@@ -107,6 +107,9 @@ pub struct BrokerdConfig {
     /// policy, and refuses to start if policy could ever permit it.
     #[serde(default)]
     pub constraint_sets: BTreeMap<CapabilityId, ConstraintSet>,
+    /// Disabled when omitted. Startup-fixed configured model aliases and supported efforts.
+    #[serde(default)]
+    pub control_targets: Vec<dekopon_broker_protocol::ControlTarget>,
     #[serde(default)]
     pub host_limits: HostLimitsConfig,
     #[serde(default)]
@@ -356,6 +359,7 @@ pub struct ResolvedConfig {
     pub policies_path: Option<PathBuf>,
     pub policies: String,
     pub constraint_sets: BTreeMap<CapabilityId, ConstraintSet>,
+    pub control_targets: Vec<dekopon_broker_protocol::ControlTarget>,
     pub host_limits: BrokerHostLimits,
     pub host_options: BrokerHostOptions,
     /// Worst-case concurrent guest memory: `maxConnections` times `maxMemoryBytes`.
@@ -528,6 +532,8 @@ async fn resolve(
     source: PathBuf,
     expected_uid: u32,
 ) -> Result<ResolvedConfig, ConfigError> {
+    dekopon_broker_protocol::validate_control_targets(&config.control_targets)
+        .map_err(ConfigError::ControlTargets)?;
     if config.provider_set.is_some() && !config.providers.is_empty() {
         return Err(ConfigError::MixedProviderSources);
     }
@@ -880,6 +886,7 @@ async fn resolve(
         policies_path,
         policies: String::new(),
         constraint_sets: config.constraint_sets,
+        control_targets: config.control_targets,
         host_limits,
         host_options: BrokerHostOptions {
             compile_cache_dir: compile_cache_path,
@@ -896,6 +903,8 @@ async fn resolve(
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    #[error(transparent)]
+    ControlTargets(#[from] dekopon_broker_protocol::ControlTargetsError),
     #[error("could not determine the current directory")]
     CurrentDirectory {
         #[source]

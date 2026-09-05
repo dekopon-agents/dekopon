@@ -10,7 +10,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -71,6 +71,16 @@ const LIVENESS_DEADLINE: Duration = Duration::from_secs(90);
 /// Fixed gateway-owned reaction used by classic/free-workspace fallback.
 const ACTIVITY_REACTION: &str = "tangerine";
 
+mod progress;
+pub(crate) use progress::OwnedProgressArtifact;
+
+struct FinalSend<'a>(&'a AtomicUsize);
+impl Drop for FinalSend<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// One Slack workspace connection.
@@ -116,6 +126,11 @@ impl SlackTransport {
                 http,
                 experience,
                 fallback: activity.classic_fallback,
+                progress_message: activity.progress_message,
+                progress_available: AtomicBool::new(true),
+                cosmetic_rate: Mutex::new(progress::CosmeticRate::default()),
+                post_rate: Mutex::new(progress::PostRate::default()),
+                final_sends: AtomicUsize::new(0),
                 agent_status_available: AtomicBool::new(true),
                 reaction_available: AtomicBool::new(true),
                 active_activity: Mutex::new(HashMap::new()),
@@ -141,6 +156,37 @@ impl SlackTransport {
     }
 
     /// Confirms the bot token and learns the bot's own user and team identifiers.
+    fn claim_installation(&self, team: &str, bot: &str) -> Result<(), TransportError> {
+        type Installations = HashMap<(String, String, String), std::sync::Weak<SlackReplier>>;
+        static INSTALLATIONS: std::sync::OnceLock<Mutex<Installations>> =
+            std::sync::OnceLock::new();
+        let mut installations = INSTALLATIONS
+            .get_or_init(Default::default)
+            .lock()
+            .expect("Slack installations");
+        installations.retain(|_, owner| owner.strong_count() != 0);
+        let key = (
+            self.endpoint.trim_end_matches('/').to_ascii_lowercase(),
+            team.to_ascii_lowercase(),
+            bot.to_ascii_lowercase(),
+        );
+        if let Some(owner) = installations.get(&key).and_then(std::sync::Weak::upgrade) {
+            if Arc::ptr_eq(&owner, &self.replier) {
+                return Ok(());
+            }
+            return Err(TransportError::Service {
+                code: "duplicate-slack-installation".into(),
+            });
+        }
+        if installations.len() >= 128 {
+            return Err(TransportError::Service {
+                code: "slack-installation-capacity".into(),
+            });
+        }
+        installations.insert(key, Arc::downgrade(&self.replier));
+        Ok(())
+    }
+
     async fn auth_test(&self) -> Result<(String, String), TransportError> {
         let body = post_form(
             &self.http,
@@ -443,6 +489,7 @@ impl ChatTransport for SlackTransport {
     fn connect(&mut self) -> BoxFuture<'_, Result<TransportIdentity, TransportError>> {
         Box::pin(async move {
             let (user_id, team_id) = self.auth_test().await?;
+            self.claim_installation(&team_id, &user_id)?;
             self.identity = TransportIdentity {
                 user_id: Some(user_id),
                 handle: None,
@@ -510,6 +557,11 @@ pub(crate) struct SlackReplier {
     http: reqwest::Client,
     experience: SlackExperience,
     fallback: SlackActivityFallback,
+    progress_message: bool,
+    progress_available: AtomicBool,
+    cosmetic_rate: Mutex<progress::CosmeticRate>,
+    post_rate: Mutex<progress::PostRate>,
+    final_sends: AtomicUsize,
     /// Permanently disabled after Slack says this installation cannot use Agent sessions.
     agent_status_available: AtomicBool,
     /// Permanently disabled after Slack says this bot lacks reaction authority.
@@ -531,6 +583,8 @@ impl ChatReplier for SlackReplier {
         reply: OutboundReply,
     ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
         Box::pin(async move {
+            self.final_sends.fetch_add(1, Ordering::AcqRel);
+            let _final_send = FinalSend(&self.final_sends);
             let ReplyTarget::Slack { channel, thread_ts } = target else {
                 return Err(TransportError::Response);
             };
@@ -557,24 +611,7 @@ impl ChatReplier for SlackReplier {
             if let Some(thread_ts) = thread_ts {
                 body["thread_ts"] = Value::String(thread_ts);
             }
-            #[allow(
-                clippy::map_err_ignore,
-                reason = "serializing a serde_json::Value cannot fail: it holds no non-string map \
-                          keys and serde_json::Number rejects non-finite floats"
-            )]
-            let response = self
-                .http
-                .post(format!("{}/api/chat.postMessage", self.endpoint))
-                .header(
-                    "authorization",
-                    format!("Bearer {}", self.bot_token.expose()),
-                )
-                .header("content-type", "application/json; charset=utf-8")
-                .body(serde_json::to_vec(&body).map_err(|_| TransportError::Response)?)
-                .send()
-                .await
-                .map_err(|source| TransportError::Request(Box::new(source)))?;
-            let body = check_ok(response).await?;
+            let body = self.post_answer(&body, &expected_channel).await?;
             let response_channel = body["channel"].as_str().ok_or(TransportError::Response)?;
             let timestamp = body["ts"].as_str().ok_or(TransportError::Response)?;
             if response_channel != expected_channel || !canonical_timestamp(timestamp) {
@@ -639,7 +676,7 @@ impl SlackReplier {
 
         let mut body = json!({
             "files": [{"id": file_id, "title": "Generated image"}],
-            "channel_id": channel,
+            "channel_id": channel.clone(),
         });
         if !text.is_empty() {
             body["initial_comment"] = Value::String(text);
@@ -647,28 +684,13 @@ impl SlackReplier {
         if let Some(thread_ts) = thread_ts {
             body["thread_ts"] = Value::String(thread_ts);
         }
-        #[allow(
-            clippy::map_err_ignore,
-            reason = "serializing a serde_json::Value cannot fail: it holds no non-string map keys \
-                      and serde_json::Number rejects non-finite floats"
-        )]
-        let completed = check_ok(
-            self.http
-                .post(format!(
-                    "{}/api/files.completeUploadExternal",
-                    self.endpoint
-                ))
-                .header(
-                    "authorization",
-                    format!("Bearer {}", self.bot_token.expose()),
-                )
-                .header("content-type", "application/json; charset=utf-8")
-                .body(serde_json::to_vec(&body).map_err(|_| TransportError::Response)?)
-                .send()
-                .await
-                .map_err(|source| TransportError::Request(Box::new(source)))?,
-        )
-        .await?;
+        // Completion is what creates the channel message, so it takes the same physical channel
+        // slot and the same single 429 retry an answer posted through `chat.postMessage` does.
+        // Obtaining the upload URL and sending the bytes create nothing in the channel and stay
+        // unpaced.
+        let completed = self
+            .paced_channel_post("files.completeUploadExternal", &body, &channel)
+            .await?;
         let accepted = completed["files"]
             .as_array()
             .is_some_and(|files| files.iter().any(|file| file["id"] == file_id));
@@ -680,6 +702,36 @@ impl SlackReplier {
 }
 
 impl ChatActivity for SlackReplier {
+    fn retire(&self, target: &ActivityTarget) {
+        self.active_activity
+            .lock()
+            .expect("Slack activity registry")
+            .remove(target);
+    }
+    fn progress_enabled(&self) -> bool {
+        self.progress_message && self.progress_available.load(Ordering::Acquire)
+    }
+    fn post_progress(
+        &self,
+        target: ActivityTarget,
+        label: dekopon_harness::activity::ActivityLabel,
+    ) -> BoxFuture<'_, Result<Option<OwnedProgressArtifact>, TransportError>> {
+        Box::pin(self.create_progress(target, label))
+    }
+    fn update_progress<'a>(
+        &'a self,
+        owned: &'a OwnedProgressArtifact,
+        label: dekopon_harness::activity::ActivityLabel,
+    ) -> BoxFuture<'a, Result<(), TransportError>> {
+        Box::pin(self.change_progress(owned, label))
+    }
+    fn delete_progress<'a>(
+        &'a self,
+        owned: &'a OwnedProgressArtifact,
+    ) -> BoxFuture<'a, Result<(), TransportError>> {
+        Box::pin(self.remove_progress(owned))
+    }
+
     fn show(&self, target: ActivityTarget) -> BoxFuture<'_, Result<(), TransportError>> {
         Box::pin(async move {
             let ActivityTarget::Slack {
@@ -730,10 +782,14 @@ impl ChatActivity for SlackReplier {
                         // may leave a harmless marker, but can never authorize this generation to
                         // remove a reaction the bot already had.
                         self.update_attempt(&target, |attempt| attempt.reaction = true);
-                        return Ok(());
+                        return agent_error
+                            .filter(crate::activity::uncertain)
+                            .map_or(Ok(()), Err);
                     }
                     Err(TransportError::Service { code }) if code == "already_reacted" => {
-                        return Ok(());
+                        return agent_error
+                            .filter(crate::activity::uncertain)
+                            .map_or(Ok(()), Err);
                     }
                     Err(error) => {
                         if permanent_reaction_error(&error)
@@ -745,7 +801,9 @@ impl ChatActivity for SlackReplier {
                                 surface = "reaction"
                             );
                         }
-                        return Err(error);
+                        return Err(agent_error
+                            .filter(crate::activity::uncertain)
+                            .unwrap_or(error));
                     }
                 }
             }
@@ -772,7 +830,8 @@ impl ChatActivity for SlackReplier {
                 .active_activity
                 .lock()
                 .expect("Slack activity registry")
-                .remove(&target)
+                .get(&target)
+                .copied()
                 .unwrap_or_default();
             let mut first_error = None;
             if attempt.agent_status
@@ -787,13 +846,34 @@ impl ChatActivity for SlackReplier {
                     .set_reaction(channel_id, message_ts, "reactions.remove")
                     .await
                 && !matches!(&error, TransportError::Service { code } if code == "no_reaction")
-                && first_error.is_none()
             {
-                first_error = Some(error);
+                if let Some(prior) = &first_error {
+                    // Both failures matter, especially an uncertain removal after a definitive
+                    // status refusal. Preserve uncertainty for the coordinator's quarantine.
+                    let displaced = if crate::activity::uncertain(&error) {
+                        prior
+                    } else {
+                        &error
+                    };
+                    tracing::debug!(
+                        event = "gateway_activity_failed",
+                        operation = "hide-additional",
+                        category = displaced.category()
+                    );
+                }
+                if first_error.is_none() || crate::activity::uncertain(&error) {
+                    first_error = Some(error);
+                }
             }
             match first_error {
                 Some(error) => Err(error),
-                None => Ok(()),
+                None => {
+                    self.active_activity
+                        .lock()
+                        .expect("Slack activity registry")
+                        .remove(&target);
+                    Ok(())
+                }
             }
         })
     }
@@ -853,25 +933,7 @@ impl SlackReplier {
     }
 
     async fn post_activity_json(&self, method: &str, body: &Value) -> Result<(), TransportError> {
-        #[allow(
-            clippy::map_err_ignore,
-            reason = "serializing a serde_json::Value cannot fail: it holds no non-string map keys \
-                      and serde_json::Number rejects non-finite floats"
-        )]
-        let response = self
-            .http
-            .post(format!("{}/api/{method}", self.endpoint))
-            .header(
-                "authorization",
-                format!("Bearer {}", self.bot_token.expose()),
-            )
-            .header("content-type", "application/json; charset=utf-8")
-            .body(serde_json::to_vec(body).map_err(|_| TransportError::Response)?)
-            .timeout(ACTIVITY_REQUEST_TIMEOUT)
-            .send()
-            .await
-            .map_err(|source| TransportError::Request(Box::new(source)))?;
-        check_ok(response).await.map(|_| ())
+        self.cosmetic_json(method, body).await.map(|_| ())
     }
 }
 

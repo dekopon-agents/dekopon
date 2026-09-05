@@ -20,7 +20,7 @@ The ChatGPT subscription transport uses a fixed, undocumented ChatGPT/Codex back
 | How long is the cache fresh on a ChatGPT subscription? | **OpenAI does not publish a retention contract for the subscription endpoint Dekopon calls.** Public API policies range from short in-memory retention to model-specific extended retention, but those values cannot be promised here. |
 | Can a long-lived agent keep the cache alive? | Keeping a Rust object, process, HTTP connection, response ID, or conversation entry alive does not documentably pin a provider cache. Only provider-side reuse policy and actual matching requests matter. `dekopond` already shares one client per configured model, which reuses connections and coordinates credential refresh; that is a transport optimization, not a cache lease. |
 | How does outbound image generation work? | A route may explicitly name a separate public OpenAI Images backend. Its chat model can call `generate_image` once; one bounded PNG is carried outside the transcript to the authenticated Slack/Discord/Telegram/local reply target. Existing Chat Completions and private ChatGPT subscription contracts are not claimed to generate images themselves. |
-| How does chat memory work? | `oneShot` routes remember nothing. `persistent` routes keep compacted question/final-answer pairs per sender in `dekopond` memory, bounded by idle time, turns, bytes, and total conversation count. Every message is authorized afresh. |
+| How does chat memory work? | `oneShot` routes remember nothing. `persistent` routes keep bounded execution-aware job records per sender through `dekopon-harness` in gateway memory, bounded by idle time, turns, bytes, and total conversation count. Every message is authorized afresh. |
 | Does Dekopon have a memory framework? | **No general framework.** It has a focused conversation window plus optional durable on-demand recent/literal-search chat turns—not task, semantic, vector, editable-fact, or automatically replayed memory. |
 
 ## Three different mechanisms
@@ -30,7 +30,7 @@ The ChatGPT subscription transport uses a fixed, undocumented ChatGPT/Codex back
 | Mechanism | Owner | Purpose | Current Dekopon behavior |
 |---|---|---|---|
 | Prompt-prefix cache | Model provider | Avoid recomputing an identical leading prompt | Sends a stable key and stable prefixes; cannot inspect, create, refresh, or delete provider entries |
-| Conversation history | `dekopond` | Let a person ask a follow-up | Optional bounded `(question, final answer)` window in process memory |
+| Conversation history | `dekopon-harness`, in the gateway process | Follow-up context and portable execution observations | Bounded job records, tool groups and separately accepted text; not durable audit |
 | Durable chat-turn memory | `dekopon-brokerd` provider storage | On-demand recent/literal search across restarts inside one attested scope | Optional JSONL turns + permanent finite dedup; no automatic replay, deletion/export, semantic index, or encryption-at-rest claim |
 
 A cache hit never substitutes an old answer. The provider still evaluates the complete current request and produces a new response. “Fresh” therefore refers to whether prefix computation can be reused, not whether the answer or its underlying data is fresh.
@@ -45,7 +45,7 @@ Slack event
   -> route selects one catalog agent and model
   -> broker returns a fresh subject-and-agent capability surface
        empty/refused -> fixed unauthorized reply; no model call
-  -> conversation store optionally supplies compacted history + an opaque cache key
+  -> conversation store optionally supplies bounded portable history + an opaque cache key
   -> prompt loop builds ModelMessage values and ModelTool definitions
   -> ChatGptCodexModel builds a Responses-shaped serde_json::Value
   -> POST https://chatgpt.com/backend-api/codex/responses
@@ -55,7 +55,7 @@ Slack event
   -> exact bounded text plus optional PNG receives complete Slack transport acceptance
      or an optional owned-thread continuation declines and sends no reply
   -> one fresh hidden record request only after an accepted reply and effective durable surface
-  -> persistent route stores only the new question and final answer, or a declined user-only turn
+  -> harness retains bounded job/execution records and separate delivery disposition
 ```
 
 The broker authorization leg is new for every Slack message. Neither remembered text nor a prompt cache key enters Cedar policy or grants a capability.
@@ -65,18 +65,18 @@ The broker authorization leg is new for every Slack message. Neither remembered 
 The current implementation has five intentional cache-friendly properties:
 
 1. **One opaque key per useful reuse lane.** A persistent conversation gets one minted key. A one-shot route gets one key shared by that route's requests, where only the common agent prefix can match.
-2. **Append-only turns inside one model session.** If the model calls a tool, the next request retains the earlier `input` items byte-for-byte and appends the reasoning replay, function call, and function result.
+2. **Append-only turns inside a compatible, untrimmed model segment.** If the model calls a tool, the next request retains the earlier `input` items byte-for-byte and appends the reasoning replay, function call, and function result.
 3. **Stable provider replay.** The subscription transport requests `reasoning.encrypted_content` and replays the opaque provider items on the next tool-loop turn instead of reconstructing them.
-4. **Stable instructions and tools.** System messages are hoisted to `instructions`; tool definitions are built once for the session. Tests fail if appending a turn mutates either.
-5. **Measured rather than assumed hits.** Responses usage is normalized into `ModelUsage::cached_input_tokens` and exported on `prompt.model_turn` plus `accounting.model.turn`.
+4. **Stable instructions and tools.** System messages are hoisted to `instructions`; tool definitions stay stable until a configured switch rebuilds the segment. Tests fail if appending a turn mutates either.
+5. **Measured rather than assumed hits.** Responses usage is normalized into `ModelUsage::cached_input_tokens` and exported on the `accounting.model.call` record and matching span.
 
 The source contracts are in:
 
 - [`crates/dekopon-model/src/model.rs`](../crates/dekopon-model/src/model.rs) — `ModelMessage`, `ModelTool`, `CompletionOptions`, `AssistantTurn`, `ModelUsage`, and `ChatModel`;
 - [`crates/dekopon-model/src/chatgpt.rs`](../crates/dekopon-model/src/chatgpt.rs) — the subscription request builder, SSE parser, and prefix-stability tests;
-- [`crates/dekopon-agent/src/prompt.rs`](../crates/dekopon-agent/src/prompt.rs) — the bounded model/tool loop;
-- [`crates/dekopon-agent/src/prompt/history.rs`](../crates/dekopon-agent/src/prompt/history.rs) — compacted cross-message history; and
-- [`crates/dekopond/src/cache_key.rs`](../crates/dekopond/src/cache_key.rs), [`conversation.rs`](../crates/dekopond/src/conversation.rs), and [`session.rs`](../crates/dekopond/src/session.rs) — key lifetime, history lifetime, and Slack-session assembly.
+- [`crates/dekopon-harness/src/session.rs`](../crates/dekopon-harness/src/session.rs) — the bounded model/tool loop;
+- [`crates/dekopon-harness/src/history.rs`](../crates/dekopon-harness/src/history.rs) — compacted cross-message history; and
+- [`crates/dekopond/src/cache_key.rs`](../crates/dekopond/src/cache_key.rs), [`harness conversation.rs`](../crates/dekopon-harness/src/conversation.rs), and [`session.rs`](../crates/dekopond/src/session.rs) — key lifetime, history lifetime, and Slack-session assembly.
 
 ### What is not optimized or cached
 
@@ -87,7 +87,39 @@ The source contracts are in:
 - The gateway does not estimate tokens before a request. Its history bound is bytes plus whole turns because provider token counts arrive only after a billed call.
 - Cross-message compaction preserves conversational meaning, not the full prior wire transcript. A follow-up can reuse a leading prefix, but it is not necessarily an append-only extension of the last tool-loop request.
 
-That last distinction matters. Within one session, the second request is deliberately the first request plus more items. Between Slack messages, `History` reconstructs only the previous question and final answer; tool calls, tool outputs, and encrypted reasoning are gone. This keeps memory bounded and portable across model backends, but it can shorten the matching provider-cache prefix.
+That last distinction matters. Within a compatible, untrimmed segment, requests extend prior
+provider items. Across messages or switches, the harness selects bounded portable tool groups and
+execution observations instead. Opaque reasoning/continuation is absent. Context trimming and
+switching can shorten a matching cache prefix; no cache hit is guaranteed.
+
+## Configured transitions (Unreleased)
+
+`CompletionOptions::with_effort(Effort)` distinguishes `providerDefault` from `low`, `medium`
+and `high`. Chat Completions encodes explicit settings as `reasoning_effort`; Codex Responses
+encodes `reasoning.effort`. Default omits the setting. Unaware adapters refuse explicit effort
+before I/O rather than silently dropping it; a backend's rejection is a failed inference, not
+permission to silently choose another setting or model. Loopback wire tests cover all four states.
+
+The gateway's opt-in [route controls](dekopond.md#configured-model-and-effort-controls-unreleased)
+select configured cached clients through `dekopon-harness::control::ModelRegistry`, not arbitrary
+model endpoints. Only a live `VerifiedControlDecision` from the server-UID-verified broker client
+can admit application. The harness never deserializes admission from a provider or checkpoint.
+Each request must be its own tool turn, with a job-wide maximum of four attempts including local
+refusals. Selecting the current model/effort is a refused no-op, not a new segment.
+
+An applied switch—including effort-only changes—invalidates all opaque replay and rotates the
+cache key before further inference. Portable whole call/result groups and independently observed
+execution evidence survive, bounded separately from model context. System/bootstrap identity,
+tool definitions and history are rebuilt for the new selection; inspection/skill repeat pointers
+are reset, but consumed budgets and image-generation attempts are never reset. Cross-provider
+transitions use reconstructed portable tool correlations rather than another provider's encrypted
+reasoning. No transport optimization, persistent provider conversation, or cache-retention claim
+is introduced. Direct/replay runners omit controls even when they have a provider broker leg.
+
+`SessionState.transitions` retains typed immutable from/to metadata, requesting model-call index,
+charged attempt, decision reference and application/refusal outcome. It contains no guessed token
+or dollar totals; the strict per-job accounting tracker owns accounting across these boundaries.
+Checkpoint receipts remain process-local bounded storage receipts, not crash-durability guarantees.
 
 ## Prompt cache key lifecycle
 
@@ -185,36 +217,17 @@ conversation:
 
 `oneShot` remains the default.
 
-A persistent conversation is keyed by transport, a transport-derived conversation identity, and the canonical sender. Two people in one Slack thread have two histories. On every message:
+A persistent conversation is keyed by agent/route/transport/channel/conversation/sender. Fresh
+broker admission precedes a harness generation lease; full metadata plus startup epoch invalidate
+old history. Entries and total bytes are bounded, and idle/LRU eviction fences late appends. Jobs
+retain whole tool groups and independently observed execution outcomes even after inference fails
+or Stop wins. Generated text is distinct from exact accepted text. Reasoning, binary assets and
+provider continuation are excluded; selected model context has independent bounds.
 
-1. the gateway opens a fresh attested broker leg;
-2. an empty or refused grant stops before inference and removes remembered history for that key;
-3. the store compares the newly granted capability identifiers with those stored beside the conversation;
-4. an idle or grant-changed entry is dropped;
-5. surviving `(question, final answer)` pairs are replayed before the new message;
-6. the new exchange is appended and the oldest whole turns are trimmed until both bounds hold. An
-   inherited Slack Agent follow-up may explicitly decline its optional reply before capability work;
-   that stores the user message alone and performs no Slack delivery or durable recording.
-
-The store is bounded by `sessions.maxConversations` across the process. Capacity evicts least-recently-used entries. Idle eviction is lazy: stale text may remain resident until lookup, capacity pressure, or process exit, but it is never replayed after its timeout.
-
-### What history deliberately drops
-
-- model reasoning, including encrypted replay items;
-- function/tool calls;
-- scripts and capability outputs;
-- system instructions, which are supplied fresh from the catalog;
-- the gateway's fixed failure sentence; and
-- any synthetic assistant text for a deliberate no-reply decision—there is none, so only the user
-  message remains in the in-process turn.
-
-This is conversation continuity, not evidence continuity. The broker audit is where authorized effects remain verifiable.
-
-### Memory never becomes authority
-
-History is untrusted prompt text. It is not sent to the broker as policy input. The prompt cache key also stays out of authorization. Every capability invocation still becomes a fresh proposal that only the broker may authorize.
-
-Grant-set invalidation has one known limit: it compares capability identifiers. Tightening a capability's execution constraints or changing its credential while retaining the same identifier does not currently invalidate history. [`security-model.md`](security-model.md#conversation-memory-as-a-trust-surface) records that live limitation.
+History is untrusted prompt text, never policy input. The broker still authorizes each invocation.
+Unknown effects fence further work. Memory checkpoints are supplied process-local storage, not
+crash durability or broker audit. See [harness.md](harness.md) for exact bounds, retention trade-offs
+and remaining recording and validation limitations.
 
 ## Outbound image generation
 
@@ -231,7 +244,7 @@ decodes at most 8 MiB, validates the PNG signature, and gives the bytes to a req
 slot. A second call is refused even when the first failed, because a failed request may still have
 incurred cost. The model reads only a fixed success/failure sentence and then produces the textual
 caption; generated bytes never become a `ModelMessage`, tool result, prompt transcript, or
-`PromptOutcome`.
+`SessionExit`.
 
 The gateway owns the filename/media type and sends the image only to the reply coordinates from the
 authenticated inbound envelope. Slack uses the external file-upload sequence, Discord a multipart
@@ -317,7 +330,7 @@ It would also create a new high-risk data system. Before adopting a framework, D
 - whether memory is scoped to a sender, agent, organization, task, or some combination;
 - consent, retention, export, deletion, and incident-response behavior;
 - prompt-injection persistence, poisoned memories, stale facts, and cross-sender retrieval;
-- capability-revocation invalidation beyond today's identifier comparison;
+- safe live-job invalidation on authority changes;
 - whether a model may propose a memory write and what trusted component validates it; and
 - how to prove retrieved memory never becomes trusted identity or authorization input.
 
@@ -329,7 +342,7 @@ effect remains freshly authorized. A broader framework must preserve those prope
 
 ## Literal Rust walkthrough
 
-The following is production-shaped, executable-style Rust with fake inline values. The two tool descriptions are shortened to keep the wire readable; their names, schemas, message shapes, options, endpoint, headers, and Responses fields match the current implementation. Credential values are intentionally fake.
+The following is an abbreviated adapter-wire illustration with fake inline values, not a complete harness driver. Request-one harness bootstrap/schema messages and some portable history are omitted for readability. The two tool descriptions are shortened to keep the wire readable; their names, schemas, message shapes, options, endpoint, headers, and Responses fields match the current implementation. Credential values are intentionally fake.
 
 ### The key Rust types
 
@@ -391,12 +404,13 @@ let options = CompletionOptions::default().with_prompt_cache_key(
     "dekopond-conversation-7e91c87d8d6a4c13",
 );
 
-let first_turn: AssistantTurn = model.complete_with(&messages, &tools, &options)?;
+// Inside a harness logical call: the driver supplies the mandatory attempt recorder.
+let first_turn: AssistantTurn = model.complete_with(&messages, &tools, &options, recorder)?;
 ```
 
 `ModelMessage` is the backend-neutral transcript. `ModelTool` is the model-facing function schema. `CompletionOptions` carries routing metadata without changing the prompt. `ChatGptCodexModel` turns those values into private wire JSON, and `AssistantTurn` normalizes text, function calls, replay state, and usage from SSE.
 
-The gateway-only types around them are `ConversationKey`, `ConversationSeed`, `ConversationStore`, and `BoundRoute`. They are crate-private because transports should not manufacture or serialize conversation state directly.
+`ConversationKey`, `ConversationSeed` and `BoundedConversationStore` belong to the harness; the gateway supplies their trusted routing coordinates from `BoundRoute` and the authenticated envelope.
 
 ### Request 1: Slack question
 
@@ -534,7 +548,7 @@ messages.push(ModelMessage::tool(
     ),
 ));
 
-let second_turn = model.complete_with(&messages, &tools, &options)?;
+let second_turn = model.complete_with(&messages, &tools, &options, recorder)?;
 ```
 
 All top-level fields remain the same. The exact `input` immediately before the second call is:
@@ -586,10 +600,10 @@ The provider may report some of request 2's input as cached. Dekopon records the
 
 ### Request 3: a Slack follow-up
 
-At the end of the first Slack message, the persistent history stores only:
+For a text-only accepted job, the portable summary can be illustrated as follows (a tool-using job also retains bounded groups and execution observations):
 
 ```rust
-let remembered = dekopon_agent::prompt::ConversationTurn::completed(
+let remembered = dekopon_harness::history::JobRecord::completed(
     "Summarize dekopon-agents/dekopon PR #110 and tell me whether it is merged.",
     "PR #110, “fix(gateway): make agent config inspection repeatable,” removes the \
      one-call limit from agent configuration inspection. It is merged.",
@@ -631,12 +645,12 @@ let request_3_input = json!([
 ]);
 ```
 
-The earlier encrypted reasoning, function call, and tool result are absent. This request shares a stable beginning with the earlier calls, but it is a compacted conversation rather than a replay of the full execution transcript. That is the trade: bounded, portable memory and safer trimming in exchange for a potentially shorter provider-cache match.
+Encrypted reasoning is absent. This abbreviated example omits retained portable tool groups and execution summaries; real selection can include them under independent byte limits. It is not an exact replay of opaque provider continuation or a promised cache match.
 
 ## How to evaluate caching in a deployment
 
 1. Use a real second or later model turn; the first eligible request normally has nothing earlier to hit.
-2. Query `usage.input_tokens` and `usage.cached_input_tokens` on `prompt.model_turn` or `accounting.model.turn`.
+2. Query `usage.input_tokens` and `usage.cached_input_tokens` on `accounting.model.call`.
 3. Treat a missing cached field as unreported. Do not coerce it to zero.
 4. Compare the ratio only across calls whose provider reported both values.
 5. Check whether instructions, tools, model, attachment parts, or the front of history changed.
@@ -660,3 +674,10 @@ Compute it only over calls where both fields were reported. A key proves Dekopon
 - [`observability.md`](observability.md) — model usage fields and payload gating.
 - [OpenAI Prompt Caching](https://developers.openai.com/api/docs/guides/prompt-caching) — public API behavior, not a subscription-endpoint guarantee.
 - [OpenAI conversation state](https://developers.openai.com/api/docs/guides/conversation-state) — public Responses state patterns, not current Dekopon behavior.
+
+Token accounting is owned by the mandatory harness ledger, across attempts, model/effort segments,
+checkpoint restore and terminal delivery dispositions. See [Accounting](observability.md#accounting)
+for optional usage, subset arithmetic, unknown spend and aggregation levels. Direct model adapters
+must accept an `AttemptRecorder`; standalone callers can supply a bounded `AttemptLog`, while the
+harness supplies its checkpoint-backed recorder. A completion return value is not the accounting
+commit point.

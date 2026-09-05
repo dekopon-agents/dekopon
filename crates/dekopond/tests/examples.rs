@@ -58,6 +58,7 @@ fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
             activity: SlackActivityConfig {
                 mode: ActivityMode::Native,
                 classic_fallback: SlackActivityFallback::Reaction,
+                progress_message: false,
             },
             ..
         }

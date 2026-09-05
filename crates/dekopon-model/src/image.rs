@@ -82,8 +82,16 @@ impl fmt::Debug for GeneratedImage {
 
 /// Synchronous generation boundary used by the synchronous agent prompt loop.
 pub trait ImageGenerator: Send + Sync {
+    /// Actual configured client identity, never a prompt-selected target.
+    fn model_identity(&self) -> (&str, &str) {
+        ("adapter", "unreported")
+    }
     /// Generates one bounded image from one model-authored prompt.
-    fn generate(&self, prompt: &str) -> Result<GeneratedImage, ImageGenerationError>;
+    fn generate(
+        &self,
+        prompt: &str,
+        recorder: &dyn crate::usage::AttemptRecorder,
+    ) -> Result<GeneratedImage, ImageGenerationError>;
 }
 
 /// OpenAI Images client fixed to the public production endpoint.
@@ -142,7 +150,14 @@ impl OpenAiImageGenerator {
 }
 
 impl ImageGenerator for OpenAiImageGenerator {
-    fn generate(&self, prompt: &str) -> Result<GeneratedImage, ImageGenerationError> {
+    fn model_identity(&self) -> (&str, &str) {
+        ("openai-images", &self.model)
+    }
+    fn generate(
+        &self,
+        prompt: &str,
+        recorder: &dyn crate::usage::AttemptRecorder,
+    ) -> Result<GeneratedImage, ImageGenerationError> {
         let prompt = prompt.trim();
         if prompt.is_empty() {
             return Err(ImageGenerationError::InvalidPrompt);
@@ -158,7 +173,8 @@ impl ImageGenerator for OpenAiImageGenerator {
             size: "1024x1024",
             output_format: "png",
         };
-        let mut response = self
+        let attempt = recorder.begin(crate::usage::AttemptKind::Http)?;
+        let response = self
             .agent
             .post(&self.endpoint)
             .header(
@@ -170,17 +186,40 @@ impl ImageGenerator for OpenAiImageGenerator {
             .map_err(|source| ImageGenerationError::Request(source.to_string()))?;
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
+            crate::model::read_error_body_recorded(response, recorder, attempt, false).map_err(
+                |e| match e {
+                    crate::model::ModelError::Accounting(e) => ImageGenerationError::Accounting(e),
+                    _other => {
+                        tracing::debug!(cause_type = "image-error-body");
+                        ImageGenerationError::Response
+                    }
+                },
+            )?;
             return Err(ImageGenerationError::Status(status));
         }
-        let response = response
-            .body_mut()
-            .with_config()
-            .limit(MAX_IMAGE_RESPONSE_BYTES)
-            .read_json::<ImageResponse>()
-            .map_err(|error| match error {
-                ureq::Error::BodyExceedsLimit(_) => ImageGenerationError::TooLarge,
-                _ => ImageGenerationError::Response,
-            })?;
+        let response = crate::usage::read_usage_json(
+            response.into_parts().1.into_reader(),
+            MAX_IMAGE_RESPONSE_BYTES,
+            recorder,
+            attempt,
+            false,
+        )
+        .map_err(|error| match error {
+            crate::model::ModelError::Accounting(error) => ImageGenerationError::Accounting(error),
+            crate::model::ModelError::Response(ref detail)
+                if detail == "response exceeded byte bound" =>
+            {
+                ImageGenerationError::TooLarge
+            }
+            _other => {
+                tracing::debug!(cause_type = "image-response");
+                ImageGenerationError::Response
+            }
+        })?;
+        let response: ImageResponse = serde_json::from_value(response).map_err(|error| {
+            tracing::debug!(cause_type = "image-response", category = ?error.classify());
+            ImageGenerationError::Response
+        })?;
         if response.data.len() != 1 {
             return Err(ImageGenerationError::Response);
         }
@@ -233,6 +272,9 @@ struct ImageData {
 /// Stable image-generation failure.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum ImageGenerationError {
+    /// Ledger refusal; no subsequent transmission is permitted.
+    #[error(transparent)]
+    Accounting(#[from] crate::usage::AccountingError),
     /// Client configuration was invalid.
     #[error("invalid image generation configuration: {0}")]
     Configuration(String),
@@ -271,6 +313,7 @@ impl ImageGenerationError {
     #[must_use]
     pub const fn category(&self) -> &'static str {
         match self {
+            Self::Accounting(_) => "accounting",
             Self::Configuration(_) => "configuration",
             Self::InvalidPrompt => "invalid-prompt",
             Self::PromptTooLarge => "prompt-too-large",
@@ -329,7 +372,10 @@ mod tests {
         .expect("loopback client");
 
         let image = generator
-            .generate("draw a small orange cat")
+            .generate(
+                "draw a small orange cat",
+                &crate::usage::AttemptLog::default(),
+            )
             .expect("one generated image");
         assert_eq!(image.bytes(), png());
 
@@ -355,12 +401,17 @@ mod tests {
         )
         .expect("client");
         assert_eq!(
-            generator.generate("  ").expect_err("empty prompt"),
+            generator
+                .generate("  ", &crate::usage::AttemptLog::default())
+                .expect_err("empty prompt"),
             ImageGenerationError::InvalidPrompt
         );
         assert_eq!(
             generator
-                .generate(&"x".repeat(super::MAX_IMAGE_PROMPT_BYTES + 1))
+                .generate(
+                    &"x".repeat(super::MAX_IMAGE_PROMPT_BYTES + 1),
+                    &crate::usage::AttemptLog::default()
+                )
                 .expect_err("oversized prompt"),
             ImageGenerationError::PromptTooLarge
         );
@@ -379,7 +430,7 @@ mod tests {
         )
         .expect("client");
         let error = generator
-            .generate("cat")
+            .generate("cat", &crate::usage::AttemptLog::default())
             .expect_err("nothing listens on port 9");
         let ImageGenerationError::Request(ref detail) = error else {
             panic!("{error:?}");
@@ -401,7 +452,9 @@ mod tests {
         )
         .expect("client");
         assert_eq!(
-            generator.generate("cat").expect_err("invalid base64"),
+            generator
+                .generate("cat", &crate::usage::AttemptLog::default())
+                .expect_err("invalid base64"),
             ImageGenerationError::InvalidEncoding
         );
 
@@ -416,7 +469,9 @@ mod tests {
         )
         .expect("client");
         assert_eq!(
-            generator.generate("cat").expect_err("invalid PNG"),
+            generator
+                .generate("cat", &crate::usage::AttemptLog::default())
+                .expect_err("invalid PNG"),
             ImageGenerationError::InvalidImage
         );
 
@@ -434,7 +489,9 @@ mod tests {
         )
         .expect("client");
         assert_eq!(
-            generator.generate("cats").expect_err("multiple images"),
+            generator
+                .generate("cats", &crate::usage::AttemptLog::default())
+                .expect_err("multiple images"),
             ImageGenerationError::Response
         );
 
@@ -450,7 +507,9 @@ mod tests {
         )
         .expect("client");
         assert_eq!(
-            generator.generate("cat").expect_err("HTTP refusal"),
+            generator
+                .generate("cat", &crate::usage::AttemptLog::default())
+                .expect_err("HTTP refusal"),
             ImageGenerationError::Status(429)
         );
 
@@ -466,8 +525,46 @@ mod tests {
         )
         .expect("client");
         assert_eq!(
-            generator.generate("cat").expect_err("oversized image"),
+            generator
+                .generate("cat", &crate::usage::AttemptLog::default())
+                .expect_err("oversized image"),
             ImageGenerationError::TooLarge
+        );
+    }
+}
+
+#[cfg(test)]
+mod accounting_tests {
+    use super::*;
+    use crate::{
+        mock::{MockResponse, MockServer},
+        usage::AttemptLog,
+    };
+    #[test]
+    fn malformed_image_bytes_do_not_erase_reported_usage() {
+        let mock = MockServer::start(vec![MockResponse::json(
+            serde_json::json!({"data":[{"b64_json":"not base64"}],"usage":{"input_tokens":10,"output_tokens":20,"total_tokens":30}}),
+        )]);
+        let generator = OpenAiImageGenerator::with_endpoint(
+            mock.base_url(),
+            "fixture",
+            "fixture-not-secret".into(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        let log = AttemptLog::default();
+        assert_eq!(
+            generator.generate("draw a fruit", &log).unwrap_err(),
+            ImageGenerationError::InvalidEncoding
+        );
+        assert_eq!(log.observations().len(), 1);
+        assert_eq!(
+            log.observations()[0]
+                .observation
+                .unwrap()
+                .usage
+                .total_tokens,
+            Some(30)
         );
     }
 }

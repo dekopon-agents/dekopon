@@ -23,24 +23,25 @@
 //! never accumulates into a durable pseudonym. Its lifetime is exactly the window over which a
 //! prefix is genuinely shared, which is also the only window in which it is useful.
 //!
+//! This module mints the route lane only. The conversation lane is minted where the conversation
+//! is created, inside [`dekopon_harness::conversation`], because the key rotates exactly when that
+//! entry does; the reasoning above is why it carries no subject either.
+//!
 //! Entropy comes from [`IdSequence`], which is the workspace's existing answer to needing an
 //! unguessable identifier without adding a dependency: an OS-seeded `RandomState` hasher mixed with
 //! the process ID and a nanosecond wall-clock reading. The broker already trusts that construction
 //! for invocation identifiers, where a collision is a replay-rejection failure; here a collision
 //! costs a wasted cache lookup.
 
-use dekopon_agent::IdSequence;
-
-/// Prefix for a key naming one remembered conversation on one `persistent` route.
-const CONVERSATION_PREFIX: &str = "dekopond-conversation";
+use dekopon_harness::runtime::IdSequence;
 
 /// Prefix for a key naming one bound route, shared by every sender that route answers.
+///
+/// The other lane is the conversation lane, and it is minted inside the harness's conversation
+/// store under [`dekopon_harness::conversation::CONVERSATION_CACHE_PREFIX`] — where the
+/// conversation it names is created and rotated. There is one definition of each prefix, and a
+/// test here pins that the two lanes cannot collide.
 const ROUTE_PREFIX: &str = "dekopond-route";
-
-/// Mints the key for one conversation, created with the conversation and rotated with it.
-pub(crate) fn for_conversation() -> String {
-    mint(CONVERSATION_PREFIX)
-}
 
 /// Mints the key for one bound route, minted once at startup and shared by every sender on it.
 ///
@@ -60,7 +61,7 @@ pub(crate) fn for_route() -> String {
 
 /// Derives one opaque identifier under `prefix`.
 ///
-/// [`IdSequence::new`] rejects only a malformed prefix, and both prefixes here are crate constants
+/// [`IdSequence::new`] rejects only a malformed prefix, and the prefix here is a crate constant
 /// covered by a test, so the error branch is unreachable. It still degrades rather than panics: an
 /// empty key is dropped by `CompletionOptions::with_prompt_cache_key`, which leaves the request
 /// exactly as it would have been with no key at all. A message is the wrong place to abort over a

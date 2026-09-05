@@ -6,6 +6,15 @@
 
 #![forbid(unsafe_code)]
 
+mod control;
+#[cfg(unix)]
+pub use control::ControlClient;
+pub use control::{
+    ControlDecision, ControlOutcome, ControlProposal, ControlScope, ControlTarget,
+    ControlTargetsError, MAX_CONTROL_ATTEMPTS, MAX_CONTROL_TARGETS, VerifiedControlDecision,
+    validate_control_targets,
+};
+
 use std::{collections::BTreeSet, fmt, io, time::Duration};
 
 #[cfg(unix)]
@@ -17,8 +26,8 @@ use std::{
 
 pub use dekopon_capability::{InvocationOutcome, InvocationResult, Permission};
 use dekopon_core::{
-    AgentId, CapabilityId, ExternalSubject, InvocationId, ProviderId, SecretUseProposal, TraceId,
-    TransportId,
+    AgentId, CapabilityId, ExternalSubject, InvocationId, ProviderId, SecretUseProposal,
+    SurfaceEpoch, TraceId, TransportId,
 };
 use dekopon_provider_sdk::ProviderCapability;
 pub use dekopon_provider_sdk::{CommandRunOutcome, ComponentFailure};
@@ -34,7 +43,7 @@ use tokio::{
 use tokio::net::UnixStream;
 
 /// Current local broker protocol identifier.
-pub const PROTOCOL_VERSION: &str = "dekopon.dev/broker/v1alpha2";
+pub const PROTOCOL_VERSION: &str = "dekopon.dev/broker/v1alpha3";
 /// Default complete request/response frame bound (2 MiB).
 pub const DEFAULT_MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 /// Hard ceiling accepted for any configured frame bound (16 MiB).
@@ -97,15 +106,13 @@ pub const ERROR_CAPACITY_EXHAUSTED: &str = "capacity-exhausted";
 /// Exact protocol version carried by every envelope.
 ///
 /// One variant, so there is no negotiation: every envelope is strict-decoded and any other string
-/// fails to deserialize. That is the seam. `v1alpha2` replaced `v1alpha1` when the per-attestation
-/// operations collapsed into one operation per verb carrying an optional [`Attestation`]; a mixed
-/// pair now refuses at the envelope in *both* directions instead of only when a client is older
-/// than the operation it names.
+/// fails to deserialize. `v1alpha3` adds bound core-session controls and a required startup epoch.
+/// Older envelopes refuse before dispatch; there is no compatibility fallback.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ProtocolVersion {
     /// Strict JSON protocol with one operation per verb.
-    #[serde(rename = "dekopon.dev/broker/v1alpha2")]
-    V1Alpha2,
+    #[serde(rename = "dekopon.dev/broker/v1alpha3")]
+    V1Alpha3,
 }
 
 /// W3C `traceparent`, carrying the client's OpenTelemetry span as a remote parent.
@@ -1199,7 +1206,7 @@ impl RequestEnvelope {
     #[must_use]
     pub const fn capabilities(attestation: Option<Attestation>) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha2,
+            api_version: ProtocolVersion::V1Alpha3,
             request: BrokerRequest::Capabilities { attestation },
         }
     }
@@ -1213,7 +1220,7 @@ impl RequestEnvelope {
         stdin: Option<String>,
     ) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha2,
+            api_version: ProtocolVersion::V1Alpha3,
             request: BrokerRequest::RunCommand {
                 attestation,
                 word,
@@ -1227,7 +1234,7 @@ impl RequestEnvelope {
     #[must_use]
     pub const fn invoke(attestation: Option<Attestation>, invocation: InvocationRequest) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha2,
+            api_version: ProtocolVersion::V1Alpha3,
             request: BrokerRequest::Invoke {
                 attestation,
                 invocation,
@@ -1242,7 +1249,7 @@ impl RequestEnvelope {
         turn: DeliveredTurnRequest,
     ) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha2,
+            api_version: ProtocolVersion::V1Alpha3,
             request: BrokerRequest::RecordDeliveredTurn { attestation, turn },
         }
     }
@@ -1251,7 +1258,7 @@ impl RequestEnvelope {
     #[must_use]
     pub const fn publish_agent_inventory(inventory: AgentInventory) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha2,
+            api_version: ProtocolVersion::V1Alpha3,
             request: BrokerRequest::PublishAgentInventory { inventory },
         }
     }
@@ -1260,7 +1267,7 @@ impl RequestEnvelope {
     #[must_use]
     pub const fn publish_model_usage(usage: ModelUsageReport) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha2,
+            api_version: ProtocolVersion::V1Alpha3,
             request: BrokerRequest::PublishModelUsage { usage },
         }
     }
@@ -1275,6 +1282,12 @@ impl RequestEnvelope {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "operation", deny_unknown_fields, rename_all = "camelCase")]
 pub enum BrokerRequest {
+    /// Fresh admission for one core model/effort transition; never invokes a provider.
+    AuthorizeControl {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        attestation: Option<Attestation>,
+        proposal: ControlProposal,
+    },
     /// Lists the capabilities and command words allowed for this context.
     ///
     /// Without an attestation this is the authenticated peer's own listing, which is never
@@ -1386,13 +1399,15 @@ pub struct ResponseEnvelope {
 impl ResponseEnvelope {
     /// Creates a successful capability response.
     #[must_use]
-    pub const fn capabilities(
+    pub fn capabilities(
         capabilities: Vec<AvailableCapability>,
         command_words: Vec<String>,
+        surface_epoch: SurfaceEpoch,
     ) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha2,
+            api_version: ProtocolVersion::V1Alpha3,
             response: BrokerResponse::Capabilities {
+                surface_epoch,
                 capabilities,
                 command_words,
                 chat_memory: None,
@@ -1402,17 +1417,19 @@ impl ResponseEnvelope {
 
     /// Creates a successful freshly authorized chat capability response.
     #[must_use]
-    pub const fn chat_capabilities(
+    pub fn chat_capabilities(
         capabilities: Vec<AvailableCapability>,
         command_words: Vec<String>,
         chat_memory: Option<ChatMemorySurface>,
+        surface_epoch: SurfaceEpoch,
     ) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha2,
+            api_version: ProtocolVersion::V1Alpha3,
             response: BrokerResponse::Capabilities {
                 capabilities,
                 command_words,
                 chat_memory,
+                surface_epoch,
             },
         }
     }
@@ -1421,7 +1438,7 @@ impl ResponseEnvelope {
     #[must_use]
     pub const fn command_resolution(capability: CapabilityId, input: serde_json::Value) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha2,
+            api_version: ProtocolVersion::V1Alpha3,
             response: BrokerResponse::CommandResolution {
                 capability: Some(capability),
                 input: Some(input),
@@ -1434,7 +1451,7 @@ impl ResponseEnvelope {
     #[must_use]
     pub const fn command_declined(message: String) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha2,
+            api_version: ProtocolVersion::V1Alpha3,
             response: BrokerResponse::CommandResolution {
                 capability: None,
                 input: None,
@@ -1447,7 +1464,7 @@ impl ResponseEnvelope {
     #[must_use]
     pub const fn command_run(result: CommandRunOutcome) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha2,
+            api_version: ProtocolVersion::V1Alpha3,
             response: BrokerResponse::CommandRun { result },
         }
     }
@@ -1456,7 +1473,7 @@ impl ResponseEnvelope {
     #[must_use]
     pub const fn invocation(result: InvocationResult) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha2,
+            api_version: ProtocolVersion::V1Alpha3,
             response: BrokerResponse::Invocation { result },
         }
     }
@@ -1465,7 +1482,7 @@ impl ResponseEnvelope {
     #[must_use]
     pub const fn acknowledged() -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha2,
+            api_version: ProtocolVersion::V1Alpha3,
             response: BrokerResponse::Acknowledged,
         }
     }
@@ -1474,7 +1491,7 @@ impl ResponseEnvelope {
     #[must_use]
     pub fn error(code: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
-            api_version: ProtocolVersion::V1Alpha2,
+            api_version: ProtocolVersion::V1Alpha3,
             response: BrokerResponse::Error {
                 code: code.into(),
                 message: message.into(),
@@ -1487,10 +1504,14 @@ impl ResponseEnvelope {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "type", deny_unknown_fields, rename_all = "camelCase")]
 pub enum BrokerResponse {
+    /// Admission or refusal for one completely echoed control proposal.
+    ControlDecision { decision: Box<ControlDecision> },
     /// Capabilities visible under exact policy for the authenticated peer.
     Capabilities {
         /// Deterministically sorted capabilities.
         capabilities: Vec<AvailableCapability>,
+        /// Host-only random broker-startup epoch; not model-visible permission.
+        surface_epoch: SurfaceEpoch,
         /// Command words this context may use, sorted.
         ///
         /// Carried here rather than fetched separately so a session costs one round trip, and
@@ -1830,6 +1851,7 @@ impl BrokerClient {
             Vec<AvailableCapability>,
             Vec<String>,
             Option<ChatMemorySurface>,
+            SurfaceEpoch,
         ),
         ClientError,
     > {
@@ -1841,9 +1863,11 @@ impl BrokerClient {
                 capabilities,
                 command_words,
                 chat_memory,
-            } => Ok((capabilities, command_words, chat_memory)),
+                surface_epoch,
+            } => Ok((capabilities, command_words, chat_memory, surface_epoch)),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::CommandResolution { .. }
+            BrokerResponse::ControlDecision { .. }
+            | BrokerResponse::CommandResolution { .. }
             | BrokerResponse::CommandRun { .. }
             | BrokerResponse::Invocation { .. }
             | BrokerResponse::Acknowledged => Err(ClientError::UnexpectedResponse),
@@ -1881,7 +1905,8 @@ impl BrokerClient {
         {
             BrokerResponse::CommandRun { result } => Ok(result),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::Capabilities { .. }
+            BrokerResponse::ControlDecision { .. }
+            | BrokerResponse::Capabilities { .. }
             | BrokerResponse::CommandResolution { .. }
             | BrokerResponse::Invocation { .. }
             | BrokerResponse::Acknowledged => Err(ClientError::UnexpectedResponse),
@@ -1904,7 +1929,8 @@ impl BrokerClient {
         {
             BrokerResponse::Invocation { result } => Ok(result),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::Capabilities { .. }
+            BrokerResponse::ControlDecision { .. }
+            | BrokerResponse::Capabilities { .. }
             | BrokerResponse::CommandResolution { .. }
             | BrokerResponse::CommandRun { .. }
             | BrokerResponse::Acknowledged => Err(ClientError::UnexpectedResponse),
@@ -1924,7 +1950,8 @@ impl BrokerClient {
         {
             BrokerResponse::Invocation { result } => Ok(result),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::Capabilities { .. }
+            BrokerResponse::ControlDecision { .. }
+            | BrokerResponse::Capabilities { .. }
             | BrokerResponse::CommandResolution { .. }
             | BrokerResponse::CommandRun { .. }
             | BrokerResponse::Acknowledged => Err(ClientError::UnexpectedResponse),
@@ -1945,7 +1972,8 @@ impl BrokerClient {
         {
             BrokerResponse::Acknowledged => Ok(()),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::Capabilities { .. }
+            BrokerResponse::ControlDecision { .. }
+            | BrokerResponse::Capabilities { .. }
             | BrokerResponse::CommandResolution { .. }
             | BrokerResponse::CommandRun { .. }
             | BrokerResponse::Invocation { .. } => Err(ClientError::UnexpectedResponse),
@@ -1960,7 +1988,8 @@ impl BrokerClient {
         {
             BrokerResponse::Acknowledged => Ok(()),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::Capabilities { .. }
+            BrokerResponse::ControlDecision { .. }
+            | BrokerResponse::Capabilities { .. }
             | BrokerResponse::CommandResolution { .. }
             | BrokerResponse::CommandRun { .. }
             | BrokerResponse::Invocation { .. } => Err(ClientError::UnexpectedResponse),
@@ -2024,6 +2053,21 @@ async fn validate_socket_path(path: &Path, expected_uid: u32) -> Result<(), Clie
 #[cfg(unix)]
 #[derive(Debug, Error)]
 pub enum ClientError {
+    /// A control scope, sequence or attestation was structurally malformed.
+    #[error("control request binding is invalid")]
+    InvalidControl,
+    /// All four job attempts have been spent (including denials).
+    #[error("control attempt budget exhausted")]
+    ControlAttempts,
+    /// An uncertain or cancelled prior exchange permanently fenced this client.
+    #[error("control client is fenced")]
+    ControlFenced,
+    /// A broker restart invalidated the active job's authority surface.
+    #[error("broker surface changed; stop the active job")]
+    SurfaceChanged,
+    /// The sole pending proposal did not match every echoed response field.
+    #[error("control response binding mismatch")]
+    ControlBinding,
     /// Socket metadata could not be inspected.
     #[error("could not inspect broker socket")]
     SocketMetadata {
@@ -2121,8 +2165,105 @@ impl fmt::Display for ExchangePhase {
     }
 }
 
+/// The stable kind of one broker-client failure, for telemetry and checkpointed records.
+///
+/// One definition of these names. A client failure reaches an operator through several surfaces —
+/// an unobserved-command audit record, a control transition's checkpointed outcome, a session's
+/// failure event — and a category token invented separately at each of them is a category that
+/// silently disagrees with itself. Every consumer maps [`ClientError`] here and prints
+/// [`ClientErrorKind::as_str`].
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClientErrorKind {
+    /// The socket path could not be inspected.
+    SocketMetadata,
+    /// The socket failed its ownership or mode check.
+    UnsafeSocket,
+    /// Connecting to the socket timed out.
+    ConnectTimeout,
+    /// Connecting to the socket failed.
+    Connect,
+    /// The peer credentials of the connected socket could not be read.
+    PeerCredentials,
+    /// The server's identity did not match what this client requires.
+    ServerIdentity,
+    /// A bound on the exchange — frame size, response size — was exceeded.
+    Limits,
+    /// Framing, encoding, or decoding failed on one half of the exchange.
+    Protocol,
+    /// The broker answered with an error envelope.
+    Remote,
+    /// The broker answered a response variant this request cannot consume.
+    UnexpectedResponse,
+    /// A control request was malformed or out of order before transmission.
+    InvalidControl,
+    /// The job's control attempt budget is spent.
+    ControlAttempts,
+    /// This control client is permanently fenced.
+    ControlFenced,
+    /// The broker's surface epoch changed under the session.
+    SurfaceChanged,
+    /// The control decision did not bind to the proposal that was sent.
+    ControlBinding,
+}
+
+#[cfg(unix)]
+impl ClientErrorKind {
+    /// The stable token for this kind, as telemetry and audit records spell it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SocketMetadata => "socket-metadata",
+            Self::UnsafeSocket => "unsafe-socket",
+            Self::ConnectTimeout => "connect-timeout",
+            Self::Connect => "connect",
+            Self::PeerCredentials => "peer-credentials",
+            Self::ServerIdentity => "server-identity",
+            Self::Limits => "limits",
+            Self::Protocol => "protocol",
+            Self::Remote => "remote",
+            Self::UnexpectedResponse => "unexpected-response",
+            Self::InvalidControl => "invalid-control",
+            Self::ControlAttempts => "control-attempts",
+            Self::ControlFenced => "control-fenced",
+            Self::SurfaceChanged => "surface-changed",
+            Self::ControlBinding => "control-binding",
+        }
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Display for ClientErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[cfg(unix)]
 impl ClientError {
+    /// The stable kind of this failure, for telemetry that must not carry the message itself.
+    #[must_use]
+    pub fn kind(&self) -> ClientErrorKind {
+        match self {
+            Self::SocketMetadata { .. } => ClientErrorKind::SocketMetadata,
+            Self::UnsafeSocket => ClientErrorKind::UnsafeSocket,
+            Self::ConnectTimeout => ClientErrorKind::ConnectTimeout,
+            Self::Connect { .. } => ClientErrorKind::Connect,
+            Self::PeerCredentials { .. } => ClientErrorKind::PeerCredentials,
+            Self::ServerIdentity { .. } => ClientErrorKind::ServerIdentity,
+            Self::Limits(_) => ClientErrorKind::Limits,
+            Self::Protocol { .. } => ClientErrorKind::Protocol,
+            Self::Remote { .. } => ClientErrorKind::Remote,
+            Self::UnexpectedResponse => ClientErrorKind::UnexpectedResponse,
+            Self::InvalidControl => ClientErrorKind::InvalidControl,
+            Self::ControlAttempts => ClientErrorKind::ControlAttempts,
+            Self::ControlFenced => ClientErrorKind::ControlFenced,
+            Self::SurfaceChanged => ClientErrorKind::SurfaceChanged,
+            Self::ControlBinding => ClientErrorKind::ControlBinding,
+        }
+    }
+
     /// Reports whether the broker may have executed the request this failure ended.
     ///
     /// `true` means the complete request frame was delivered and this client could not establish
@@ -2148,7 +2289,7 @@ impl fmt::Display for ProtocolVersion {
         // Matched rather than written from the constant so a second variant cannot silently
         // inherit the first one's identifier while serializing correctly.
         formatter.write_str(match self {
-            Self::V1Alpha2 => PROTOCOL_VERSION,
+            Self::V1Alpha3 => PROTOCOL_VERSION,
         })
     }
 }

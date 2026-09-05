@@ -2,16 +2,26 @@
 //!
 //! # Why this is its own test binary
 //!
-//! Same reason as `prompt_tracing.rs`: `tracing` caches per-callsite interest globally the first
-//! time a callsite is hit, so a callsite first reached with no subscriber installed stays disabled
-//! for every later thread-local subscriber. Sharing a binary with other tests that call
-//! `run_prompt` would make these assertions depend on execution order.
+//! Same reason as `prompt_tracing.rs`: `tracing` caches per-callsite interest for the whole
+//! process the first time a callsite is registered, and a callsite first reached by a thread with
+//! no subscriber installed is cached off for every later scoped subscriber. This binary holds one
+//! test, so nothing else can reach these callsites first and the scoped dispatcher below is safe;
+//! a test that must share a binary uses `dekopon_test_support::CaptureLayer::install` instead,
+//! which installs one permanent process-global subscriber and routes captures by thread. Sharing
+//! a binary with other tests that drive `SessionEngine::run` under a scoped dispatcher would make
+//! these assertions depend on execution order.
 
+use dekopon_harness::tools::SCRIPT_TOOL_NAME;
+use dekopon_harness::{
+    bootstrap::{BootstrapError, CapabilitySnapshot, SessionBootstrap},
+    history::History,
+    runtime::ScriptRuntime,
+    session::{PromptLimits, SessionEngine},
+};
 use dekopon_model::model::{
     AssistantTurn, ChatModel, ModelError, ModelFunctionCall, ModelMessage, ModelTool,
     ModelToolCall, ModelUsage,
 };
-use dekopon_run::prompt::{PromptLimits, SCRIPT_TOOL_NAME, ScriptRuntime, run_prompt};
 use dekopon_shell::{Interpreter, Limits, ScriptOutcome};
 use dekopon_test_support::CaptureLayer;
 use serde_json::json;
@@ -29,46 +39,70 @@ impl ChatModel for ScriptedModel {
         &self,
         messages: &[ModelMessage],
         _tools: &[ModelTool],
+        recorder: &dyn dekopon_model::usage::AttemptRecorder,
     ) -> Result<AssistantTurn, ModelError> {
-        if messages.iter().any(|message| message.role() == "tool") {
-            return Ok(AssistantTurn {
-                content: Some(ANSWER_SENTINEL.to_owned()),
-                tool_calls: Vec::new(),
+        let attempt = recorder.begin(dekopon_model::usage::AttemptKind::Adapter)?;
+        #[allow(
+            clippy::redundant_closure_call,
+            reason = "fixture early returns must still record usage before propagation"
+        )]
+        let result: Result<AssistantTurn, ModelError> = (|| {
+            if messages.iter().any(|message| message.role() == "tool") {
+                return Ok(AssistantTurn {
+                    content: Some(ANSWER_SENTINEL.to_owned()),
+                    tool_calls: Vec::new(),
+                    usage: Some(ModelUsage {
+                        input_tokens: Some(23),
+                        cached_input_tokens: Some(9),
+                        output_tokens: Some(4),
+                        reasoning_output_tokens: Some(2),
+                        total_tokens: Some(27),
+                    }),
+                    replay_items: Vec::new(),
+                });
+            }
+            Ok(AssistantTurn {
+                content: None,
+                tool_calls: vec![ModelToolCall {
+                    id: "call-1".to_owned(),
+                    kind: "function".to_owned(),
+                    function: ModelFunctionCall {
+                        name: SCRIPT_TOOL_NAME.to_owned(),
+                        arguments: json!({ "script": format!("echo {SCRIPT_SENTINEL}") })
+                            .to_string(),
+                    },
+                }],
                 usage: Some(ModelUsage {
-                    input_tokens: Some(23),
-                    cached_input_tokens: Some(9),
-                    output_tokens: Some(4),
-                    reasoning_output_tokens: Some(2),
-                    total_tokens: Some(27),
+                    input_tokens: Some(11),
+                    cached_input_tokens: None,
+                    output_tokens: Some(3),
+                    reasoning_output_tokens: None,
+                    total_tokens: Some(14),
                 }),
                 replay_items: Vec::new(),
-            });
-        }
-        Ok(AssistantTurn {
-            content: None,
-            tool_calls: vec![ModelToolCall {
-                id: "call-1".to_owned(),
-                kind: "function".to_owned(),
-                function: ModelFunctionCall {
-                    name: SCRIPT_TOOL_NAME.to_owned(),
-                    arguments: json!({ "script": format!("echo {SCRIPT_SENTINEL}") }).to_string(),
+            })
+        })();
+        if let Ok(turn) = &result
+            && let Some(usage) = turn.usage
+        {
+            recorder.observe(
+                attempt,
+                dekopon_model::usage::UsageObservation {
+                    usage,
+                    invalid: [false; 5],
                 },
-            }],
-            usage: Some(ModelUsage {
-                input_tokens: Some(11),
-                cached_input_tokens: None,
-                output_tokens: Some(3),
-                reasoning_output_tokens: None,
-                total_tokens: Some(14),
-            }),
-            replay_items: Vec::new(),
-        })
+            )?;
+        }
+        result
     }
 }
 
 struct ShellRuntime;
 
 impl ScriptRuntime for ShellRuntime {
+    fn capability_snapshot(&self) -> Result<CapabilitySnapshot, BootstrapError> {
+        Ok(CapabilitySnapshot::empty())
+    }
     fn run_script(&self, script: &str, max_capability_calls: u32) -> ScriptOutcome {
         Interpreter::new(Limits {
             max_capability_calls,
@@ -102,17 +136,19 @@ fn session_events(payloads: bool) -> String {
     tracing::subscriber::with_default(subscriber, || {
         tracing::callsite::rebuild_interest_cache();
         dekopon_core::set_telemetry_payloads(payloads);
-        run_prompt(
-            &ScriptedModel,
-            &ShellRuntime,
-            PROMPT_SENTINEL,
-            None,
-            PromptLimits {
-                max_steps: 4,
-                max_capability_calls: 8,
-            },
-        )
-        .expect("prompt session succeeds");
+        SessionEngine::new(&ScriptedModel, &ShellRuntime)
+            .run(
+                SessionBootstrap::new(
+                    PROMPT_SENTINEL,
+                    PromptLimits {
+                        max_steps: 4,
+                        max_capability_calls: 8,
+                    },
+                    "fixture-model",
+                ),
+                &mut History::default(),
+            )
+            .expect("prompt session succeeds");
         dekopon_core::set_telemetry_payloads(false);
     });
     captured.events_text()
@@ -138,7 +174,7 @@ fn transcript_is_opt_in_and_carries_the_whole_exchange() {
 
     // The accounting record still fires in either mode, so a failure below is about content
     // rather than about the session having failed to run at all.
-    assert!(quiet.contains("accounting.model.turn"), "{quiet}");
+    assert!(quiet.contains("accounting.model.call"), "{quiet}");
 
     // Token usage is accounting, not payload: the counts ride the accounting record even in quiet
     // mode, one set per turn, exactly as the model reported them.
@@ -219,7 +255,7 @@ fn transcript_is_opt_in_and_carries_the_whole_exchange() {
     );
     // The second request still carries the whole conversation — `message.count` says how much of
     // it there is — and the event carries only what this turn appended.
-    assert!(prompts[1].contains("message.count=3"), "{}", prompts[1]);
+    assert!(prompts[1].contains("message.count=4"), "{}", prompts[1]);
     assert!(
         !prompts[1].contains(PROMPT_SENTINEL),
         "the prompt was re-shipped: {}",

@@ -1297,6 +1297,7 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
     let peer_bytes = serde_json::to_vec(&ResponseEnvelope::capabilities(
         broker.capabilities(&gateway),
         broker.command_words(&gateway),
+        broker.surface_epoch().clone(),
     ))
     .expect("peer response encodes")
     .len();
@@ -1331,6 +1332,7 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
         capabilities,
         words,
         broker.chat_memory_ceiling(),
+        broker.surface_epoch().clone(),
     ))
     .expect("ceiling response encodes")
     .len();
@@ -1346,4 +1348,35 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
     );
     validate_capability_responses(&broker, &identities, ceiling_bytes)
         .expect("a frame that carries the widest answer starts");
+}
+
+#[tokio::test]
+async fn control_target_configuration_is_strict_and_reports_every_conflict() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("broker.yaml");
+    let mut document = attested_document(current_uid());
+    document["controlTargets"] = json!([
+        {"model":"baseline", "efforts":[]},
+        {"model":"baseline", "efforts":["low", "low"]}
+    ]);
+    write_config(&path, &document);
+    let error = config::load(&path, current_uid())
+        .await
+        .unwrap_err()
+        .to_string();
+    for cause in ["duplicate model", "no efforts", "repeats effort"] {
+        assert!(error.contains(cause), "{error}");
+    }
+    for target in [
+        json!({"model":"baseline", "efforts":["max"]}),
+        json!({"model":"baseline", "efforts":["low"], "endpoint":"forbidden"}),
+        json!({"model":"https://forbidden", "efforts":["low"]}),
+    ] {
+        document["controlTargets"] = json!([target]);
+        write_config(&path, &document);
+        assert!(matches!(
+            config::load(&path, current_uid()).await,
+            Err(config::ConfigError::Decode { .. })
+        ));
+    }
 }

@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "crates/dekopon",
-    "crates/dekopon-agent",
+    "crates/dekopon-harness",
     "crates/dekopon-broker",
     "crates/dekopon-broker-host",
     "crates/dekopon-broker-protocol",
@@ -92,7 +92,7 @@ url = "2.5.8"
 wasmtime = { version = "36.0.13", default-features = false, features = ["cache", "component-model", "cranelift", "parallel-compilation", "runtime", "std"] }
 wit-bindgen = { version = "0.46.0", default-features = false, features = ["bitflags", "macros", "realloc"] }
 
-dekopon-agent = { version = "0.12.0", path = "crates/dekopon-agent" }
+dekopon-harness = { version = "0.12.0", path = "crates/dekopon-harness" }
 dekopon-broker = { version = "0.12.0", path = "crates/dekopon-broker" }
 dekopon-broker-host = { version = "0.12.0", path = "crates/dekopon-broker-host" }
 dekopon-broker-protocol = { version = "0.12.0", path = "crates/dekopon-broker-protocol" }

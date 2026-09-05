@@ -22,7 +22,7 @@ use std::{
 
 mod capture;
 
-pub use capture::{CaptureLayer, Record};
+pub use capture::{CaptureLayer, CaptureSession, Record};
 
 /// How long a fixture waits on a peer before deciding the test, not the network, is stuck.
 const FIXTURE_TIMEOUT: Duration = Duration::from_secs(5);

@@ -1,7 +1,7 @@
 use std::{fmt, io::Read as _, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use dekopon_core::Redacted;
+use dekopon_core::{Effort, Redacted};
 
 use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
@@ -22,7 +22,7 @@ pub struct ModelTool {
 /// One piece of a multimodal message.
 ///
 /// `Debug` and `Serialize` render bytes as a summary and never as bytes. Every message this crate
-/// builds passes through the prompt transcript `dekopon-agent` writes to the audit log, and a
+/// builds passes through the prompt transcript `dekopon-harness` writes to the audit log, and a
 /// base64 screenshot in that record would be enormous, sender-supplied, and permanent. The wire
 /// encoding lives in each transport's own request builder, which is the only place a data URL is
 /// produced.
@@ -254,7 +254,7 @@ pub struct ModelFunctionCall {
 /// determine cost, so inventing a zero would turn "the API said nothing" into "the API said free".
 /// Chat-completions responses call the halves `prompt_tokens`/`completion_tokens`; the Codex
 /// Responses API calls them `input_tokens`/`output_tokens`. Both normalize to the latter here.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
 pub struct ModelUsage {
     /// Tokens the request consumed, cached and uncached alike.
     pub input_tokens: Option<u64>,
@@ -266,6 +266,28 @@ pub struct ModelUsage {
     pub reasoning_output_tokens: Option<u64>,
     /// Provider-reported total for the call.
     pub total_tokens: Option<u64>,
+}
+
+impl ModelUsage {
+    /// Fixed field order: input, cached subset, output, reasoning subset, provider total.
+    pub const fn fields(self) -> [Option<u64>; 5] {
+        [
+            self.input_tokens,
+            self.cached_input_tokens,
+            self.output_tokens,
+            self.reasoning_output_tokens,
+            self.total_tokens,
+        ]
+    }
+    pub const fn from_fields(f: [Option<u64>; 5]) -> Self {
+        Self {
+            input_tokens: f[0],
+            cached_input_tokens: f[1],
+            output_tokens: f[2],
+            reasoning_output_tokens: f[3],
+            total_tokens: f[4],
+        }
+    }
 }
 
 /// One assistant response, which may contain text or tool calls.
@@ -282,26 +304,37 @@ pub struct AssistantTurn {
     pub replay_items: Vec<Value>,
 }
 
-/// Request-scoped routing metadata for one model call.
-///
-/// Deliberately separate from `messages` and `tools`: nothing here changes what the model is
-/// asked, only how the provider routes the request that carries it. Every field is optional and a
-/// transport that does not understand one omits it, so the worst outcome of a field going
-/// unrecognized is that the request costs more — never that it answers differently.
-///
-/// Options are passed per request rather than stored on a client. The model client is currently
-/// rebuilt for each gateway message, and the obvious optimization is to share one client across
-/// sessions; a value captured in a constructor would then describe the first conversation forever
-/// while quietly mislabeling every later one.
-///
-/// Fields are private so later routing metadata can join this struct without breaking callers that
-/// build it with [`CompletionOptions::default`] and the `with_*` methods.
+/// Request-scoped inference settings and cache-affinity hints for shared model clients.
+/// Explicit effort changes inference semantics: adapters must encode it or refuse before I/O.
+/// ProviderDefault is distinct from an explicit level and omits the wire setting.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct CompletionOptions {
     prompt_cache_key: Option<String>,
+    effort: Effort,
 }
 
 impl CompletionOptions {
+    /// Selects a typed effort; unsupported adapters fail before any model request.
+    #[must_use]
+    pub const fn with_effort(mut self, effort: Effort) -> Self {
+        self.effort = effort;
+        self
+    }
+
+    /// The explicit setting, including the distinct backend-default state.
+    pub const fn effort(&self) -> Effort {
+        self.effort
+    }
+
+    pub(crate) const fn wire_effort(&self) -> Option<&'static str> {
+        match self.effort {
+            Effort::ProviderDefault => None,
+            Effort::Low => Some("low"),
+            Effort::Medium => Some("medium"),
+            Effort::High => Some("high"),
+        }
+    }
+
     /// Groups this request with earlier requests carrying the same key.
     ///
     /// The key is a hint for the provider's automatic prefix cache: it tells the backend which
@@ -329,32 +362,42 @@ impl CompletionOptions {
 
 /// Synchronous model boundary used by the immediate prompt loop.
 pub trait ChatModel {
+    /// Actual client/backend identity, excluding endpoints and credentials.
+    fn model_identity(&self) -> (&str, &str) {
+        ("adapter", "unreported")
+    }
     /// Requests the next assistant turn.
     fn complete(
         &self,
         messages: &[ModelMessage],
         tools: &[ModelTool],
+        recorder: &dyn crate::usage::AttemptRecorder,
     ) -> Result<AssistantTurn, ModelError>;
 
-    /// Requests the next assistant turn with request-scoped routing metadata.
-    ///
-    /// Provided rather than required so that adding routing metadata does not force every
-    /// implementation — most of which are test doubles — to grow a parameter it has no use for.
-    /// The default discards `options` and calls [`ChatModel::complete`], which is the safe
-    /// degradation: an implementation that never learned about a field behaves exactly as it did
-    /// before, because nothing in [`CompletionOptions`] is required for a correct answer.
-    ///
-    /// Transports that do act on options should override this method and define `complete` as
-    /// delegating to it with [`CompletionOptions::default`], so one request-building path serves
-    /// both entry points and the two cannot drift apart.
+    /// Whether this adapter can encode a setting, not whether a remote model will accept it.
+    fn supports_effort(&self, effort: Effort) -> bool {
+        effort == Effort::ProviderDefault
+    }
+
+    /// Validates semantic options before transmission; no implicit fallback is permitted.
+    fn validate_options(&self, options: &CompletionOptions) -> Result<(), ModelError> {
+        if self.supports_effort(options.effort()) {
+            Ok(())
+        } else {
+            Err(ModelError::UnsupportedEffort(options.effort()))
+        }
+    }
+
+    /// Requests the next assistant turn with settings; unaware adapters refuse explicit effort.
     fn complete_with(
         &self,
         messages: &[ModelMessage],
         tools: &[ModelTool],
         options: &CompletionOptions,
+        recorder: &dyn crate::usage::AttemptRecorder,
     ) -> Result<AssistantTurn, ModelError> {
-        let _ = options;
-        self.complete(messages, tools)
+        self.validate_options(options)?;
+        self.complete(messages, tools, recorder)
     }
 }
 
@@ -413,12 +456,20 @@ impl OpenAiChatModel {
 }
 
 impl ChatModel for OpenAiChatModel {
+    fn model_identity(&self) -> (&str, &str) {
+        ("openai-compatible", &self.model)
+    }
+    fn supports_effort(&self, _effort: Effort) -> bool {
+        true
+    }
+
     fn complete(
         &self,
         messages: &[ModelMessage],
         tools: &[ModelTool],
+        recorder: &dyn crate::usage::AttemptRecorder,
     ) -> Result<AssistantTurn, ModelError> {
-        self.complete_with(messages, tools, &CompletionOptions::default())
+        self.complete_with(messages, tools, &CompletionOptions::default(), recorder)
     }
 
     fn complete_with(
@@ -426,7 +477,9 @@ impl ChatModel for OpenAiChatModel {
         messages: &[ModelMessage],
         tools: &[ModelTool],
         options: &CompletionOptions,
+        recorder: &dyn crate::usage::AttemptRecorder,
     ) -> Result<AssistantTurn, ModelError> {
+        self.validate_options(options)?;
         let span = tracing::info_span!(
             "model.complete",
             model = %self.model,
@@ -449,6 +502,7 @@ impl ChatModel for OpenAiChatModel {
             tools: &tools,
             tool_choice: "auto",
             prompt_cache_key: options.prompt_cache_key(),
+            reasoning_effort: options.wire_effort(),
         };
 
         let mut request = self
@@ -460,17 +514,31 @@ impl ChatModel for OpenAiChatModel {
             // wire rather than into a variable that could later be formatted somewhere else.
             request = request.header("authorization", &format!("Bearer {}", token.expose()));
         }
-        let mut response = request
+        let attempt = recorder.begin(crate::usage::AttemptKind::Http)?;
+        let response = request
             .send_json(&request_body)
             .map_err(|error| ModelError::Request(error.to_string()))?;
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
-            let detail = read_error_body(response);
+            let detail = read_error_body_recorded(response, recorder, attempt, true)?;
             return Err(ModelError::Request(format!("HTTP {status}: {detail}")));
         }
-        let response = response
-            .body_mut()
-            .read_json::<ChatResponse>()
+        let value = crate::usage::read_usage_json(
+            response.into_parts().1.into_reader(),
+            16 * 1024 * 1024,
+            recorder,
+            attempt,
+            true,
+        )?;
+        // Content validation follows independent field-wise usage capture.
+        let usage = value
+            .get("usage")
+            .map(|v| crate::usage::UsageObservation::from_json(v, true).usage);
+        let mut content = value;
+        if let Some(object) = content.as_object_mut() {
+            object.remove("usage");
+        }
+        let response: ChatResponse = serde_json::from_value(content)
             .map_err(|error| ModelError::Response(error.to_string()))?;
         let choice = response
             .choices
@@ -487,7 +555,7 @@ impl ChatModel for OpenAiChatModel {
         Ok(AssistantTurn {
             content: choice.message.content,
             tool_calls,
-            usage: response.usage.map(ModelUsage::from),
+            usage,
             replay_items: Vec::new(),
         })
     }
@@ -503,6 +571,8 @@ struct ChatRequest<'a> {
     /// before the field existed. Compatible endpoints that have never heard of it ignore it.
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_key: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<&'static str>,
 }
 
 /// One message as the chat-completions wire wants it.
@@ -603,6 +673,7 @@ struct OpenAiTool<'a> {
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<ChatChoice>,
+    #[cfg(test)]
     #[serde(default)]
     usage: Option<WireChatUsage>,
 }
@@ -610,6 +681,7 @@ struct ChatResponse {
 /// Chat-completions `usage` object, including the detail blocks that carry cache and reasoning
 /// counts. Every field defaults: a compatible endpoint that omits any of them still bills for the
 /// rest, so a partial report is worth keeping.
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 struct WireChatUsage {
     #[serde(default)]
@@ -624,18 +696,21 @@ struct WireChatUsage {
     completion_tokens_details: Option<WireCompletionTokensDetails>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 struct WirePromptTokensDetails {
     #[serde(default)]
     cached_tokens: Option<u64>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Deserialize)]
 struct WireCompletionTokensDetails {
     #[serde(default)]
     reasoning_tokens: Option<u64>,
 }
 
+#[cfg(test)]
 impl From<WireChatUsage> for ModelUsage {
     fn from(usage: WireChatUsage) -> Self {
         Self {
@@ -749,6 +824,12 @@ fn completion_url(endpoint: &str) -> String {
 /// Failure while requesting or decoding a model turn.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum ModelError {
+    /// Ledger failure prevents subsequent inference.
+    #[error(transparent)]
+    Accounting(#[from] crate::usage::AccountingError),
+    /// Explicit semantic settings may never be silently discarded.
+    #[error("model adapter does not support effort {0}")]
+    UnsupportedEffort(Effort),
     /// Client configuration was invalid.
     #[error("invalid model configuration: {0}")]
     Configuration(String),
@@ -804,6 +885,52 @@ pub(crate) fn read_error_body(response: http::Response<ureq::Body>) -> String {
     text
 }
 
+pub(crate) fn read_error_body_recorded(
+    response: http::Response<ureq::Body>,
+    recorder: &dyn crate::usage::AttemptRecorder,
+    attempt: u32,
+    chat: bool,
+) -> Result<String, ModelError> {
+    // Tee the bounded raw prefix before diagnostic conversion. The incremental decoder commits
+    // complete usage members even if a later member, read, or diagnostic cutoff fails.
+    struct DiagnosticReader<R> {
+        inner: R,
+        bytes: Vec<u8>,
+    }
+    impl<R: std::io::Read> std::io::Read for DiagnosticReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.bytes.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+    }
+    let mut reader = DiagnosticReader {
+        inner: response
+            .into_parts()
+            .1
+            .into_reader()
+            .take(MAX_ERROR_BODY_BYTES),
+        bytes: Vec::new(),
+    };
+    match crate::usage::read_usage_json(&mut reader, MAX_ERROR_BODY_BYTES, recorder, attempt, chat)
+    {
+        Ok(_) => {}
+        Err(ModelError::Accounting(error)) => return Err(error.into()),
+        Err(error) => tracing::debug!(cause_type = "model-error-body-not-json", %error),
+    }
+    // A non-JSON diagnostic may stop the parser at its first byte; finish the bounded prefix.
+    let mut rest = Vec::new();
+    if let Err(error) = reader.read_to_end(&mut rest) {
+        tracing::debug!(cause_type = "model-error-body-read", kind = ?error.kind());
+    }
+    let detail = sanitize_diagnostic(&String::from_utf8_lossy(&reader.bytes));
+    Ok(if detail.trim().is_empty() {
+        "no response body".to_owned()
+    } else {
+        detail
+    })
+}
+
 /// Strips control characters so endpoint-supplied text cannot forge log structure.
 pub(crate) fn sanitize_diagnostic(value: &str) -> String {
     value
@@ -828,6 +955,114 @@ mod tests {
     };
     use crate::mock::{MockResponse, MockServer};
 
+    #[test]
+    fn non_success_diagnostics_preserve_usage_before_malformed_tail_or_cutoff() {
+        use crate::usage::{AttemptKind, AttemptLog, AttemptRecorder};
+        for chat in [true, false] {
+            for tail in [
+                "\"unfinished".to_owned(),
+                format!("\"{}\"}}", "x".repeat(20000)),
+            ] {
+                let usage = if chat {
+                    r#""usage":{"prompt_tokens":17},"error":"#
+                } else {
+                    r#""response":{"usage":{"input_tokens":17}},"error":"#
+                };
+                let body = format!("{{{usage}{tail}");
+                let server = MockServer::start(vec![MockResponse::raw_failure(429, body)]);
+                let response = crate::agent(Duration::from_secs(2))
+                    .get(server.base_url())
+                    .call()
+                    .unwrap();
+                let log = AttemptLog::default();
+                let attempt = log.begin(AttemptKind::Http).unwrap();
+                let detail =
+                    super::read_error_body_recorded(response, &log, attempt, chat).unwrap();
+                assert!(detail.len() <= super::MAX_ERROR_BODY_BYTES as usize);
+                assert_eq!(log.observations().len(), 1);
+                assert_eq!(
+                    log.observations()[0].observation.unwrap().usage.fields(),
+                    [Some(17), None, None, None, None]
+                );
+            }
+        }
+    }
+    #[test]
+    fn chat_effort_is_encoded_on_the_wire_and_default_is_not_an_explicit_level() {
+        use dekopon_core::Effort;
+        let server = MockServer::start(
+            (0..4)
+                .map(|_| MockResponse::json(json!({"choices":[{"message":{"content":"ok"}}]})))
+                .collect(),
+        );
+        let model = OpenAiChatModel::new(
+            server.base_url(),
+            "wire-model",
+            None,
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        for effort in [
+            Effort::ProviderDefault,
+            Effort::Low,
+            Effort::Medium,
+            Effort::High,
+        ] {
+            model
+                .complete_with(
+                    &[ModelMessage::user("hi")],
+                    &[],
+                    &CompletionOptions::default().with_effort(effort),
+                    &crate::usage::AttemptLog::default(),
+                )
+                .unwrap();
+        }
+        let requests = server.requests.lock().unwrap();
+        for (request, expected) in
+            requests
+                .iter()
+                .zip([None, Some("low"), Some("medium"), Some("high")])
+        {
+            let body: Value =
+                serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            assert_eq!(
+                body.get("reasoning_effort").and_then(Value::as_str),
+                expected
+            );
+            assert!(body.get("reasoning").is_none());
+        }
+    }
+
+    #[test]
+    fn an_unaware_adapter_refuses_explicit_effort_before_calling_complete() {
+        struct Unaware;
+        impl ChatModel for Unaware {
+            fn complete(
+                &self,
+                _: &[ModelMessage],
+                _: &[ModelTool],
+                _: &dyn crate::usage::AttemptRecorder,
+            ) -> Result<AssistantTurn, ModelError> {
+                panic!("explicit unsupported effort must fail before completion")
+            }
+        }
+        for effort in [
+            dekopon_core::Effort::Low,
+            dekopon_core::Effort::Medium,
+            dekopon_core::Effort::High,
+        ] {
+            assert_eq!(
+                Unaware.complete_with(
+                    &[],
+                    &[],
+                    &CompletionOptions::default().with_effort(effort),
+                    &crate::usage::AttemptLog::default()
+                ),
+                Err(ModelError::UnsupportedEffort(effort))
+            );
+        }
+    }
+
     /// `ureq`'s own status error renders as `http status: 429` and discards the body, which is the
     /// only part of a failure that says whether the model name is wrong, the context is too long,
     /// or which rate limit was hit.
@@ -842,7 +1077,11 @@ mod tests {
                 .expect("model client");
 
         let error = model
-            .complete(&[ModelMessage::user("hello")], &[])
+            .complete(
+                &[ModelMessage::user("hello")],
+                &[],
+                &crate::usage::AttemptLog::default(),
+            )
             .expect_err("a 429 must fail the turn");
 
         let message = error.to_string();
@@ -1025,6 +1264,7 @@ mod tests {
                     tools: &tools,
                     tool_choice: "auto",
                     prompt_cache_key: None,
+                    reasoning_effort: None,
                 })
                 .expect("serialize chat request"),
             );
@@ -1096,6 +1336,7 @@ mod tests {
                 tools: &tools,
                 tool_choice: "auto",
                 prompt_cache_key,
+                reasoning_effort: None,
             })
             .expect("serialize chat request")
         };
@@ -1156,15 +1397,31 @@ mod tests {
                 &self,
                 messages: &[ModelMessage],
                 _tools: &[ModelTool],
+                recorder: &dyn crate::usage::AttemptRecorder,
             ) -> Result<AssistantTurn, ModelError> {
-                Ok(AssistantTurn {
-                    content: messages.last().and_then(|message| {
-                        message.content().map(|content| content.to_uppercase())
-                    }),
-                    tool_calls: Vec::new(),
-                    usage: None,
-                    replay_items: Vec::new(),
-                })
+                let attempt = recorder.begin(crate::usage::AttemptKind::Adapter)?;
+                let result: Result<AssistantTurn, ModelError> = {
+                    Ok(AssistantTurn {
+                        content: messages.last().and_then(|message| {
+                            message.content().map(|content| content.to_uppercase())
+                        }),
+                        tool_calls: Vec::new(),
+                        usage: None,
+                        replay_items: Vec::new(),
+                    })
+                };
+                if let Ok(turn) = &result
+                    && let Some(usage) = turn.usage
+                {
+                    recorder.observe(
+                        attempt,
+                        crate::usage::UsageObservation {
+                            usage,
+                            invalid: [false; 5],
+                        },
+                    )?;
+                }
+                result
             }
         }
 
@@ -1173,6 +1430,7 @@ mod tests {
                 &[ModelMessage::user("hello")],
                 &[],
                 &CompletionOptions::default().with_prompt_cache_key("session-7"),
+                &crate::usage::AttemptLog::default(),
             )
             .expect("a keyless implementation still answers");
 
@@ -1250,7 +1508,7 @@ mod tests {
 
     #[test]
     fn an_attachment_never_reaches_the_audit_transcript_as_bytes() {
-        // `dekopon-agent` logs every prompt by serializing the message slice, so `ModelMessage`'s
+        // `dekopon-harness` logs every prompt by serializing the message slice, so `ModelMessage`'s
         // own `Serialize` is the audit rendering rather than the wire one. A base64 screenshot in
         // that record would be enormous, sender-supplied, and permanent. The wire mapping above is
         // the only thing that ever encodes.

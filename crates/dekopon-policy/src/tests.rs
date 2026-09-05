@@ -1,9 +1,10 @@
 use dekopon_capability::{EffectKind, Idempotency};
-use dekopon_core::{RiskLevel, SecretSinkKind};
+use dekopon_core::{ProviderId, RiskLevel, SecretSinkKind};
 
 use super::{
-    AGENT_PROMPT_ACTION, MAX_POLICY_BYTES, PolicyBuildError, PolicyContext, PolicyDecision,
-    PolicyEngine, PolicyRequest, PolicyTarget, PolicyWorld, SECRET_USE_ACTION, UnresolvedKind,
+    AGENT_EFFORT_SET_ACTION, AGENT_PROMPT_ACTION, MAX_POLICY_BYTES, PolicyBuildError,
+    PolicyContext, PolicyDecision, PolicyEngine, PolicyRequest, PolicyTarget, PolicyWorld,
+    SECRET_USE_ACTION, UnresolvedKind,
 };
 
 /// The workflow world: two principals, two echo capabilities.
@@ -538,6 +539,45 @@ fn world_construction_rejects_duplicates_and_reserved_names() {
     }
 }
 
+#[test]
+fn every_reserved_and_every_duplicate_capability_is_reported_in_one_failure() {
+    let provider = || {
+        "agent"
+            .parse::<ProviderId>()
+            .expect("valid provider fixture")
+    };
+    let reserved = PolicyWorld::new(
+        [],
+        [
+            (AGENT_PROMPT_ACTION.parse().unwrap(), provider()),
+            (AGENT_EFFORT_SET_ACTION.parse().unwrap(), provider()),
+        ],
+    )
+    .expect_err("two reserved collisions must not be reported one restart at a time");
+    let message = reserved.to_string();
+    for action in [AGENT_PROMPT_ACTION, AGENT_EFFORT_SET_ACTION] {
+        assert!(message.contains(action), "{action} missing from {message}");
+    }
+
+    let duplicates = PolicyWorld::new(
+        [],
+        [
+            ("echo.echo".parse().unwrap(), provider()),
+            ("echo.echo".parse().unwrap(), provider()),
+            ("http.fetch".parse().unwrap(), provider()),
+            ("http.fetch".parse().unwrap(), provider()),
+        ],
+    )
+    .expect_err("two duplicated routes must both be named");
+    let message = duplicates.to_string();
+    for capability in ["echo.echo", "http.fetch"] {
+        assert!(
+            message.contains(capability),
+            "{capability} missing from {message}"
+        );
+    }
+}
+
 /// Debug output is reachable from the broker's own `Debug`; it must fingerprint the policy set
 /// rather than reproduce it.
 #[test]
@@ -854,4 +894,60 @@ fn secret_use_is_a_separate_exact_resource_decision() {
     )
     .expect_err("unknown DRN refuses startup");
     assert!(matches!(unknown, PolicyBuildError::UnknownSecret { .. }));
+}
+
+#[test]
+fn core_control_actions_are_reserved_and_have_exact_typed_agent_context() {
+    use super::{AGENT_EFFORT_SET_ACTION, AGENT_MODEL_SELECT_ACTION, AgentControlAction};
+    use dekopon_core::{Effort, ModelSelection};
+    for action in [AGENT_MODEL_SELECT_ACTION, AGENT_EFFORT_SET_ACTION] {
+        assert!(matches!(
+            PolicyWorld::new([], [(action.parse().unwrap(), "provider".parse().unwrap())]),
+            Err(PolicyBuildError::ReservedAction { .. })
+        ));
+    }
+    let policy = r#"
+        permit(principal == Dekopon::Principal::"cpetersen",
+               action == Dekopon::Action::"agent.model.select",
+               resource == Dekopon::Agent::"reviewer")
+        when { context.agent == "reviewer" && context.fromModel == "baseline"
+            && context.toModel == "gpt-5.6-sol" && context.fromEffort == "low"
+            && context.toEffort == "high" && context has via && context.via == "gateway" };
+    "#;
+    let engine = PolicyEngine::new(policy, &world()).unwrap();
+    assert_eq!(engine.referenced_capabilities().count(), 0);
+    let request = PolicyRequest {
+        principal: "cpetersen".parse().unwrap(),
+        target: PolicyTarget::AgentControl {
+            agent: "reviewer".parse().unwrap(),
+            action: AgentControlAction::ModelSelect,
+            from: ModelSelection {
+                model: "baseline".parse().unwrap(),
+                effort: Effort::Low,
+            },
+            to: ModelSelection {
+                model: "gpt-5.6-sol".parse().unwrap(),
+                effort: Effort::High,
+            },
+        },
+        context: via("gateway"),
+    };
+    assert!(engine.authorize(request.clone()).allowed);
+    let mut direct = request.clone();
+    direct.context.via = None;
+    assert!(!engine.authorize(direct).allowed);
+    let mut effort = request;
+    let PolicyTarget::AgentControl { ref mut action, .. } = effort.target else {
+        panic!()
+    };
+    *action = AgentControlAction::EffortSet;
+    assert!(!engine.authorize(effort).allowed);
+    for field in ["history", "spend", "provider", "input", "endpoint"] {
+        let forbidden = format!(
+            "permit(principal, action == Dekopon::Action::\"agent.model.select\", resource) when {{ context.{field} == \"value\" }};"
+        );
+        assert!(PolicyEngine::new(&forbidden, &world()).is_err(), "{field}");
+    }
+    let wrong_resource = "permit(principal, action == Dekopon::Action::\"agent.model.select\", resource == Dekopon::Provider::\"echo\");";
+    assert!(PolicyEngine::new(wrong_resource, &world()).is_err());
 }

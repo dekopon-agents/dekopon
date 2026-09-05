@@ -11,6 +11,7 @@
 #![forbid(unsafe_code)]
 
 mod accept;
+mod control;
 mod diagnostics;
 mod redaction;
 mod skill;
@@ -25,6 +26,10 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use thiserror::Error;
 
 pub use accept::{ACCEPT_BACKOFF_MS, MAX_ACCEPT_BACKOFF_MS, retryable_accept_error};
+pub use control::{
+    ConfiguredModelId, ControlIdentifierError, Effort, GenerationId, JobId, ModelSelection,
+    RequestId, SessionId, SurfaceEpoch,
+};
 pub use diagnostics::error_chain;
 pub use redaction::{Redacted, redaction_marker, serialize_exposed};
 pub use skill::{MAX_SKILL_NAME_LENGTH, SkillId, SkillIdError};

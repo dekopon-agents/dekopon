@@ -116,3 +116,14 @@ reporting the same digest evaluated the same authorization surface. It is record
 Part of the [Dekopon](https://github.com/dekopon-agents/dekopon) workspace; see
 `docs/design.md` for the authority model and `docs/security-model.md` for the trust
 boundaries this adapter informs but never enforces.
+
+
+## Core session controls (unreleased)
+
+Two reserved actions, `agent.model.select` and `agent.effort.set`, apply only from `Principal` to
+`Agent`; provider actions cannot collide with them. Their strict context requires `agent`,
+`fromModel`, `toModel`, `fromEffort`, `toEffort`, and accepts only the existing optional trusted
+routing fields (`via`, `subject`, `transportKind`, `transport`, `channel`, `conversation`).
+The four selection strings are typed intent, not verified model state. No history, spend,
+provider JSON, endpoint, credential or arbitrary context enters Cedar. The broker separately
+requires a fresh `agent.prompt` decision and every changed dimension's permit; errors deny.

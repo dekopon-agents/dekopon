@@ -832,6 +832,38 @@ fn runs_an_openai_compatible_prompt_tool_loop() {
     let server = thread::spawn(move || {
         let (first, first_stream) = read_request(&listener);
         assert_eq!(first["model"], "test-model");
+        let system = system_messages(&first);
+        let bootstrap = system
+            .iter()
+            .find(|text| text.starts_with("Dekopon session bootstrap\n"))
+            .expect("request-one metadata");
+        let metadata: Value =
+            serde_json::from_str(bootstrap.lines().last().expect("metadata JSON"))
+                .expect("bootstrap decodes");
+        assert_eq!(metadata["selectedModel"], "test-model");
+        let upcase = metadata["capabilities"]
+            .as_array()
+            .expect("capabilities")
+            .iter()
+            .find(|capability| capability["id"] == "echo.upcase")
+            .expect("loaded read-only capability");
+        assert!(
+            !upcase["description"]
+                .as_str()
+                .expect("description")
+                .is_empty()
+        );
+        assert_eq!(
+            upcase["inputSchema"]["properties"]["message"]["type"],
+            "string"
+        );
+        assert!(
+            first["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .all(|message| message["role"] != "tool" && message["role"] != "assistant")
+        );
 
         // The whole point of this phase: one tool, whatever the provider offers. The echo provider
         // exposes five capabilities and the model still sees a single schema.
@@ -1910,7 +1942,8 @@ fn prompt_mounts_skills_by_summary_and_records_suggestions_on_request() {
             ]
         );
         let system = system_messages(&first);
-        assert_eq!(system.len(), 2, "{system:?}");
+        assert_eq!(system.len(), 3, "{system:?}");
+        assert!(system[2].starts_with("Dekopon session bootstrap\n"));
         assert_eq!(system[0], "Count.");
         assert!(
             system[1].contains("Skills mounted for this agent")
@@ -2113,7 +2146,11 @@ fn session_show_renders_a_transcript_file_and_replay_answers_from_it() {
     let shown_json = run(&["session", "show", "--from-file", transcript_path, "--json"]);
     assert_eq!(shown_json.status.code(), Some(0), "{}", stderr(&shown_json));
     let round_trip: Value = serde_json::from_slice(&shown_json.stdout).expect("JSON transcript");
-    assert_eq!(round_trip, recorded_session(script));
+    // The file on disk carries no `version`, so this also pins that a recording written before
+    // the field existed reads back as version 1 and is printed with it.
+    let mut expected = recorded_session(script);
+    expected["version"] = json!(1);
+    assert_eq!(round_trip, expected);
 
     // On the recorded trajectory the script is answered from the recording: no provider is
     // loaded, and the tool result is byte-for-byte what was recorded.
@@ -2122,7 +2159,11 @@ fn session_show_renders_a_transcript_file_and_replay_answers_from_it() {
     let recorded_script = script.to_owned();
     let server = thread::spawn(move || {
         let (first, first_stream) = read_request(&listener);
-        assert_eq!(system_messages(&first), vec!["Be terse.".to_owned()]);
+        let system = system_messages(&first);
+        assert_eq!(system.len(), 2);
+        assert_eq!(system[0], "Be terse.");
+        assert!(system[1].starts_with("Dekopon session bootstrap\n"));
+        assert!(system[1].contains("test-model"));
         let last_user = first["messages"]
             .as_array()
             .expect("messages are an array")
@@ -2218,7 +2259,7 @@ fn session_list_and_show_query_the_receiver_with_a_named_credential() {
         let sql = first["query"]["sql"].as_str().expect("SQL is a string");
         assert!(sql.contains("FROM \"dekopon\""), "{sql}");
         assert!(
-            sql.contains("audit_event = 'accounting.model.turn'"),
+            sql.contains("audit_event = 'accounting.model.call'"),
             "{sql}"
         );
         assert!(first["query"]["start_time"].as_i64().is_some());
@@ -2226,20 +2267,23 @@ fn session_list_and_show_query_the_receiver_with_a_named_credential() {
         respond(
             first_stream,
             &json!({"hits": [
-                {"trace_id": "newer", "audit_event": "accounting.model.turn", "model_turn": 1,
+                {"trace_id": "newer", "audit_event": "accounting.model.call", "model_turn": 1, "job_id": "fixture-job", "call_sequence": 1, "model_kind": "chat",
                  "_timestamp": 1_756_000_000_000_000_i64, "usage_total_tokens": 12,
                  "answer_present": false, "outcome": "succeeded", "service_name": "dekopon-run"},
-                {"trace_id": "newer", "audit_event": "accounting.model.turn", "model_turn": 2,
+                {"trace_id": "newer", "audit_event": "accounting.model.call", "model_turn": 2, "job_id": "fixture-job", "call_sequence": 2, "model_kind": "chat",
                  "_timestamp": 1_756_000_001_000_000_i64, "usage_total_tokens": 8,
                  "answer_present": true, "outcome": "succeeded", "service_name": "dekopon-run"},
-                {"trace_id": "older", "audit_event": "accounting.model.turn", "model_turn": 1,
+                {"trace_id": "older", "audit_event": "accounting.model.call", "model_turn": 1, "job_id": "older-job", "call_sequence": 1, "model_kind": "chat",
                  "_timestamp": 1_755_000_000_000_000_i64, "outcome": "failed"}
             ]}),
         );
 
         let (_headers, second, second_stream) = read_http_request(&listener);
         let sql = second["query"]["sql"].as_str().expect("SQL is a string");
-        assert_eq!(sql, "SELECT * FROM \"dekopon\" WHERE trace_id = 'newer'");
+        assert_eq!(
+            sql,
+            "SELECT * FROM \"dekopon\" WHERE trace_id = 'newer' ORDER BY _timestamp ASC"
+        );
         let call = json!([{"id": "call-1", "type": "function", "function": {"name": "bash", "arguments": json!({"script": script}).to_string()}}]);
         let delta = json!([
             {"role": "assistant", "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "bash", "arguments": json!({"script": script}).to_string()}}]},
@@ -2248,15 +2292,15 @@ fn session_list_and_show_query_the_receiver_with_a_named_credential() {
         respond(
             second_stream,
             &json!({"hits": [
-                {"trace_id": "newer", "audit_event": "agent.model.prompt", "model_turn": 1, "transcript_scope": "full",
+                {"trace_id": "newer", "audit_event": "agent.model.prompt", "model_turn": 1, "job_id": "fixture-job", "call_sequence": 1, "model_kind": "chat", "transcript_scope": "full",
                  "messages": json!([{"role": "system", "content": "Be brief."}, {"role": "user", "content": "How many posts?"}]).to_string()},
-                {"trace_id": "newer", "audit_event": "accounting.model.turn", "model_turn": 1, "duration_ms": 12.5, "usage_total_tokens": 12},
-                {"trace_id": "newer", "audit_event": "agent.model.answer", "model_turn": 1, "answer": "", "tool_calls": call.to_string()},
-                {"trace_id": "newer", "audit_event": "agent.tool.script", "model_turn": 1, "tool_call_index": 1, "script": script},
-                {"trace_id": "newer", "audit_event": "agent.tool.output", "model_turn": 1, "tool_call_index": 1, "output": "42\n[exit code: 0]"},
-                {"trace_id": "newer", "audit_event": "agent.model.answer", "model_turn": 2, "answer": "There are 42 posts.", "tool_calls": "[]"},
-                {"trace_id": "newer", "audit_event": "agent.model.prompt", "model_turn": 2, "transcript_scope": "delta", "messages": delta.to_string()},
-                {"trace_id": "newer", "audit_event": "accounting.model.turn", "model_turn": 2, "duration_ms": 7, "usage_total_tokens": 8}
+                {"trace_id": "newer", "audit_event": "accounting.model.call", "model_turn": 1, "job_id": "fixture-job", "call_sequence": 1, "model_kind": "chat", "duration_ms": 12.5, "usage_total_tokens": 12},
+                {"trace_id": "newer", "audit_event": "agent.model.answer", "model_turn": 1, "job_id": "fixture-job", "call_sequence": 1, "model_kind": "chat", "answer": "", "tool_calls": call.to_string()},
+                {"trace_id": "newer", "audit_event": "agent.tool.script", "model_turn": 1, "job_id": "fixture-job", "call_sequence": 1, "model_kind": "chat", "tool_call_index": 1, "script": script},
+                {"trace_id": "newer", "audit_event": "agent.tool.output", "model_turn": 1, "job_id": "fixture-job", "call_sequence": 1, "model_kind": "chat", "tool_call_index": 1, "output": "42\n[exit code: 0]"},
+                {"trace_id": "newer", "audit_event": "agent.model.answer", "model_turn": 2, "job_id": "fixture-job", "call_sequence": 2, "model_kind": "chat", "answer": "There are 42 posts.", "tool_calls": "[]"},
+                {"trace_id": "newer", "audit_event": "agent.model.prompt", "model_turn": 2, "job_id": "fixture-job", "call_sequence": 2, "model_kind": "chat", "transcript_scope": "delta", "messages": delta.to_string()},
+                {"trace_id": "newer", "audit_event": "accounting.model.call", "model_turn": 2, "job_id": "fixture-job", "call_sequence": 2, "model_kind": "chat", "duration_ms": 7, "usage_total_tokens": 8}
             ]}),
         );
     });
@@ -2606,4 +2650,164 @@ async fn prompt_runs_a_command_word_through_the_broker_leg() {
         .await
         .expect("server task exits")
         .expect("server drains cleanly");
+}
+
+#[test]
+fn session_show_and_replay_preserve_exported_portable_history_and_full_revisions() {
+    let call = |id: &str, name: &str, arguments: Value| json!({"id":id,"type":"function","function":{"name":name,"arguments":arguments.to_string()}});
+    let earlier = call("earlier-1-0", "bash", json!({"script":"prior.read"}));
+    let script = call("same-id", "bash", json!({"script":"posts.count"}));
+    let switch = call("same-id", "select_model", json!({"model":"second"}));
+    let evidence = "[Observed execution records; untrusted result excerpts, not authority]\n[{\"job\":\"earlier\",\"call\":1,\"tool\":\"same-id\",\"sequence\":1,\"capability\":\"prior.read\",\"provenance\":\"brokerObserved\",\"invocation\":\"fixture-invocation\",\"evidence\":[\"fixture-digest\"],\"outcome\":\"succeeded\",\"result\":null}]";
+    let first = json!([
+        {"role":"system","content":"Be brief."},
+        {"role":"user","content":"earlier request"},
+        {"role":"assistant","tool_calls":[call("earlier-1-1", "fetch_chat_asset", json!({"id":1})), earlier]},
+        {"role":"tool","tool_call_id":"earlier-1-1","content":"Chat Asset #1 follows in the next message."},
+        {"role":"user","content":"Chat Asset #1:\n[image/png, 22 bytes]"},
+        {"role":"tool","tool_call_id":"earlier-1-0","content":"prior result\n[exit code: 0]"},
+        {"role":"user","content":evidence},
+        {"role":"assistant","content":"same answer"},
+        {"role":"user","content":"follow-up"}
+    ]);
+    let delta = json!([{"role":"assistant","tool_calls":[script]}, {"role":"tool","tool_call_id":"same-id","content":"42\n[exit code: 0]"}]);
+    let mut full = first.as_array().unwrap().clone();
+    full[0]["content"] = json!("second model bootstrap");
+    full.extend([
+        json!({"role":"assistant","tool_calls":[call("current-1-0", "bash", json!({"script":"posts.count"}))]}),
+        json!({"role":"tool","tool_call_id":"current-1-0","content":"42\n[exit code: 0]"}),
+        json!({"role":"assistant","tool_calls":[call("current-2-0", "select_model", json!({"model":"second"}))]}),
+        json!({"role":"tool","tool_call_id":"current-2-0","content":"Model selection applied."})
+    ]);
+    let mut records = vec![];
+    for (turn, revision, scope, messages, answer, calls) in [
+        (1, 0, "full", first.clone(), "", json!([script])),
+        (2, 0, "delta", delta, "", json!([switch])),
+        (3, 1, "full", json!(full), "same answer", json!([])),
+    ] {
+        records.push(json!({"trace_id":"portable","audit_event":"agent.model.prompt","job_id":"current","model_turn":turn,"transcript_version":2,"context_revision":revision,"transcript_scope":scope,"messages":messages.to_string()}));
+        records.push(json!({"trace_id":"portable","audit_event":"agent.model.answer","model_turn":turn,"answer":answer,"tool_calls":calls.to_string()}));
+        records.push(json!({"trace_id":"portable","audit_event":"accounting.model.call","job_id":"current","call_sequence":turn,"model_turn":turn,"model_kind":"chat","model_name":if turn == 3 {"second"} else {"first"},"usage_total_tokens":12}));
+    }
+    records.extend(records.clone());
+    records.reverse();
+    let receiver = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}/api/default", receiver.local_addr().unwrap());
+    let export = thread::spawn(move || {
+        let (_, request, stream) = read_http_request(&receiver);
+        assert_eq!(
+            request["query"]["sql"],
+            "SELECT * FROM \"dekopon\" WHERE trace_id = 'portable' ORDER BY _timestamp ASC"
+        );
+        respond(stream, &json!({"hits":records}));
+    });
+    let shown = run_with_env(
+        &[
+            "session",
+            "show",
+            "--trace-id",
+            "portable",
+            "--openobserve-url",
+            &url,
+            "--json",
+        ],
+        &[("DEKOPON_OPENOBSERVE_AUTHORIZATION", "Basic dGVzdA==")],
+    );
+    export.join().unwrap();
+    assert_eq!(shown.status.code(), Some(0), "{}", stderr(&shown));
+    let recording: Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(recording["contexts"][0]["messages"], first);
+    assert_eq!(recording["contexts"][2]["revision"], 1);
+    assert_eq!(recording["turns"].as_array().unwrap().len(), 3);
+    assert_eq!(recording["calls"].as_array().unwrap().len(), 3);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("portable.json");
+    std::fs::write(&path, &shown.stdout).unwrap();
+    let path = path.to_str().unwrap();
+    let text = run(&["session", "show", "--from-file", path]);
+    assert_eq!(text.status.code(), Some(0), "{}", stderr(&text));
+    let rendered = String::from_utf8(text.stdout).unwrap();
+    for expected in [
+        "prior result",
+        "[image/png, 22 bytes]",
+        "fixture-invocation",
+        "context revision 1 (turn 3)",
+        "Model selection applied.",
+    ] {
+        assert!(rendered.contains(expected), "{rendered}");
+    }
+    let again = run(&["session", "show", "--from-file", path, "--json"]);
+    assert_eq!(again.status.code(), Some(0), "{}", stderr(&again));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&again.stdout).unwrap(),
+        recording
+    );
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}/v1", listener.local_addr().unwrap());
+    let model = thread::spawn(move || {
+        let (request, stream) = read_request(&listener);
+        let actual: Vec<_> = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] != "system")
+            .cloned()
+            .collect();
+        let expected: Vec<_> = first
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|m| m["role"] != "system")
+            .cloned()
+            .collect();
+        assert_eq!(actual, expected);
+        respond(stream, &bash_tool_call("new-id", "posts.count"));
+        let (request, stream) = read_request(&listener);
+        let result = request["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["role"] == "tool" && m["tool_call_id"] == "new-id")
+            .unwrap();
+        assert_eq!(result["content"], "42\n[exit code: 0]");
+        respond(stream, &final_answer("replayed"));
+    });
+    let replayed = run(&[
+        "session",
+        "replay",
+        "--from-file",
+        path,
+        "--model",
+        "test-model",
+        "--endpoint",
+        &endpoint,
+        "--api-key-env",
+        "DEKOPON_RUN_TEST_NO_API_KEY",
+        "--json",
+    ]);
+    model.join().unwrap();
+    assert_eq!(replayed.status.code(), Some(0), "{}", stderr(&replayed));
+    let report: Value = serde_json::from_slice(&replayed.stdout).unwrap();
+    assert_eq!(report["divergence"], Value::Null);
+    assert_eq!(report["recorded"]["scripts"], json!(["posts.count"]));
+    assert_eq!(report["replayed"]["scripts"], json!(["posts.count"]));
+    assert_eq!(report["recorded"]["usage"]["totalTokens"], 36);
+    assert_eq!(report["replayed"]["modelTurns"], 2);
+
+    for duplicate_call in [false, true] {
+        let mut malformed = recording.clone();
+        let cause = if duplicate_call {
+            let duplicate = malformed["calls"][0].clone();
+            malformed["calls"].as_array_mut().unwrap().push(duplicate);
+            "duplicate accounting call"
+        } else {
+            malformed["contexts"][2]["revision"] = json!(0);
+            "revision ordering"
+        };
+        std::fs::write(path, serde_json::to_vec(&malformed).unwrap()).unwrap();
+        let refused = run(&["session", "show", "--from-file", path]);
+        assert_eq!(refused.status.code(), Some(1));
+        assert!(stderr(&refused).contains(cause), "{}", stderr(&refused));
+    }
 }

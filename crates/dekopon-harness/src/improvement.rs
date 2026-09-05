@@ -17,7 +17,7 @@ use dekopon_model::model::{ModelMessage, ModelTool, ModelToolCall};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::prompt::{PromptError, reject_tool_call};
+use crate::{session::PromptError, tools::reject_tool_call};
 
 /// The tool a model calls to record one improvement suggestion.
 pub const IMPROVEMENT_TOOL_NAME: &str = "suggest_improvement";
@@ -247,7 +247,7 @@ pub(crate) fn suggest_improvement_into(
     // a suggestion. What the record never carries is chat text the gateway holds or a subject —
     // only what the model chose to write into these six bounded fields.
     tracing::info!(
-        target: "dekopon_agent::audit",
+        target: "dekopon_harness::audit",
         {
             audit.event = "agent.improvement.suggested",
             model.turn = model_turn,
@@ -275,7 +275,7 @@ pub(crate) fn suggest_improvement_into(
 
 fn refuse(model_turn: u32, tool_call_index: usize, reason: &'static str) {
     tracing::info!(
-        target: "dekopon_agent::audit",
+        target: "dekopon_harness::audit",
         {
             audit.event = "agent.improvement.refused",
             model.turn = model_turn,

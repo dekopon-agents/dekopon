@@ -277,7 +277,16 @@ fn final_answer(text: &str) -> Value {
 /// contacting a model has already spent the money the refusal was supposed to save. The bodies are
 /// what a conversation assertion needs, since "this message was seeded with the last exchange" is a
 /// claim about the message list a request carried and not about how many requests there were.
-fn spawn_model(responses: Vec<Value>) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
+struct ModelGate {
+    request: usize,
+    entered: oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+fn spawn_model(
+    responses: Vec<Value>,
+    mut gate: Option<ModelGate>,
+) -> (String, Arc<AtomicUsize>, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("mock model binds");
     let address = listener.local_addr().expect("mock model address");
     let requests = Arc::new(AtomicUsize::new(0));
@@ -285,7 +294,7 @@ fn spawn_model(responses: Vec<Value>) -> (String, Arc<AtomicUsize>, Arc<Mutex<Ve
     let bodies = Arc::new(Mutex::new(Vec::new()));
     let recorded = Arc::clone(&bodies);
     thread::spawn(move || {
-        for response in responses {
+        for (index, response) in responses.into_iter().enumerate() {
             let Ok((mut stream, _)) = listener.accept() else {
                 return;
             };
@@ -297,6 +306,15 @@ fn spawn_model(responses: Vec<Value>) -> (String, Arc<AtomicUsize>, Arc<Mutex<Ve
                 .lock()
                 .expect("recorded model requests")
                 .push(request);
+            if gate.as_ref().is_some_and(|gate| gate.request == index) {
+                let gate = gate.take().unwrap();
+                gate.entered
+                    .send(())
+                    .expect("test observes blocked inference");
+                gate.release
+                    .recv_timeout(Duration::from_secs(30))
+                    .expect("test releases inference");
+            }
             respond(stream, &response);
         }
     });
@@ -510,6 +528,14 @@ async fn boot(responses: Vec<Value>) -> Fixture {
 
 /// Reboots both real processes over the same audit and provider-storage directory.
 async fn boot_in(directory: tempfile::TempDir, responses: Vec<Value>) -> Fixture {
+    boot_with_gate(directory, responses, None).await
+}
+
+async fn boot_with_gate(
+    directory: tempfile::TempDir,
+    responses: Vec<Value>,
+    gate: Option<ModelGate>,
+) -> Fixture {
     let uid = dekopon_brokerd::current_uid();
 
     let broker_path = directory.path().join("broker.json");
@@ -541,7 +567,7 @@ async fn boot_in(directory: tempfile::TempDir, responses: Vec<Value>) -> Fixture
         &directory.path().join("dekopon.yaml"),
         catalog_text().as_bytes(),
     );
-    let (endpoint, model_requests, model_prompts) = spawn_model(responses);
+    let (endpoint, model_requests, model_prompts) = spawn_model(responses, gate);
     let gateway_path = directory.path().join("dekopond.json");
     write_owner_only(
         &gateway_path,
@@ -644,6 +670,27 @@ async fn a_persistent_route_answers_a_follow_up_with_the_exchange_before_it() {
     .expect("the follow-up completes");
     assert_eq!(second, "The second one was the database.");
 
+    let initial = fixture.prompt(0);
+    assert_eq!(initial[1].0, "system");
+    assert!(initial[1].1.starts_with("Dekopon session bootstrap\n"));
+    let bootstrap: Value = serde_json::from_str(initial[1].1.lines().last().unwrap()).unwrap();
+    assert_eq!(bootstrap["selectedModel"], "test-model");
+    assert_eq!(
+        bootstrap["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["echo.echo", "memory.chat.recent", "memory.chat.search"]
+    );
+    assert!(
+        bootstrap["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["inputSchema"]["type"] == "object")
+    );
     let follow_up = fixture.prompt(1);
     assert_eq!(
         follow_up
@@ -658,6 +705,14 @@ async fn a_persistent_route_answers_a_follow_up_with_the_exchange_before_it() {
                     "Durable chat memory is available on demand. Use `memory recent --last N` or ",
                     "`memory search --query TEXT`. Searches inspect at most 200 prior turns. Do not ",
                     "claim recall without retrieving it."
+                )
+            ),
+            ("system", initial[1].1.as_str()),
+            (
+                "system",
+                concat!(
+                    "Host-selected inference identity (not authorization): ",
+                    r#"{"configured":"mock","backend":"openai-compatible","model":"test-model","effort":"providerDefault"}"#
                 )
             ),
             ("user", "what broke?"),
@@ -742,4 +797,103 @@ async fn an_unmapped_subject_is_refused_before_a_model_is_ever_asked() {
     // A refused capability *listing* is not an invocation, so it produces no decision record; the
     // durable chain stays empty because nothing was ever proposed.
     assert!(audit_events(&audit).is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn broker_restart_and_cedar_revocation_fence_an_inflight_gateway_answer() {
+    for revoked in [false, true] {
+        let (entered, ready) = oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let mut fixture = boot_with_gate(
+            temporary(),
+            vec![
+                bash_tool_call("before-restart", "echo.echo --message evidence"),
+                final_answer("PRIVATE stale generated answer"),
+            ],
+            Some(ModelGate {
+                request: 1,
+                entered,
+                release: released,
+            }),
+        )
+        .await;
+        let socket = fixture.socket();
+        let answer =
+            tokio::task::spawn_blocking(move || ask(&socket, MAPPED_SUBJECT, "perform one echo"));
+        tokio::time::timeout(Duration::from_secs(30), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        // Evidence already exists before authority changes; the gateway itself stays alive.
+        assert_eq!(
+            audit_events(&fixture.audit())
+                .iter()
+                .filter(|event| event["type"] == "execution"
+                    && event["capability"] == "echo.echo"
+                    && event["outcome"] == "Succeeded")
+                .count(),
+            1
+        );
+        let (stop, stopped) = oneshot::channel();
+        std::mem::replace(&mut fixture.stop_broker, stop)
+            .send(())
+            .unwrap();
+        (&mut fixture.broker).await.unwrap().unwrap();
+        if revoked {
+            let policies = format!(
+                "{}\nforbid(principal, action == Dekopon::Action::\"agent.prompt\", resource);",
+                broker_policies()
+            );
+            write_owner_only(
+                &fixture.directory.path().join("policies.cedar"),
+                policies.as_bytes(),
+            );
+        }
+        let broker_path = fixture.directory.path().join("broker.json");
+        fixture.broker = tokio::spawn(dekopon_brokerd::run(broker_path, async move {
+            stopped.await.expect("test stops restarted broker");
+        }));
+        wait_for_socket(
+            &fixture.directory.path().join("broker.sock"),
+            &mut fixture.broker,
+        )
+        .await;
+        release.send(()).unwrap();
+        assert_eq!(
+            answer.await.unwrap(),
+            "The agent could not complete this request."
+        );
+        assert_eq!(
+            fixture.model_requests.load(Ordering::SeqCst),
+            2,
+            "freshness failure cannot spend another inference or retry execution"
+        );
+        if revoked {
+            let socket = fixture.socket();
+            let refusal = tokio::task::spawn_blocking(move || {
+                ask_when_idle(&socket, MAPPED_SUBJECT, "try again")
+            })
+            .await
+            .unwrap();
+            assert_eq!(refusal, "You're not authorized to use this agent.");
+            assert_eq!(fixture.model_requests.load(Ordering::SeqCst), 2);
+        }
+        let audit = fixture.audit();
+        let _directory = fixture.shutdown().await;
+        let events = audit_events(&audit);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "execution" && event["capability"] == "echo.echo")
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["type"] == "execution"
+                    && event["capability"] == "memory.chat.record"),
+            "stale generation and fixed warnings are never durably recorded"
+        );
+    }
 }

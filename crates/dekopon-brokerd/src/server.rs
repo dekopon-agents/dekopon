@@ -385,13 +385,48 @@ where
     };
     let context = &peer.context;
     let response = match request.request {
+        BrokerRequest::AuthorizeControl {
+            attestation,
+            proposal,
+        } => {
+            if !proposal.is_well_formed(attestation.as_ref()) {
+                return refuse_invalid_claim(&mut stream, limits).await;
+            }
+            let span = tracing::info_span!("broker.control", control = %proposal.id,
+                job = %proposal.scope.job, request = %proposal.scope.request,
+                sequence = proposal.sequence);
+            adopt_trace_parent(&span, proposal.trace_parent);
+            match broker
+                .authorize_control(
+                    context,
+                    peer.attestor.as_ref(),
+                    attestation.as_ref(),
+                    proposal,
+                )
+                .instrument(span)
+                .await
+            {
+                Ok(decision) => ResponseEnvelope {
+                    api_version: dekopon_broker_protocol::ProtocolVersion::V1Alpha3,
+                    response: dekopon_broker_protocol::BrokerResponse::ControlDecision {
+                        decision: Box::new(decision),
+                    },
+                },
+                Err(error) => return write_broker_failure(&mut stream, limits, error).await,
+            }
+        }
         BrokerRequest::Capabilities { attestation } => {
             if !claim_is_valid(attestation.as_ref(), None) {
                 return refuse_invalid_claim(&mut stream, limits).await;
             }
             match broker.capability_surface(context, peer.attestor.as_ref(), attestation.as_ref()) {
                 Some((capabilities, command_words, chat_memory)) => {
-                    ResponseEnvelope::chat_capabilities(capabilities, command_words, chat_memory)
+                    ResponseEnvelope::chat_capabilities(
+                        capabilities,
+                        command_words,
+                        chat_memory,
+                        broker.surface_epoch().clone(),
+                    )
                 }
                 // A refused attestation discloses nothing about what the attested context could
                 // have seen — not even whether the subject is mapped.
@@ -580,7 +615,13 @@ async fn write_broker_failure(
     limits: FrameLimits,
     error: BrokerError,
 ) -> Result<(), ConnectionError> {
-    let (code, message, failure) = if let Some(invocation) = error.unaudited_outcome() {
+    let (code, message, failure) = if matches!(error, BrokerError::InvalidControl) {
+        (
+            ERROR_INVALID_REQUEST,
+            "control binding is invalid",
+            ConnectionError::Broker { source: error },
+        )
+    } else if let Some(invocation) = error.unaudited_outcome() {
         let invocation = invocation.clone();
         (
             ERROR_OUTCOME_UNAUDITED,

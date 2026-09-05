@@ -1,13 +1,13 @@
 [package]
-name = "dekopon-agent"
-description = "Bounded model prompt loop and session capability dispatch for Dekopon agents"
+name = "dekopon-harness"
+description = "Unprivileged checkpointed session runtime and token accounting for Dekopon agents"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
-documentation = "https://docs.rs/dekopon-agent"
+documentation = "https://docs.rs/dekopon-harness"
 readme = "README.md"
 keywords = ["agents", "llm", "orchestration", "sandbox"]
 categories = ["development-tools"]
@@ -23,6 +23,7 @@ dekopon-core.workspace = true
 dekopon-model.workspace = true
 dekopon-shell.workspace = true
 dekopon-telemetry.workspace = true
+sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -30,6 +31,8 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+dekopon-test-support = { path = "../dekopon-test-support" }
+tracing-subscriber.workspace = true
 dekopon-capability.workspace = true
 rustix.workspace = true
 tempfile.workspace = true

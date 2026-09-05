@@ -100,7 +100,7 @@ export DEKOPON_OPENOBSERVE_AUTHORIZATION="Basic ${auth_token}"
 
 The default stream, `dekopon`, is the `stream-name` step 2 sets; `--openobserve-stream` (or `DEKOPON_OPENOBSERVE_STREAM`) names another, and `--openobserve-auth-env` reads a differently named variable.
 
-Sessions are listed from `accounting.model.turn` records, which only a model loop writes: the `invoke` in step 3 leaves spans and lifecycle logs but no session. `show` and `replay` also need the transcript, which reaches the receiver only when the session ran with payload telemetry on — `--otel-telemetry-payloads true`, or `DEKOPON_OTEL_TELEMETRY_PAYLOADS` — so record one that way:
+Sessions are listed from `accounting.model.call` records, which only a model loop writes: the `invoke` in step 3 leaves spans and lifecycle logs but no session. `show` and `replay` also need the transcript, which reaches the receiver only when the session ran with payload telemetry on — `--otel-telemetry-payloads true`, or `DEKOPON_OTEL_TELEMETRY_PAYLOADS` — so record one that way:
 
 ```console
 cargo run --locked -p dekopon-run -- \

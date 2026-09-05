@@ -27,6 +27,8 @@
 
 #![forbid(unsafe_code)]
 
+mod control;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -1783,6 +1785,15 @@ impl fmt::Display for RouteConflict {
 /// Failure to construct a coherent broker boundary.
 #[derive(Debug, Error)]
 pub enum BrokerBuildError {
+    /// All conflicts in the owner-configured model/effort allowlist.
+    #[error(transparent)]
+    ControlTargets(#[from] dekopon_broker_protocol::ControlTargetsError),
+    /// A new process must have a fresh unpredictable authority epoch.
+    #[error("could not generate broker surface epoch: {reason}")]
+    SurfaceEntropy { reason: String },
+    /// No provider may declare a core session action.
+    #[error("provider capability {capability} collides with a reserved core action")]
+    ReservedControl { capability: CapabilityId },
     /// A broker limit was zero.
     #[error("broker limit {field} must be greater than zero")]
     ZeroLimit {
@@ -1994,6 +2005,23 @@ pub enum BrokerBuildError {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum AuditEvent {
+    /// Durable core admission (not application). Existing variants and their hashes are unchanged.
+    ControlDecision {
+        proposal: dekopon_broker_protocol::ControlProposal,
+        peer: PrincipalId,
+        principal: PrincipalId,
+        actor: Actor,
+        via: Option<PrincipalId>,
+        attested_subject: Option<ExternalSubject>,
+        surface_epoch: dekopon_core::SurfaceEpoch,
+        authorized_by: PrincipalId,
+        policy_revision: String,
+        policy_digest: String,
+        policy_ids: Vec<String>,
+        allowed: bool,
+        reason: Option<String>,
+        decision_ref: String,
+    },
     /// Authorization allowed or denied before provider execution.
     Decision {
         /// Invocation identifier.
@@ -2132,6 +2160,16 @@ pub enum AuditEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         storage: Option<StorageEvidence>,
     },
+}
+
+impl AuditEvent {
+    fn replay_id(&self) -> Option<&InvocationId> {
+        match self {
+            Self::Decision { invocation, .. } => Some(invocation),
+            Self::ControlDecision { proposal, .. } => Some(&proposal.id),
+            Self::Execution { .. } => None,
+        }
+    }
 }
 
 /// One immutable record in a process-local audit hash chain.
@@ -2399,7 +2437,7 @@ impl AuditLog for FileAuditLog {
         state.count += 1;
         state.previous_head = state.head.replace(record.record_hash.clone());
         if let Some(ids) = state.replay_ids.as_mut()
-            && let AuditEvent::Decision { invocation, .. } = &record.event
+            && let Some(invocation) = record.event.replay_id()
         {
             ids.insert(invocation.clone());
         }
@@ -2441,7 +2479,7 @@ async fn scan_audit_file(
             }
         })?;
         verify_file_record(count, previous.as_deref(), &record)?;
-        if let AuditEvent::Decision { invocation, .. } = &record.event {
+        if let Some(invocation) = record.event.replay_id() {
             replay_ids.insert(invocation.clone());
         }
         before_previous = previous.replace(record.record_hash);
@@ -2825,6 +2863,8 @@ pub struct Broker<A> {
     audit: Arc<A>,
     replay: ReplayLedger,
     chat_memory: Option<ChatMemoryConfig>,
+    control_targets: Vec<dekopon_broker_protocol::ControlTarget>,
+    surface_epoch: dekopon_core::SurfaceEpoch,
 }
 
 impl<A> Broker<A>
@@ -2948,6 +2988,16 @@ where
                 warnings.push(StartupWarning::UnroutedConstraintSet { capability });
             }
         }
+        for (_, capability) in registry.capabilities() {
+            if matches!(
+                capability.id.as_str(),
+                dekopon_policy::AGENT_MODEL_SELECT_ACTION | dekopon_policy::AGENT_EFFORT_SET_ACTION
+            ) {
+                return Err(BrokerBuildError::ReservedControl {
+                    capability: capability.id.clone(),
+                });
+            }
+        }
         constraints.validate(&registry, &credentials, limits.max_constraint_sets)?;
         // Every capability a policy could permit must be executable. The decision path treats a
         // missing constraint set as a denial anyway, but a grant that can only ever be refused is
@@ -2995,6 +3045,8 @@ where
                     ids: Mutex::new(restored_replay_ids),
                 },
                 chat_memory: None,
+                control_targets: Vec::new(),
+                surface_epoch: control::fresh_epoch()?,
             },
             warnings,
         ))
@@ -5502,6 +5554,9 @@ fn public_host_error(error: &BrokerHostError, route: CapabilityRoute) -> &'stati
 /// Failure to evaluate or durably account for one broker invocation.
 #[derive(Debug, Error)]
 pub enum BrokerError {
+    /// Malformed control/request linkage is not a policy denial.
+    #[error("invalid control request binding")]
+    InvalidControl,
     /// Process-lifetime replay ledger reached its configured bound.
     #[error("broker replay ledger reached its {maximum}-identifier bound")]
     ReplayLedgerFull {
@@ -5635,7 +5690,8 @@ impl BrokerError {
             | Self::AuthorizedFailureAudit {
                 source: AuditError::Full { .. },
             } => Some("capacity-exhausted"),
-            Self::MemoryUnavailable
+            Self::InvalidControl
+            | Self::MemoryUnavailable
             | Self::InvalidMemoryInput
             | Self::Storage { .. }
             | Self::StorageTask { .. }
@@ -5666,7 +5722,8 @@ impl BrokerError {
             Self::OutcomeEvidence { invocation, .. }
             | Self::OutcomeAudit { invocation, .. }
             | Self::StorageOutcome { invocation, .. } => Some(invocation),
-            Self::ReplayLedgerFull { .. }
+            Self::InvalidControl
+            | Self::ReplayLedgerFull { .. }
             | Self::MemoryUnavailable
             | Self::InvalidMemoryInput
             | Self::Storage { .. }

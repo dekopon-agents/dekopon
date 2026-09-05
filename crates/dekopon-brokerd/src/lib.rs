@@ -322,6 +322,9 @@ where
     )
     .map_err(BrokerdError::Broker)?;
     let broker = broker
+        .with_control_targets(config.control_targets)
+        .map_err(BrokerdError::Broker)?;
+    let broker = broker
         .with_secret_catalog(secret_catalog)
         .map_err(BrokerdError::Broker)?;
     let broker = match config.chat_memory {
@@ -600,7 +603,11 @@ fn validate_capability_responses<A: AuditLog>(
         // out would let a provider directory with a large vocabulary pass startup and then fail to
         // serve the very first session.
         let (capabilities, command_words) = broker.capability_view(&peer.context);
-        let response = ResponseEnvelope::capabilities(capabilities, command_words);
+        let response = ResponseEnvelope::capabilities(
+            capabilities,
+            command_words,
+            broker.surface_epoch().clone(),
+        );
         let length = encoded_capability_response(&response)?;
         if length > maximum {
             return Err(BrokerdError::CapabilityResponseTooLarge { length, maximum });
@@ -622,6 +629,7 @@ fn validate_capability_responses<A: AuditLog>(
         capabilities,
         command_words,
         broker.chat_memory_ceiling(),
+        broker.surface_epoch().clone(),
     );
     let length = encoded_capability_response(&response)?;
     if length > maximum {

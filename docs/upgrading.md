@@ -4,7 +4,7 @@
 edit, in what order to restart, and which releases require a configuration change rather than a
 binary swap. The changelog records *what changed*; this records *what you have to do about it*.
 
-Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no compatibility promise
+Dekopon is pre-1.0 and the local broker protocol is `v1alpha3`. There is no compatibility promise
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
@@ -50,19 +50,68 @@ explicit operator recovery. See [`operations.md`](operations.md#the-audit-chain-
 Only releases that need an operator action appear here. A release absent from this list is a binary
 swap in the order above.
 
+### 0.12.0 → next (unreleased) — harness APIs and accounting
+
+Rust embedders replace the `dekopon-agent` dependency/imports with `dekopon-harness`, then construct
+`SessionEngine`, `SessionBootstrap` and harness history. There is no compatibility facade or old
+`prompt` entrypoint. Out-of-tree console migration and new-name crates.io bootstrap have not run.
+`ChatModel`/image adapters require an `AttemptRecorder`; record before content decoding and include
+failed/cancelled inference and HTTP retry attempts, never fabricate missing usage. Retain
+`JobAccounting` until host delivery is known; generated output alone is not accepted delivery.
+
+Dashboards migrate from `accounting.model.turn`/separate image accounting to the versioned
+`accounting.model.call`, `accounting.model.transition` and `accounting.model.job` schemas; choose
+one aggregation level, never sum all three. Informational `ModelUsageReport` now derives solely
+from tracker attempt observations, not a success-only observer. Unknown totals display unknown.
+New transcript events identify context revision/full versus delta; the reader currently refuses
+later full rebuilds. Checkpoints are version 2 process-local memory, not on-disk upgrade state.
+See [the runtime contract and remaining integration gaps](harness.md).
+
+**Every `models[].name` in `dekopond.yaml` must now be a configured-model identifier**:
+`[a-z0-9][a-z0-9._-]{0,63}`, so lowercase, starting with a letter or digit, at most 64 bytes.
+A 0.12.0 file naming a model `GPT-5`, `Local Qwen` or `_scratch` no longer starts, and the grammar
+applies whether or not the deployment configures `controls:` — the name is the model's configured
+identity everywhere it is used, not a controls field. Rename the model and every `routes[].model`
+and `controls.models` entry that points at it in the same edit; the name is a local alias, so
+renaming it changes no endpoint and no credential. The refusal names `models[].name` and the
+offending value, and every offending name is reported in one startup failure.
+
+`sessions.maxConcurrent` is now validated against the harness checkpoint store's lease ceiling
+(`dekopon_harness::checkpoint::MAX_JOBS`, 128). A configuration asking for more sessions than the
+store admits leases is refused at startup instead of turning the surplus into capacity failures
+under load; the refusal names the field, the value and the constant.
+
+### 0.12.0 → next (unreleased) — core controls and `v1alpha3`
+
+Upgrade all four executables together. `authorizeControl` and the required host-only
+`surfaceEpoch` change the protocol to `dekopon.dev/broker/v1alpha3`; `v1alpha1`/`v1alpha2`
+envelopes refuse before dispatch. An older client cannot decode the newer refusal either.
+Stop gateway, drain broker, retain audit and checkpoint, install the binaries, start broker,
+then gateway. Never erase replay history to make a mixed installation start: older binaries
+cannot decode the new `ControlDecision` audit variant. Existing event hashes remain valid.
+
+Controls are disabled without `controlTargets`. Opt-in requires separate `agent.prompt`,
+`agent.model.select` and/or `agent.effort.set` permits, and explicit attestor `chatScopes` for
+chat controls. No subject-only scope fallback applies. Both changed dimensions require both
+permissions. Configured model aliases are not endpoints and allowlisting them grants nothing.
+
+`policy_digest` now hashes the two reserved control actions (`agent.model.select`,
+`agent.effort.set`) unconditionally, so every deployment's digest changes on upgrade even when the
+policy set is byte-identical. Audit records written either side of the upgrade carry different
+digests for the same policy; that is expected and is not evidence of a policy change.
+
 ### 0.12.0 → next (unreleased) — command words run over `runCommand`
 
 Not yet released; the version that carries it is named when it is cut. Nothing here needs a
 configuration edit.
 
 - **Upgrade the broker before its clients, and all four executables together.** The local protocol
-  stays `dekopon.dev/broker/v1alpha2`, but `dekopon-run --broker` and `dekopond` now send a provider
+  now uses `dekopon.dev/broker/v1alpha3`, and `dekopon-run --broker` and `dekopond` now send a provider
   command word as `runCommand` — the word, its argv, and the optional piped value — and read back
   the guest's own outcome. A newer broker still answers the legacy `resolveCommand`, with a
-  rendered page degraded to a decline carrying its stdout then stderr, so an older client keeps
-  working for one release. The reverse does not hold: an older broker refuses `runCommand` as
-  `invalid-request` at the `operation` tag, indistinguishable from a corrupt frame, so a newer
-  client against an older broker reports every command word as a failed run until the broker moves.
+  rendered page degraded to a decline carrying its stdout then stderr. This is a legacy operation
+  within the new envelope, not cross-version compatibility: `v1alpha2` clients are rejected before
+  dispatch and must upgrade in lockstep.
 - **Upgrade the hosts before a provider adopts `run-command`.** A component built against
   `dekopon:provider@0.3.0`'s `provider-cli` world exports `run-command`, which only a broker or
   runner at this version looks up; an older host finds no `resolve-command` behind the manifest's
@@ -137,10 +186,12 @@ bootstrap limitations.
   A fifth broker client lives outside this repository:
   [dekopon-console](https://github.com/dekopon-agents/dekopon-console) pins
   `dekopon-agent = "=0.11.1"` and `dekopon-broker-protocol = "=0.11.1"`, so it still speaks
-  `v1alpha1` and cannot talk to a broker built from this tree. It does not merely need a version
-  bump: it calls `BrokerLeg::connect_attested`, which no longer exists, so moving its pin past
-  0.11.1 is a source change to `crates/dekopon-tui/src/session.rs`. Leave the pin where it is until
-  that lands, and do not run the console against an upgraded broker.
+  `v1alpha1` and cannot talk to a broker built from this tree. There is no newer `dekopon-agent` to
+  move that pin to: the crate was replaced outright by `dekopon-harness`, as
+  [0.12.0 → next](#0120--next-unreleased--harness-apis-and-accounting) records, and the console's
+  `BrokerLeg::connect_attested` call no longer exists either. Migrating it is that source change in
+  `crates/dekopon-tui/src/session.rs` against the new crate, not a version bump. Leave the pin where
+  it is until that lands, and do not run the console against an upgraded broker.
 - **The interactive console left this repository.** `dekopon console` and the `dekopon-tui` crate
   now ship from [dekopon-console](https://github.com/dekopon-agents/dekopon-console), the way the
   `gh` provider did. `dekopon` is a local catalog and model-account CLI again, and a bare `dekopon`

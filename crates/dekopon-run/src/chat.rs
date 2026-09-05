@@ -29,8 +29,8 @@ use std::{
     path::PathBuf,
 };
 
-use dekopon_agent::IdSequence;
 use dekopon_core::{ExternalSubject, IdentifierError};
+use dekopon_harness::runtime::IdSequence;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -104,7 +104,7 @@ impl ChatSession {
 
 /// Derives a fresh conversation identifier.
 ///
-/// Reuses the session identifier space `dekopon-agent` already derives for broker traces, for the
+/// Reuses the session identifier space `dekopon-harness` already derives for broker traces, for the
 /// same reason it exists there: a randomly seeded hash over the process identifier and a
 /// nanosecond wall-clock reading collides far less readily than either input alone.
 fn mint_conversation() -> Result<String, ChatError> {

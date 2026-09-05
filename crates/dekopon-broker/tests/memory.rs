@@ -1394,6 +1394,7 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
     assert_eq!(records.len(), 5);
     for record in records {
         match record.event {
+            AuditEvent::ControlDecision { .. } => panic!("storage never admits model controls"),
             AuditEvent::Decision {
                 invocation,
                 principal,

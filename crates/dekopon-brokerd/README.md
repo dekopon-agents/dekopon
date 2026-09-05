@@ -504,7 +504,7 @@ The overview includes:
 
 A provider page is intentionally rustdoc-like: local artifact path, source byte count and SHA-256, Wasmtime-visible imports/exports and nested interface functions, command words, every capability's description/effect/risk/idempotency/input schema, and the complete validated manifest. The host executes local WebAssembly component bytes and reports the digest of its exact compile buffer. A managed lock separately retains the OCI source and manifest digest, but the UI is not yet given that lock context and says so rather than presenting the component digest as publisher provenance.
 
-Agent and token state still belongs to the unprivileged gateway. A mapped attestor may publish a content-free normalized inventory and bounded usage deltas over the authenticated Unix protocol. Reports omit instructions, prompts, answers, subjects, principals, credentials, policy, constraints, and authorization; are held only in process memory; reset on broker restart; and are never consulted by Cedar, routing, execution, evidence, replay, or durable audit. Reporting is best effort, so the live totals are not billing reconciliation—use the displayed OTLP configuration and `accounting.model.turn` for retained accounting.
+Agent and token state still belongs to the unprivileged gateway. A mapped attestor may publish a content-free normalized inventory and bounded usage deltas over the authenticated Unix protocol. Reports omit instructions, prompts, answers, subjects, principals, credentials, policy, constraints, and authorization; are held only in process memory; reset on broker restart; and are never consulted by Cedar, routing, execution, evidence, replay, or durable audit. Reporting is best effort, so the live totals are not billing reconciliation—use the displayed OTLP configuration and `accounting.model.call` for retained accounting.
 
 “No login” makes the surrounding network the access boundary. Agent names, provider schemas, artifact paths/digests, OTLP endpoints, and runtime limits/activity are deployment information. `--http-bind=0.0.0.0:8080` deliberately exposes it on every interface; choose that address only when everyone who can reach it may read those facts.
 
@@ -685,3 +685,47 @@ identities:
           channel: c0123abc
           conversation: c0123abc:1712345678.000100
 ```
+
+
+## Model and effort control ceiling (unreleased)
+
+Optional startup-fixed broker configuration (omitting it disables controls):
+
+```yaml
+controlTargets:
+  - model: baseline
+    efforts: [providerDefault, low, high]
+  - model: gpt-5.6-sol
+    efforts: [providerDefault, low, high]
+```
+
+At most 16 entries; model IDs match `[a-z0-9][a-z0-9._-]{0,63}`. Duplicate models, repeated efforts,
+and empty effort sets are reported together. These aliases name configured gateway clients,
+never endpoints or credentials. Gateway route configuration must independently narrow candidates;
+an allowlist is not a policy grant.
+
+Both halves of a proposal must be listed here. A route whose baseline model and effort do not
+themselves appear in that model's `efforts` makes *every* proposal from that route `target-denied`,
+because the broker checks the `from` selection as well as the `to` one — and each of those refusals
+still spends one of the job's four control attempts. So list the route's own baseline effort, not
+only the ones a model may switch to. The gateway's `select_model` tool mirrors this by offering only
+efforts some candidate actually carries; an effort no candidate lists would cost prompt tokens and
+an attempt to be refused by the broker.
+
+Alongside a separate `agent.prompt` permit, for example:
+
+```cedar
+permit(principal == Dekopon::Principal::"maintainer",
+       action == Dekopon::Action::"agent.model.select",
+       resource == Dekopon::Agent::"reviewer")
+when { context has via && context.via == "gateway"
+    && context.toModel == "gpt-5.6-sol" };
+```
+
+Changing effort additionally requires `agent.effort.set`; a model permit alone never covers it.
+Attested controls require an explicit matching `chatScopes` grant, unlike legacy subject-only
+provider operation fallback. A direct peer can control only its owner-mapped agent. Controls
+share the durable replay domain and persist admission audit plus checkpoint before replying.
+Lockstep protocol `v1alpha3` rejects older envelopes before dispatch. Retain audit/checkpoint,
+stop gateway, drain broker, replace binaries, start broker, then gateway. Older binaries cannot
+read the new `ControlDecision` audit variant. See `docs/upgrading.md` in the repository.

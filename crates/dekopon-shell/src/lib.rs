@@ -94,7 +94,9 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
+
+use thiserror::Error;
 
 use serde_json::Value;
 
@@ -196,11 +198,72 @@ pub enum CommandRun {
     },
 }
 
+/// Which part of the host-owned session surface stopped matching what the session was built on.
+///
+/// A freshness check is a five-way disjunction, and the five causes are operationally different
+/// incidents: a restarted host, a redeployed provider, a narrowed policy. Reporting them as one
+/// string made every one of them read as "something changed", so the answer to "why did this
+/// session stop?" was unavailable exactly when it was needed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SurfaceChange {
+    /// The host's startup epoch changed: it restarted underneath the session.
+    Epoch,
+    /// A capability's model-facing description or input schema changed.
+    Descriptions,
+    /// The trusted effective-capability classification changed: policy narrowed or widened.
+    EffectiveViews,
+    /// The set of provider command words changed: a provider was loaded, removed, or redeployed.
+    CommandWords,
+    /// The durable chat-memory surface changed.
+    ChatMemory,
+}
+
+impl SurfaceChange {
+    /// The stable token for this cause, as telemetry spells it.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Epoch => "epoch",
+            Self::Descriptions => "descriptions",
+            Self::EffectiveViews => "effective-views",
+            Self::CommandWords => "command-words",
+            Self::ChatMemory => "chat-memory",
+        }
+    }
+}
+
+impl fmt::Display for SurfaceChange {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Why a freshness check could not confirm the session's surface.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum FreshnessError {
+    /// The fresh surface could not be obtained at all, naming the transport cause.
+    ///
+    /// Distinct from [`Self::Changed`] on the axis the caller acts on: nothing is known to have
+    /// changed, the host simply could not be asked, and an operator chasing a narrowed policy
+    /// should not be sent looking for one that is not there.
+    #[error("fresh session surface unavailable: {0}")]
+    Unavailable(String),
+    /// The fresh surface differs from the one this session was built on.
+    #[error("session surface changed: {0}")]
+    Changed(SurfaceChange),
+}
+
 /// The boundary between this interpreter and the real world.
 ///
 /// Implementations decide what a "capability" is: a direct Wasm component call, a broker proposal,
 /// or a test fixture. This crate never learns which.
 pub trait CapabilityInvoker {
+    /// Revalidate host-owned session metadata before reuse. Local immutable dispatch needs no I/O;
+    /// remote adapters must fail on changed or uncertain freshness. This grants no invocation.
+    fn check_freshness(&self) -> Result<(), FreshnessError> {
+        Ok(())
+    }
+
     /// Returns every capability identifier currently available to invoke.
     fn granted(&self) -> Vec<String>;
 
@@ -309,6 +372,9 @@ pub fn secret_use_unsupported() -> CapabilityCallResult {
 /// dispatch at the same time. It replaced a hand-written forwarder that had to be kept in step with
 /// the trait by hand and was not.
 impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
+    fn check_freshness(&self) -> Result<(), FreshnessError> {
+        self.as_ref().check_freshness()
+    }
     fn granted(&self) -> Vec<String> {
         self.as_ref().granted()
     }

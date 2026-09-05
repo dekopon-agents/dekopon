@@ -36,9 +36,9 @@ and replies with the answer.
 - **Authorization** — every session opens an *attested* broker leg naming the sender's
   canonical subject. An empty capability set ends the session before any model call.
 - **Conversations** — one independent session per message unless a route sets
-  `mode: persistent`, which keeps a per-sender history in gateway memory, compacted to
-  question-and-answer pairs inside a sliding window and dropped on an idle timeout, an LRU
-  ceiling, or a changed capability grant. It caches no authorization.
+  `mode: persistent`, which keeps a per-sender history in gateway memory, managed by `dekopon-harness` with bounded whole tool groups, execution observations and separate
+  generated/accepted text. Generation leases fence stale appends after idle/LRU eviction or changed
+  full metadata/startup epoch. It caches no authorization.
 - **Skills** — the agent's catalog skills ride its bound route, read whole into memory when the
   catalog loads and shared by every session on that route, so a session never touches the
   filesystem. When any are mounted, a second system message after the instructions lists each by
@@ -62,7 +62,7 @@ and replies with the answer.
   loop's shared bounds, with no inspection-specific counter; a repeat points at the copy already
   in the conversation instead of appending a second one.
 - **Informational status** — after the broker probe, the gateway best-effort reports a bounded
-  content-free catalog inventory; each session separately coalesces provider-reported model usage.
+  content-free catalog inventory; each session projects informational deltas from its mandatory harness token tracker.
   These feed only the broker-hosted web UI, reset with the broker process, and never affect a
   session, policy, credentials, execution, evidence, or durable audit.
 
@@ -115,3 +115,39 @@ When the broker returns an effective all-three memory surface, the prompt notes 
 requires complete service/kernel transport acceptance, and sends exactly one fresh hidden record
 request containing the original bounded sender text and exact accepted answer. It never retries;
 record failure cannot change an already delivered answer. Receipts do not prove human receipt.
+
+## Configured controls (Unreleased)
+
+`models[].effort` is `providerDefault` (default), `low`, `medium`, or `high`. A route's optional
+`controls: {models: [configured-alias, alternate-alias], maxAttempts: 4}` narrows the cached model
+registry and must include its baseline. Missing controls disables the tools. Candidate aliases
+are not grants: every application requires fresh broker `agent.prompt` plus the changed-dimension
+Cedar permissions and the broker's target/chat-scope ceilings. Mixed tool batches run nothing;
+refusals consume attempts; a new inbound job starts at baseline. See the complete
+[configuration and transition contract](../../docs/dekopond.md#configured-model-and-effort-controls-unreleased).
+
+## Structured runtime activity (Unreleased)
+
+Gateway routes may configure `activityLabels` (256 capability IDs, 80 UTF-8 bytes per public
+label); runtime submissions use only the fresh scoped intersection, otherwise `Running capability`.
+Slack's strict default-false `activity.progressMessage` requires native activity and adds one
+owned ordinary post with a fixed hourglass, plain-text details and a non-linking fallback. Updates
+and removal are best effort and separate from delivery receipts/history; notifications or retained
+artifacts can survive failed cleanup. Other transports retain native typing/no-op behavior.
+See the [consumed configuration schema and lifecycle bounds](../../docs/dekopond.md#structured-activity-and-slack-progress-unreleased).
+
+The clean-break runtime, checkpoint bounds, delivery/accounting ownership and known integration
+limitations are documented in [`docs/harness.md`](../../docs/harness.md).
+
+Slack refuses duplicate authenticated endpoint/team/bot installations, naming every transport that
+could not connect rather than only the first. Final/progress posts and the completion that publishes
+a generated image share
+bounded one-second channel slots, rechecked before transmission and extended from response arrival;
+only a definitive HTTP 429 can retry a final post once (Retry-After at most five seconds). A 429
+parks the channel for the stated Retry-After capped at sixty seconds, or five seconds with no usable
+header, and later senders wait for the slot up to a sixty-second ceiling instead of being refused.
+Unknown creations never retry. Native cleanup metadata retires after bounded cleanup;
+unknown native ordering remains under the coordinator's quarantine, which is counted and aged out
+apart from the live lease ceiling. Shutdown drains activity cleanup inside the grace. Platform pacing can
+delay acceptance, independently of cosmetic I/O. Gateway cancellation wrappers forward fresh broker
+surface checks; a broker restart or Cedar revocation during inference fences stale disclosure.

@@ -26,7 +26,6 @@ mod activity;
 mod asset;
 mod cache_key;
 mod config;
-mod conversation;
 mod routes;
 mod session;
 mod transport;
@@ -65,7 +64,6 @@ pub use transport::TransportError;
 use crate::{
     asset::AssetStore,
     config::render_problems,
-    conversation::ConversationStore,
     routes::RoutingTable,
     session::{
         ConfiguredModels, ImageGeneratorStartupError, ModelCache, ModelCredentialError,
@@ -189,15 +187,22 @@ where
     let mut asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>> = HashMap::new();
     let mut activities: HashMap<String, Arc<dyn ChatActivity>> = HashMap::new();
     let mut thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>> = HashMap::new();
+    // Every transport that cannot connect is named in one refusal, so an operator who mis-scoped
+    // two workspaces does not restart the daemon once per conflict to discover the next one. A
+    // duplicate Slack installation is one such failure: the first configuration to claim it keeps
+    // it, and the configuration refused for it is the one this list names.
+    let mut connect_problems = Vec::new();
     for (spec, mut transport) in config.transports.iter().zip(built_transports) {
-        let identity =
-            transport
-                .connect()
-                .await
-                .map_err(|source| DekopondError::TransportConnect {
+        let identity = match transport.connect().await {
+            Ok(identity) => identity,
+            Err(source) => {
+                connect_problems.push(TransportConnectProblem {
                     transport: spec.name().to_owned(),
                     source,
-                })?;
+                });
+                continue;
+            }
+        };
         tracing::info!(
             event = "gateway_transport_connected",
             transport = spec.name(),
@@ -218,6 +223,11 @@ where
         }
         transports.push(transport);
     }
+    if !connect_problems.is_empty() {
+        return Err(DekopondError::TransportConnect {
+            problems: connect_problems,
+        });
+    }
 
     let (usage_sender, usage_receiver) = mpsc::channel(USAGE_REPORT_BUFFER);
     let mut usage_reporter = tokio::spawn(report_status(
@@ -230,7 +240,9 @@ where
         models: Arc::new(ModelCache::new(Arc::new(ConfiguredModels))),
         gate: SessionGate::new(config.sessions.max_concurrent),
         reply_on_busy: config.sessions.reply_on_busy,
-        conversations: ConversationStore::new(config.sessions.max_conversations),
+        conversations: dekopon_harness::conversation::BoundedConversationStore::new(
+            config.sessions.max_conversations,
+        ),
         // Sized and expired like the conversation store, because an attachment reference outliving
         // the conversation that introduced it is a number no prompt can still name.
         assets: Arc::new(AssetStore::new(
@@ -243,6 +255,7 @@ where
         thread_ownership,
         active_sessions: session::ActiveSessions::default(),
         usage_reports: Some(usage_sender),
+        activity_supervisors: activity::ActivitySupervisors::default(),
     });
 
     let (sender, receiver) = mpsc::channel::<TransportEvent>(INBOUND_BUFFER);
@@ -265,7 +278,7 @@ where
     );
 
     let outcome = serve(
-        runner,
+        Arc::clone(&runner),
         routes,
         Arc::new(identities),
         Arc::new(repliers),
@@ -301,16 +314,31 @@ where
 
     match outcome {
         ServeOutcome::Shutdown => {
-            tracing::info!(event = "gateway_stopped", reason = "shutdown");
+            gateway_stopped("shutdown", runner.conversations.tracked());
             Ok(())
         }
         // Nothing can wake the daemon again, and nobody asked it to stop. Exiting successfully
         // here is what let a gateway that lost every workspace to a revoked token look like a
         // clean run to whatever supervises it.
         ServeOutcome::TransportsLost => {
-            tracing::error!(event = "gateway_stopped", reason = "transports-lost");
+            gateway_stopped("transports-lost", runner.conversations.tracked());
             Err(DekopondError::TransportsLost)
         }
+    }
+}
+
+/// The daemon's exit record, and the one place the conversation count is ever published.
+///
+/// Conversations are process memory and die here, so how many were still resident at exit is what
+/// an operator sizing `sessions.maxConversations` reads back: a store that ends every run at the
+/// ceiling was set too low, and the `gateway_conversation_evicted` churn it produced has a
+/// denominator. It is published once, at exit, rather than per message — a size reported on every
+/// message would be one more place a live conversation could be described.
+fn gateway_stopped(reason: &'static str, conversations: usize) {
+    if reason == "shutdown" {
+        tracing::info!(event = "gateway_stopped", reason, conversations);
+    } else {
+        tracing::error!(event = "gateway_stopped", reason, conversations);
     }
 }
 
@@ -516,6 +544,11 @@ fn client_error_category(error: &dekopon_broker_protocol::ClientError) -> &'stat
         ClientError::Protocol { .. } => "protocol",
         ClientError::Remote { .. } => "remote",
         ClientError::UnexpectedResponse => "unexpected-response",
+        ClientError::InvalidControl => "invalid-control",
+        ClientError::ControlAttempts => "control-attempts",
+        ClientError::ControlFenced => "control-fenced",
+        ClientError::SurfaceChanged => "surface-changed",
+        ClientError::ControlBinding => "control-binding",
     }
 }
 
@@ -627,18 +660,39 @@ where
     }
 
     // In-flight sessions are given the configured grace to finish: a model call is already paid
-    // for, and abandoning it means a person watching a chat window never hears back.
-    if timeout(grace, async {
+    // for, and abandoning it means a person watching a chat window never hears back. The activity
+    // supervisors drain inside the same grace and after the sessions, because a session's last act
+    // is to queue the removal of its ⌛ progress message onto one of them.
+    let deadline = tokio::time::Instant::now() + grace;
+    let sessions_finished = tokio::time::timeout_at(deadline, async {
         while let Some(result) = sessions.join_next().await {
             observe_session(result);
         }
     })
     .await
-    .is_err()
-    {
+    .is_ok();
+    if !sessions_finished {
         tracing::warn!(event = "gateway_sessions_abandoned");
         sessions.abort_all();
         while sessions.join_next().await.is_some() {}
+    }
+    // Cleanup is what removes the ⌛ from somebody's channel, and an abandoned supervisor leaves
+    // it there. The two outcomes are reported apart because "a person never heard back" and "a
+    // progress message is stuck in a channel" are different things for an operator to act on.
+    let drained = sessions_finished
+        && tokio::time::timeout_at(deadline, runner.activity_supervisors.drain())
+            .await
+            .is_ok();
+    if !drained {
+        let abandoned = runner.activity_supervisors.abandon();
+        if abandoned > 0 {
+            tracing::warn!(
+                event = "gateway_activity_failed",
+                operation = "cleanup",
+                cause_type = "activity-cleanup-abandoned",
+                abandoned
+            );
+        }
     }
     outcome
 }
@@ -980,13 +1034,16 @@ pub enum DekopondError {
     /// The configured broker did not answer a capability probe at startup.
     #[error("broker is not reachable; start dekopon-brokerd before the gateway")]
     BrokerProbe(#[source] dekopon_broker_protocol::ClientError),
-    /// A transport could not authenticate or open its wakeup path.
-    #[error("chat transport {transport} could not connect")]
+    /// One or more transports could not authenticate or open their wakeup path.
+    ///
+    /// Every failing transport is reported together rather than only the first, so two mis-scoped
+    /// transports are one refusal and one restart. A duplicate Slack installation appears here as
+    /// the configuration that was refused it; the one already holding it connected and is not a
+    /// failure to report.
+    #[error("{}", render_problems(.problems))]
     TransportConnect {
-        /// Configured transport name.
-        transport: String,
-        #[source]
-        source: TransportError,
+        /// Every transport that could not connect, in configured order.
+        problems: Vec<TransportConnectProblem>,
     },
     /// Every transport ended on its own, with no shutdown asked for.
     ///
@@ -994,6 +1051,16 @@ pub enum DekopondError {
     /// difference between a supervisor restarting the gateway and a pod that stays green.
     #[error("every chat transport ended; the gateway can no longer be reached")]
     TransportsLost,
+}
+
+/// One transport that could not connect, reported through [`DekopondError::TransportConnect`].
+#[derive(Debug, Error)]
+#[error("chat transport {transport} could not connect")]
+pub struct TransportConnectProblem {
+    /// Configured transport name, carried by the rendered message rather than read directly.
+    transport: String,
+    #[source]
+    source: TransportError,
 }
 
 /// One thing the daemon must hold before any transport authenticates.

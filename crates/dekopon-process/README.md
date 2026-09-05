@@ -31,7 +31,7 @@ existing synchronous interpreter with `spawn_blocking` inside one opaque
 self-contained supervisor task. `dekopon-run`'s direct leg runs each provider
 command word a script executes as one `direct-command` node, non-interruptible
 for the reason above: the guest call is `spawn_blocking` work the supervisor
-would not join. `dekopon-agent`'s broker leg runs each command word as one
+would not join. `dekopon-harness`'s broker leg runs each command word as one
 cancellable `broker-command` node around the broker round trip; `dekopond` ties
 its `CancelSignal` to the session's Stop, so a run in flight is aborted at its
 next await and joined before the script reads `session-cancelled`, while

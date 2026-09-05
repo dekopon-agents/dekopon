@@ -9,13 +9,38 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Added
 
+- Harness-owned execution-aware history, scoped generation leases and bounded versioned memory
+  checkpoints. Request-one bootstrap carries fresh descriptions and complete input schemas;
+  execution evidence and consumed budgets survive inference failure and Stop, while generated
+  text, accepted delivery and optional durable-memory recording remain separate.
+
+- Unreleased structured harness activity at actual nested capability submissions, bounded public
+  `activityLabels`, and opt-in Slack `activity.progressMessage`: one owned plain-text/hourglass
+  post, coalesced updates and generation-safe best-effort cleanup, separate from replies/history.
+  Existing Agent status/Stop/reaction and Discord/Telegram typing remain; local/WhatsApp are no-ops.
+
+- Add harness-owned checkpointed token accounting across inference attempts, model/effort segments and terminal delivery outcomes; preserve unknown usage and replace success-only token observers.
+
+- Unreleased configured model/effort transitions in `dekopon-harness`, opt-in gateway route
+  `controls`, reused allowlisted clients, sole-tool batch preflight, bounded refusal-inclusive
+  attempts, fresh broker admission per application, checkpointed portable-context rebuilds and
+  replay/cache invalidation without resetting work budgets. Explicit model effort is encoded as
+  Chat Completions `reasoning_effort` or Responses `reasoning.effort`; default omits the setting.
+  Direct/replay runners remain fail-closed without a control authorizer.
+
+- Unreleased core model/effort admission through authenticated `authorizeControl`, fresh Cedar
+  `agent.prompt` plus reserved `agent.model.select`/`agent.effort.set` decisions, bounded broker
+  `controlTargets`, request/agent/job bindings, startup epochs, and durable replay-consuming
+  admission audit. Protocol `v1alpha3` requires lockstep client/broker migration; admission is not
+  application or reusable provider authority.
+
 - Added cooperative cancellation to `dekopon-process`: `CancelSignal::pair` yields a cloneable
   `CancelHandle` whose idempotent `cancel` makes the supervisor abort a
   `ProcessMetadata::cancellable` node at its next await and then still join it, surfacing
   `ProcessOutcome::TaskFailed` with `is_cancelled()`; a node that already returned keeps its real
   result, dropping every handle (or `CancelSignal::never`) never cancels, and the `process.node`
   span records `process.interruptibility` as `cancellable` and a requested cancellation as
-  `process.outcome` `cancelled`. The broker leg in `dekopon-agent` is the one cancellable
+  `process.outcome` `cancelled`. The broker leg in `dekopon-harness` is the one cancellable
   consumer — a gateway session's Stop abandons an in-flight command run through it — and the
   runner's `legacy-shell` and `direct-command` nodes stay non-interruptible.
 - Added `dekopon:provider@0.3.0`, whose new `provider-cli` world exports `run-command`: a command
@@ -50,7 +75,7 @@ All notable changes to Dekopon are documented here. The format is based on
   node inside the `legacy-shell` node, so `probe --help` renders the component's page,
   `echo hello | probe upper -` hands the piped value to the guest, and a proposal is invoked
   exactly as a bare capability word would be; `--max-input-bytes` bounds argv plus the piped value
-  there. The broker leg in `dekopon-agent` runs each word as a cancellable `broker-command` node:
+  there. The broker leg in `dekopon-harness` runs each word as a cancellable `broker-command` node:
   `BrokerLeg::with_cancel_signal` accepts a `CancelSignal`, `dekopond` supplies one per session,
   and a native Stop abandons an in-flight command run instead of waiting for the broker's answer.
   `dekopon-run --broker` supplies none, so its nodes are cancellable in contract only.
@@ -60,7 +85,7 @@ All notable changes to Dekopon are documented here. The format is based on
   `1`), and a run cancelled underneath its session like a refused capability
   (`<word>: denied: session-cancelled`, exit `126`), so neither reads to the model as a usage
   error it should fix.
-- Added the `agent.command.unobserved` audit record, emitted by `dekopon-agent`'s
+- Added the `agent.command.unobserved` audit record, emitted by `dekopon-harness`'s
   `report_unobserved_command_run` when either command leg's process node finishes after its
   caller was dropped: `command.leg` (`broker` or `direct`), a fixed `outcome`, and a fixed
   `error.type`, never the word, the argv, or any text; the cause goes out as an ordinary error
@@ -103,7 +128,7 @@ All notable changes to Dekopon are documented here. The format is based on
   the session continues either way. Both records fire whether or not payload telemetry is on,
   because offering the tool is the consent to put model-authored text in the log. A suggestion
   changes nothing: no instruction, skill, limit, or grant moves because a model asked. Embedders
-  read them back from `PromptOutcome.suggestions`.
+  read them back from `SessionExit.suggestions`.
 - Added `dekopon-run session list|show|replay`, which read sessions back from the OpenObserve log
   stream the runner and gateway export to. The receiver is `--openobserve-url`
   (`DEKOPON_OPENOBSERVE_URL`), the organization base the OTLP exporter posts to, with
@@ -112,7 +137,7 @@ All notable changes to Dekopon are documented here. The format is based on
   holding the complete `Authorization` header value, so no credential value appears in an
   argument; the client follows no redirect, uses no ambient proxy, reads at most 20 pages of 500
   records and warns when it stops there, bounds a response at 32 MiB, and validates a trace
-  identifier before interpolating it into SQL. `list` groups `accounting.model.turn` records by
+  identifier before interpolating it into SQL. `list` groups `accounting.model.call` records by
   trace within `--since` (default `7d`; a count followed by `s`, `m`, `h`, or `d`), newest first,
   so it also lists sessions recorded metadata-only; `show` reconstructs one session — system
   messages, earlier exchanges, prompt, every turn's scripts and their outputs, the answer — from
@@ -133,8 +158,25 @@ All notable changes to Dekopon are documented here. The format is based on
   than a divergence stop. Turns before the divergence are a faithful comparison and turns after a
   live one are a new session; replay never invents tool output. There is deliberately no durable
   store, no automatic rewriting, and no grader: the loop is `list`, `show`, edit, `replay`, commit.
+- Added the telemetry this round's refusals needed, all of it category-only and all of it recorded
+  in `docs/observability.md`: warn-level `gateway_reply_rate_limited` (`transport`, `method`,
+  `cause_type`, `retry_after_seconds` for the refused sender and `channel_parked_seconds` for the
+  shared slot, plus the `channel` only under the payload gate) for a channel-creating post refused
+  because the channel is parked; the
+  `gateway_activity_failed` cause types `activity-quarantine-full` and `activity-cleanup-abandoned`;
+  the warn-level `conflicting-usage-observation` and `accounting-field-unreported` records naming
+  the usage fields a tracker stopped trusting and the job they belong to; the error-level
+  `live-checkpoint-lock`, emitted where a poisoned checkpoint lock is recovered or fences the
+  lease; and the error-level `control-surface`, which names every conflict in a route's `controls:`
+  block at construction. No new `audit.event` name.
 
 ### Changed
+
+- Replace `dekopon-agent` with `dekopon-harness` and migrate all in-tree embedders to
+  `SessionEngine`/`SessionBootstrap`; no compatibility facade. Model adapters now require an
+  inference-attempt recorder. New call/transition/job accounting supersedes turn/image emitters.
+  See `docs/upgrading.md` for API, protocol and telemetry migration and `docs/harness.md` for
+  the current integration limitations. New-crate publication bootstrap is a separate release task.
 
 - `dekopon-shell`'s `CapabilityInvoker::run_command` replaces `resolve_command`: it receives the
   piped value rendered as text (strings verbatim, other values as compact JSON) and answers with a
@@ -142,7 +184,7 @@ All notable changes to Dekopon are documented here. The format is based on
   rendered itself (help, a version, a usage error) written to the shell's stdout and diagnostic
   streams at the provider's own exit status and charging no capability call, or a decline
   reported as a usage error at exit `2`. The scripting tool's description now tells the model to
-  run `<word> --help` for a provider command word's subcommands and flags. `dekopon-agent`,
+  run `<word> --help` for a provider command word's subcommands and flags. `dekopon-harness`,
   `dekopond`, and `dekopon-run` forward the new method, and the broker leg carries it over the
   new `runCommand` operation with the piped value.
 - The broker protocol gains `runCommand` (`BrokerRequest::RunCommand`, with an optional `stdin`),
@@ -153,8 +195,8 @@ All notable changes to Dekopon are documented here. The format is based on
   `Broker::run_command` replaces `Broker::resolve_command` and threads the piped value to the
   guest, and `dekopon-brokerd` answers both operations: `runCommand` with the
   outcome intact and the legacy `resolveCommand` with rendered text degraded to a decline carrying
-  the text, so an older client keeps working against a newer broker for one release while a newer
-  client's `runCommand` reaching an older broker is refused `invalid-request`. The piped value is
+  the text. Legacy operation handling does not admit an older envelope: the controls migration
+  requires `v1alpha3` on both sides and rejects older binaries before dispatch. The piped value is
   bounded by the frame ceiling on the client and by the host's `maxInputBytes` on the broker.
 - `dekopon-broker-host` renamed its command-word errors around the new export:
   `MissingResolveCommand` is `MissingCommandExport`, `ResolveCommandSignature` is
@@ -174,19 +216,231 @@ All notable changes to Dekopon are documented here. The format is based on
 - `dekopon describe agent` always prints a `Skills:` section, `(none)` when nothing is mounted, its
   `--output json` carries each loaded skill whole, and the wide `get agent` table gains a `SKILLS`
   column between `PROVIDERS` and `MODEL`.
-- `dekopon-agent`'s `PromptOutcome` gains `suggestions`, and `PromptError` gains
+- `dekopon-harness`'s `SessionExit` gains `suggestions`, and `PromptError` gains
   `MissingSkillName`, `UnexpectedSkillArguments`, and `InvalidSuggestion` (telemetry kinds
   `missing-skill-name`, `unexpected-skill-arguments`, `invalid-suggestion`), which end a session
   as every other malformed tool call does; an exhaustive match downstream must name them.
-- `dekopon-agent` now depends on `dekopon-config`, for the loaded `Skill` a session shows a model,
+- `dekopon-harness` now depends on `dekopon-config`, for the loaded `Skill` a session shows a model,
   and `dekopon-run` on `dekopon-config` (the same loader behind `--skill`), `ureq` (the OpenObserve
   client, on the HTTP stack the model clients already use), and `time` (RFC 3339 timestamps in
   `session list`). `dekopon-run` still reaches no broker crate; the CI `cargo tree` gate checks it.
-  `dekopon-agent` and `dekopond` now also depend on `dekopon-process`, for the node each broker
+  `dekopon-harness` and `dekopond` now also depend on `dekopon-process`, for the node each broker
   command run executes in and the cancel signal a gateway session hands it; it is not a broker
   crate, and the same gate covers `dekopond`.
   `dekopon-core` gains `SkillId`, `SkillIdError`, and `MAX_SKILL_NAME_LENGTH`, and
   `dekopon-protocol`'s `AgentSpec` gains `skills`, absent from serialized output when empty.
+  `dekopon-harness` also gains `sha2`, for the per-component surface digests a session's freshness
+  check compares, and `dekopon-broker` gains `getrandom`, for the startup epoch every control
+  admission is bound to.
+- `sessions.maxConcurrent` is validated at startup against `dekopon_harness::checkpoint::MAX_JOBS`
+  (128), the checkpoint-lease ceiling every live session holds one of, and the refusal names the
+  field, the value and the constant. A configured model whose `name` is not a configured-model
+  identifier is refused with `models[].name` and the offending value, whether or not the deployment
+  configures `controls:`; `docs/upgrading.md` carries the migration.
+- `CheckpointStore::compare_and_save` takes the encoded length of the document its caller built, so
+  a store checks its ceiling against that measurement instead of re-encoding the snapshot; an
+  out-of-tree implementation must accept the added argument, and `Checkpoint::measure` is public so
+  one that enforces the ceiling itself measures the document the same way the in-tree store does.
+- `dekopon_shell::CapabilityInvoker::check_freshness` returns `Result<(), FreshnessError>` instead
+  of `Result<(), String>`. `FreshnessError` is `Unavailable` or `Changed(SurfaceChange)`, and
+  `SurfaceChange` names which half of the surface moved (`Epoch`, `Descriptions`, `EffectiveViews`,
+  `CommandWords`, `ChatMemory`), so a log site records a stable token rather than a sentence; an
+  out-of-tree implementor changes its signature and returns the typed value.
+- A session compares its capability surface against the broker's at exactly two points in a turn —
+  before each model request, and after a completion before it is disclosed — where it also compared
+  before every capability invocation and every tool call. The broker authorizes each `invoke` and
+  `runCommand` at dispatch, under the live epoch and the policy loaded then, so the client-side
+  comparison guards disclosure rather than authority; dropping it from the inner loops removes one
+  broker round trip per tool call and per invocation without moving where a decision is made.
+  `docs/security-model.md` and `docs/harness.md` name the two checks that remain.
+- The harness checkpoint store's byte ceiling is `MAX_JOBS * MAX_CHECKPOINT_BYTES`, so its lease
+  ceiling and its byte ceiling agree at 128 rather than exhausting the second at 32 reservations —
+  which is what silently capped a deployment's concurrent sessions at a quarter of the leases it
+  advertised. A store already holding `MAX_JOBS` leases refuses the next one with `Capacity` before
+  it evicts anything, so reaching the ceiling no longer destroys every stored checkpoint on the way
+  to an error, and the refusal names the ceiling. `MAX_JOBS` is public and `docs/harness.md` states
+  the relationship.
+- A conversation's idle timeout runs from its last message rather than from its last committed
+  turn: `begin` touches the entry the way `commit` already did. Without it a session that answered
+  slowly left its own conversation the least recently touched candidate at the moment it finished,
+  which is the eviction the **Fixed** entry below closes.
+- `routes[].activityLabels` reports every offending entry in one refusal, each named with the rule
+  it broke, instead of stopping at the first. A label the renderer would truncate past
+  `MAX_ACTIVITY_LABEL_BYTES` (80 UTF-8 bytes) or leave blank once control characters and
+  directional marks are stripped is refused at startup rather than shown clipped or empty; the
+  gate calls the renderer's own `label_is_renderable` rather than mirroring its constant.
+- A quarantined activity target — one an uncertain native write may still own — is tracked apart
+  from the live leases, under its own 128-entry ceiling, and ages out after fifteen minutes. A full
+  quarantine used to consume the lease ceiling and disable activity process-wide behind a debug
+  log; it now costs one warn-level `gateway_activity_failed` when it fills and live leases keep
+  acquiring. That event's category is `busy`, `quarantined`, or `capacity`, where one combined
+  token could not tell a contended thread from an exhausted ceiling.
+- `select_model`'s `effort` enum offers only the efforts the candidate list actually carries,
+  mirroring `set_effort`. The gateway still offers all four, because it cannot see the broker's
+  `controlTargets`; `docs/dekopond.md` states that a route whose baseline effort is absent from
+  that list is answered `target-denied` on every proposal while still spending an attempt.
+- `policy_digest` hashes the two reserved control actions unconditionally, so every deployment's
+  digest changes on upgrade even where the policy set is byte-identical. `docs/upgrading.md`
+  records that as expected rather than as evidence that a policy moved.
+- A recording carries `version` at its top level and refuses an unknown top-level key. A file
+  written before the field is read as version 1, and a version this build does not read is refused
+  naming it; a hand-written recording carrying an extra key that used to be ignored is now a
+  read-side break. `ReplayReport` gains `droppedHistoryTurns`, and a replay whose recorded exchanges
+  did not fit `HistoryLimits` says how many turns it dropped rather than replaying a short history
+  silently.
+- An `agent.model.answer` row claiming more than `MAX_TOOL_CALLS_PER_TURN` tool calls is refused
+  before the reconstruction iterates it, naming the turn, the claimed count, and the limit; the
+  writer never produces such a row, so it is a corrupt or hostile one.
+- Public API, for anyone rebasing on this branch: `dekopon-shell` gains `SurfaceChange` and
+  `FreshnessError`; `dekopon-broker-protocol` gains `ClientErrorKind` and `ClientError::kind()` and
+  drops the unconsumed `ERROR_CONTROL_DENIED`; `dekopon-model`'s `usage` module gains
+  `USAGE_FIELD_NAMES`, `ObservationPrecedence`, `LoggedAttempt`, `AttemptLog`, `conflicting_fields`,
+  and a defaulted `AttemptRecorder::observe_ranked`, and `ChatGptError` gains `Accounting`;
+  `dekopon-harness` gains `control::ControlFailureKind` and `ControlError::Surface`, makes
+  `TransitionOutcome::AuthorizationFailed` a struct variant carrying `cause` (a checkpoint JSON
+  shape change, unreleased), adds `precedence` to `AttemptRecord`, and publishes
+  `HistoryLimits::MAX_TURNS`/`MAX_BYTES`, `checkpoint::MAX_JOBS`, `CONVERSATION_CACHE_PREFIX`,
+  `MAX_ACTIVITY_LABEL_BYTES`, `MAX_ACTIVITY_LABELS`, and `label_is_renderable`;
+  `PolicyBuildError::{ReservedAction, DuplicateCapability}` and `BootstrapError::{Identifier,
+  InvalidSchema}` carry every collision rather than one; and `dekopond`'s `cache_key::for_conversation`
+  is deleted in favor of the harness-owned prefix constant both minting sites now share.
+
+### Removed
+
+- Removed `dekopon-agent`. `dekopon-harness` replaces it outright — no compatibility crate, no
+  alias, no `run_prompt_session` facade — so there is no newer `dekopon-agent` version to move a
+  pin to; an out-of-tree embedder migrates its dependency, its imports, and its
+  `BrokerLeg::connect_attested` call sites, as `docs/upgrading.md` records.
+
+### Fixed
+
+- Reconstruct persistent portable tool history and model-switch/full context revisions in session
+  show/replay; reject conflicting revisions and preserve independent failure/image usage without
+  recounting remembered calls or restoring opaque provider continuation. Accept byte-free asset
+  summaries interleaved within tool batches and count failed chat calls in replay comparisons.
+- Repair gateway test compilation and parallel accounting trace capture; pin interpreter job-span
+  ancestry and make oversized-frame refusal tests independent of socket write buffering.
+- Fence retained-context reuse at authenticated broker freshness boundaries; validate execution IDs
+  before checkpoint reservation and bound eviction of inactive fenced jobs. Preserve batch-local
+  results, restored history, failed/nullable response usage and terminal host delivery accounting.
+- Bound Slack cleanup metadata, retain native-write uncertainty through fallback, reject duplicate
+  authenticated installations, and coordinate final/progress channel posts with definitive-429-only
+  recovery. Recheck physical post slots after response arrival to prevent concurrent retries from
+  colliding; preserve cleanup uncertainty and forward gateway safe-yield authorization checks.
+- A Slack 429 now makes later senders in that channel wait rather than turning their paid-for
+  answers into an instant `post-capacity`. The wait each sender can afford is measured from the
+  moment it observes the slot, not from when it entered, so a sender already queued behind another
+  when the 429 lands waits the whole park out instead of inheriting somebody else's backoff as a
+  refusal; a sender waits at most two minutes in total, a stated `Retry-After` parks the channel
+  for at most sixty seconds, and a missing or unparsable one parks it for five. A sender that is
+  refused — because it spent that total, or because it drew the 429 itself — is told how many
+  seconds of backoff are left, uncapped for the sender the service told to come back later, and
+  `gateway_reply_failed` names the refusal rather than the generic `service`. Image answers take
+  the same channel slot as text ones, because `files.completeUploadExternal` creates a channel
+  message exactly as `chat.postMessage` does.
+- Gateway shutdown drains the activity workers after the sessions and inside the same
+  `shutdownGraceMs`, so an ordinary SIGTERM no longer strands a ⌛ progress message in a channel.
+  A grace that expires before the removals land reports what it abandoned: one warn-level
+  `gateway_activity_failed` with `cause_type="activity-cleanup-abandoned"` counting the artifacts
+  left behind, separate from `gateway_sessions_abandoned`, which now means what it says. The
+  workers are owned by the gateway rather than by the process, so two gateways in one process
+  cannot drain or abandon each other's.
+- Conversation eviction no longer takes a conversation another in-flight session is answering
+  under: the store records the outstanding generation and evicts one nobody is answering first, so
+  one sender's arrival cannot rotate another's cache key and turn a delivered answer into a
+  refused append. When every candidate is in flight the least recently touched still goes, and a
+  generation nobody committed stops protecting its conversation once it is idle.
+- A checkpoint mutation encodes the snapshot once, not twice: the model-facing group ceiling, the
+  per-checkpoint byte ceiling and the save share one measurement, where the size check and the save
+  each used to traverse up to 2 MiB of JSON under the live lock five to eight times per tool call.
+  Resuming an existing dormant entry at the lease ceiling is admitted rather than refused for a
+  slot it already occupies.
+- The gateway builds one capability snapshot per message. The broker leg keeps the projection it
+  validated when it connected, and the fingerprint behind a conversation's surface is computed
+  once, where each was built and encoded twice per inbound message.
+- An operator-authored `activityLabels` value is accepted exactly when the renderer keeps it whole:
+  the gate bounded the trimmed text while the renderer bounded the untrimmed one, so surrounding
+  whitespace bought a label that passed startup validation and then lost its last characters in the
+  channel.
+- A usage field the tracker cannot trust is now reported as unreported calls for that field alone,
+  instead of blanking the whole delta. `take_report` decides every field before it advances its
+  cursor, so a `provider_total` that does not equal `input + output` no longer discards the input
+  and output the same attempt reported, and the calls it covered are no longer skipped for good;
+  the field and the job are named in a warn-level `accounting-field-unreported` record.
+- A second, differing usage observation on one attempt marks that attempt's usage unknown instead
+  of fencing the job and its checkpoint. Duplicate `"usage"` keys in one JSON object and a
+  non-terminal SSE usage that disagrees with the terminal one are both handled that way, and a
+  terminal `response.completed` usage wins over a non-terminal one when they differ.
+- `modelTurns` is unknown rather than zero for a recording whose call list names no chat call at
+  all — image calls only, which a truncated page set produces — and the transcript query is ordered
+  like the accounting one, so a truncated fetch keeps the start of a session rather than an
+  arbitrary slice. A reconstruction always states its call list, empty included, so a current trace
+  whose accounting rows the receiver did not return reads as unknown rather than falling back to
+  its answered turns — a different quantity — the way a file written before call accounting does.
+- The cosmetic ⌛ progress post honors the same channel-slot park bound the answer path does. It is
+  a `chat.postMessage` on the same physical channel, so a 429 there used to park the shared slot
+  for the stated `Retry-After` — up to a day — and drop every later answer in that channel,
+  including the failure fallback, as `post-capacity`.
+- `gateway_session_failed` carries a stable `cause` token rather than the error chain. It is the
+  terminal catch-all for every session failure, including a model-selected tool name, and
+  `docs/observability.md` keeps untrusted model, provider and transport text out of events; a
+  control failure still reports which client failure it was.
+- Session reconstruction names the offender in every conflict it reports: a conflicting accounting
+  call record names its job and call sequence and a conflicting prompt job ID names both IDs, where
+  identical bare sentences collapsed into a single line naming none of them.
+- `gateway_stopped` reports how many conversations were still resident at exit, the denominator for
+  the `gateway_conversation_evicted` churn an operator sizing `sessions.maxConversations` watches.
+- A whitespace-only completion is no longer stored as the job's generated answer before it is
+  rejected, so a job resumed from that checkpoint can no longer deliver an empty answer with a
+  `Send` outcome. `SessionBootstrap::with_resume` is `pub(crate)`, and `docs/harness.md` says
+  plainly that no shipped binary resumes a checkpoint today.
+- A control authorization failure carries a typed `ControlFailureKind` instead of a discarded
+  `ClientError`: the kind reaches the checkpointed transition record, the `accounting.model.transition`
+  event, and the gateway's `gateway_session_failed` through `cause`, so a `ControlBinding` refusal
+  and a `ConnectTimeout` are no longer the same line in the log.
+- A ledger refusal is reported as what it is. `ChatGptRequestError` and `ChatGptError` gain
+  `Accounting`, which maps to `ModelError::Accounting` and to a `PromptError` whose
+  `telemetry_kind()` is `accounting` rather than a retryable transport `Request`, on the image path
+  as well as the chat one — a fenced tracker is an operator problem, and dashboards counting model
+  transport errors were counting it.
+- A broken policy stays visible: once a proposal's reason is `policy-error`, a later dimension's
+  ordinary `policy-denied` does not overwrite it, so the operator signal that a policy failed to
+  evaluate survives a denial that happened to follow it in the same proposal.
+- The 30-per-minute cosmetic budget is reserved after the local gates rather than before them, so a
+  cosmetic call refused because the route sends nothing, or because the channel's post rate is
+  already spent, no longer spends an installation's budget on work that never left the process.
+- A replay group claims `RecordedReplay` provenance only when every result in the batch was answered
+  from the recording. A batch mixing recorded answers with a live dispatch carries the live
+  provenance and shows no banner, where the group label used to promise that no new capability
+  execution was claimed while one had just happened.
+- `list_sessions` deduplicates by job and call coordinate *after* it filters on `audit.event`, so a
+  non-accounting row sharing a coordinate with a real accounting row no longer suppresses it and
+  drops the session from the listing. `docs/run.md` states that sessions recorded before the
+  accounting rename appear in `show` but not `list`.
+- Reconstruction, context validation, and recording validation each report every conflict they find
+  before failing, instead of stopping at the first, and a `duration_ms` disagreement between
+  duplicate exports is a conflict rather than a last-wins overwrite. `PolicyWorld::new` reports
+  every reserved-action and duplicate-capability collision at once, bootstrap reports every
+  malformed identifier and every non-object schema at once, `SessionControls::new` collects all
+  three surface conflicts, and gateway startup names every transport that could not connect —
+  `DekopondError::TransportConnect` carries the whole list — where each of these used to make an
+  operator fix one problem per run.
+- The replay validator and the live enforcer agree on what a message group's bytes are: both reset
+  the count on any non-`tool` message, including the attachment summary, and an equality test feeds
+  the same message sequence to both so the two cannot drift apart again.
+- `begin` and `commit` no longer serialize the whole conversation corpus. `History::bytes()` is
+  O(1) against a size maintained in `record`, trim, and eviction, and the store keeps a running
+  byte total, where enforcing the ceiling used to re-encode every resident conversation on every
+  message. Checkpoint sizes are likewise measured once per save through a counting writer and cached
+  on the stored entry, so eviction reads cached sizes instead of re-encoding every stored checkpoint
+  per step, and `CapabilitySnapshot::from_invoker` bounds itself with a running count rather than
+  re-encoding the accumulated vector per capability.
+- The scripting tool's description no longer tells the model to open with a `cap --list` discovery
+  call. Request-one bootstrap already carries fresh descriptions and complete input schemas, so that
+  sentence bought nothing and spent a paid model turn; a test pins that the description instructs no
+  discovery call.
+- `examples/conditional-write/dekopond.yaml`'s `http-probe` activity labels describe what that
+  example's capabilities actually do, rather than naming work it never performs.
 
 ## [0.12.0] - 2026-08-29
 

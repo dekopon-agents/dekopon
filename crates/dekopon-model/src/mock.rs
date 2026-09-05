@@ -53,6 +53,15 @@ impl MockResponse {
         }
     }
 
+    pub(crate) fn raw_failure(status: u16, body: String) -> Self {
+        Self {
+            status,
+            content_type: "application/json",
+            body,
+            hang_up: false,
+        }
+    }
+
     pub(crate) fn hang_up() -> Self {
         Self {
             status: 0,

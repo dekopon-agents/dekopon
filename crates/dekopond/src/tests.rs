@@ -1,3 +1,4 @@
+use dekopon_harness::conversation::{BoundedConversationStore, ConversationKey, EvictionReason};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     ffi::OsString,
@@ -12,11 +13,6 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use dekopon_agent::prompt::{
-    AGENT_CONFIG_TOOL_NAME, AssetSource as _, ConversationTurn, DECLINE_REPLY_TOOL_NAME,
-    HistoryLimits, IMAGE_GENERATION_TOOL_NAME, IMPROVEMENT_TOOL_NAME, PromptLimits,
-    SKILL_TOOL_NAME,
-};
 use dekopon_broker_protocol::{
     Attestation, AvailableCapability, BrokerRequest, BrokerSocketDiscovery, ChatMemorySurface,
     CommandRunOutcome, FrameLimits, InvocationOutcome, InvocationResult, RequestEnvelope,
@@ -24,6 +20,16 @@ use dekopon_broker_protocol::{
 };
 use dekopon_config::LocalCatalog;
 use dekopon_core::{ExternalSubject, SecretDrn, SecretUseProposal};
+use dekopon_harness::{
+    history::{HistoryLimits, JobRecord},
+    improvement::IMPROVEMENT_TOOL_NAME,
+    session::PromptLimits,
+    skills::SKILL_TOOL_NAME,
+    tools::{
+        AGENT_CONFIG_TOOL_NAME, AssetSource as _, DECLINE_REPLY_TOOL_NAME,
+        IMAGE_GENERATION_TOOL_NAME,
+    },
+};
 use dekopon_model::{
     image::{GeneratedImage, ImageGenerationError, ImageGenerator},
     model::{
@@ -44,7 +50,6 @@ use crate::{
         ImageGeneratorConfig, ModelConfig, NativeActivityConfig, ResolvedBroker, RouteMatch,
         SlackActivityConfig, SlackActivityFallback, SlackExperience,
     },
-    conversation::{ConversationKey, ConversationStore, EvictionReason},
     routes::{RouteError, RouteProblem, RoutingTable},
     session::{
         BUSY_REPLY, CancelAwareInvoker, FAILURE_REPLY, ImageGeneratorStartupError, ModelCache,
@@ -422,6 +427,7 @@ fn a_model_api_key_variable_is_absent_or_usable_and_never_silently_empty() {
         timeout_ms: 60_000,
         classes: vec!["fast".to_owned()],
         modalities: Vec::new(),
+        effort: Default::default(),
     };
 
     // No field at all is a deliberate configuration, not a missing credential.
@@ -487,6 +493,7 @@ async fn slack_activity_and_experience_are_explicit_and_strict() {
             activity: SlackActivityConfig {
                 mode: ActivityMode::Native,
                 classic_fallback: SlackActivityFallback::Reaction,
+                progress_message: false,
             },
             ..
         })
@@ -1133,6 +1140,131 @@ async fn every_configuration_problem_is_reported_before_the_file_is_refused() {
     );
     assert!(rendered.contains("at least one step"), "{rendered}");
     assert!(rendered.contains("session bounds"), "{rendered}");
+}
+
+/// The model-name grammar names the field and the value, and never blames controls.
+///
+/// Every configured model's name is a configured-model identifier whether or not the deployment
+/// uses `controls:`, so a 0.12.0 file with `name: GPT-5` stops starting. That is a breaking change
+/// (`docs/upgrading.md` carries it), and a breaking refusal that says only "invalid configured
+/// model controls" points an operator at a feature they are not using.
+#[tokio::test]
+async fn every_invalid_model_name_is_reported_with_its_field_and_its_value() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["models"][0]["name"] = json!("GPT-5");
+    document["models"]
+        .as_array_mut()
+        .expect("models array")
+        .push(json!({
+            "name": "-leading-punctuation",
+            "kind": "openaiCompatible",
+            "endpoint": "http://127.0.0.1:11434/v1",
+            "model": "qwen3",
+            "timeoutMs": 120_000
+        }));
+
+    let error = load(directory.path(), &document)
+        .await
+        .expect_err("two ungrammatical model names cannot start");
+    let ConfigError::Invalid { problems, .. } = &error else {
+        panic!("an aggregated refusal: {error:?}");
+    };
+    let named = problems
+        .iter()
+        .filter(|problem| matches!(problem, ConfigProblem::InvalidModelName { .. }))
+        .count();
+    assert_eq!(named, 2, "both names, one refusal: {problems:?}");
+    let rendered = error.to_string();
+    assert!(rendered.contains("models[].name"), "{rendered}");
+    assert!(rendered.contains("GPT-5"), "{rendered}");
+    assert!(rendered.contains("-leading-punctuation"), "{rendered}");
+    assert!(
+        !rendered.contains("invalid configured model controls"),
+        "the grammar is not a controls failure: {rendered}"
+    );
+}
+
+/// `sessions.maxConcurrent` is validated against the store ceiling it actually competes for.
+///
+/// Every live session holds a checkpoint lease reserving the whole per-job ceiling, so a gateway
+/// admitting more sessions than `MAX_JOBS` converts the surplus into capacity refusals under load.
+#[tokio::test]
+async fn max_concurrent_beyond_the_checkpoint_lease_ceiling_is_refused_at_startup() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["sessions"] = json!({ "maxConcurrent": dekopon_harness::checkpoint::MAX_JOBS + 1 });
+
+    let error = load(directory.path(), &document)
+        .await
+        .expect_err("more sessions than leases cannot start");
+    assert!(reports(&error, |problem| matches!(
+        problem,
+        ConfigProblem::ExcessiveMaxConcurrent { .. }
+    )));
+    let rendered = error.to_string();
+    assert!(rendered.contains("sessions.maxConcurrent"), "{rendered}");
+    assert!(rendered.contains("MAX_JOBS"), "{rendered}");
+    assert!(
+        rendered.contains(&dekopon_harness::checkpoint::MAX_JOBS.to_string()),
+        "{rendered}"
+    );
+
+    let mut exact = document.clone();
+    exact["sessions"] = json!({ "maxConcurrent": dekopon_harness::checkpoint::MAX_JOBS });
+    load(directory.path(), &exact)
+        .await
+        .expect("the ceiling itself is admissible");
+}
+
+/// Every offending `activityLabels` entry, with the rule it broke.
+///
+/// One aggregate naming no offender told an operator with twenty labels to go and find it. The
+/// byte rule is the harness's own renderability check rather than a raw byte count here, so this
+/// gate cannot accept a label the transport then truncates.
+#[tokio::test]
+async fn every_offending_activity_label_names_its_key_and_its_rule() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["routes"][0]["activityLabels"] = json!({
+        "Not A Capability": "Reading the record",
+        "http-probe.fetch": "x".repeat(dekopon_harness::activity::MAX_ACTIVITY_LABEL_BYTES + 1),
+        // Blank once stripped: the renderer silently replaces it with the default label.
+        "http-probe.write": "\u{202e}\u{200b}",
+        // Stripping alone is not a loss worth refusing; this one renders whole.
+        "http-probe.ok": "Writing\u{202e}the record",
+    });
+
+    let error = load(directory.path(), &document)
+        .await
+        .expect_err("three bad labels cannot start");
+    let ConfigError::Invalid { problems, .. } = &error else {
+        panic!("an aggregated refusal: {error:?}");
+    };
+    let offenders = problems
+        .iter()
+        .filter_map(|problem| match problem {
+            ConfigProblem::InvalidActivityLabel { capability, .. } => Some(capability.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(offenders.len(), 3, "{problems:?}");
+    for offender in ["Not A Capability", "http-probe.fetch", "http-probe.write"] {
+        assert!(offenders.contains(&offender), "{offenders:?}");
+    }
+    assert!(
+        !offenders.contains(&"http-probe.ok"),
+        "a valid label is not an offender: {offenders:?}"
+    );
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("not a capability identifier"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(&dekopon_harness::activity::MAX_ACTIVITY_LABEL_BYTES.to_string()),
+        "{rendered}"
+    );
 }
 
 /// A list that failed is not blamed on the routes that name it.
@@ -1960,6 +2092,14 @@ impl ModelScript {
             .unwrap_or_else(|| panic!("request {index} declared a prompt cache key"))
     }
 
+    /// Portable conversation messages excluding the independently tested request-one bootstrap.
+    fn conversation_prompt(&self, index: usize) -> Vec<(String, String)> {
+        self.prompt(index)
+            .into_iter()
+            .filter(|(_, text)| !text.starts_with("Dekopon session bootstrap\n"))
+            .collect()
+    }
+
     /// One request's messages as `(role, content)` pairs, in the order the model saw them.
     fn prompt(&self, index: usize) -> Vec<(String, String)> {
         let prompts = self.prompts.lock().expect("recorded prompts");
@@ -1998,8 +2138,9 @@ impl ChatModel for ScriptedModel {
         &self,
         messages: &[ModelMessage],
         tools: &[ModelTool],
+        recorder: &dyn dekopon_model::usage::AttemptRecorder,
     ) -> Result<AssistantTurn, ModelError> {
-        self.complete_with(messages, tools, &CompletionOptions::default())
+        self.complete_with(messages, tools, &CompletionOptions::default(), recorder)
     }
 
     fn complete_with(
@@ -2007,31 +2148,49 @@ impl ChatModel for ScriptedModel {
         messages: &[ModelMessage],
         tools: &[ModelTool],
         options: &CompletionOptions,
+        recorder: &dyn dekopon_model::usage::AttemptRecorder,
     ) -> Result<AssistantTurn, ModelError> {
-        assert!(!self.0.forbidden, "this session must never reach a model");
-        self.0
-            .prompts
-            .lock()
-            .expect("recorded prompts")
-            .push(messages.to_vec());
-        self.0
-            .tools
-            .lock()
-            .expect("recorded tools")
-            .push(tools.to_vec());
-        self.0
-            .cache_keys
-            .lock()
-            .expect("recorded cache keys")
-            .push(options.prompt_cache_key().map(ToOwned::to_owned));
-        self.0.requests.fetch_add(1, Ordering::SeqCst);
-        self.0
-            .turns
-            .lock()
-            .expect("scripted turn lock")
-            .pop_front()
-            .flatten()
-            .ok_or(ModelError::NoChoices)
+        {
+            let attempt = recorder.begin(dekopon_model::usage::AttemptKind::Adapter)?;
+            let result: Result<AssistantTurn, ModelError> = {
+                assert!(!self.0.forbidden, "this session must never reach a model");
+                self.0
+                    .prompts
+                    .lock()
+                    .expect("recorded prompts")
+                    .push(messages.to_vec());
+                self.0
+                    .tools
+                    .lock()
+                    .expect("recorded tools")
+                    .push(tools.to_vec());
+                self.0
+                    .cache_keys
+                    .lock()
+                    .expect("recorded cache keys")
+                    .push(options.prompt_cache_key().map(ToOwned::to_owned));
+                self.0.requests.fetch_add(1, Ordering::SeqCst);
+                self.0
+                    .turns
+                    .lock()
+                    .expect("scripted turn lock")
+                    .pop_front()
+                    .flatten()
+                    .ok_or(ModelError::NoChoices)
+            };
+            if let Ok(turn) = &result
+                && let Some(usage) = turn.usage
+            {
+                recorder.observe(
+                    attempt,
+                    dekopon_model::usage::UsageObservation {
+                        usage,
+                        invalid: [false; 5],
+                    },
+                )?;
+            }
+            result
+        }
     }
 }
 
@@ -2398,6 +2557,7 @@ fn memory_surface_response() -> ResponseEnvelope {
             max_lookback_turns: 200,
             prompt_note: "Durable memory is available only on demand.".to_owned(),
         }),
+        "fixture-epoch".parse().expect("fixture epoch"),
     )
 }
 
@@ -2457,6 +2617,117 @@ async fn stub_broker(
     )
 }
 
+/// Repeat each nonempty initial surface for the explicitly expected safe-boundary checks.
+/// Refusals are terminal and therefore still receive only one exchange.
+async fn stub_broker_with_checks(
+    checks: usize,
+    directory: &Path,
+    responses: Vec<ResponseEnvelope>,
+) -> (ResolvedBroker, mpsc::UnboundedReceiver<RequestEnvelope>) {
+    stub_broker(
+        directory,
+        responses
+            .into_iter()
+            .flat_map(|response| {
+                let count = if matches!(&response.response,
+            dekopon_broker_protocol::BrokerResponse::Capabilities { capabilities, .. }
+                if !capabilities.is_empty())
+                {
+                    checks
+                } else {
+                    1
+                };
+                std::iter::repeat_n(response, count)
+            })
+            .collect(),
+    )
+    .await
+}
+
+async fn stub_broker_with_effect(
+    before: usize,
+    after: usize,
+    directory: &Path,
+    responses: Vec<ResponseEnvelope>,
+) -> (ResolvedBroker, mpsc::UnboundedReceiver<RequestEnvelope>) {
+    let [surface, effect]: [ResponseEnvelope; 2] = responses.try_into().unwrap();
+    let mut responses = vec![surface.clone(); before];
+    responses.push(effect);
+    responses.extend(std::iter::repeat_n(surface, after));
+    stub_broker(directory, responses).await
+}
+
+fn session_seed(
+    runner: &SessionRunner,
+    route: &crate::routes::BoundRoute,
+    inbound: &InboundMessage,
+    surface: ResponseEnvelope,
+) -> dekopon_harness::conversation::ConversationSeed {
+    let key = ConversationKey::scoped(
+        route.agent.as_str(),
+        &route.cache_key,
+        &inbound.transport,
+        &inbound.channel,
+        &inbound.conversation_id,
+        &inbound.subject.canonical(),
+    );
+    runner.conversations.begin(
+        &key,
+        &conversation_surface(surface),
+        route.conversation.window().unwrap(),
+        Instant::now(),
+    )
+}
+
+fn conversation_surface(response: ResponseEnvelope) -> Vec<String> {
+    match response.response {
+        dekopon_broker_protocol::BrokerResponse::Capabilities {
+            capabilities,
+            command_words,
+            surface_epoch,
+            ..
+        } => {
+            struct Metadata(
+                Vec<dekopon_broker_protocol::AvailableCapability>,
+                Vec<String>,
+            );
+            impl dekopon_shell::CapabilityInvoker for Metadata {
+                fn granted(&self) -> Vec<String> {
+                    self.0.iter().map(|c| c.capability.id.to_string()).collect()
+                }
+                fn command_words(&self) -> Vec<String> {
+                    self.1.clone()
+                }
+                fn describe(&self, id: &str) -> Option<dekopon_shell::CapabilityDescription> {
+                    self.0
+                        .iter()
+                        .find(|c| c.capability.id.as_str() == id)
+                        .map(|c| dekopon_shell::CapabilityDescription {
+                            capability: id.into(),
+                            description: c.capability.description.clone(),
+                            input_schema: c.capability.input_schema.clone(),
+                        })
+                }
+                fn invoke(
+                    &self,
+                    _: &str,
+                    _: Value,
+                    _: Option<dekopon_core::SecretUseProposal>,
+                ) -> dekopon_shell::CapabilityCallResult {
+                    panic!("metadata only")
+                }
+            }
+            let metadata = dekopon_harness::bootstrap::CapabilitySnapshot::from_invoker(&Metadata(
+                capabilities,
+                command_words,
+            ))
+            .unwrap();
+            vec![metadata.fingerprint(), surface_epoch.to_string()]
+        }
+        _ => panic!("capability fixture"),
+    }
+}
+
 fn route(model: ModelConfig) -> crate::routes::BoundRoute {
     crate::routes::BoundRoute {
         transport: "dev".to_owned(),
@@ -2467,8 +2738,10 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         instructions: Some("Answer briefly.".to_owned()),
         skills: Arc::from(Vec::new()),
         model: Arc::new(model),
+        controls: None,
         image_generator: false,
         improvement_suggestions: false,
+        activity_labels: Default::default(),
         limits: PromptLimits {
             max_steps: 4,
             max_capability_calls: 8,
@@ -2509,6 +2782,7 @@ fn model_config() -> ModelConfig {
         classes: vec!["reasoning".to_owned()],
         // Text only, which is the default and the right one for a local endpoint.
         modalities: Vec::new(),
+        effort: Default::default(),
     }
 }
 
@@ -2635,7 +2909,7 @@ fn runner_tracking(
         models: Arc::new(ModelCache::new(models)),
         gate: SessionGate::new(max_concurrent),
         reply_on_busy: true,
-        conversations: ConversationStore::new(max_conversations),
+        conversations: BoundedConversationStore::new(max_conversations),
         assets: Arc::new(AssetStore::new(
             max_conversations,
             Duration::from_secs(60 * 60),
@@ -2646,6 +2920,7 @@ fn runner_tracking(
         thread_ownership: HashMap::new(),
         active_sessions: Default::default(),
         usage_reports: None,
+        activity_supervisors: crate::activity::ActivitySupervisors::default(),
     })
 }
 
@@ -2717,25 +2992,45 @@ impl ChatModel for BlockedHandle {
         &self,
         _messages: &[ModelMessage],
         _tools: &[ModelTool],
+        recorder: &dyn dekopon_model::usage::AttemptRecorder,
     ) -> Result<AssistantTurn, ModelError> {
-        if let Some(sender) = self.0.entered.lock().expect("entered lock").take() {
-            let _ = sender.send(());
+        {
+            let attempt = recorder.begin(dekopon_model::usage::AttemptKind::Adapter)?;
+            let result: Result<AssistantTurn, ModelError> = {
+                if let Some(sender) = self.0.entered.lock().expect("entered lock").take() {
+                    let _ = sender.send(());
+                }
+                if let Some(receiver) = self.0.release_signal.lock().expect("release lock").take() {
+                    let _ = receiver.recv_timeout(Duration::from_secs(30));
+                }
+                Ok(self.0.turn.clone())
+            };
+            if let Ok(turn) = &result
+                && let Some(usage) = turn.usage
+            {
+                recorder.observe(
+                    attempt,
+                    dekopon_model::usage::UsageObservation {
+                        usage,
+                        invalid: [false; 5],
+                    },
+                )?;
+            }
+            result
         }
-        if let Some(receiver) = self.0.release_signal.lock().expect("release lock").take() {
-            let _ = receiver.recv_timeout(Duration::from_secs(30));
-        }
-        Ok(self.0.turn.clone())
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_authorized_message_reaches_its_agent_and_answers_in_chat() {
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
+    let (broker, mut observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
             Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
         )],
     )
     .await;
@@ -2770,7 +3065,12 @@ async fn an_authorized_message_reaches_its_agent_and_answers_in_chat() {
 struct TestImageGenerator;
 
 impl ImageGenerator for TestImageGenerator {
-    fn generate(&self, _prompt: &str) -> Result<GeneratedImage, ImageGenerationError> {
+    fn generate(
+        &self,
+        _prompt: &str,
+        recorder: &dyn dekopon_model::usage::AttemptRecorder,
+    ) -> Result<GeneratedImage, ImageGenerationError> {
+        recorder.begin(dekopon_model::usage::AttemptKind::Adapter)?;
         let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
         png.extend_from_slice(b"kitty pixels");
         GeneratedImage::from_png(png)
@@ -2780,11 +3080,13 @@ impl ImageGenerator for TestImageGenerator {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_explicit_route_generator_yields_an_image_reply() {
     let directory = temporary();
-    let (broker, _) = stub_broker(
+    let (broker, _) = stub_broker_with_checks(
+        6,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
             Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
         )],
     )
     .await;
@@ -2821,7 +3123,8 @@ async fn an_explicit_route_generator_yields_an_image_reply() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_freshly_authorized_agent_message_claims_its_exact_sender_thread() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(1, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker_with_checks(3, directory.path(), listings(1, &["echo.echo"])).await;
     let models = ModelScript::new([answer("Claimed.")]);
     let replier = Arc::new(RecordingReplier::default());
     let ownership = Arc::new(RecordingThreadOwnership::default());
@@ -2894,7 +3197,8 @@ async fn a_revoked_sender_loses_owned_thread_continuation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
+    let (broker, mut observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![memory_surface_response(), ResponseEnvelope::acknowledged()],
     )
@@ -2918,11 +3222,15 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
         message_ts: "1700000000.000002".to_owned(),
         initiator_user_id: "u9xyz".to_owned(),
     });
-    let key = ConversationKey::new(
+    let key = ConversationKey::scoped(
+        route.agent.as_str(),
+        &route.cache_key,
         &message.transport,
+        &message.channel,
         &message.conversation_id,
         &message.subject.canonical(),
     );
+    let surface = conversation_surface(memory_surface_response());
 
     run_session(
         Arc::clone(&runner),
@@ -2955,15 +3263,23 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
             .iter()
             .any(|(role, text)| role == "system" && text.contains("last word"))
     );
-    let remembered = runner.conversations.begin(
-        &key,
-        &granted(&["memory.chat.recent", "memory.chat.search"]),
-        window(),
-        Instant::now(),
-    );
+    let remembered = runner
+        .conversations
+        .begin(&key, &surface, window(), Instant::now());
     assert_eq!(remembered.history.turns().len(), 1);
     assert_eq!(remembered.history.turns()[0].user(), "OK, thanks");
     assert_eq!(remembered.history.turns()[0].answer(), None);
+    let record = &remembered.history.turns()[0];
+    assert_eq!(
+        record.delivery,
+        dekopon_harness::history::DeliveryDisposition::Suppressed
+    );
+    let checkpoint = dekopon_harness::checkpoint::memory_checkpoints()
+        .load(&record.job)
+        .unwrap();
+    assert!(checkpoint.finalized);
+    assert_eq!(checkpoint.record.delivery, record.delivery);
+    assert_eq!(checkpoint.state.accounting.delivery, "suppressed");
     assert!(matches!(
         observed
             .recv()
@@ -2974,6 +3290,7 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
             attestation: Some(Attestation { scope: Some(_), .. })
         }
     ));
+    assert_surface_checks(&mut observed, 2);
     assert!(
         observed.try_recv().is_err(),
         "no Slack acceptance means no durable-memory record request"
@@ -2986,10 +3303,16 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
+    let (broker, mut observed) = stub_broker_with_effect(
+        3,
+        2,
         directory.path(),
         vec![
-            ResponseEnvelope::capabilities(vec![capability("echo.echo")], vec!["probe".to_owned()]),
+            ResponseEnvelope::capabilities(
+                vec![capability("echo.echo")],
+                vec!["probe".to_owned()],
+                "fixture-epoch".parse().expect("fixture epoch"),
+            ),
             ResponseEnvelope::command_run(CommandRunOutcome::Rendered {
                 stdout: "Usage: probe <COMMAND>\n".to_owned(),
                 stderr: String::new(),
@@ -3019,6 +3342,7 @@ async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
             .request,
         BrokerRequest::Capabilities { .. }
     ));
+    assert_surface_checks(&mut observed, 2);
     let run = observed.recv().await.expect("the command run").request;
     assert!(
         matches!(
@@ -3028,6 +3352,7 @@ async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
         ),
         "{run:?}"
     );
+    assert_surface_checks(&mut observed, 2);
     assert!(
         observed.try_recv().is_err(),
         "rendered text proposes nothing to invoke"
@@ -3040,10 +3365,16 @@ async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() {
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
+    let (broker, mut observed) = stub_broker_with_effect(
+        3,
+        2,
         directory.path(),
         vec![
-            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
+            ResponseEnvelope::capabilities(
+                vec![capability("echo.echo")],
+                Vec::new(),
+                "fixture-epoch".parse().expect("fixture epoch"),
+            ),
             ResponseEnvelope::invocation(record_result(InvocationOutcome::Succeeded, None)),
         ],
     )
@@ -3073,6 +3404,7 @@ async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() 
             attestation: Some(Attestation { scope: Some(_), .. })
         }
     ));
+    assert_surface_checks(&mut observed, 2);
     assert!(matches!(
         observed
             .recv()
@@ -3084,6 +3416,7 @@ async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() 
             ..
         }
     ));
+    assert_surface_checks(&mut observed, 2);
     assert!(
         observed.try_recv().is_err(),
         "the warning is not a delivered model answer and must not be durably recorded"
@@ -3093,7 +3426,8 @@ async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() 
 #[tokio::test(flavor = "multi_thread")]
 async fn one_hidden_record_request_follows_transport_acceptance_and_is_never_retried() {
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
+    let (broker, mut observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![
             memory_surface_response(),
@@ -3124,6 +3458,7 @@ async fn one_hidden_record_request_follows_transport_acceptance_and_is_never_ret
             attestation: Some(Attestation { scope: Some(_), .. })
         }
     ));
+    assert_surface_checks(&mut observed, 2);
     let record = observed.recv().await.expect("one record request");
     let BrokerRequest::RecordDeliveredTurn { attestation, turn } = record.request else {
         panic!("expected hidden record operation: {record:?}");
@@ -3229,7 +3564,8 @@ async fn denied_failed_dedup_and_storage_record_results_are_terminal_without_ret
     ] {
         let directory = temporary();
         let result = record_result(outcome, error);
-        let (broker, mut observed) = stub_broker(
+        let (broker, mut observed) = stub_broker_with_checks(
+            3,
             directory.path(),
             vec![
                 memory_surface_response(),
@@ -3259,6 +3595,7 @@ async fn denied_failed_dedup_and_storage_record_results_are_terminal_without_ret
                 attestation: Some(Attestation { scope: Some(_), .. })
             }
         ));
+        assert_surface_checks(&mut observed, 2);
         assert!(matches!(
             observed.recv().await.expect("record request").request,
             BrokerRequest::RecordDeliveredTurn { .. }
@@ -3273,7 +3610,8 @@ async fn denied_failed_dedup_and_storage_record_results_are_terminal_without_ret
 #[tokio::test(flavor = "multi_thread")]
 async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_text() {
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
+    let (broker, mut observed) = stub_broker_with_checks(
+        2,
         directory.path(),
         vec![memory_surface_response(), ResponseEnvelope::acknowledged()],
     )
@@ -3294,13 +3632,15 @@ async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_te
             attestation: Some(Attestation { scope: Some(_), .. })
         }
     ));
+    assert_surface_checks(&mut observed, 1);
     assert!(
         observed.try_recv().is_err(),
         "the fixed gateway failure reply must not be recorded"
     );
 
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
+    let (broker, mut observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![memory_surface_response(), ResponseEnvelope::acknowledged()],
     )
@@ -3319,6 +3659,7 @@ async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_te
             attestation: Some(Attestation { scope: Some(_), .. })
         }
     ));
+    assert_surface_checks(&mut observed, 2);
     assert!(
         observed.try_recv().is_err(),
         "partial transport delivery must not be recorded"
@@ -3328,11 +3669,13 @@ async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_te
 #[tokio::test(flavor = "multi_thread")]
 async fn authorized_work_shows_activity_until_after_the_durable_reply() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
+    let (broker, _observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
             Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
         )],
     )
     .await;
@@ -3373,11 +3716,13 @@ async fn authorized_work_shows_activity_until_after_the_durable_reply() {
 #[tokio::test(flavor = "multi_thread")]
 async fn sealing_does_not_delay_reply_and_cleanup_follows_an_issued_show() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
+    let (broker, _observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
             Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
         )],
     )
     .await;
@@ -3443,7 +3788,11 @@ async fn unauthorized_work_never_publishes_activity() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(
         directory.path(),
-        vec![ResponseEnvelope::capabilities(Vec::new(), Vec::new())],
+        vec![ResponseEnvelope::capabilities(
+            Vec::new(),
+            Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
+        )],
     )
     .await;
     let surface = Arc::new(RecordingSurface::default());
@@ -3476,10 +3825,10 @@ async fn unauthorized_work_never_publishes_activity() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_native_stop_wins_the_race_and_suppresses_answer_history_and_durable_recording() {
+async fn a_native_stop_suppresses_delivery_but_retains_private_job_history() {
     let directory = temporary();
     let (broker, mut observed) =
-        stub_broker(directory.path(), vec![memory_surface_response()]).await;
+        stub_broker_with_checks(3, directory.path(), vec![memory_surface_response()]).await;
     let model = BlockedModel::new("stale answer");
     let surface = Arc::new(RecordingSurface::default());
     let mut runner = runner_with(
@@ -3505,8 +3854,8 @@ async fn a_native_stop_wins_the_race_and_suppresses_answer_history_and_durable_r
     let session_runner = Arc::clone(&runner);
     let session = tokio::spawn(run_session(
         session_runner,
-        route,
-        inbound,
+        route.clone(),
+        inbound.clone(),
         Arc::clone(&surface) as Arc<dyn ChatReplier>,
     ));
     surface.wait_until_shown().await;
@@ -3548,15 +3897,29 @@ async fn a_native_stop_wins_the_race_and_suppresses_answer_history_and_durable_r
     assert!(!events.iter().any(|event| event.contains("stale answer")));
     assert_eq!(
         runner.conversations.tracked(),
-        0,
-        "a cancelled turn is never committed to persistent history"
+        1,
+        "Stop retains the independently recorded job, not a delivery receipt"
     );
+    let seed = session_seed(&runner, &route, &inbound, memory_surface_response());
+    let record = &seed.history.turns()[0];
+    assert_eq!(
+        record.delivery,
+        dekopon_harness::history::DeliveryDisposition::Cancelled
+    );
+    let checkpoint = dekopon_harness::checkpoint::memory_checkpoints()
+        .load(&record.job)
+        .unwrap();
+    assert!(checkpoint.finalized);
+    assert_eq!(checkpoint.record.delivery, record.delivery);
+    assert_eq!(checkpoint.state.accounting.delivery, "cancelled");
+    assert_eq!(checkpoint.state.accounting.calls.len(), 1);
     assert!(matches!(
         observed.recv().await.expect("surface request").request,
         BrokerRequest::Capabilities {
             attestation: Some(Attestation { scope: Some(_), .. })
         }
     ));
+    assert_surface_checks(&mut observed, 2);
     assert!(
         observed.try_recv().is_err(),
         "a cancelled turn is never durably recorded"
@@ -3566,10 +3929,15 @@ async fn a_native_stop_wins_the_race_and_suppresses_answer_history_and_durable_r
 #[tokio::test(flavor = "multi_thread")]
 async fn aborting_the_async_session_cancels_later_blocking_tool_work() {
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
+    let (broker, mut observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![
-            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
+            ResponseEnvelope::capabilities(
+                vec![capability("echo.echo")],
+                Vec::new(),
+                "fixture-epoch".parse().expect("fixture epoch"),
+            ),
             ResponseEnvelope::error(
                 "unexpected-invocation",
                 "tool work should have been cancelled",
@@ -3613,6 +3981,7 @@ async fn aborting_the_async_session_cancels_later_blocking_tool_work() {
         }
     ));
 
+    assert_surface_checks(&mut observed, 1);
     session.abort();
     assert!(
         session
@@ -3622,6 +3991,20 @@ async fn aborting_the_async_session_cancels_later_blocking_tool_work() {
         "the async owner is gone"
     );
     model.release();
+    let freshness = tokio::time::timeout(Duration::from_secs(3), observed.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(
+            freshness.request,
+            BrokerRequest::Capabilities {
+                attestation: Some(_),
+                ..
+            }
+        ),
+        "the late model result still crosses a fresh authorization check, never an invocation"
+    );
 
     assert!(
         tokio::time::timeout(Duration::from_millis(300), observed.recv())
@@ -3661,11 +4044,13 @@ async fn a_bound_route_carries_the_skills_its_agent_mounts() {
 async fn a_session_lists_mounted_skills_by_summary_and_reads_one_on_demand() {
     let directory = temporary();
     let skill = mounted_skill(directory.path(), "counting");
-    let (broker, _observed) = stub_broker(
+    let (broker, _observed) = stub_broker_with_checks(
+        9,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
             Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
         )],
     )
     .await;
@@ -3727,11 +4112,13 @@ async fn a_session_lists_mounted_skills_by_summary_and_reads_one_on_demand() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_suggestion_tool_is_offered_only_where_the_route_opts_in() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
+    let (broker, _observed) = stub_broker_with_checks(
+        6,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
             Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
         )],
     )
     .await;
@@ -3795,11 +4182,13 @@ async fn improvement_suggestions_are_a_per_route_opt_in() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_authorized_agent_can_inspect_its_credential_free_effective_configuration() {
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(
+    let (broker, mut observed) = stub_broker_with_checks(
+        5,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
             Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
         )],
     )
     .await;
@@ -3869,6 +4258,7 @@ async fn an_authorized_agent_can_inspect_its_credential_free_effective_configura
             attestation: Some(Attestation { scope: Some(_), .. })
         }
     ));
+    assert_surface_checks(&mut observed, 4);
     assert!(
         observed.try_recv().is_err(),
         "meta inspection makes no broker call"
@@ -3878,11 +4268,13 @@ async fn an_authorized_agent_can_inspect_its_credential_free_effective_configura
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_reports_unreported_model_usage_without_delaying_the_answer() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
+    let (broker, _observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
             Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
         )],
     )
     .await;
@@ -3918,7 +4310,11 @@ async fn an_unauthorized_subject_is_refused_before_any_model_call() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(
         directory.path(),
-        vec![ResponseEnvelope::capabilities(Vec::new(), Vec::new())],
+        vec![ResponseEnvelope::capabilities(
+            Vec::new(),
+            Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
+        )],
     )
     .await;
     let models = ModelScript::forbidden();
@@ -4060,11 +4456,13 @@ async fn a_failed_session_answers_one_fixed_line_and_never_raw_error_text() {
     // A `PromptError` can carry model-chosen text, a provider message, or a transport diagnostic.
     // Chat is the last place any of those belong.
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
+    let (broker, _observed) = stub_broker_with_checks(
+        2,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
             Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
         )],
     )
     .await;
@@ -4109,11 +4507,13 @@ async fn an_unreachable_broker_fails_the_session_without_reaching_a_model() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_model_answer_longer_than_chat_accepts_is_bounded_on_the_way_out() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
+    let (broker, _observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
             Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
         )],
     )
     .await;
@@ -4154,17 +4554,21 @@ fn message_from(subject: &str, text: &str) -> InboundMessage {
 
 /// A prompt written the way a test reads it.
 fn transcript(messages: &[(&str, &str)]) -> Vec<(String, String)> {
-    messages
+    let mut expected: Vec<_> = messages
         .iter()
         .map(|(role, content)| ((*role).to_owned(), (*content).to_owned()))
-        .collect()
+        .collect();
+    expected.insert(1, ("system".into(), concat!(
+        "Host-selected inference identity (not authorization): ",
+        r#"{"configured":"local-qwen","backend":"adapter","model":"qwen3","effort":"providerDefault"}"#
+    ).into()));
+    expected
 }
 
 /// Every broker request the stub saw, asserting each one was a capability listing.
 ///
-/// The count is the assertion that matters: `stub_broker` serves one connection per response, so
-/// "N messages produced N attested `capabilities` envelopes" is what proves authorization is asked again
-/// per message rather than remembered with the conversation.
+/// The exact count includes initial admission plus safe boundaries, proving that authorization
+/// is freshly checked rather than remembered with the conversation.
 fn capability_listings(observed: &mut mpsc::UnboundedReceiver<RequestEnvelope>) -> usize {
     let mut count = 0;
     while let Ok(request) = observed.try_recv() {
@@ -4182,7 +4586,21 @@ fn capability_listings(observed: &mut mpsc::UnboundedReceiver<RequestEnvelope>) 
     count
 }
 
-/// One capability listing per message, so a two-message test needs two of them.
+fn assert_surface_checks(observed: &mut mpsc::UnboundedReceiver<RequestEnvelope>, count: usize) {
+    for _ in 0..count {
+        assert!(matches!(
+            observed
+                .try_recv()
+                .expect("expected fresh surface check")
+                .request,
+            BrokerRequest::Capabilities {
+                attestation: Some(Attestation { scope: Some(_), .. })
+            }
+        ));
+    }
+}
+
+/// Exactly `count` surface exchanges; callers include every safe-yield check they expect.
 fn listings(count: usize, capabilities: &[&str]) -> Vec<ResponseEnvelope> {
     (0..count)
         .map(|_| {
@@ -4192,6 +4610,7 @@ fn listings(count: usize, capabilities: &[&str]) -> Vec<ResponseEnvelope> {
                     .map(|identifier| capability(identifier))
                     .collect(),
                 Vec::new(),
+                "fixture-epoch".parse().expect("fixture epoch"),
             )
         })
         .collect()
@@ -4207,21 +4626,17 @@ fn granted(capabilities: &[&str]) -> Vec<String> {
 /// Records one exchange for the store tests whose subject is the history rather than the cache
 /// lane, minting the key the way the first session of a conversation supplies it.
 fn commit(
-    store: &ConversationStore,
+    store: &BoundedConversationStore,
     key: &ConversationKey,
     granted: &[String],
     window: ConversationWindow,
-    turn: ConversationTurn,
+    turn: JobRecord,
     now: Instant,
 ) {
-    store.commit(
-        key,
-        granted,
-        window,
-        turn,
-        &cache_key::for_conversation(),
-        now,
-    );
+    let seed = store.begin(key, granted, window, now);
+    store
+        .commit(key, granted, window, turn, &seed.cache_key, now)
+        .expect("live test lease");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4229,7 +4644,8 @@ async fn a_persistent_route_replays_the_previous_exchange_into_the_next_prompt()
     // The whole feature in one assertion: a follow-up that says "and the second one?" is answerable
     // because the exchange before it is in the prompt, in order, ahead of the new message.
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let (broker, mut observed) =
+        stub_broker_with_checks(3, directory.path(), listings(2, &["echo.echo"])).await;
     let models = ModelScript::new([
         answer("Two things broke."),
         answer("The second one was the database."),
@@ -4256,12 +4672,12 @@ async fn a_persistent_route_replays_the_previous_exchange_into_the_next_prompt()
         ]
     );
     assert_eq!(
-        models.prompt(0),
+        models.conversation_prompt(0),
         transcript(&[("system", "Answer briefly."), ("user", "what broke?")]),
         "the first message of a conversation starts clean"
     );
     assert_eq!(
-        models.prompt(1),
+        models.conversation_prompt(1),
         transcript(&[
             ("system", "Answer briefly."),
             ("user", "what broke?"),
@@ -4272,13 +4688,14 @@ async fn a_persistent_route_replays_the_previous_exchange_into_the_next_prompt()
     );
     // Persistence remembers text and never a decision: both messages asked the broker for
     // themselves.
-    assert_eq!(capability_listings(&mut observed), 2);
+    assert_eq!(capability_listings(&mut observed), 6);
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_one_shot_route_starts_from_an_empty_prompt_every_message() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker_with_checks(3, directory.path(), listings(2, &["echo.echo"])).await;
     let models = ModelScript::new([answer("Two things broke."), answer("Which one?")]);
     let replier = Arc::new(RecordingReplier::default());
     let runner = runner(broker, Arc::clone(&models), 4);
@@ -4294,7 +4711,7 @@ async fn a_one_shot_route_starts_from_an_empty_prompt_every_message() {
     }
 
     assert_eq!(
-        models.prompt(1),
+        models.conversation_prompt(1),
         transcript(&[
             ("system", "Answer briefly."),
             ("user", "and the second one?")
@@ -4314,7 +4731,8 @@ async fn one_client_serves_every_message_routed_to_the_same_model() {
     // fresh TCP and TLS handshake before the first token of every answer. Sharing is only correct
     // because the prompt cache key is request-scoped, which the cache-key tests above pin down.
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker_with_checks(3, directory.path(), listings(2, &["echo.echo"])).await;
     let models = ModelScript::new([answer("Two things broke."), answer("Which one?")]);
     let replier = Arc::new(RecordingReplier::default());
     let runner = runner(broker, Arc::clone(&models), 4);
@@ -4342,7 +4760,8 @@ async fn two_configured_models_never_share_one_client() {
     // The key is the configured name the loader already proved unique. Two endpoints sharing a
     // client would send one route's messages to the other's host.
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker_with_checks(3, directory.path(), listings(2, &["echo.echo"])).await;
     let models = ModelScript::new([answer("from one"), answer("from the other")]);
     let replier = Arc::new(RecordingReplier::default());
     let runner = runner(broker, Arc::clone(&models), 4);
@@ -4374,7 +4793,8 @@ async fn two_senders_in_one_conversation_never_see_each_others_history() {
     // in it; the history key deliberately does, and this is the difference that makes.
     const OTHER_SUBJECT: &str = "tel.16035550100";
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(3, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker_with_checks(3, directory.path(), listings(3, &["echo.echo"])).await;
     let models = ModelScript::new([
         answer("Your deploy failed."),
         answer("Yours is still running."),
@@ -4399,12 +4819,12 @@ async fn two_senders_in_one_conversation_never_see_each_others_history() {
     }
 
     assert_eq!(
-        models.prompt(1),
+        models.conversation_prompt(1),
         transcript(&[("system", "Answer briefly."), ("user", "and mine?")]),
         "the second sender's first message must not carry the first sender's exchange"
     );
     assert_eq!(
-        models.prompt(2),
+        models.conversation_prompt(2),
         transcript(&[
             ("system", "Answer briefly."),
             ("user", "what happened to mine?"),
@@ -4422,14 +4842,20 @@ async fn a_narrowed_grant_drops_the_history_it_was_built_under() {
     // reach without dropping it would keep replaying that output after the capability that produced
     // it was taken away.
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
+    let (broker, _observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![
             ResponseEnvelope::capabilities(
                 vec![capability("echo.echo"), capability("gh.pr_view")],
                 Vec::new(),
+                "fixture-epoch".parse().expect("fixture epoch"),
             ),
-            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
+            ResponseEnvelope::capabilities(
+                vec![capability("echo.echo")],
+                Vec::new(),
+                "fixture-epoch".parse().expect("fixture epoch"),
+            ),
         ],
     )
     .await;
@@ -4452,7 +4878,7 @@ async fn a_narrowed_grant_drops_the_history_it_was_built_under() {
     }
 
     assert_eq!(
-        models.prompt(1),
+        models.conversation_prompt(1),
         transcript(&[("system", "Answer briefly."), ("user", "and now?")]),
         "a changed grant set starts a fresh conversation"
     );
@@ -4461,11 +4887,20 @@ async fn a_narrowed_grant_drops_the_history_it_was_built_under() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_empty_grant_removes_the_conversation_rather_than_only_refusing_the_message() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
+    let (broker, _observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![
-            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
-            ResponseEnvelope::capabilities(Vec::new(), Vec::new()),
+            ResponseEnvelope::capabilities(
+                vec![capability("echo.echo")],
+                Vec::new(),
+                "fixture-epoch".parse().expect("fixture epoch"),
+            ),
+            ResponseEnvelope::capabilities(
+                Vec::new(),
+                Vec::new(),
+                "fixture-epoch".parse().expect("fixture epoch"),
+            ),
         ],
     )
     .await;
@@ -4509,11 +4944,10 @@ async fn an_empty_grant_removes_the_conversation_rather_than_only_refusing_the_m
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_session_records_the_question_it_could_not_answer() {
-    // The fixed failure line is this daemon's sentence rather than the agent's, and storing it
-    // would teach the model to keep producing it. The question still happened, though: dropping it
-    // would leave the retry with nothing to refer back to.
+    // The fixed failure line is a delivery fact, never generated assistant text. Both the question
+    // and the exact accepted warning survive so a retry can distinguish observation from generation.
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let (broker, _observed) = stub_broker(directory.path(), listings(5, &["echo.echo"])).await;
     let models = ModelScript::scripted([None, Some(answer("It was the database."))]);
     let replier = Arc::new(RecordingReplier::default());
     let runner = runner(broker, Arc::clone(&models), 4);
@@ -4537,13 +4971,17 @@ async fn a_failed_session_records_the_question_it_could_not_answer() {
     .await;
 
     assert_eq!(
-        models.prompt(1),
+        models.conversation_prompt(1),
         transcript(&[
             ("system", "Answer briefly."),
             ("user", "what broke?"),
+            (
+                "user",
+                "[Exact transport-accepted text, distinct from generation]\nThe agent could not complete this request."
+            ),
             ("user", "try again"),
         ]),
-        "an unanswered turn replays the question and nothing in the answer's place"
+        "the accepted warning is a delivery fact, never generated assistant text"
     );
     let replies = replier.replies();
     assert!(
@@ -4576,10 +5014,12 @@ async fn a_session_that_never_reached_a_model_remembers_nothing() {
         4,
     );
 
+    let bound = persistent_route(model_config(), window());
+    let inbound = message("what broke?");
     run_session(
         Arc::clone(&runner),
-        persistent_route(model_config(), window()),
-        message("what broke?"),
+        bound.clone(),
+        inbound.clone(),
         Arc::clone(&replier) as Arc<dyn ChatReplier>,
     )
     .await;
@@ -4587,8 +5027,18 @@ async fn a_session_that_never_reached_a_model_remembers_nothing() {
     assert_eq!(replier.replies(), vec![FAILURE_REPLY.to_owned()]);
     assert_eq!(
         runner.conversations.tracked(),
-        0,
-        "a message nothing was ever asked about leaves no exchange behind"
+        1,
+        "admission reserves one empty generation"
+    );
+    let seed = session_seed(
+        &runner,
+        &bound,
+        &inbound,
+        listings(1, &["echo.echo"]).remove(0),
+    );
+    assert!(
+        seed.history.is_empty(),
+        "pre-model failure commits no job, including seeded jobs"
     );
 }
 
@@ -4597,8 +5047,8 @@ fn an_idle_conversation_is_dropped_and_the_next_message_starts_fresh() {
     // The clock is a parameter because `tokio::time::pause` does not reach
     // `std::time::Instant::now()` inside a blocking task, so injecting it is the only way this is
     // deterministic rather than a sleep.
-    let store = ConversationStore::new(8);
-    let key = ConversationKey::new("dev", "dev", SUBJECT);
+    let store = BoundedConversationStore::new(8);
+    let key = conversation_key("dev", "dev", SUBJECT);
     let allowed = granted(&["echo.echo"]);
     let start = Instant::now();
     commit(
@@ -4606,7 +5056,7 @@ fn an_idle_conversation_is_dropped_and_the_next_message_starts_fresh() {
         &key,
         &allowed,
         window(),
-        ConversationTurn::completed("what broke?", "two things"),
+        JobRecord::completed("what broke?", "two things"),
         start,
     );
 
@@ -4617,15 +5067,29 @@ fn an_idle_conversation_is_dropped_and_the_next_message_starts_fresh() {
         "inside the timeout the exchange is replayed"
     );
 
+    // Seeding a session is itself a touch — a message arrived and this history answered it — so
+    // the timeout runs from the warm lookup, not from the last committed turn. That is also what
+    // keeps a concurrent session's ceiling from evicting the conversation this one is answering.
     let cold = store.begin(&key, &allowed, window(), start + Duration::from_secs(900));
+    assert_eq!(
+        cold.history.len(),
+        1,
+        "the warm lookup at 899s reset the idle clock"
+    );
+    let cold = store.begin(
+        &key,
+        &allowed,
+        window(),
+        start + Duration::from_secs(900 + 900),
+    );
     assert!(
         cold.history.is_empty(),
         "past the timeout the next message starts fresh"
     );
     assert_eq!(
         store.tracked(),
-        0,
-        "an idle conversation is dropped rather than merely skipped"
+        1,
+        "begin reserves a fresh empty generation after dropping the idle one"
     );
 }
 
@@ -4633,12 +5097,12 @@ fn an_idle_conversation_is_dropped_and_the_next_message_starts_fresh() {
 fn the_conversation_ceiling_evicts_the_least_recently_used_rather_than_refusing() {
     // A person talking now matters more than one who stopped an hour ago, so a memory bound must
     // not become an admission bound.
-    let store = ConversationStore::new(2);
+    let store = BoundedConversationStore::new(2);
     let allowed = granted(&["echo.echo"]);
     let start = Instant::now();
     let keys = ["first", "second", "third"]
-        .map(|conversation| ConversationKey::new("dev", conversation, SUBJECT));
-    let turn = |text: &str| ConversationTurn::completed(text, "noted");
+        .map(|conversation| conversation_key("dev", conversation, SUBJECT));
+    let turn = |text: &str| JobRecord::completed(text, "noted");
 
     commit(&store, &keys[0], &allowed, window(), turn("one"), start);
     commit(
@@ -4669,13 +5133,6 @@ fn the_conversation_ceiling_evicts_the_least_recently_used_rather_than_refusing(
 
     let now = start + Duration::from_secs(4);
     assert_eq!(store.tracked(), 2, "the ceiling holds");
-    assert!(
-        store
-            .begin(&keys[1], &allowed, window(), now)
-            .history
-            .is_empty(),
-        "the least recently used conversation is the one that goes"
-    );
     assert_eq!(
         store.begin(&keys[0], &allowed, window(), now).history.len(),
         2,
@@ -4684,6 +5141,13 @@ fn the_conversation_ceiling_evicts_the_least_recently_used_rather_than_refusing(
     assert_eq!(
         store.begin(&keys[2], &allowed, window(), now).history.len(),
         1
+    );
+    assert!(
+        store
+            .begin(&keys[1], &allowed, window(), now)
+            .history
+            .is_empty(),
+        "the least recently used conversation is the one that goes"
     );
 }
 
@@ -4700,26 +5164,26 @@ fn each_window_bound_drops_the_oldest_exchange_on_its_own() {
             max_bytes: 64 * 1024,
         },
     };
-    // Each exchange below is a ten-byte question and a nine-byte answer, so two fit under this
-    // ceiling and three do not, while the turn count stays well inside `max_turns`.
+    // Portable structure and IDs count too, not just the question and answer text.
+    let record_bytes = JobRecord::completed("question a", "an answer").bytes();
     let by_bytes = ConversationWindow {
         idle_timeout: Duration::from_secs(900),
         limits: HistoryLimits {
             max_turns: 12,
-            max_bytes: 40,
+            max_bytes: record_bytes * 2,
         },
     };
 
     for (window, name) in [(by_turns, "turn bound"), (by_bytes, "byte bound")] {
-        let store = ConversationStore::new(8);
-        let key = ConversationKey::new("dev", "dev", SUBJECT);
+        let store = BoundedConversationStore::new(8);
+        let key = conversation_key("dev", "dev", SUBJECT);
         for text in ["question a", "question b", "question c"] {
             commit(
                 &store,
                 &key,
                 &allowed,
                 window,
-                ConversationTurn::completed(text, "an answer"),
+                JobRecord::completed(text, "an answer"),
                 now,
             );
         }
@@ -4735,8 +5199,8 @@ fn each_window_bound_drops_the_oldest_exchange_on_its_own() {
 
 #[test]
 fn a_history_and_a_revoked_entry_are_two_different_removals() {
-    let store = ConversationStore::new(8);
-    let key = ConversationKey::new("dev", "dev", SUBJECT);
+    let store = BoundedConversationStore::new(8);
+    let key = conversation_key("dev", "dev", SUBJECT);
     let allowed = granted(&["echo.echo"]);
     let now = Instant::now();
 
@@ -4749,7 +5213,7 @@ fn a_history_and_a_revoked_entry_are_two_different_removals() {
         &key,
         &allowed,
         window(),
-        ConversationTurn::completed("what broke?", "two things"),
+        JobRecord::completed("what broke?", "two things"),
         now,
     );
     assert!(store.remove(&key, EvictionReason::GrantChanged));
@@ -4762,8 +5226,8 @@ fn two_sessions_sharing_one_conversation_both_land_their_exchange() {
     // inside it admit under different keys and share one conversation identity, so a sender
     // replying to themselves before the bot answers runs two sessions against one history. Both
     // read the same seed; neither may erase the other's answer.
-    let store = ConversationStore::new(8);
-    let key = ConversationKey::new("slack", "c0123abc:1700000000.000001", SUBJECT);
+    let store = BoundedConversationStore::new(8);
+    let key = conversation_key("slack", "c0123abc:1700000000.000001", SUBJECT);
     let allowed = granted(&["echo.echo"]);
     let now = Instant::now();
 
@@ -4771,22 +5235,26 @@ fn two_sessions_sharing_one_conversation_both_land_their_exchange() {
     let second = store.begin(&key, &allowed, window(), now);
     assert!(first.history.is_empty() && second.history.is_empty());
 
-    store.commit(
-        &key,
-        &allowed,
-        window(),
-        ConversationTurn::completed("what broke?", "two things"),
-        &first.cache_key,
-        now,
-    );
-    store.commit(
-        &key,
-        &allowed,
-        window(),
-        ConversationTurn::completed("still there?", "yes"),
-        &second.cache_key,
-        now,
-    );
+    store
+        .commit(
+            &key,
+            &allowed,
+            window(),
+            JobRecord::completed("what broke?", "two things"),
+            &first.cache_key,
+            now,
+        )
+        .expect("live test lease");
+    store
+        .commit(
+            &key,
+            &allowed,
+            window(),
+            JobRecord::completed("still there?", "yes"),
+            &second.cache_key,
+            now,
+        )
+        .expect("live test lease");
 
     let resumed = store.begin(&key, &allowed, window(), now);
     assert_eq!(resumed.history.len(), 2);
@@ -4796,21 +5264,21 @@ fn two_sessions_sharing_one_conversation_both_land_their_exchange() {
     // is the lane the conversation keeps. The loser paid for one cache lookup on one message; the
     // alternative — the last writer renaming the lane every message — would leave every request
     // naming a lane no earlier request had ever used.
-    assert_ne!(first.cache_key, second.cache_key);
+    assert_eq!(first.cache_key, second.cache_key);
     assert_eq!(resumed.cache_key, first.cache_key);
 }
 
 #[test]
 fn the_store_prints_counts_rather_than_conversations() {
-    // `History` and `ConversationTurn` both derive `Debug`, so a derived impl here would put whole
+    // `History` and `JobRecord` both derive `Debug`, so a derived impl here would put whole
     // conversations into the log stream on one `tracing::debug!(?store)`.
-    let store = ConversationStore::new(8);
+    let store = BoundedConversationStore::new(8);
     commit(
         &store,
-        &ConversationKey::new("dev", "dev", SUBJECT),
+        &conversation_key("dev", "dev", SUBJECT),
         &granted(&["echo.echo"]),
         window(),
-        ConversationTurn::completed("the secret question", "the secret answer"),
+        JobRecord::completed("the secret question", "the secret answer"),
         Instant::now(),
     );
 
@@ -4835,22 +5303,112 @@ fn message_in(conversation: &str, text: &str) -> InboundMessage {
 
 #[test]
 fn a_minted_cache_key_is_opaque_and_never_repeats() {
-    // Both prefixes are crate constants and `IdSequence::new` rejects a malformed one, in which
-    // case minting degrades to an empty key that `with_prompt_cache_key` then drops. That failure
-    // is silent by design — a routing hint must not abort a message — so this is the test that
-    // keeps the constants valid.
-    let first = cache_key::for_conversation();
-    let second = cache_key::for_conversation();
+    // The prefix is a crate constant and `IdSequence::new` rejects a malformed one, in which case
+    // minting degrades to an empty key that `with_prompt_cache_key` then drops. That failure is
+    // silent by design — a routing hint must not abort a message — so a bad prefix would reach
+    // production as every route quietly losing its cache lane, and this is what catches it. The
+    // conversation lane is minted in the harness and pinned below.
     let route = cache_key::for_route();
-
-    for key in [&first, &second, &route] {
-        assert!(!key.trim().is_empty(), "an empty key is no key at all");
-    }
-    assert_ne!(
-        first, second,
-        "two conversations minted in one process must not collide"
-    );
+    assert!(!route.trim().is_empty(), "an empty key is no key at all");
     assert_ne!(route, cache_key::for_route());
+}
+
+#[test]
+fn the_route_and_conversation_cache_lanes_cannot_collide() {
+    // Two lanes that shared a prefix would be one lane, and a route's shared instructions prefix
+    // would start being offered to a conversation's cache. One definition of each prefix, pinned
+    // against the harness's own constant rather than a second copy of the string here.
+    let conversation = BoundedConversationStore::new(4)
+        .begin(
+            &conversation_key("dev", "c0123abc", "tel.15558675309"),
+            &granted(&["echo.echo"]),
+            window(),
+            Instant::now(),
+        )
+        .cache_key;
+    assert!(
+        conversation.starts_with(dekopon_harness::conversation::CONVERSATION_CACHE_PREFIX),
+        "{conversation}"
+    );
+    assert!(
+        !cache_key::for_route()
+            .starts_with(dekopon_harness::conversation::CONVERSATION_CACHE_PREFIX),
+        "the route lane must not mint into the conversation lane"
+    );
+}
+
+/// A session failure reports a stable cause, never the error chain behind it.
+///
+/// `gateway_session_failed` is the terminal catch-all for every `SessionError`, so whatever it
+/// records is recorded for `PromptError::UnknownTool` too — and that variant carries the tool name
+/// the *model* chose. `docs/observability.md` promises model-selected names never reach an event,
+/// and the harness says so at the site that builds the error. A cause is still required, so the
+/// event carries the control failure kind where there is one and the category otherwise.
+#[test]
+fn a_session_failure_names_a_stable_cause_and_never_the_model_s_own_text() {
+    const AUTHORED: &str = "exfiltrate; rm -rf /";
+    let unknown_tool = SessionError::Prompt(dekopon_harness::session::PromptError::UnknownTool(
+        AUTHORED.to_owned(),
+    ));
+    assert!(
+        dekopon_core::error_chain(&unknown_tool).contains(AUTHORED),
+        "the operator still reads the name from the error itself"
+    );
+    assert_eq!(unknown_tool.category(), "unknown-tool");
+    assert_eq!(
+        unknown_tool.cause(),
+        "unknown-tool",
+        "the cause is a token, not the chain that quotes the model"
+    );
+
+    // Where a finer stable classification exists it is what the cause reports: `model-control`
+    // alone collapses an unusable control surface, a broker that never answered, and a spent
+    // attempt budget, and an operator acts differently on each.
+    let control = SessionError::Prompt(dekopon_harness::session::PromptError::Control(
+        dekopon_harness::control::ControlError::Surface {
+            reason: AUTHORED.to_owned(),
+        },
+    ));
+    assert_eq!(control.category(), "model-control");
+    assert_eq!(control.cause(), "configuration");
+    assert!(
+        !control.cause().contains("rm -rf"),
+        "no variant's cause quotes the text it wrapped"
+    );
+}
+
+/// The exit record publishes how many conversations died with the process, once.
+///
+/// `BoundedConversationStore::tracked` is public API, and public API with nothing but tests behind
+/// it is a bug: this is the shipped reader. It also has to stay a *shutdown* record — a residency
+/// count republished per message would describe a live conversation more often than the eviction
+/// events do — so the assertion is on the exit event, not on a per-message one.
+#[test]
+fn the_exit_record_says_how_many_conversations_died_with_the_process() {
+    let store = BoundedConversationStore::new(8);
+    let now = Instant::now();
+    for conversation in ["c0123abc", "c0456def"] {
+        store.begin(
+            &conversation_key("dev", conversation, SUBJECT),
+            &granted(&["echo.echo"]),
+            window(),
+            now,
+        );
+    }
+
+    let capture = dekopon_test_support::CaptureLayer::install();
+    crate::gateway_stopped("shutdown", store.tracked());
+    let events = capture.events_text();
+    assert!(
+        events.contains("gateway_stopped")
+            && events.contains("reason=\"shutdown\"")
+            && events.contains("conversations=2"),
+        "the exit record carries the residency the store reported: {events}"
+    );
+    assert!(
+        !events.contains("c0123abc") && !events.contains(SUBJECT),
+        "it is a count, never a conversation or a sender: {events}"
+    );
 }
 
 #[test]
@@ -4859,8 +5417,8 @@ fn a_cache_key_carries_nothing_about_the_sender() {
     // number, so sending it — or a hash of it, which is a stable pseudonym — would hand a model
     // provider the sender's identity in exchange for routing that happens either way.
     const DISTINCTIVE: &str = "tel.15558675309";
-    let store = ConversationStore::new(8);
-    let key = ConversationKey::new("dev", "c0123abc", DISTINCTIVE);
+    let store = BoundedConversationStore::new(8);
+    let key = conversation_key("dev", "c0123abc", DISTINCTIVE);
     let seed = store.begin(&key, &granted(&["echo.echo"]), window(), Instant::now());
 
     for fragment in [DISTINCTIVE, "15558675309", "tel", "c0123abc"] {
@@ -4880,20 +5438,22 @@ fn an_evicted_conversation_comes_back_with_a_new_cache_key() {
     // Rotation is what keeps the key from becoming a durable pseudonym, and it is also simply
     // correct: an evicted conversation rebuilds a prompt sharing no prefix with the one it
     // replaced, so naming the old lane would be a guaranteed miss.
-    let store = ConversationStore::new(8);
-    let key = ConversationKey::new("dev", "dev", SUBJECT);
+    let store = BoundedConversationStore::new(8);
+    let key = conversation_key("dev", "dev", SUBJECT);
     let allowed = granted(&["echo.echo"]);
     let start = Instant::now();
 
     let first = store.begin(&key, &allowed, window(), start);
-    store.commit(
-        &key,
-        &allowed,
-        window(),
-        ConversationTurn::completed("what broke?", "two things"),
-        &first.cache_key,
-        start,
-    );
+    store
+        .commit(
+            &key,
+            &allowed,
+            window(),
+            JobRecord::completed("what broke?", "two things"),
+            &first.cache_key,
+            start,
+        )
+        .expect("live test lease");
 
     let warm = store.begin(&key, &allowed, window(), start + Duration::from_secs(60));
     assert_eq!(
@@ -4901,7 +5461,8 @@ fn an_evicted_conversation_comes_back_with_a_new_cache_key() {
         "a live conversation stays in the lane its own turns warmed"
     );
 
-    let cold = store.begin(&key, &allowed, window(), start + Duration::from_secs(900));
+    // The warm lookup at 60s is itself a touch, so the idle window runs from there.
+    let cold = store.begin(&key, &allowed, window(), start + Duration::from_secs(960));
     assert!(
         cold.history.is_empty(),
         "the idle timeout dropped the entry"
@@ -4918,7 +5479,8 @@ async fn one_conversation_keeps_one_cache_key_and_two_conversations_never_share_
     // as its prefix, and declaring the same lane is what lets the provider serve that prefix from
     // its cache instead of reading it again.
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(3, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker_with_checks(3, directory.path(), listings(3, &["echo.echo"])).await;
     let models = ModelScript::new([
         answer("Two things broke."),
         answer("The second one was the database."),
@@ -4962,7 +5524,8 @@ async fn a_one_shot_route_sends_every_sender_to_the_route_s_own_lane() {
     // request and give up the only caching a stateless route can have.
     const OTHER_SUBJECT: &str = "tel.16035550100";
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(3, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker_with_checks(3, directory.path(), listings(3, &["echo.echo"])).await;
     let models = ModelScript::new([answer("one"), answer("two"), answer("three")]);
     let replier = Arc::new(RecordingReplier::default());
     let runner = runner(broker, Arc::clone(&models), 4);
@@ -5011,13 +5574,31 @@ impl ChatModel for KeylessModel {
         &self,
         messages: &[ModelMessage],
         _tools: &[ModelTool],
+        recorder: &dyn dekopon_model::usage::AttemptRecorder,
     ) -> Result<AssistantTurn, ModelError> {
-        Ok(answer(
-            messages
-                .last()
-                .and_then(ModelMessage::content)
-                .unwrap_or_default(),
-        ))
+        {
+            let attempt = recorder.begin(dekopon_model::usage::AttemptKind::Adapter)?;
+            let result: Result<AssistantTurn, ModelError> = {
+                Ok(answer(
+                    messages
+                        .last()
+                        .and_then(ModelMessage::content)
+                        .unwrap_or_default(),
+                ))
+            };
+            if let Ok(turn) = &result
+                && let Some(usage) = turn.usage
+            {
+                recorder.observe(
+                    attempt,
+                    dekopon_model::usage::UsageObservation {
+                        usage,
+                        invalid: [false; 5],
+                    },
+                )?;
+            }
+            result
+        }
     }
 }
 
@@ -5026,7 +5607,8 @@ async fn a_model_that_never_heard_of_a_cache_key_still_answers() {
     // `complete_with` is a provided method precisely so this keeps working: an implementation that
     // ignores the options loses a cache lookup, never an answer.
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(1, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker_with_checks(3, directory.path(), listings(1, &["echo.echo"])).await;
     let replier = Arc::new(RecordingReplier::default());
     let runner = runner_with(broker, Arc::new(KeylessModel) as Arc<dyn ModelFactory>, 4);
 
@@ -5301,7 +5883,8 @@ async fn a_transport_owned_thread_continuation_bypasses_only_the_repeat_mention(
     let routes = Arc::new(
         RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("route binds"),
     );
-    let (broker, _observed) = stub_broker(directory.path(), listings(1, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker_with_checks(3, directory.path(), listings(1, &["echo.echo"])).await;
     let models = ModelScript::new([answer("Useful follow-up.")]);
     let runner = runner(broker, Arc::clone(&models), 4);
     let replier = Arc::new(RecordingReplier::default());
@@ -5812,11 +6395,13 @@ async fn a_slack_envelope_is_acknowledged_before_the_session_that_answers_it() {
     let mut transport = slack(&http.base);
     transport.connect().await.expect("slack transport connects");
 
-    let (broker, _observed) = stub_broker(
+    let (broker, _observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
             Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
         )],
     )
     .await;
@@ -6423,6 +7008,7 @@ async fn slack_agent_activity_uses_thread_sessions_and_explicit_lifecycle_states
         SlackActivityConfig {
             mode: ActivityMode::Native,
             classic_fallback: SlackActivityFallback::Reaction,
+            progress_message: false,
         },
     );
     transport.connect().await.expect("Slack Agent connects");
@@ -6486,6 +7072,7 @@ async fn slack_permanently_degrades_agent_status_to_owned_tangerine_reactions() 
         SlackActivityConfig {
             mode: ActivityMode::Native,
             classic_fallback: SlackActivityFallback::Reaction,
+            progress_message: false,
         },
     );
     transport.connect().await.expect("Slack connects");
@@ -6558,6 +7145,7 @@ async fn slack_does_not_remove_a_reaction_this_generation_did_not_add() {
         SlackActivityConfig {
             mode: ActivityMode::Native,
             classic_fallback: SlackActivityFallback::Reaction,
+            progress_message: false,
         },
     );
     transport.connect().await.expect("classic Slack connects");
@@ -6614,6 +7202,7 @@ async fn slack_lost_reaction_response_never_grants_cleanup_ownership() {
         SlackActivityConfig {
             mode: ActivityMode::Native,
             classic_fallback: SlackActivityFallback::Reaction,
+            progress_message: false,
         },
     );
     transport.connect().await.expect("classic Slack connects");
@@ -6733,11 +7322,13 @@ async fn a_slack_answer_is_posted_as_a_markdown_block() {
     let mut transport = slack(&http.base);
     transport.connect().await.expect("slack transport connects");
 
-    let (broker, _observed) = stub_broker(
+    let (broker, _observed) = stub_broker_with_checks(
+        3,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
             Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
         )],
     )
     .await;
@@ -8718,4 +9309,298 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
             .expect("image write and flush are accepted")
             .accepted()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bootstrap_uses_each_fresh_chat_surface_before_request_one_without_discovery() {
+    let directory = temporary();
+    let mut first_capability = capability("echo.echo");
+    first_capability.capability.description = "Return the specified message".to_owned();
+    first_capability.capability.input_schema = json!({"type":"object", "properties":{"message":{"type":"string"}}, "required":["message"], "additionalProperties":false});
+    let schema = first_capability.capability.input_schema.clone();
+    let (broker, mut observed) = stub_broker_with_checks(
+        3,
+        directory.path(),
+        vec![
+            ResponseEnvelope::capabilities(
+                vec![first_capability, capability("private.first-only")],
+                vec!["echo-cli".to_owned()],
+                "fixture-epoch".parse().expect("fixture epoch"),
+            ),
+            ResponseEnvelope::capabilities(
+                vec![capability("echo.echo")],
+                Vec::new(),
+                "fixture-epoch".parse().expect("fixture epoch"),
+            ),
+        ],
+    )
+    .await;
+    let models = ModelScript::new([answer("First answer."), answer("Second answer.")]);
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    for text in ["first", "second"] {
+        run_session(
+            Arc::clone(&runner),
+            route(model_config()),
+            message(text),
+            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        )
+        .await;
+    }
+    assert_eq!(
+        models.requests(),
+        2,
+        "one inference per inbound job, no discovery call"
+    );
+    for index in 0..2 {
+        let messages = models.prompt(index);
+        assert!(
+            messages
+                .iter()
+                .all(|(role, _)| role == "system" || role == "user"),
+            "no fabricated tool or assistant messages"
+        );
+        let context = messages
+            .iter()
+            .find(|(_, text)| text.starts_with("Dekopon session bootstrap\n"))
+            .expect("bootstrap context");
+        let document: Value =
+            serde_json::from_str(context.1.lines().last().expect("metadata JSON"))
+                .expect("bootstrap JSON");
+        assert_eq!(document["selectedModel"], "qwen3");
+        assert!(!context.1.contains(SUBJECT));
+        assert!(!context.1.contains("http://127.0.0.1:1/v1"));
+        assert_eq!(document["capabilities"][0]["id"], "echo.echo");
+        if index == 0 {
+            assert_eq!(
+                document["capabilities"][0]["description"],
+                "Return the specified message"
+            );
+            assert_eq!(document["capabilities"][0]["inputSchema"], schema);
+            assert_eq!(document["commandWords"], json!(["echo-cli"]));
+        } else {
+            assert!(
+                !context.1.contains("private.first-only"),
+                "fresh narrowed grant replaces old metadata"
+            );
+            assert!(!context.1.contains("echo-cli"));
+            assert_eq!(
+                document["capabilities"]
+                    .as_array()
+                    .expect("capabilities")
+                    .len(),
+                1
+            );
+        }
+        assert!(matches!(
+            observed.recv().await.expect("one snapshot per job").request,
+            BrokerRequest::Capabilities {
+                attestation: Some(Attestation { scope: Some(_), .. })
+            }
+        ));
+    }
+    assert_surface_checks(&mut observed, 4);
+    assert!(
+        observed.try_recv().is_err(),
+        "bootstrap runs no discovery commands or broker invocations"
+    );
+    assert_eq!(replier.replies(), ["First answer.", "Second answer."]);
+}
+
+fn conversation_key(transport: &str, conversation: &str, subject: &str) -> ConversationKey {
+    ConversationKey::scoped(
+        "test-agent",
+        "test-route",
+        transport,
+        "test-channel",
+        conversation,
+        subject,
+    )
+}
+
+#[tokio::test]
+async fn configured_controls_validation_is_strict_aggregate_and_resolves_all_candidates() {
+    let directory = temporary();
+    let mut doc = document(directory.path());
+    doc["routes"][0]["controls"] =
+        json!({"models":["local-qwen","local-qwen","missing"],"maxAttempts":9});
+    let error = load(directory.path(), &doc).await.unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("duplicate control model local-qwen"));
+    assert!(text.contains("maxAttempts"));
+    assert!(text.contains("missing"));
+    doc["routes"][0]["controls"] = json!({"models":["local-qwen"],"endpoint":"https://invalid"});
+    assert!(load(directory.path(), &doc).await.is_err());
+    doc["routes"][0]["controls"] = json!({"models":["local-qwen"],"maxAttempts":2});
+    doc["models"][0]["effort"] = json!("high");
+    let config = load(directory.path(), &doc).await.unwrap();
+    assert_eq!(config.models[0].effort(), dekopon_core::Effort::High);
+    assert_eq!(config.routes[0].controls.as_ref().unwrap().max_attempts, 2);
+    doc["models"][0]["effort"] = json!("extreme");
+    assert!(load(directory.path(), &doc).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn configured_controls_reuse_gateway_clients_and_authorize_each_job_from_its_baseline() {
+    use dekopon_broker_protocol::{ControlDecision, ControlOutcome, ProtocolVersion};
+    let directory = temporary();
+    let path = directory.path().join("broker.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let (send, mut recv) = mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        for _ in 0..12 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: RequestEnvelope = read_frame(&mut stream, FrameLimits::default())
+                .await
+                .unwrap();
+            let response = match request.request {
+                BrokerRequest::Capabilities { .. } => ResponseEnvelope::capabilities(
+                    vec![capability("echo.echo")],
+                    vec![],
+                    "fixture-epoch".parse().unwrap(),
+                ),
+                BrokerRequest::AuthorizeControl {
+                    proposal,
+                    attestation,
+                } => {
+                    let claim = attestation.as_ref().unwrap();
+                    assert!(claim.scope.is_some());
+                    assert_eq!(claim.agent, proposal.scope.agent);
+                    assert_eq!(claim.invocation.as_ref(), Some(&proposal.id));
+                    send.send(proposal.clone()).unwrap();
+                    ResponseEnvelope {
+                        api_version: ProtocolVersion::V1Alpha3,
+                        response: dekopon_broker_protocol::BrokerResponse::ControlDecision {
+                            decision: Box::new(ControlDecision {
+                                proposal,
+                                attestation,
+                                surface_epoch: "fixture-epoch".parse().unwrap(),
+                                decision_ref: format!("sha256:{}", "1".repeat(64)),
+                                outcome: ControlOutcome::Admitted,
+                            }),
+                        },
+                    }
+                }
+                _ => panic!("no provider effect or other broker operation expected"),
+            };
+            write_frame(&mut stream, &response, FrameLimits::default())
+                .await
+                .unwrap();
+        }
+    });
+    let switch = || AssistantTurn {
+        content: None,
+        tool_calls: vec![ModelToolCall {
+            id: "switch".into(),
+            kind: "function".into(),
+            function: ModelFunctionCall {
+                name: "select_model".into(),
+                arguments: json!({"model":"alternate"}).to_string(),
+            },
+        }],
+        usage: None,
+        replay_items: vec![],
+    };
+    let models = ModelScript::new([switch(), answer("first"), switch(), answer("second")]);
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner(
+        ResolvedBroker {
+            socket_path: path,
+            server_uid: crate::current_uid(),
+            frame: FrameLimits::default(),
+        },
+        models.clone(),
+        4,
+    );
+    let mut bound = route(model_config());
+    let mut second = model_config();
+    if let ModelConfig::OpenaiCompatible { name, model, .. } = &mut second {
+        *name = "alternate".into();
+        *model = "other-wire-model".into();
+    }
+    bound.controls = Some(crate::routes::BoundControls {
+        models: vec![bound.model.clone(), Arc::new(second)],
+        max_attempts: 4,
+    });
+    for question in ["one", "two"] {
+        run_session(
+            runner.clone(),
+            bound.clone(),
+            message(question),
+            replier.clone() as Arc<dyn ChatReplier>,
+        )
+        .await;
+    }
+    server.await.unwrap();
+    assert_eq!(replier.replies(), ["first", "second"]);
+    assert_eq!(models.builds(), 2);
+    let first = recv.recv().await.unwrap();
+    let second = recv.recv().await.unwrap();
+    assert_ne!(first.scope.job, second.scope.job);
+    for proposal in [&first, &second] {
+        assert_eq!(proposal.from.model.as_str(), "local-qwen");
+        assert_eq!(proposal.to.model.as_str(), "alternate");
+        assert_eq!(proposal.sequence, 1);
+    }
+    assert!(
+        models
+            .prompt(1)
+            .iter()
+            .any(|(_, text)| text.contains("other-wire-model"))
+    );
+    assert!(
+        models
+            .prompt(2)
+            .iter()
+            .any(|(_, text)| text.contains("qwen3"))
+    );
+    assert_ne!(models.cache_key(0), models.cache_key(1));
+    assert_eq!(models.cache_key(0), models.cache_key(2));
+}
+
+mod activity_progress;
+mod lifecycle_receipts;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repair_unknown_work_survives_evicted_history_before_a_followup() {
+    let directory = temporary();
+    let mut responses = listings(5, &["echo.echo"]);
+    responses.push(ResponseEnvelope::error(
+        "outcome-unaudited",
+        "fixture unknown effect",
+    ));
+    responses.extend(listings(2, &["echo.echo"]));
+    let (broker, mut observed) = stub_broker(directory.path(), responses).await;
+    let models = ModelScript::new([script_call("echo.echo"), answer("must not infer again")]);
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let mut tiny = window();
+    tiny.limits.max_bytes = 1;
+    let route = persistent_route(model_config(), tiny);
+    let replier = Arc::new(RecordingReplier::default());
+    for text in ["oversized request", "follow up"] {
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            message(text),
+            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        )
+        .await;
+    }
+    assert_eq!(
+        models.requests(),
+        1,
+        "unknown work fences follow-up before inference"
+    );
+    let mut invocations = 0;
+    while let Ok(request) = observed.try_recv() {
+        if matches!(request.request, BrokerRequest::Invoke { .. }) {
+            invocations += 1;
+        }
+    }
+    assert_eq!(
+        invocations, 1,
+        "unknown effects are not automatically retried"
+    );
+    assert_eq!(replier.replies(), [FAILURE_REPLY, FAILURE_REPLY]);
 }

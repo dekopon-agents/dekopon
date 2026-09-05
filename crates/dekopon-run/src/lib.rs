@@ -11,24 +11,12 @@ use std::{
     env,
     error::Error as _,
     fs::File,
-    io::{self, Read, Write},
+    io::{self, Read},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime, SystemTimeError, UNIX_EPOCH},
 };
 
-#[cfg(unix)]
-use dekopon_agent::{BrokerLeg, BrokerLegError};
-use dekopon_agent::{
-    SessionInvoker, ShellRuntime, command_run_from_outcome,
-    improvement::ImprovementSuggestion,
-    prompt::{PromptError, PromptLimits, ScriptRuntime, SessionInputs, format_script_outcome},
-    replay::{
-        RecordedSession, RecordedToolCall, RecordingError, ReplayInputs, ReplayReport,
-        SessionListing, list_sessions, replay,
-    },
-    report_unobserved_command_run,
-};
 #[cfg(unix)]
 use dekopon_broker_protocol::BrokerSocketDiscovery;
 #[cfg(unix)]
@@ -37,6 +25,23 @@ use dekopon_config::{Skill, SkillError};
 #[cfg(unix)]
 use dekopon_core::IdentifierError;
 use dekopon_core::{CapabilityId, ExternalSubject, ProviderId};
+#[cfg(unix)]
+use dekopon_harness::runtime::{BrokerLeg, BrokerLegError};
+use dekopon_harness::{
+    bootstrap::SessionBootstrap,
+    history,
+    improvement::ImprovementSuggestion,
+    replay::{
+        RecordedSession, RecordedToolCall, RecordingError, ReplayInputs, ReplayReport,
+        SessionListing, list_sessions, replay,
+    },
+    runtime::{
+        ScriptRuntime, SessionInvoker, ShellRuntime, command_run_from_outcome,
+        report_unobserved_command_run,
+    },
+    session::{self, PromptError, PromptLimits, SessionEngine},
+    tools::format_script_outcome,
+};
 use dekopon_model::{
     chatgpt::{ChatGptCodexModel, ChatGptError},
     model::{ChatModel, ModelError, OpenAiChatModel},
@@ -76,10 +81,6 @@ mod trace;
 /// instruction by a model's context; a file past this is not one of either.
 const MAX_TEXT_FILE_BYTES: usize = 64 * 1024 * 1024;
 
-/// The prompt loop and session types now live in `dekopon-agent`; this re-export keeps the
-/// `dekopon_run::prompt` path stable for existing consumers and tests.
-pub use dekopon_agent::prompt;
-
 /// Runs a parsed CLI invocation and returns a process exit code.
 ///
 /// Clap handles syntax failures before this function and exits with code `2`.
@@ -109,7 +110,7 @@ pub async fn run(cli: Cli) -> i32 {
     // silently mis-parent every event emitted there.
     let exit_code = async {
         match evaluate(&cli).await {
-            Ok(output) => match write_output(&output.text) {
+            Ok(output) => match output.write_to(&mut io::stdout().lock()) {
                 Ok(()) => output.exit_code,
                 Err(error) if error.kind() == io::ErrorKind::BrokenPipe => output.exit_code,
                 Err(error) => {
@@ -437,6 +438,7 @@ async fn evaluate_shell(
                     Ok(CommandOutput {
                         text: format_script_outcome(&outcome),
                         exit_code: i32::from(outcome.exit_code.get()),
+                        accounting: None,
                     })
                 })
             })
@@ -654,22 +656,29 @@ async fn evaluate_prompt(
 
     let leg = connect_prompt_broker(broker, connection).await?;
     let span = tracing::Span::current();
+    let accounting = dekopon_harness::accounting::JobAccounting::default();
+    let worker_accounting = accounting.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         let _entered = span.enter();
-        run_prompt_session(settings, leg)
+        run_prompt_session(settings, leg, &worker_accounting)
     })
     .await
     .map_err(AppError::PromptTask)??;
 
     report_suggestions(&outcome.suggestions);
-    Ok(CommandOutput::success(outcome.answer))
+    Ok(CommandOutput {
+        text: outcome.answer,
+        exit_code: 0,
+        accounting: Some(accounting),
+    })
 }
 
 /// Loads providers, builds the model client, and runs the loop. Blocking throughout.
 fn run_prompt_session(
     settings: PromptSettings,
     broker: Option<Box<dyn CapabilityInvoker + Send>>,
-) -> Result<prompt::PromptOutcome, AppError> {
+    accounting: &dekopon_harness::accounting::JobAccounting,
+) -> Result<session::SessionExit, AppError> {
     let registry = Arc::new(ProviderRegistry::load_with_options(
         settings.providers,
         settings.limits,
@@ -685,16 +694,22 @@ fn run_prompt_session(
         curl_capability: settings.curl_capability,
     };
 
-    let mut inputs = SessionInputs::new(&settings.prompt, settings.prompt_limits)
-        .with_system(settings.system.as_deref())
-        .with_skills(&settings.skills);
+    let mut inputs = SessionBootstrap::new(
+        &settings.prompt,
+        settings.prompt_limits,
+        &settings.model.model,
+    )
+    .with_system(settings.system.as_deref())
+    .with_skills(&settings.skills)
+    .with_accounting(accounting);
     if settings.suggestions {
         inputs = inputs.with_improvement_suggestions();
     }
     // A one-shot session starts from an empty conversation and forgets it on the way out; the
     // accumulator exists only because the loop records into one.
-    let mut history = prompt::History::default();
-    prompt::run_prompt_session(model.as_ref(), &runtime, inputs, &mut history)
+    let mut history = history::History::default();
+    SessionEngine::new(model.as_ref(), &runtime)
+        .run(inputs, &mut history)
         .map_err(AppError::from)
 }
 
@@ -792,9 +807,11 @@ async fn evaluate_session(command: &SessionCommand) -> Result<CommandOutput, App
                 prompt.suggestions = *suggestions,
                 replay.system_replaced = settings.system.is_some()
             );
+            let accounting = dekopon_harness::accounting::JobAccounting::default();
+            let worker_accounting = accounting.clone();
             let report = tokio::task::spawn_blocking(move || {
                 let _entered = span.enter();
-                run_replay(settings)
+                run_replay(settings, &worker_accounting)
             })
             .await
             .map_err(AppError::PromptTask)??;
@@ -807,7 +824,11 @@ async fn evaluate_session(command: &SessionCommand) -> Result<CommandOutput, App
             } else {
                 render_replay(&report)
             };
-            Ok(CommandOutput { text, exit_code })
+            Ok(CommandOutput {
+                text,
+                exit_code,
+                accounting: Some(accounting),
+            })
         }
     }
 }
@@ -829,7 +850,10 @@ struct ReplaySettings {
 }
 
 /// Builds the model, loads any live providers, and replays. Blocking throughout.
-fn run_replay(settings: ReplaySettings) -> Result<ReplayReport, AppError> {
+fn run_replay(
+    settings: ReplaySettings,
+    accounting: &dekopon_harness::accounting::JobAccounting,
+) -> Result<ReplayReport, AppError> {
     let model = build_model(&settings.model)?;
     // Providers are loaded only when named: the default replay must be provably effect-free, and
     // a loaded component is a thing that can run.
@@ -851,6 +875,8 @@ fn run_replay(settings: ReplaySettings) -> Result<ReplayReport, AppError> {
         curl_capability: None,
     });
     let inputs = ReplayInputs {
+        accounting: Some(accounting),
+        selected_model: &settings.model.model,
         system: settings.system.as_deref(),
         skills: &settings.skills,
         improvement_suggestions: settings.suggestions,
@@ -866,10 +892,13 @@ fn run_replay(settings: ReplaySettings) -> Result<ReplayReport, AppError> {
 async fn load_recorded(source: &SessionSourceArgs) -> Result<RecordedSession, AppError> {
     if let Some(path) = &source.from_file {
         let text = read_text_file(path)?;
-        return serde_json::from_str(&text).map_err(|error| AppError::ParseRecording {
-            path: path.clone(),
-            source: error,
-        });
+        let recorded: RecordedSession =
+            serde_json::from_str(&text).map_err(|error| AppError::ParseRecording {
+                path: path.clone(),
+                source: error,
+            })?;
+        recorded.validate().map_err(AppError::Recording)?;
+        return Ok(recorded);
     }
     let trace_id = source
         .trace_id
@@ -1038,14 +1067,40 @@ fn render_transcript(recorded: &RecordedSession) -> String {
     for system in &recorded.system {
         text.push_str(&format!("system:\n{}\n", indented(system)));
     }
-    for exchange in &recorded.history {
-        text.push_str(&format!("user (earlier):\n{}\n", indented(&exchange.user)));
-        if let Some(answer) = &exchange.answer {
-            text.push_str(&format!("assistant (earlier):\n{}\n", indented(answer)));
+    if let Some(initial) = recorded.contexts.first() {
+        for message in initial
+            .messages
+            .iter()
+            .take(initial.messages.len().saturating_sub(1))
+            .filter(|m| m.role != "system")
+        {
+            render_context_message(&mut text, message, " (earlier)");
+        }
+    } else {
+        for exchange in &recorded.history {
+            text.push_str(&format!("user (earlier):\n{}\n", indented(&exchange.user)));
+            if let Some(answer) = &exchange.answer {
+                text.push_str(&format!("assistant (earlier):\n{}\n", indented(answer)));
+            }
         }
     }
     text.push_str(&format!("user:\n{}\n", indented(&recorded.prompt)));
     for turn in &recorded.turns {
+        if let Some(context) = recorded
+            .contexts
+            .iter()
+            .skip(1)
+            .find(|c| c.turn == turn.turn && c.scope == "full")
+        {
+            text.push_str(&format!(
+                "context revision {} (turn {}):\n",
+                context.revision.unwrap_or_default(),
+                context.turn
+            ));
+            for message in &context.messages {
+                render_context_message(&mut text, message, " (context)");
+            }
+        }
         let mut header = format!("turn {}", turn.turn);
         if let Some(duration) = turn.duration_ms {
             header.push_str(&format!(" [{duration:.0} ms"));
@@ -1073,6 +1128,29 @@ fn render_transcript(recorded: &RecordedSession) -> String {
         None => text.push_str("answer: (none recorded)\n"),
     }
     text
+}
+
+fn render_context_message(
+    text: &mut String,
+    message: &dekopon_harness::replay::RecordedMessage,
+    label: &str,
+) {
+    text.push_str(&format!(
+        "{}{label}:\n{}\n",
+        message.role,
+        indented(message.content.as_deref().unwrap_or_default())
+    ));
+    for call in &message.tool_calls {
+        text.push_str(&format!(
+            "  tool {} [{}]:\n{}\n",
+            call.function.name,
+            call.id,
+            indented(&call.function.arguments)
+        ));
+    }
+    if let Some(id) = &message.tool_call_id {
+        text.push_str(&format!("  answers tool {id}\n"));
+    }
 }
 
 fn render_tool_call(text: &mut String, call: &RecordedToolCall) {
@@ -1104,7 +1182,9 @@ fn render_replay(report: &ReplayReport) -> String {
     ] {
         text.push_str(&format!(
             "{label}: {} turn(s), {} script(s), {} token(s), answer: {}\n",
-            summary.model_turns,
+            summary
+                .model_turns
+                .map_or_else(|| "-".to_owned(), |turns| turns.to_string()),
             summary.scripts.len(),
             summary
                 .usage
@@ -1123,14 +1203,20 @@ fn render_replay(report: &ReplayReport) -> String {
                 "divergence: turn {} ({}), {} recorded script(s) unused\n  script:\n{}\n",
                 divergence.turn,
                 match divergence.handling {
-                    dekopon_agent::replay::DivergenceHandling::Stopped => "stopped there",
-                    dekopon_agent::replay::DivergenceHandling::Live => "ran live",
+                    dekopon_harness::replay::DivergenceHandling::Stopped => "stopped there",
+                    dekopon_harness::replay::DivergenceHandling::Live => "ran live",
                 },
                 divergence.unused_recorded_scripts.len(),
                 indented(&divergence.script)
             ));
         }
         None => text.push_str("divergence: none\n"),
+    }
+    if report.dropped_history_turns > 0 {
+        text.push_str(&format!(
+            "history: {} recorded exchange(s) did not fit the replay's retention window\n",
+            report.dropped_history_turns
+        ));
     }
     let width = report
         .recorded
@@ -1179,11 +1265,16 @@ fn render_replay(report: &ReplayReport) -> String {
 struct CommandOutput {
     text: String,
     exit_code: i32,
+    accounting: Option<dekopon_harness::accounting::JobAccounting>,
 }
 
 impl CommandOutput {
     fn success(text: String) -> Self {
-        Self { text, exit_code: 0 }
+        Self {
+            text,
+            exit_code: 0,
+            accounting: None,
+        }
     }
 
     /// A command that already streamed its own output and has nothing left to print.
@@ -1192,6 +1283,7 @@ impl CommandOutput {
         Self {
             text: String::new(),
             exit_code: 0,
+            accounting: None,
         }
     }
 }
@@ -1353,6 +1445,7 @@ async fn connect_prompt_broker(
     let leg = BrokerLeg::connect(client, "dekopon-run-prompt", None)
         .await
         .map_err(|error| match error {
+            BrokerLegError::Bootstrap(source) => AppError::from(PromptError::from(source)),
             BrokerLegError::Client(source) => AppError::BrokerClient(source),
             BrokerLegError::SessionIdentifier(source) => AppError::SessionIdentifier(source),
             BrokerLegError::DuplicateCapabilities { capabilities } => {
@@ -1475,7 +1568,7 @@ async fn evaluate_broker(command: &BrokerCommand) -> Result<CommandOutput, AppEr
                             id: invocation_id.clone(),
                             capability: capability.clone(),
                             trace: trace_id.clone(),
-                            trace_parent: dekopon_agent::current_trace_parent(),
+                            trace_parent: dekopon_harness::runtime::current_trace_parent(),
                             secret_use: None,
                             input,
                         },
@@ -1487,7 +1580,11 @@ async fn evaluate_broker(command: &BrokerCommand) -> Result<CommandOutput, AppEr
                     1
                 };
                 serde_json::to_string_pretty(&result)
-                    .map(|text| CommandOutput { text, exit_code })
+                    .map(|text| CommandOutput {
+                        text,
+                        exit_code,
+                        accounting: None,
+                    })
                     .map_err(AppError::Serialize)
             }
             .instrument(tracing::info_span!(
@@ -1587,19 +1684,43 @@ fn read_optional_secret(variable: &str) -> Result<Option<String>, AppError> {
         .map_err(|_| AppError::Environment(format!("environment variable {variable} is not UTF-8")))
 }
 
-fn write_output(output: &str) -> io::Result<()> {
-    // A command that printed as it went returns nothing here, and a bare newline would append a
-    // blank line to output it already finished.
-    if output.is_empty() {
-        return Ok(());
+impl CommandOutput {
+    fn write_to(&self, writer: &mut impl io::Write) -> io::Result<()> {
+        use history::DeliveryDisposition;
+        let mut bytes = self.text.as_bytes().to_vec();
+        if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+            bytes.push(b'\n');
+        }
+        let mut written = 0;
+        let mut flushing = false;
+        let result = (|| {
+            while written < bytes.len() {
+                match writer.write(&bytes[written..]) {
+                    Ok(0) => return Err(io::Error::from(io::ErrorKind::WriteZero)),
+                    Ok(n) => written += n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+            flushing = true;
+            writer.flush()
+        })();
+        let disposition = if result.is_ok() {
+            DeliveryDisposition::Accepted {
+                text: self.text.clone(),
+            }
+        } else if flushing {
+            DeliveryDisposition::Unknown
+        } else if written == 0 {
+            DeliveryDisposition::Failed
+        } else {
+            DeliveryDisposition::Partial
+        };
+        if let Some(accounting) = &self.accounting {
+            accounting.finalize(&disposition);
+        }
+        result
     }
-    let stdout = io::stdout();
-    let mut handle = stdout.lock();
-    handle.write_all(output.as_bytes())?;
-    if !output.ends_with('\n') {
-        handle.write_all(b"\n")?;
-    }
-    handle.flush()
 }
 
 fn report_error(error: &AppError, verbosity: u8) {
@@ -1864,6 +1985,40 @@ impl AppError {
 mod tests {
     use std::{fs, time::Duration};
 
+    /// An unknown turn count renders as `-`, never as `0`.
+    ///
+    /// The JSON half of this is pinned in the harness; the text line is what an operator actually
+    /// reads, and "0 turn(s)" for a recording that never said how many is a claim about spend.
+    #[test]
+    fn an_unknown_recorded_turn_count_renders_as_a_dash() {
+        use dekopon_harness::replay::{ReplayReport, SessionSummary};
+        let unknown = SessionSummary {
+            model_turns: None,
+            ..SessionSummary::default()
+        };
+        let known = SessionSummary {
+            model_turns: Some(2),
+            ..SessionSummary::default()
+        };
+        let text = super::render_replay(&ReplayReport {
+            trace_id: "t1".to_owned(),
+            recorded: unknown,
+            replayed: known,
+            divergence: None,
+            suggestions: Vec::new(),
+            dropped_history_turns: 0,
+            error: None,
+        });
+        assert!(
+            text.contains("recorded: - turn(s)"),
+            "an unknown count is a dash: {text}"
+        );
+        assert!(
+            text.contains("replayed: 2 turn(s)"),
+            "a known count is the number: {text}"
+        );
+    }
+
     use serde_json::json;
 
     #[cfg(unix)]
@@ -1983,6 +2138,115 @@ mod tests {
         assert_eq!(resolve_broker_server_uid(Some(4242)), 4242);
     }
 
-    // Composite dispatch and broker-leg behavior are covered in `dekopon-agent`, where those
+    // Composite dispatch and broker-leg behavior are covered in `dekopon-harness`, where those
     // types now live.
+}
+
+#[cfg(test)]
+mod output_accounting_tests {
+    use super::*;
+    use dekopon_model::model::{AssistantTurn, ModelError, ModelMessage, ModelTool};
+    struct Model;
+    impl ChatModel for Model {
+        fn complete(
+            &self,
+            _: &[ModelMessage],
+            _: &[ModelTool],
+            recorder: &dyn dekopon_model::usage::AttemptRecorder,
+        ) -> Result<AssistantTurn, ModelError> {
+            let attempt = recorder.begin(dekopon_model::usage::AttemptKind::Adapter)?;
+            recorder.observe(
+                attempt,
+                dekopon_model::usage::UsageObservation::from_json(
+                    &serde_json::json!({"input_tokens":7}),
+                    false,
+                ),
+            )?;
+            Ok(AssistantTurn {
+                content: Some("answer".into()),
+                tool_calls: vec![],
+                usage: None,
+                replay_items: vec![],
+            })
+        }
+    }
+    struct NoCapabilities;
+    impl CapabilityInvoker for NoCapabilities {
+        fn granted(&self) -> Vec<String> {
+            vec![]
+        }
+        fn describe(&self, _: &str) -> Option<dekopon_shell::CapabilityDescription> {
+            None
+        }
+        fn invoke(
+            &self,
+            _: &str,
+            _: Value,
+            _: Option<dekopon_core::SecretUseProposal>,
+        ) -> CapabilityCallResult {
+            CapabilityCallResult::NotFound
+        }
+    }
+    struct Fail(io::ErrorKind);
+    impl io::Write for Fail {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(self.0))
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn host_output_finalizes_after_success_broken_pipe_or_failed_write() {
+        for failure in [
+            None,
+            Some(io::ErrorKind::BrokenPipe),
+            Some(io::ErrorKind::PermissionDenied),
+        ] {
+            let ledger = dekopon_harness::accounting::JobAccounting::default();
+            let runtime = ShellRuntime {
+                invoker: NoCapabilities,
+                limits: dekopon_shell::Limits::default(),
+                curl_capability: None,
+            };
+            SessionEngine::new(&Model, &runtime)
+                .run(
+                    SessionBootstrap::new(
+                        "request",
+                        PromptLimits {
+                            max_steps: 1,
+                            max_capability_calls: 1,
+                        },
+                        "fixture",
+                    )
+                    .with_accounting(&ledger),
+                    &mut history::History::default(),
+                )
+                .unwrap();
+            assert!(!ledger.snapshot().finalized);
+            let output = CommandOutput {
+                text: "answer".into(),
+                exit_code: 0,
+                accounting: Some(ledger.clone()),
+            };
+            match failure {
+                None => output.write_to(&mut Vec::new()).unwrap(),
+                Some(kind) => {
+                    assert_eq!(output.write_to(&mut Fail(kind)).unwrap_err().kind(), kind)
+                }
+            }
+            let tracked = ledger.snapshot();
+            assert!(tracked.finalized);
+            assert_eq!(
+                tracked.delivery,
+                if failure.is_some() {
+                    "failed"
+                } else {
+                    "accepted"
+                }
+            );
+            assert_eq!(tracked.totals().cumulative.usage().input_tokens, Some(7));
+            assert!(!ledger.finalize(&history::DeliveryDisposition::Unknown));
+        }
+    }
 }

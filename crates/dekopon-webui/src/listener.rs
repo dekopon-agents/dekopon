@@ -265,15 +265,17 @@ mod tests {
     use dekopon_core::{ACCEPT_BACKOFF_MS, MAX_ACCEPT_BACKOFF_MS};
     use dekopon_test_support::CaptureLayer;
     use tokio::net::{TcpListener, TcpStream};
-    use tracing_subscriber::{layer::SubscriberExt as _, registry};
 
     use super::{AcceptBackoff, BoundedListener, Duration};
     use crate::WebUiLimits;
 
     /// Runs `body` against a capture, returning what it produced beside every event it emitted.
     fn captured<T>(body: impl FnOnce() -> T) -> (T, String) {
-        let capture = CaptureLayer::workspace();
-        let produced = tracing::subscriber::with_default(registry().with(capture.clone()), body);
+        // Through the process-global subscriber, routed to this thread: a scoped dispatcher in a
+        // shared test binary races a sibling's first registration of the same callsite, and the
+        // event is then cached `never` and this test fails only under parallel load.
+        let capture = CaptureLayer::install();
+        let produced = body();
         (produced, capture.events_text())
     }
 
