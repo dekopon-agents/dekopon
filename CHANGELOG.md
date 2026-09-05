@@ -228,7 +228,13 @@ All notable changes to Dekopon are documented here. The format is based on
   configures `controls:`; `docs/upgrading.md` carries the migration.
 - `CheckpointStore::compare_and_save` takes the encoded length of the document its caller built, so
   a store checks its ceiling against that measurement instead of re-encoding the snapshot; an
-  out-of-tree implementation must accept the added argument.
+  out-of-tree implementation must accept the added argument, and `Checkpoint::measure` is public so
+  one that enforces the ceiling itself measures the document the same way the in-tree store does.
+- `dekopon_shell::CapabilityInvoker::check_freshness` returns `Result<(), FreshnessError>` instead
+  of `Result<(), String>`. `FreshnessError` is `Unavailable` or `Changed(SurfaceChange)`, and
+  `SurfaceChange` names which half of the surface moved (`Epoch`, `Descriptions`, `EffectiveViews`,
+  `CommandWords`, `ChatMemory`), so a log site records a stable token rather than a sentence; an
+  out-of-tree implementor changes its signature and returns the typed value.
 
 ### Removed
 
@@ -284,10 +290,34 @@ All notable changes to Dekopon are documented here. The format is based on
   the gate bounded the trimmed text while the renderer bounded the untrimmed one, so surrounding
   whitespace bought a label that passed startup validation and then lost its last characters in the
   channel.
+- A usage field the tracker cannot trust is now reported as unreported calls for that field alone,
+  instead of blanking the whole delta. `take_report` decides every field before it advances its
+  cursor, so a `provider_total` that does not equal `input + output` no longer discards the input
+  and output the same attempt reported, and the calls it covered are no longer skipped for good;
+  the field and the job are named in a warn-level `accounting-field-unreported` record.
+- A second, differing usage observation on one attempt marks that attempt's usage unknown instead
+  of fencing the job and its checkpoint. Duplicate `"usage"` keys in one JSON object and a
+  non-terminal SSE usage that disagrees with the terminal one are both handled that way, and a
+  terminal `response.completed` usage wins over a non-terminal one when they differ.
 - `modelTurns` is unknown rather than zero for a recording whose call list names no chat call at
   all — image calls only, which a truncated page set produces — and the transcript query is ordered
   like the accounting one, so a truncated fetch keeps the start of a session rather than an
-  arbitrary slice.
+  arbitrary slice. A reconstruction always states its call list, empty included, so a current trace
+  whose accounting rows the receiver did not return reads as unknown rather than falling back to
+  its answered turns — a different quantity — the way a file written before call accounting does.
+- The cosmetic ⌛ progress post honors the same channel-slot park bound the answer path does. It is
+  a `chat.postMessage` on the same physical channel, so a 429 there used to park the shared slot
+  for the stated `Retry-After` — up to a day — and drop every later answer in that channel,
+  including the failure fallback, as `post-capacity`.
+- `gateway_session_failed` carries a stable `cause` token rather than the error chain. It is the
+  terminal catch-all for every session failure, including a model-selected tool name, and
+  `docs/observability.md` keeps untrusted model, provider and transport text out of events; a
+  control failure still reports which client failure it was.
+- Session reconstruction names the offender in every conflict it reports: a conflicting accounting
+  call record names its job and call sequence and a conflicting prompt job ID names both IDs, where
+  identical bare sentences collapsed into a single line naming none of them.
+- `gateway_stopped` reports how many conversations were still resident at exit, the denominator for
+  the `gateway_conversation_evicted` churn an operator sizing `sessions.maxConversations` watches.
 
 ## [0.12.0] - 2026-08-29
 
