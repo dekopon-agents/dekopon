@@ -30,10 +30,10 @@ live log or a retained copy, without starting the broker.
 Full mechanics, filesystem requirements, and the limits of local integrity evidence:
 [`crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.md#audit-checkpoint-and-recovery).
 
-## Session checkpoints are not broker audit checkpoints
+## Live session state is not a broker audit checkpoint
 
-The unreleased harness uses bounded process-local memory checkpoints for live session consistency.
-They disappear on restart and do not replace either retained broker file above. Stop prevents later
+The unreleased harness keeps one bounded in-process state object per running session and nothing
+after it ends. It never reaches disk and does not replace either retained broker file above. Stop prevents later
 work and delivery, not already completed effects or observed token spend. Unknown effects require
 operator investigation, not an automatic rerun. See [harness lifecycle and limitations](harness.md)
 and [strict accounting](observability.md#accounting). Model/effort controls and Slack progress are

@@ -10,8 +10,8 @@ not a published crate or permission to bootstrap publication.
 `SessionEngine::new(model, runtime).run(bootstrap, &mut history)` is the concrete driver.
 `SessionBootstrap` supplies host context, instructions, services and optional controls/activity.
 `ScriptRuntime` and `ShellRuntime` adapt direct read-only execution or the identity-free broker
-protocol client. `ContextPolicy`, `CheckpointStore` and `ModelRegistry` are narrow replaceable
-seams, not a framework-wide agent trait. Runner, replay and gateway consume the engine.
+protocol client. `ContextPolicy` and `ModelRegistry` are narrow replaceable seams, not a
+framework-wide agent trait. Runner, replay and gateway consume the engine.
 
 The gateway retains authenticated ingress, routing coordinates, admission, cached clients, Stop,
 reply delivery and transport receipts. It supplies harness-owned conversation storage and retains
@@ -45,8 +45,8 @@ rerun or exactly-once effect claim exists.
 Retained history defaults to 12 jobs/64 KiB, independently of the 1 MiB model-context and 512 KiB
 whole-group ceilings; execution excerpts are at most 4 KiB. Retention can discard old bounded
 records and is not an audit archive. Pending-work warnings survive selection. Reasoning, binary
-attachments, generated PNGs and opaque provider continuation are excluded from history/checkpoints.
-Trimming or switching discards incompatible continuation and repairs skill/inspection repeat
+attachments, generated PNGs and opaque provider continuation are excluded from history and job
+state. Trimming or switching discards incompatible continuation and repairs skill/inspection repeat
 pointers so missing text can be read again.
 
 `BoundedConversationStore` keys agent/route/transport/channel/conversation/sender from routing
@@ -68,44 +68,37 @@ eviction step ever encodes the retained corpus. `HistoryLimits::MAX_TURNS` and
 `HistoryLimits::MAX_BYTES` are the hard clamps any configured window is reduced to, published so a
 reader reconstructing a recorded history can report what the clamp dropped.
 
-## Checkpoints, accounting and controls
+## Job state, accounting and controls
 
-All engines consume supplied bounded memory checkpoints by default. Version 2 snapshots contain
-position/revision/scope/surface, model/effort, portable history/evidence, pending work, spent budgets,
-one-attempt flags, skill state and the mandatory token tracker including sequences/report cursor
-and terminal flags. Storage uses exclusive live-job leases and compare-and-save receipts; limits
-are `MAX_JOBS` = 128 jobs, 2 MiB per snapshot, and a store ceiling of exactly
-`MAX_JOBS * MAX_CHECKPOINT_BYTES` = 256 MiB so the two agree. Active jobs reserve worst-case space
-and are not evicted, which makes `MAX_JOBS` a **concurrency ceiling**: every live session holds one
-lease, so `dekopond` refuses a `sessions.maxConcurrent` above it at startup rather than converting
-the surplus into capacity refusals under load. A store already holding `MAX_JOBS` leases refuses
-the next one before evicting anything, so a refusal never destroys the snapshots the other
-in-flight messages still need. Capacity failure precedes work, and the refusal names the ceiling.
-Each stored snapshot's encoded size is measured once by the save that stored it, so eviction reads
-cached sizes rather than re-encoding every stored checkpoint on every step. A mutation walks the
-snapshot exactly once as well, at any size: the model-facing group ceiling, the per-checkpoint byte
-ceiling and the save all come from one traversal, taken as two measurements of disjoint halves —
-the tool groups, and the document with them removed — rather than two measurements of the whole.
-That matters because a mutation runs several times per tool call and holds the live lock while it
-does, and because a checkpoint well inside its 2 MiB ceiling is already several times the 512 KiB
-group ceiling. Trimming an oversized group set re-measures one omitted batch at a time, never the
-list per omission. An out-of-crate `CheckpointStore` measures a document with `Checkpoint::measure`
-rather than trusting the length its caller passed. Saves surround dispatch
-observations, transitions and terminalization; failed persistence fences old copies and retains
-live observations.
+A session's state is live, in-process and request-scoped: `ExecutionJournal` owns one `Checkpoint`
+for the duration of one turn and nothing outside that turn reads it. It holds position,
+scope/surface, model/effort, portable history and evidence, pending work, spent budgets,
+one-attempt flags, skill state and the mandatory token tracker including sequences, report cursor
+and terminal flags. There is no store, no lease, no revision and no persistence: dekopon runs as a
+single executable on one machine, and if high availability ever arrives it will be Kubernetes
+leases in front of the process, not an application-level lease/CAS protocol inside it. Nothing
+here is crash durability, a broker audit checkpoint, automatic recovery of binary assets or
+exactly-once execution.
 
-These are **process-local storage receipts**, not crash durability, broker audit checkpoints,
-automatic recovery of binary assets or exactly-once execution. Resume requires matching scope and
-fresh surface, preserves consumed limits and refuses unresolved work. A noninitial model selection
-requires fresh admission from the configured baseline; stored decisions grant nothing.
-**No shipped binary resumes a checkpoint today.** Neither `dekopond` nor `dekopon-run` calls the
-resume path: a checkpoint is what a failing session leaves behind for inspection and what fences a
-retry, not a queue something drains. `SessionBootstrap::with_resume` is crate-visible for that
-reason, and the engine's own tests are what exercise the path.
+Every mutation revalidates the whole state and a mutation that breaks a bound fences the job for
+good, while still applying what it observed: a fenced session reports what it did rather than
+losing it. Each field is bounded on its own — 128 executions, 4 KiB per excerpt, 128 KiB of user
+text, 128 tool batches, 1280 transitions — so exactly one bound needs an encoding to enforce it,
+the 512 KiB model-facing group ceiling. That matters because a mutation runs several times per
+tool call and holds the live lock while it does. Trimming an oversized group set re-measures one
+omitted batch at a time, never the list per omission, and keeps a labelled position marker for an
+omitted batch rather than orphaning its results in the execution ledger.
+
+A host that must remember the completed job reads it from `SessionBootstrap::with_final_state`:
+the engine records its turn into the caller's `History` as well, but bounded retention trims that
+copy, and a conversation window narrower than one job's text would otherwise drop a started job
+whose effects are unresolved. A fenced session hands the same state back through
+`PromptError::Interrupted`. A noninitial model selection requires fresh admission from the
+configured baseline; nothing recorded grants anything.
 
 `TokenTracker` owns logical chat/image calls and bounded inference-attempt observations across
-model segments and resume. `ChatModel`/`ImageGenerator` require `AttemptRecorder`: reserve before
-each inference transmission and observe usage before decoding content. The single explicit-401
+model segments. `ChatModel`/`ImageGenerator` require `AttemptRecorder`: reserve before each
+inference transmission and observe usage before decoding content. The single explicit-401
 subscription retry is a second inference attempt; authentication refresh is not. Missing or invalid
 usage is unknown, never zero; cached input and reasoning output are subsets, never additive spend.
 Observed usage survives cancellation, tool errors, failed persistence and failed delivery.
@@ -117,9 +110,9 @@ No prices or subscription-dollar estimates are inferred.
 Optional `select_model` and `set_effort` tools select only configured clients. A control must be its
 sole tool in a batch; mixed batches execute nothing. Local refusals and broker denials consume the
 maximum four attempts per job. Fresh broker `agent.prompt` plus each changed-dimension Cedar action
-is required. Safe application checkpoints, preserves budgets/evidence, rotates cache/continuation
-and rebuilds portable context. Missing controls disables the tools, including in direct/replay
-runners with a provider broker leg. See [gateway configuration](dekopond.md#configured-model-and-effort-controls-unreleased)
+is required. Safe application records the transition, preserves budgets/evidence, rotates
+cache/continuation and rebuilds portable context. Missing controls disables the tools, including
+in direct/replay runners with a provider broker leg. See [gateway configuration](dekopond.md#configured-model-and-effort-controls-unreleased)
 and [lockstep migration](upgrading.md#0120--next-unreleased--core-controls-and-v1alpha3).
 
 ## Cosmetic activity and current limitations
@@ -128,7 +121,7 @@ The runtime activity seam reports actual submissions with bounded public configu
 arguments, private titles, results or reasoning. Submission is not execution evidence. Slack may
 opt into one owned ordinary progress post plus its existing native status/reaction; Discord and
 Telegram use their existing expiring typing actions, local is a no-op and WhatsApp has no activity.
-Progress is coalesced/bounded, separate from history/checkpoints/receipts, and holds no execution
+Progress is coalesced/bounded, separate from history/job state/receipts, and holds no execution
 or final-delivery I/O lock. Physical channel post pacing can delay acceptance.
 Posts may notify or remain platform-retained after failed removal. See
 [activity lifecycle and platform bounds](dekopond.md#structured-activity-and-slack-progress-unreleased).
@@ -145,9 +138,8 @@ back, on the `invoke` path. A failed check names which part of the surface moved
 descriptions, the effective views, the command words, or the chat-memory surface. The comparison is
 five per-component digests taken once when the session's broker leg is built, so a check costs the
 round trip and nothing else. Changed or uncertain
-responses fence the checkpoint and retain live observations privately; they do not authorize effects.
-Inactive fenced entries can be evicted under the same bounded store policy; restore then fails, never
-selects an older snapshot. Model-selected capability identifiers are validated before reservation.
+responses fence the job and retain live observations privately; they do not authorize effects.
+Model-selected capability identifiers are validated before reservation.
 Portable context normalizes tool IDs by host job/call/batch coordinates.
 
 Slack startup refuses two authenticated configurations for the same endpoint/team/bot installation.

@@ -9,8 +9,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Added
 
-- Harness-owned execution-aware history, scoped generation leases and bounded versioned memory
-  checkpoints. Request-one bootstrap carries fresh descriptions and complete input schemas;
+- Harness-owned execution-aware history, scoped generation leases and bounded live per-job session
+  state. Request-one bootstrap carries fresh descriptions and complete input schemas;
   execution evidence and consumed budgets survive inference failure and Stop, while generated
   text, accepted delivery and optional durable-memory recording remain separate.
 
@@ -19,11 +19,11 @@ All notable changes to Dekopon are documented here. The format is based on
   post, coalesced updates and generation-safe best-effort cleanup, separate from replies/history.
   Existing Agent status/Stop/reaction and Discord/Telegram typing remain; local/WhatsApp are no-ops.
 
-- Add harness-owned checkpointed token accounting across inference attempts, model/effort segments and terminal delivery outcomes; preserve unknown usage and replace success-only token observers.
+- Add harness-owned token accounting across inference attempts, model/effort segments and terminal delivery outcomes; preserve unknown usage and replace success-only token observers.
 
 - Unreleased configured model/effort transitions in `dekopon-harness`, opt-in gateway route
   `controls`, reused allowlisted clients, sole-tool batch preflight, bounded refusal-inclusive
-  attempts, fresh broker admission per application, checkpointed portable-context rebuilds and
+  attempts, fresh broker admission per application, recorded portable-context rebuilds and
   replay/cache invalidation without resetting work budgets. Explicit model effort is encoded as
   Chat Completions `reasoning_effort` or Responses `reasoning.effort`; default omits the setting.
   Direct/replay runners remain fail-closed without a control authorizer.
@@ -232,15 +232,9 @@ All notable changes to Dekopon are documented here. The format is based on
   `dekopon-harness` also gains `sha2`, for the per-component surface digests a session's freshness
   check compares, and `dekopon-broker` gains `getrandom`, for the startup epoch every control
   admission is bound to.
-- `sessions.maxConcurrent` is validated at startup against `dekopon_harness::checkpoint::MAX_JOBS`
-  (128), the checkpoint-lease ceiling every live session holds one of, and the refusal names the
-  field, the value and the constant. A configured model whose `name` is not a configured-model
-  identifier is refused with `models[].name` and the offending value, whether or not the deployment
-  configures `controls:`; `docs/upgrading.md` carries the migration.
-- `CheckpointStore::compare_and_save` takes the encoded length of the document its caller built, so
-  a store checks its ceiling against that measurement instead of re-encoding the snapshot; an
-  out-of-tree implementation must accept the added argument, and `Checkpoint::measure` is public so
-  one that enforces the ceiling itself measures the document the same way the in-tree store does.
+- A configured model whose `name` is not a configured-model identifier is refused at startup with
+  `models[].name` and the offending value, whether or not the deployment configures `controls:`;
+  `docs/upgrading.md` carries the migration.
 - `dekopon_shell::CapabilityInvoker::check_freshness` returns `Result<(), FreshnessError>` instead
   of `Result<(), String>`. `FreshnessError` is `Unavailable` or `Changed(SurfaceChange)`, and
   `SurfaceChange` names which half of the surface moved (`Epoch`, `Descriptions`, `EffectiveViews`,
@@ -253,13 +247,6 @@ All notable changes to Dekopon are documented here. The format is based on
   comparison guards disclosure rather than authority; dropping it from the inner loops removes one
   broker round trip per tool call and per invocation without moving where a decision is made.
   `docs/security-model.md` and `docs/harness.md` name the two checks that remain.
-- The harness checkpoint store's byte ceiling is `MAX_JOBS * MAX_CHECKPOINT_BYTES`, so its lease
-  ceiling and its byte ceiling agree at 128 rather than exhausting the second at 32 reservations —
-  which is what silently capped a deployment's concurrent sessions at a quarter of the leases it
-  advertised. A store already holding `MAX_JOBS` leases refuses the next one with `Capacity` before
-  it evicts anything, so reaching the ceiling no longer destroys every stored checkpoint on the way
-  to an error, and the refusal names the ceiling. `MAX_JOBS` is public and `docs/harness.md` states
-  the relationship.
 - A conversation's idle timeout runs from its last message rather than from its last committed
   turn: `begin` touches the entry the way `commit` already did. Without it a session that answered
   slowly left its own conversation the least recently touched candidate at the moment it finished,
@@ -297,15 +284,36 @@ All notable changes to Dekopon are documented here. The format is based on
   `USAGE_FIELD_NAMES`, `ObservationPrecedence`, `LoggedAttempt`, `AttemptLog`, `conflicting_fields`,
   and a defaulted `AttemptRecorder::observe_ranked`, and `ChatGptError` gains `Accounting`;
   `dekopon-harness` gains `control::ControlFailureKind` and `ControlError::Surface`, makes
-  `TransitionOutcome::AuthorizationFailed` a struct variant carrying `cause` (a checkpoint JSON
-  shape change, unreleased), adds `precedence` to `AttemptRecord`, and publishes
-  `HistoryLimits::MAX_TURNS`/`MAX_BYTES`, `checkpoint::MAX_JOBS`, `CONVERSATION_CACHE_PREFIX`,
+  `TransitionOutcome::AuthorizationFailed` a struct variant carrying `cause`, adds `precedence` to
+  `AttemptRecord`, and publishes `HistoryLimits::MAX_TURNS`/`MAX_BYTES`, `checkpoint::FinalState`
+  with `SessionBootstrap::with_final_state`, `CONVERSATION_CACHE_PREFIX`,
   `MAX_ACTIVITY_LABEL_BYTES`, `MAX_ACTIVITY_LABELS`, and `label_is_renderable`;
   `PolicyBuildError::{ReservedAction, DuplicateCapability}` and `BootstrapError::{Identifier,
   InvalidSchema}` carry every collision rather than one; and `dekopond`'s `cache_key::for_conversation`
   is deleted in favor of the harness-owned prefix constant both minting sites now share.
 
 ### Removed
+
+- Removed the harness checkpoint *store*. `CheckpointStore`, `MemoryCheckpointStore`,
+  `memory_checkpoints`, `SaveReceipt`, `SessionEngine::with_checkpoint_store`, lease tokens,
+  `compare_and_save`'s revision CAS, the fencing flag, `CHECKPOINT_VERSION`,
+  `Checkpoint::validate_resume` and the whole resume path are gone, along with `MAX_JOBS`,
+  `MAX_STORE_BYTES`, `MAX_CHECKPOINT_BYTES` and `Checkpoint::measure`. That was a contract for a
+  distributed store with one in-process `BTreeMap` behind it: dekopon runs as a single executable
+  on one machine, nothing ever resumed a snapshot, and if high availability arrives it will be
+  Kubernetes leases in front of the process rather than an application-level protocol inside it.
+  `ExecutionJournal` now owns its `Checkpoint` directly and revalidates every field bound on every
+  mutation; `CheckpointError` keeps only the variants that still fire (`Capacity`, `Fenced`,
+  `Poisoned`, `Invalid`, `ScopeChanged`, `UnknownWork`, `Budget`), and `Position::Finalized` and
+  `Checkpoint::{version, revision, finalized}` go with the terminal write that set them. A mutation
+  now measures only `record.groups`, the one field whose bound is a byte count, instead of
+  encoding the whole document to check a store ceiling. A host that must remember the completed job
+  reads the untrimmed record from the new `SessionBootstrap::with_final_state`
+  (`checkpoint::FinalState`), which is also how `dekopond` keeps a job whose text a narrow
+  conversation window evicted.
+- `dekopond` no longer refuses to start on `sessions.maxConcurrent` above 128, and
+  `ConfigProblem::ExcessiveMaxConcurrent` is gone. That ceiling was the checkpoint store's
+  per-lease heap reservation, not anything the gateway could not serve; zero is still refused.
 
 - Removed `dekopon-agent`. `dekopon-harness` replaces it outright — no compatibility crate, no
   alias, no `run_prompt_session` facade — so there is no newer `dekopon-agent` version to move a
@@ -390,12 +398,10 @@ All notable changes to Dekopon are documented here. The format is based on
   identical bare sentences collapsed into a single line naming none of them.
 - `gateway_stopped` reports how many conversations were still resident at exit, the denominator for
   the `gateway_conversation_evicted` churn an operator sizing `sessions.maxConversations` watches.
-- A whitespace-only completion is no longer stored as the job's generated answer before it is
-  rejected, so a job resumed from that checkpoint can no longer deliver an empty answer with a
-  `Send` outcome. `SessionBootstrap::with_resume` is `pub(crate)`, and `docs/harness.md` says
-  plainly that no shipped binary resumes a checkpoint today.
+- A whitespace-only completion is no longer recorded as the job's generated answer before it is
+  rejected, so the conversation this turn is appended to no longer replays a blank assistant turn.
 - A control authorization failure carries a typed `ControlFailureKind` instead of a discarded
-  `ClientError`: the kind reaches the checkpointed transition record, the `accounting.model.transition`
+  `ClientError`: the kind reaches the recorded transition, the `accounting.model.transition`
   event, and the gateway's `gateway_session_failed` through `cause`, so a `ControlBinding` refusal
   and a `ConnectTimeout` are no longer the same line in the log.
 - A ledger refusal is reported as what it is. `ChatGptRequestError` and `ChatGptError` gain

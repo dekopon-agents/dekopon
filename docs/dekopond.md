@@ -148,10 +148,9 @@ A gateway that starts and then refuses everything is worse than one that does no
 - a route naming an agent the catalog does not contain, or one the catalog disables;
 - an agent with no resolvable model — no `model` override and no configured model offering its `modelClass`, or no `modelClass` at all;
 - duplicate transport names, duplicate model names, a route naming an unknown transport or an unknown model;
-- a zero step budget, a zero capability budget, or zero concurrency, or a `sessions.maxConcurrent`
-  above the harness's `MAX_JOBS` checkpoint-lease ceiling (128) — every live session holds one
-  lease, so a larger number buys capacity refusals under load rather than concurrency, and the
-  refusal names the field, the value, and the constant;
+- a zero step budget, a zero capability budget, or zero concurrency. `sessions.maxConcurrent` has
+  no upper bound of its own: the harness holds one session's state for the life of that session
+  and nothing else, so what a number here buys is decided by the model endpoint and the machine;
 - a configured model whose `name` is not a configured-model identifier (`[a-z0-9][a-z0-9._-]{0,63}`),
   which is refused whether or not the deployment configures `controls:`, naming `models[].name` and
   each offending value;
@@ -206,14 +205,13 @@ unsupported, mixed-batch and policy-denied requests. A control must be the only 
 a mixed/multiple-control turn executes **none** of its tools and receives correlated refusals.
 An optional decline keeps precedence and still runs no work.
 
-The harness checkpoints before preparation/authorization and after application. Each applied
+The harness records the transition before preparation/authorization and after application. Each applied
 transition replaces the selected cached client/options, rotates its opaque cache lane, discards
 provider continuation, and rebuilds model identity, system/tool context and portable history.
 Consumed model/capability/asset/control budgets, image-attempt flags and execution evidence do
 not reset. Client-preparation failure and denial retain the previous selection; interrupted
-broker exchanges, changed startup epochs, Stop or checkpoint failure halt further inference.
-Recreated runtimes freshly authorize a noninitial checkpoint selection from the configured
-baseline, spending another attempt; every new inbound job starts at baseline.
+broker exchanges, changed startup epochs, Stop or a fenced job halt further inference.
+Every new inbound job starts at baseline.
 
 Both built-in transports encode explicit effort, but wire support does not promise acceptance
 by an arbitrary compatible model or the undocumented subscription backend. A remote refusal
@@ -373,7 +371,7 @@ capability names never select text. Controls/bidi marks are removed and labels a
 The runtime emits typed job/generation/sequence/operation/phase/outcome observations at each actual
 submission, including multiple calls inside functions/loops/provider commands in one script.
 Help/builtins are not submissions. These events prove neither admission nor external execution.
-They never enter history, checkpoints, replay, delivery receipts or durable memory.
+They never enter history, job state, replay, delivery receipts or durable memory.
 
 Slack `activity.progressMessage: true` requires `mode: native` and adds one **ordinary bot-owned
 message**, independent of Agent status and the configured reaction fallback. It also works in
@@ -648,7 +646,7 @@ and generated PNGs are absent. Excerpts are bounded/digested; incomplete groups 
 are labelled, never fabricated successes. Retained records and selected model context have separate
 bounds. Unknown execution remains fenced even when a tiny text window evicts every record, including
 a stopped job. A pre-model failure may leave a reserved empty conversation generation but records no
-job. See [harness.md](harness.md) for exact ceilings, checkpoint semantics and known gaps.
+job. See [harness.md](harness.md) for exact ceilings, job-state semantics and known gaps.
 
 ### The bounds
 

@@ -141,7 +141,7 @@ New in 0.5.0 — chat that can see what you sent it. One documented invariant wa
 ## Unreleased harness work
 
 The source tree now replaces `dekopon-agent` with `dekopon-harness`: fresh scoped schemas before
-inference, execution-aware history and memory checkpoints, strict job/attempt token accounting,
+inference, execution-aware history and live per-job session state, strict job/attempt token accounting,
 broker-controlled configured model/effort switches and optional owned Slack progress. Skills,
 suggestions and recorded replay remain unreleased. See [the runtime contract and integration
 gaps](docs/harness.md) and [lockstep/API migration](docs/upgrading.md). This is not part of the

@@ -42,7 +42,7 @@ They are gone. What remains is accounting, refusals, errors, and payloads.
 
 ## Accounting
 
-The unprivileged harness owns one mandatory checkpointed `TokenTracker` for each opaque job.
+The unprivileged harness owns one mandatory `TokenTracker` for each opaque job.
 These are operational facts, not broker authority, a delivery receipt, a billing reconciliation,
 or estimated dollars. Subscription token reports do not imply public-API prices.
 
@@ -86,10 +86,9 @@ disagree leave only the fields they disagree about unknown, fencing neither the 
 A later Stop, tool error, persistence failure or reply failure cannot erase observed tokens. Live
 Stop drains synchronous bounded inference before terminal accounting. Dropping the last finalizer
 after workers settle records abandoned/unknown delivery; process death can leave an unterminated,
-unknown job and never proves complete spend. Terminal flags are checkpointed; failed persistence
-fences the retained store copy, while live observations still reach accounting. Memory checkpoints
-promise no crash durability or exactly-once effects/export. A repeated restore does not recount
-calls, reset consumed limits or open another segment merely to reauthorize the restored client.
+unknown job and never proves complete spend. Terminal flags live on the tracker itself, and a
+fenced job still reaches accounting with everything it observed. The tracker is in-process state:
+it promises no crash durability and no exactly-once effects or export.
 
 Transitions, including denied/failed/local refusals, snapshot spend without fabricating a model
 call. Only applied model/effort changes create segments; return-to-model totals include earlier
@@ -116,8 +115,8 @@ Method/authority/status are absent when unknown, and paths, queries, headers and
 
 `ModelUsageReport` is a best-effort delta projection of the harness tracker, not another accumulator.
 Its historical `modelCalls`/`unreportedCalls` fields count attempt observations (including explicitly
-unknown adapter operations), including failed and cancelled calls and images. A checkpointed report
-cursor prevents reporting old observations again on resume, and it advances only after every field
+unknown adapter operations), including failed and cancelled calls and images. A report cursor
+prevents offering the same observations twice, and it advances only after every field
 of the delta has been decided. A field the tracker cannot trust — an untrusted or overflowed known
 sum — is reported as unreported calls for that field rather than dropping the whole delta, so one
 bad field never converts the other four into silence; nothing else is refused here, and the broker
@@ -162,9 +161,9 @@ the gateway holds and no subject, only what the model chose to write into those 
 
 Two harness failures have no audit record because neither is a decision about a request; each is an
 error-level log line carrying a stable `cause_type` and the underlying failure. `live-checkpoint-lock`
-is a poisoned checkpoint mutex: a read recovers it, because the observations already recorded are
-exactly what a failing session still has to report, while a write refuses and fences the lease, and
-the token is how an operator tells a fenced job caused by a panic from one caused by a full store.
+is a poisoned session-state mutex: a read recovers it, because the observations already recorded are
+exactly what a failing session still has to report, while a write refuses and fences the job, and
+the token is how an operator tells a fence caused by a panic from one caused by a broken bound.
 `control-surface` is emitted where a session's control surface cannot be built — invalid configured
 control targets, an attempt budget outside `1..=MAX_CONTROL_ATTEMPTS`, or a baseline selection that
 is not one of those targets — and its `cause` carries every one of those conflicts joined, so an

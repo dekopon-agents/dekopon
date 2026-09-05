@@ -64,7 +64,8 @@ Dashboards migrate from `accounting.model.turn`/separate image accounting to the
 one aggregation level, never sum all three. Informational `ModelUsageReport` now derives solely
 from tracker attempt observations, not a success-only observer. Unknown totals display unknown.
 New transcript events identify context revision/full versus delta; the reader currently refuses
-later full rebuilds. Checkpoints are version 2 process-local memory, not on-disk upgrade state.
+later full rebuilds. A session's state is live in-process memory that ends with the turn, not
+on-disk upgrade state and not something a second process reads.
 See [the runtime contract and remaining integration gaps](harness.md).
 
 **Every `models[].name` in `dekopond.yaml` must now be a configured-model identifier**:
@@ -76,10 +77,10 @@ and `controls.models` entry that points at it in the same edit; the name is a lo
 renaming it changes no endpoint and no credential. The refusal names `models[].name` and the
 offending value, and every offending name is reported in one startup failure.
 
-`sessions.maxConcurrent` is now validated against the harness checkpoint store's lease ceiling
-(`dekopon_harness::checkpoint::MAX_JOBS`, 128). A configuration asking for more sessions than the
-store admits leases is refused at startup instead of turning the surplus into capacity failures
-under load; the refusal names the field, the value and the constant.
+`sessions.maxConcurrent` has no application-level ceiling. The harness holds one session's state
+for the life of that session and nothing after it, so there is no store ceiling for a concurrency
+knob to be validated against. A file edited down to 128 against an earlier build of this branch can
+be raised again; nothing else about the field changed.
 
 ### 0.12.0 → next (unreleased) — core controls and `v1alpha3`
 

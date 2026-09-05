@@ -157,7 +157,7 @@ Persistent conversations add one more thing that terminates in this daemon — c
 broker `controlTargets`, explicit chat scope and narrower gateway candidates. Complete opaque
 request/job/session/generation bindings, startup epoch and from/to intent are verified by a live
 consume-once client. Admission is audited before return, not proof of application; lost responses
-are not retried. Provider JSON, model text and checkpoints cannot create verified admission.
+are not retried. Provider JSON, model text and recorded session state cannot create verified admission.
 Selection fields express intent, not broker-verified live model state. These controls constrain
 untrusted proposals; they do not constrain a compromised gateway already holding model credentials
 or another same-UID process. No Cedar, provider credentials, endpoint or policy payload enters the
