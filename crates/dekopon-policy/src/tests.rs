@@ -1,9 +1,10 @@
 use dekopon_capability::{EffectKind, Idempotency};
-use dekopon_core::{RiskLevel, SecretSinkKind};
+use dekopon_core::{ProviderId, RiskLevel, SecretSinkKind};
 
 use super::{
-    AGENT_PROMPT_ACTION, MAX_POLICY_BYTES, PolicyBuildError, PolicyContext, PolicyDecision,
-    PolicyEngine, PolicyRequest, PolicyTarget, PolicyWorld, SECRET_USE_ACTION, UnresolvedKind,
+    AGENT_EFFORT_SET_ACTION, AGENT_PROMPT_ACTION, MAX_POLICY_BYTES, PolicyBuildError,
+    PolicyContext, PolicyDecision, PolicyEngine, PolicyRequest, PolicyTarget, PolicyWorld,
+    SECRET_USE_ACTION, UnresolvedKind,
 };
 
 /// The workflow world: two principals, two echo capabilities.
@@ -535,6 +536,45 @@ fn world_construction_rejects_duplicates_and_reserved_names() {
         )
         .expect_err("a capability must not shadow a fixed action");
         assert!(matches!(reserved, PolicyBuildError::ReservedAction { .. }));
+    }
+}
+
+#[test]
+fn every_reserved_and_every_duplicate_capability_is_reported_in_one_failure() {
+    let provider = || {
+        "agent"
+            .parse::<ProviderId>()
+            .expect("valid provider fixture")
+    };
+    let reserved = PolicyWorld::new(
+        [],
+        [
+            (AGENT_PROMPT_ACTION.parse().unwrap(), provider()),
+            (AGENT_EFFORT_SET_ACTION.parse().unwrap(), provider()),
+        ],
+    )
+    .expect_err("two reserved collisions must not be reported one restart at a time");
+    let message = reserved.to_string();
+    for action in [AGENT_PROMPT_ACTION, AGENT_EFFORT_SET_ACTION] {
+        assert!(message.contains(action), "{action} missing from {message}");
+    }
+
+    let duplicates = PolicyWorld::new(
+        [],
+        [
+            ("echo.echo".parse().unwrap(), provider()),
+            ("echo.echo".parse().unwrap(), provider()),
+            ("http.fetch".parse().unwrap(), provider()),
+            ("http.fetch".parse().unwrap(), provider()),
+        ],
+    )
+    .expect_err("two duplicated routes must both be named");
+    let message = duplicates.to_string();
+    for capability in ["echo.echo", "http.fetch"] {
+        assert!(
+            message.contains(capability),
+            "{capability} missing from {message}"
+        );
     }
 }
 

@@ -170,9 +170,11 @@ impl PolicyWorld {
     ///
     /// # Errors
     ///
-    /// Returns [`PolicyBuildError::DuplicateCapability`] when one capability identifier is declared
-    /// twice, and [`PolicyBuildError::ReservedAction`] when a capability collides with
-    /// [`AGENT_PROMPT_ACTION`].
+    /// Returns [`PolicyBuildError::DuplicateCapability`] naming every capability identifier
+    /// declared twice, and [`PolicyBuildError::ReservedAction`] naming every capability that
+    /// collides with a reserved core action. Both list *all* of their conflicts: an operator
+    /// renaming one capability per restart, four restarts in a row, is a validator's failure and
+    /// not the operator's.
     pub fn new(
         principals: impl IntoIterator<Item = PrincipalId>,
         capabilities: impl IntoIterator<Item = (CapabilityId, ProviderId)>,
@@ -181,6 +183,8 @@ impl PolicyWorld {
         for principal in principals {
             world.principals.insert(principal);
         }
+        let mut reserved = BTreeSet::new();
+        let mut duplicates = BTreeSet::new();
         for (capability, provider) in capabilities {
             if matches!(
                 capability.as_str(),
@@ -189,7 +193,8 @@ impl PolicyWorld {
                     | AGENT_MODEL_SELECT_ACTION
                     | AGENT_EFFORT_SET_ACTION
             ) {
-                return Err(PolicyBuildError::ReservedAction { capability });
+                reserved.insert(capability);
+                continue;
             }
             world.providers.insert(provider.clone());
             if world
@@ -197,8 +202,20 @@ impl PolicyWorld {
                 .insert(capability.clone(), provider)
                 .is_some()
             {
-                return Err(PolicyBuildError::DuplicateCapability { capability });
+                duplicates.insert(capability);
             }
+        }
+        // Reserved first: a capability named `agent.prompt` is also the one most likely to appear
+        // twice, and reporting it as a duplicate would send the operator to the wrong fix.
+        if !reserved.is_empty() {
+            return Err(PolicyBuildError::ReservedAction {
+                capabilities: reserved.into_iter().collect(),
+            });
+        }
+        if !duplicates.is_empty() {
+            return Err(PolicyBuildError::DuplicateCapability {
+                capabilities: duplicates.into_iter().collect(),
+            });
         }
         Ok(world)
     }
@@ -1240,6 +1257,15 @@ fn policy_digest(
     Ok(hex)
 }
 
+/// Renders every identifier in one conflict list, in the order they were collected.
+fn join_ids(capabilities: &[CapabilityId]) -> String {
+    capabilities
+        .iter()
+        .map(CapabilityId::as_str)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Failure to build a coherent, validated policy engine.
 ///
 /// Every variant is a startup failure. Construction-time detail is deliberately verbose — an
@@ -1357,17 +1383,23 @@ pub enum PolicyBuildError {
         /// Duplicated identifier.
         policy: String,
     },
-    /// One capability identifier was declared twice.
-    #[error("policy world declares capability {capability} more than once")]
+    /// One or more capability identifiers were declared twice.
+    #[error(
+        "policy world declares these capabilities more than once: {}",
+        join_ids(capabilities)
+    )]
     DuplicateCapability {
-        /// Duplicated capability.
-        capability: CapabilityId,
+        /// Every duplicated capability, in identifier order.
+        capabilities: Vec<CapabilityId>,
     },
-    /// A capability collided with the fixed `agent.prompt` action.
-    #[error("capability {capability} collides with a reserved core action")]
+    /// One or more capabilities collided with a reserved core action.
+    #[error(
+        "these capabilities collide with reserved core actions: {}",
+        join_ids(capabilities)
+    )]
     ReservedAction {
-        /// Colliding capability.
-        capability: CapabilityId,
+        /// Every colliding capability, in identifier order.
+        capabilities: Vec<CapabilityId>,
     },
     /// The declared world could not be turned into a Cedar entity store.
     #[error("policy entity store could not be built: {message}")]
