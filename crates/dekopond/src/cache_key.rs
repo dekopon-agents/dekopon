@@ -29,15 +29,17 @@
 //! for invocation identifiers, where a collision is a replay-rejection failure; here a collision
 //! costs a wasted cache lookup.
 
-use dekopon_agent::IdSequence;
+use dekopon_harness::runtime::IdSequence;
 
 /// Prefix for a key naming one remembered conversation on one `persistent` route.
+#[cfg(test)]
 const CONVERSATION_PREFIX: &str = "dekopond-conversation";
 
 /// Prefix for a key naming one bound route, shared by every sender that route answers.
 const ROUTE_PREFIX: &str = "dekopond-route";
 
 /// Mints the key for one conversation, created with the conversation and rotated with it.
+#[cfg(test)]
 pub(crate) fn for_conversation() -> String {
     mint(CONVERSATION_PREFIX)
 }

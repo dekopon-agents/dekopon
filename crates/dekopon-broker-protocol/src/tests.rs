@@ -352,7 +352,7 @@ fn wire_invocation_contains_no_identity_or_authority_fields() {
     }
     assert!(
         serde_json::from_value::<RequestEnvelope>(json!({
-            "apiVersion": "dekopon.dev/broker/v1alpha2",
+            "apiVersion": "dekopon.dev/broker/v1alpha3",
             "request": {
                 "operation": "invoke",
                 "invocation": {
@@ -504,7 +504,11 @@ async fn unix_client_authenticates_private_socket_and_response_variant() {
         ));
         write_frame(
             &mut stream,
-            &ResponseEnvelope::capabilities(Vec::new(), Vec::new()),
+            &ResponseEnvelope::capabilities(
+                Vec::new(),
+                Vec::new(),
+                "fixture-epoch".parse().expect("fixture epoch"),
+            ),
             limits,
         )
         .await
@@ -757,14 +761,14 @@ fn inventory_and_usage_validation_name_the_offending_agent_and_bound() {
 #[test]
 fn protocol_version_constant_wire_form_and_display_agree() {
     assert_eq!(
-        serde_json::to_value(ProtocolVersion::V1Alpha2).expect("version serializes"),
+        serde_json::to_value(ProtocolVersion::V1Alpha3).expect("version serializes"),
         json!(PROTOCOL_VERSION)
     );
-    assert_eq!(ProtocolVersion::V1Alpha2.to_string(), PROTOCOL_VERSION);
+    assert_eq!(ProtocolVersion::V1Alpha3.to_string(), PROTOCOL_VERSION);
     assert_eq!(
         serde_json::from_value::<ProtocolVersion>(json!(PROTOCOL_VERSION))
             .expect("version decodes"),
-        ProtocolVersion::V1Alpha2
+        ProtocolVersion::V1Alpha3
     );
     assert_eq!(
         serde_json::to_value(RequestEnvelope::capabilities(None))
@@ -1145,7 +1149,7 @@ fn every_verb_is_one_operation_whatever_attestation_accompanies_it() {
         (
             "resolveCommand",
             RequestEnvelope {
-                api_version: ProtocolVersion::V1Alpha2,
+                api_version: ProtocolVersion::V1Alpha3,
                 request: BrokerRequest::ResolveCommand {
                     attestation: None,
                     word: "memory".to_owned(),
@@ -1156,7 +1160,7 @@ fn every_verb_is_one_operation_whatever_attestation_accompanies_it() {
         (
             "resolveCommand",
             RequestEnvelope {
-                api_version: ProtocolVersion::V1Alpha2,
+                api_version: ProtocolVersion::V1Alpha3,
                 request: BrokerRequest::ResolveCommand {
                     attestation: Some(chat.clone()),
                     word: "memory".to_owned(),

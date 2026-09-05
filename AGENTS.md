@@ -2,7 +2,7 @@
 
 ## What this repository is
 
-Dekopon is early-stage security infrastructure for AI agents: a model may *propose* an invocation, only the separate privileged broker may *authorize* and execute it, and providers are import-free WebAssembly components. It is one Rust workspace (`Cargo.toml`, edition 2024, shared version `0.12.0`) of 26 crates under `crates/`, 25 of them published, with four binaries: `dekopon` (operator CLI), `dekopon-run` (direct read-only runner), `dekopon-brokerd` (the broker), and `dekopond` (the unprivileged chat gateway). Skills, `read_skill`, `suggest_improvement`, and `dekopon-run session list|show|replay` are post-0.12.0 work recorded under `[Unreleased]` in `CHANGELOG.md`; do not describe them as released.
+Dekopon is early-stage security infrastructure for AI agents: a model may *propose* an invocation, only the separate privileged broker may *authorize* and execute it, and providers are import-free WebAssembly components. It is one Rust workspace (`Cargo.toml`, edition 2024, shared version `0.12.0`) of 26 crates under `crates/`, 25 of them published, with four binaries: `dekopon` (operator CLI), `dekopon-run` (direct read-only runner), `dekopon-brokerd` (the broker), and `dekopond` (the unprivileged chat gateway). The clean-break `dekopon-harness` runtime (replacing `dekopon-agent`), controls/accounting/activity, skills, `read_skill`, `suggest_improvement`, and `dekopon-run session list|show|replay` are post-0.12.0 work recorded under `[Unreleased]` in `CHANGELOG.md`; do not describe them as released.
 
 ## Required reading
 

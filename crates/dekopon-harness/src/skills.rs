@@ -17,7 +17,7 @@ use dekopon_config::Skill;
 use dekopon_model::model::{ModelMessage, ModelTool, ModelToolCall};
 use serde_json::{Value, json};
 
-use crate::prompt::{PromptError, reject_tool_call};
+use crate::{session::PromptError, tools::reject_tool_call};
 
 /// The tool a model calls to read a mounted skill's instructions or one of its resource files.
 pub const SKILL_TOOL_NAME: &str = "read_skill";
@@ -108,8 +108,8 @@ pub(crate) fn skill_tool() -> ModelTool {
 }
 
 /// What one session has already shown the model, so a repeat costs a pointer rather than a copy.
-#[derive(Default)]
-pub(crate) struct SkillReads {
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SkillReads {
     shown: BTreeSet<(String, Option<String>)>,
 }
 
@@ -178,7 +178,7 @@ pub(crate) fn read_skill_into(
         result
     };
     tracing::info!(
-        target: "dekopon_agent::audit",
+        target: "dekopon_harness::audit",
         {
             audit.event = "agent.skill.read",
             model.turn = model_turn,
@@ -196,7 +196,7 @@ pub(crate) fn read_skill_into(
 
 fn refuse(model_turn: u32, tool_call_index: usize, reason: &'static str) {
     tracing::info!(
-        target: "dekopon_agent::audit",
+        target: "dekopon_harness::audit",
         {
             audit.event = "agent.skill.refused",
             model.turn = model_turn,

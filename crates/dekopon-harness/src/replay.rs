@@ -30,12 +30,13 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
+    bootstrap::{self, BootstrapError, CapabilitySnapshot, SessionBootstrap},
+    history::{History, HistoryLimits},
     improvement::ImprovementSuggestion,
-    prompt::{
-        CancellationProbe, History, HistoryLimits, ModelUsageObserver, PromptError, PromptLimits,
-        SCRIPT_TOOL_NAME, ScriptRuntime, SessionInputs, run_prompt_session,
-    },
+    runtime::ScriptRuntime,
+    session::{CancellationProbe, PromptError, PromptLimits, SessionEngine},
     skills,
+    tools::SCRIPT_TOOL_NAME,
 };
 
 /// One session as its transcript recorded it.
@@ -59,9 +60,23 @@ pub struct RecordedSession {
     /// Every model turn, in order.
     #[serde(default)]
     pub turns: Vec<RecordedTurn>,
+    /// Independent call accounting, including failed/no-answer calls and images. Absent only in
+    /// historical transcript files; an empty current list means unknown, never free inference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calls: Option<Vec<RecordedAccountingCall>>,
     /// The final answer, when the session produced one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer: Option<String>,
+}
+
+/// A job/call coordinate is independent of any provider assistant/tool ID.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RecordedAccountingCall {
+    pub job: String,
+    pub sequence: u64,
+    pub kind: String,
+    pub usage: RecordedUsage,
 }
 
 /// One remembered exchange a persistent route replayed.
@@ -149,9 +164,7 @@ pub struct RecordedUsage {
 impl RecordedUsage {
     fn add(&mut self, other: &Self) {
         fn sum(total: &mut Option<u64>, value: Option<u64>) {
-            if let Some(value) = value {
-                *total = Some(total.unwrap_or(0).saturating_add(value));
-            }
+            *total = total.zip(value).and_then(|(a, b)| a.checked_add(b));
         }
         sum(&mut self.input_tokens, other.input_tokens);
         sum(&mut self.cached_input_tokens, other.cached_input_tokens);
@@ -303,6 +316,7 @@ impl RecordedSession {
         let mut prompts = BTreeMap::<u64, (String, String)>::new();
         let mut answers = BTreeMap::<u64, (String, String)>::new();
         let mut accounting = BTreeMap::<u64, (Option<RecordedUsage>, Option<f64>)>::new();
+        let mut calls = BTreeMap::<(String, u64), RecordedAccountingCall>::new();
         for record in owned {
             let Some(event) = text(record, "audit.event") else {
                 continue;
@@ -333,8 +347,7 @@ impl RecordedSession {
                         ),
                     );
                 }
-                "accounting.model.turn" => {
-                    let Some(turn) = turn else { continue };
+                "accounting.model.call" | "accounting.model.turn" => {
                     let usage = RecordedUsage {
                         input_tokens: unsigned(record, "usage.input_tokens"),
                         cached_input_tokens: unsigned(record, "usage.cached_input_tokens"),
@@ -342,8 +355,41 @@ impl RecordedSession {
                         reasoning_output_tokens: unsigned(record, "usage.reasoning_output_tokens"),
                         total_tokens: unsigned(record, "usage.total_tokens"),
                     };
-                    let usage = (usage != RecordedUsage::default()).then_some(usage);
-                    accounting.insert(turn, (usage, float(record, "duration_ms")));
+                    let (job, sequence) = if event == "accounting.model.call" {
+                        (
+                            text(record, "job.id").ok_or_else(|| {
+                                malformed("accounting.model.call without job.id".into())
+                            })?,
+                            unsigned(record, "call.sequence").ok_or_else(|| {
+                                malformed("accounting.model.call without call.sequence".into())
+                            })?,
+                        )
+                    } else {
+                        (
+                            format!("historical-{trace_id}"),
+                            turn.ok_or_else(|| {
+                                malformed("accounting.model.turn without model.turn".into())
+                            })?,
+                        )
+                    };
+                    let kind = text(record, "model.kind").unwrap_or_else(|| "chat".into());
+                    let call = RecordedAccountingCall {
+                        job: job.clone(),
+                        sequence,
+                        kind: kind.clone(),
+                        usage,
+                    };
+                    if let Some(old) = calls.insert((job, sequence), call.clone())
+                        && old != call
+                    {
+                        return Err(malformed("conflicting accounting call records".into()));
+                    }
+                    if kind != "image"
+                        && let Some(turn) = turn
+                    {
+                        let usage = (usage != RecordedUsage::default()).then_some(usage);
+                        accounting.insert(turn, (usage, float(record, "duration_ms")));
+                    }
                 }
                 _ => {}
             }
@@ -364,7 +410,10 @@ impl RecordedSession {
 
         // The message vector, exactly as the loop grew it.
         let mut messages = Vec::new();
-        for (turn, (_, encoded)) in &prompts {
+        for (turn, (scope, encoded)) in &prompts {
+            if *turn != first_turn && scope == "full" {
+                return Err(malformed("context was rebuilt; multi-revision replay cannot be reconstructed by concatenating deltas".into()));
+            }
             let appended = serde_json::from_str::<Vec<TranscriptMessage>>(encoded)
                 .map_err(|error| malformed(format!("turn {turn} messages: {error}")))?;
             messages.extend(appended);
@@ -541,6 +590,7 @@ impl RecordedSession {
             history,
             prompt,
             turns,
+            calls: Some(calls.into_values().collect()),
             answer,
         })
     }
@@ -554,14 +604,23 @@ impl RecordedSession {
             .collect()
     }
 
-    /// Token usage summed over every accounted turn.
+    /// Unknown-aware usage over independent accounting calls, with historical file fallback.
     #[must_use]
     pub fn usage(&self) -> RecordedUsage {
-        let mut total = RecordedUsage::default();
-        for turn in &self.turns {
-            if let Some(usage) = &turn.usage {
-                total.add(usage);
-            }
+        let observations: Vec<_> = match &self.calls {
+            Some(calls) => calls.iter().map(|call| call.usage).collect(),
+            None => self
+                .turns
+                .iter()
+                .map(|turn| turn.usage.unwrap_or_default())
+                .collect(),
+        };
+        let mut observations = observations.into_iter();
+        let Some(mut total) = observations.next() else {
+            return RecordedUsage::default();
+        };
+        for usage in observations {
+            total.add(&usage);
         }
         total
     }
@@ -602,8 +661,17 @@ pub struct SessionListing {
 #[must_use]
 pub fn list_sessions(records: &[Value]) -> Vec<SessionListing> {
     let mut sessions: BTreeMap<String, SessionListing> = BTreeMap::new();
+    let mut seen = std::collections::BTreeSet::new();
     for record in records {
-        if text(record, "audit.event").as_deref() != Some("accounting.model.turn") {
+        if let (Some(job), Some(call)) = (text(record, "job.id"), unsigned(record, "call.sequence"))
+            && !seen.insert((job, call))
+        {
+            continue;
+        }
+        if !matches!(
+            text(record, "audit.event").as_deref(),
+            Some("accounting.model.call" | "accounting.model.turn")
+        ) {
             continue;
         }
         let Some(trace_id) = text(record, "trace_id") else {
@@ -615,7 +683,10 @@ pub fn list_sessions(records: &[Value]) -> Vec<SessionListing> {
             .unwrap_or_default();
         let turn = unsigned(record, "model.turn").and_then(|turn| u32::try_from(turn).ok());
         let tokens = unsigned(record, "usage.total_tokens");
-        let failed = text(record, "outcome").as_deref() == Some("failed");
+        let failed = matches!(
+            text(record, "outcome").as_deref(),
+            Some("failed" | "cancelled" | "abandoned")
+        );
         let answered = matches!(field(record, "answer.present"), Some(Value::Bool(true)))
             || text(record, "answer.present").as_deref() == Some("true");
         let entry = sessions
@@ -626,7 +697,7 @@ pub fn list_sessions(records: &[Value]) -> Vec<SessionListing> {
                 started_us: timestamp,
                 ended_us: timestamp,
                 model_turns: 0,
-                total_tokens: None,
+                total_tokens: Some(0),
                 failed: false,
                 answered: false,
             });
@@ -640,14 +711,10 @@ pub fn list_sessions(records: &[Value]) -> Vec<SessionListing> {
             entry.model_turns = turn;
             entry.answered = answered;
         }
-        if let Some(tokens) = tokens {
-            entry.total_tokens = Some(
-                entry
-                    .total_tokens
-                    .unwrap_or_default()
-                    .saturating_add(tokens),
-            );
-        }
+        entry.total_tokens = entry
+            .total_tokens
+            .zip(tokens)
+            .and_then(|(a, b)| a.checked_add(b));
         entry.failed |= failed;
     }
     let mut listing = sessions.into_values().collect::<Vec<_>>();
@@ -670,6 +737,10 @@ fn content_text(content: &Option<TranscriptContent>) -> String {
 
 /// What the replayed session runs under, beyond the model.
 pub struct ReplayInputs<'a> {
+    /// Host retains this finalizer until its output disposition is known.
+    pub accounting: Option<&'a crate::accounting::JobAccounting>,
+    /// Exact model name selected by the replay host, replacing any recorded model identity.
+    pub selected_model: &'a str,
     /// Replacement standing instructions; `None` replays the recorded ones.
     pub system: Option<&'a str>,
     /// Skills to mount, replacing any listing the recording carried.
@@ -750,9 +821,8 @@ struct ReplayRuntime<'a> {
     recorded: Mutex<VecDeque<(String, ScriptOutcome)>>,
     requested: Mutex<Vec<String>>,
     divergence: Mutex<Option<Divergence>>,
-    turns: Mutex<u32>,
-    usage: Mutex<RecordedUsage>,
     live: Option<&'a (dyn ScriptRuntime + Sync)>,
+    recorded_system: &'a [String],
 }
 
 impl ReplayRuntime<'_> {
@@ -795,8 +865,13 @@ fn outcome_from_result(result: &str) -> ScriptOutcome {
     }
 }
 
-impl ScriptRuntime for ReplayRuntime<'_> {
-    fn run_script(&self, script: &str, max_capability_calls: u32) -> ScriptOutcome {
+impl ReplayRuntime<'_> {
+    fn run_script_inner(
+        &self,
+        script: &str,
+        max_capability_calls: u32,
+        journal: Option<&crate::checkpoint::ExecutionJournal>,
+    ) -> ScriptOutcome {
         self.requested
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -809,6 +884,16 @@ impl ScriptRuntime for ReplayRuntime<'_> {
         // may reorder two independent scripts and still be on the recorded trajectory.
         if let Some(position) = recorded.iter().position(|(recorded, _)| recorded == script) {
             let (_, outcome) = recorded.remove(position).expect("position is in range");
+            if let Some(journal) = journal
+                && let Err(error) = journal.update(|c| {
+                    if let Some(group) = c.record.groups.last_mut() {
+                        group.provenance =
+                            Some(crate::history::ExecutionProvenance::RecordedReplay);
+                    }
+                })
+            {
+                journal.failure(error);
+            }
             return outcome;
         }
         let unused = recorded
@@ -816,10 +901,7 @@ impl ScriptRuntime for ReplayRuntime<'_> {
             .map(|(script, _)| script.clone())
             .collect::<Vec<_>>();
         drop(recorded);
-        let turn = *self
-            .turns
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let turn = journal.map_or(0, |journal| journal.snapshot().state.spent.model_calls);
         let mut divergence = self
             .divergence
             .lock()
@@ -833,7 +915,12 @@ impl ScriptRuntime for ReplayRuntime<'_> {
                     handling: DivergenceHandling::Live,
                 });
                 drop(divergence);
-                live.run_script(script, max_capability_calls)
+                match journal {
+                    Some(journal) => {
+                        live.run_script_observed(script, max_capability_calls, journal)
+                    }
+                    None => live.run_script(script, max_capability_calls),
+                }
             }
             None => {
                 *divergence = Some(Divergence {
@@ -854,11 +941,29 @@ impl ScriptRuntime for ReplayRuntime<'_> {
             }
         }
     }
-
+}
+impl ScriptRuntime for ReplayRuntime<'_> {
+    fn observes_executions(&self) -> bool {
+        self.live.is_some_and(ScriptRuntime::observes_executions)
+    }
+    fn run_script(&self, script: &str, maximum: u32) -> ScriptOutcome {
+        self.run_script_inner(script, maximum, None)
+    }
+    fn run_script_observed(
+        &self,
+        script: &str,
+        maximum: u32,
+        journal: &crate::checkpoint::ExecutionJournal,
+    ) -> ScriptOutcome {
+        self.run_script_inner(script, maximum, Some(journal))
+    }
     // The tool description is part of the prompt the replayed model is shown, so it has to name
     // the words the live runtime would run; with no live runtime there are none to offer.
-    fn command_words(&self) -> Vec<String> {
-        self.live.map_or_else(Vec::new, |live| live.command_words())
+    fn capability_snapshot(&self) -> Result<CapabilitySnapshot, BootstrapError> {
+        match self.live {
+            Some(live) => live.capability_snapshot(),
+            None => CapabilitySnapshot::from_recording(self.recorded_system),
+        }
     }
 }
 
@@ -869,21 +974,6 @@ impl CancellationProbe for ReplayRuntime<'_> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .is_some_and(|divergence| divergence.handling == DivergenceHandling::Stopped)
-    }
-}
-
-impl ModelUsageObserver for ReplayRuntime<'_> {
-    fn observe(&self, usage: Option<ModelUsage>) {
-        *self
-            .turns
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
-        if let Some(usage) = usage {
-            self.usage
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .add(&RecordedUsage::from(usage));
-        }
     }
 }
 
@@ -901,9 +991,8 @@ where
         recorded: Mutex::new(ReplayRuntime::recorded_outcomes(recorded)),
         requested: Mutex::new(Vec::new()),
         divergence: Mutex::new(None),
-        turns: Mutex::new(0),
-        usage: Mutex::new(RecordedUsage::default()),
         live: inputs.live,
+        recorded_system: &recorded.system,
     };
     let system = match inputs.system {
         Some(system) => Some(system.to_owned()),
@@ -911,6 +1000,7 @@ where
             let kept = recorded
                 .system
                 .iter()
+                .filter(|message| !bootstrap::is_prompt_block(message))
                 .filter(|message| inputs.skills.is_empty() || !skills::is_prompt_block(message))
                 .cloned()
                 .collect::<Vec<_>>();
@@ -923,19 +1013,22 @@ where
     });
     for exchange in &recorded.history {
         history.record(match &exchange.answer {
-            Some(answer) => crate::prompt::ConversationTurn::completed(&exchange.user, answer),
-            None => crate::prompt::ConversationTurn::unanswered(&exchange.user),
+            Some(answer) => crate::history::JobRecord::completed(&exchange.user, answer),
+            None => crate::history::JobRecord::unanswered(&exchange.user),
         });
     }
-    let mut session = SessionInputs::new(&recorded.prompt, inputs.limits)
+    let fallback_accounting = crate::accounting::JobAccounting::default();
+    let accounting = inputs.accounting.unwrap_or(&fallback_accounting);
+    let mut session = SessionBootstrap::new(&recorded.prompt, inputs.limits, inputs.selected_model)
         .with_system(system.as_deref())
         .with_skills(inputs.skills)
-        .with_usage_observer(&runtime)
+        .with_accounting(accounting)
         .with_cancellation(&runtime);
     if inputs.improvement_suggestions {
         session = session.with_improvement_suggestions();
     }
-    let outcome = run_prompt_session(model, &runtime, session, &mut history);
+    let outcome = SessionEngine::new(model, &runtime).run(session, &mut history);
+    let tracked = accounting.snapshot();
     let divergence = runtime
         .divergence
         .lock()
@@ -965,20 +1058,18 @@ where
             usage: recorded.usage(),
         },
         replayed: SessionSummary {
-            model_turns: *runtime
-                .turns
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            model_turns: tracked
+                .calls
+                .iter()
+                .filter(|c| c.kind == crate::accounting::CallKind::Chat)
+                .count() as u32,
             scripts: runtime
                 .requested
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone(),
             answer,
-            usage: *runtime
-                .usage
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            usage: RecordedUsage::from(tracked.totals().cumulative.usage()),
         },
         divergence,
         suggestions,
@@ -1000,7 +1091,29 @@ mod tests {
         DivergenceHandling, RecordedSession, RecordingError, ReplayInputs, SessionListing,
         list_sessions, outcome_from_result, replay,
     };
-    use crate::prompt::{PromptLimits, SCRIPT_TOOL_NAME};
+    use crate::{session::PromptLimits, tools::SCRIPT_TOOL_NAME};
+
+    #[test]
+    fn independent_accounting_includes_failed_calls_images_and_unknown_fields() {
+        let prompt = json!({"trace_id":"usage", "audit_event":"agent.model.prompt", "model_turn":1,"transcript_scope":"full", "messages":json!([{"role":"user","content":"request"}]).to_string()});
+        let failed = json!({"trace_id":"usage", "audit_event":"accounting.model.call", "job_id":"job", "call_sequence":1, "model_turn":1,"model_kind":"chat", "usage_input_tokens":17, "outcome":"failed"});
+        let records = vec![prompt.clone(), failed.clone(), failed.clone()];
+        let recorded = RecordedSession::from_records("usage", &records).unwrap();
+        assert!(recorded.turns.is_empty());
+        assert_eq!(recorded.calls.as_ref().unwrap().len(), 1);
+        assert_eq!(recorded.usage().input_tokens, Some(17));
+        assert_eq!(recorded.usage().output_tokens, None);
+        assert_eq!(recorded.usage().total_tokens, None);
+        let image = json!({"trace_id":"usage", "audit_event":"accounting.model.call", "job_id":"job", "call_sequence":2, "model_turn":1,"model_kind":"image", "usage_input_tokens":5,"usage_output_tokens":6});
+        let recorded = RecordedSession::from_records("usage", &[prompt, failed, image]).unwrap();
+        assert_eq!(recorded.calls.as_ref().unwrap().len(), 2);
+        assert_eq!(recorded.usage().input_tokens, Some(22));
+        assert_eq!(recorded.usage().output_tokens, None);
+        assert_eq!(
+            RecordedSession::default().usage(),
+            super::RecordedUsage::default()
+        );
+    }
 
     /// A listing is built from accounting alone, so it covers sessions with no transcript.
     #[test]
@@ -1025,7 +1138,7 @@ mod tests {
                     started_us: 5_000,
                     ended_us: 6_000,
                     model_turns: 2,
-                    total_tokens: Some(7),
+                    total_tokens: None,
                     failed: true,
                     answered: false,
                 },
@@ -1157,19 +1270,35 @@ mod tests {
             &self,
             messages: &[ModelMessage],
             _tools: &[ModelTool],
+            recorder: &dyn dekopon_model::usage::AttemptRecorder,
         ) -> Result<AssistantTurn, ModelError> {
-            self.systems.lock().expect("systems").push(
-                messages
-                    .iter()
-                    .filter(|message| message.role() == "system")
-                    .filter_map(|message| message.content().map(str::to_owned))
-                    .collect(),
-            );
-            self.turns
-                .lock()
-                .expect("turns")
-                .pop_front()
-                .ok_or(ModelError::NoChoices)
+            let attempt = recorder.begin(dekopon_model::usage::AttemptKind::Adapter)?;
+            let result: Result<AssistantTurn, ModelError> = {
+                self.systems.lock().expect("systems").push(
+                    messages
+                        .iter()
+                        .filter(|message| message.role() == "system")
+                        .filter_map(|message| message.content().map(str::to_owned))
+                        .collect(),
+                );
+                self.turns
+                    .lock()
+                    .expect("turns")
+                    .pop_front()
+                    .ok_or(ModelError::NoChoices)
+            };
+            if let Ok(turn) = &result
+                && let Some(usage) = turn.usage
+            {
+                recorder.observe(
+                    attempt,
+                    dekopon_model::usage::UsageObservation {
+                        usage,
+                        invalid: [false; 5],
+                    },
+                )?;
+            }
+            result
         }
     }
 
@@ -1200,6 +1329,8 @@ mod tests {
 
     fn inputs<'a>(system: Option<&'a str>) -> ReplayInputs<'a> {
         ReplayInputs {
+            accounting: None,
+            selected_model: "replay-model",
             system,
             skills: &[],
             improvement_suggestions: false,
@@ -1235,7 +1366,10 @@ mod tests {
         );
         // The override replaced the recorded instructions, and the history was replayed.
         let systems = model.systems.lock().expect("systems");
-        assert_eq!(systems[0], vec!["Be terse.".to_owned()]);
+        assert_eq!(systems[0].len(), 2);
+        assert_eq!(systems[0][0], "Be terse.");
+        assert!(crate::bootstrap::is_prompt_block(&systems[0][1]));
+        assert!(systems[0][1].contains("replay-model"));
     }
 
     #[test]
@@ -1261,6 +1395,9 @@ mod tests {
         assert_eq!(report.replayed.model_turns, 1);
         // Without an override the recorded instructions were replayed.
         let systems = model.systems.lock().expect("systems");
-        assert_eq!(systems[0], vec!["Be brief.".to_owned()]);
+        assert_eq!(systems[0].len(), 2);
+        assert_eq!(systems[0][0], "Be brief.");
+        assert!(crate::bootstrap::is_prompt_block(&systems[0][1]));
+        assert!(systems[0][1].contains("replay-model"));
     }
 }

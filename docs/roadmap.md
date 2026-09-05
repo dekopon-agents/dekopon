@@ -242,7 +242,7 @@ Version 0.12.0 adds `dekopon-process`, removes `dekopon-tui`, and leaves twenty-
 This adds no crate, process boundary, inbound listener, provider credential access, or effect
 authority. The one new network path is the runner's outbound OpenObserve query client, whose
 `Authorization` header value is read from an environment variable named on the command line
-rather than passed as an argument; `dekopon-agent` gains a `dekopon-config` dependency, and
+rather than passed as an argument; `dekopon-harness` gains a `dekopon-config` dependency, and
 `dekopon-run` still reaches no broker crate under the CI `cargo tree` gate.
 [`CHANGELOG.md`](../CHANGELOG.md#unreleased) records the detail under `[Unreleased]`.
 
@@ -269,9 +269,19 @@ rather than passed as an argument; `dekopon-agent` gains a `dekopon-config` depe
 
 This adds no crate, process boundary, listener, credential path, or effect authority: a proposal is
 authorized where it always was, rendered text authorizes nothing, and `dekopond` and `dekopon-run`
-still reach no broker crate under the CI `cargo tree` gate; `dekopon-agent` and `dekopond` gain a
+still reach no broker crate under the CI `cargo tree` gate; `dekopon-harness` and `dekopond` gain a
 `dekopon-process` dependency. [`CHANGELOG.md`](../CHANGELOG.md#unreleased) records the detail under
 `[Unreleased]`.
+
+## Unreleased — harness session runtime (integration in progress)
+
+Replace `dekopon-agent` outright with `dekopon-harness`: fresh scoped request-one schemas,
+execution-aware bounded history/context, checkpoint leases, job-wide attempt/token accounting,
+Cedar-admitted configured model/effort switches and safe transport progress. In-tree runner and
+gateway consumers migrated; provider WIT and privileged process ownership do not change.
+The [implemented contract and remaining gaps](harness.md) identify safe-yield epoch fencing,
+multi-revision replay, runner delivery finalization and cross-configuration Slack ownership work.
+No release or new-crate publication bootstrap is claimed by this roadmap entry.
 
 ## Next milestones
 
@@ -306,7 +316,7 @@ The whole-tree audit behind 0.12.0 decided thirty-five findings: the thirty-two 
 
 ## Intended package namespace
 
-`dekopon-process` is now present with a tested one-run/one-node Tokio lifecycle seam consumed by `dekopon-run` and, through `dekopon-agent`'s broker leg, by `dekopond`. `dekopon-model` is now present with tested OpenAI-compatible and ChatGPT/Codex transports plus model-account authentication. `dekopon-agent` is now present with the shared bounded prompt loop and session capability dispatch, consumed by both `dekopon-run` and `dekopond`. `dekopond` itself is now present as the unprivileged chat gateway. `dekopon-policy` is now present too, as the bounded Cedar adapter behind the broker's authorization decisions. `dekopon-webui` is now present as the tested GET-only operational view embedded in the broker service. The following remaining names are reserved for future meaningful crates. They are **not** present in the workspace and are not claimed as crates.io reservations or published packages:
+`dekopon-process` is now present with a tested one-run/one-node Tokio lifecycle seam consumed by `dekopon-run` and, through `dekopon-harness`'s broker leg, by `dekopond`. `dekopon-model` is now present with tested OpenAI-compatible and ChatGPT/Codex transports plus model-account authentication. `dekopon-harness` is now present with the shared bounded prompt loop and session capability dispatch, consumed by both `dekopon-run` and `dekopond`. `dekopond` itself is now present as the unprivileged chat gateway. `dekopon-policy` is now present too, as the bounded Cedar adapter behind the broker's authorization decisions. `dekopon-webui` is now present as the tested GET-only operational view embedded in the broker service. The following remaining names are reserved for future meaningful crates. They are **not** present in the workspace and are not claimed as crates.io reservations or published packages:
 
 - `dekopon-identity`
 - `dekopon-context`

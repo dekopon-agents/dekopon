@@ -201,6 +201,12 @@ pub enum CommandRun {
 /// Implementations decide what a "capability" is: a direct Wasm component call, a broker proposal,
 /// or a test fixture. This crate never learns which.
 pub trait CapabilityInvoker {
+    /// Revalidate host-owned session metadata before reuse. Local immutable dispatch needs no I/O;
+    /// remote adapters must fail on changed or uncertain freshness. This grants no invocation.
+    fn check_freshness(&self) -> Result<(), String> {
+        Ok(())
+    }
+
     /// Returns every capability identifier currently available to invoke.
     fn granted(&self) -> Vec<String>;
 
@@ -309,6 +315,9 @@ pub fn secret_use_unsupported() -> CapabilityCallResult {
 /// dispatch at the same time. It replaced a hand-written forwarder that had to be kept in step with
 /// the trait by hand and was not.
 impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
+    fn check_freshness(&self) -> Result<(), String> {
+        self.as_ref().check_freshness()
+    }
     fn granted(&self) -> Vec<String> {
         self.as_ref().granted()
     }

@@ -103,6 +103,27 @@ use thiserror::Error;
 pub const NAMESPACE: &str = "Dekopon";
 /// The one action that is not a capability: permission for a principal to drive an agent session.
 pub const AGENT_PROMPT_ACTION: &str = "agent.prompt";
+/// Reserved Principal-to-Agent configured-model selection action.
+pub const AGENT_MODEL_SELECT_ACTION: &str = "agent.model.select";
+/// Reserved Principal-to-Agent effort-setting action.
+pub const AGENT_EFFORT_SET_ACTION: &str = "agent.effort.set";
+
+/// One core control dimension. Provider capability names may not collide with either action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentControlAction {
+    ModelSelect,
+    EffortSet,
+}
+
+impl AgentControlAction {
+    /// Fixed Cedar action spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ModelSelect => AGENT_MODEL_SELECT_ACTION,
+            Self::EffortSet => AGENT_EFFORT_SET_ACTION,
+        }
+    }
+}
 /// Separate permission to consume one public DRN in a broker-native sink.
 pub const SECRET_USE_ACTION: &str = "secret.use";
 /// Maximum accepted policy-source bytes.
@@ -161,7 +182,13 @@ impl PolicyWorld {
             world.principals.insert(principal);
         }
         for (capability, provider) in capabilities {
-            if matches!(capability.as_str(), AGENT_PROMPT_ACTION | SECRET_USE_ACTION) {
+            if matches!(
+                capability.as_str(),
+                AGENT_PROMPT_ACTION
+                    | SECRET_USE_ACTION
+                    | AGENT_MODEL_SELECT_ACTION
+                    | AGENT_EFFORT_SET_ACTION
+            ) {
                 return Err(PolicyBuildError::ReservedAction { capability });
             }
             world.providers.insert(provider.clone());
@@ -270,6 +297,10 @@ impl PolicyWorld {
                 "conversation": { "type": "String", "required": false },
             }
         });
+        let mut control_context = prompt_context.clone();
+        for name in ["agent", "fromModel", "toModel", "fromEffort", "toEffort"] {
+            control_context["attributes"][name] = json!({"type": "String"});
+        }
         let secret_context = json!({
             "type": "Record",
             "attributes": {
@@ -316,6 +347,15 @@ impl PolicyWorld {
                 }
             }),
         );
+        for action in [AGENT_MODEL_SELECT_ACTION, AGENT_EFFORT_SET_ACTION] {
+            actions.insert(
+                action.to_owned(),
+                json!({"appliesTo": {
+                    "principalTypes": ["Principal"], "resourceTypes": ["Agent"],
+                    "context": control_context,
+                }}),
+            );
+        }
         let mut entity_types = serde_json::Map::from_iter([
             ("Principal".to_owned(), entity_shape.clone()),
             ("Provider".to_owned(), entity_shape.clone()),
@@ -373,6 +413,13 @@ pub enum PolicyTarget {
         /// The agent being driven, which is the Cedar resource.
         agent: AgentId,
     },
+    /// Core session intent, separate from provider capability authorization.
+    AgentControl {
+        agent: AgentId,
+        action: AgentControlAction,
+        from: dekopon_core::ModelSelection,
+        to: dekopon_core::ModelSelection,
+    },
     /// Permission to consume one exact DRN in one broker-native sink for one capability.
     SecretUse {
         secret: SecretDrn,
@@ -389,6 +436,7 @@ impl PolicyTarget {
         match self {
             Self::Capability { capability, .. } => capability.as_str(),
             Self::AgentPrompt { .. } => AGENT_PROMPT_ACTION,
+            Self::AgentControl { action, .. } => action.as_str(),
             Self::SecretUse { .. } => SECRET_USE_ACTION,
         }
     }
@@ -737,7 +785,7 @@ impl PolicyEngine {
         let PolicyRequest {
             principal,
             target,
-            context,
+            mut context,
         } = request;
         let action = entity_uid(&self.entity_types.action, target.action());
         let principal = entity_uid(&self.entity_types.principal, principal.as_str());
@@ -769,6 +817,25 @@ impl PolicyEngine {
                 entity_uid(&self.entity_types.agent, agent.as_str()),
                 Vec::new(),
             ),
+            PolicyTarget::AgentControl {
+                agent, from, to, ..
+            } => {
+                // Required agent context comes from the same typed target as the resource.
+                // Do not let a caller create a resource/context disagreement.
+                context.agent = Some(agent.to_string());
+                (
+                    entity_uid(&self.entity_types.agent, agent.as_str()),
+                    [
+                        ("fromModel", from.model.to_string()),
+                        ("toModel", to.model.to_string()),
+                        ("fromEffort", from.effort.to_string()),
+                        ("toEffort", to.effort.to_string()),
+                    ]
+                    .into_iter()
+                    .map(|(name, value)| (name.to_owned(), RestrictedExpression::new_string(value)))
+                    .collect(),
+                )
+            }
             PolicyTarget::SecretUse {
                 secret,
                 capability,
@@ -981,7 +1048,13 @@ fn classify_policies(
                     }
                 }
                 ACTION_TYPE => {
-                    if matches!(value.as_str(), AGENT_PROMPT_ACTION | SECRET_USE_ACTION) {
+                    if matches!(
+                        value.as_str(),
+                        AGENT_PROMPT_ACTION
+                            | SECRET_USE_ACTION
+                            | AGENT_MODEL_SELECT_ACTION
+                            | AGENT_EFFORT_SET_ACTION
+                    ) {
                         continue;
                     }
                     let parsed = value.parse::<CapabilityId>().ok();
@@ -1127,7 +1200,11 @@ fn policy_digest(
         .keys()
         .map(|capability| capability.as_str())
         .collect::<Vec<_>>();
-    actions.push(AGENT_PROMPT_ACTION);
+    actions.extend([
+        AGENT_PROMPT_ACTION,
+        AGENT_MODEL_SELECT_ACTION,
+        AGENT_EFFORT_SET_ACTION,
+    ]);
     if !world.secrets.is_empty() {
         actions.push(SECRET_USE_ACTION);
     }
@@ -1287,7 +1364,7 @@ pub enum PolicyBuildError {
         capability: CapabilityId,
     },
     /// A capability collided with the fixed `agent.prompt` action.
-    #[error("capability {capability} collides with the reserved agent.prompt action")]
+    #[error("capability {capability} collides with a reserved core action")]
     ReservedAction {
         /// Colliding capability.
         capability: CapabilityId,

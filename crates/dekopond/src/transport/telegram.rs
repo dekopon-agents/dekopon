@@ -420,13 +420,11 @@ impl ChatActivity for TelegramReplier {
                 .send()
                 .await
                 .map_err(|source| TransportError::Request(Box::new(source)))?;
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|source| TransportError::Request(Box::new(source)))?;
+            let status = response.status();
+            let bytes = super::activity_response(response).await?;
             let body = serde_json::from_slice::<Value>(&bytes)
                 .map_err(TransportError::MalformedResponse)?;
-            if body["ok"] == Value::Bool(true) {
+            if status.is_success() && body["ok"] == Value::Bool(true) {
                 *self
                     .activity_cooldown_until
                     .lock()

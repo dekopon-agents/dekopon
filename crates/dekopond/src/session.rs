@@ -5,6 +5,11 @@
 //! An empty grant ends the session before a single model token is spent, which is deliberate: the
 //! cheapest possible refusal, and one that cannot be talked out of by the message text.
 
+use dekopon_harness::{
+    control::{ModelIdentity, ModelRegistry, PreparationError, PreparedModel, SessionControls},
+    conversation::{BoundedConversationStore, ConversationKey, ConversationSeed, EvictionReason},
+    history::{DeliveryDisposition, JobRecord},
+};
 use std::{
     collections::{BTreeSet, HashMap, hash_map::Entry},
     sync::{
@@ -14,24 +19,24 @@ use std::{
     time::Instant,
 };
 
-use dekopon_agent::{
-    BrokerLeg, BrokerLegError, IdSequence, ShellRuntime, current_trace_parent,
-    meta::{AgentConfigView, ConversationConfigView, SessionConfigView, SkillView},
-    prompt::{
-        CancellationProbe, GeneratedImageOutput, History, ModelUsageObserver, PromptError,
-        ReplyDisposition, SessionInputs, run_prompt_session,
-    },
-};
 use dekopon_broker_protocol::{
     Attestation, BrokerClient, ChatScopeClaim, ClientError, DeliveredTurnRequest, DeliveryIdentity,
     ERROR_STORAGE_BUSY, ERROR_STORAGE_CORRUPT, ERROR_STORAGE_IO, ERROR_STORAGE_QUOTA,
     ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED, InvocationOutcome, InvocationResult,
     ModelUsageReport,
 };
+use dekopon_harness::{
+    bootstrap::SessionBootstrap,
+    history::History,
+    meta::{AgentConfigView, ConversationConfigView, SessionConfigView, SkillView},
+    runtime::{BrokerLeg, BrokerLegError, IdSequence, ShellRuntime, current_trace_parent},
+    session::{CancellationProbe, PromptError, ReplyDisposition, SessionEngine},
+    tools::GeneratedImageOutput,
+};
 use dekopon_model::{
     chatgpt::ChatGptCodexModel,
     image::{ImageGenerationError, ImageGenerator, OpenAiImageGenerator},
-    model::{ChatModel, CompletionOptions, ModelError, ModelUsage, OpenAiChatModel},
+    model::{ChatModel, CompletionOptions, ModelError, OpenAiChatModel},
 };
 use dekopon_process::{CancelHandle, CancelSignal};
 use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, Limits as ShellLimits};
@@ -43,7 +48,6 @@ use crate::{
     activity::{ActivityControl, ActivityLease},
     asset::{self, AssetStore, SessionAssets},
     config::{ConversationPolicy, ImageGeneratorConfig, ModelConfig, ResolvedBroker},
-    conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
     routes::BoundRoute,
     transport::{
         AssetFetcher, ChatActivity, ChatReplier, DeliveryReceipt, InboundMessage, OutboundReply,
@@ -248,6 +252,67 @@ impl ModelCache {
                 .or_insert(built),
         ))
     }
+}
+
+struct GatewayModelRegistry {
+    cache: Arc<ModelCache>,
+    models: Vec<Arc<ModelConfig>>,
+}
+impl ModelRegistry for GatewayModelRegistry {
+    fn candidates(&self) -> Vec<dekopon_broker_protocol::ControlTarget> {
+        self.models
+            .iter()
+            .map(|model| dekopon_broker_protocol::ControlTarget {
+                model: model.name().parse().expect("validated configured model ID"),
+                // Both built-in transports encode these options; remote acceptance is not promised.
+                efforts: vec![
+                    dekopon_core::Effort::ProviderDefault,
+                    dekopon_core::Effort::Low,
+                    dekopon_core::Effort::Medium,
+                    dekopon_core::Effort::High,
+                ],
+            })
+            .collect()
+    }
+    fn prepare(
+        &self,
+        selection: &dekopon_core::ModelSelection,
+    ) -> Result<PreparedModel, PreparationError> {
+        let configured = self
+            .models
+            .iter()
+            .find(|m| m.name() == selection.model.as_str())
+            .ok_or(PreparationError::UnknownModel)?;
+        let client = self.cache.client(configured).map_err(|error| {
+            tracing::warn!(
+                cause_type = error.category(),
+                "configured control client preparation failed"
+            );
+            PreparationError::Unavailable
+        })?;
+        let (backend, model) = match configured.as_ref() {
+            ModelConfig::OpenaiCompatible { model, .. } => ("openai-compatible", model),
+            ModelConfig::ChatgptSubscription { model, .. } => ("chatgpt-subscription", model),
+        };
+        Ok(PreparedModel {
+            identity: ModelIdentity {
+                configured: Some(selection.model.clone()),
+                backend: backend.into(),
+                model: model.clone(),
+                effort: selection.effort,
+            },
+            client,
+            accepts_images: configured.accepts_images(),
+        })
+    }
+}
+
+fn control_coordinate() -> String {
+    IdSequence::new("control")
+        .expect("constant bounded prefix")
+        .trace()
+        .as_str()
+        .to_owned()
 }
 
 /// Admission control: a process-wide ceiling plus per-conversation serialization.
@@ -541,7 +606,7 @@ pub(crate) struct SessionRunner {
     pub gate: SessionGate,
     pub reply_on_busy: bool,
     /// What `persistent` routes remember. Empty and untouched while every route is `oneShot`.
-    pub conversations: ConversationStore,
+    pub conversations: BoundedConversationStore,
     /// The attachments live conversations carry, numbered so a model can ask for one.
     pub assets: Arc<AssetStore>,
     /// How each transport turns one of those references back into bytes, by transport name.
@@ -557,67 +622,6 @@ pub(crate) struct SessionRunner {
     pub active_sessions: ActiveSessions,
     /// Best-effort informational usage deltas for the broker-hosted web UI.
     pub usage_reports: Option<mpsc::Sender<ModelUsageReport>>,
-}
-
-#[derive(Default)]
-struct UsageAccumulator(Mutex<ModelUsageReport>);
-
-impl UsageAccumulator {
-    fn report(&self) -> ModelUsageReport {
-        *self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
-
-impl ModelUsageObserver for UsageAccumulator {
-    fn observe(&self, usage: Option<ModelUsage>) {
-        let mut report = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        report.model_calls = report.model_calls.saturating_add(1);
-        let usage = usage.unwrap_or_default();
-        (report.input_tokens, report.input_unreported_calls) = accumulated(
-            report.input_tokens,
-            report.input_unreported_calls,
-            usage.input_tokens,
-        );
-        (
-            report.cached_input_tokens,
-            report.cached_input_unreported_calls,
-        ) = accumulated(
-            report.cached_input_tokens,
-            report.cached_input_unreported_calls,
-            usage.cached_input_tokens,
-        );
-        (report.output_tokens, report.output_unreported_calls) = accumulated(
-            report.output_tokens,
-            report.output_unreported_calls,
-            usage.output_tokens,
-        );
-        (
-            report.reasoning_output_tokens,
-            report.reasoning_unreported_calls,
-        ) = accumulated(
-            report.reasoning_output_tokens,
-            report.reasoning_unreported_calls,
-            usage.reasoning_output_tokens,
-        );
-        (report.total_tokens, report.total_unreported_calls) = accumulated(
-            report.total_tokens,
-            report.total_unreported_calls,
-            usage.total_tokens,
-        );
-    }
-}
-
-fn accumulated(total: u64, unreported: u64, value: Option<u64>) -> (u64, u64) {
-    match value {
-        Some(value) => (total.saturating_add(value), unreported),
-        None => (total, unreported.saturating_add(1)),
-    }
 }
 
 /// Runs one routed message end to end, answering unless an optional continuation declines.
@@ -695,6 +699,14 @@ async fn session(
     message: &InboundMessage,
     replier: &Arc<dyn ChatReplier>,
 ) -> &'static str {
+    let key = ConversationKey::scoped(
+        route.agent.as_str(),
+        &route.cache_key,
+        &message.transport,
+        &message.channel,
+        &message.conversation_id,
+        &message.subject.canonical(),
+    );
     let leg = match connect(runner, route, message).await {
         Ok(leg) => leg,
         // A refused attestation never reaches a decision record, so it arrives as a transport-level
@@ -704,6 +716,9 @@ async fn session(
             code, ..
         }))) if code == ERROR_UNAUTHENTICATED => {
             revoke_thread_ownership(runner, message);
+            runner
+                .conversations
+                .remove(&key, EvictionReason::GrantChanged);
             tracing::info!(
                 event = "gateway_session_rejected",
                 reason = "attestation-refused"
@@ -723,11 +738,7 @@ async fn session(
     // Never cached and never remembered as a permission: this is a fresh answer from the broker
     // about what this subject may reach through this agent, on this message.
     let granted = leg.granted();
-    let key = ConversationKey::new(
-        &message.transport,
-        &message.conversation_id,
-        &message.subject.canonical(),
-    );
+
     // The authorization gate, and it costs nothing: an empty answer is a complete answer, so there
     // is no model call to make. Removing the entry rather than only refusing is the other half —
     // a revoked subject whose exchange stayed resident for the rest of its idle timeout would be
@@ -759,6 +770,15 @@ async fn session(
     // The lookup happens *after* the authorization gate because the grant comparison needs a fresh
     // grant to compare against. `Instant` is supplied by the caller rather than read inside the
     // store so eviction has a clock a test can drive.
+    let surface = match dekopon_harness::bootstrap::CapabilitySnapshot::from_invoker(&leg) {
+        Ok(snapshot) => vec![snapshot.fingerprint(), leg.surface_epoch().to_string()],
+        Err(error) => {
+            tracing::error!(event = "gateway_session_failed", category = "invalid-bootstrap", cause = %error);
+            answer(replier, message, FAILURE_REPLY).await;
+            return "failed";
+        }
+    };
+    let checkpoint_scope = key.commitment();
     let window = route.conversation.window();
     let ConversationSeed {
         history: seeded,
@@ -766,7 +786,7 @@ async fn session(
     } = match window {
         Some(window) => runner
             .conversations
-            .begin(&key, &granted, window, Instant::now()),
+            .begin(&key, &surface, window, Instant::now()),
         // A route that remembers nothing has no conversation to name, so its messages route to the
         // route's own lane: the instructions and tools ahead of every one of them are the only
         // prefix they share, and they share all of it. `routes::BoundRoute::cache_key` has the
@@ -796,6 +816,7 @@ async fn session(
     }
 
     let memory_surface = leg.chat_memory_surface().cloned();
+    let surface_epoch = leg.surface_epoch().clone();
     let chat_claim = chat_claim(route, message).ok();
     let image_generator = match (route.image_generator, runner.image_generator.as_ref()) {
         (false, _) => None,
@@ -851,7 +872,53 @@ async fn session(
     // Request-scoped and built here rather than handed to `ModelFactory::build`, which is what lets
     // `ModelCache` share one client across sessions: a key captured in a constructor would describe
     // the first conversation forever while quietly mislabeling every later one.
-    let options = CompletionOptions::default().with_prompt_cache_key(cache_key.clone());
+    let options = CompletionOptions::default()
+        .with_prompt_cache_key(cache_key.clone())
+        .with_effort(model_config.effort());
+    let configured_controls = route.controls.clone();
+    let control_executor = tokio::runtime::Handle::current();
+    let control_client = if configured_controls.is_some() {
+        let make_client = || -> Result<_, SessionError> {
+            let client = BrokerClient::new(
+                &runner.broker.socket_path,
+                runner.broker.server_uid,
+                runner.broker.frame,
+            )?;
+            Ok(client.control_client(
+                dekopon_broker_protocol::ControlScope {
+                    agent: route.agent.clone(),
+                    job: control_coordinate()
+                        .parse()
+                        .expect("bounded opaque coordinate"),
+                    session: control_coordinate()
+                        .parse()
+                        .expect("bounded opaque coordinate"),
+                    request: control_coordinate()
+                        .parse()
+                        .expect("bounded opaque coordinate"),
+                    generation: control_coordinate()
+                        .parse()
+                        .expect("bounded opaque coordinate"),
+                },
+                surface_epoch.clone(),
+                Some(self::chat_claim(route, message)?),
+                0,
+            )?)
+        };
+        match make_client() {
+            Ok(client) => Some(client),
+            Err(error) => {
+                tracing::error!(
+                    event = "gateway_session_failed",
+                    category = error.category()
+                );
+                answer(replier, message, FAILURE_REPLY).await;
+                return "failed";
+            }
+        }
+    } else {
+        None
+    };
 
     // Activity is armed only after the fresh authorization gate and immediately before the costly
     // model/tool work. The registry and cancellation probe share one generation, so a native Slack
@@ -863,7 +930,13 @@ async fn session(
     // parked on, so the blocking loop reaches its next cancellation check instead of waiting out
     // a broker that is still working.
     let leg = leg.with_cancel_signal(cancellation.signal());
-    let mut activity = ActivityLease::start(driver, message.activity.clone());
+    let reply_optional = message
+        .thread_continuation
+        .as_ref()
+        .is_some_and(|c| c.inherited);
+    let mut activity = ActivityLease::start(driver, message.activity.clone(), reply_optional);
+    let activity_publisher = activity.publisher();
+    let activity_labels = route.activity_labels.clone();
     let _active_registration = activity_enabled.then(|| {
         runner.active_sessions.register(
             message,
@@ -880,7 +953,7 @@ async fn session(
     // — a model round trip, a script that sleeps, a broker call per command. Running that on a
     // runtime worker would stall every other session in the process.
     let blocking_span = span.clone();
-    let usage = Arc::new(UsageAccumulator::default());
+    let usage = Arc::new(dekopon_harness::accounting::JobAccounting::default());
     let observed_usage = Arc::clone(&usage);
     let prompt_cancellation = cancellation.clone();
     let reply_optional = message
@@ -899,6 +972,18 @@ async fn session(
             Ok(model) => model,
             Err(error) => return (Err(error), None, None),
         };
+        let registry = GatewayModelRegistry {
+            cache: Arc::clone(&models),
+            models: configured_controls.as_ref().map_or_else(Vec::new, |c| c.models.clone()),
+        };
+        let controls = match control_client.map(|client| SessionControls::new(
+            &registry, dekopon_core::ModelSelection {
+                model: model_config.name().parse().expect("validated configured model ID"), effort: model_config.effort(),
+            }, client, control_executor, configured_controls.as_ref().expect("enabled controls").max_attempts,
+        )).transpose() {
+            Ok(controls) => controls,
+            Err(error) => return (Err(SessionError::Prompt(error.into())), None, None),
+        };
         let runtime = ShellRuntime {
             invoker: CancelAwareInvoker {
                 inner: leg,
@@ -911,14 +996,26 @@ async fn session(
         // recorded into it whichever way the loop ends.
         let mut history = seeded;
         let generated_image = GeneratedImageOutput::default();
-        let mut inputs = SessionInputs::new(&text, limits)
-            .with_system(instructions.as_deref())
-            .with_skills(&skills)
-            .with_options(&options)
-            .with_assets(&assets)
-            .with_usage_observer(observed_usage.as_ref())
-            .with_agent_config(&agent_config)
-            .with_cancellation(&prompt_cancellation);
+        let mut inputs = SessionBootstrap::new(
+            &text,
+            limits,
+            match model_config.as_ref() {
+                ModelConfig::OpenaiCompatible { model, .. }
+                | ModelConfig::ChatgptSubscription { model, .. } => model,
+            },
+        )
+        .with_surface_epoch(&surface_epoch)
+                .with_scope(&checkpoint_scope)
+        .with_system(instructions.as_deref())
+        .with_skills(&skills)
+        .with_options(&options)
+        .with_assets(&assets)
+        .with_accounting(observed_usage.as_ref())
+        .with_model_identity(ModelIdentity { configured: Some(model_config.name().parse().expect("configured model")), backend: model.model_identity().0.to_owned(), model: match model_config.as_ref() { ModelConfig::OpenaiCompatible { model, .. } | ModelConfig::ChatgptSubscription { model, .. } => model.clone() }, effort: model_config.effort() })
+        .with_agent_config(&agent_config)
+        .with_cancellation(&prompt_cancellation);
+        if let Some(publisher) = &activity_publisher { inputs = inputs.with_activity(publisher, &activity_labels); }
+        if let Some(controls) = &controls { inputs = inputs.with_controls(controls); }
         if let Some(generator) = image_generator.as_deref() {
             inputs = inputs.with_image_generation(generator, &generated_image);
         }
@@ -928,26 +1025,35 @@ async fn session(
         if reply_optional {
             inputs = inputs.with_optional_reply();
         }
-        let outcome = run_prompt_session(model.as_ref(), &runtime, inputs, &mut history)
+        let prior_job = history.turns().last().map(|r| r.job.clone());
+        let outcome = SessionEngine::new(model.as_ref(), &runtime)
+            .run(inputs, &mut history)
             .map_err(SessionError::from);
-        // Reading the turn back off the accumulator keeps the completed-versus-unanswered decision
-        // in the one module that owns it. The single exception is the message the loop refuses
-        // outright: a zero step budget builds no request, records nothing, and would otherwise make
-        // the newest *seeded* turn look like this session's — which strict configuration already
-        // rejects at startup, and which must not silently duplicate an exchange if it ever did not.
+        // The independent checkpoint owns every started job, even when bounded history evicts
+        // its text. Unknown effects and Stop must still reach the scoped store and finalizer.
         let turn = match &outcome {
-            Err(SessionError::Prompt(PromptError::ZeroSteps | PromptError::Cancelled)) => None,
-            _ => history.turns().last().cloned(),
+            Err(SessionError::Prompt(PromptError::Interrupted { checkpoint, .. })) => Some(checkpoint.record.clone()),
+            _ => {
+                let job = observed_usage.snapshot().job;
+                if job.is_empty() { None } else {
+                    match dekopon_harness::checkpoint::memory_checkpoints().load(&job) {
+                        Ok(saved) => Some(saved.record),
+                        Err(error) => {
+                            tracing::error!(event = "gateway_session_failed", category = "checkpoint-load", cause = %error);
+                            history.turns().last().filter(|r| Some(&r.job) != prior_job.as_ref()).cloned()
+                        }
+                    }
+                }
+            }
         };
         let image = outcome.is_ok().then(|| generated_image.take()).flatten();
         (outcome, turn, image)
     })
     .await;
 
-    let usage = usage.report();
-    if usage.model_calls > 0
+    if let Some(report) = usage.take_report()
         && let Some(reports) = &runner.usage_reports
-        && reports.try_send(usage).is_err()
+        && reports.try_send(report).is_err()
     {
         // Informational accounting must never delay or fail a paid-for answer. A bounded full or
         // closed queue loses a live dashboard delta and leaves OTLP accounting unchanged.
@@ -971,10 +1077,39 @@ async fn session(
         }
     };
 
+    let remember = |turn: Option<JobRecord>, delivery: DeliveryDisposition| {
+        let job = usage.snapshot().job;
+        if !job.is_empty()
+            && let Err(error) = dekopon_harness::checkpoint::finalize_delivery(
+                &job,
+                delivery.clone(),
+                usage.as_ref(),
+            )
+        {
+            tracing::error!(event = "gateway_session_failed", category = "checkpoint-finalization", cause = %error);
+        }
+        if let Some(mut turn) = turn {
+            turn.delivery = delivery;
+            if let Some(window) = window
+                && let Err(error) = runner.conversations.commit(
+                    &key,
+                    &surface,
+                    window,
+                    turn,
+                    &cache_key,
+                    Instant::now(),
+                )
+            {
+                tracing::warn!(event = "gateway_conversation_append_refused", cause = %error);
+            }
+        }
+    };
+
     if matches!(&outcome, Err(SessionError::Prompt(PromptError::Cancelled)))
         || cancellation.is_cancelled()
         || !cancellation.claim_completion()
     {
+        remember(turn, DeliveryDisposition::Cancelled);
         tracing::info!(event = "gateway_session_cancelled");
         activity.finish_in_background();
         return "cancelled";
@@ -985,18 +1120,6 @@ async fn session(
     // the completion decision is durable in gateway state.
     activity.seal();
 
-    // The exchange when the session answered, and the bare question when it did not. The fixed
-    // failure line is never stored: it is this daemon's sentence rather than the agent's, and
-    // replaying it would teach the model to keep producing it. Cancellation claimed the state
-    // above and therefore never reaches this commit.
-    if let Some(window) = window
-        && let Some(turn) = turn
-    {
-        runner
-            .conversations
-            .commit(&key, &granted, window, turn, &cache_key, Instant::now());
-    }
-
     if matches!(
         &outcome,
         Ok(outcome) if outcome.disposition == ReplyDisposition::Suppress
@@ -1005,6 +1128,7 @@ async fn session(
         // activity still returns to its inactive state through the separate cosmetic surface. The
         // unanswered in-process turn was committed above so a later continuation still sees what
         // the person said. Activity cleanup remains best effort and cannot create a chat message.
+        remember(turn, DeliveryDisposition::Suppressed);
         activity.finish_in_background();
         return "declined";
     }
@@ -1035,7 +1159,13 @@ async fn session(
     let delivery = deliver(replier, message, reply).await;
     activity.finish_in_background();
     match delivery {
-        Some(receipt) if receipt.accepted() => {
+        Ok(receipt) if receipt.accepted() => {
+            remember(
+                turn,
+                DeliveryDisposition::Accepted {
+                    text: delivered_answer.clone(),
+                },
+            );
             if recordable
                 && memory_surface.is_some()
                 && let Some(claim) = chat_claim
@@ -1044,7 +1174,20 @@ async fn session(
             }
             completed_outcome
         }
-        Some(_) | None => "reply-failed",
+        Ok(_) | Err(TransportError::PartialDelivery) => {
+            remember(turn, DeliveryDisposition::Partial);
+            "reply-failed"
+        }
+        Err(error) => {
+            let disposition = if matches!(&error, TransportError::Service { code } if matches!(code.as_str(), "ratelimited" | "post-capacity" | "invalid_auth" | "token_revoked" | "missing_scope"))
+            {
+                DeliveryDisposition::Failed
+            } else {
+                DeliveryDisposition::Unknown
+            };
+            remember(turn, disposition);
+            "reply-failed"
+        }
     }
 }
 
@@ -1082,7 +1225,7 @@ fn agent_config_view(
     model_class: Option<&str>,
     instructions: Option<&str>,
     skills: &[dekopon_config::Skill],
-    limits: dekopon_agent::prompt::PromptLimits,
+    limits: dekopon_harness::session::PromptLimits,
     conversation: ConversationPolicy,
     leg: &BrokerLeg,
 ) -> AgentConfigView {
@@ -1323,6 +1466,7 @@ fn memory_record_category(error: &MemoryRecordFailure) -> &'static str {
         MemoryRecordFailure::Broker(BrokerLegError::Client(ClientError::Remote {
             code, ..
         })) if code == ERROR_STORAGE_IO => ERROR_STORAGE_IO,
+        MemoryRecordFailure::Broker(BrokerLegError::Bootstrap(_)) => "invalid-bootstrap",
         MemoryRecordFailure::Broker(BrokerLegError::Client(_)) => "broker",
         MemoryRecordFailure::Broker(BrokerLegError::SessionIdentifier(_)) => "identifier",
         MemoryRecordFailure::Broker(BrokerLegError::DuplicateCapabilities { .. }) => {
@@ -1340,19 +1484,19 @@ fn memory_record_category(error: &MemoryRecordFailure) -> &'static str {
 async fn answer(replier: &Arc<dyn ChatReplier>, message: &InboundMessage, text: &str) -> bool {
     deliver(replier, message, OutboundReply::text(bound_outbound(text)))
         .await
-        .is_some()
+        .is_ok_and(|receipt| receipt.accepted())
 }
 
 async fn deliver(
     replier: &Arc<dyn ChatReplier>,
     message: &InboundMessage,
     reply: OutboundReply,
-) -> Option<DeliveryReceipt> {
+) -> Result<DeliveryReceipt, TransportError> {
     match replier.reply(message.reply.clone(), reply).await {
-        Ok(receipt) => Some(receipt),
+        Ok(receipt) => Ok(receipt),
         Err(error) => {
             tracing::error!(event = "gateway_reply_failed", category = error.category());
-            None
+            Err(error)
         }
     }
 }

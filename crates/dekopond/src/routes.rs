@@ -6,9 +6,9 @@
 
 use std::{collections::BTreeSet, sync::Arc};
 
-use dekopon_agent::prompt::PromptLimits;
 use dekopon_config::{LocalCatalog, Skill};
 use dekopon_core::AgentId;
+use dekopon_harness::session::PromptLimits;
 use thiserror::Error;
 
 use crate::{
@@ -35,10 +35,13 @@ pub(crate) struct BoundRoute {
     /// can be a megabyte of text that never changes while the daemon runs.
     pub skills: Arc<[Skill]>,
     pub model: Arc<ModelConfig>,
+    pub controls: Option<BoundControls>,
     /// Whether this route may generate images, already validated against the configured generator.
     pub image_generator: bool,
     /// Whether this route's sessions may record improvement suggestions.
     pub improvement_suggestions: bool,
+    pub activity_labels:
+        std::collections::BTreeMap<String, dekopon_harness::activity::ActivityLabel>,
     pub limits: PromptLimits,
     /// What this route remembers between messages.
     pub conversation: ConversationPolicy,
@@ -57,6 +60,13 @@ pub(crate) struct BoundRoute {
     /// The alternative, a fresh key per message, names a lane holding exactly one request and gives
     /// up the only caching a stateless route can have.
     pub cache_key: String,
+}
+
+/// Startup-resolved candidates; clients remain owned and reused by the gateway cache.
+#[derive(Clone, Debug)]
+pub(crate) struct BoundControls {
+    pub models: Vec<Arc<ModelConfig>>,
+    pub max_attempts: u32,
 }
 
 /// Every bound route, consulted in declaration order.
@@ -130,6 +140,26 @@ impl RoutingTable {
                     continue;
                 }
             };
+            let controls = route.controls.as_ref().map(|controls| {
+                if !controls.models.iter().any(|id| id.as_str() == model.name()) {
+                    problems.push(RouteProblem::ControlBaseline {
+                        model: model.name().to_owned(),
+                    });
+                }
+                let mut candidates = Vec::new();
+                for id in &controls.models {
+                    match models.iter().find(|m| m.name() == id.as_str()) {
+                        Some(model) => candidates.push(Arc::clone(model)),
+                        None => problems.push(RouteProblem::UnknownModel {
+                            model: id.to_string(),
+                        }),
+                    }
+                }
+                BoundControls {
+                    models: candidates,
+                    max_attempts: controls.max_attempts,
+                }
+            });
             routes.push(BoundRoute {
                 transport: route.transport.clone(),
                 r#match: route.r#match.clone(),
@@ -139,8 +169,19 @@ impl RoutingTable {
                 instructions: agent.spec.instructions.clone(),
                 skills: Arc::from(catalog.agent_skills(&route.agent).to_vec()),
                 model: Arc::clone(model),
+                controls,
                 image_generator: route.image_generator,
                 improvement_suggestions: route.improvement_suggestions,
+                activity_labels: route
+                    .activity_labels
+                    .iter()
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            dekopon_harness::activity::ActivityLabel::sanitized(v),
+                        )
+                    })
+                    .collect(),
                 limits: PromptLimits {
                     max_steps: route.limits.max_steps,
                     max_capability_calls: route.limits.max_capability_calls,
@@ -165,8 +206,12 @@ impl RoutingTable {
         let mut seen = BTreeSet::new();
         self.routes
             .iter()
-            .filter(|route| seen.insert(route.model.name().to_owned()))
-            .map(|route| route.model.as_ref())
+            .flat_map(|route| {
+                std::iter::once(&route.model)
+                    .chain(route.controls.iter().flat_map(|c| c.models.iter()))
+            })
+            .filter(|model| seen.insert(model.name().to_owned()))
+            .map(AsRef::as_ref)
             .collect()
     }
 
@@ -210,6 +255,8 @@ pub struct RouteError {
 /// One route that no configuration could ever satisfy.
 #[derive(Debug, Error)]
 pub enum RouteProblem {
+    #[error("controls.models must include the configured baseline {model:?}")]
+    ControlBaseline { model: String },
     #[error("route names agent {agent:?}, which is not in the catalog")]
     UnknownAgent { agent: String },
     #[error("route names agent {agent:?}, which the catalog disables")]

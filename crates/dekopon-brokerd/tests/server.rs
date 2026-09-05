@@ -376,7 +376,7 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
     let task = tokio::spawn(server.serve(listener, shutdown_on(shutdown_receive)));
 
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
-    let (_, words, _) = client
+    let (_, words, _, _) = client
         .session_surface(None)
         .await
         .expect("inspect the surface");
@@ -478,7 +478,7 @@ async fn a_legacy_resolve_command_frame_is_still_answered() {
             .await
             .expect("connect to the fixture socket");
         let envelope = RequestEnvelope {
-            api_version: ProtocolVersion::V1Alpha2,
+            api_version: ProtocolVersion::V1Alpha3,
             request: BrokerRequest::ResolveCommand {
                 attestation: None,
                 word: "probe".to_owned(),
@@ -1389,7 +1389,7 @@ async fn attested_capabilities_over_the_socket() {
     let granted_task = tokio::spawn(granted.serve(granted_listener, shutdown_on(granted_stopped)));
 
     let client = BrokerClient::new(&granted_path, uid, limits.frame).expect("client starts");
-    let (capabilities, _, _) = client
+    let (capabilities, _, _, _) = client
         .session_surface(Some(Attestation::for_subject(
             subject(),
             agent("chat-agent"),
@@ -1601,3 +1601,6 @@ async fn default_startup_tolerates_names_no_loaded_provider_declares() {
         .expect_err("an undeclared principal refuses startup even when tolerating");
     assert!(matches!(error, BrokerdError::Policy { .. }), "{error:?}");
 }
+
+#[path = "server/controls.rs"]
+mod controls;

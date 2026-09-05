@@ -738,10 +738,7 @@ impl ChatActivity for DiscordReplier {
                 .await
                 .map_err(|source| TransportError::Request(Box::new(source)))?;
             if response.status().as_u16() == 429 {
-                let bytes = response
-                    .bytes()
-                    .await
-                    .map_err(|source| TransportError::Request(Box::new(source)))?;
+                let bytes = super::activity_response(response).await?;
                 let body = serde_json::from_slice::<Value>(&bytes)
                     .map_err(TransportError::MalformedResponse)?;
                 let retry = retry_after_from_body(&body, MAX_ACTIVITY_COOLDOWN)

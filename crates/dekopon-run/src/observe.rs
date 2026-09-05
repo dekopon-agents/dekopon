@@ -4,7 +4,7 @@
 //! reads them back, so an operator can list the sessions a deployment ran and replay one. It
 //! speaks the receiver's search endpoint and nothing else — no ingestion, no stream management —
 //! and it treats what comes back as untrusted data: every response is byte-bounded, every page
-//! count is capped, and the records are handed to `dekopon-agent`'s reconstruction as JSON values
+//! count is capped, and the records are handed to `dekopon-harness`'s reconstruction as JSON values
 //! it inspects field by field.
 //!
 //! The base URL is the same organization base the OTLP exporter posts to, so one deployment's
@@ -160,7 +160,7 @@ impl OpenObserveClient {
     #[must_use]
     pub fn accounting_sql(&self) -> String {
         format!(
-            "SELECT * FROM \"{}\" WHERE audit_event = 'accounting.model.turn' ORDER BY _timestamp DESC",
+            "SELECT * FROM \"{}\" WHERE audit_event = 'accounting.model.call' ORDER BY _timestamp DESC",
             self.stream
         )
     }
@@ -299,7 +299,7 @@ mod tests {
         assert!(
             client
                 .accounting_sql()
-                .contains("audit_event = 'accounting.model.turn'")
+                .contains("audit_event = 'accounting.model.call'")
         );
     }
 

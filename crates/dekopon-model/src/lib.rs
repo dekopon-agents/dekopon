@@ -17,6 +17,8 @@ pub mod image;
 mod mock;
 /// Generic chat-model contract and OpenAI-compatible transport.
 pub mod model;
+/// Required inference attempt recorder.
+pub mod usage;
 
 /// Builds the one HTTP agent shape every transport in this crate uses.
 ///

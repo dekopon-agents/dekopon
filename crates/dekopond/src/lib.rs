@@ -26,7 +26,6 @@ mod activity;
 mod asset;
 mod cache_key;
 mod config;
-mod conversation;
 mod routes;
 mod session;
 mod transport;
@@ -65,7 +64,6 @@ pub use transport::TransportError;
 use crate::{
     asset::AssetStore,
     config::render_problems,
-    conversation::ConversationStore,
     routes::RoutingTable,
     session::{
         ConfiguredModels, ImageGeneratorStartupError, ModelCache, ModelCredentialError,
@@ -230,7 +228,9 @@ where
         models: Arc::new(ModelCache::new(Arc::new(ConfiguredModels))),
         gate: SessionGate::new(config.sessions.max_concurrent),
         reply_on_busy: config.sessions.reply_on_busy,
-        conversations: ConversationStore::new(config.sessions.max_conversations),
+        conversations: dekopon_harness::conversation::BoundedConversationStore::new(
+            config.sessions.max_conversations,
+        ),
         // Sized and expired like the conversation store, because an attachment reference outliving
         // the conversation that introduced it is a number no prompt can still name.
         assets: Arc::new(AssetStore::new(
@@ -516,6 +516,11 @@ fn client_error_category(error: &dekopon_broker_protocol::ClientError) -> &'stat
         ClientError::Protocol { .. } => "protocol",
         ClientError::Remote { .. } => "remote",
         ClientError::UnexpectedResponse => "unexpected-response",
+        ClientError::InvalidControl => "invalid-control",
+        ClientError::ControlAttempts => "control-attempts",
+        ClientError::ControlFenced => "control-fenced",
+        ClientError::SurfaceChanged => "surface-changed",
+        ClientError::ControlBinding => "control-binding",
     }
 }
 

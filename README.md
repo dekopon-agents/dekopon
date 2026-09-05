@@ -138,6 +138,15 @@ New in 0.5.0 — chat that can see what you sent it. One documented invariant wa
 - **A broker loads providers from a directory** rather than an enumerated list, and policy tolerates names no loaded provider declares, so adding a provider is one change rather than two.
 - **`dekopon-model` carries images and documents.** A message is text unless it is built with parts, and a text message serializes to exactly the bytes it did before. The public `Serialize` is now the redacted audit rendering rather than the chat-completions wire shape — the two were one type, which put a base64 attachment one careless `to_string` from the audit log.
 
+## Unreleased harness work
+
+The source tree now replaces `dekopon-agent` with `dekopon-harness`: fresh scoped schemas before
+inference, execution-aware history and memory checkpoints, strict job/attempt token accounting,
+broker-controlled configured model/effort switches and optional owned Slack progress. Skills,
+suggestions and recorded replay remain unreleased. See [the runtime contract and integration
+gaps](docs/harness.md) and [lockstep/API migration](docs/upgrading.md). This is not part of the
+published 0.12.0 binaries described above; publication of the new crate name is a separate task.
+
 ## What does not work yet
 
 Automatic memory replay, semantic/vector memory, cross-agent sharing, task memory, deletion/export UX,

@@ -1,0 +1,509 @@
+//! Ordinary bot-owned progress posts. API contracts: chat.postMessage, chat.update (as_user=true),
+//! chat.delete; <https://docs.slack.dev/reference/methods/>. No ephemeral/stream/animation API.
+use super::*;
+use dekopon_harness::activity::ActivityLabel;
+use tokio::time::Instant;
+
+/// Only a validated creation response can construct this handle. Not a delivery receipt.
+pub(crate) struct OwnedProgressArtifact {
+    channel: String,
+    timestamp: String,
+}
+
+#[derive(Default)]
+pub(super) struct CosmeticRate {
+    requests: VecDeque<Instant>,
+    cooldown: Option<Instant>,
+}
+impl CosmeticRate {
+    fn reserve(&mut self, now: Instant) -> Result<(), TransportError> {
+        while self
+            .requests
+            .front()
+            .is_some_and(|t| *t + Duration::from_secs(60) <= now)
+        {
+            self.requests.pop_front();
+        }
+        let limit = self
+            .requests
+            .front()
+            .filter(|_| self.requests.len() >= 30)
+            .map(|t| *t + Duration::from_secs(60));
+        if let Some(until) = limit
+            .into_iter()
+            .chain(self.cooldown)
+            .max()
+            .filter(|t| *t > now)
+        {
+            return Err(TransportError::ActivityRateLimited {
+                retry_after: until - now,
+            });
+        }
+        self.requests.push_back(now);
+        Ok(())
+    }
+}
+/// Shared physical channel post slots; final reservations outrank any new cosmetic post.
+#[derive(Default)]
+pub(super) struct PostRate {
+    next: HashMap<String, Instant>,
+}
+impl PostRate {
+    fn reserve(&mut self, channel: &str, final_post: bool) -> Result<Instant, TransportError> {
+        let now = Instant::now();
+        self.next.retain(|_, next| *next > now);
+        let slot = self.next.get(channel).copied().unwrap_or(now);
+        if (!final_post && slot > now)
+            || (self.next.len() >= 128 && !self.next.contains_key(channel))
+        {
+            return Err(TransportError::ActivityRateLimited {
+                retry_after: Duration::from_secs(1),
+            });
+        }
+        if slot > now + Duration::from_secs(10) {
+            return Err(TransportError::Service {
+                code: "post-capacity".into(),
+            });
+        }
+        self.next
+            .insert(channel.to_owned(), slot + Duration::from_secs(1));
+        Ok(slot)
+    }
+}
+fn body(label: ActivityLabel) -> Value {
+    // Detail is plain_text with emoji parsing off. Fallback is fixed, non-linking and cannot
+    // mention anyone, even when operator text resembles Slack's proprietary markup.
+    // Escape even in plain_text and re-bound after expansion, without cutting an entity or UTF-8.
+    let mut detail = String::from("⌛ ");
+    for c in label.as_str().chars() {
+        let escaped = match c {
+            '&' => "&amp;".into(),
+            '<' => "&lt;".into(),
+            '>' => "&gt;".into(),
+            _ => c.to_string(),
+        };
+        if detail.len() + escaped.len() > 84 {
+            break;
+        }
+        detail.push_str(&escaped);
+    }
+    json!({"text":"Working…", "mrkdwn":false, "parse":"none", "link_names":false,
+        "unfurl_links":false, "unfurl_media":false,
+        "blocks":[{"type":"section", "text":{"type":"plain_text", "text":detail, "emoji":false}}]})
+}
+impl SlackReplier {
+    pub(super) async fn post_answer(
+        &self,
+        body: &Value,
+        channel: &str,
+    ) -> Result<Value, TransportError> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        for attempt in 0..2 {
+            let slot = loop {
+                let reservation = self
+                    .post_rate
+                    .lock()
+                    .expect("Slack channel post rate")
+                    .reserve(channel, true);
+                match reservation {
+                    Ok(slot) => break slot,
+                    Err(TransportError::ActivityRateLimited { retry_after })
+                        if Instant::now() + retry_after < deadline =>
+                    {
+                        tokio::time::sleep(retry_after).await
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            if slot > deadline {
+                return Err(TransportError::Service {
+                    code: "post-capacity".into(),
+                });
+            }
+            tokio::time::sleep_until(slot).await;
+            let response = self
+                .http
+                .post(format!("{}/api/chat.postMessage", self.endpoint))
+                .header(
+                    "authorization",
+                    format!("Bearer {}", self.bot_token.expose()),
+                )
+                .header("content-type", "application/json; charset=utf-8")
+                .body(serde_json::to_vec(body).expect("JSON value serializes"))
+                .send()
+                .await
+                .map_err(|source| TransportError::Request(Box::new(source)))?;
+            // Only an explicit HTTP 429 proves nonacceptance. No EOF, timeout, malformed success,
+            // or other uncertain message creation is ever retried.
+            if response.status().as_u16() != 429 {
+                return check_ok(response).await;
+            }
+            let retry = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(60)
+                .max(1);
+            if attempt == 1 || retry > 5 || Instant::now() + Duration::from_secs(retry) > deadline {
+                return Err(TransportError::Service {
+                    code: "ratelimited".into(),
+                });
+            }
+            tokio::time::sleep(Duration::from_secs(retry)).await;
+        }
+        Err(TransportError::Service {
+            code: "ratelimited".into(),
+        })
+    }
+    pub(super) async fn create_progress(
+        &self,
+        target: ActivityTarget,
+        label: ActivityLabel,
+    ) -> Result<Option<OwnedProgressArtifact>, TransportError> {
+        if !self.progress_available.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let ActivityTarget::Slack {
+            channel_id,
+            thread_ts,
+            message_ts,
+            ..
+        } = target
+        else {
+            return Err(TransportError::Response);
+        };
+        let mut body = body(label);
+        body["channel"] = json!(channel_id);
+        // Same authenticated destination as replies, including classic whole-DM behavior.
+        if self.experience == SlackExperience::Agent || !channel_id.starts_with(['D', 'd']) {
+            body["thread_ts"] = json!(thread_ts);
+        }
+        body["reply_broadcast"] = json!(false);
+        let response = self.cosmetic_json("chat.postMessage", &body).await?;
+        let timestamp = response["ts"].as_str().ok_or(TransportError::Response)?;
+        if response["channel"] != channel_id
+            || !canonical_timestamp(timestamp)
+            || timestamp == message_ts
+            || timestamp == thread_ts
+        {
+            return Err(TransportError::Response);
+        }
+        Ok(Some(OwnedProgressArtifact {
+            channel: channel_id,
+            timestamp: timestamp.to_owned(),
+        }))
+    }
+    pub(super) async fn change_progress(
+        &self,
+        owned: &OwnedProgressArtifact,
+        label: ActivityLabel,
+    ) -> Result<(), TransportError> {
+        if !self.progress_available.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let mut body = body(label);
+        body["channel"] = json!(owned.channel);
+        body["ts"] = json!(owned.timestamp);
+        body["as_user"] = json!(true);
+        let response = self.cosmetic_json("chat.update", &body).await?;
+        if response["channel"] != owned.channel || response["ts"] != owned.timestamp {
+            return Err(TransportError::Response);
+        }
+        Ok(())
+    }
+    pub(super) async fn remove_progress(
+        &self,
+        owned: &OwnedProgressArtifact,
+    ) -> Result<(), TransportError> {
+        // Even a disabled posting surface must attempt cleanup of this run's confirmed handle.
+        match self
+            .cosmetic_json(
+                "chat.delete",
+                &json!({"channel":owned.channel,"ts":owned.timestamp}),
+            )
+            .await
+        {
+            Ok(response)
+                if response["channel"] == owned.channel && response["ts"] == owned.timestamp =>
+            {
+                Ok(())
+            }
+            Ok(_) => Err(TransportError::Response),
+            Err(TransportError::Service { code }) if code == "message_not_found" => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+    pub(super) async fn cosmetic_json(
+        &self,
+        method: &str,
+        body: &Value,
+    ) -> Result<Value, TransportError> {
+        self.cosmetic_rate
+            .lock()
+            .expect("Slack cosmetic rate")
+            .reserve(Instant::now())?;
+        // Reply sends do not acquire this mutex/budget; pending final sends win new cosmetic starts.
+        if self.final_sends.load(Ordering::Acquire) != 0 {
+            return Err(TransportError::ActivityRateLimited {
+                retry_after: Duration::from_secs(2),
+            });
+        }
+        if method == "chat.postMessage" {
+            let channel = body["channel"].as_str().ok_or(TransportError::Response)?;
+            self.post_rate
+                .lock()
+                .expect("Slack channel post rate")
+                .reserve(channel, false)?;
+        }
+        let mut response = self
+            .http
+            .post(format!("{}/api/{method}", self.endpoint))
+            .header(
+                "authorization",
+                format!("Bearer {}", self.bot_token.expose()),
+            )
+            .header("content-type", "application/json; charset=utf-8")
+            .body(serde_json::to_vec(body).expect("JSON value serializes"))
+            .timeout(ACTIVITY_REQUEST_TIMEOUT)
+            .send()
+            .await
+            .map_err(|source| TransportError::Request(Box::new(source)))?;
+        let status = response.status();
+        if status.as_u16() == 429 {
+            let seconds = response
+                .headers()
+                .get("retry-after")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(60)
+                .clamp(1, 86400);
+            let retry_after = Duration::from_secs(seconds);
+            self.cosmetic_rate
+                .lock()
+                .expect("Slack cosmetic rate")
+                .cooldown = Some(Instant::now() + retry_after);
+            return Err(TransportError::ActivityRateLimited { retry_after });
+        }
+        let mut bytes = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|source| TransportError::Request(Box::new(source)))?
+        {
+            if chunk.len() > 64 * 1024 - bytes.len() {
+                return Err(TransportError::Response);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let body: Value =
+            serde_json::from_slice(&bytes).map_err(TransportError::MalformedResponse)?;
+        if status.is_success() && body["ok"] == true {
+            return Ok(body);
+        }
+        let code = if status.is_success() {
+            // Closed vocabulary: raw platform text must not enter cosmetic diagnostics.
+            match body["error"].as_str().unwrap_or("") {
+                "missing_scope" => "missing_scope",
+                "invalid_auth" => "invalid_auth",
+                "token_revoked" => "token_revoked",
+                "feature_disabled" => "feature_disabled",
+                "not_allowed_token_type" => "not_allowed_token_type",
+                "method_deprecated" => "method_deprecated",
+                "deprecated_endpoint" => "deprecated_endpoint",
+                "already_reacted" => "already_reacted",
+                "no_reaction" => "no_reaction",
+                "message_not_found" => "message_not_found",
+                "cant_delete_message" => "cant_delete_message",
+                "cant_update_message" => "cant_update_message",
+                _ => "service-error",
+            }
+        } else {
+            "http-error"
+        };
+        if matches!(
+            code,
+            "missing_scope"
+                | "invalid_auth"
+                | "token_revoked"
+                | "not_allowed_token_type"
+                | "cant_update_message"
+                | "cant_delete_message"
+        ) && method.starts_with("chat.")
+        {
+            self.progress_available.store(false, Ordering::Release);
+        }
+        Err(TransportError::Service { code: code.into() })
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests;
+#[cfg(test)]
+mod rate_tests {
+    use super::*;
+    fn transport(name: &str) -> SlackTransport {
+        SlackTransport::new(
+            name.into(),
+            "http://127.0.0.1:43219".into(),
+            "fixture-app".into(),
+            "fixture-bot".into(),
+            SlackExperience::Agent,
+            SlackActivityConfig::default(),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn authenticated_physical_installation_refuses_an_independent_configuration() {
+        let first = transport("first");
+        let second = transport("second");
+        first.claim_installation("T1", "U1").unwrap();
+        first.claim_installation("T1", "U1").unwrap();
+        assert!(
+            matches!(second.claim_installation("t1","u1"), Err(TransportError::Service {code}) if code=="duplicate-slack-installation")
+        );
+        drop(first);
+        second.claim_installation("T1", "U1").unwrap();
+    }
+    #[test]
+    fn terminal_retirement_bounds_failed_cleanup_metadata() {
+        let transport = transport("retire");
+        for i in 0..256 {
+            let target = ActivityTarget::Slack {
+                channel_id: "C1".into(),
+                thread_ts: "1.000001".into(),
+                message_ts: format!("2.{i:06}"),
+                initiator_user_id: "U1".into(),
+            };
+            transport
+                .replier
+                .update_attempt(&target, |attempt| attempt.agent_status = true);
+            assert_eq!(transport.replier.active_activity.lock().unwrap().len(), 1);
+            transport.replier.retire(&target);
+        }
+        assert!(transport.replier.active_activity.lock().unwrap().is_empty());
+    }
+    fn response(status: u16, body: &str) -> Vec<u8> {
+        format!("HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nRetry-After: 1\r\nConnection: close\r\n\r\n{body}",body.len()).into_bytes()
+    }
+    fn with_endpoint(endpoint: String, progress_message: bool) -> SlackTransport {
+        SlackTransport::new(
+            "fixture".into(),
+            endpoint,
+            "app".into(),
+            "bot".into(),
+            SlackExperience::Classic,
+            SlackActivityConfig {
+                mode: ActivityMode::Native,
+                classic_fallback: SlackActivityFallback::Reaction,
+                progress_message,
+            },
+        )
+        .unwrap()
+    }
+    fn target() -> ActivityTarget {
+        ActivityTarget::Slack {
+            channel_id: "C1".into(),
+            thread_ts: "1.000001".into(),
+            message_ts: "1.000001".into(),
+            initiator_user_id: "U1".into(),
+        }
+    }
+    #[tokio::test]
+    async fn progress_and_concurrent_final_posts_share_channel_slots_and_explicit_429_recovery() {
+        for progress in [false, true] {
+            let mut responses = Vec::new();
+            if progress {
+                responses.push(response(
+                    200,
+                    r#"{"ok":true,"channel":"C1","ts":"1.000002"}"#,
+                ));
+            }
+            responses.extend([
+                response(429, "{}"),
+                response(200, r#"{"ok":true,"channel":"C1","ts":"1.000003"}"#),
+                response(200, r#"{"ok":true,"channel":"C1","ts":"1.000004"}"#),
+            ]);
+            let server = dekopon_test_support::LoopbackServer::sequence(responses);
+            let transport = with_endpoint(server.url(), progress);
+            if progress {
+                assert!(
+                    transport
+                        .replier
+                        .create_progress(target(), ActivityLabel::sanitized("Working"))
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+            }
+            let reply_target = ReplyTarget::Slack {
+                channel: "C1".into(),
+                thread_ts: Some("1.000001".into()),
+            };
+            let (first, second) = tokio::join!(
+                transport
+                    .replier
+                    .reply(reply_target.clone(), OutboundReply::text("same final")),
+                transport
+                    .replier
+                    .reply(reply_target, OutboundReply::text("same final"))
+            );
+            assert!(first.unwrap().accepted());
+            assert!(second.unwrap().accepted());
+            let requests = server.recorded();
+            assert_eq!(requests.len(), if progress { 4 } else { 3 });
+            for request in requests.iter().skip(usize::from(progress)) {
+                let request = String::from_utf8_lossy(request);
+                assert!(request.contains("same final"));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn unknown_final_post_is_not_retried() {
+        let server = dekopon_test_support::LoopbackServer::once(b"");
+        let transport = with_endpoint(server.url(), false);
+        assert!(
+            transport
+                .replier
+                .reply(
+                    ReplyTarget::Slack {
+                        channel: "C1".into(),
+                        thread_ts: None
+                    },
+                    OutboundReply::text("final")
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(server.recorded().len(), 1);
+    }
+    #[tokio::test]
+    async fn uncertain_native_write_survives_successful_reaction_fallback_and_cleanup() {
+        let server = dekopon_test_support::LoopbackServer::sequence([
+            vec![],
+            response(200, r#"{"ok":true}"#),
+            response(200, r#"{"ok":true}"#),
+            response(200, r#"{"ok":true}"#),
+        ]);
+        let mut transport = with_endpoint(server.url(), false);
+        Arc::get_mut(&mut transport.replier).unwrap().experience = SlackExperience::Agent;
+        let error = transport.replier.show(target()).await.unwrap_err();
+        assert!(crate::activity::uncertain(&error));
+        transport.replier.hide(target()).await.unwrap();
+        transport.replier.retire(&target());
+        assert!(transport.replier.active_activity.lock().unwrap().is_empty());
+        assert_eq!(server.recorded().len(), 4);
+    }
+    #[test]
+    fn installation_budget_is_thirty_requests_per_rolling_minute() {
+        let mut rate = CosmeticRate::default();
+        let now = Instant::now();
+        for _ in 0..30 {
+            rate.reserve(now).unwrap();
+        }
+        assert!(
+            matches!(rate.reserve(now),Err(TransportError::ActivityRateLimited { retry_after }) if retry_after == Duration::from_secs(60))
+        );
+        rate.reserve(now + Duration::from_secs(60)).unwrap();
+    }
+}

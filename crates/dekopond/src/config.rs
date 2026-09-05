@@ -16,12 +16,12 @@ use std::{
     time::Duration,
 };
 
-use dekopon_agent::prompt::HistoryLimits;
 use dekopon_broker_protocol::{
     BrokerSocketDiscovery, DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, ProtocolError,
     ResolvedBrokerSocket,
 };
 use dekopon_core::{AgentId, FileHygieneError, FileTier, read_trusted_file};
+use dekopon_harness::history::HistoryLimits;
 use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
 use serde::Deserialize;
 use thiserror::Error;
@@ -118,6 +118,9 @@ pub struct SlackActivityConfig {
     /// Used by classic apps and when Agent status is unavailable for this installation.
     #[serde(default)]
     pub classic_fallback: SlackActivityFallback,
+    /// One owned ordinary progress message, separate from native status; opt-in.
+    #[serde(default)]
+    pub progress_message: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -267,6 +270,9 @@ pub enum ModelConfig {
         name: String,
         endpoint: String,
         model: String,
+        /// Explicit inference effort; omitted means providerDefault, not medium or high.
+        #[serde(default)]
+        effort: dekopon_core::Effort,
         #[serde(default)]
         api_key_env: Option<String>,
         timeout_ms: u64,
@@ -285,6 +291,9 @@ pub enum ModelConfig {
     ChatgptSubscription {
         name: String,
         model: String,
+        /// Explicit inference effort; omitted means providerDefault, not medium or high.
+        #[serde(default)]
+        effort: dekopon_core::Effort,
         #[serde(default)]
         auth_file: Option<PathBuf>,
         timeout_ms: u64,
@@ -314,6 +323,14 @@ impl ModelConfig {
     pub fn name(&self) -> &str {
         match self {
             Self::OpenaiCompatible { name, .. } | Self::ChatgptSubscription { name, .. } => name,
+        }
+    }
+
+    pub fn effort(&self) -> dekopon_core::Effort {
+        match self {
+            Self::OpenaiCompatible { effort, .. } | Self::ChatgptSubscription { effort, .. } => {
+                *effort
+            }
         }
     }
 
@@ -490,6 +507,8 @@ pub struct RouteConfig {
     /// Overrides model-class selection for this route.
     #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub controls: Option<ControlsConfig>,
     /// Explicitly enables the gateway's image generator for this route.
     #[serde(default)]
     pub image_generator: bool,
@@ -501,24 +520,15 @@ pub struct RouteConfig {
     #[serde(default)]
     pub improvement_suggestions: bool,
     #[serde(default)]
+    pub activity_labels: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
     pub limits: RouteLimits,
     /// What this route remembers between messages; `oneShot` unless an operator says otherwise.
     #[serde(default)]
     pub conversation: ConversationConfig,
 }
 
-/// A persistent route's bounds, with `idleTimeoutMs` already resolved to a [`Duration`].
-///
-/// Both window bounds apply together, oldest exchanges dropping first until each holds. Two bounds
-/// because they fail differently: twelve one-line exchanges and twelve paragraph-length ones are the
-/// same number of turns and very different prompts.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ConversationWindow {
-    /// How long an untouched conversation survives before a lookup drops it.
-    pub idle_timeout: Duration,
-    /// What the replayed window holds.
-    pub limits: HistoryLimits,
-}
+pub use dekopon_harness::conversation::ConversationWindow;
 
 /// What a route remembers, after validation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -548,10 +558,12 @@ pub struct ResolvedRoute {
     pub agent: AgentId,
     /// Overrides model-class selection for this route.
     pub model: Option<String>,
+    pub controls: Option<ControlsConfig>,
     /// Whether this route may generate images, already proved against the configured generator.
     pub image_generator: bool,
     /// Whether this route's sessions may record improvement suggestions.
     pub improvement_suggestions: bool,
+    pub activity_labels: std::collections::BTreeMap<String, String>,
     pub limits: RouteLimits,
     pub conversation: ConversationPolicy,
 }
@@ -767,9 +779,11 @@ pub(crate) fn resolve(
                 let activity_is_meaningful = match (experience, activity.mode) {
                     (_, ActivityMode::Off) => {
                         activity.classic_fallback == SlackActivityFallback::None
+                            && !activity.progress_message
                     }
                     (SlackExperience::Classic, ActivityMode::Native) => {
                         activity.classic_fallback == SlackActivityFallback::Reaction
+                            || activity.progress_message
                     }
                     (SlackExperience::Agent, ActivityMode::Native) => true,
                 };
@@ -877,6 +891,11 @@ pub(crate) fn resolve(
             models_incomplete = true;
             continue;
         }
+        if name.parse::<dekopon_core::ConfiguredModelId>().is_err() {
+            problems.push(ConfigProblem::InvalidControlConfiguration {
+                reason: "model name is not a configured-model identifier".into(),
+            });
+        }
         if !model_names.insert(name.clone()) {
             problems.push(ConfigProblem::DuplicateModel { name });
             continue;
@@ -917,6 +936,41 @@ pub(crate) fn resolve(
             problems.push(ConfigProblem::UnknownRouteModel {
                 model: model.clone(),
             });
+        }
+        if let Some(controls) = &route.controls {
+            if controls.models.is_empty()
+                || controls.models.len() > dekopon_broker_protocol::MAX_CONTROL_TARGETS
+            {
+                problems.push(ConfigProblem::InvalidControlConfiguration {
+                    reason: "controls.models must contain 1..=16 candidates".into(),
+                });
+            }
+            if !(1..=dekopon_broker_protocol::MAX_CONTROL_ATTEMPTS).contains(&controls.max_attempts)
+            {
+                problems.push(ConfigProblem::InvalidControlConfiguration {
+                    reason: "controls.maxAttempts must be 1..=4".into(),
+                });
+            }
+            let mut seen = BTreeSet::new();
+            for model in &controls.models {
+                if !seen.insert(model) {
+                    problems.push(ConfigProblem::InvalidControlConfiguration {
+                        reason: format!("duplicate control model {model}"),
+                    });
+                }
+                if !models_incomplete && !model_names.contains(model.as_str()) {
+                    problems.push(ConfigProblem::UnknownRouteModel {
+                        model: model.to_string(),
+                    });
+                }
+            }
+        }
+        if route.activity_labels.len() > 256
+            || route.activity_labels.iter().any(|(id, label)| {
+                id.parse::<dekopon_core::CapabilityId>().is_err() || label.len() > 80
+            })
+        {
+            problems.push(ConfigProblem::InvalidActivityLabels);
         }
         if route.image_generator && config.image_generator.is_none() {
             problems.push(ConfigProblem::UnconfiguredRouteImageGenerator {
@@ -964,8 +1018,10 @@ pub(crate) fn resolve(
             r#match: route.r#match,
             agent: route.agent,
             model: route.model,
+            controls: route.controls,
             image_generator: route.image_generator,
             improvement_suggestions: route.improvement_suggestions,
+            activity_labels: route.activity_labels,
             limits: route.limits,
             conversation,
         });
@@ -1245,6 +1301,8 @@ pub enum ConfigError {
 /// [`ConfigError::Invalid`], which owns the source path they all share.
 #[derive(Debug, Error)]
 pub enum ConfigProblem {
+    #[error("invalid configured model controls: {reason}")]
+    InvalidControlConfiguration { reason: String },
     #[error("gateway configuration must declare at least one transport")]
     NoTransports,
     #[error("gateway configuration must declare at least one model")]
@@ -1266,9 +1324,13 @@ pub enum ConfigProblem {
     #[error("the image generator must have a timeout greater than zero")]
     InvalidImageGeneratorTimeout,
     #[error(
-        "Slack transport {name:?} has an activity fallback that cannot take effect; off requires fallback none, and classic native activity requires fallback reaction"
+        "Slack transport {name:?} has an activity fallback that cannot take effect; off requires fallback none and progressMessage false, and classic native activity requires fallback reaction or progressMessage true"
     )]
     InvalidSlackActivity { name: String },
+    #[error(
+        "activityLabels requires at most 256 valid capability IDs with labels of at most 80 UTF-8 bytes"
+    )]
+    InvalidActivityLabels,
     #[error("WhatsApp transport {name:?} must bind an explicit nonzero port")]
     InvalidWhatsappBind { name: String },
     #[error("WhatsApp transport {name:?} must use canonical positive WABA and phone-number IDs")]
@@ -1347,4 +1409,16 @@ pub(crate) fn render_problems<P: std::error::Error>(problems: &[P]) -> String {
         }
     }
     rendered
+}
+
+/// Route-local candidate list, never permission. The broker separately bounds and authorizes it.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ControlsConfig {
+    pub models: Vec<dekopon_core::ConfiguredModelId>,
+    #[serde(default = "default_control_attempts")]
+    pub max_attempts: u32,
+}
+fn default_control_attempts() -> u32 {
+    dekopon_broker_protocol::MAX_CONTROL_ATTEMPTS
 }

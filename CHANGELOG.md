@@ -7,7 +7,41 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- Fence retained-context reuse at authenticated broker freshness boundaries; validate execution IDs
+  before checkpoint reservation and bound eviction of inactive fenced jobs. Preserve batch-local
+  results, restored history, failed/nullable response usage and terminal host delivery accounting.
+- Bound Slack cleanup metadata, retain native-write uncertainty through fallback, reject duplicate
+  authenticated installations, and coordinate final/progress channel posts with definitive-429-only
+  recovery. Portable multi-revision recording reconstruction remains incomplete.
+
 ### Added
+
+- Harness-owned execution-aware history, scoped generation leases and bounded versioned memory
+  checkpoints. Request-one bootstrap carries fresh descriptions and complete input schemas;
+  execution evidence and consumed budgets survive inference failure and Stop, while generated
+  text, accepted delivery and optional durable-memory recording remain separate.
+
+- Unreleased structured harness activity at actual nested capability submissions, bounded public
+  `activityLabels`, and opt-in Slack `activity.progressMessage`: one owned plain-text/hourglass
+  post, coalesced updates and generation-safe best-effort cleanup, separate from replies/history.
+  Existing Agent status/Stop/reaction and Discord/Telegram typing remain; local/WhatsApp are no-ops.
+
+- Add harness-owned checkpointed token accounting across inference attempts, model/effort segments and terminal delivery outcomes; preserve unknown usage and replace success-only token observers.
+
+- Unreleased configured model/effort transitions in `dekopon-harness`, opt-in gateway route
+  `controls`, reused allowlisted clients, sole-tool batch preflight, bounded refusal-inclusive
+  attempts, fresh broker admission per application, checkpointed portable-context rebuilds and
+  replay/cache invalidation without resetting work budgets. Explicit model effort is encoded as
+  Chat Completions `reasoning_effort` or Responses `reasoning.effort`; default omits the setting.
+  Direct/replay runners remain fail-closed without a control authorizer.
+
+- Unreleased core model/effort admission through authenticated `authorizeControl`, fresh Cedar
+  `agent.prompt` plus reserved `agent.model.select`/`agent.effort.set` decisions, bounded broker
+  `controlTargets`, request/agent/job bindings, startup epochs, and durable replay-consuming
+  admission audit. Protocol `v1alpha3` requires lockstep client/broker migration; admission is not
+  application or reusable provider authority.
 
 - Added cooperative cancellation to `dekopon-process`: `CancelSignal::pair` yields a cloneable
   `CancelHandle` whose idempotent `cancel` makes the supervisor abort a
@@ -15,7 +49,7 @@ All notable changes to Dekopon are documented here. The format is based on
   `ProcessOutcome::TaskFailed` with `is_cancelled()`; a node that already returned keeps its real
   result, dropping every handle (or `CancelSignal::never`) never cancels, and the `process.node`
   span records `process.interruptibility` as `cancellable` and a requested cancellation as
-  `process.outcome` `cancelled`. The broker leg in `dekopon-agent` is the one cancellable
+  `process.outcome` `cancelled`. The broker leg in `dekopon-harness` is the one cancellable
   consumer — a gateway session's Stop abandons an in-flight command run through it — and the
   runner's `legacy-shell` and `direct-command` nodes stay non-interruptible.
 - Added `dekopon:provider@0.3.0`, whose new `provider-cli` world exports `run-command`: a command
@@ -50,7 +84,7 @@ All notable changes to Dekopon are documented here. The format is based on
   node inside the `legacy-shell` node, so `probe --help` renders the component's page,
   `echo hello | probe upper -` hands the piped value to the guest, and a proposal is invoked
   exactly as a bare capability word would be; `--max-input-bytes` bounds argv plus the piped value
-  there. The broker leg in `dekopon-agent` runs each word as a cancellable `broker-command` node:
+  there. The broker leg in `dekopon-harness` runs each word as a cancellable `broker-command` node:
   `BrokerLeg::with_cancel_signal` accepts a `CancelSignal`, `dekopond` supplies one per session,
   and a native Stop abandons an in-flight command run instead of waiting for the broker's answer.
   `dekopon-run --broker` supplies none, so its nodes are cancellable in contract only.
@@ -60,7 +94,7 @@ All notable changes to Dekopon are documented here. The format is based on
   `1`), and a run cancelled underneath its session like a refused capability
   (`<word>: denied: session-cancelled`, exit `126`), so neither reads to the model as a usage
   error it should fix.
-- Added the `agent.command.unobserved` audit record, emitted by `dekopon-agent`'s
+- Added the `agent.command.unobserved` audit record, emitted by `dekopon-harness`'s
   `report_unobserved_command_run` when either command leg's process node finishes after its
   caller was dropped: `command.leg` (`broker` or `direct`), a fixed `outcome`, and a fixed
   `error.type`, never the word, the argv, or any text; the cause goes out as an ordinary error
@@ -103,7 +137,7 @@ All notable changes to Dekopon are documented here. The format is based on
   the session continues either way. Both records fire whether or not payload telemetry is on,
   because offering the tool is the consent to put model-authored text in the log. A suggestion
   changes nothing: no instruction, skill, limit, or grant moves because a model asked. Embedders
-  read them back from `PromptOutcome.suggestions`.
+  read them back from `SessionExit.suggestions`.
 - Added `dekopon-run session list|show|replay`, which read sessions back from the OpenObserve log
   stream the runner and gateway export to. The receiver is `--openobserve-url`
   (`DEKOPON_OPENOBSERVE_URL`), the organization base the OTLP exporter posts to, with
@@ -112,7 +146,7 @@ All notable changes to Dekopon are documented here. The format is based on
   holding the complete `Authorization` header value, so no credential value appears in an
   argument; the client follows no redirect, uses no ambient proxy, reads at most 20 pages of 500
   records and warns when it stops there, bounds a response at 32 MiB, and validates a trace
-  identifier before interpolating it into SQL. `list` groups `accounting.model.turn` records by
+  identifier before interpolating it into SQL. `list` groups `accounting.model.call` records by
   trace within `--since` (default `7d`; a count followed by `s`, `m`, `h`, or `d`), newest first,
   so it also lists sessions recorded metadata-only; `show` reconstructs one session — system
   messages, earlier exchanges, prompt, every turn's scripts and their outputs, the answer — from
@@ -136,13 +170,19 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Changed
 
+- Replace `dekopon-agent` with `dekopon-harness` and migrate all in-tree embedders to
+  `SessionEngine`/`SessionBootstrap`; no compatibility facade. Model adapters now require an
+  inference-attempt recorder. New call/transition/job accounting supersedes turn/image emitters.
+  See `docs/upgrading.md` for API, protocol and telemetry migration and `docs/harness.md` for
+  the current integration limitations. New-crate publication bootstrap is a separate release task.
+
 - `dekopon-shell`'s `CapabilityInvoker::run_command` replaces `resolve_command`: it receives the
   piped value rendered as text (strings verbatim, other values as compact JSON) and answers with a
   `CommandRun` — a capability proposal authorized and charged like a direct call, text the provider
   rendered itself (help, a version, a usage error) written to the shell's stdout and diagnostic
   streams at the provider's own exit status and charging no capability call, or a decline
   reported as a usage error at exit `2`. The scripting tool's description now tells the model to
-  run `<word> --help` for a provider command word's subcommands and flags. `dekopon-agent`,
+  run `<word> --help` for a provider command word's subcommands and flags. `dekopon-harness`,
   `dekopond`, and `dekopon-run` forward the new method, and the broker leg carries it over the
   new `runCommand` operation with the piped value.
 - The broker protocol gains `runCommand` (`BrokerRequest::RunCommand`, with an optional `stdin`),
@@ -153,8 +193,8 @@ All notable changes to Dekopon are documented here. The format is based on
   `Broker::run_command` replaces `Broker::resolve_command` and threads the piped value to the
   guest, and `dekopon-brokerd` answers both operations: `runCommand` with the
   outcome intact and the legacy `resolveCommand` with rendered text degraded to a decline carrying
-  the text, so an older client keeps working against a newer broker for one release while a newer
-  client's `runCommand` reaching an older broker is refused `invalid-request`. The piped value is
+  the text. Legacy operation handling does not admit an older envelope: the controls migration
+  requires `v1alpha3` on both sides and rejects older binaries before dispatch. The piped value is
   bounded by the frame ceiling on the client and by the host's `maxInputBytes` on the broker.
 - `dekopon-broker-host` renamed its command-word errors around the new export:
   `MissingResolveCommand` is `MissingCommandExport`, `ResolveCommandSignature` is
@@ -174,15 +214,15 @@ All notable changes to Dekopon are documented here. The format is based on
 - `dekopon describe agent` always prints a `Skills:` section, `(none)` when nothing is mounted, its
   `--output json` carries each loaded skill whole, and the wide `get agent` table gains a `SKILLS`
   column between `PROVIDERS` and `MODEL`.
-- `dekopon-agent`'s `PromptOutcome` gains `suggestions`, and `PromptError` gains
+- `dekopon-harness`'s `SessionExit` gains `suggestions`, and `PromptError` gains
   `MissingSkillName`, `UnexpectedSkillArguments`, and `InvalidSuggestion` (telemetry kinds
   `missing-skill-name`, `unexpected-skill-arguments`, `invalid-suggestion`), which end a session
   as every other malformed tool call does; an exhaustive match downstream must name them.
-- `dekopon-agent` now depends on `dekopon-config`, for the loaded `Skill` a session shows a model,
+- `dekopon-harness` now depends on `dekopon-config`, for the loaded `Skill` a session shows a model,
   and `dekopon-run` on `dekopon-config` (the same loader behind `--skill`), `ureq` (the OpenObserve
   client, on the HTTP stack the model clients already use), and `time` (RFC 3339 timestamps in
   `session list`). `dekopon-run` still reaches no broker crate; the CI `cargo tree` gate checks it.
-  `dekopon-agent` and `dekopond` now also depend on `dekopon-process`, for the node each broker
+  `dekopon-harness` and `dekopond` now also depend on `dekopon-process`, for the node each broker
   command run executes in and the cancel signal a gateway session hands it; it is not a broker
   crate, and the same gate covers `dekopond`.
   `dekopon-core` gains `SkillId`, `SkillIdError`, and `MAX_SKILL_NAME_LENGTH`, and

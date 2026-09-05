@@ -814,27 +814,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dekopon-agent"
-version = "0.12.0"
-dependencies = [
- "dekopon-broker-protocol",
- "dekopon-capability",
- "dekopon-config",
- "dekopon-core",
- "dekopon-model",
- "dekopon-process",
- "dekopon-shell",
- "dekopon-telemetry",
- "rustix",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "dekopon-broker"
 version = "0.12.0"
 dependencies = [
@@ -846,6 +825,7 @@ dependencies = [
  "dekopon-policy",
  "dekopon-storage-host",
  "dekopon-test-support",
+ "getrandom 0.4.3",
  "libc",
  "serde",
  "serde_json",
@@ -967,6 +947,30 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "dekopon-harness"
+version = "0.12.0"
+dependencies = [
+ "dekopon-broker-protocol",
+ "dekopon-capability",
+ "dekopon-config",
+ "dekopon-core",
+ "dekopon-model",
+ "dekopon-process",
+ "dekopon-shell",
+ "dekopon-telemetry",
+ "dekopon-test-support",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1098,7 +1102,6 @@ name = "dekopon-run"
 version = "0.12.0"
 dependencies = [
  "clap",
- "dekopon-agent",
  "dekopon-broker",
  "dekopon-broker-host",
  "dekopon-broker-protocol",
@@ -1106,6 +1109,7 @@ dependencies = [
  "dekopon-capability",
  "dekopon-config",
  "dekopon-core",
+ "dekopon-harness",
  "dekopon-model",
  "dekopon-process",
  "dekopon-provider-host",
@@ -1211,11 +1215,11 @@ dependencies = [
  "axum",
  "base64 0.23.1",
  "clap",
- "dekopon-agent",
  "dekopon-broker-protocol",
  "dekopon-brokerd",
  "dekopon-config",
  "dekopon-core",
+ "dekopon-harness",
  "dekopon-model",
  "dekopon-process",
  "dekopon-shell",

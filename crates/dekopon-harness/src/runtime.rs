@@ -1,29 +1,4 @@
-//! The reusable agent session layer shared by Dekopon's embedding binaries.
-//!
-//! `dekopon-run` drives one prompt session from a CLI; `dekopond` drives many from chat transports. Both need the same four pieces, and this crate is where they live so there is one
-//! authoritative copy:
-//!
-//! - [`prompt::run_prompt`] — the bounded model tool loop offering one sandboxed scripting tool,
-//!   with [`prompt::run_prompt_with_history`] running that same loop as the continuation of a
-//!   bounded [`prompt::History`], [`prompt::SessionInputs`] optionally carrying cooperative
-//!   cancellation for transport-owned Stop controls or a request-scoped no-reply decision, and
-//!   [`prompt::run_prompt_with_history_and_options`] adding the request-scoped routing metadata a
-//!   caller uses to point one conversation's turns at one provider cache lane;
-//! - [`ShellRuntime`] — the [`prompt::ScriptRuntime`] that runs each model-authored script on a
-//!   fresh `dekopon-shell` interpreter under a session-wide capability budget;
-//! - [`SessionInvoker`] — capability dispatch that prefers a local read-only leg and falls through
-//!   to a broker leg;
-//! - [`BrokerLeg`] — a synchronous [`CapabilityInvoker`] facade over the asynchronous
-//!   [`BrokerClient`], for sessions that run on a blocking task.
-//!
-//! Nothing here holds authority. The broker leg submits identity-free proposals and reports back
-//! whatever the broker decided; this crate never interprets policy, resolves credentials, or
-//! constructs authorization state, and it deliberately depends only on the client half of the
-//! broker protocol.
-
-#![forbid(unsafe_code)]
-
-use std::time::Duration;
+//! Unprivileged shell dispatch and direct-first broker adapters.
 
 #[cfg(unix)]
 use std::{
@@ -55,13 +30,49 @@ use serde_json::Value;
 #[cfg(unix)]
 use thiserror::Error;
 
-use crate::{meta::EffectiveCapabilityView, prompt::ScriptRuntime};
+use crate::{
+    bootstrap::{BootstrapError, CapabilitySnapshot},
+    meta::EffectiveCapabilityView,
+};
 
-pub mod improvement;
-pub mod meta;
-pub mod prompt;
-pub mod replay;
-pub mod skills;
+/// Script execution boundary consumed by the prompt loop.
+///
+/// This deliberately returns no `Result`. A script failure — a parse error, an exhausted budget, a
+/// capability that policy refused — is a script *outcome*, and the model reads it and recovers the
+/// same way it would from a non-zero exit code in a terminal. Only a broken session aborts the
+/// loop.
+pub trait ScriptRuntime {
+    /// Fresh host/broker surface check before inference or reuse of retained context.
+    fn check_freshness(&self) -> Result<(), String> {
+        Ok(())
+    }
+    /// Whether actual dispatch observations, rather than a legacy script total, own the budget.
+    fn observes_executions(&self) -> bool {
+        false
+    }
+    /// Runs one model-authored script, invoking at most `max_capability_calls` capabilities.
+    ///
+    /// The ceiling is supplied per call rather than fixed at construction because the prompt loop
+    /// spends one session-wide budget across every script it runs.
+    fn run_script(&self, script: &str, max_capability_calls: u32) -> ScriptOutcome;
+
+    /// Reads the same scoped in-memory metadata used by `cap --list` and `cap --describe`.
+    ///
+    /// This must not execute a script, invoke a provider, or discover capabilities through a model.
+    /// A runtime with no live capability surface returns an explicitly empty snapshot.
+    fn capability_snapshot(&self) -> Result<CapabilitySnapshot, BootstrapError>;
+
+    /// Observe actual dispatch, not a script's narrative. Non-dispatch replay/mock runtimes may
+    /// return recorded scripts without claiming new capability executions.
+    fn run_script_observed(
+        &self,
+        script: &str,
+        maximum: u32,
+        _journal: &crate::checkpoint::ExecutionJournal,
+    ) -> ScriptOutcome {
+        self.run_script(script, maximum)
+    }
+}
 
 /// Runs each model-authored script on the interpreter under this session's dispatch.
 pub struct ShellRuntime<I> {
@@ -74,6 +85,33 @@ pub struct ShellRuntime<I> {
 }
 
 impl<I: CapabilityInvoker> ScriptRuntime for ShellRuntime<I> {
+    fn check_freshness(&self) -> Result<(), String> {
+        self.invoker.check_freshness()
+    }
+    fn observes_executions(&self) -> bool {
+        true
+    }
+    fn run_script_observed(
+        &self,
+        script: &str,
+        maximum: u32,
+        journal: &crate::checkpoint::ExecutionJournal,
+    ) -> ScriptOutcome {
+        let limits = ShellLimits {
+            max_capability_calls: self.limits.max_capability_calls.min(maximum),
+            ..self.limits
+        };
+        Interpreter::new(limits)
+            .with_curl_capability(self.curl_capability.clone())
+            .run(
+                script,
+                &ObservedInvoker {
+                    inner: &self.invoker,
+                    journal,
+                },
+            )
+    }
+
     fn run_script(&self, script: &str, max_capability_calls: u32) -> ScriptOutcome {
         // A fresh interpreter per script, but not a fresh budget: the prompt loop spends one
         // capability allowance across the whole session, so this script gets whatever the earlier
@@ -89,8 +127,8 @@ impl<I: CapabilityInvoker> ScriptRuntime for ShellRuntime<I> {
             .run(script, &self.invoker)
     }
 
-    fn command_words(&self) -> Vec<String> {
-        self.invoker.command_words()
+    fn capability_snapshot(&self) -> Result<CapabilitySnapshot, BootstrapError> {
+        CapabilitySnapshot::from_invoker(&self.invoker)
     }
 }
 
@@ -108,6 +146,13 @@ pub struct SessionInvoker<D> {
 }
 
 impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
+    fn check_freshness(&self) -> Result<(), String> {
+        self.direct.check_freshness()?;
+        if let Some(broker) = &self.broker {
+            broker.check_freshness()?;
+        }
+        Ok(())
+    }
     fn granted(&self) -> Vec<String> {
         let mut granted = self.direct.granted();
         if let Some(broker) = &self.broker {
@@ -199,6 +244,125 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
     }
 }
 
+// The shell seam deliberately knows nothing about broker evidence. A scoped synchronous slot
+// carries typed detail across that seam on the same blocking thread, never across tasks or jobs.
+// The outer invoker observes every actual dispatch, including a gateway's lone broker leg.
+#[derive(Clone)]
+struct DispatchDetail {
+    provenance: crate::history::ExecutionProvenance,
+    invocation: Option<String>,
+    evidence: Vec<String>,
+    outcome: crate::history::ExecutionOutcome,
+}
+thread_local! { static DISPATCH_DETAIL: std::cell::RefCell<Option<DispatchDetail>> = const { std::cell::RefCell::new(None) }; }
+fn dispatch_detail(detail: DispatchDetail) {
+    DISPATCH_DETAIL.with(|slot| *slot.borrow_mut() = Some(detail));
+}
+
+struct ObservedInvoker<'a, I> {
+    inner: &'a I,
+    journal: &'a crate::checkpoint::ExecutionJournal<'a>,
+}
+impl<I: CapabilityInvoker> CapabilityInvoker for ObservedInvoker<'_, I> {
+    fn granted(&self) -> Vec<String> {
+        self.inner.granted()
+    }
+    fn is_granted(&self, c: &str) -> bool {
+        self.inner.is_granted(c)
+    }
+    fn grants_namespace(&self, n: &str) -> bool {
+        self.inner.grants_namespace(n)
+    }
+    fn command_words(&self) -> Vec<String> {
+        self.inner.command_words()
+    }
+    fn has_command_word(&self, w: &str) -> bool {
+        self.inner.has_command_word(w)
+    }
+    fn describe(&self, c: &str) -> Option<dekopon_shell::CapabilityDescription> {
+        self.inner.describe(c)
+    }
+    fn run_command(&self, w: &str, args: &[String], stdin: Option<&str>) -> Option<CommandRun> {
+        if self.journal.cancelled() {
+            return Some(CommandRun::Denied {
+                reason: "session-cancelled".to_owned(),
+            });
+        }
+        self.inner.run_command(w, args, stdin)
+    }
+    fn invoke(
+        &self,
+        capability: &str,
+        input: Value,
+        secret: Option<dekopon_core::SecretUseProposal>,
+    ) -> CapabilityCallResult {
+        use crate::history::{ExecutionOutcome as EO, ExecutionProvenance as EP};
+        if self.journal.cancelled() {
+            return CapabilityCallResult::Denied {
+                reason: "session-cancelled".to_owned(),
+            };
+        }
+        if let Err(error) = self.inner.check_freshness() {
+            tracing::warn!(cause_type = "session-surface-fenced", cause = %error);
+            self.journal
+                .failure(crate::checkpoint::CheckpointError::ScopeChanged);
+            return CapabilityCallResult::Denied {
+                reason: "session surface fenced".to_owned(),
+            };
+        }
+        let sequence = match self.journal.reserve(capability) {
+            Ok(sequence) => sequence,
+            Err(error) => {
+                self.journal.failure(error);
+                return CapabilityCallResult::Denied {
+                    reason: error.to_string(),
+                };
+            }
+        };
+        if let Some(activity) = &self.journal.activity {
+            activity.emit(
+                sequence,
+                capability,
+                crate::activity::ActivityPhase::Submitted,
+                None,
+            );
+        }
+        DISPATCH_DETAIL.with(|slot| slot.borrow_mut().take());
+        let result = self.inner.invoke(capability, input, secret);
+        let detail = DISPATCH_DETAIL.with(|slot| slot.borrow_mut().take());
+        let (outcome, text) = match &result {
+            CapabilityCallResult::Succeeded(output) => (EO::Succeeded, output.to_string()),
+            CapabilityCallResult::Failed { error } => (EO::Failed, error.clone()),
+            CapabilityCallResult::Denied { reason } => (EO::Denied, reason.clone()),
+            CapabilityCallResult::NotFound => (EO::NotExecuted, "capability not found".to_owned()),
+        };
+        let detail = detail.unwrap_or(DispatchDetail {
+            provenance: EP::DirectReadOnly,
+            invocation: None,
+            evidence: Vec::new(),
+            outcome,
+        });
+        if let Some(activity) = &self.journal.activity {
+            activity.emit(
+                sequence,
+                capability,
+                crate::activity::ActivityPhase::Finished,
+                Some(detail.outcome),
+            );
+        }
+        if let Err(error) = self.journal.observe(sequence, |record| {
+            record.provenance = detail.provenance;
+            record.invocation = detail.invocation;
+            record.evidence = detail.evidence;
+            record.outcome = detail.outcome;
+            record.result = Some(crate::checkpoint::result_excerpt(&text));
+        }) {
+            self.journal.failure(error);
+        }
+        result
+    }
+}
+
 /// Trace context to send with a broker proposal, if this process is exporting one.
 ///
 /// `None` is the ordinary state when export is disabled: the broker then records its own root
@@ -254,7 +418,7 @@ pub fn report_unobserved_command_run<E: std::error::Error + 'static>(
     match outcome {
         ProcessOutcome::Completed(Ok(_run)) => {
             tracing::warn!(
-                target: "dekopon_agent::audit",
+                target: "dekopon_harness::audit",
                 {
                     audit.event = "agent.command.unobserved",
                     command.leg = leg,
@@ -266,7 +430,7 @@ pub fn report_unobserved_command_run<E: std::error::Error + 'static>(
         }
         ProcessOutcome::Completed(Err(error)) => {
             tracing::error!(
-                target: "dekopon_agent::audit",
+                target: "dekopon_harness::audit",
                 {
                     audit.event = "agent.command.unobserved",
                     command.leg = leg,
@@ -288,7 +452,7 @@ pub fn report_unobserved_command_run<E: std::error::Error + 'static>(
                 ("task-failed", "task-panicked")
             };
             tracing::error!(
-                target: "dekopon_agent::audit",
+                target: "dekopon_harness::audit",
                 {
                     audit.event = "agent.command.unobserved",
                     command.leg = leg,
@@ -320,6 +484,11 @@ fn client_error_kind(error: &ClientError) -> &'static str {
         ClientError::Protocol { .. } => "protocol",
         ClientError::Remote { .. } => "remote",
         ClientError::UnexpectedResponse => "unexpected-response",
+        ClientError::InvalidControl => "invalid-control",
+        ClientError::ControlAttempts => "control-attempts",
+        ClientError::ControlFenced => "control-fenced",
+        ClientError::SurfaceChanged => "surface-changed",
+        ClientError::ControlBinding => "control-binding",
     }
 }
 
@@ -327,6 +496,9 @@ fn client_error_kind(error: &ClientError) -> &'static str {
 #[cfg(unix)]
 #[derive(Debug, Error)]
 pub enum BrokerLegError {
+    /// The complete scoped surface cannot fit safely in request-one context.
+    #[error(transparent)]
+    Bootstrap(#[from] BootstrapError),
     /// The broker could not be reached or refused the capability snapshot.
     #[error(transparent)]
     Client(#[from] ClientError),
@@ -374,6 +546,7 @@ pub struct BrokerLeg {
     attestation: Option<Attestation>,
     /// Broker-derived optional all-three durable-memory surface for this exact chat scope.
     chat_memory: Option<ChatMemorySurface>,
+    surface_epoch: dekopon_core::SurfaceEpoch,
     /// What cancels a command-word run in flight: [`CancelSignal::never`] until an embedder ties
     /// it to its own session with [`BrokerLeg::with_cancel_signal`].
     cancel: CancelSignal,
@@ -384,7 +557,7 @@ impl BrokerLeg {
     /// Connects one session's broker leg, snapshotting its capability set.
     ///
     /// The snapshot happens here, on the async side, for two reasons. It lets `cap --list` answer
-    /// without a round trip per script, and it turns "the daemon is not running" into one clear
+    /// and request-one bootstrap answer without another round trip, and it turns "the daemon is not running" into one clear
     /// startup failure instead of a capability that inexplicably reports "command not found"
     /// halfway through a script a model already committed to.
     ///
@@ -407,7 +580,7 @@ impl BrokerLeg {
         trace_prefix: &str,
         attestation: Option<Attestation>,
     ) -> Result<Self, BrokerLegError> {
-        let (capabilities, command_words, chat_memory) =
+        let (capabilities, command_words, chat_memory, surface_epoch) =
             client.session_surface(attestation.clone()).await?;
         Self::build(
             client,
@@ -416,6 +589,7 @@ impl BrokerLeg {
             command_words,
             attestation,
             chat_memory,
+            surface_epoch,
         )
     }
 
@@ -426,10 +600,11 @@ impl BrokerLeg {
         command_words: Vec<String>,
         attestation: Option<Attestation>,
         chat_memory: Option<ChatMemorySurface>,
+        surface_epoch: dekopon_core::SurfaceEpoch,
     ) -> Result<Self, BrokerLegError> {
         let (capabilities, effective_capabilities) = snapshot(available)?;
         let namespaces = capabilities.keys().map(|id| namespace_of(id)).collect();
-        Ok(Self {
+        let leg = Self {
             client,
             runtime: tokio::runtime::Handle::current(),
             capabilities,
@@ -440,8 +615,11 @@ impl BrokerLeg {
                 .map_err(BrokerLegError::SessionIdentifier)?,
             attestation,
             chat_memory,
+            surface_epoch,
             cancel: CancelSignal::never(),
-        })
+        };
+        CapabilitySnapshot::from_invoker(&leg)?;
+        Ok(leg)
     }
 
     /// Ties every command-word run this leg makes to the embedder's cancellation.
@@ -462,6 +640,11 @@ impl BrokerLeg {
     #[must_use]
     pub fn effective_capabilities(&self) -> Vec<EffectiveCapabilityView> {
         self.effective_capabilities.clone()
+    }
+
+    /// Host-only broker startup epoch. It never enters capability metadata or model context.
+    pub fn surface_epoch(&self) -> &dekopon_core::SurfaceEpoch {
+        &self.surface_epoch
     }
 
     /// Returns the broker-derived memory note and lookback only when all three grants are effective.
@@ -544,6 +727,22 @@ fn snapshot(
 
 #[cfg(unix)]
 impl CapabilityInvoker for BrokerLeg {
+    fn check_freshness(&self) -> Result<(), String> {
+        let (available, words, memory, epoch) = self
+            .runtime
+            .block_on(self.client.session_surface(self.attestation.clone()))
+            .map_err(|error| format!("fresh broker surface unavailable: {error}"))?;
+        let (descriptions, effective) = snapshot(available).map_err(|error| error.to_string())?;
+        if epoch != self.surface_epoch
+            || descriptions != self.capabilities
+            || effective != self.effective_capabilities
+            || words.into_iter().collect::<BTreeSet<_>>() != self.command_words
+            || memory != self.chat_memory
+        {
+            return Err("broker session surface changed".to_owned());
+        }
+        Ok(())
+    }
     fn granted(&self) -> Vec<String> {
         self.capabilities.keys().cloned().collect()
     }
@@ -637,6 +836,7 @@ impl CapabilityInvoker for BrokerLeg {
                 error: "could not derive a unique invocation identifier".to_owned(),
             };
         };
+        let observed_invocation = id.to_string();
         let request = InvocationRequest {
             id,
             capability: parsed,
@@ -655,6 +855,35 @@ impl CapabilityInvoker for BrokerLeg {
         let submitted = self
             .runtime
             .block_on(async { self.client.invoke(self.attestation.clone(), request).await });
+        // Typed broker observations are captured before shell status conversion. In particular,
+        // outcome-unknown must never be mis-recorded as the shell's non-retryable Denied status.
+        use crate::history::{ExecutionOutcome as EO, ExecutionProvenance as EP};
+        let (outcome, evidence) = match &submitted {
+            Ok(result) => (
+                match result.outcome {
+                    InvocationOutcome::Succeeded => EO::Succeeded,
+                    InvocationOutcome::Denied => EO::Denied,
+                    InvocationOutcome::Failed => EO::Failed,
+                },
+                result
+                    .evidence
+                    .iter()
+                    .take(16)
+                    .map(|e| crate::history::Excerpt::new(&e.digest, 256).text)
+                    .collect(),
+            ),
+            Err(ClientError::Remote { code, .. }) if code == ERROR_UNAUTHENTICATED => {
+                (EO::Denied, Vec::new())
+            }
+            Err(error) if error.may_have_executed() => (EO::Unknown, Vec::new()),
+            Err(_) => (EO::NotExecuted, Vec::new()),
+        };
+        dispatch_detail(DispatchDetail {
+            provenance: EP::BrokerObserved,
+            invocation: Some(observed_invocation),
+            evidence,
+            outcome,
+        });
         match submitted {
             Ok(result) => match result.outcome {
                 InvocationOutcome::Succeeded => {
@@ -758,10 +987,6 @@ impl IdSequence {
         let counter = self.next.fetch_add(1, Ordering::Relaxed);
         format!("{}-{counter}", self.trace).parse()
     }
-}
-
-pub(crate) fn milliseconds(duration: Duration) -> f64 {
-    duration.as_secs_f64() * 1000.0
 }
 
 #[cfg(test)]
@@ -1057,7 +1282,10 @@ mod tests {
             sync::{mpsc, oneshot},
         };
 
-        use crate::{Attestation, BrokerLeg, IdSequence, meta::EffectiveCapabilityView};
+        use crate::{
+            meta::EffectiveCapabilityView,
+            runtime::{Attestation, BrokerLeg, IdSequence},
+        };
 
         const CAPABILITY: &str = "http-probe.fetch";
         const SUBJECT: &str = "slack.t0123abc.u9xyz";
@@ -1332,7 +1560,7 @@ mod tests {
             );
             let namespaces = capabilities
                 .keys()
-                .map(|id| crate::namespace_of(id))
+                .map(|id| crate::runtime::namespace_of(id))
                 .collect();
             BrokerLeg {
                 client: BrokerClient::new(socket, server_uid(), FrameLimits::default())
@@ -1349,9 +1577,10 @@ mod tests {
                 }],
                 command_words: BTreeSet::new(),
                 namespaces,
-                identifiers: IdSequence::new("dekopon-agent-test").expect("session identifiers"),
+                identifiers: IdSequence::new("dekopon-harness-test").expect("session identifiers"),
                 attestation,
                 chat_memory: None,
+                surface_epoch: "fixture-epoch".parse().expect("fixture epoch"),
                 cancel: CancelSignal::never(),
             }
         }
@@ -1566,7 +1795,7 @@ mod tests {
         async fn invocation_identifiers_are_unique_and_extend_the_session_trace() {
             // The broker treats an invocation ID as a durable replay-rejection key, so a script
             // calling one capability in a loop must not collide with itself.
-            let identifiers = IdSequence::new("dekopon-agent-test").expect("session identifiers");
+            let identifiers = IdSequence::new("dekopon-harness-test").expect("session identifiers");
             let first = identifiers.next_invocation().expect("first identifier");
             let second = identifiers.next_invocation().expect("second identifier");
 
@@ -1574,10 +1803,11 @@ mod tests {
             let trace = identifiers.trace().as_str();
             assert!(first.as_str().starts_with(trace), "{first} vs {trace}");
             assert!(second.as_str().starts_with(trace), "{second} vs {trace}");
-            assert!(trace.starts_with("dekopon-agent-test-"), "{trace}");
+            assert!(trace.starts_with("dekopon-harness-test-"), "{trace}");
 
             // Two sessions in the same process must not share a key space either.
-            let other = IdSequence::new("dekopon-agent-test").expect("second session identifiers");
+            let other =
+                IdSequence::new("dekopon-harness-test").expect("second session identifiers");
             assert_ne!(identifiers.trace(), other.trace());
         }
 
@@ -1624,13 +1854,124 @@ mod tests {
             .expect("capability fixture decodes")
         }
 
+        #[tokio::test(flavor = "multi_thread")]
+        async fn ordinary_safe_yields_fence_changed_or_uncertain_broker_surface_after_evidence() {
+            use crate::{
+                bootstrap::SessionBootstrap,
+                history::History,
+                session::{PromptError, PromptLimits, SessionEngine},
+            };
+            use dekopon_model::model::{
+                AssistantTurn, ChatModel, ModelError, ModelFunctionCall, ModelMessage, ModelTool,
+                ModelToolCall,
+            };
+            struct Model(std::sync::atomic::AtomicUsize);
+            impl ChatModel for Model {
+                fn complete(
+                    &self,
+                    _: &[ModelMessage],
+                    _: &[ModelTool],
+                    recorder: &dyn dekopon_model::usage::AttemptRecorder,
+                ) -> Result<AssistantTurn, ModelError> {
+                    assert_eq!(
+                        self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                        0,
+                        "no subsequent inference"
+                    );
+                    let attempt = recorder.begin(dekopon_model::usage::AttemptKind::Adapter)?;
+                    recorder.observe(
+                        attempt,
+                        dekopon_model::usage::UsageObservation::from_json(
+                            &json!({"input_tokens":7}),
+                            false,
+                        ),
+                    )?;
+                    Ok(AssistantTurn {
+                        content: None,
+                        tool_calls: vec![ModelToolCall {
+                            id: "same-id".into(),
+                            kind: "function".into(),
+                            function: ModelFunctionCall {
+                                name: "bash".into(),
+                                arguments: json!({"script":CAPABILITY}).to_string(),
+                            },
+                        }],
+                        usage: None,
+                        replay_items: vec![],
+                    })
+                }
+            }
+            for uncertain in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut responses = (0..4)
+                    .map(|_| {
+                        ResponseEnvelope::capabilities(
+                            vec![available(CAPABILITY)],
+                            vec![],
+                            "fixture-epoch".parse().unwrap(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                responses.push(ResponseEnvelope::invocation(result(
+                    InvocationOutcome::Succeeded,
+                    None,
+                )));
+                responses.push(if uncertain {
+                    ResponseEnvelope::error(ERROR_UNAUTHENTICATED, "revoked")
+                } else {
+                    ResponseEnvelope::capabilities(vec![], vec![], "new-epoch".parse().unwrap())
+                });
+                let (leg, mut received) =
+                    stub_leg_observing(directory.path(), responses, None).await;
+                tokio::task::spawn_blocking(move || {
+                    let runtime = crate::runtime::ShellRuntime {
+                        invoker: leg,
+                        limits: dekopon_shell::Limits::default(),
+                        curl_capability: None,
+                    };
+                    let mut history = History::default();
+                    let error = SessionEngine::new(&Model(Default::default()), &runtime)
+                        .run(
+                            SessionBootstrap::new(
+                                "request",
+                                PromptLimits {
+                                    max_steps: 3,
+                                    max_capability_calls: 3,
+                                },
+                                "fixture",
+                            ),
+                            &mut history,
+                        )
+                        .unwrap_err();
+                    let PromptError::Interrupted { checkpoint, source } = error else {
+                        panic!("must fence checkpoint")
+                    };
+                    assert_eq!(source, crate::checkpoint::CheckpointError::ScopeChanged);
+                    assert_eq!(checkpoint.record.executions.len(), 1);
+                    assert_eq!(
+                        checkpoint.record.executions[0].outcome,
+                        crate::history::ExecutionOutcome::Succeeded
+                    );
+                    assert_eq!(checkpoint.state.accounting.calls.len(), 1);
+                    assert!(checkpoint.record.generated.is_none());
+                })
+                .await
+                .unwrap();
+                let mut count = 0;
+                while received.try_recv().is_ok() {
+                    count += 1;
+                }
+                assert_eq!(count, 6);
+            }
+        }
+
         #[test]
         fn a_duplicated_capability_identifier_is_a_malformed_broker_answer() {
             // Last-wins here would leave `cap --list` and `inspect_agent_config` describing
             // different sessions: the map keeps one entry per identifier and the effective view
             // keeps every entry it was handed. Every repeat is named at once, the way the rest of
             // the workspace reports conflicts.
-            let error = crate::snapshot(vec![
+            let error = crate::runtime::snapshot(vec![
                 available("http-probe.fetch"),
                 available("echo.echo"),
                 available("http-probe.fetch"),
@@ -1641,7 +1982,7 @@ mod tests {
             assert!(
                 matches!(
                     &error,
-                    crate::BrokerLegError::DuplicateCapabilities { capabilities }
+                    crate::runtime::BrokerLegError::DuplicateCapabilities { capabilities }
                         if capabilities == "echo.echo, http-probe.fetch"
                 ),
                 "{error}"
@@ -1650,9 +1991,11 @@ mod tests {
 
         #[test]
         fn a_distinct_capability_set_indexes_both_views() {
-            let (descriptions, effective) =
-                crate::snapshot(vec![available("http-probe.fetch"), available("echo.echo")])
-                    .expect("a distinct set is accepted");
+            let (descriptions, effective) = crate::runtime::snapshot(vec![
+                available("http-probe.fetch"),
+                available("echo.echo"),
+            ])
+            .expect("a distinct set is accepted");
 
             assert_eq!(descriptions.len(), 2);
             assert_eq!(
@@ -1663,5 +2006,118 @@ mod tests {
                 vec!["echo.echo", "http-probe.fetch"]
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod execution_observation_tests {
+    use super::*;
+    use crate::{
+        bootstrap::SessionBootstrap,
+        history::{ExecutionOutcome, ExecutionProvenance, History},
+        session::{PromptLimits, SessionEngine},
+    };
+    use dekopon_model::model::{
+        AssistantTurn, ChatModel, ModelError, ModelFunctionCall, ModelMessage, ModelTool,
+        ModelToolCall,
+    };
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Model;
+    impl ChatModel for Model {
+        fn complete(
+            &self,
+            _: &[ModelMessage],
+            _: &[ModelTool],
+            recorder: &dyn dekopon_model::usage::AttemptRecorder,
+        ) -> Result<AssistantTurn, ModelError> {
+            let attempt = recorder.begin(dekopon_model::usage::AttemptKind::Adapter)?;
+            let result: Result<AssistantTurn, ModelError> = {
+                Ok(AssistantTurn {
+                    content: None,
+                    tool_calls: vec![ModelToolCall {
+                        id: "batch".to_owned(),
+                        kind: "function".to_owned(),
+                        function: ModelFunctionCall {
+                            name: "bash".to_owned(),
+                            arguments: json!({"script":"test.read; test.read"}).to_string(),
+                        },
+                    }],
+                    usage: None,
+                    replay_items: Vec::new(),
+                })
+            };
+            if let Ok(turn) = &result
+                && let Some(usage) = turn.usage
+            {
+                recorder.observe(
+                    attempt,
+                    dekopon_model::usage::UsageObservation {
+                        usage,
+                        invalid: [false; 5],
+                    },
+                )?;
+            }
+            result
+        }
+    }
+    struct UnknownBroker(AtomicUsize);
+    impl CapabilityInvoker for UnknownBroker {
+        fn granted(&self) -> Vec<String> {
+            vec!["test.read".to_owned()]
+        }
+        fn describe(&self, _: &str) -> Option<dekopon_shell::CapabilityDescription> {
+            Some(dekopon_shell::CapabilityDescription {
+                capability: "test.read".to_owned(),
+                description: "fixture".to_owned(),
+                input_schema: json!({"type":"object"}),
+            })
+        }
+        fn invoke(
+            &self,
+            _: &str,
+            _: Value,
+            _: Option<dekopon_core::SecretUseProposal>,
+        ) -> CapabilityCallResult {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            dispatch_detail(DispatchDetail {
+                provenance: ExecutionProvenance::BrokerObserved,
+                invocation: Some("invocation-fixture".to_owned()),
+                evidence: vec!["sha256:fixture".to_owned()],
+                outcome: ExecutionOutcome::Unknown,
+            });
+            CapabilityCallResult::Denied {
+                reason: "unknown broker outcome, do not resubmit".to_owned(),
+            }
+        }
+    }
+    #[test]
+    fn typed_unknown_broker_evidence_is_not_misrecorded_as_shell_denial_or_retried() {
+        let runtime = ShellRuntime {
+            invoker: UnknownBroker(AtomicUsize::new(0)),
+            limits: ShellLimits::default(),
+            curl_capability: None,
+        };
+        let mut history = History::default();
+        let result = SessionEngine::new(&Model, &runtime).run(
+            SessionBootstrap::new(
+                "request",
+                PromptLimits {
+                    max_steps: 4,
+                    max_capability_calls: 4,
+                },
+                "fixture",
+            ),
+            &mut history,
+        );
+        assert!(result.is_err());
+        assert_eq!(runtime.invoker.0.load(Ordering::SeqCst), 1);
+        let record = &history.turns()[0].executions[0];
+        assert_eq!(record.outcome, ExecutionOutcome::Unknown);
+        assert_eq!(record.provenance, ExecutionProvenance::BrokerObserved);
+        assert_eq!(record.invocation.as_deref(), Some("invocation-fixture"));
+        assert_eq!(record.evidence, vec!["sha256:fixture".to_owned()]);
+        assert!(history.has_unknown_work());
     }
 }

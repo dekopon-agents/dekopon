@@ -71,9 +71,9 @@ The protocol exposes only the operations needed by a broker client — **one ope
 - `runCommand` runs one provider-declared shell command word, with the value piped into it, as the
   command-line program its provider declared, answering with a capability proposal, rendered text
   and an exit status, or a decline;
-- `resolveCommand` is the legacy form of that run, kept for one release so an older client keeps
-  working: no piped value, and rendered text reaches it as a decline carrying the text;
+- `resolveCommand` is the legacy form of that run, retained within the current envelope, not to admit older protocol versions: no piped value, and rendered text reaches it as a decline carrying the text;
 - `invoke` submits one invocation proposal;
+- `authorizeControl` admits or refuses a scoped core model/effort transition without provider execution;
 - `recordDeliveredTurn` submits hidden post-acceptance recording, and is the only way to reach it;
 - `publishAgentInventory` and `publishModelUsage` let a mapped attestor report a bounded
   informational catalog inventory and model-token delta for the process-local web UI; and
@@ -126,18 +126,21 @@ The `operation` tag is still strict-decoded, so an operation a broker does not k
 
 ### Version and compatibility
 
-**Status: current.** `PROTOCOL_VERSION` is the single constant `dekopon.dev/broker/v1alpha2`, carried as `apiVersion` on every request and response envelope. There is one variant, so there is no negotiation: both envelopes are strict-decoded and any other string fails to deserialize. A request the broker cannot decode is answered `invalid-request` and the connection is closed; a response the client cannot decode is a client-side protocol error, which for a submitted invocation means the outcome is unknown to that client rather than known not to have happened.
+**Status: current (unreleased controls).** `PROTOCOL_VERSION` is the single constant `dekopon.dev/broker/v1alpha3`, carried as `apiVersion` on every request and response envelope. There is one variant, so there is no negotiation: both envelopes are strict-decoded and any other string fails to deserialize. A request the broker cannot decode is answered `invalid-request` and the connection is closed; a response the client cannot decode is a client-side protocol error, which for a submitted invocation means the outcome is unknown to that client rather than known not to have happened.
 
 **`dekopond`, `dekopon-run`, and `dekopon-brokerd` must be upgraded together.** They are separately installable — Homebrew, crates.io, release archives, the container image, and the chart with its own `image.tag` — so a mixed set is a normal deployment mistake rather than a hypothetical one, and the alpha protocol has no compatibility promise across releases. 0.5.0 changed it for policy-filtered command words and command resolution and required exactly this lockstep. `v1alpha2` changed it again, collapsing the per-attestation-shape operations into one operation per verb. The chart and the container image ship all four executables from one release for the same reason.
 
 A mismatch is now loud in **both** directions, which is the whole reason the version moved rather than the operation tags being aliased:
 
-- **A newer client against an older broker** sends `apiVersion: dekopon.dev/broker/v1alpha2`, which an older broker strict-decodes into `invalid-request`. Nothing is authorized, accounted, or audited.
-- **An older client against a newer broker** sends `v1alpha1` and gets the same `invalid-request` on its first frame. Under `v1alpha1` this direction failed on the *response* instead — response variants are `deny_unknown_fields`, so a field added to a response an old client already understood made that response undecodable, and for a submitted proposal that is an unknown outcome rather than a refusal. Failing at the envelope moves that failure to before anything runs.
+- **A newer client against an older broker** sends `apiVersion: dekopon.dev/broker/v1alpha3`, which an older broker strict-decodes into `invalid-request`. Nothing is authorized, accounted, or audited.
+- **An older client against a newer broker** sends `v1alpha1` or `v1alpha2` and gets the same `invalid-request` on its first frame. Under `v1alpha1` this direction failed on the *response* instead — response variants are `deny_unknown_fields`, so a field added to a response an old client already understood made that response undecodable, and for a submitted proposal that is an unknown outcome rather than a refusal. Failing at the envelope moves that failure to before anything runs.
 
 Retiring the old `operation` tags outright, rather than keeping them as deprecated aliases for a cycle, is the same decision: an alias would have carried the old *field shapes* too, which is exactly the multiplication the collapse removed, and a mixed pair would then have half-worked instead of refusing.
 
-`runCommand` was added inside `v1alpha2` rather than behind a version bump, because it adds an operation without changing any existing shape, and the lockstep rule still holds. A newer client's `runCommand` reaching an older broker is refused `invalid-request` at the strict `operation` tag, indistinguishable from a corrupt frame, before anything runs. An older client's `resolveCommand` reaching a newer broker is answered as before, except that text a `run-command` guest renders arrives as a decline carrying that text. Upgrade the broker first, as the restart order below already requires.
+`runCommand` initially extended `v1alpha2` without changing an existing shape. The unreleased
+controls migration now requires `v1alpha3`: older envelopes are rejected before operation dispatch.
+`resolveCommand` remains a legacy operation inside that envelope, not a promise that an older binary
+can connect. Upgrade all clients and broker together in the restart order below.
 
 Restart order follows from the gateway's startup probe rather than from the protocol: `dekopond` asks the broker for capabilities once before connecting any transport and exits non-zero if the broker does not answer. Start the broker first and stop it last. [`upgrading.md`](upgrading.md) records the per-release steps.
 
@@ -171,7 +174,7 @@ defines which conditions share `secret-denied`, and its
 [Resolution and rotation](secrets.md#resolution-and-rotation) section defines the source-failure
 conditions.
 
-A failure response is not the only way to reach that state. Nothing ties a client's `io_timeout` to broker-side execution deadlines, so a client whose response read fails is in the same position: the complete request frame was delivered and the outcome is unknown to it. `ClientError` therefore records which half of the exchange failed — a request-phase framing failure delivered nothing, a response-phase one delivered everything — and `ClientError::may_have_executed` covers both that case and the `outcome-unaudited` code. A caller submitting a write must map it to a non-retryable result: `dekopon-agent` reports it to a script as `denied` (exit `126`) rather than as a generic failure, because a retry carries a fresh invocation identifier and replay rejection cannot recognize it as a duplicate.
+A failure response is not the only way to reach that state. Nothing ties a client's `io_timeout` to broker-side execution deadlines, so a client whose response read fails is in the same position: the complete request frame was delivered and the outcome is unknown to it. `ClientError` therefore records which half of the exchange failed — a request-phase framing failure delivered nothing, a response-phase one delivered everything — and `ClientError::may_have_executed` covers both that case and the `outcome-unaudited` code. A caller submitting a write must map it to a non-retryable result: `dekopon-harness` reports it to a script as `denied` (exit `126`) rather than as a generic failure, because a retry carries a fresh invocation identifier and replay rejection cannot recognize it as a duplicate.
 
 Invalid informational reports are also diagnosable server-side without widening the wire: `AgentInventory::validate` and `ModelUsageReport::validate` name the offending agent and the exact bound, `dekopon-brokerd` logs that as `broker_agent_inventory_rejected` / `broker_model_usage_rejected`, and the response stays the generic `invalid-request`.
 
@@ -381,3 +384,22 @@ The behavior landed in reviewable slices, none of which granted authority to the
 14. Add independently retained, signed, or remote checkpoints before production claims.
 
 Slice 14 is the only slice in this list still outstanding; until it lands, checkpoint anchoring is local integrity evidence only (see [Evidence and audit](#evidence-and-audit)). The other committed directions — a dedicated gateway UID and operator-CLI integration — are listed under [Current foundation](#current-foundation).
+
+
+## Core session control protocol (unreleased)
+
+`authorizeControl` is not a provider capability. It binds the host's opaque job/session/request/
+generation, agent, sequence, invocation ID, active startup epoch, complete from/to model and effort,
+trace and attestation. Only the broker authenticates/remaps and evaluates fresh `agent.prompt` plus
+reserved `agent.model.select` and/or `agent.effort.set` permits. Attested controls require explicit
+chat scope authority; legacy scope-less fallback is forbidden here. Direct peers must match their
+configured agent. `controlTargets` bounds configured aliases/efforts, not provider endpoints.
+
+A strict echoed decision and reference mean admission, never application or a reusable bearer.
+The live client verifies server UID, pinned epoch and every binding once; lost/late/forged results
+cause no switch and no retry. Public denials collapse to `control-denied`, malformed bindings to
+`invalid-request`, while capacity/infrastructure failures remain distinct. Every control ID,
+including denials, shares the durable global replay domain. Audit plus checkpoint persist before
+admission. New `ControlDecision` records do not alter historical event hashes, but older binaries
+cannot read them. Required `surfaceEpoch` on capability responses is random per startup, retained
+only by hosts for invalidation; it is not model-visible metadata or permission.

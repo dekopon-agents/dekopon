@@ -14,10 +14,16 @@
 
 use std::sync::{Arc, Mutex};
 
+use dekopon_harness::tools::SCRIPT_TOOL_NAME;
+use dekopon_harness::{
+    bootstrap::{BootstrapError, CapabilitySnapshot, SessionBootstrap},
+    history::History,
+    runtime::ScriptRuntime,
+    session::{PromptLimits, SessionEngine},
+};
 use dekopon_model::model::{
     AssistantTurn, ChatModel, ModelError, ModelFunctionCall, ModelMessage, ModelTool, ModelToolCall,
 };
-use dekopon_run::prompt::{PromptLimits, SCRIPT_TOOL_NAME, ScriptRuntime, run_prompt};
 use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, Interpreter, Limits, ScriptOutcome};
 use serde_json::{Value, json};
 use tracing_subscriber::layer::SubscriberExt;
@@ -58,28 +64,48 @@ impl ChatModel for ScriptedModel {
         &self,
         messages: &[ModelMessage],
         _tools: &[ModelTool],
+        recorder: &dyn dekopon_model::usage::AttemptRecorder,
     ) -> Result<AssistantTurn, ModelError> {
-        if messages.iter().any(|message| message.role() == "tool") {
-            return Ok(AssistantTurn {
-                content: Some("done".to_owned()),
-                tool_calls: Vec::new(),
+        let attempt = recorder.begin(dekopon_model::usage::AttemptKind::Adapter)?;
+        #[allow(
+            clippy::redundant_closure_call,
+            reason = "fixture early returns must still record usage before propagation"
+        )]
+        let result: Result<AssistantTurn, ModelError> = (|| {
+            if messages.iter().any(|message| message.role() == "tool") {
+                return Ok(AssistantTurn {
+                    content: Some("done".to_owned()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    replay_items: Vec::new(),
+                });
+            }
+            Ok(AssistantTurn {
+                content: None,
+                tool_calls: vec![ModelToolCall {
+                    id: "call-1".to_owned(),
+                    kind: "function".to_owned(),
+                    function: ModelFunctionCall {
+                        name: SCRIPT_TOOL_NAME.to_owned(),
+                        arguments: json!({ "script": self.script }).to_string(),
+                    },
+                }],
                 usage: None,
                 replay_items: Vec::new(),
-            });
-        }
-        Ok(AssistantTurn {
-            content: None,
-            tool_calls: vec![ModelToolCall {
-                id: "call-1".to_owned(),
-                kind: "function".to_owned(),
-                function: ModelFunctionCall {
-                    name: SCRIPT_TOOL_NAME.to_owned(),
-                    arguments: json!({ "script": self.script }).to_string(),
+            })
+        })();
+        if let Ok(turn) = &result
+            && let Some(usage) = turn.usage
+        {
+            recorder.observe(
+                attempt,
+                dekopon_model::usage::UsageObservation {
+                    usage,
+                    invalid: [false; 5],
                 },
-            }],
-            usage: None,
-            replay_items: Vec::new(),
-        })
+            )?;
+        }
+        result
     }
 }
 
@@ -113,6 +139,9 @@ struct BridgedShellRuntime {
 }
 
 impl ScriptRuntime for BridgedShellRuntime {
+    fn capability_snapshot(&self) -> Result<CapabilitySnapshot, BootstrapError> {
+        Ok(CapabilitySnapshot::empty())
+    }
     fn run_script(&self, script: &str, max_capability_calls: u32) -> ScriptOutcome {
         Interpreter::new(Limits {
             max_capability_calls,
@@ -149,17 +178,19 @@ async fn interpreter_spans_nest_under_the_script_span_across_the_blocking_bridge
                 script: "echo one\necho.echo --message two".to_owned(),
             };
             let runtime = BridgedShellRuntime { handle };
-            run_prompt(
-                &model,
-                &runtime,
-                "trace it",
-                None,
-                PromptLimits {
-                    max_steps: 4,
-                    max_capability_calls: 32,
-                },
-            )
-            .expect("prompt session succeeds");
+            SessionEngine::new(&model, &runtime)
+                .run(
+                    SessionBootstrap::new(
+                        "trace it",
+                        PromptLimits {
+                            max_steps: 4,
+                            max_capability_calls: 32,
+                        },
+                        "fixture-model",
+                    ),
+                    &mut History::default(),
+                )
+                .expect("prompt session succeeds");
         });
     })
     .await
@@ -172,7 +203,7 @@ async fn interpreter_spans_nest_under_the_script_span_across_the_blocking_bridge
         .collect::<Vec<_>>();
     assert_eq!(commands.len(), 2, "one span per command the script ran");
     for (_, parents) in commands {
-        // `prompt.model_turn` is absent by design: the loop drops that guard once the model has
+        // `accounting.model.call` is absent by design: the loop drops that guard once the model has
         // answered, so a script runs under the session rather than under the turn. The
         // interpreter's own `shell.script` sits innermost, where it holds the run's totals.
         assert_eq!(

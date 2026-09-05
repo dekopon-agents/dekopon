@@ -21,7 +21,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dekopon_agent::prompt::{AssetSource, FetchedAsset};
+use dekopon_harness::tools::{AssetSource, FetchedAsset};
 use tokio::runtime::Handle;
 
 use crate::transport::AssetFetcher;
@@ -464,7 +464,7 @@ const MAX_FETCHES_PER_SESSION: u32 = 4;
 
 /// One session's view of the attachments it may show its model.
 ///
-/// Implements [`dekopon_agent::prompt::AssetSource`], whose `fetch` is synchronous because the
+/// Implements [`dekopon_harness::tools::AssetSource`], whose `fetch` is synchronous because the
 /// prompt loop is. The loop runs on a blocking task, so blocking on the download here parks a
 /// blocking thread rather than a runtime worker — the same reason the loop is on one at all.
 pub(crate) struct SessionAssets {

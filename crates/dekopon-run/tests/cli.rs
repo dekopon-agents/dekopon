@@ -832,6 +832,38 @@ fn runs_an_openai_compatible_prompt_tool_loop() {
     let server = thread::spawn(move || {
         let (first, first_stream) = read_request(&listener);
         assert_eq!(first["model"], "test-model");
+        let system = system_messages(&first);
+        let bootstrap = system
+            .iter()
+            .find(|text| text.starts_with("Dekopon session bootstrap\n"))
+            .expect("request-one metadata");
+        let metadata: Value =
+            serde_json::from_str(bootstrap.lines().last().expect("metadata JSON"))
+                .expect("bootstrap decodes");
+        assert_eq!(metadata["selectedModel"], "test-model");
+        let upcase = metadata["capabilities"]
+            .as_array()
+            .expect("capabilities")
+            .iter()
+            .find(|capability| capability["id"] == "echo.upcase")
+            .expect("loaded read-only capability");
+        assert!(
+            !upcase["description"]
+                .as_str()
+                .expect("description")
+                .is_empty()
+        );
+        assert_eq!(
+            upcase["inputSchema"]["properties"]["message"]["type"],
+            "string"
+        );
+        assert!(
+            first["messages"]
+                .as_array()
+                .expect("messages")
+                .iter()
+                .all(|message| message["role"] != "tool" && message["role"] != "assistant")
+        );
 
         // The whole point of this phase: one tool, whatever the provider offers. The echo provider
         // exposes five capabilities and the model still sees a single schema.
@@ -1910,7 +1942,8 @@ fn prompt_mounts_skills_by_summary_and_records_suggestions_on_request() {
             ]
         );
         let system = system_messages(&first);
-        assert_eq!(system.len(), 2, "{system:?}");
+        assert_eq!(system.len(), 3, "{system:?}");
+        assert!(system[2].starts_with("Dekopon session bootstrap\n"));
         assert_eq!(system[0], "Count.");
         assert!(
             system[1].contains("Skills mounted for this agent")
@@ -2122,7 +2155,11 @@ fn session_show_renders_a_transcript_file_and_replay_answers_from_it() {
     let recorded_script = script.to_owned();
     let server = thread::spawn(move || {
         let (first, first_stream) = read_request(&listener);
-        assert_eq!(system_messages(&first), vec!["Be terse.".to_owned()]);
+        let system = system_messages(&first);
+        assert_eq!(system.len(), 2);
+        assert_eq!(system[0], "Be terse.");
+        assert!(system[1].starts_with("Dekopon session bootstrap\n"));
+        assert!(system[1].contains("test-model"));
         let last_user = first["messages"]
             .as_array()
             .expect("messages are an array")
@@ -2218,7 +2255,7 @@ fn session_list_and_show_query_the_receiver_with_a_named_credential() {
         let sql = first["query"]["sql"].as_str().expect("SQL is a string");
         assert!(sql.contains("FROM \"dekopon\""), "{sql}");
         assert!(
-            sql.contains("audit_event = 'accounting.model.turn'"),
+            sql.contains("audit_event = 'accounting.model.call'"),
             "{sql}"
         );
         assert!(first["query"]["start_time"].as_i64().is_some());
@@ -2226,13 +2263,13 @@ fn session_list_and_show_query_the_receiver_with_a_named_credential() {
         respond(
             first_stream,
             &json!({"hits": [
-                {"trace_id": "newer", "audit_event": "accounting.model.turn", "model_turn": 1,
+                {"trace_id": "newer", "audit_event": "accounting.model.call", "model_turn": 1, "job_id": "fixture-job", "call_sequence": 1, "model_kind": "chat",
                  "_timestamp": 1_756_000_000_000_000_i64, "usage_total_tokens": 12,
                  "answer_present": false, "outcome": "succeeded", "service_name": "dekopon-run"},
-                {"trace_id": "newer", "audit_event": "accounting.model.turn", "model_turn": 2,
+                {"trace_id": "newer", "audit_event": "accounting.model.call", "model_turn": 2, "job_id": "fixture-job", "call_sequence": 2, "model_kind": "chat",
                  "_timestamp": 1_756_000_001_000_000_i64, "usage_total_tokens": 8,
                  "answer_present": true, "outcome": "succeeded", "service_name": "dekopon-run"},
-                {"trace_id": "older", "audit_event": "accounting.model.turn", "model_turn": 1,
+                {"trace_id": "older", "audit_event": "accounting.model.call", "model_turn": 1, "job_id": "older-job", "call_sequence": 1, "model_kind": "chat",
                  "_timestamp": 1_755_000_000_000_000_i64, "outcome": "failed"}
             ]}),
         );
@@ -2248,15 +2285,15 @@ fn session_list_and_show_query_the_receiver_with_a_named_credential() {
         respond(
             second_stream,
             &json!({"hits": [
-                {"trace_id": "newer", "audit_event": "agent.model.prompt", "model_turn": 1, "transcript_scope": "full",
+                {"trace_id": "newer", "audit_event": "agent.model.prompt", "model_turn": 1, "job_id": "fixture-job", "call_sequence": 1, "model_kind": "chat", "transcript_scope": "full",
                  "messages": json!([{"role": "system", "content": "Be brief."}, {"role": "user", "content": "How many posts?"}]).to_string()},
-                {"trace_id": "newer", "audit_event": "accounting.model.turn", "model_turn": 1, "duration_ms": 12.5, "usage_total_tokens": 12},
-                {"trace_id": "newer", "audit_event": "agent.model.answer", "model_turn": 1, "answer": "", "tool_calls": call.to_string()},
-                {"trace_id": "newer", "audit_event": "agent.tool.script", "model_turn": 1, "tool_call_index": 1, "script": script},
-                {"trace_id": "newer", "audit_event": "agent.tool.output", "model_turn": 1, "tool_call_index": 1, "output": "42\n[exit code: 0]"},
-                {"trace_id": "newer", "audit_event": "agent.model.answer", "model_turn": 2, "answer": "There are 42 posts.", "tool_calls": "[]"},
-                {"trace_id": "newer", "audit_event": "agent.model.prompt", "model_turn": 2, "transcript_scope": "delta", "messages": delta.to_string()},
-                {"trace_id": "newer", "audit_event": "accounting.model.turn", "model_turn": 2, "duration_ms": 7, "usage_total_tokens": 8}
+                {"trace_id": "newer", "audit_event": "accounting.model.call", "model_turn": 1, "job_id": "fixture-job", "call_sequence": 1, "model_kind": "chat", "duration_ms": 12.5, "usage_total_tokens": 12},
+                {"trace_id": "newer", "audit_event": "agent.model.answer", "model_turn": 1, "job_id": "fixture-job", "call_sequence": 1, "model_kind": "chat", "answer": "", "tool_calls": call.to_string()},
+                {"trace_id": "newer", "audit_event": "agent.tool.script", "model_turn": 1, "job_id": "fixture-job", "call_sequence": 1, "model_kind": "chat", "tool_call_index": 1, "script": script},
+                {"trace_id": "newer", "audit_event": "agent.tool.output", "model_turn": 1, "job_id": "fixture-job", "call_sequence": 1, "model_kind": "chat", "tool_call_index": 1, "output": "42\n[exit code: 0]"},
+                {"trace_id": "newer", "audit_event": "agent.model.answer", "model_turn": 2, "job_id": "fixture-job", "call_sequence": 2, "model_kind": "chat", "answer": "There are 42 posts.", "tool_calls": "[]"},
+                {"trace_id": "newer", "audit_event": "agent.model.prompt", "model_turn": 2, "job_id": "fixture-job", "call_sequence": 2, "model_kind": "chat", "transcript_scope": "delta", "messages": delta.to_string()},
+                {"trace_id": "newer", "audit_event": "accounting.model.call", "model_turn": 2, "job_id": "fixture-job", "call_sequence": 2, "model_kind": "chat", "duration_ms": 7, "usage_total_tokens": 8}
             ]}),
         );
     });

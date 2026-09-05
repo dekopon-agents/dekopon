@@ -251,3 +251,6 @@ reported as `<withheld>` rather than copied, while its kind still says what happ
 ## License
 
 Licensed under either of [Apache-2.0](../../LICENSE-APACHE) or [MIT](../../LICENSE-MIT) at your option.
+
+`CapabilityInvoker::check_freshness` lets a remote adapter reject stale session metadata at host
+safe boundaries; immutable direct dispatch defaults to no I/O. It supplies no invocation authority.

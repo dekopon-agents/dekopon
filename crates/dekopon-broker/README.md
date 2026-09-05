@@ -37,3 +37,20 @@ persisted random epochs, so semantic A→B→A creates three generations. Provid
 unrelated denied providers, enabled-agent ordering, policy formatting, and a principal remap that
 leaves the canonical subject's effective surface unchanged do not rotate. Explicit `stable`
 preserves the namespace across semantic changes.
+
+
+## Core model/effort admission (unreleased)
+
+`Broker::with_control_targets` installs a startup-fixed, aggregate-validated ceiling of at most
+16 configured aliases and explicit `providerDefault|low|medium|high` efforts. Empty disables it.
+`authorize_control` freshly remaps each attested subject and requires an explicitly granted chat
+scope (no legacy fallback); a direct peer must be mapped to the proposal's agent. It rechecks
+`agent.prompt` plus `agent.model.select` and/or `agent.effort.set`, atomically requiring both when
+both dimensions change. Unknown targets, unsupported combinations, no-ops, policy errors,
+forbids and replayed IDs refuse. Selection fields are intent, not verified runtime state.
+
+Control IDs share the durable provider-invocation replay ledger, including denials. New
+`ControlDecision` audit records commit authenticated context, all proposal bindings, policy and
+outcome; prior event serialization/hashes are unchanged. Audit and the deployed audit checkpoint
+must persist before returning admission. Admission is not model selection or execution evidence;
+no `AuthorizedInvocation` leaves the broker. A random `surfaceEpoch` changes at every startup.

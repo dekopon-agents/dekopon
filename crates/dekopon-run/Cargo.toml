@@ -16,7 +16,7 @@ include = ["src/**", "tests/**", "README.md", "Cargo.toml"]
 
 [dependencies]
 clap.workspace = true
-dekopon-agent.workspace = true
+dekopon-harness.workspace = true
 dekopon-broker-protocol.workspace = true
 # `prompt --skill` and `session replay --skill` read skill directories with the catalog's loader;
 # the runner still has no catalog concept.

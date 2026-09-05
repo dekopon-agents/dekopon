@@ -306,6 +306,31 @@ pub(crate) trait ThreadOwnership: Send + Sync {
 /// exact endpoints, fallback, and per-installation degradation. Failures are cosmetic and never
 /// become session failures.
 pub(crate) trait ChatActivity: Send + Sync {
+    /// Only Slack opts in. Other transports consume the same event seam as native typing/no-op.
+    fn progress_enabled(&self) -> bool {
+        false
+    }
+    fn post_progress(
+        &self,
+        _target: ActivityTarget,
+        _label: dekopon_harness::activity::ActivityLabel,
+    ) -> BoxFuture<'_, Result<Option<slack::OwnedProgressArtifact>, TransportError>> {
+        Box::pin(async { Ok(None) })
+    }
+    fn update_progress<'a>(
+        &'a self,
+        _owned: &'a slack::OwnedProgressArtifact,
+        _label: dekopon_harness::activity::ActivityLabel,
+    ) -> BoxFuture<'a, Result<(), TransportError>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn delete_progress<'a>(
+        &'a self,
+        _owned: &'a slack::OwnedProgressArtifact,
+    ) -> BoxFuture<'a, Result<(), TransportError>> {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Starts or renews activity for one authenticated target under a short driver-owned deadline.
     ///
     /// The coordinator deliberately retains an issued call across sealing so later cleanup cannot
@@ -315,8 +340,30 @@ pub(crate) trait ChatActivity: Send + Sync {
     /// Clears activity where the service supports it, or performs a no-op for expiring signals.
     fn hide(&self, target: ActivityTarget) -> BoxFuture<'_, Result<(), TransportError>>;
 
+    /// Retire metadata after the coordinator's bounded cleanup ends. Unknown native ordering is
+    /// independently fenced by its counted target lease; no abandoned registry may grow forever.
+    fn retire(&self, _target: &ActivityTarget) {}
+
     /// Renewal interval for expiring signals; `None` for durable state transitions such as Slack.
     fn refresh_interval(&self) -> Option<Duration>;
+}
+
+/// Cosmetic response bound, independent of attachment and terminal-reply collection.
+pub(crate) async fn activity_response(
+    mut response: reqwest::Response,
+) -> Result<Vec<u8>, TransportError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|source| TransportError::Request(Box::new(source)))?
+    {
+        if chunk.len() > 64 * 1024 - bytes.len() {
+            return Err(TransportError::Response);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }
 
 /// One complete terminal chat reply.
@@ -403,6 +450,8 @@ pub(crate) trait AssetFetcher: Send + Sync {
 /// of them carries a credential, and the daemon logs the category rather than the message.
 #[derive(Debug, Error)]
 pub enum TransportError {
+    #[error("cosmetic activity is rate limited")]
+    ActivityRateLimited { retry_after: Duration },
     #[error("credential environment variable {name} is not set")]
     MissingCredential { name: String },
     #[error("credential environment variable {name} is set to an empty value")]
@@ -439,6 +488,7 @@ impl TransportError {
     /// Stable low-cardinality category for telemetry, never the underlying message.
     pub const fn category(&self) -> &'static str {
         match self {
+            Self::ActivityRateLimited { .. } => "activity-rate-limited",
             Self::MissingCredential { .. } => "missing-credential",
             Self::EmptyCredential { .. } => "empty-credential",
             Self::NonUtf8Credential { .. } => "non-utf8-credential",

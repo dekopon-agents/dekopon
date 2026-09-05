@@ -30,6 +30,8 @@ transports:
     activity:
       mode: native
       classicFallback: reaction
+      # Ordinary bot-owned post; may notify/remain in Slack retention after best-effort deletion.
+      progressMessage: false
 
 models:
   - name: local-reasoning
@@ -39,6 +41,8 @@ models:
     # provider credential either way; it only ever writes shell scripts.
     endpoint: http://127.0.0.1:11434/v1
     model: qwen3
+    # Explicit low/medium/high requires support from the remote model; default sends no setting.
+    effort: providerDefault
     timeoutMs: 120000
     # Matched against the agent's `modelClass` when a route names no model explicitly.
     classes: [reasoning]
@@ -57,6 +61,12 @@ routes:
   - transport: workspace-slack
     match: { kind: directMessage }
     agent: xaviers-conditional-writer
+    # Public labels only, intersected with fresh grants; omitted IDs use Running capability.
+    activityLabels:
+      http-probe.fetch: Fetching GitHub pull request details
+    # Optional core controls, disabled here. The baseline must be included; add configured aliases
+    # to permit model-selection proposals. Broker controlTargets and Cedar permits are independent.
+    # controls: { models: [local-reasoning], maxAttempts: 4 }
     # Opt in to the gateway's one image generator. Absent means this route gets no `generate_image`
     # tool, reads no image credential, and answers with byte-identical text.
     imageGenerator: true

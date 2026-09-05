@@ -4,7 +4,7 @@
 edit, in what order to restart, and which releases require a configuration change rather than a
 binary swap. The changelog records *what changed*; this records *what you have to do about it*.
 
-Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no compatibility promise
+Dekopon is pre-1.0 and the local broker protocol is `v1alpha3`. There is no compatibility promise
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
@@ -50,19 +50,49 @@ explicit operator recovery. See [`operations.md`](operations.md#the-audit-chain-
 Only releases that need an operator action appear here. A release absent from this list is a binary
 swap in the order above.
 
+### 0.12.0 → next (unreleased) — harness APIs and accounting
+
+Rust embedders replace the `dekopon-agent` dependency/imports with `dekopon-harness`, then construct
+`SessionEngine`, `SessionBootstrap` and harness history. There is no compatibility facade or old
+`prompt` entrypoint. Out-of-tree console migration and new-name crates.io bootstrap have not run.
+`ChatModel`/image adapters require an `AttemptRecorder`; record before content decoding and include
+failed/cancelled inference and HTTP retry attempts, never fabricate missing usage. Retain
+`JobAccounting` until host delivery is known; generated output alone is not accepted delivery.
+
+Dashboards migrate from `accounting.model.turn`/separate image accounting to the versioned
+`accounting.model.call`, `accounting.model.transition` and `accounting.model.job` schemas; choose
+one aggregation level, never sum all three. Informational `ModelUsageReport` now derives solely
+from tracker attempt observations, not a success-only observer. Unknown totals display unknown.
+New transcript events identify context revision/full versus delta; the reader currently refuses
+later full rebuilds. Checkpoints are version 2 process-local memory, not on-disk upgrade state.
+See [the runtime contract and remaining integration gaps](harness.md).
+
+### 0.12.0 → next (unreleased) — core controls and `v1alpha3`
+
+Upgrade all four executables together. `authorizeControl` and the required host-only
+`surfaceEpoch` change the protocol to `dekopon.dev/broker/v1alpha3`; `v1alpha1`/`v1alpha2`
+envelopes refuse before dispatch. An older client cannot decode the newer refusal either.
+Stop gateway, drain broker, retain audit and checkpoint, install the binaries, start broker,
+then gateway. Never erase replay history to make a mixed installation start: older binaries
+cannot decode the new `ControlDecision` audit variant. Existing event hashes remain valid.
+
+Controls are disabled without `controlTargets`. Opt-in requires separate `agent.prompt`,
+`agent.model.select` and/or `agent.effort.set` permits, and explicit attestor `chatScopes` for
+chat controls. No subject-only scope fallback applies. Both changed dimensions require both
+permissions. Configured model aliases are not endpoints and allowlisting them grants nothing.
+
 ### 0.12.0 → next (unreleased) — command words run over `runCommand`
 
 Not yet released; the version that carries it is named when it is cut. Nothing here needs a
 configuration edit.
 
 - **Upgrade the broker before its clients, and all four executables together.** The local protocol
-  stays `dekopon.dev/broker/v1alpha2`, but `dekopon-run --broker` and `dekopond` now send a provider
+  now uses `dekopon.dev/broker/v1alpha3`, and `dekopon-run --broker` and `dekopond` now send a provider
   command word as `runCommand` — the word, its argv, and the optional piped value — and read back
   the guest's own outcome. A newer broker still answers the legacy `resolveCommand`, with a
-  rendered page degraded to a decline carrying its stdout then stderr, so an older client keeps
-  working for one release. The reverse does not hold: an older broker refuses `runCommand` as
-  `invalid-request` at the `operation` tag, indistinguishable from a corrupt frame, so a newer
-  client against an older broker reports every command word as a failed run until the broker moves.
+  rendered page degraded to a decline carrying its stdout then stderr. This is a legacy operation
+  within the new envelope, not cross-version compatibility: `v1alpha2` clients are rejected before
+  dispatch and must upgrade in lockstep.
 - **Upgrade the hosts before a provider adopts `run-command`.** A component built against
   `dekopon:provider@0.3.0`'s `provider-cli` world exports `run-command`, which only a broker or
   runner at this version looks up; an older host finds no `resolve-command` behind the manifest's

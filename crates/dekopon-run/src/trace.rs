@@ -16,11 +16,11 @@ use tracing_subscriber::{EnvFilter, Layer as _};
 use crate::cli::TelemetryArgs;
 
 /// Crates whose execution spans and lifecycle events belong in runner telemetry.
-const TRACE_FILTER: &str = "dekopon_run=trace,dekopon_agent=trace,dekopon_model=trace,dekopon_process=trace,dekopon_provider_host=trace,dekopon_shell=trace";
+const TRACE_FILTER: &str = "dekopon_run=trace,dekopon_harness=trace,dekopon_model=trace,dekopon_process=trace,dekopon_provider_host=trace,dekopon_shell=trace";
 /// Transport crates are silenced explicitly: an HTTP stack logs every connection. The OTLP
 /// exporter's own diagnostics are silenced by `dekopon_telemetry`, which appends that directive to
 /// every OTLP layer it installs.
-const OTEL_LOG_FILTER: &str = "dekopon_run=info,dekopon_agent=info,dekopon_model=info,dekopon_provider_host=info,dekopon_shell=info,hyper=off,h2=off,reqwest=off";
+const OTEL_LOG_FILTER: &str = "dekopon_run=info,dekopon_harness=info,dekopon_model=info,dekopon_provider_host=info,dekopon_shell=info,hyper=off,h2=off,reqwest=off";
 
 pub(crate) struct TraceGuard {
     chrome: Option<FlushGuard>,
@@ -54,7 +54,7 @@ pub(crate) fn initialize(
         1 => "info",
         _ => "debug",
     };
-    // Lifecycle audit events target `dekopon_run::audit` and `dekopon_agent::audit` so they reach
+    // Lifecycle audit events target `dekopon_run::audit` and `dekopon_harness::audit` so they reach
     // the OTLP and Chrome sinks (whose crate directives match the prefix) without ever printing on
     // the operator's stderr, which must stay byte-for-byte what it was before those events
     // existed.
@@ -66,7 +66,7 @@ pub(crate) fn initialize(
         },
         writer: ConsoleWriter::Stderr,
         filter: ConsoleFilter::Directive(format!(
-            "{level},dekopon_run::audit=off,dekopon_agent::audit=off"
+            "{level},dekopon_run::audit=off,dekopon_harness::audit=off"
         )),
     };
 

@@ -1,3 +1,4 @@
+use dekopon_harness::conversation::{BoundedConversationStore, ConversationKey, EvictionReason};
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     ffi::OsString,
@@ -12,11 +13,6 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use dekopon_agent::prompt::{
-    AGENT_CONFIG_TOOL_NAME, AssetSource as _, ConversationTurn, DECLINE_REPLY_TOOL_NAME,
-    HistoryLimits, IMAGE_GENERATION_TOOL_NAME, IMPROVEMENT_TOOL_NAME, PromptLimits,
-    SKILL_TOOL_NAME,
-};
 use dekopon_broker_protocol::{
     Attestation, AvailableCapability, BrokerRequest, BrokerSocketDiscovery, ChatMemorySurface,
     CommandRunOutcome, FrameLimits, InvocationOutcome, InvocationResult, RequestEnvelope,
@@ -24,6 +20,16 @@ use dekopon_broker_protocol::{
 };
 use dekopon_config::LocalCatalog;
 use dekopon_core::{ExternalSubject, SecretDrn, SecretUseProposal};
+use dekopon_harness::{
+    history::{HistoryLimits, JobRecord},
+    improvement::IMPROVEMENT_TOOL_NAME,
+    session::PromptLimits,
+    skills::SKILL_TOOL_NAME,
+    tools::{
+        AGENT_CONFIG_TOOL_NAME, AssetSource as _, DECLINE_REPLY_TOOL_NAME,
+        IMAGE_GENERATION_TOOL_NAME,
+    },
+};
 use dekopon_model::{
     image::{GeneratedImage, ImageGenerationError, ImageGenerator},
     model::{
@@ -44,7 +50,6 @@ use crate::{
         ImageGeneratorConfig, ModelConfig, NativeActivityConfig, ResolvedBroker, RouteMatch,
         SlackActivityConfig, SlackActivityFallback, SlackExperience,
     },
-    conversation::{ConversationKey, ConversationStore, EvictionReason},
     routes::{RouteError, RouteProblem, RoutingTable},
     session::{
         BUSY_REPLY, CancelAwareInvoker, FAILURE_REPLY, ImageGeneratorStartupError, ModelCache,
@@ -422,6 +427,7 @@ fn a_model_api_key_variable_is_absent_or_usable_and_never_silently_empty() {
         timeout_ms: 60_000,
         classes: vec!["fast".to_owned()],
         modalities: Vec::new(),
+        effort: Default::default(),
     };
 
     // No field at all is a deliberate configuration, not a missing credential.
@@ -487,6 +493,7 @@ async fn slack_activity_and_experience_are_explicit_and_strict() {
             activity: SlackActivityConfig {
                 mode: ActivityMode::Native,
                 classic_fallback: SlackActivityFallback::Reaction,
+                progress_message: false,
             },
             ..
         })
@@ -1960,6 +1967,14 @@ impl ModelScript {
             .unwrap_or_else(|| panic!("request {index} declared a prompt cache key"))
     }
 
+    /// Portable conversation messages excluding the independently tested request-one bootstrap.
+    fn conversation_prompt(&self, index: usize) -> Vec<(String, String)> {
+        self.prompt(index)
+            .into_iter()
+            .filter(|(_, text)| !text.starts_with("Dekopon session bootstrap\n"))
+            .collect()
+    }
+
     /// One request's messages as `(role, content)` pairs, in the order the model saw them.
     fn prompt(&self, index: usize) -> Vec<(String, String)> {
         let prompts = self.prompts.lock().expect("recorded prompts");
@@ -1998,8 +2013,9 @@ impl ChatModel for ScriptedModel {
         &self,
         messages: &[ModelMessage],
         tools: &[ModelTool],
+        recorder: &dyn dekopon_model::usage::AttemptRecorder,
     ) -> Result<AssistantTurn, ModelError> {
-        self.complete_with(messages, tools, &CompletionOptions::default())
+        self.complete_with(messages, tools, &CompletionOptions::default(), recorder)
     }
 
     fn complete_with(
@@ -2007,31 +2023,49 @@ impl ChatModel for ScriptedModel {
         messages: &[ModelMessage],
         tools: &[ModelTool],
         options: &CompletionOptions,
+        recorder: &dyn dekopon_model::usage::AttemptRecorder,
     ) -> Result<AssistantTurn, ModelError> {
-        assert!(!self.0.forbidden, "this session must never reach a model");
-        self.0
-            .prompts
-            .lock()
-            .expect("recorded prompts")
-            .push(messages.to_vec());
-        self.0
-            .tools
-            .lock()
-            .expect("recorded tools")
-            .push(tools.to_vec());
-        self.0
-            .cache_keys
-            .lock()
-            .expect("recorded cache keys")
-            .push(options.prompt_cache_key().map(ToOwned::to_owned));
-        self.0.requests.fetch_add(1, Ordering::SeqCst);
-        self.0
-            .turns
-            .lock()
-            .expect("scripted turn lock")
-            .pop_front()
-            .flatten()
-            .ok_or(ModelError::NoChoices)
+        {
+            let attempt = recorder.begin(dekopon_model::usage::AttemptKind::Adapter)?;
+            let result: Result<AssistantTurn, ModelError> = {
+                assert!(!self.0.forbidden, "this session must never reach a model");
+                self.0
+                    .prompts
+                    .lock()
+                    .expect("recorded prompts")
+                    .push(messages.to_vec());
+                self.0
+                    .tools
+                    .lock()
+                    .expect("recorded tools")
+                    .push(tools.to_vec());
+                self.0
+                    .cache_keys
+                    .lock()
+                    .expect("recorded cache keys")
+                    .push(options.prompt_cache_key().map(ToOwned::to_owned));
+                self.0.requests.fetch_add(1, Ordering::SeqCst);
+                self.0
+                    .turns
+                    .lock()
+                    .expect("scripted turn lock")
+                    .pop_front()
+                    .flatten()
+                    .ok_or(ModelError::NoChoices)
+            };
+            if let Ok(turn) = &result
+                && let Some(usage) = turn.usage
+            {
+                recorder.observe(
+                    attempt,
+                    dekopon_model::usage::UsageObservation {
+                        usage,
+                        invalid: [false; 5],
+                    },
+                )?;
+            }
+            result
+        }
     }
 }
 
@@ -2398,6 +2432,7 @@ fn memory_surface_response() -> ResponseEnvelope {
             max_lookback_turns: 200,
             prompt_note: "Durable memory is available only on demand.".to_owned(),
         }),
+        "fixture-epoch".parse().expect("fixture epoch"),
     )
 }
 
@@ -2467,8 +2502,10 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         instructions: Some("Answer briefly.".to_owned()),
         skills: Arc::from(Vec::new()),
         model: Arc::new(model),
+        controls: None,
         image_generator: false,
         improvement_suggestions: false,
+        activity_labels: Default::default(),
         limits: PromptLimits {
             max_steps: 4,
             max_capability_calls: 8,
@@ -2509,6 +2546,7 @@ fn model_config() -> ModelConfig {
         classes: vec!["reasoning".to_owned()],
         // Text only, which is the default and the right one for a local endpoint.
         modalities: Vec::new(),
+        effort: Default::default(),
     }
 }
 
@@ -2635,7 +2673,7 @@ fn runner_tracking(
         models: Arc::new(ModelCache::new(models)),
         gate: SessionGate::new(max_concurrent),
         reply_on_busy: true,
-        conversations: ConversationStore::new(max_conversations),
+        conversations: BoundedConversationStore::new(max_conversations),
         assets: Arc::new(AssetStore::new(
             max_conversations,
             Duration::from_secs(60 * 60),
@@ -2717,14 +2755,32 @@ impl ChatModel for BlockedHandle {
         &self,
         _messages: &[ModelMessage],
         _tools: &[ModelTool],
+        recorder: &dyn dekopon_model::usage::AttemptRecorder,
     ) -> Result<AssistantTurn, ModelError> {
-        if let Some(sender) = self.0.entered.lock().expect("entered lock").take() {
-            let _ = sender.send(());
+        {
+            let attempt = recorder.begin(dekopon_model::usage::AttemptKind::Adapter)?;
+            let result: Result<AssistantTurn, ModelError> = {
+                if let Some(sender) = self.0.entered.lock().expect("entered lock").take() {
+                    let _ = sender.send(());
+                }
+                if let Some(receiver) = self.0.release_signal.lock().expect("release lock").take() {
+                    let _ = receiver.recv_timeout(Duration::from_secs(30));
+                }
+                Ok(self.0.turn.clone())
+            };
+            if let Ok(turn) = &result
+                && let Some(usage) = turn.usage
+            {
+                recorder.observe(
+                    attempt,
+                    dekopon_model::usage::UsageObservation {
+                        usage,
+                        invalid: [false; 5],
+                    },
+                )?;
+            }
+            result
         }
-        if let Some(receiver) = self.0.release_signal.lock().expect("release lock").take() {
-            let _ = receiver.recv_timeout(Duration::from_secs(30));
-        }
-        Ok(self.0.turn.clone())
     }
 }
 
@@ -2736,6 +2792,7 @@ async fn an_authorized_message_reaches_its_agent_and_answers_in_chat() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
             Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
         )],
     )
     .await;
@@ -2770,7 +2827,12 @@ async fn an_authorized_message_reaches_its_agent_and_answers_in_chat() {
 struct TestImageGenerator;
 
 impl ImageGenerator for TestImageGenerator {
-    fn generate(&self, _prompt: &str) -> Result<GeneratedImage, ImageGenerationError> {
+    fn generate(
+        &self,
+        _prompt: &str,
+        recorder: &dyn dekopon_model::usage::AttemptRecorder,
+    ) -> Result<GeneratedImage, ImageGenerationError> {
+        recorder.begin(dekopon_model::usage::AttemptKind::Adapter)?;
         let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
         png.extend_from_slice(b"kitty pixels");
         GeneratedImage::from_png(png)
@@ -2785,6 +2847,7 @@ async fn an_explicit_route_generator_yields_an_image_reply() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
             Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
         )],
     )
     .await;
@@ -2918,11 +2981,60 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
         message_ts: "1700000000.000002".to_owned(),
         initiator_user_id: "u9xyz".to_owned(),
     });
-    let key = ConversationKey::new(
+    let key = ConversationKey::scoped(
+        route.agent.as_str(),
+        &route.cache_key,
         &message.transport,
+        &message.channel,
         &message.conversation_id,
         &message.subject.canonical(),
     );
+    let surface = match memory_surface_response().response {
+        dekopon_broker_protocol::BrokerResponse::Capabilities {
+            capabilities,
+            command_words,
+            surface_epoch,
+            ..
+        } => {
+            struct Metadata(
+                Vec<dekopon_broker_protocol::AvailableCapability>,
+                Vec<String>,
+            );
+            impl dekopon_shell::CapabilityInvoker for Metadata {
+                fn granted(&self) -> Vec<String> {
+                    self.0.iter().map(|c| c.capability.id.to_string()).collect()
+                }
+                fn command_words(&self) -> Vec<String> {
+                    self.1.clone()
+                }
+                fn describe(&self, id: &str) -> Option<dekopon_shell::CapabilityDescription> {
+                    self.0
+                        .iter()
+                        .find(|c| c.capability.id.as_str() == id)
+                        .map(|c| dekopon_shell::CapabilityDescription {
+                            capability: id.into(),
+                            description: c.capability.description.clone(),
+                            input_schema: c.capability.input_schema.clone(),
+                        })
+                }
+                fn invoke(
+                    &self,
+                    _: &str,
+                    _: Value,
+                    _: Option<dekopon_core::SecretUseProposal>,
+                ) -> dekopon_shell::CapabilityCallResult {
+                    panic!("metadata only")
+                }
+            }
+            let metadata = dekopon_harness::bootstrap::CapabilitySnapshot::from_invoker(&Metadata(
+                capabilities,
+                command_words,
+            ))
+            .unwrap();
+            vec![metadata.fingerprint(), surface_epoch.to_string()]
+        }
+        _ => panic!("capability fixture"),
+    };
 
     run_session(
         Arc::clone(&runner),
@@ -2955,12 +3067,9 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
             .iter()
             .any(|(role, text)| role == "system" && text.contains("last word"))
     );
-    let remembered = runner.conversations.begin(
-        &key,
-        &granted(&["memory.chat.recent", "memory.chat.search"]),
-        window(),
-        Instant::now(),
-    );
+    let remembered = runner
+        .conversations
+        .begin(&key, &surface, window(), Instant::now());
     assert_eq!(remembered.history.turns().len(), 1);
     assert_eq!(remembered.history.turns()[0].user(), "OK, thanks");
     assert_eq!(remembered.history.turns()[0].answer(), None);
@@ -2989,7 +3098,11 @@ async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
     let (broker, mut observed) = stub_broker(
         directory.path(),
         vec![
-            ResponseEnvelope::capabilities(vec![capability("echo.echo")], vec!["probe".to_owned()]),
+            ResponseEnvelope::capabilities(
+                vec![capability("echo.echo")],
+                vec!["probe".to_owned()],
+                "fixture-epoch".parse().expect("fixture epoch"),
+            ),
             ResponseEnvelope::command_run(CommandRunOutcome::Rendered {
                 stdout: "Usage: probe <COMMAND>\n".to_owned(),
                 stderr: String::new(),
@@ -3043,7 +3156,11 @@ async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() 
     let (broker, mut observed) = stub_broker(
         directory.path(),
         vec![
-            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
+            ResponseEnvelope::capabilities(
+                vec![capability("echo.echo")],
+                Vec::new(),
+                "fixture-epoch".parse().expect("fixture epoch"),
+            ),
             ResponseEnvelope::invocation(record_result(InvocationOutcome::Succeeded, None)),
         ],
     )
@@ -3333,6 +3450,7 @@ async fn authorized_work_shows_activity_until_after_the_durable_reply() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
             Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
         )],
     )
     .await;
@@ -3378,6 +3496,7 @@ async fn sealing_does_not_delay_reply_and_cleanup_follows_an_issued_show() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
             Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
         )],
     )
     .await;
@@ -3443,7 +3562,11 @@ async fn unauthorized_work_never_publishes_activity() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(
         directory.path(),
-        vec![ResponseEnvelope::capabilities(Vec::new(), Vec::new())],
+        vec![ResponseEnvelope::capabilities(
+            Vec::new(),
+            Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
+        )],
     )
     .await;
     let surface = Arc::new(RecordingSurface::default());
@@ -3476,7 +3599,7 @@ async fn unauthorized_work_never_publishes_activity() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_native_stop_wins_the_race_and_suppresses_answer_history_and_durable_recording() {
+async fn a_native_stop_suppresses_delivery_but_retains_private_job_history() {
     let directory = temporary();
     let (broker, mut observed) =
         stub_broker(directory.path(), vec![memory_surface_response()]).await;
@@ -3548,8 +3671,8 @@ async fn a_native_stop_wins_the_race_and_suppresses_answer_history_and_durable_r
     assert!(!events.iter().any(|event| event.contains("stale answer")));
     assert_eq!(
         runner.conversations.tracked(),
-        0,
-        "a cancelled turn is never committed to persistent history"
+        1,
+        "Stop retains the independently recorded job, not a delivery receipt"
     );
     assert!(matches!(
         observed.recv().await.expect("surface request").request,
@@ -3569,7 +3692,11 @@ async fn aborting_the_async_session_cancels_later_blocking_tool_work() {
     let (broker, mut observed) = stub_broker(
         directory.path(),
         vec![
-            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
+            ResponseEnvelope::capabilities(
+                vec![capability("echo.echo")],
+                Vec::new(),
+                "fixture-epoch".parse().expect("fixture epoch"),
+            ),
             ResponseEnvelope::error(
                 "unexpected-invocation",
                 "tool work should have been cancelled",
@@ -3666,6 +3793,7 @@ async fn a_session_lists_mounted_skills_by_summary_and_reads_one_on_demand() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
             Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
         )],
     )
     .await;
@@ -3732,6 +3860,7 @@ async fn the_suggestion_tool_is_offered_only_where_the_route_opts_in() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
             Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
         )],
     )
     .await;
@@ -3800,6 +3929,7 @@ async fn an_authorized_agent_can_inspect_its_credential_free_effective_configura
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
             Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
         )],
     )
     .await;
@@ -3883,6 +4013,7 @@ async fn a_session_reports_unreported_model_usage_without_delaying_the_answer() 
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
             Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
         )],
     )
     .await;
@@ -3918,7 +4049,11 @@ async fn an_unauthorized_subject_is_refused_before_any_model_call() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(
         directory.path(),
-        vec![ResponseEnvelope::capabilities(Vec::new(), Vec::new())],
+        vec![ResponseEnvelope::capabilities(
+            Vec::new(),
+            Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
+        )],
     )
     .await;
     let models = ModelScript::forbidden();
@@ -4065,6 +4200,7 @@ async fn a_failed_session_answers_one_fixed_line_and_never_raw_error_text() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
             Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
         )],
     )
     .await;
@@ -4114,6 +4250,7 @@ async fn a_model_answer_longer_than_chat_accepts_is_bounded_on_the_way_out() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
             Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
         )],
     )
     .await;
@@ -4192,6 +4329,7 @@ fn listings(count: usize, capabilities: &[&str]) -> Vec<ResponseEnvelope> {
                     .map(|identifier| capability(identifier))
                     .collect(),
                 Vec::new(),
+                "fixture-epoch".parse().expect("fixture epoch"),
             )
         })
         .collect()
@@ -4207,21 +4345,17 @@ fn granted(capabilities: &[&str]) -> Vec<String> {
 /// Records one exchange for the store tests whose subject is the history rather than the cache
 /// lane, minting the key the way the first session of a conversation supplies it.
 fn commit(
-    store: &ConversationStore,
+    store: &BoundedConversationStore,
     key: &ConversationKey,
     granted: &[String],
     window: ConversationWindow,
-    turn: ConversationTurn,
+    turn: JobRecord,
     now: Instant,
 ) {
-    store.commit(
-        key,
-        granted,
-        window,
-        turn,
-        &cache_key::for_conversation(),
-        now,
-    );
+    let seed = store.begin(key, granted, window, now);
+    store
+        .commit(key, granted, window, turn, &seed.cache_key, now)
+        .expect("live test lease");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4256,12 +4390,12 @@ async fn a_persistent_route_replays_the_previous_exchange_into_the_next_prompt()
         ]
     );
     assert_eq!(
-        models.prompt(0),
+        models.conversation_prompt(0),
         transcript(&[("system", "Answer briefly."), ("user", "what broke?")]),
         "the first message of a conversation starts clean"
     );
     assert_eq!(
-        models.prompt(1),
+        models.conversation_prompt(1),
         transcript(&[
             ("system", "Answer briefly."),
             ("user", "what broke?"),
@@ -4294,7 +4428,7 @@ async fn a_one_shot_route_starts_from_an_empty_prompt_every_message() {
     }
 
     assert_eq!(
-        models.prompt(1),
+        models.conversation_prompt(1),
         transcript(&[
             ("system", "Answer briefly."),
             ("user", "and the second one?")
@@ -4399,12 +4533,12 @@ async fn two_senders_in_one_conversation_never_see_each_others_history() {
     }
 
     assert_eq!(
-        models.prompt(1),
+        models.conversation_prompt(1),
         transcript(&[("system", "Answer briefly."), ("user", "and mine?")]),
         "the second sender's first message must not carry the first sender's exchange"
     );
     assert_eq!(
-        models.prompt(2),
+        models.conversation_prompt(2),
         transcript(&[
             ("system", "Answer briefly."),
             ("user", "what happened to mine?"),
@@ -4428,8 +4562,13 @@ async fn a_narrowed_grant_drops_the_history_it_was_built_under() {
             ResponseEnvelope::capabilities(
                 vec![capability("echo.echo"), capability("gh.pr_view")],
                 Vec::new(),
+                "fixture-epoch".parse().expect("fixture epoch"),
             ),
-            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
+            ResponseEnvelope::capabilities(
+                vec![capability("echo.echo")],
+                Vec::new(),
+                "fixture-epoch".parse().expect("fixture epoch"),
+            ),
         ],
     )
     .await;
@@ -4452,7 +4591,7 @@ async fn a_narrowed_grant_drops_the_history_it_was_built_under() {
     }
 
     assert_eq!(
-        models.prompt(1),
+        models.conversation_prompt(1),
         transcript(&[("system", "Answer briefly."), ("user", "and now?")]),
         "a changed grant set starts a fresh conversation"
     );
@@ -4464,8 +4603,16 @@ async fn an_empty_grant_removes_the_conversation_rather_than_only_refusing_the_m
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![
-            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
-            ResponseEnvelope::capabilities(Vec::new(), Vec::new()),
+            ResponseEnvelope::capabilities(
+                vec![capability("echo.echo")],
+                Vec::new(),
+                "fixture-epoch".parse().expect("fixture epoch"),
+            ),
+            ResponseEnvelope::capabilities(
+                Vec::new(),
+                Vec::new(),
+                "fixture-epoch".parse().expect("fixture epoch"),
+            ),
         ],
     )
     .await;
@@ -4537,7 +4684,7 @@ async fn a_failed_session_records_the_question_it_could_not_answer() {
     .await;
 
     assert_eq!(
-        models.prompt(1),
+        models.conversation_prompt(1),
         transcript(&[
             ("system", "Answer briefly."),
             ("user", "what broke?"),
@@ -4597,8 +4744,8 @@ fn an_idle_conversation_is_dropped_and_the_next_message_starts_fresh() {
     // The clock is a parameter because `tokio::time::pause` does not reach
     // `std::time::Instant::now()` inside a blocking task, so injecting it is the only way this is
     // deterministic rather than a sleep.
-    let store = ConversationStore::new(8);
-    let key = ConversationKey::new("dev", "dev", SUBJECT);
+    let store = BoundedConversationStore::new(8);
+    let key = conversation_key("dev", "dev", SUBJECT);
     let allowed = granted(&["echo.echo"]);
     let start = Instant::now();
     commit(
@@ -4606,7 +4753,7 @@ fn an_idle_conversation_is_dropped_and_the_next_message_starts_fresh() {
         &key,
         &allowed,
         window(),
-        ConversationTurn::completed("what broke?", "two things"),
+        JobRecord::completed("what broke?", "two things"),
         start,
     );
 
@@ -4624,8 +4771,8 @@ fn an_idle_conversation_is_dropped_and_the_next_message_starts_fresh() {
     );
     assert_eq!(
         store.tracked(),
-        0,
-        "an idle conversation is dropped rather than merely skipped"
+        1,
+        "begin reserves a fresh empty generation after dropping the idle one"
     );
 }
 
@@ -4633,12 +4780,12 @@ fn an_idle_conversation_is_dropped_and_the_next_message_starts_fresh() {
 fn the_conversation_ceiling_evicts_the_least_recently_used_rather_than_refusing() {
     // A person talking now matters more than one who stopped an hour ago, so a memory bound must
     // not become an admission bound.
-    let store = ConversationStore::new(2);
+    let store = BoundedConversationStore::new(2);
     let allowed = granted(&["echo.echo"]);
     let start = Instant::now();
     let keys = ["first", "second", "third"]
-        .map(|conversation| ConversationKey::new("dev", conversation, SUBJECT));
-    let turn = |text: &str| ConversationTurn::completed(text, "noted");
+        .map(|conversation| conversation_key("dev", conversation, SUBJECT));
+    let turn = |text: &str| JobRecord::completed(text, "noted");
 
     commit(&store, &keys[0], &allowed, window(), turn("one"), start);
     commit(
@@ -4669,13 +4816,6 @@ fn the_conversation_ceiling_evicts_the_least_recently_used_rather_than_refusing(
 
     let now = start + Duration::from_secs(4);
     assert_eq!(store.tracked(), 2, "the ceiling holds");
-    assert!(
-        store
-            .begin(&keys[1], &allowed, window(), now)
-            .history
-            .is_empty(),
-        "the least recently used conversation is the one that goes"
-    );
     assert_eq!(
         store.begin(&keys[0], &allowed, window(), now).history.len(),
         2,
@@ -4684,6 +4824,13 @@ fn the_conversation_ceiling_evicts_the_least_recently_used_rather_than_refusing(
     assert_eq!(
         store.begin(&keys[2], &allowed, window(), now).history.len(),
         1
+    );
+    assert!(
+        store
+            .begin(&keys[1], &allowed, window(), now)
+            .history
+            .is_empty(),
+        "the least recently used conversation is the one that goes"
     );
 }
 
@@ -4711,15 +4858,15 @@ fn each_window_bound_drops_the_oldest_exchange_on_its_own() {
     };
 
     for (window, name) in [(by_turns, "turn bound"), (by_bytes, "byte bound")] {
-        let store = ConversationStore::new(8);
-        let key = ConversationKey::new("dev", "dev", SUBJECT);
+        let store = BoundedConversationStore::new(8);
+        let key = conversation_key("dev", "dev", SUBJECT);
         for text in ["question a", "question b", "question c"] {
             commit(
                 &store,
                 &key,
                 &allowed,
                 window,
-                ConversationTurn::completed(text, "an answer"),
+                JobRecord::completed(text, "an answer"),
                 now,
             );
         }
@@ -4735,8 +4882,8 @@ fn each_window_bound_drops_the_oldest_exchange_on_its_own() {
 
 #[test]
 fn a_history_and_a_revoked_entry_are_two_different_removals() {
-    let store = ConversationStore::new(8);
-    let key = ConversationKey::new("dev", "dev", SUBJECT);
+    let store = BoundedConversationStore::new(8);
+    let key = conversation_key("dev", "dev", SUBJECT);
     let allowed = granted(&["echo.echo"]);
     let now = Instant::now();
 
@@ -4749,7 +4896,7 @@ fn a_history_and_a_revoked_entry_are_two_different_removals() {
         &key,
         &allowed,
         window(),
-        ConversationTurn::completed("what broke?", "two things"),
+        JobRecord::completed("what broke?", "two things"),
         now,
     );
     assert!(store.remove(&key, EvictionReason::GrantChanged));
@@ -4762,8 +4909,8 @@ fn two_sessions_sharing_one_conversation_both_land_their_exchange() {
     // inside it admit under different keys and share one conversation identity, so a sender
     // replying to themselves before the bot answers runs two sessions against one history. Both
     // read the same seed; neither may erase the other's answer.
-    let store = ConversationStore::new(8);
-    let key = ConversationKey::new("slack", "c0123abc:1700000000.000001", SUBJECT);
+    let store = BoundedConversationStore::new(8);
+    let key = conversation_key("slack", "c0123abc:1700000000.000001", SUBJECT);
     let allowed = granted(&["echo.echo"]);
     let now = Instant::now();
 
@@ -4771,22 +4918,26 @@ fn two_sessions_sharing_one_conversation_both_land_their_exchange() {
     let second = store.begin(&key, &allowed, window(), now);
     assert!(first.history.is_empty() && second.history.is_empty());
 
-    store.commit(
-        &key,
-        &allowed,
-        window(),
-        ConversationTurn::completed("what broke?", "two things"),
-        &first.cache_key,
-        now,
-    );
-    store.commit(
-        &key,
-        &allowed,
-        window(),
-        ConversationTurn::completed("still there?", "yes"),
-        &second.cache_key,
-        now,
-    );
+    store
+        .commit(
+            &key,
+            &allowed,
+            window(),
+            JobRecord::completed("what broke?", "two things"),
+            &first.cache_key,
+            now,
+        )
+        .expect("live test lease");
+    store
+        .commit(
+            &key,
+            &allowed,
+            window(),
+            JobRecord::completed("still there?", "yes"),
+            &second.cache_key,
+            now,
+        )
+        .expect("live test lease");
 
     let resumed = store.begin(&key, &allowed, window(), now);
     assert_eq!(resumed.history.len(), 2);
@@ -4796,21 +4947,21 @@ fn two_sessions_sharing_one_conversation_both_land_their_exchange() {
     // is the lane the conversation keeps. The loser paid for one cache lookup on one message; the
     // alternative — the last writer renaming the lane every message — would leave every request
     // naming a lane no earlier request had ever used.
-    assert_ne!(first.cache_key, second.cache_key);
+    assert_eq!(first.cache_key, second.cache_key);
     assert_eq!(resumed.cache_key, first.cache_key);
 }
 
 #[test]
 fn the_store_prints_counts_rather_than_conversations() {
-    // `History` and `ConversationTurn` both derive `Debug`, so a derived impl here would put whole
+    // `History` and `JobRecord` both derive `Debug`, so a derived impl here would put whole
     // conversations into the log stream on one `tracing::debug!(?store)`.
-    let store = ConversationStore::new(8);
+    let store = BoundedConversationStore::new(8);
     commit(
         &store,
-        &ConversationKey::new("dev", "dev", SUBJECT),
+        &conversation_key("dev", "dev", SUBJECT),
         &granted(&["echo.echo"]),
         window(),
-        ConversationTurn::completed("the secret question", "the secret answer"),
+        JobRecord::completed("the secret question", "the secret answer"),
         Instant::now(),
     );
 
@@ -4859,8 +5010,8 @@ fn a_cache_key_carries_nothing_about_the_sender() {
     // number, so sending it — or a hash of it, which is a stable pseudonym — would hand a model
     // provider the sender's identity in exchange for routing that happens either way.
     const DISTINCTIVE: &str = "tel.15558675309";
-    let store = ConversationStore::new(8);
-    let key = ConversationKey::new("dev", "c0123abc", DISTINCTIVE);
+    let store = BoundedConversationStore::new(8);
+    let key = conversation_key("dev", "c0123abc", DISTINCTIVE);
     let seed = store.begin(&key, &granted(&["echo.echo"]), window(), Instant::now());
 
     for fragment in [DISTINCTIVE, "15558675309", "tel", "c0123abc"] {
@@ -4880,20 +5031,22 @@ fn an_evicted_conversation_comes_back_with_a_new_cache_key() {
     // Rotation is what keeps the key from becoming a durable pseudonym, and it is also simply
     // correct: an evicted conversation rebuilds a prompt sharing no prefix with the one it
     // replaced, so naming the old lane would be a guaranteed miss.
-    let store = ConversationStore::new(8);
-    let key = ConversationKey::new("dev", "dev", SUBJECT);
+    let store = BoundedConversationStore::new(8);
+    let key = conversation_key("dev", "dev", SUBJECT);
     let allowed = granted(&["echo.echo"]);
     let start = Instant::now();
 
     let first = store.begin(&key, &allowed, window(), start);
-    store.commit(
-        &key,
-        &allowed,
-        window(),
-        ConversationTurn::completed("what broke?", "two things"),
-        &first.cache_key,
-        start,
-    );
+    store
+        .commit(
+            &key,
+            &allowed,
+            window(),
+            JobRecord::completed("what broke?", "two things"),
+            &first.cache_key,
+            start,
+        )
+        .expect("live test lease");
 
     let warm = store.begin(&key, &allowed, window(), start + Duration::from_secs(60));
     assert_eq!(
@@ -5011,13 +5164,31 @@ impl ChatModel for KeylessModel {
         &self,
         messages: &[ModelMessage],
         _tools: &[ModelTool],
+        recorder: &dyn dekopon_model::usage::AttemptRecorder,
     ) -> Result<AssistantTurn, ModelError> {
-        Ok(answer(
-            messages
-                .last()
-                .and_then(ModelMessage::content)
-                .unwrap_or_default(),
-        ))
+        {
+            let attempt = recorder.begin(dekopon_model::usage::AttemptKind::Adapter)?;
+            let result: Result<AssistantTurn, ModelError> = {
+                Ok(answer(
+                    messages
+                        .last()
+                        .and_then(ModelMessage::content)
+                        .unwrap_or_default(),
+                ))
+            };
+            if let Ok(turn) = &result
+                && let Some(usage) = turn.usage
+            {
+                recorder.observe(
+                    attempt,
+                    dekopon_model::usage::UsageObservation {
+                        usage,
+                        invalid: [false; 5],
+                    },
+                )?;
+            }
+            result
+        }
     }
 }
 
@@ -5817,6 +5988,7 @@ async fn a_slack_envelope_is_acknowledged_before_the_session_that_answers_it() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
             Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
         )],
     )
     .await;
@@ -6423,6 +6595,7 @@ async fn slack_agent_activity_uses_thread_sessions_and_explicit_lifecycle_states
         SlackActivityConfig {
             mode: ActivityMode::Native,
             classic_fallback: SlackActivityFallback::Reaction,
+            progress_message: false,
         },
     );
     transport.connect().await.expect("Slack Agent connects");
@@ -6486,6 +6659,7 @@ async fn slack_permanently_degrades_agent_status_to_owned_tangerine_reactions() 
         SlackActivityConfig {
             mode: ActivityMode::Native,
             classic_fallback: SlackActivityFallback::Reaction,
+            progress_message: false,
         },
     );
     transport.connect().await.expect("Slack connects");
@@ -6558,6 +6732,7 @@ async fn slack_does_not_remove_a_reaction_this_generation_did_not_add() {
         SlackActivityConfig {
             mode: ActivityMode::Native,
             classic_fallback: SlackActivityFallback::Reaction,
+            progress_message: false,
         },
     );
     transport.connect().await.expect("classic Slack connects");
@@ -6614,6 +6789,7 @@ async fn slack_lost_reaction_response_never_grants_cleanup_ownership() {
         SlackActivityConfig {
             mode: ActivityMode::Native,
             classic_fallback: SlackActivityFallback::Reaction,
+            progress_message: false,
         },
     );
     transport.connect().await.expect("classic Slack connects");
@@ -6738,6 +6914,7 @@ async fn a_slack_answer_is_posted_as_a_markdown_block() {
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
             Vec::new(),
+            "fixture-epoch".parse().expect("fixture epoch"),
         )],
     )
     .await;
@@ -8718,4 +8895,295 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
             .expect("image write and flush are accepted")
             .accepted()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bootstrap_uses_each_fresh_chat_surface_before_request_one_without_discovery() {
+    let directory = temporary();
+    let mut first_capability = capability("echo.echo");
+    first_capability.capability.description = "Return the specified message".to_owned();
+    first_capability.capability.input_schema = json!({"type":"object", "properties":{"message":{"type":"string"}}, "required":["message"], "additionalProperties":false});
+    let schema = first_capability.capability.input_schema.clone();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![
+            ResponseEnvelope::capabilities(
+                vec![first_capability, capability("private.first-only")],
+                vec!["echo-cli".to_owned()],
+                "fixture-epoch".parse().expect("fixture epoch"),
+            ),
+            ResponseEnvelope::capabilities(
+                vec![capability("echo.echo")],
+                Vec::new(),
+                "fixture-epoch".parse().expect("fixture epoch"),
+            ),
+        ],
+    )
+    .await;
+    let models = ModelScript::new([answer("First answer."), answer("Second answer.")]);
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    for text in ["first", "second"] {
+        run_session(
+            Arc::clone(&runner),
+            route(model_config()),
+            message(text),
+            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        )
+        .await;
+    }
+    assert_eq!(
+        models.requests(),
+        2,
+        "one inference per inbound job, no discovery call"
+    );
+    for index in 0..2 {
+        let messages = models.prompt(index);
+        assert!(
+            messages
+                .iter()
+                .all(|(role, _)| role == "system" || role == "user"),
+            "no fabricated tool or assistant messages"
+        );
+        let context = messages
+            .iter()
+            .find(|(_, text)| text.starts_with("Dekopon session bootstrap\n"))
+            .expect("bootstrap context");
+        let document: Value =
+            serde_json::from_str(context.1.lines().last().expect("metadata JSON"))
+                .expect("bootstrap JSON");
+        assert_eq!(document["selectedModel"], "qwen3");
+        assert!(!context.1.contains(SUBJECT));
+        assert!(!context.1.contains("http://127.0.0.1:1/v1"));
+        assert_eq!(document["capabilities"][0]["id"], "echo.echo");
+        if index == 0 {
+            assert_eq!(
+                document["capabilities"][0]["description"],
+                "Return the specified message"
+            );
+            assert_eq!(document["capabilities"][0]["inputSchema"], schema);
+            assert_eq!(document["commandWords"], json!(["echo-cli"]));
+        } else {
+            assert!(
+                !context.1.contains("private.first-only"),
+                "fresh narrowed grant replaces old metadata"
+            );
+            assert!(!context.1.contains("echo-cli"));
+            assert_eq!(
+                document["capabilities"]
+                    .as_array()
+                    .expect("capabilities")
+                    .len(),
+                1
+            );
+        }
+        assert!(matches!(
+            observed.recv().await.expect("one snapshot per job").request,
+            BrokerRequest::Capabilities {
+                attestation: Some(Attestation { scope: Some(_), .. })
+            }
+        ));
+    }
+    assert!(
+        observed.try_recv().is_err(),
+        "bootstrap runs no discovery commands or broker invocations"
+    );
+    assert_eq!(replier.replies(), ["First answer.", "Second answer."]);
+}
+
+fn conversation_key(transport: &str, conversation: &str, subject: &str) -> ConversationKey {
+    ConversationKey::scoped(
+        "test-agent",
+        "test-route",
+        transport,
+        "test-channel",
+        conversation,
+        subject,
+    )
+}
+
+#[tokio::test]
+async fn configured_controls_validation_is_strict_aggregate_and_resolves_all_candidates() {
+    let directory = temporary();
+    let mut doc = document(directory.path());
+    doc["routes"][0]["controls"] =
+        json!({"models":["local-qwen","local-qwen","missing"],"maxAttempts":9});
+    let error = load(directory.path(), &doc).await.unwrap_err();
+    let text = error.to_string();
+    assert!(text.contains("duplicate control model local-qwen"));
+    assert!(text.contains("maxAttempts"));
+    assert!(text.contains("missing"));
+    doc["routes"][0]["controls"] = json!({"models":["local-qwen"],"endpoint":"https://invalid"});
+    assert!(load(directory.path(), &doc).await.is_err());
+    doc["routes"][0]["controls"] = json!({"models":["local-qwen"],"maxAttempts":2});
+    doc["models"][0]["effort"] = json!("high");
+    let config = load(directory.path(), &doc).await.unwrap();
+    assert_eq!(config.models[0].effort(), dekopon_core::Effort::High);
+    assert_eq!(config.routes[0].controls.as_ref().unwrap().max_attempts, 2);
+    doc["models"][0]["effort"] = json!("extreme");
+    assert!(load(directory.path(), &doc).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn configured_controls_reuse_gateway_clients_and_authorize_each_job_from_its_baseline() {
+    use dekopon_broker_protocol::{ControlDecision, ControlOutcome, ProtocolVersion};
+    let directory = temporary();
+    let path = directory.path().join("broker.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let (send, mut recv) = mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        for _ in 0..4 {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let request: RequestEnvelope = read_frame(&mut stream, FrameLimits::default())
+                .await
+                .unwrap();
+            let response = match request.request {
+                BrokerRequest::Capabilities { .. } => ResponseEnvelope::capabilities(
+                    vec![capability("echo.echo")],
+                    vec![],
+                    "fixture-epoch".parse().unwrap(),
+                ),
+                BrokerRequest::AuthorizeControl {
+                    proposal,
+                    attestation,
+                } => {
+                    let claim = attestation.as_ref().unwrap();
+                    assert!(claim.scope.is_some());
+                    assert_eq!(claim.agent, proposal.scope.agent);
+                    assert_eq!(claim.invocation.as_ref(), Some(&proposal.id));
+                    send.send(proposal.clone()).unwrap();
+                    ResponseEnvelope {
+                        api_version: ProtocolVersion::V1Alpha3,
+                        response: dekopon_broker_protocol::BrokerResponse::ControlDecision {
+                            decision: Box::new(ControlDecision {
+                                proposal,
+                                attestation,
+                                surface_epoch: "fixture-epoch".parse().unwrap(),
+                                decision_ref: format!("sha256:{}", "1".repeat(64)),
+                                outcome: ControlOutcome::Admitted,
+                            }),
+                        },
+                    }
+                }
+                _ => panic!("no provider effect or other broker operation expected"),
+            };
+            write_frame(&mut stream, &response, FrameLimits::default())
+                .await
+                .unwrap();
+        }
+    });
+    let switch = || AssistantTurn {
+        content: None,
+        tool_calls: vec![ModelToolCall {
+            id: "switch".into(),
+            kind: "function".into(),
+            function: ModelFunctionCall {
+                name: "select_model".into(),
+                arguments: json!({"model":"alternate"}).to_string(),
+            },
+        }],
+        usage: None,
+        replay_items: vec![],
+    };
+    let models = ModelScript::new([switch(), answer("first"), switch(), answer("second")]);
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner(
+        ResolvedBroker {
+            socket_path: path,
+            server_uid: crate::current_uid(),
+            frame: FrameLimits::default(),
+        },
+        models.clone(),
+        4,
+    );
+    let mut bound = route(model_config());
+    let mut second = model_config();
+    if let ModelConfig::OpenaiCompatible { name, model, .. } = &mut second {
+        *name = "alternate".into();
+        *model = "other-wire-model".into();
+    }
+    bound.controls = Some(crate::routes::BoundControls {
+        models: vec![bound.model.clone(), Arc::new(second)],
+        max_attempts: 4,
+    });
+    for question in ["one", "two"] {
+        run_session(
+            runner.clone(),
+            bound.clone(),
+            message(question),
+            replier.clone() as Arc<dyn ChatReplier>,
+        )
+        .await;
+    }
+    server.await.unwrap();
+    assert_eq!(replier.replies(), ["first", "second"]);
+    assert_eq!(models.builds(), 2);
+    let first = recv.recv().await.unwrap();
+    let second = recv.recv().await.unwrap();
+    assert_ne!(first.scope.job, second.scope.job);
+    for proposal in [&first, &second] {
+        assert_eq!(proposal.from.model.as_str(), "local-qwen");
+        assert_eq!(proposal.to.model.as_str(), "alternate");
+        assert_eq!(proposal.sequence, 1);
+    }
+    assert!(
+        models
+            .prompt(1)
+            .iter()
+            .any(|(_, text)| text.contains("other-wire-model"))
+    );
+    assert!(
+        models
+            .prompt(2)
+            .iter()
+            .any(|(_, text)| text.contains("qwen3"))
+    );
+    assert_ne!(models.cache_key(0), models.cache_key(1));
+    assert_eq!(models.cache_key(0), models.cache_key(2));
+}
+
+mod activity_progress;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn repair_unknown_work_survives_evicted_history_before_a_followup() {
+    let directory = temporary();
+    let mut responses = listings(5, &["echo.echo"]);
+    responses.push(ResponseEnvelope::error(
+        "outcome-unaudited",
+        "fixture unknown effect",
+    ));
+    responses.extend(listings(2, &["echo.echo"]));
+    let (broker, mut observed) = stub_broker(directory.path(), responses).await;
+    let models = ModelScript::new([script_call("echo.echo"), answer("must not infer again")]);
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let mut tiny = window();
+    tiny.limits.max_bytes = 1;
+    let route = persistent_route(model_config(), tiny);
+    let replier = Arc::new(RecordingReplier::default());
+    for text in ["oversized request", "follow up"] {
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            message(text),
+            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        )
+        .await;
+    }
+    assert_eq!(
+        models.requests(),
+        1,
+        "unknown work fences follow-up before inference"
+    );
+    let mut invocations = 0;
+    while let Ok(request) = observed.try_recv() {
+        if matches!(request.request, BrokerRequest::Invoke { .. }) {
+            invocations += 1;
+        }
+    }
+    assert_eq!(
+        invocations, 1,
+        "unknown effects are not automatically retried"
+    );
+    assert_eq!(replier.replies(), [FAILURE_REPLY, FAILURE_REPLY]);
 }
