@@ -216,9 +216,6 @@ impl ImageGenerator for OpenAiImageGenerator {
                 ImageGenerationError::Response
             }
         })?;
-        if !(200..300).contains(&status) {
-            return Err(ImageGenerationError::Status(status));
-        }
         let response: ImageResponse = serde_json::from_value(response).map_err(|error| {
             tracing::debug!(cause_type = "image-response", category = ?error.classify());
             ImageGenerationError::Response
@@ -562,7 +559,11 @@ mod accounting_tests {
         );
         assert_eq!(log.observations().len(), 1);
         assert_eq!(
-            log.observations()[0].1.unwrap().usage.total_tokens,
+            log.observations()[0]
+                .observation
+                .unwrap()
+                .usage
+                .total_tokens,
             Some(30)
         );
     }

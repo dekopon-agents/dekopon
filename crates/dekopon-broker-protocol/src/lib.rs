@@ -11,8 +11,8 @@ mod control;
 pub use control::ControlClient;
 pub use control::{
     ControlDecision, ControlOutcome, ControlProposal, ControlScope, ControlTarget,
-    ControlTargetsError, ERROR_CONTROL_DENIED, MAX_CONTROL_ATTEMPTS, MAX_CONTROL_TARGETS,
-    VerifiedControlDecision, validate_control_targets,
+    ControlTargetsError, MAX_CONTROL_ATTEMPTS, MAX_CONTROL_TARGETS, VerifiedControlDecision,
+    validate_control_targets,
 };
 
 use std::{collections::BTreeSet, fmt, io, time::Duration};
@@ -2165,8 +2165,105 @@ impl fmt::Display for ExchangePhase {
     }
 }
 
+/// The stable kind of one broker-client failure, for telemetry and checkpointed records.
+///
+/// One definition of these names. A client failure reaches an operator through several surfaces —
+/// an unobserved-command audit record, a control transition's checkpointed outcome, a session's
+/// failure event — and a category token invented separately at each of them is a category that
+/// silently disagrees with itself. Every consumer maps [`ClientError`] here and prints
+/// [`ClientErrorKind::as_str`].
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClientErrorKind {
+    /// The socket path could not be inspected.
+    SocketMetadata,
+    /// The socket failed its ownership or mode check.
+    UnsafeSocket,
+    /// Connecting to the socket timed out.
+    ConnectTimeout,
+    /// Connecting to the socket failed.
+    Connect,
+    /// The peer credentials of the connected socket could not be read.
+    PeerCredentials,
+    /// The server's identity did not match what this client requires.
+    ServerIdentity,
+    /// A bound on the exchange — frame size, response size — was exceeded.
+    Limits,
+    /// Framing, encoding, or decoding failed on one half of the exchange.
+    Protocol,
+    /// The broker answered with an error envelope.
+    Remote,
+    /// The broker answered a response variant this request cannot consume.
+    UnexpectedResponse,
+    /// A control request was malformed or out of order before transmission.
+    InvalidControl,
+    /// The job's control attempt budget is spent.
+    ControlAttempts,
+    /// This control client is permanently fenced.
+    ControlFenced,
+    /// The broker's surface epoch changed under the session.
+    SurfaceChanged,
+    /// The control decision did not bind to the proposal that was sent.
+    ControlBinding,
+}
+
+#[cfg(unix)]
+impl ClientErrorKind {
+    /// The stable token for this kind, as telemetry and audit records spell it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SocketMetadata => "socket-metadata",
+            Self::UnsafeSocket => "unsafe-socket",
+            Self::ConnectTimeout => "connect-timeout",
+            Self::Connect => "connect",
+            Self::PeerCredentials => "peer-credentials",
+            Self::ServerIdentity => "server-identity",
+            Self::Limits => "limits",
+            Self::Protocol => "protocol",
+            Self::Remote => "remote",
+            Self::UnexpectedResponse => "unexpected-response",
+            Self::InvalidControl => "invalid-control",
+            Self::ControlAttempts => "control-attempts",
+            Self::ControlFenced => "control-fenced",
+            Self::SurfaceChanged => "surface-changed",
+            Self::ControlBinding => "control-binding",
+        }
+    }
+}
+
+#[cfg(unix)]
+impl fmt::Display for ClientErrorKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[cfg(unix)]
 impl ClientError {
+    /// The stable kind of this failure, for telemetry that must not carry the message itself.
+    #[must_use]
+    pub fn kind(&self) -> ClientErrorKind {
+        match self {
+            Self::SocketMetadata { .. } => ClientErrorKind::SocketMetadata,
+            Self::UnsafeSocket => ClientErrorKind::UnsafeSocket,
+            Self::ConnectTimeout => ClientErrorKind::ConnectTimeout,
+            Self::Connect { .. } => ClientErrorKind::Connect,
+            Self::PeerCredentials { .. } => ClientErrorKind::PeerCredentials,
+            Self::ServerIdentity { .. } => ClientErrorKind::ServerIdentity,
+            Self::Limits(_) => ClientErrorKind::Limits,
+            Self::Protocol { .. } => ClientErrorKind::Protocol,
+            Self::Remote { .. } => ClientErrorKind::Remote,
+            Self::UnexpectedResponse => ClientErrorKind::UnexpectedResponse,
+            Self::InvalidControl => ClientErrorKind::InvalidControl,
+            Self::ControlAttempts => ClientErrorKind::ControlAttempts,
+            Self::ControlFenced => ClientErrorKind::ControlFenced,
+            Self::SurfaceChanged => ClientErrorKind::SurfaceChanged,
+            Self::ControlBinding => ClientErrorKind::ControlBinding,
+        }
+    }
+
     /// Reports whether the broker may have executed the request this failure ended.
     ///
     /// `true` means the complete request frame was delivered and this client could not establish

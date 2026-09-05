@@ -197,7 +197,7 @@ impl ChatGptCodexModel {
         let body = build_request_body(&self.model, messages, tools, options);
         let attempt = recorder
             .begin(crate::usage::AttemptKind::Http)
-            .map_err(|e| ChatGptRequestError::Protocol(e.to_string()))?;
+            .map_err(ChatGptRequestError::Accounting)?;
         let response = self
             .agent
             .post(&self.endpoints.responses)
@@ -219,15 +219,24 @@ impl ChatGptCodexModel {
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
             let detail = crate::model::read_error_body_recorded(response, recorder, attempt, false)
-                .map_err(|error| ChatGptRequestError::Protocol(error.to_string()))?;
+                .map_err(|error| match error {
+                    crate::model::ModelError::Accounting(error) => {
+                        ChatGptRequestError::Accounting(error)
+                    }
+                    other => ChatGptRequestError::Protocol(other.to_string()),
+                })?;
             if status == 401 {
                 return Err(ChatGptRequestError::Unauthorized);
             }
             return Err(ChatGptRequestError::Status { status, detail });
         }
 
-        parse_sse_recorded(response.into_parts().1.into_reader(), recorder, attempt)
-            .map_err(|error| ChatGptRequestError::Protocol(error.to_string()))
+        parse_sse_recorded(response.into_parts().1.into_reader(), recorder, attempt).map_err(
+            |error| match error {
+                ChatGptError::Accounting(error) => ChatGptRequestError::Accounting(error),
+                other => ChatGptRequestError::Protocol(other.to_string()),
+            },
+        )
     }
 }
 
@@ -282,9 +291,9 @@ impl ChatModel for ChatGptCodexModel {
                     self.install_credentials(&credentials);
                 }
                 self.request_turn(&credentials, messages, tools, options, recorder)
-                    .map_err(|error| ModelError::Request(error.to_string()))
+                    .map_err(model_error)
             }
-            Err(error) => Err(ModelError::Request(error.to_string())),
+            Err(error) => Err(model_error(error)),
         }
     }
 }
@@ -844,6 +853,8 @@ struct StreamState {
     call_order: Vec<String>,
     completed: bool,
     usage: Option<ModelUsage>,
+    /// Rank of the report `usage` came from, so an interim event cannot overwrite the terminal one.
+    usage_precedence: crate::usage::ObservationPrecedence,
 }
 
 #[derive(Default)]
@@ -957,21 +968,35 @@ fn process_sse_data(
     }
     let event = serde_json::from_str::<Value>(data)
         .map_err(|source| ChatGptError::Protocol(format!("invalid SSE event: {source}")))?;
+    let kind = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     if let Some(usage) = event
         .pointer("/response/usage")
         .or_else(|| event.get("usage"))
         .filter(|usage| !usage.is_null())
     {
+        // A stream may report usage before it finishes and again when it does. Only a terminal
+        // event carries the provider's own final count, so an earlier estimate that disagrees with
+        // it is superseded rather than reconciled into "unknown".
+        let precedence = if matches!(
+            kind,
+            "response.completed" | "response.failed" | "response.incomplete"
+        ) {
+            crate::usage::ObservationPrecedence::Final
+        } else {
+            crate::usage::ObservationPrecedence::Interim
+        };
         let observation = crate::usage::UsageObservation::from_json(usage, false);
         recorder
-            .observe(attempt, observation)
-            .map_err(|e| ChatGptError::Protocol(e.to_string()))?;
-        state.usage = Some(observation.usage);
+            .observe_ranked(attempt, observation, precedence)
+            .map_err(ChatGptError::Accounting)?;
+        if precedence >= state.usage_precedence {
+            state.usage = Some(observation.usage);
+            state.usage_precedence = precedence;
+        }
     }
-    let kind = event
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
     match kind {
         "response.output_item.added" => {
             if let Some(item) = event.get("item") {
@@ -1557,8 +1582,23 @@ fn unix_time() -> Result<u64, ChatGptError> {
         .map_err(|_| ChatGptError::Configuration("system clock is before Unix epoch".to_owned()))
 }
 
+/// Reports one request failure on the axis the caller acts on.
+///
+/// A ledger refusal keeps its own kind all the way out. `ModelError::Request` means "the endpoint
+/// or the network failed, and retrying may work"; a fenced ledger is neither, and the harness reads
+/// the difference — `PromptError::telemetry_kind` says `accounting`, not `model`.
+fn model_error(error: ChatGptRequestError) -> ModelError {
+    match error {
+        ChatGptRequestError::Accounting(error) => ModelError::Accounting(error),
+        other => ModelError::Request(other.to_string()),
+    }
+}
+
 #[derive(Debug, Error)]
 enum ChatGptRequestError {
+    /// The inference ledger refused this attempt. Permanent, and not the endpoint's doing.
+    #[error(transparent)]
+    Accounting(crate::usage::AccountingError),
     #[error("ChatGPT authorization expired")]
     Unauthorized,
     #[error("ChatGPT request failed: {0}")]
@@ -1572,6 +1612,13 @@ enum ChatGptRequestError {
 /// Failure while authenticating or using a ChatGPT subscription.
 #[derive(Debug, Error)]
 pub enum ChatGptError {
+    /// The inference ledger refused the attempt; no further transmission on it is safe.
+    ///
+    /// Deliberately distinct from [`Self::Protocol`]. A ledger refusal is permanent and this
+    /// process caused it; flattening it into a protocol string would tell a caller the endpoint
+    /// misbehaved and that retrying is reasonable, and both are false.
+    #[error(transparent)]
+    Accounting(#[from] crate::usage::AccountingError),
     /// Configuration was invalid.
     #[error("invalid ChatGPT configuration: {0}")]
     Configuration(String),
@@ -1754,7 +1801,7 @@ mod tests {
         );
     }
 
-    fn fake_access(account: &str) -> String {
+    pub(super) fn fake_access(account: &str) -> String {
         let payload = URL_SAFE_NO_PAD.encode(
             serde_json::to_vec(&json!({
                 "https://api.openai.com/auth": {"chatgpt_account_id": account}
@@ -2677,7 +2724,7 @@ mod tests {
             "the explicit 401 and retry are different attempts; refresh/adoption is not inference"
         );
         assert_eq!(
-            log.observations()[0].1,
+            log.observations()[0].observation,
             None,
             "401 usage is unreported, not zero"
         );
@@ -3022,7 +3069,7 @@ mod accounting_tests {
         let turn = parse_sse_recorded(stream.as_bytes(), &log, attempt).unwrap();
         assert_eq!(turn.content.as_deref(), Some("answer"));
         assert_eq!(log.observations().len(), 1);
-        let observation = log.observations()[0].1.unwrap();
+        let observation = log.observations()[0].observation.unwrap();
         assert_eq!(
             observation.usage.fields(),
             [Some(8), Some(2), Some(3), Some(1), Some(11)]
@@ -3042,11 +3089,73 @@ mod accounting_tests {
                 "data: {{\"type\":\"{terminal}\",\"response\":{{\"usage\":{{\"input_tokens\":8,\"output_tokens\":3,\"output_tokens_details\":{{\"reasoning_tokens\":2}}}}}}}}\n\ndata: invalid-json\n\n"
             );
             assert!(parse_sse_recorded(stream.as_bytes(), &log, attempt).is_err());
-            let usage = log.observations()[0].1.unwrap().usage;
+            let usage = log.observations()[0].observation.unwrap().usage;
             assert_eq!(usage.input_tokens, Some(8));
             assert_eq!(usage.output_tokens, Some(3));
             assert_eq!(usage.reasoning_output_tokens, Some(2));
             assert_eq!(usage.cached_input_tokens, None);
         }
+    }
+    #[test]
+    fn a_completed_usage_report_supersedes_a_disagreeing_in_progress_one_without_fencing() {
+        let log = AttemptLog::default();
+        let attempt = log.begin(AttemptKind::Http).unwrap();
+        let stream = concat!(
+            "data: {\"type\":\"response.in_progress\",\"response\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":1,\"total_tokens\":9}}}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"answer\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":30,\"total_tokens\":38}}}\n\n"
+        );
+        let turn = parse_sse_recorded(stream.as_bytes(), &log, attempt)
+            .expect("a disagreeing interim report is not a stream failure");
+        assert_eq!(turn.usage.unwrap().output_tokens, Some(30));
+        let observation = log.observations()[0].observation.unwrap();
+        assert_eq!(observation.usage.output_tokens, Some(30));
+        assert_eq!(observation.usage.total_tokens, Some(38));
+        assert_eq!(observation.invalid, [false; 5]);
+    }
+    #[test]
+    fn a_fenced_ledger_surfaces_as_accounting_rather_than_a_retryable_request_failure() {
+        struct FencedLedger;
+        impl AttemptRecorder for FencedLedger {
+            fn begin(&self, _kind: AttemptKind) -> Result<u32, crate::usage::AccountingError> {
+                Err(crate::usage::AccountingError("job fenced"))
+            }
+            fn observe(
+                &self,
+                _attempt: u32,
+                _usage: crate::usage::UsageObservation,
+            ) -> Result<(), crate::usage::AccountingError> {
+                Err(crate::usage::AccountingError("job fenced"))
+            }
+        }
+        let temp = tempfile::TempDir::new().expect("temporary directory");
+        let path = temp.path().join("auth.json");
+        save_credentials(
+            &path,
+            &ChatGptCredentials {
+                version: AUTH_VERSION,
+                access: Redacted::new(super::tests::fake_access("acct-test")),
+                refresh: Redacted::new("refresh-secret".to_owned()),
+                expires_at: u64::MAX,
+                account_id: "acct-test".to_owned(),
+            },
+        )
+        .expect("save credentials");
+        let model = ChatGptCodexModel::with_endpoints(
+            "gpt-test",
+            Some(&path),
+            Duration::from_secs(2),
+            // Never reached: the ledger refuses before the request is built.
+            ChatGptEndpoints::local("http://127.0.0.1:1"),
+        )
+        .expect("model client");
+
+        let error = model
+            .complete(&[ModelMessage::user("hello")], &[], &FencedLedger)
+            .expect_err("a fenced ledger cannot complete a turn");
+        assert!(
+            matches!(error, ModelError::Accounting(_)),
+            "a ledger refusal must not be reported as a retryable request failure: {error:?}"
+        );
     }
 }

@@ -133,7 +133,11 @@ impl<A: AuditLog> Broker<A> {
                 });
                 policy_ids.extend(decision.determining_policy_ids);
                 // Evaluate both changed dimensions even when the first denies; no partial permit.
-                if !decision.allowed {
+                // A later iteration never downgrades the reason: `policy-error` says the operator's
+                // policy is broken and `policy-denied` says it worked, so letting the effort
+                // dimension's ordinary denial overwrite the model dimension's evaluation error
+                // would hide the one refusal an operator has to act on.
+                if !decision.allowed && reason != Some("policy-error") {
                     reason = Some(if decision.errors_present {
                         "policy-error"
                     } else {

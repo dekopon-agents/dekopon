@@ -2,8 +2,8 @@
 use std::sync::{Arc, Mutex};
 
 use dekopon_broker_protocol::{
-    ControlClient, ControlOutcome, ControlScope, ControlTarget, MAX_CONTROL_ATTEMPTS,
-    VerifiedControlDecision, validate_control_targets,
+    ClientErrorKind, ControlClient, ControlOutcome, ControlScope, ControlTarget,
+    MAX_CONTROL_ATTEMPTS, VerifiedControlDecision, validate_control_targets,
 };
 use dekopon_core::{ConfiguredModelId, Effort, InvocationId, ModelSelection, SurfaceEpoch};
 use dekopon_model::model::{ChatModel, CompletionOptions, ModelTool, ModelToolCall};
@@ -61,10 +61,68 @@ pub trait ModelRegistry {
 pub enum ControlError {
     #[error("invalid configured control surface")]
     Configuration,
+    /// The session's configured control surface is unusable, naming every conflict at once.
+    ///
+    /// Separate from [`Self::Configuration`], which is a live client failure rather than an
+    /// authored one: an operator reading "invalid configured control surface" learned nothing about
+    /// which of three independent checks refused, and there was no event carrying it either.
+    #[error("invalid configured control surface: {reason}")]
+    Surface {
+        /// Every conflict, joined, in the order they are checked.
+        reason: String,
+    },
     #[error(transparent)]
     Preparation(#[from] PreparationError),
     #[error("control exchange failed; no retry or further inference is safe: {0}")]
     Authorization(#[from] dekopon_broker_protocol::ClientError),
+}
+
+/// Why a control transition could not be authorized, on the axis an operator acts on.
+///
+/// Carried by [`TransitionOutcome::AuthorizationFailed`] so it survives into the checkpointed
+/// transition record and the accounting event. `AuthorizationFailed` on its own collapses a
+/// substituted decision binding, a broker that never answered, and a spent attempt budget into one
+/// token, and the underlying `ClientError` was logged nowhere at all.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ControlFailureKind {
+    /// The transition was interrupted before any broker answer — a checkpoint or host failure.
+    Interrupted,
+    /// This session's own control surface or client was unusable.
+    Configuration,
+    /// A configured model could not be prepared.
+    Preparation,
+    /// The broker exchange failed, carrying the client's own stable kind.
+    Client(ClientErrorKind),
+}
+
+impl ControlFailureKind {
+    /// Classifies one control failure without discarding which client failure produced it.
+    #[must_use]
+    pub fn of(error: &ControlError) -> Self {
+        match error {
+            ControlError::Configuration | ControlError::Surface { .. } => Self::Configuration,
+            ControlError::Preparation(_) => Self::Preparation,
+            ControlError::Authorization(error) => Self::Client(error.kind()),
+        }
+    }
+
+    /// The stable token for this kind, as telemetry spells it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Interrupted => "interrupted",
+            Self::Configuration => "configuration",
+            Self::Preparation => "preparation",
+            Self::Client(kind) => kind.as_str(),
+        }
+    }
+}
+
+impl std::fmt::Display for ControlFailureKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// A request-bound live authenticated authorizer plus configured registry. Never serialized.
@@ -88,16 +146,31 @@ impl<'a> SessionControls<'a> {
         max_attempts: u32,
     ) -> Result<Self, ControlError> {
         let mut candidates = registry.candidates();
+        // Every conflict, then fail. Three independent checks used to share one silent refusal, so
+        // an operator whose attempt budget *and* baseline were wrong fixed one, restarted, and
+        // learned about the other.
+        let mut conflicts = Vec::new();
         if let Err(error) = validate_control_targets(&candidates) {
-            tracing::error!(cause_type = "control-candidates", %error);
-            return Err(ControlError::Configuration);
+            conflicts.push(format!("configured control targets are invalid: {error}"));
         }
-        if !(1..=MAX_CONTROL_ATTEMPTS).contains(&max_attempts)
-            || !candidates
-                .iter()
-                .any(|c| c.model == baseline.model && c.efforts.contains(&baseline.effort))
+        if !(1..=MAX_CONTROL_ATTEMPTS).contains(&max_attempts) {
+            conflicts.push(format!(
+                "control attempt budget {max_attempts} is outside 1..={MAX_CONTROL_ATTEMPTS}"
+            ));
+        }
+        if !candidates
+            .iter()
+            .any(|c| c.model == baseline.model && c.efforts.contains(&baseline.effort))
         {
-            return Err(ControlError::Configuration);
+            conflicts.push(format!(
+                "baseline selection {}/{} is not a configured control target",
+                baseline.model, baseline.effort
+            ));
+        }
+        if !conflicts.is_empty() {
+            let reason = conflicts.join("; ");
+            tracing::error!(cause_type = "control-surface", cause = %reason);
+            return Err(ControlError::Surface { reason });
         }
         candidates.sort_by(|a, b| a.model.cmp(&b.model));
         for candidate in &mut candidates {
@@ -202,12 +275,21 @@ impl<'a> SessionControls<'a> {
             .iter()
             .any(|c| Some(&c.model) != current.configured.as_ref())
         {
+            // Only efforts some candidate actually carries. Offering all four mirrored nothing:
+            // the broker requires both `from` and `to` to appear in `controlTargets`, so an effort
+            // no candidate lists makes every proposal naming it `target-denied` while still costing
+            // prompt tokens and one of the job's four attempts.
+            let efforts = self
+                .candidates
+                .iter()
+                .flat_map(|c| c.efforts.iter())
+                .collect::<std::collections::BTreeSet<_>>();
             tools.push(ModelTool {
                 name: SELECT_MODEL_TOOL.into(),
                 description: "Request a configured model, never an endpoint. Candidates are not grants: the broker authorizes every change. Must be the sole tool in a turn. Omitted effort preserves the current effort; same-target requests are refused without switching.".into(),
                 parameters: json!({"type":"object","additionalProperties":false,"required":["model"],"properties":{
                     "model":{"type":"string","enum":self.candidates.iter().map(|c| c.model.as_str()).collect::<Vec<_>>()},
-                    "effort":{"type":"string","enum":["providerDefault","low","medium","high"]}
+                    "effort":{"type":"string","enum":efforts}
                 }}),
             });
         }
@@ -263,7 +345,11 @@ pub enum TransitionOutcome {
     BatchRefused,
     AttemptsExhausted,
     PreparationFailed,
-    AuthorizationFailed,
+    /// No admission was obtained, naming why. The cause travels to the accounting event and the
+    /// embedder's failure record rather than stopping at the tracing call that discarded it.
+    AuthorizationFailed {
+        cause: ControlFailureKind,
+    },
     Cancelled,
     IncompatibleAssets,
 }

@@ -379,6 +379,38 @@ async fn controls_effort_only_both_forbid_error_unknown_and_no_scope_fail_closed
 }
 
 #[tokio::test]
+async fn a_broken_model_policy_is_not_overwritten_by_the_effort_dimensions_plain_denial() {
+    // Both dimensions change in one proposal. `agent.model.select` is evaluated first and its only
+    // permit raises a Cedar evaluation error; `agent.effort.set` then has no permit at all. The
+    // second, ordinary denial must not overwrite the first: `policy-error` is the operator's signal
+    // that the deployed policy is broken, and `policy-denied` reads as "it worked and said no".
+    let broken_model_select = "permit(principal, action == Dekopon::Action::\"agent.model.select\", resource) when { context.toModel == \"never\" || (9223372036854775807 + 1) > 0 };";
+    let audit = Arc::new(InMemoryAuditLog::new(32).unwrap());
+    let broker = build(
+        &format!("{}\n{broken_model_select}", policies(false, false)),
+        audit.clone(),
+        vec![],
+        32,
+    )
+    .await;
+    let mut p = proposal("both-dimensions", broker.surface_epoch(), "brokerd-test");
+    p.to = selection("gpt-5.6-sol", Effort::High);
+    assert_eq!(
+        broker
+            .authorize_control(&context("caller"), None, None, p)
+            .await
+            .unwrap()
+            .outcome,
+        ControlOutcome::Denied
+    );
+    let records = audit.records().await;
+    let AuditEvent::ControlDecision { reason, .. } = &records[0].event else {
+        panic!("{:?}", records[0].event)
+    };
+    assert_eq!(reason.as_deref(), Some("policy-error"));
+}
+
+#[tokio::test]
 async fn controls_durable_replay_restart_changed_policy_and_global_invocation_collision() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("audit.jsonl");

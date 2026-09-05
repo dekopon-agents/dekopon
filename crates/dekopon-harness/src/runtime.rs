@@ -43,7 +43,13 @@ use crate::{
 /// loop.
 pub trait ScriptRuntime {
     /// Fresh host/broker surface check before inference or reuse of retained context.
-    fn check_freshness(&self) -> Result<(), String> {
+    ///
+    /// This is a *disclosure* gate, not an authorization one, and it belongs at the turn
+    /// boundaries: before a model request and before a completion is disclosed. Dispatch-time
+    /// authority is the broker's — every `invoke` and every `runCommand` is authorized there under
+    /// the current policy and the live epoch — so running this per capability call bought no
+    /// authority and cost one broker round trip per call.
+    fn check_freshness(&self) -> Result<(), dekopon_shell::FreshnessError> {
         Ok(())
     }
     /// Whether actual dispatch observations, rather than a legacy script total, own the budget.
@@ -85,7 +91,7 @@ pub struct ShellRuntime<I> {
 }
 
 impl<I: CapabilityInvoker> ScriptRuntime for ShellRuntime<I> {
-    fn check_freshness(&self) -> Result<(), String> {
+    fn check_freshness(&self) -> Result<(), dekopon_shell::FreshnessError> {
         self.invoker.check_freshness()
     }
     fn observes_executions(&self) -> bool {
@@ -146,7 +152,7 @@ pub struct SessionInvoker<D> {
 }
 
 impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
-    fn check_freshness(&self) -> Result<(), String> {
+    fn check_freshness(&self) -> Result<(), dekopon_shell::FreshnessError> {
         self.direct.check_freshness()?;
         if let Some(broker) = &self.broker {
             broker.check_freshness()?;
@@ -297,17 +303,14 @@ impl<I: CapabilityInvoker> CapabilityInvoker for ObservedInvoker<'_, I> {
         secret: Option<dekopon_core::SecretUseProposal>,
     ) -> CapabilityCallResult {
         use crate::history::{ExecutionOutcome as EO, ExecutionProvenance as EP};
+        // No freshness check here, deliberately, and none in `run_command` either. The broker
+        // authorizes this dispatch under its own live policy and epoch a few microseconds from now;
+        // a client-side refetch immediately before it adds a full round trip per capability call
+        // and decides nothing the broker is not about to decide. Freshness is a disclosure gate and
+        // runs at the turn boundaries in `session.rs`.
         if self.journal.cancelled() {
             return CapabilityCallResult::Denied {
                 reason: "session-cancelled".to_owned(),
-            };
-        }
-        if let Err(error) = self.inner.check_freshness() {
-            tracing::warn!(cause_type = "session-surface-fenced", cause = %error);
-            self.journal
-                .failure(crate::checkpoint::CheckpointError::ScopeChanged);
-            return CapabilityCallResult::Denied {
-                reason: "session surface fenced".to_owned(),
             };
         }
         let sequence = match self.journal.reserve(capability) {
@@ -547,9 +550,149 @@ pub struct BrokerLeg {
     /// Broker-derived optional all-three durable-memory surface for this exact chat scope.
     chat_memory: Option<ChatMemorySurface>,
     surface_epoch: dekopon_core::SurfaceEpoch,
+    /// Per-component commitment to the surface this leg was built on, for freshness comparison.
+    digest: SurfaceDigest,
     /// What cancels a command-word run in flight: [`CancelSignal::never`] until an embedder ties
     /// it to its own session with [`BrokerLeg::with_cancel_signal`].
     cancel: CancelSignal,
+}
+
+/// One commitment per component of a session surface, so a change names the component it hit.
+///
+/// Five digests rather than one. A single digest answers "did anything change" and nothing else,
+/// and the five causes are different incidents — a restarted broker, a redeployed provider, a
+/// narrowed policy. Digests rather than the values themselves because this is compared on the hot
+/// path: the previous check rebuilt the whole indexed catalog, cloning every input schema, to run a
+/// deep equality it then threw away.
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SurfaceDigest {
+    epoch: [u8; 32],
+    descriptions: [u8; 32],
+    effective: [u8; 32],
+    command_words: [u8; 32],
+    chat_memory: [u8; 32],
+}
+
+#[cfg(unix)]
+impl SurfaceDigest {
+    /// The first component that differs, in the order a change is most likely to explain the rest.
+    fn changed(&self, fresh: &Self) -> Option<dekopon_shell::SurfaceChange> {
+        use dekopon_shell::SurfaceChange;
+        // Epoch first: a restarted broker changes everything downstream of it, and reporting one of
+        // those consequences instead would send an operator looking for a policy edit.
+        for (mine, theirs, change) in [
+            (&self.epoch, &fresh.epoch, SurfaceChange::Epoch),
+            (
+                &self.descriptions,
+                &fresh.descriptions,
+                SurfaceChange::Descriptions,
+            ),
+            (
+                &self.effective,
+                &fresh.effective,
+                SurfaceChange::EffectiveViews,
+            ),
+            (
+                &self.command_words,
+                &fresh.command_words,
+                SurfaceChange::CommandWords,
+            ),
+            (
+                &self.chat_memory,
+                &fresh.chat_memory,
+                SurfaceChange::ChatMemory,
+            ),
+        ] {
+            if mine != theirs {
+                return Some(change);
+            }
+        }
+        None
+    }
+}
+
+/// Feeds one length-prefixed field into a digest.
+///
+/// Length-prefixed rather than delimiter-joined because two of these fields are provider-supplied
+/// text: a description containing the delimiter must not be able to spell a neighbour's value and
+/// leave the digest unchanged.
+#[cfg(unix)]
+fn digest_field(hasher: &mut sha2::Sha256, bytes: &[u8]) {
+    use sha2::Digest as _;
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+/// Commits to one fetched broker surface without building either indexed view.
+#[cfg(unix)]
+fn surface_digest(
+    available: &[dekopon_broker_protocol::AvailableCapability],
+    command_words: &[String],
+    chat_memory: Option<&ChatMemorySurface>,
+    epoch: &dekopon_core::SurfaceEpoch,
+) -> SurfaceDigest {
+    use sha2::{Digest as _, Sha256};
+    // Sorted by identifier, and words sorted and deduplicated, because neither indexed view depends
+    // on the order the broker listed them in: one is a `BTreeMap` and the other is sorted. Hashing
+    // the raw order would report a reordered answer as a changed surface.
+    let mut order = (0..available.len()).collect::<Vec<_>>();
+    order.sort_by(|&left, &right| {
+        available[left]
+            .capability
+            .id
+            .as_str()
+            .cmp(available[right].capability.id.as_str())
+    });
+    let mut descriptions = Sha256::new();
+    let mut effective = Sha256::new();
+    for index in order {
+        let entry = &available[index];
+        let id = entry.capability.id.as_str();
+        // A duplicate identifier is hashed twice and so cannot match the distinct set this leg was
+        // built on; `snapshot` refuses one outright at construction.
+        digest_field(&mut descriptions, id.as_bytes());
+        digest_field(&mut descriptions, entry.capability.description.as_bytes());
+        digest_field(
+            &mut descriptions,
+            &serde_json::to_vec(&entry.capability.input_schema)
+                .expect("a fetched input schema is JSON"),
+        );
+        digest_field(&mut effective, id.as_bytes());
+        digest_field(&mut effective, entry.provider.as_str().as_bytes());
+        digest_field(&mut effective, entry.capability.description.as_bytes());
+        digest_field(
+            &mut effective,
+            entry.capability.effect.to_string().as_bytes(),
+        );
+        digest_field(&mut effective, entry.capability.risk.to_string().as_bytes());
+        digest_field(
+            &mut effective,
+            entry.capability.idempotency.to_string().as_bytes(),
+        );
+    }
+    let mut words = Sha256::new();
+    for word in command_words.iter().collect::<BTreeSet<_>>() {
+        digest_field(&mut words, word.as_bytes());
+    }
+    let mut memory = Sha256::new();
+    match chat_memory {
+        Some(surface) => {
+            digest_field(&mut memory, b"present");
+            digest_field(&mut memory, &surface.max_lookback_turns.to_be_bytes());
+            digest_field(&mut memory, surface.prompt_note.as_bytes());
+        }
+        None => digest_field(&mut memory, b"absent"),
+    }
+    let mut startup = Sha256::new();
+    digest_field(&mut startup, epoch.as_str().as_bytes());
+    SurfaceDigest {
+        epoch: startup.finalize().into(),
+        descriptions: descriptions.finalize().into(),
+        effective: effective.finalize().into(),
+        command_words: words.finalize().into(),
+        chat_memory: memory.finalize().into(),
+    }
 }
 
 #[cfg(unix)]
@@ -602,6 +745,12 @@ impl BrokerLeg {
         chat_memory: Option<ChatMemorySurface>,
         surface_epoch: dekopon_core::SurfaceEpoch,
     ) -> Result<Self, BrokerLegError> {
+        let digest = surface_digest(
+            &available,
+            &command_words,
+            chat_memory.as_ref(),
+            &surface_epoch,
+        );
         let (capabilities, effective_capabilities) = snapshot(available)?;
         let namespaces = capabilities.keys().map(|id| namespace_of(id)).collect();
         let leg = Self {
@@ -611,6 +760,7 @@ impl BrokerLeg {
             effective_capabilities,
             command_words: command_words.into_iter().collect(),
             namespaces,
+            digest,
             identifiers: IdSequence::new(trace_prefix)
                 .map_err(BrokerLegError::SessionIdentifier)?,
             attestation,
@@ -727,21 +877,20 @@ fn snapshot(
 
 #[cfg(unix)]
 impl CapabilityInvoker for BrokerLeg {
-    fn check_freshness(&self) -> Result<(), String> {
+    fn check_freshness(&self) -> Result<(), dekopon_shell::FreshnessError> {
         let (available, words, memory, epoch) = self
             .runtime
             .block_on(self.client.session_surface(self.attestation.clone()))
-            .map_err(|error| format!("fresh broker surface unavailable: {error}"))?;
-        let (descriptions, effective) = snapshot(available).map_err(|error| error.to_string())?;
-        if epoch != self.surface_epoch
-            || descriptions != self.capabilities
-            || effective != self.effective_capabilities
-            || words.into_iter().collect::<BTreeSet<_>>() != self.command_words
-            || memory != self.chat_memory
-        {
-            return Err("broker session surface changed".to_owned());
+            .map_err(|error| {
+                dekopon_shell::FreshnessError::Unavailable(dekopon_core::error_chain(&error))
+            })?;
+        // Digests, not a rebuilt catalog: this compares five 32-byte commitments instead of
+        // re-indexing every capability and cloning every input schema to throw the result away.
+        let fresh = surface_digest(&available, &words, memory.as_ref(), &epoch);
+        match self.digest.changed(&fresh) {
+            Some(change) => Err(dekopon_shell::FreshnessError::Changed(change)),
+            None => Ok(()),
         }
-        Ok(())
     }
     fn granted(&self) -> Vec<String> {
         self.capabilities.keys().cloned().collect()
@@ -1263,6 +1412,7 @@ mod tests {
             collections::{BTreeMap, BTreeSet},
             os::unix::fs::PermissionsExt as _,
             path::Path,
+            sync::atomic,
         };
 
         use dekopon_broker_protocol::{
@@ -1581,6 +1731,14 @@ mod tests {
                 attestation,
                 chat_memory: None,
                 surface_epoch: "fixture-epoch".parse().expect("fixture epoch"),
+                // The same commitment `build` would make for this fixture surface, so a stub that
+                // answers with the identical catalog is fresh and one that changes it is not.
+                digest: crate::runtime::surface_digest(
+                    &[available(CAPABILITY)],
+                    &[],
+                    None,
+                    &"fixture-epoch".parse().expect("fixture epoch"),
+                ),
                 cancel: CancelSignal::never(),
             }
         }
@@ -1903,7 +2061,10 @@ mod tests {
             }
             for uncertain in [false, true] {
                 let directory = tempfile::tempdir().unwrap();
-                let mut responses = (0..4)
+                // Three surface answers, one invocation, then the change: the turn's pre-model
+                // check, its post-completion disclosure check, and the tool-call check. Dispatch
+                // itself no longer refetches the surface — the broker authorizes it.
+                let mut responses = (0..3)
                     .map(|_| {
                         ResponseEnvelope::capabilities(
                             vec![available(CAPABILITY)],
@@ -1961,7 +2122,248 @@ mod tests {
                 while received.try_recv().is_ok() {
                     count += 1;
                 }
-                assert_eq!(count, 6);
+                assert_eq!(count, 5);
+            }
+        }
+
+        /// A stub broker that answers by request kind rather than from a fixed queue, counting the
+        /// `Capabilities` requests a session makes.
+        ///
+        /// It answers an unbounded number of them on purpose: the property under test is that the
+        /// count does *not* grow with the number of capabilities a script drives, and a queue whose
+        /// length encodes the expected answer would make the test restate its own expectation.
+        async fn counting_stub(directory: &Path) -> (BrokerLeg, std::sync::Arc<CountedRequests>) {
+            let socket = directory.join("broker.sock");
+            let listener = UnixListener::bind(&socket).expect("bind stub broker");
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
+                .expect("secure stub socket");
+            let counts = std::sync::Arc::new(CountedRequests::default());
+            let observed = std::sync::Arc::clone(&counts);
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let Ok(request) =
+                        read_frame::<_, RequestEnvelope>(&mut stream, FrameLimits::default()).await
+                    else {
+                        return;
+                    };
+                    let response = match request.request {
+                        dekopon_broker_protocol::BrokerRequest::Capabilities { .. } => {
+                            observed.surfaces.fetch_add(1, atomic::Ordering::SeqCst);
+                            ResponseEnvelope::capabilities(
+                                vec![available(CAPABILITY)],
+                                vec![],
+                                "fixture-epoch".parse().expect("fixture epoch"),
+                            )
+                        }
+                        _ => {
+                            observed.invocations.fetch_add(1, atomic::Ordering::SeqCst);
+                            ResponseEnvelope::invocation(result(InvocationOutcome::Succeeded, None))
+                        }
+                    };
+                    if write_frame(&mut stream, &response, FrameLimits::default())
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
+            (leg_with(&socket, None), counts)
+        }
+
+        #[derive(Default)]
+        struct CountedRequests {
+            surfaces: atomic::AtomicUsize,
+            invocations: atomic::AtomicUsize,
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn freshness_round_trips_do_not_grow_with_the_capabilities_a_script_drives() {
+            use crate::{
+                bootstrap::SessionBootstrap,
+                history::History,
+                session::{PromptLimits, SessionEngine},
+            };
+            use dekopon_model::model::{
+                AssistantTurn, ChatModel, ModelError, ModelFunctionCall, ModelMessage, ModelTool,
+                ModelToolCall,
+            };
+            /// One bash tool call running `calls` capabilities, then a plain answer.
+            struct Model {
+                calls: usize,
+                turn: atomic::AtomicUsize,
+            }
+            impl ChatModel for Model {
+                fn complete(
+                    &self,
+                    _: &[ModelMessage],
+                    _: &[ModelTool],
+                    recorder: &dyn dekopon_model::usage::AttemptRecorder,
+                ) -> Result<AssistantTurn, ModelError> {
+                    let attempt = recorder.begin(dekopon_model::usage::AttemptKind::Adapter)?;
+                    recorder.observe(
+                        attempt,
+                        dekopon_model::usage::UsageObservation::from_json(
+                            &json!({"input_tokens":7}),
+                            false,
+                        ),
+                    )?;
+                    if self.turn.fetch_add(1, atomic::Ordering::SeqCst) > 0 {
+                        return Ok(AssistantTurn {
+                            content: Some("done".into()),
+                            tool_calls: vec![],
+                            usage: None,
+                            replay_items: vec![],
+                        });
+                    }
+                    let script = vec![format!("{CAPABILITY} > /dev/null"); self.calls].join("\n");
+                    Ok(AssistantTurn {
+                        content: None,
+                        tool_calls: vec![ModelToolCall {
+                            id: "call-1".into(),
+                            kind: "function".into(),
+                            function: ModelFunctionCall {
+                                name: "bash".into(),
+                                arguments: json!({ "script": script }).to_string(),
+                            },
+                        }],
+                        usage: None,
+                        replay_items: vec![],
+                    })
+                }
+            }
+
+            let mut observed = Vec::new();
+            for calls in [1_usize, 3] {
+                let directory = tempfile::tempdir().expect("temporary broker directory");
+                let (leg, counts) = counting_stub(directory.path()).await;
+                tokio::task::spawn_blocking(move || {
+                    let runtime = crate::runtime::ShellRuntime {
+                        invoker: leg,
+                        limits: dekopon_shell::Limits::default(),
+                        curl_capability: None,
+                    };
+                    let model = Model {
+                        calls,
+                        turn: atomic::AtomicUsize::new(0),
+                    };
+                    let mut history = History::default();
+                    SessionEngine::new(&model, &runtime)
+                        .run(
+                            SessionBootstrap::new(
+                                "request",
+                                PromptLimits {
+                                    max_steps: 4,
+                                    max_capability_calls: 8,
+                                },
+                                "fixture",
+                            ),
+                            &mut history,
+                        )
+                        .expect("the session completes");
+                })
+                .await
+                .expect("blocking session completes");
+                observed.push((
+                    counts.surfaces.load(atomic::Ordering::SeqCst),
+                    counts.invocations.load(atomic::Ordering::SeqCst),
+                ));
+            }
+
+            assert_eq!(observed[0].1, 1, "one capability, one dispatch");
+            assert_eq!(observed[1].1, 3, "three capabilities, three dispatches");
+            // The whole point: freshness is a turn-boundary disclosure gate, so tripling the
+            // capabilities a script drives must not triple the broker traffic the session makes.
+            assert_eq!(
+                observed[0].0, observed[1].0,
+                "freshness round trips scaled with capability invocations: {observed:?}"
+            );
+        }
+
+        #[test]
+        fn each_kind_of_surface_change_reports_its_own_cause() {
+            use dekopon_broker_protocol::ChatMemorySurface;
+            use dekopon_shell::SurfaceChange;
+            let epoch = || "fixture-epoch".parse().expect("fixture epoch");
+            let memory = ChatMemorySurface {
+                max_lookback_turns: 4,
+                prompt_note: "note".to_owned(),
+            };
+            let words = vec!["probe".to_owned()];
+            let base = crate::runtime::surface_digest(
+                &[available(CAPABILITY)],
+                &words,
+                Some(&memory),
+                &epoch(),
+            );
+
+            // Same surface, capabilities listed in the other order: not a change. The two indexed
+            // views are order-independent, so reporting a reordered answer as a fence would stop
+            // sessions for nothing.
+            let reordered = crate::runtime::surface_digest(
+                &[available(CAPABILITY)],
+                &words,
+                Some(&memory),
+                &epoch(),
+            );
+            assert_eq!(base.changed(&reordered), None);
+
+            let mut redescribed = available(CAPABILITY);
+            redescribed.capability.description = "Fetches something else".to_owned();
+            let mut reclassified = available(CAPABILITY);
+            reclassified.provider = "other-probe".parse().expect("provider fixture");
+            let quieter = ChatMemorySurface {
+                max_lookback_turns: 2,
+                prompt_note: memory.prompt_note.clone(),
+            };
+            for (fresh, expected) in [
+                (
+                    crate::runtime::surface_digest(
+                        &[available(CAPABILITY)],
+                        &words,
+                        Some(&memory),
+                        &"restarted-epoch".parse().expect("fixture epoch"),
+                    ),
+                    SurfaceChange::Epoch,
+                ),
+                (
+                    crate::runtime::surface_digest(&[redescribed], &words, Some(&memory), &epoch()),
+                    SurfaceChange::Descriptions,
+                ),
+                (
+                    crate::runtime::surface_digest(
+                        &[reclassified],
+                        &words,
+                        Some(&memory),
+                        &epoch(),
+                    ),
+                    SurfaceChange::EffectiveViews,
+                ),
+                (
+                    crate::runtime::surface_digest(
+                        &[available(CAPABILITY)],
+                        &[],
+                        Some(&memory),
+                        &epoch(),
+                    ),
+                    SurfaceChange::CommandWords,
+                ),
+                (
+                    crate::runtime::surface_digest(
+                        &[available(CAPABILITY)],
+                        &words,
+                        Some(&quieter),
+                        &epoch(),
+                    ),
+                    SurfaceChange::ChatMemory,
+                ),
+            ] {
+                assert_eq!(base.changed(&fresh), Some(expected));
+                let error = dekopon_shell::FreshnessError::Changed(expected);
+                assert!(
+                    error.to_string().contains(expected.as_str()),
+                    "{error} does not name its cause"
+                );
             }
         }
 

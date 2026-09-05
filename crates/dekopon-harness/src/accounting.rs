@@ -6,7 +6,10 @@ use crate::{
 };
 use dekopon_model::{
     model::ModelUsage,
-    usage::{AccountingError, AttemptKind, AttemptRecorder, UsageObservation},
+    usage::{
+        AccountingError, AttemptKind, AttemptRecorder, ObservationPrecedence, USAGE_FIELD_NAMES,
+        UsageObservation, conflicting_fields,
+    },
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -141,6 +144,9 @@ pub struct AttemptRecord {
     pub sequence: u32,
     pub kind: AttemptKind,
     pub observation: Option<UsageObservation>,
+    /// Which report `observation` came from, so a terminal one is not displaced by an interim one.
+    #[serde(default)]
+    pub precedence: ObservationPrecedence,
 }
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct CallRecord {
@@ -368,8 +374,15 @@ impl JobAccounting {
     }
     /// Informational projection only. A restored cursor cannot report old observations twice.
     /// The legacy protocol's `modelCalls`/`unreportedCalls` now count attempt observations.
+    ///
+    /// One bad field no longer blanks the delta, and the cursor moves only when a report is
+    /// emitted. `provider_total != input + output` is a real disagreement about *that* field —
+    /// several OpenAI-compatible endpoints define the total differently — and treating it as
+    /// grounds to discard the input and output counts left the broker's live token view empty
+    /// forever, since the cursor had already advanced past them.
     pub fn take_report(&self) -> Option<dekopon_broker_protocol::ModelUsageReport> {
         let mut live = self.lock();
+        let job = live.tracker.job.clone();
         let tracker = &mut live.tracker;
         let start = tracker.reported_calls;
         let end = tracker
@@ -386,33 +399,45 @@ impl JobAccounting {
                 totals.unknown_call();
             }
         }
-        tracker.reported_calls = end;
         if totals.attempts + totals.unobserved_calls == 0 {
+            // Nothing observed, so nothing to report — and nothing to advance past either. Moving
+            // the cursor here would skip these calls for good if an observation lands later.
             return None;
         }
-        let fields = [
-            &totals.input,
-            &totals.cached_input,
-            &totals.output,
-            &totals.reasoning_output,
-            &totals.provider_total,
-        ];
-        if fields.iter().any(|c| c.invalid || c.known.is_none()) {
-            tracing::warn!(cause_type = "accounting-report-invalid");
-            return None;
-        }
+        let calls = u64::from(totals.attempts + totals.unobserved_calls);
+        // Per field, not per report: a field this process cannot trust is unreported for every call
+        // in the delta, and the other four still carry what the provider actually said.
+        let field = |count: &TokenCount, name: &str| match (count.invalid, count.known) {
+            (false, Some(known)) => (known, u64::from(count.unreported)),
+            _ => {
+                tracing::warn!(
+                    cause_type = "accounting-field-unreported",
+                    job.id = %job,
+                    usage.field = name,
+                    usage.calls = calls,
+                    "usage field is unknown for these calls and is reported as unreported"
+                );
+                (0, calls)
+            }
+        };
+        let input = field(&totals.input, USAGE_FIELD_NAMES[0]);
+        let cached_input = field(&totals.cached_input, USAGE_FIELD_NAMES[1]);
+        let output = field(&totals.output, USAGE_FIELD_NAMES[2]);
+        let reasoning_output = field(&totals.reasoning_output, USAGE_FIELD_NAMES[3]);
+        let provider_total = field(&totals.provider_total, USAGE_FIELD_NAMES[4]);
+        tracker.reported_calls = end;
         Some(dekopon_broker_protocol::ModelUsageReport {
-            model_calls: u64::from(totals.attempts + totals.unobserved_calls),
-            input_tokens: totals.input.known?,
-            input_unreported_calls: u64::from(totals.input.unreported),
-            cached_input_tokens: totals.cached_input.known?,
-            cached_input_unreported_calls: u64::from(totals.cached_input.unreported),
-            output_tokens: totals.output.known?,
-            output_unreported_calls: u64::from(totals.output.unreported),
-            reasoning_output_tokens: totals.reasoning_output.known?,
-            reasoning_unreported_calls: u64::from(totals.reasoning_output.unreported),
-            total_tokens: totals.provider_total.known?,
-            total_unreported_calls: u64::from(totals.provider_total.unreported),
+            model_calls: calls,
+            input_tokens: input.0,
+            input_unreported_calls: input.1,
+            cached_input_tokens: cached_input.0,
+            cached_input_unreported_calls: cached_input.1,
+            output_tokens: output.0,
+            output_unreported_calls: output.1,
+            reasoning_output_tokens: reasoning_output.0,
+            reasoning_unreported_calls: reasoning_output.1,
+            total_tokens: provider_total.0,
+            total_unreported_calls: provider_total.1,
         })
     }
     pub(crate) fn transition(
@@ -445,6 +470,17 @@ impl JobAccounting {
         let span = tracing::info_span!(parent: parent.as_ref().and_then(tracing::Span::id), "accounting.model.transition", job.id=%t.job, transition.sequence=record.sequence, event.sequence=event);
         span.in_scope(|| tracing::info!(target:"dekopon_harness::audit", { audit.event="accounting.model.transition", accounting.version=ACCOUNTING_VERSION, job.id=%t.job, transition.sequence=record.sequence, event.sequence=event, accounting=%json(&accounting) }, "model transition accounted"));
     }
+}
+/// The one `accounting.model.call` span shape, for every path that opens one.
+///
+/// Two callsites used to build this span with two different field sets, so a call the finalize
+/// sweep closed as abandoned exported without the model identity, the segment, or the usage fields
+/// an ordinary call carries — and a query filtering on any of them silently omitted exactly the
+/// calls whose outcome was in doubt.
+fn call_span(tracker: &TokenTracker, parent: Option<tracing::Id>, call: u32) -> tracing::Span {
+    let record = &tracker.calls[call as usize - 1];
+    let identity = &record.identity;
+    tracing::info_span!(parent: parent, "accounting.model.call", accounting.version=ACCOUNTING_VERSION, job.id=%tracker.job, call.sequence=call, model.turn=record.model_turn, segment.sequence=tracker.segment, model.configured=identity.configured.as_ref().map(|m|m.as_str()), model.backend=%identity.backend, model.name=%identity.model, model.effort=%identity.effort, usage.input_tokens=tracing::field::Empty, usage.cached_input_tokens=tracing::field::Empty, usage.output_tokens=tracing::field::Empty, usage.reasoning_output_tokens=tracing::field::Empty, usage.total_tokens=tracing::field::Empty, outcome=tracing::field::Empty, reason=tracing::field::Empty, duration_ms=tracing::field::Empty, event.sequence=tracing::field::Empty)
 }
 fn millis(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
@@ -492,7 +528,11 @@ fn finalize(live: &mut LiveAccounting, disposition: &DeliveryDisposition) -> boo
     // An unwound call can have observations even though its result was never received.
     for index in 0..live.tracker.calls.len() {
         if live.tracker.calls[index].event_sequence.is_none() {
-            let span = tracing::info_span!(parent:live.span.as_ref().and_then(tracing::Span::id), "accounting.model.call", job.id=%live.tracker.job, call.sequence=index as u32+1);
+            let span = call_span(
+                &live.tracker,
+                live.span.as_ref().and_then(tracing::Span::id),
+                index as u32 + 1,
+            );
             span.in_scope(|| {
                 finish_call(
                     live,
@@ -576,11 +616,8 @@ impl<'a, 'b> CallRecorder<'a, 'b> {
         Ok(Self::reserved(journal, call))
     }
     pub(crate) fn reserved(journal: &'a ExecutionJournal<'b>, call: u32) -> Self {
-        let t = journal.accounting.snapshot();
-        let record = &t.calls[call as usize - 1];
-        let identity = &record.identity;
-        let model_turn = record.model_turn;
-        let span = tracing::info_span!(parent:&journal.accounting.span(), "accounting.model.call", accounting.version=ACCOUNTING_VERSION, job.id=%t.job, call.sequence=call, model.turn=model_turn, segment.sequence=t.segment, model.configured=identity.configured.as_ref().map(|m|m.as_str()), model.backend=%identity.backend, model.name=%identity.model, model.effort=%identity.effort, usage.input_tokens=tracing::field::Empty, usage.cached_input_tokens=tracing::field::Empty, usage.output_tokens=tracing::field::Empty, usage.reasoning_output_tokens=tracing::field::Empty, usage.total_tokens=tracing::field::Empty, outcome=tracing::field::Empty, reason=tracing::field::Empty, duration_ms=tracing::field::Empty, event.sequence=tracing::field::Empty);
+        let tracker = journal.accounting.snapshot();
+        let span = call_span(&tracker, journal.accounting.span().id(), call);
         Self {
             journal,
             call,
@@ -687,6 +724,7 @@ impl AttemptRecorder for CallRecorder<'_, '_> {
                 sequence,
                 kind,
                 observation: None,
+                precedence: ObservationPrecedence::Interim,
             });
             c.attempts_complete = true;
             sequence
@@ -698,28 +736,71 @@ impl AttemptRecorder for CallRecorder<'_, '_> {
         Ok(attempt)
     }
     fn observe(&self, attempt: u32, observation: UsageObservation) -> Result<(), AccountingError> {
+        self.observe_ranked(attempt, observation, ObservationPrecedence::Final)
+    }
+    /// Records one usage report, reconciling a disagreeing one instead of fencing the job.
+    ///
+    /// A second, differing report of the same attempt is provider-controlled data — duplicate
+    /// `"usage"` keys in one object are legal JSON, and a stream can contradict itself — so making
+    /// it fence the ledger handed a provider a way to end every later turn of the job and to make
+    /// the checkpoint unresumable. The disagreeing *fields* become unknown, named in a warning; the
+    /// job keeps counting. A terminal report still supersedes an interim one outright.
+    fn observe_ranked(
+        &self,
+        attempt: u32,
+        observation: UsageObservation,
+        precedence: ObservationPrecedence,
+    ) -> Result<(), AccountingError> {
+        let index = attempt
+            .checked_sub(1)
+            .ok_or(AccountingError("attempt id"))? as usize;
         {
             let mut live = self.journal.accounting.lock();
-            let t = &mut live.tracker;
-            let c = &mut t.calls[self.call as usize - 1];
-            let closed = c.event_sequence.is_some();
-            let a = c
-                .attempts
-                .get_mut(
-                    attempt
-                        .checked_sub(1)
-                        .ok_or(AccountingError("attempt id"))? as usize,
+            let job = live.tracker.job.clone();
+            let (existing, existing_precedence, closed) = {
+                let call = &live.tracker.calls[self.call as usize - 1];
+                let recorded = call
+                    .attempts
+                    .get(index)
+                    .ok_or(AccountingError("attempt id"))?;
+                (
+                    recorded.observation,
+                    recorded.precedence,
+                    call.event_sequence.is_some(),
                 )
-                .ok_or(AccountingError("attempt id"))?;
-            if a.observation.is_some_and(|old| old != observation) {
-                t.invalid = true;
-                return Err(AccountingError("conflicting observation"));
+            };
+            let mut install = |observation, precedence| {
+                let recorded = &mut live.tracker.calls[self.call as usize - 1].attempts[index];
+                recorded.observation = Some(observation);
+                recorded.precedence = precedence;
+            };
+            match existing {
+                // A first observation arriving after the call closed is this process losing track
+                // of its own ledger, not a provider disagreeing with itself. That still fences.
+                None if closed => {
+                    live.tracker.invalid = true;
+                    return Err(AccountingError("observation after closed call"));
+                }
+                None => install(observation, precedence),
+                Some(existing) if existing != observation => {
+                    if precedence > existing_precedence {
+                        install(observation, precedence);
+                    } else if precedence == existing_precedence {
+                        let (merged, conflicts) = existing.reconcile(observation);
+                        install(merged, existing_precedence);
+                        tracing::warn!(
+                            cause_type = "conflicting-usage-observation",
+                            job.id = %job,
+                            call.sequence = self.call,
+                            attempt,
+                            usage.fields = %conflicting_fields(conflicts),
+                            "attempt reported disagreeing usage; those fields are unknown"
+                        );
+                    }
+                    // An interim report never displaces the terminal one.
+                }
+                Some(_) => {}
             }
-            if closed && a.observation.is_none() {
-                t.invalid = true;
-                return Err(AccountingError("observation after closed call"));
-            }
-            a.observation = Some(observation);
         }
         // Live evidence is installed before persistence can fail. Never retry from an older copy.
         self.journal.update(|_| {}).map_err(|e| {
@@ -751,6 +832,7 @@ pub(crate) fn fixture_tracker(job: &str, reports: &[[Option<u64>; 5]]) -> TokenT
                 attempts: vec![AttemptRecord {
                     sequence: 1,
                     kind: AttemptKind::Adapter,
+                    precedence: ObservationPrecedence::Final,
                     observation: Some(UsageObservation {
                         usage: ModelUsage::from_fields(*f),
                         invalid: [false; 5],

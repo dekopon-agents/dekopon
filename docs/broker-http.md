@@ -393,7 +393,12 @@ generation, agent, sequence, invocation ID, active startup epoch, complete from/
 trace and attestation. Only the broker authenticates/remaps and evaluates fresh `agent.prompt` plus
 reserved `agent.model.select` and/or `agent.effort.set` permits. Attested controls require explicit
 chat scope authority; legacy scope-less fallback is forbidden here. Direct peers must match their
-configured agent. `controlTargets` bounds configured aliases/efforts, not provider endpoints.
+configured agent. `controlTargets` bounds configured aliases/efforts, not provider endpoints. Both
+`from` and `to` are checked against it, so a route whose baseline model and effort are absent from
+that model's `efforts` gets `target-denied` on every proposal while still spending an attempt; the
+route's own baseline belongs in the list. `MAX_CONTROL_ATTEMPTS` is enforced as the range a
+proposal's `sequence` must fall in and as the client's own spend ceiling — the broker keeps no
+per-job attempt counter, and the replay reservation on the invocation ID is what stops a repeat.
 
 A strict echoed decision and reference mean admission, never application or a reusable bearer.
 The live client verifies server UID, pinned epoch and every binding once; lost/late/forged results

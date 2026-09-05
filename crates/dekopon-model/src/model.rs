@@ -981,7 +981,7 @@ mod tests {
                 assert!(detail.len() <= super::MAX_ERROR_BODY_BYTES as usize);
                 assert_eq!(log.observations().len(), 1);
                 assert_eq!(
-                    log.observations()[0].1.unwrap().usage.fields(),
+                    log.observations()[0].observation.unwrap().usage.fields(),
                     [Some(17), None, None, None, None]
                 );
             }
