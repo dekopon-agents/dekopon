@@ -122,7 +122,7 @@ fn actual_nested_submissions_have_distinct_operations_and_no_payload_labels() {
         6,
         "help and builtins are not capability executions"
     );
-    for (i, pair) in events.as_slices().0.chunks_exact(2).enumerate() {
+    for (i, pair) in events.as_slices().0.as_chunks::<2>().0.iter().enumerate() {
         assert_eq!(pair[0].operation, i as u32 + 1);
         assert_eq!(pair[1].operation, pair[0].operation);
         assert_eq!(pair[0].phase, ActivityPhase::Submitted);
