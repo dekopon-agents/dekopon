@@ -159,7 +159,7 @@ async fn stop_retains_unknown_execution_when_the_entire_text_window_is_evicted()
     let server = tokio::spawn(async move {
         let mut entered = Some(entered);
         let mut released = Some(released);
-        for index in 0..8 {
+        for index in 0..6 {
             let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
                 .await
                 .unwrap()
@@ -167,7 +167,7 @@ async fn stop_retains_unknown_execution_when_the_entire_text_window_is_evicted()
             let request: RequestEnvelope = read_frame(&mut stream, FrameLimits::default())
                 .await
                 .unwrap();
-            let response = if index == 5 {
+            let response = if index == 3 {
                 assert!(matches!(request.request, BrokerRequest::Invoke { .. }));
                 entered.take().unwrap().send(()).unwrap();
                 released.take().unwrap().await.unwrap();

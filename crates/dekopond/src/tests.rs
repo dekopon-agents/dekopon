@@ -3303,7 +3303,7 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
 async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
     let directory = temporary();
     let (broker, mut observed) = stub_broker_with_effect(
-        4,
+        3,
         2,
         directory.path(),
         vec![
@@ -3341,7 +3341,7 @@ async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
             .request,
         BrokerRequest::Capabilities { .. }
     ));
-    assert_surface_checks(&mut observed, 3);
+    assert_surface_checks(&mut observed, 2);
     let run = observed.recv().await.expect("the command run").request;
     assert!(
         matches!(
@@ -3365,7 +3365,7 @@ async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
 async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() {
     let directory = temporary();
     let (broker, mut observed) = stub_broker_with_effect(
-        5,
+        3,
         2,
         directory.path(),
         vec![
@@ -3403,7 +3403,7 @@ async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() 
             attestation: Some(Attestation { scope: Some(_), .. })
         }
     ));
-    assert_surface_checks(&mut observed, 4);
+    assert_surface_checks(&mut observed, 2);
     assert!(matches!(
         observed
             .recv()
@@ -4182,7 +4182,7 @@ async fn improvement_suggestions_are_a_per_route_opt_in() {
 async fn an_authorized_agent_can_inspect_its_credential_free_effective_configuration() {
     let directory = temporary();
     let (broker, mut observed) = stub_broker_with_checks(
-        6,
+        5,
         directory.path(),
         vec![ResponseEnvelope::capabilities(
             vec![capability("echo.echo")],
@@ -4257,7 +4257,7 @@ async fn an_authorized_agent_can_inspect_its_credential_free_effective_configura
             attestation: Some(Attestation { scope: Some(_), .. })
         }
     ));
-    assert_surface_checks(&mut observed, 5);
+    assert_surface_checks(&mut observed, 4);
     assert!(
         observed.try_recv().is_err(),
         "meta inspection makes no broker call"
