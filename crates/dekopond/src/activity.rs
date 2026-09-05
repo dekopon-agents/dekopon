@@ -3,7 +3,7 @@
 use crate::transport::{ActivityTarget, ChatActivity, TransportError};
 use dekopon_harness::activity::{ActivityEvent, ActivityLabel, ActivityPublisher};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     sync::{
         Arc, Mutex, OnceLock,
@@ -13,6 +13,7 @@ use std::{
 };
 use tokio::{
     sync::{Notify, Semaphore},
+    task::JoinHandle,
     time::Instant,
 };
 
@@ -21,17 +22,101 @@ const SEALED: u8 = 1;
 const FINISHED: u8 = 2;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const PROGRESS_INTERVAL: Duration = Duration::from_secs(2);
+/// Targets a live generation may hold at once, across every transport.
+const MAX_ACTIVE_TARGETS: usize = 128;
+/// Targets held back because their native ordering is unknown, counted separately from the live
+/// ceiling so an accreted quarantine can never refuse a healthy new session its activity.
+const MAX_QUARANTINED_TARGETS: usize = 128;
+/// How long an uncertain native write keeps its target reserved.
+///
+/// The reservation exists because a `processing` write that may still land must not be overtaken
+/// by a later generation's `active`. Slack does not hold an unacknowledged write for anything like
+/// this long, so past it the ordering question is settled and the thread is usable again.
+const QUARANTINE_TTL: Duration = Duration::from_secs(15 * 60);
 static REQUESTS: Semaphore = Semaphore::const_new(16);
-// Active/cleanup targets and quarantined uncertain native targets share the same hard ceiling.
-type Targets = HashMap<(usize, ActivityTarget), std::sync::Weak<dyn ChatActivity>>;
-static TARGETS: OnceLock<Mutex<Targets>> = OnceLock::new();
+type TargetKey = (usize, ActivityTarget);
+static TARGETS: OnceLock<Mutex<Registry>> = OnceLock::new();
+
+fn registry() -> &'static Mutex<Registry> {
+    TARGETS.get_or_init(Default::default)
+}
+
+/// Which targets a generation may take, and which are held back and why.
+#[derive(Default)]
+struct Registry {
+    /// Targets a live generation owns right now.
+    active: HashSet<TargetKey>,
+    /// Uncertain native targets, each holding the driver allocation so a later installation can
+    /// never be handed the same address and inherit this quarantine, plus when it was recorded.
+    quarantined: HashMap<TargetKey, (std::sync::Weak<dyn ChatActivity>, Instant)>,
+    /// Set once the quarantine is full, so the operator hears about it once rather than per lease.
+    quarantine_full_reported: bool,
+}
+impl Registry {
+    fn expire(&mut self, now: Instant) {
+        self.quarantined
+            .retain(|_, (_, recorded)| now.saturating_duration_since(*recorded) < QUARANTINE_TTL);
+        if self.quarantined.len() < MAX_QUARANTINED_TARGETS {
+            self.quarantine_full_reported = false;
+        }
+    }
+    /// Takes the target for a new generation, or names the reason it is unavailable.
+    fn admit(&mut self, key: &TargetKey, now: Instant) -> Result<(), &'static str> {
+        self.expire(now);
+        if self.quarantined.contains_key(key) {
+            return Err("quarantined");
+        }
+        if self.active.contains(key) {
+            return Err("busy");
+        }
+        if self.active.len() >= MAX_ACTIVE_TARGETS {
+            return Err("capacity");
+        }
+        self.active.insert(key.clone());
+        Ok(())
+    }
+    fn release(&mut self, key: &TargetKey) {
+        self.active.remove(key);
+    }
+    /// Holds a released target back. Returns whether this call is the one that filled the
+    /// quarantine, so exactly one warning is emitted for a ceiling that stays reached.
+    fn quarantine(
+        &mut self,
+        key: &TargetKey,
+        driver: std::sync::Weak<dyn ChatActivity>,
+        now: Instant,
+    ) -> bool {
+        self.active.remove(key);
+        self.expire(now);
+        let mut newly_full = false;
+        if self.quarantined.len() >= MAX_QUARANTINED_TARGETS && !self.quarantined.contains_key(key)
+        {
+            newly_full = !std::mem::replace(&mut self.quarantine_full_reported, true);
+            // The oldest reservation is the one whose ordering question is closest to settled.
+            if let Some(oldest) = self
+                .quarantined
+                .iter()
+                .min_by_key(|(_, (_, recorded))| *recorded)
+                .map(|(key, _)| key.clone())
+            {
+                self.quarantined.remove(&oldest);
+            }
+        }
+        self.quarantined.insert(key.clone(), (driver, now));
+        newly_full
+    }
+}
 
 struct TargetLease {
-    key: (usize, ActivityTarget),
+    key: TargetKey,
+    driver: std::sync::Weak<dyn ChatActivity>,
     quarantine: bool,
 }
 impl TargetLease {
-    fn acquire(driver: &Arc<dyn ChatActivity>, mut target: ActivityTarget) -> Option<Self> {
+    fn acquire(
+        driver: &Arc<dyn ChatActivity>,
+        mut target: ActivityTarget,
+    ) -> Result<Self, &'static str> {
         // Agent status is thread-global, not sender/message scoped. Never allow an older `active`
         // to land after a newer generation's `processing`. Busy targets degrade to no activity.
         if let ActivityTarget::Slack {
@@ -44,31 +129,78 @@ impl TargetLease {
             initiator_user_id.clear();
         }
         let key = (Arc::as_ptr(driver) as *const () as usize, target);
-        let mut targets = TARGETS
-            .get_or_init(Default::default)
+        registry()
             .lock()
-            .expect("activity targets");
-        if targets.len() >= 128 || targets.contains_key(&key) {
-            return None;
-        }
-        // Keep the allocation identity reserved even after a quarantined driver drops. A reused
-        // Arc address must not accidentally quarantine an unrelated later installation.
-        targets.insert(key.clone(), Arc::downgrade(driver));
-        Some(Self {
+            .expect("activity targets")
+            .admit(&key, Instant::now())?;
+        Ok(Self {
             key,
+            driver: Arc::downgrade(driver),
             quarantine: false,
         })
     }
 }
 impl Drop for TargetLease {
     fn drop(&mut self) {
-        if !self.quarantine {
-            TARGETS
-                .get_or_init(Default::default)
-                .lock()
-                .expect("activity targets")
-                .remove(&self.key);
+        let mut registry = registry().lock().expect("activity targets");
+        let newly_full = if self.quarantine {
+            registry.quarantine(&self.key, self.driver.clone(), Instant::now())
+        } else {
+            registry.release(&self.key);
+            false
+        };
+        drop(registry);
+        if newly_full {
+            tracing::warn!(
+                event = "gateway_activity_failed",
+                operation = "quarantine",
+                cause_type = "activity-quarantine-full"
+            );
         }
+    }
+}
+
+/// Activity supervisors the gateway still owns.
+///
+/// Cleanup of a progress message is the last thing a session's activity does, and it outlives the
+/// session task that started it. Shutdown drains this so a SIGTERM does not strand a ⌛ message in
+/// somebody's channel.
+static SUPERVISORS: Mutex<Vec<JoinHandle<()>>> = Mutex::new(Vec::new());
+
+fn track(handle: JoinHandle<()>) {
+    let mut supervisors = SUPERVISORS.lock().expect("activity supervisors");
+    supervisors.retain(|handle| !handle.is_finished());
+    supervisors.push(handle);
+}
+
+/// Awaits every activity supervisor still posting, updating, or cleaning up.
+///
+/// Called by `serve` after the sessions, inside the same shutdown grace: an activity worker holds
+/// no session admission, so nothing here can be waiting on work the sessions had not finished.
+pub(crate) async fn drain() {
+    loop {
+        let pending = std::mem::take(&mut *SUPERVISORS.lock().expect("activity supervisors"));
+        if pending.is_empty() {
+            return;
+        }
+        for handle in pending {
+            if let Err(error) = handle.await
+                && !error.is_cancelled()
+            {
+                tracing::debug!(
+                    event = "gateway_activity_failed",
+                    operation = "supervisor",
+                    category = "panic"
+                );
+            }
+        }
+    }
+}
+
+/// Gives up on the supervisors the shutdown grace did not cover.
+pub(crate) fn abandon() {
+    for handle in std::mem::take(&mut *SUPERVISORS.lock().expect("activity supervisors")) {
+        handle.abort();
     }
 }
 
@@ -117,25 +249,31 @@ impl ActivityLease {
         let (Some(driver), Some(target)) = (driver, target) else {
             return Self { coordination: None };
         };
-        let Some(lease) = TargetLease::acquire(&driver, target.clone()) else {
-            tracing::debug!(
-                event = "gateway_activity_failed",
-                operation = "lease",
-                category = "busy-or-capacity"
-            );
-            return Self { coordination: None };
+        let lease = match TargetLease::acquire(&driver, target.clone()) {
+            Ok(lease) => lease,
+            Err(category) => {
+                tracing::debug!(
+                    event = "gateway_activity_failed",
+                    operation = "lease",
+                    category
+                );
+                return Self { coordination: None };
+            }
         };
         let coordination = Arc::new(Coordination::default());
         let worker_coordination = coordination.clone();
         // Self-contained bounded worker owns its target through late creation and cleanup. This
         // supervisor observes panics, and conservatively quarantines uncertain ordering on unwind.
-        tokio::spawn(async move {
+        // The worker rides a `JoinSet` rather than a bare spawn so that abandoning the supervisor
+        // abandons the worker with it, and the supervisor itself is owned by the gateway.
+        track(tokio::spawn(async move {
             let mut lease = lease;
             lease.quarantine = true;
-            let worker = tokio::spawn(run(driver, target, worker_coordination, optional_reply));
-            match worker.await {
-                Ok(quarantine) => lease.quarantine = quarantine,
-                Err(error) => tracing::debug!(
+            let mut worker = tokio::task::JoinSet::new();
+            worker.spawn(run(driver, target, worker_coordination, optional_reply));
+            match worker.join_next().await {
+                Some(Ok(quarantine)) => lease.quarantine = quarantine,
+                Some(Err(error)) => tracing::debug!(
                     event = "gateway_activity_failed",
                     operation = "worker",
                     category = if error.is_panic() {
@@ -144,8 +282,13 @@ impl ActivityLease {
                         "cancelled"
                     }
                 ),
+                None => tracing::debug!(
+                    event = "gateway_activity_failed",
+                    operation = "worker",
+                    category = "cancelled"
+                ),
             }
-        });
+        }));
         Self {
             coordination: Some(coordination),
         }
@@ -370,4 +513,111 @@ where
         }
     }
     unknown
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+
+    /// A driver whose only job is to give the registry a distinct allocation address.
+    struct Fake;
+    impl ChatActivity for Fake {
+        fn show(
+            &self,
+            _: ActivityTarget,
+        ) -> futures_util::future::BoxFuture<'_, Result<(), TransportError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn hide(
+            &self,
+            _: ActivityTarget,
+        ) -> futures_util::future::BoxFuture<'_, Result<(), TransportError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn refresh_interval(&self) -> Option<Duration> {
+            None
+        }
+        fn retire(&self, _: &ActivityTarget) {}
+    }
+    fn key(index: usize) -> TargetKey {
+        (
+            index,
+            ActivityTarget::Slack {
+                channel_id: format!("C{index}"),
+                thread_ts: "1700000000.000001".into(),
+                message_ts: String::new(),
+                initiator_user_id: String::new(),
+            },
+        )
+    }
+    fn driver() -> (Arc<dyn ChatActivity>, std::sync::Weak<dyn ChatActivity>) {
+        let driver: Arc<dyn ChatActivity> = Arc::new(Fake);
+        let weak = Arc::downgrade(&driver);
+        (driver, weak)
+    }
+
+    #[test]
+    fn a_full_quarantine_is_reported_once_and_never_refuses_a_live_lease() {
+        let (_driver, weak) = driver();
+        let mut registry = Registry::default();
+        let now = Instant::now();
+        for index in 0..MAX_QUARANTINED_TARGETS {
+            assert!(
+                !registry.quarantine(&key(index), weak.clone(), now),
+                "an unfilled quarantine reports nothing"
+            );
+        }
+        assert!(
+            registry.quarantine(&key(MAX_QUARANTINED_TARGETS), weak.clone(), now),
+            "the call that finds the quarantine full reports it"
+        );
+        assert!(
+            !registry.quarantine(&key(MAX_QUARANTINED_TARGETS + 1), weak.clone(), now),
+            "a quarantine that stays full is reported once, not per lease"
+        );
+        assert_eq!(registry.quarantined.len(), MAX_QUARANTINED_TARGETS);
+        // The whole point of the split: quarantine accretion never disables live activity.
+        registry
+            .admit(&key(9_000), now)
+            .expect("a live target is unaffected by a full quarantine");
+    }
+
+    #[test]
+    fn a_quarantined_target_ages_out_and_becomes_usable_again() {
+        let (_driver, weak) = driver();
+        let mut registry = Registry::default();
+        let now = Instant::now();
+        registry.quarantine(&key(1), weak, now);
+        assert_eq!(
+            registry.admit(&key(1), now + QUARANTINE_TTL - Duration::from_secs(1)),
+            Err("quarantined"),
+            "an unsettled native write still holds its thread"
+        );
+        registry
+            .admit(&key(1), now + QUARANTINE_TTL + Duration::from_secs(1))
+            .expect("past the age-out the ordering question is settled");
+    }
+
+    #[test]
+    fn an_unavailable_target_names_whether_it_is_busy_or_at_capacity() {
+        let (_driver, weak) = driver();
+        let mut registry = Registry::default();
+        let now = Instant::now();
+        registry.admit(&key(1), now).expect("the first generation");
+        assert_eq!(registry.admit(&key(1), now), Err("busy"));
+        for index in 2..=MAX_ACTIVE_TARGETS {
+            registry
+                .admit(&key(index), now)
+                .expect("inside the ceiling");
+        }
+        assert_eq!(registry.admit(&key(9_001), now), Err("capacity"));
+        registry.quarantine(&key(1), weak, now);
+        assert_eq!(
+            registry.admit(&key(1), now),
+            Err("quarantined"),
+            "a quarantined target is not reported as a live generation holding the thread"
+        );
+        // Quarantining released the active slot, so the ceiling admits another live target.
+        registry.admit(&key(9_001), now).expect("released capacity");
+    }
 }

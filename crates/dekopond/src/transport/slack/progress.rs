@@ -4,10 +4,32 @@ use super::*;
 use dekopon_harness::activity::ActivityLabel;
 use tokio::time::Instant;
 
+/// Longest a channel-creating post waits for its physical slot before it gives up.
+///
+/// A 429 penalty parks the slot for *every* sender in that channel, so this ceiling is what makes
+/// an unrelated session's answer wait rather than fail instantly. Nothing parks the slot for
+/// longer than this, so a wait past it means this caller has already spent the budget waiting.
+const POST_WAIT_CEILING: Duration = Duration::from_secs(60);
+/// What a 429 whose `Retry-After` is absent or unparsable parks the channel slot for.
+const UNSTATED_RETRY_PENALTY: Duration = Duration::from_secs(5);
+/// Longest server-stated backoff this process sleeps through before retrying the same post once.
+const MAX_HONORED_RETRY: Duration = Duration::from_secs(5);
+
 /// Only a validated creation response can construct this handle. Not a delivery receipt.
 pub(crate) struct OwnedProgressArtifact {
     channel: String,
     timestamp: String,
+}
+
+#[cfg(test)]
+impl OwnedProgressArtifact {
+    /// A handle a test can hold without a live Slack creation response behind it.
+    pub(crate) fn fixture(channel: &str, timestamp: &str) -> Self {
+        Self {
+            channel: channel.to_owned(),
+            timestamp: timestamp.to_owned(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -99,44 +121,66 @@ fn body(label: ActivityLabel) -> Value {
         "blocks":[{"type":"section", "text":{"type":"plain_text", "text":detail, "emoji":false}}]})
 }
 impl SlackReplier {
-    pub(super) async fn post_answer(
+    /// Waits for this physical channel's next post slot, refusing only a wait past `deadline`.
+    ///
+    /// A channel parked by somebody else's 429 makes this caller *wait*; it never turns an
+    /// unrelated session's paid-for answer into an instant `post-capacity`.
+    async fn reserve_channel_post(
         &self,
+        channel: &str,
+        deadline: Instant,
+    ) -> Result<(), TransportError> {
+        loop {
+            let reservation = self
+                .post_rate
+                .lock()
+                .expect("Slack channel post rate")
+                .reserve(channel, true);
+            match reservation {
+                Ok(slot) if slot > deadline => {
+                    return Err(TransportError::Service {
+                        code: "post-capacity".into(),
+                    });
+                }
+                // Waiting senders recheck the slot at transmission time, so a reservation taken
+                // while this one slept is never reused.
+                Ok(slot) if slot > Instant::now() => tokio::time::sleep_until(slot).await,
+                Ok(_) => return Ok(()),
+                Err(TransportError::ActivityRateLimited { retry_after })
+                    if Instant::now() + retry_after < deadline =>
+                {
+                    tokio::time::sleep(retry_after).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    /// Extends this channel's slot after a transmission completed or a 429 penalty was honored.
+    fn channel_post_completed(&self, channel: &str, interval: Duration) {
+        self.post_rate
+            .lock()
+            .expect("Slack channel post rate")
+            .completed(channel, interval);
+    }
+
+    /// One channel-creating POST through the shared per-channel slot.
+    ///
+    /// `chat.postMessage` and `files.completeUploadExternal` both create a message in the channel,
+    /// so both reserve the same slot, extend it identically, and honor a 429 the same way. Grep
+    /// for the platform endpoints rather than for this helper when adding a third.
+    pub(super) async fn paced_channel_post(
+        &self,
+        method: &str,
         body: &Value,
         channel: &str,
     ) -> Result<Value, TransportError> {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + POST_WAIT_CEILING;
         for attempt in 0..2 {
-            let slot = loop {
-                let reservation = self
-                    .post_rate
-                    .lock()
-                    .expect("Slack channel post rate")
-                    .reserve(channel, true);
-                match reservation {
-                    Ok(slot) if slot > deadline => {
-                        return Err(TransportError::Service {
-                            code: "post-capacity".into(),
-                        });
-                    }
-                    Ok(slot) if slot > Instant::now() => tokio::time::sleep_until(slot).await,
-                    Ok(slot) => break slot,
-                    Err(TransportError::ActivityRateLimited { retry_after })
-                        if Instant::now() + retry_after < deadline =>
-                    {
-                        tokio::time::sleep(retry_after).await
-                    }
-                    Err(error) => return Err(error),
-                }
-            };
-            if slot > deadline {
-                return Err(TransportError::Service {
-                    code: "post-capacity".into(),
-                });
-            }
-            tokio::time::sleep_until(slot).await;
+            self.reserve_channel_post(channel, deadline).await?;
             let response = self
                 .http
-                .post(format!("{}/api/chat.postMessage", self.endpoint))
+                .post(format!("{}/api/{method}", self.endpoint))
                 .header(
                     "authorization",
                     format!("Bearer {}", self.bot_token.expose()),
@@ -146,37 +190,57 @@ impl SlackReplier {
                 .send()
                 .await
                 .map_err(|source| TransportError::Request(Box::new(source)));
-            self.post_rate
-                .lock()
-                .expect("Slack channel post rate")
-                .completed(channel, Duration::from_secs(1));
+            self.channel_post_completed(channel, Duration::from_secs(1));
             let response = response?;
             // Only an explicit HTTP 429 proves nonacceptance. No EOF, timeout, malformed success,
             // or other uncertain message creation is ever retried.
             if response.status().as_u16() != 429 {
                 return check_ok(response).await;
             }
-            let retry = response
+            let stated = response
                 .headers()
                 .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(60)
-                .max(1);
-            self.post_rate
-                .lock()
-                .expect("Slack channel post rate")
-                .completed(channel, Duration::from_secs(retry.min(86400)));
-            if attempt == 1 || retry > 5 || Instant::now() + Duration::from_secs(retry) > deadline {
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .map(|seconds| Duration::from_secs(seconds.max(1)));
+            // The penalty is bounded by the wait ceiling: a day-long Retry-After must not make
+            // every other sender in this channel wait past it, and it must not park the slot
+            // somewhere no later caller can reach.
+            let penalty = stated
+                .unwrap_or(UNSTATED_RETRY_PENALTY)
+                .min(POST_WAIT_CEILING);
+            self.channel_post_completed(channel, penalty);
+            // One retry per post, and only for a backoff the service actually stated and this
+            // caller can sit through. Anything longer is this caller's refusal, not the channel's.
+            let honored = stated
+                .filter(|_| attempt == 0)
+                .filter(|stated| *stated <= MAX_HONORED_RETRY)
+                .filter(|stated| Instant::now() + *stated <= deadline);
+            let Some(honored) = honored else {
+                tracing::warn!(
+                    event = "gateway_reply_rate_limited",
+                    transport = "slack",
+                    method,
+                    retry_after_seconds = penalty.as_secs()
+                );
                 return Err(TransportError::Service {
                     code: "ratelimited".into(),
                 });
-            }
-            tokio::time::sleep(Duration::from_secs(retry)).await;
+            };
+            tokio::time::sleep(honored).await;
         }
         Err(TransportError::Service {
             code: "ratelimited".into(),
         })
+    }
+
+    pub(super) async fn post_answer(
+        &self,
+        body: &Value,
+        channel: &str,
+    ) -> Result<Value, TransportError> {
+        self.paced_channel_post("chat.postMessage", body, channel)
+            .await
     }
     pub(super) async fn create_progress(
         &self,
@@ -261,10 +325,6 @@ impl SlackReplier {
         method: &str,
         body: &Value,
     ) -> Result<Value, TransportError> {
-        self.cosmetic_rate
-            .lock()
-            .expect("Slack cosmetic rate")
-            .reserve(Instant::now())?;
         // Reply sends do not acquire this mutex/budget; pending final sends win new cosmetic starts.
         if self.final_sends.load(Ordering::Acquire) != 0 {
             return Err(TransportError::ActivityRateLimited {
@@ -278,6 +338,12 @@ impl SlackReplier {
                 .expect("Slack channel post rate")
                 .reserve(channel, false)?;
         }
+        // Last, so that a call the two local gates above refuse costs no installation budget: the
+        // 30-per-minute window is what cleanup — chat.delete, reactions.remove — has to spend.
+        self.cosmetic_rate
+            .lock()
+            .expect("Slack cosmetic rate")
+            .reserve(Instant::now())?;
         let mut response = self
             .http
             .post(format!("{}/api/{method}", self.endpoint))
@@ -449,8 +515,124 @@ mod rate_tests {
             initiator_user_id: "U1".into(),
         }
     }
+    #[tokio::test(start_paused = true)]
+    async fn a_channel_backoff_makes_later_posts_wait_rather_than_fail_instantly() {
+        // No request is issued: this is the slot arithmetic a parked channel imposes on every
+        // other sender, which is what a 429 used to turn into an instant `post-capacity`.
+        let transport = with_endpoint("http://127.0.0.1:1".into(), false);
+        let replier = &transport.replier;
+
+        replier.channel_post_completed("C1", Duration::from_secs(30));
+        let start = Instant::now();
+        replier
+            .reserve_channel_post("C1", Instant::now() + POST_WAIT_CEILING)
+            .await
+            .expect("a backoff inside the ceiling is waited out, not refused");
+        assert!(
+            start.elapsed() >= Duration::from_secs(30),
+            "the honored backoff is waited through: {:?}",
+            start.elapsed()
+        );
+
+        // A budget already spent waiting refuses rather than waiting past the ceiling.
+        replier.channel_post_completed("C2", POST_WAIT_CEILING);
+        assert!(
+            matches!(
+                replier
+                    .reserve_channel_post("C2", Instant::now() + Duration::from_secs(10))
+                    .await,
+                Err(TransportError::Service { code }) if code == "post-capacity"
+            ),
+            "a wait past this caller's deadline is its own refusal"
+        );
+    }
+
     #[tokio::test]
-    async fn progress_and_concurrent_final_posts_share_channel_slots_and_explicit_429_recovery() {
+    async fn an_unbounded_retry_after_parks_the_channel_only_to_the_wait_ceiling() {
+        for (header, parked) in [
+            ("Retry-After: 120\r\n", POST_WAIT_CEILING),
+            ("Retry-After: 86400\r\n", POST_WAIT_CEILING),
+            ("", UNSTATED_RETRY_PENALTY),
+            ("Retry-After: soon\r\n", UNSTATED_RETRY_PENALTY),
+        ] {
+            let server = dekopon_test_support::LoopbackServer::once(
+                format!("HTTP/1.1 429 Too Many Requests\r\n{header}Content-Length: 0\r\nConnection: close\r\n\r\n")
+                    .as_bytes(),
+            );
+            let transport = with_endpoint(server.url(), false);
+            let error = transport
+                .replier
+                .reply(
+                    ReplyTarget::Slack {
+                        channel: "C1".into(),
+                        thread_ts: None,
+                    },
+                    OutboundReply::text("refused"),
+                )
+                .await
+                .expect_err("a backoff this caller cannot sit through is its own refusal");
+            assert!(
+                matches!(&error, TransportError::Service { code } if code == "ratelimited"),
+                "{error:?}"
+            );
+            assert_eq!(
+                server.recorded().len(),
+                1,
+                "no retry past the honored bound"
+            );
+            let slot = transport.replier.post_rate.lock().unwrap().next["C1"];
+            let remaining = slot.saturating_duration_since(Instant::now());
+            assert!(
+                remaining <= parked && remaining + Duration::from_secs(2) >= parked,
+                "{header:?} parks the slot for {parked:?}, not {remaining:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn locally_refused_cosmetics_leave_the_installation_budget_untouched() {
+        let server = dekopon_test_support::LoopbackServer::sequence(Vec::<Vec<u8>>::new());
+        let transport = with_endpoint(server.url(), true);
+        // A pending final send sheds new cosmetics; the channel slot refuses them too.
+        transport.replier.final_sends.fetch_add(1, Ordering::AcqRel);
+        for _ in 0..10 {
+            let error = transport
+                .replier
+                .cosmetic_json("chat.postMessage", &json!({"channel": "C1"}))
+                .await
+                .expect_err("a pending final send sheds a new cosmetic");
+            assert!(matches!(error, TransportError::ActivityRateLimited { .. }));
+        }
+        transport.replier.final_sends.fetch_sub(1, Ordering::AcqRel);
+        transport
+            .replier
+            .channel_post_completed("C1", Duration::from_secs(30));
+        for _ in 0..10 {
+            let error = transport
+                .replier
+                .cosmetic_json("chat.postMessage", &json!({"channel": "C1"}))
+                .await
+                .expect_err("a parked channel refuses a new cosmetic post");
+            assert!(matches!(error, TransportError::ActivityRateLimited { .. }));
+        }
+        assert!(
+            transport
+                .replier
+                .cosmetic_rate
+                .lock()
+                .unwrap()
+                .requests
+                .is_empty(),
+            "twenty locally refused calls spent none of the 30-per-minute budget"
+        );
+        assert!(
+            server.recorded().is_empty(),
+            "nothing reached the service either"
+        );
+    }
+
+    #[tokio::test]
+    async fn progress_and_final_posts_share_channel_slots_and_recover_from_one_explicit_429() {
         for progress in [false, true] {
             let mut responses = Vec::new();
             if progress {

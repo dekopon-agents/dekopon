@@ -676,7 +676,7 @@ impl SlackReplier {
 
         let mut body = json!({
             "files": [{"id": file_id, "title": "Generated image"}],
-            "channel_id": channel,
+            "channel_id": channel.clone(),
         });
         if !text.is_empty() {
             body["initial_comment"] = Value::String(text);
@@ -684,28 +684,13 @@ impl SlackReplier {
         if let Some(thread_ts) = thread_ts {
             body["thread_ts"] = Value::String(thread_ts);
         }
-        #[allow(
-            clippy::map_err_ignore,
-            reason = "serializing a serde_json::Value cannot fail: it holds no non-string map keys \
-                      and serde_json::Number rejects non-finite floats"
-        )]
-        let completed = check_ok(
-            self.http
-                .post(format!(
-                    "{}/api/files.completeUploadExternal",
-                    self.endpoint
-                ))
-                .header(
-                    "authorization",
-                    format!("Bearer {}", self.bot_token.expose()),
-                )
-                .header("content-type", "application/json; charset=utf-8")
-                .body(serde_json::to_vec(&body).map_err(|_| TransportError::Response)?)
-                .send()
-                .await
-                .map_err(|source| TransportError::Request(Box::new(source)))?,
-        )
-        .await?;
+        // Completion is what creates the channel message, so it takes the same physical channel
+        // slot and the same single 429 retry an answer posted through `chat.postMessage` does.
+        // Obtaining the upload URL and sending the bytes create nothing in the channel and stay
+        // unpaced.
+        let completed = self
+            .paced_channel_post("files.completeUploadExternal", &body, &channel)
+            .await?;
         let accepted = completed["files"]
             .as_array()
             .is_some_and(|files| files.iter().any(|file| file["id"] == file_id));

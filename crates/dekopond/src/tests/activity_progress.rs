@@ -1,4 +1,5 @@
 use super::*;
+use crate::activity::ActivityLease;
 use dekopon_harness::activity::ActivityLabel;
 use tokio::io::AsyncWriteExt as _;
 fn progress_target() -> ActivityTarget {
@@ -355,6 +356,228 @@ async fn gateway_answers_survive_enforced_slack_channel_quota_with_progress_on_o
             server.await.unwrap();
         }
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_image_answer_takes_the_same_physical_channel_slot_as_a_text_answer() {
+    // `files.completeUploadExternal` creates a channel message exactly as `chat.postMessage` does,
+    // so it is paced with it. Obtaining the upload URL and sending the bytes create nothing.
+    let base = Arc::new(std::sync::OnceLock::<String>::new());
+    let handler_base = Arc::clone(&base);
+    let stamps = Arc::new(Mutex::new(Vec::<(String, Instant)>::new()));
+    let recorder = Arc::clone(&stamps);
+    let http = spawn_http_mock(move |path, _| {
+        recorder
+            .lock()
+            .unwrap()
+            .push((path.to_owned(), Instant::now()));
+        match path {
+            "/api/chat.postMessage" => json!({"ok":true,"channel":"C1","ts":"1700000000.000002"}),
+            "/api/files.getUploadURLExternal" => json!({
+                "ok": true,
+                "file_id": "F1",
+                "upload_url": format!("{}/upload", handler_base.get().expect("mock base")),
+            }),
+            "/upload" => json!({"ok":true}),
+            "/api/files.completeUploadExternal" => json!({"ok":true,"files":[{"id":"F1"}]}),
+            other => panic!("unexpected Slack endpoint {other}"),
+        }
+    });
+    base.set(http.base.clone()).expect("mock base is set once");
+    let replier = slack(&http.base).replier();
+    let target = ReplyTarget::Slack {
+        channel: "C1".into(),
+        thread_ts: None,
+    };
+    let image = generated_image();
+
+    assert!(
+        replier
+            .reply(target.clone(), OutboundReply::text("text first"))
+            .await
+            .unwrap()
+            .accepted()
+    );
+    assert!(
+        replier
+            .reply(target.clone(), OutboundReply::with_image("look", image))
+            .await
+            .unwrap()
+            .accepted()
+    );
+    assert!(
+        replier
+            .reply(target, OutboundReply::text("text after"))
+            .await
+            .unwrap()
+            .accepted()
+    );
+
+    let stamps = stamps.lock().unwrap().clone();
+    let at = |path: &str| {
+        stamps
+            .iter()
+            .find(|(seen, _)| seen == path)
+            .unwrap_or_else(|| panic!("{path} was called"))
+            .1
+    };
+    let first_text = at("/api/chat.postMessage");
+    let describe = at("/api/files.getUploadURLExternal");
+    let complete = at("/api/files.completeUploadExternal");
+    let second_text = stamps
+        .iter()
+        .filter(|(path, _)| path == "/api/chat.postMessage")
+        .nth(1)
+        .expect("the text answer after the image")
+        .1;
+    assert!(
+        describe.duration_since(first_text) < Duration::from_millis(500),
+        "obtaining an upload URL creates no channel message and is not paced"
+    );
+    assert!(
+        complete.duration_since(first_text) >= Duration::from_secs(1),
+        "the image completion waits for the channel slot the text answer took"
+    );
+    assert!(
+        second_text.duration_since(complete) >= Duration::from_secs(1),
+        "a text answer after an image completion waits for the slot the image took"
+    );
+}
+
+/// An activity driver whose progress removal takes long enough that "did shutdown wait?" is a
+/// question with one answer rather than a race.
+struct SlowCleanupActivity {
+    posted: Arc<tokio::sync::Notify>,
+    deleted: Arc<std::sync::atomic::AtomicBool>,
+}
+impl ChatActivity for SlowCleanupActivity {
+    fn show(&self, _: ActivityTarget) -> BoxFuture<'_, Result<(), TransportError>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn hide(&self, _: ActivityTarget) -> BoxFuture<'_, Result<(), TransportError>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn refresh_interval(&self) -> Option<Duration> {
+        None
+    }
+    fn retire(&self, _: &ActivityTarget) {}
+    fn progress_enabled(&self) -> bool {
+        true
+    }
+    fn post_progress(
+        &self,
+        _: ActivityTarget,
+        _: dekopon_harness::activity::ActivityLabel,
+    ) -> BoxFuture<'_, Result<Option<crate::transport::slack::OwnedProgressArtifact>, TransportError>>
+    {
+        Box::pin(async {
+            self.posted.notify_one();
+            Ok(Some(
+                crate::transport::slack::OwnedProgressArtifact::fixture("C1", "1700000000.000002"),
+            ))
+        })
+    }
+    fn delete_progress<'a>(
+        &'a self,
+        _: &'a crate::transport::slack::OwnedProgressArtifact,
+    ) -> BoxFuture<'a, Result<(), TransportError>> {
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            self.deleted
+                .store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn shutdown_drains_activity_cleanup_before_the_routing_loop_returns() {
+    // A SIGTERM mid-session used to tear the runtime down on top of a detached worker that had
+    // only just started removing the ⌛ message, leaving it in somebody's channel forever.
+    let posted = Arc::new(tokio::sync::Notify::new());
+    let deleted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let driver: Arc<dyn ChatActivity> = Arc::new(SlowCleanupActivity {
+        posted: Arc::clone(&posted),
+        deleted: Arc::clone(&deleted),
+    });
+    let mut lease = ActivityLease::start(Some(driver), Some(progress_target()), false);
+    tokio::time::timeout(Duration::from_secs(4), posted.notified())
+        .await
+        .expect("the progress artifact is created");
+    lease.finish_in_background();
+    assert!(
+        !deleted.load(std::sync::atomic::Ordering::Acquire),
+        "removal is still in flight when shutdown begins"
+    );
+
+    let directory = temporary();
+    let (runner, routes) = idle_routing_loop(directory.path()).await;
+    let (_sender, receiver) = mpsc::channel(4);
+    let outcome = crate::serve(
+        runner,
+        routes,
+        Arc::new(BTreeMap::new()),
+        Arc::new(BTreeMap::new()),
+        receiver,
+        std::future::ready(()),
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(outcome, crate::ServeOutcome::Shutdown);
+    assert!(
+        deleted.load(std::sync::atomic::Ordering::Acquire),
+        "the routing loop drains activity cleanup inside the shutdown grace"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn every_transport_that_cannot_connect_is_named_in_one_refusal() {
+    // Two configurations claiming one Slack installation fail *each other*; naming only the first
+    // one connected hides the half of the conflict an operator has to look at to resolve it.
+    let directory = temporary();
+    std::fs::write(
+        directory.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .expect("catalog fixture writes");
+    for name in ["first.sock", "second.sock"] {
+        std::fs::write(
+            directory.path().join(name),
+            b"an ordinary file, not a socket",
+        )
+        .expect("socket stand-in writes");
+    }
+    let mut document = document(directory.path());
+    document["broker"]["serverUid"] = json!(crate::current_uid());
+    document["transports"] = json!([
+        {
+            "name": "first-local",
+            "kind": "local",
+            "socketPath": directory.path().join("first.sock")
+        },
+        {
+            "name": "second-local",
+            "kind": "local",
+            "socketPath": directory.path().join("second.sock")
+        }
+    ]);
+    document["routes"][0]["transport"] = json!("first-local");
+    let (_broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let path = write_config(directory.path(), &document);
+
+    let error = crate::run(&path, std::future::pending())
+        .await
+        .expect_err("neither transport can bind its socket");
+    let crate::DekopondError::TransportConnect { problems } = &error else {
+        panic!("one refusal naming both transports, not the first one: {error:?}");
+    };
+    assert_eq!(problems.len(), 2, "{problems:?}");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("first-local") && rendered.contains("second-local"),
+        "the refusal names both transports: {rendered}"
+    );
 }
 
 #[tokio::test]

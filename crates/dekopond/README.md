@@ -139,10 +139,15 @@ See the [consumed configuration schema and lifecycle bounds](../../docs/dekopond
 The clean-break runtime, checkpoint bounds, delivery/accounting ownership and known integration
 limitations are documented in [`docs/harness.md`](../../docs/harness.md).
 
-Slack refuses duplicate authenticated endpoint/team/bot installations. Final/progress posts share
+Slack refuses duplicate authenticated endpoint/team/bot installations, naming every transport that
+could not connect rather than only the first. Final/progress posts and the completion that publishes
+a generated image share
 bounded one-second channel slots, rechecked before transmission and extended from response arrival;
-only a definitive HTTP 429 can retry a final post once (Retry-After at most five seconds inside a
-ten-second pacing budget). Unknown creations never retry. Native cleanup metadata retires after bounded cleanup;
-unknown native ordering remains under the coordinator's counted quarantine. Platform pacing can
+only a definitive HTTP 429 can retry a final post once (Retry-After at most five seconds). A 429
+parks the channel for the stated Retry-After capped at sixty seconds, or five seconds with no usable
+header, and later senders wait for the slot up to a sixty-second ceiling instead of being refused.
+Unknown creations never retry. Native cleanup metadata retires after bounded cleanup;
+unknown native ordering remains under the coordinator's quarantine, which is counted and aged out
+apart from the live lease ceiling. Shutdown drains activity cleanup inside the grace. Platform pacing can
 delay acceptance, independently of cosmetic I/O. Gateway cancellation wrappers forward fresh broker
 surface checks; a broker restart or Cedar revocation during inference fences stale disclosure.
