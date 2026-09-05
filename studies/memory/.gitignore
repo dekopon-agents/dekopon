@@ -1,0 +1,14 @@
+# Local operator context contains private host and filesystem coordinates.
+/STUDY_BRIEF.md
+# Local one-shot orchestration prompt embeds owner delivery coordinates; retain as provenance only.
+/workflows/prove-one-experiment.js
+# Live evidence stays local; sanitized relational exports are versioned separately.
+/*.sqlite3
+/*.sqlite3-*
+/private/
+/artifacts/raw/
+/runs/
+/builds/
+/targets/
+__pycache__/
+*.pyc
