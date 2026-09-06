@@ -1221,6 +1221,7 @@ dependencies = [
  "dekopon-shell",
  "dekopon-storage-host",
  "dekopon-telemetry",
+ "dekopon-test-support",
  "futures-util",
  "getrandom 0.4.3",
  "hmac",
@@ -1238,6 +1239,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

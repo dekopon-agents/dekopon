@@ -209,6 +209,11 @@ All notable changes to Dekopon are documented here. The format is based on
   `dekopon-core` gains `SkillId`, `SkillIdError`, and `MAX_SKILL_NAME_LENGTH`, and
   `dekopon-protocol`'s `AgentSpec` gains `skills`, absent from serialized output when empty.
 
+### Fixed
+
+- Slack text replies wait and retry once after HTTP 429, honoring integer Retry-After
+  seconds up to 60 (default 5), with a payload-free rate-limit warning.
+
 ## [0.12.0] - 2026-08-29
 
 ### Added

@@ -7390,6 +7390,89 @@ async fn a_slack_answer_is_posted_as_a_markdown_block() {
     assert_eq!(body["channel"], "d0123abc");
 }
 
+#[tokio::test]
+async fn a_slack_429_delays_the_identical_answer_once_without_reply_failure() {
+    use dekopon_test_support::CaptureLayer;
+    use tokio::io::AsyncWriteExt as _;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback Slack stand-in");
+    let endpoint = format!("http://{}", listener.local_addr().expect("bound address"));
+    let server = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(10), async move {
+            let mut requests = Vec::new();
+            let mut deliveries = 0;
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("post connects");
+                let (path, _, body) = read_http_request_parts(&mut stream)
+                    .await
+                    .expect("complete post");
+                assert_eq!(path, "/api/chat.postMessage");
+                requests.push((body, Instant::now()));
+                let (status, headers, body) = if attempt == 0 {
+                    ("429 Too Many Requests", "Retry-After: 1\r\n", json!({"ok": false}))
+                } else {
+                    deliveries += 1;
+                    ("200 OK", "", json!({"ok": true, "channel": "C1", "ts": "1700000000.000100"}))
+                };
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.expect("response writes");
+            }
+            (requests, deliveries)
+        }).await.expect("stand-in finishes within ten seconds")
+    });
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("echo.echo")],
+            Vec::new(),
+        )],
+    )
+    .await;
+    let models = ModelScript::new([answer("answer-payload-sentinel")]);
+    let mut inbound = message("question-payload-sentinel");
+    inbound.reply = ReplyTarget::Slack {
+        channel: "C1".into(),
+        thread_ts: Some("1700000000.000001".into()),
+    };
+    let capture = CaptureLayer::workspace();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_session(
+            runner(broker, models, 4),
+            route(model_config()),
+            inbound,
+            slack(&endpoint).replier(),
+        )
+        .with_subscriber(tracing_subscriber::registry().with(capture.clone())),
+    )
+    .await
+    .expect("session finishes within ten seconds");
+    let (requests, deliveries) = server.await.expect("stand-in joins");
+    assert_eq!(deliveries, 1);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].0, requests[1].0,
+        "retry preserves the whole post"
+    );
+    assert!(requests[1].1.duration_since(requests[0].1) >= Duration::from_secs(1));
+    let recorded = capture.text();
+    assert!(recorded.contains("outcome=\"answered\""), "{recorded}");
+    assert!(!recorded.contains("reply-failed"), "{recorded}");
+    assert_eq!(recorded.matches("gateway_reply_rate_limited").count(), 1);
+    assert!(recorded.contains("retry_after_seconds=1"), "{recorded}");
+    assert!(!recorded.contains("payload-sentinel"), "{recorded}");
+    assert!(!recorded.contains("bot-token"), "{recorded}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn slack_uploads_one_generated_png_without_sending_the_token_to_the_upload_url() {
     let base = Arc::new(Mutex::new(String::new()));

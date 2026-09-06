@@ -258,6 +258,14 @@ attested context was derived.
 | `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `busy`, `failed`, `cancelled`, `reply-failed`) |
 | `gateway.session` | `agent`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 
+| Event | Level | Fields |
+|---|---|---|
+| `gateway_reply_rate_limited` | warn | `transport=slack`, `retry_after_seconds`; no message text or credentials |
+
+A `chat.postMessage` HTTP 429 delays the identical post once: integer `Retry-After`
+seconds are capped at 60, defaulting to 5 when missing or unparsable. A second 429
+uses the ordinary reply-failure path; no other HTTP failure is retried.
+
 The prompt loop's spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `prompt.image_generation`, `shell.script`, `shell.command`) nest under `gateway.session`, and the broker's `broker.invocation` joins the same trace through the proposal's `traceParent` — so one trace reads from "a person asked something in Slack" to "a provider made an HTTP call". The image span carries only turn/tool indexes and a success byte count, never prompt or PNG content. `prompt.asset_fetch` joins them whenever a model opens an attachment: one span per fetch, carrying the asset number the conversation referred to and the turn and tool-call index that asked for it, never the file's name or bytes. It is gateway-only, because only a gateway session offers the asset tool.
 
 Neither gateway span carries chat text or a subject identifier. `outcome` is the whole answer at the metadata level: `declined` means an optional owned-thread continuation deliberately produced no chat delivery, `unauthorized` means the broker's chat-scoped `capabilities` returned nothing and no model or activity call was made, `busy` means admission control refused the message, `cancelled` means an authenticated native Stop won the race against terminal delivery, and `failed` names a category through the `gateway_session_failed` log event rather than a message. The sender's canonical subject and the message text ride the `gateway.message.received` log event under the payload gate below, never a span attribute. `agent.reply.declined` records only the model-turn number; it carries no proposed text, thread key, or subject. `unreported-capability-work` is a stable failure category whose fixed chat warning directs the sender to audit before retrying; no provider detail enters either surface.

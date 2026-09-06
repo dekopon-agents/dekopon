@@ -142,7 +142,32 @@ changing their bytes. This unreleased chart requires a matching image containing
 no image publication/deployment, D3g probe change or D7 auth move was performed.
 
 ### D1a
-pending — Slack single 429 retry; commit: —; discoveries: —.
+landed — freshly re-reviewed and integrated into `simplify/2026-09`.
+Reviewed worker: `96b345057010cbc9f30444ed69be5e844d058522`; fresh review:
+workspace `.validation/simplify-2026-09/D1a/rereview.md`.
+Batch gates and exact integrated identities are recorded in workspace
+`.validation/simplify-2026-09/wave0-batch-3.md`. Only ledger integration metadata
+differs from the reviewed tree. Worker target was verified inactive/ignored and
+removed immediately after cherry-pick; registered source stays until wave boundary.
+Self identity: `Simplify-Unit: D1a`, branch `simplify/unit-D1a` (one work commit).
+Base/D6b integrated SHA: `020f0bd72b7ad5ff1b2a14e857c703cbac6a052f`;
+D6a: `302cff4922c189a7783248ce159764a29765c522`; console D8a:
+`97e8625617aa44dbc4b62a58d6f005b98d0c7af6`; console D8b:
+`e3896db08d675921070b5e17d021ee70c5293904`.
+Ported only text-post 429 backoff/retry, with unchanged receipt validation and a
+payload-free warning. The bounded loopback session test proves identical posts,
+a one-second wait, one accepted delivery and answered rather than reply-failed.
+No identifiers, APIs, paths or tests removed; no surviving assertions changed.
+Existing shared capture support and tracing-subscriber are test-only dependencies;
+the generated lock adds only those two edges. Check/test (206 tests), scoped Clippy,
+fmt, doc/event, metadata, dependency and mechanical gates pass. Evidence: workspace
+`.validation/simplify-2026-09/D1a/report.md`. Worker target reclaimed at integration. Integration target retained only for the
+immediate full wave-0 gate, then reclaimed. Discoveries: none.
+Focused review repair: moved only the Slack retry bullet from released 0.12.0 to
+Unreleased / Fixed; released history now matches the integrated base byte-for-byte.
+Original reviewed identity: `4bf567dde3d64b113f05883a1a1a880e61cf2910`;
+same unit amended under `Simplify-Unit: D1a`. Rust source and tests unchanged.
+Repair validation: workspace `.validation/simplify-2026-09/D1a/review-repair.md`.
 
 ### D1b
 pending — policy and transport aggregate refusals; commit: —; discoveries: —.
