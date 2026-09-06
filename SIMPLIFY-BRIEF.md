@@ -511,13 +511,31 @@ No worker may waive a gate. Evidence must identify the exact unit commit.
    changed surface. A deletion's release metadata must be internally consistent now,
    not only after a later orphan cleanup.
 
-### Exactly four stop-and-ask triggers
+### Repair authority and exactly four stop-and-ask triggers
 
-Halt and report when: (1) a deletion changes a public API **not named in its unit's
-contract**; (2) a surviving real test invariant cannot be re-expressed; (3) a gate fails
-for a reason this brief does not describe; or (4) a unit depends on another unit that
-has not landed. Do not interpret ordinary authorized public removals as trigger (1).
-A runtime/tooling infrastructure failure is also reported exactly under the harness
+Distinguish necessary mechanics from new decisions before escalating a worker's blocked
+result. These three rules govern the stop triggers, not a literal inventory of every edit:
+
+- **Mechanical consequences of approved work:** repair within the unit, record in
+  `SIMPLIFY.md`, rerun gates, and obtain fresh review.
+- **Changes to surviving behavior, meaningful API contracts, or credential boundaries
+  not already authorized by the unit:** stop.
+- **A gate still failing after bounded, in-scope repair:** stop.
+
+For example, boxing `Command::Prompt.model` in the already-retiring `dekopon-run` crate
+when D3a's session deletion exposes `large_enum_variant` is an authorized mechanical
+repair, provided CLI behavior and surviving tests remain unchanged. A Rust field-type
+change alone is not a new product decision. No suppression, assertion weakening, hidden
+residue, or expansion of surviving functionality is authorized by this rule.
+
+Halt and report when: (1) work would change surviving behavior, a meaningful API contract,
+or a credential boundary beyond the unit's authority; (2) a surviving real test invariant
+cannot be re-expressed; (3) a required gate remains failing after one focused, in-scope
+same-worker repair pass; or (4) a unit depends on another unit that has not landed.
+The orchestrator classifies the actual cause before treating a worker's `blocked` label
+as an owner decision. Mechanical repair stays in the same unit commit, followed by gates
+and fresh review; no subsequent wave starts with unresolved acceptance.
+A runtime/tooling infrastructure failure is still reported immediately under the harness
 protocol, with clean/partial worktree state; no silent change of execution mode.
 
 ### Disk hygiene — follow the schedule, never wait for disk-full

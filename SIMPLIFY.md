@@ -4,7 +4,28 @@ Authority: [SIMPLIFY-BRIEF.md](SIMPLIFY-BRIEF.md). Core integration branch:
 `simplify/2026-09`, base `542430e`. Console base `ef0bf3f`, separate repository and branch.
 No releases, crate publication, yanks, PR merges, or live deployments are authorized.
 
-## Current milestone — wave 0 accepted
+## Current milestone — wave 1 mechanical repair authorized
+
+The owner clarified §5: repair mechanical consequences inside the unit, record them here,
+rerun gates and obtain fresh review; stop for unapproved surviving behavior/API/credential
+boundary changes, or a required gate still failing after bounded in-scope repair. The
+amended brief applies these rules directly to the four stop triggers. D3a's temporary
+`Command::Prompt.model` boxing is explicitly within that authority; no suppression or
+weakened test is allowed. Repair, review and integration remain pending, not passed.
+
+Core source remains the accepted wave-0 head `2e5d7a892602ea672579f0e54e1889eea724b8b6`;
+this owner-requested brief/ledger amendment changes no implementation. D3a's clean worker
+checkpoint is `fb4a007a8aac69029b18cb822c28f692ae9d9104` (175 tests pass, Clippy blocked).
+D3g's clean worker commit is `e79eb2c999b2d202263c70bfd6131a0f8276728a` (worker gates pass).
+Both remain unreviewed/unintegrated in `simplify-D3a` / `simplify-D3g`; all later wave-1
+units are unstarted. Evidence: workspace `.validation/simplify-2026-09/wave1-stop.md`.
+
+All three inactive core/D3a/D3g targets have been reclaimed; the latest physical free-space
+receipt is 81 GiB. Recheck headroom before resuming; no speculative target retention.
+Execution/review uses Dynamic Workflows (`workflow` and `agent()`); pi-subagents was used
+only for the successful native smoke. Workflow cost receipts are separate from its cost view.
+
+## Wave 0 accepted — historical receipt
 
 All six planned wave-0 units are freshly reviewed and integrated. Stable full-workspace
 fmt, warnings-denied all-target/all-feature Clippy, all-feature tests with no-fail-fast,
@@ -26,7 +47,7 @@ assertion weakening was introduced.
 Known integrated work identities: D6a `302cff4922c189a7783248ce159764a29765c522`,
 D6b `020f0bd72b7ad5ff1b2a14e857c703cbac6a052f`,
 D1a `88bc2d6da32ebdf901fe03f159a8ec0794b14816`,
-D1b self `Simplify-Unit: D1b` (prior validated integrated SHA above),
+D1b `2e5d7a892602ea672579f0e54e1889eea724b8b6` (prior validated source-equivalent SHA above),
 console D8a `97e8625617aa44dbc4b62a58d6f005b98d0c7af6` and
 D8b `e3896db08d675921070b5e17d021ee70c5293904`.
 
@@ -266,13 +287,20 @@ in the console repository; commit: `e3896db08d675921070b5e17d021ee70c5293904`; r
 assertions remain; seven published requirements stay `=0.11.1`. Discoveries: none.
 
 ### D3a
-pending — recorded-session/replay deletion; commit: —; discoveries: —.
+in-progress — worker checkpoint `fb4a007a8aac69029b18cb822c28f692ae9d9104`, branch
+`simplify/unit-D3a`; package check/175 tests pass, Clippy exposed `large_enum_variant`.
+The owner-approved §5 mechanical-repair rule now covers boxing the retiring runner's
+Prompt model field; repair/gates/fresh review/integration remain pending. Evidence:
+workspace `.validation/simplify-2026-09/D3a/report.md`. No suppressions/assertion weakening.
 
 ### D3b
 pending — two-daemon OTLP smoke and stub model; commit: —; discoveries: —.
 
 ### D3g
-pending — authenticated broker probe/chart consumers; commit: —; discoveries: —.
+in-progress — worker commit `e79eb2c999b2d202263c70bfd6131a0f8276728a`, branch
+`simplify/unit-D3g`; scoped Rust/chart/docs/mechanical gates pass, fresh review and
+integration pending. Evidence: workspace `.validation/simplify-2026-09/D3g/report.md`.
+Discoveries: none; inactive worker target reclaimed.
 
 ### D2a
 pending — direct storage handle, no transaction/GC; commit: —; discoveries: —.
