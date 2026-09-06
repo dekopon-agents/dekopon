@@ -115,37 +115,6 @@ the one-shot runner prints them to stderr. A suggestion is advisory by construct
 instruction, skill, limit, or grant moves because a model asked. It is recorded, and a person
 decides.
 
-`replay` puts a recorded session to a model again with the operator's change applied and answers
-each script from the recording, so no capability runs and no effect happens.
-`replay::RecordedSession::from_records(trace_id, &[Value])` rebuilds one session from flattened
-log records: `agent.model.prompt` (the first turn's `full` transcript plus each later turn's
-`delta`), `agent.model.answer`, and `accounting.model.turn`, reading every attribute under either
-its dotted or underscored spelling and ignoring records of other traces. The result carries the
-leading `system` messages, the `history` exchanges ahead of the prompt, the `prompt`, every turn
-with its tool calls, their results, usage, and duration, and the final `answer`; it is also the
-JSON shape `dekopon-run session show --json` prints and `session replay --from-file` reads back.
-`replay::RecordingError` says why a set of records is not a session: `NoRecords`, `NoTranscript`
-(accounted turns but no transcript, because the session ran with payload telemetry off), or
-`Malformed`. `replay::list_sessions` groups `accounting.model.turn` records by trace into
-`SessionListing`s (`trace_id`, `service`, `started_us`, `ended_us`, `model_turns`,
-`total_tokens`, `failed`, `answered`), newest first; accounting fires in either payload mode, so a
-listing shows sessions no transcript was exported for, and only `from_records` says whether one can
-be replayed. `replay::replay(model, &recorded, ReplayInputs { system, skills,
-improvement_suggestions, live, limits })` replays the recorded system messages joined into one
-(unless `system` replaces them; a recorded skills listing is dropped whenever `skills` mounts
-anything, so the replay lists exactly what it can read, while with nothing mounted a recorded
-listing replays as text with no `read_skill` behind it), the whole recorded history, and the
-prompt, and answers each script the model writes with the first unconsumed recorded outcome of
-that exact text, rebuilt from the `[exit code: N]` trailer and spending none of the capability
-budget. The first script the recording never ran is the *divergence*: with `live: None` the
-replay stops there (`DivergenceHandling::Stopped`, which is not a failure); with a live
-`ScriptRuntime` the script runs on it (`Live`) and every turn after it is a new session. The
-`ReplayReport` carries `trace_id`, `recorded` and `replayed` summaries (`model_turns`, `scripts`,
-`answer`, `usage`), the `divergence` (`turn`, `script`, `unused_recorded_scripts`, `handling`),
-the replayed model's `suggestions`, and an `error` for any session failure other than a
-divergence stop. What replay cannot do is invent tool output: turns before the divergence are a
-faithful comparison, and turns after a live one are not.
-
 Nothing in this crate holds authority. The broker leg submits identity-free proposals
 over an authenticated Unix socket and reports back whatever the broker decided; this
 crate never interprets policy, resolves credentials, or constructs authorization state.

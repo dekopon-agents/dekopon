@@ -66,7 +66,6 @@ Full mechanics, filesystem requirements, and the limits of local integrity evide
 | Question | Read |
 |---|---|
 | What do the traces, spans, and audit-safe logs contain? | [`observability.md`](observability.md) |
-| What did a session actually say and run, after the fact? | [`observability.md` § Reading sessions back](observability.md#reading-sessions-back) — `dekopon-run session list`, `show`, and `replay` query the OpenObserve receiver the runner and gateway export to; a session recorded with payload telemetry off still lists, but `show` and `replay` find its accounted turns and no transcript |
 | What is the dashboard, and what does exposing it disclose? | [`dekopon-brokerd` § Read-only web UI](../crates/dekopon-brokerd/README.md#read-only-web-ui) |
 | A client got a failure code — is it safe to resubmit? | [`broker-http.md` § Failure codes](broker-http.md#failure-codes) |
 | An invocation may have taken effect and was not recorded. | `outcome-unaudited`, in the same table. The durable audit is the only record; do not resubmit under any identifier |

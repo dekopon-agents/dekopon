@@ -225,7 +225,7 @@ broker upgrade together.
 
 Version 0.12.0 adds `dekopon-process`, removes `dekopon-tui`, and leaves twenty-five public crates.
 
-## Unreleased — skills, improvement suggestions, and session replay (implemented, not yet released)
+## Unreleased — skills and improvement suggestions (implemented, not yet released)
 
 - `spec.skills` mounts Agent Skills `SKILL.md` directories, read whole at catalog load under fixed
   bounds; a session lists them by name and description and reads a body or one resource on
@@ -234,16 +234,6 @@ Version 0.12.0 adds `dekopon-process`, removes `dekopon-tui`, and leaves twenty-
   notes per session, off everywhere by default, opt-in per gateway route
   (`improvementSuggestions: true`) or per runner session (`--suggestions`); a note is telemetry a
   person reads and changes nothing.
-- `dekopon-run session list|show|replay` reads recorded sessions back from OpenObserve and replays
-  one against a model, answering its scripts from the recording; only `--provider` makes a
-  divergent script run, in the same read-only import-free direct mode as `prompt`. See
-  [`improvement.md`](improvement.md).
-
-This adds no crate, process boundary, inbound listener, provider credential access, or effect
-authority. The one new network path is the runner's outbound OpenObserve query client, whose
-`Authorization` header value is read from an environment variable named on the command line
-rather than passed as an argument; `dekopon-agent` gains a `dekopon-config` dependency, and
-`dekopon-run` still reaches no broker crate under the CI `cargo tree` gate.
 [`CHANGELOG.md`](../CHANGELOG.md#unreleased) records the detail under `[Unreleased]`.
 
 ## Unreleased — provider command words as command-line facades (implemented, not yet released)

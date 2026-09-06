@@ -110,7 +110,7 @@ untrusted text that triggered it:
 fields are model-authored — bounded and stripped of control characters other than newline and
 tab, but never reduced to a category — and they are recorded whether or not payloads are on, because a suggestion nobody can
 read is not a suggestion. That is why `suggest_improvement` is never offered unless the embedder
-opted in: `dekopon-run prompt --suggestions`, `session replay --suggestions`, or
+opted in: `dekopon-run prompt --suggestions` or
 `improvementSuggestions: true` on a `dekopond` route. Enabling it is the consent that declares the
 log sink in scope for that text, and nothing else widens with it: the record carries no chat text
 the gateway holds and no subject, only what the model chose to write into those fields.
@@ -597,95 +597,6 @@ delta, with payloads on. Neither `agent.tool.script` nor `agent.tool.output` fir
 read; `agent.skill.read` records the name, the path, and the byte count in either mode, and a
 repeated read is answered with a one-line pointer for the same reason a repeated inspection is.
 
-### Reading sessions back
-
-`dekopon-run session` is the half of this contract that reads the stream back. It queries the
-receiver the runner and gateway export to, contacts no broker, loads a component only for a
-`replay` given `--provider`, and runs a model only for `replay`, whose scripts are answered from
-the recording rather than executed. The
-command reference is in [`run.md`](run.md); the loop these commands close — record a session,
-inspect a bad one, change instructions or write a skill, replay, compare — is in
-[`improvement.md`](improvement.md).
-
-- `session list [--since 7d] [--limit 50] [--json]` reads `accounting.model.turn` records and
-  nothing else, so it lists sessions recorded metadata-only. Records are grouped by `trace_id`,
-  newest first: `TRACE`, `STARTED` (the earliest record's `_timestamp`, RFC 3339 UTC to the
-  second), `TURNS` (the highest `model.turn`), `TOKENS` (`usage.total_tokens` summed over the turns
-  that reported it, `-` when none did), `OUTCOME` (`failed` when any turn was accounted `failed`,
-  otherwise `answered` or `no-answer` from the last turn's `answer.present`), and `SERVICE` (the
-  `service.name` resource attribute, stored as `service_name`). `--json` prints
-  `[{traceId, service, startedUs, endedUs, modelTurns, totalTokens, failed, answered}]`.
-- `session show (--trace-id ID | --from-file PATH) [--json]` fetches every record carrying the
-  trace and rebuilds the message vector from `agent.model.prompt` — the `full` first-turn list,
-  then each `delta` in turn order — adds the last turn's `agent.model.answer`, which no later
-  prompt carries, and takes each turn's usage and `duration_ms` from `accounting.model.turn`.
-  Scripts, their outputs, and every other tool exchange are the tool-call and tool messages those
-  deltas already carry, so no other event is read. `--json` prints exactly the document
-  `replay --from-file` reads back — `traceId`, `system`, `history`, `prompt`, `turns`, and
-  `answer` — which is how a recording is kept, edited, and replayed with no receiver in the loop.
-- `session replay (--trace-id ID | --from-file PATH) --model MODEL …` puts the recorded system
-  messages (or a `--system`/`--system-file` replacement), the earlier exchanges, and the prompt to
-  a model again, and answers every script the model writes from the recording. **It runs no
-  capability unless `--provider` is given**: the first script the recording never ran is the
-  divergence, and without live components the replay stops there and reports it as `stopped`;
-  with them that script runs in direct mode — import-free, read-only, no network — and the report
-  says `live`. `--skill DIR` mounts skills and drops the recorded listing; `--suggestions` offers
-  `suggest_improvement` to the replayed model and prints what it recorded on stderr, as `prompt`
-  does. The exit code is `1` only when the replayed session failed for a reason other than a
-  divergence stop.
-
-**`show` and `replay` need a transcript.** Both require the original session to have run with
-`telemetryPayloads` on. Without it the accounting records are found but no `agent.model.prompt`
-is, and the command fails with `trace <ID> has <N> accounted model turn(s) but no transcript; the
-session was recorded with payload telemetry off, so its prompt and scripts cannot be replayed`. A
-trace no record carries fails with `no telemetry records were found for trace <ID>`, and a
-transcript event that is not the shape the loop writes with `transcript for trace <ID> is
-malformed: <detail>`.
-
-**The receiver flags** are shared by `list` and by a `--trace-id` source; a `--from-file` source
-needs none of them:
-
-| Flag | Environment | Default |
-|---|---|---|
-| `--openobserve-url` | `DEKOPON_OPENOBSERVE_URL` | unset; the command fails with `no OpenObserve URL; pass --openobserve-url or set DEKOPON_OPENOBSERVE_URL` |
-| `--openobserve-stream` | `DEKOPON_OPENOBSERVE_STREAM` | `dekopon` |
-| `--openobserve-auth-env` | — | `DEKOPON_OPENOBSERVE_AUTHORIZATION` |
-| `--openobserve-timeout-ms` | — | `10000` |
-| `--since` | — | `7d` |
-
-The URL is the organization base the OTLP exporter posts to — the `http://127.0.0.1:5080/api/default`
-of the export example above, so one deployment's endpoint is also its query base — and it must
-carry no query, fragment, or userinfo. `--openobserve-auth-env` follows the rule every other
-Dekopon credential follows: it names the environment variable holding the complete
-`Authorization` header value, such as `Basic <token>`, and a value never appears in an argument.
-An unset variable fails with `environment variable <NAME> is not set; it must hold the OpenObserve
-Authorization header value`. The stream name is `[A-Za-z0-9_]`, and `--since` is a count followed
-by `s`, `m`, `h`, or `d`, never zero.
-
-The client posts `{"query": {"sql", "start_time", "end_time", "from", "size"}}` to
-`<base>/_search?type=logs` over a microsecond window ending now, follows no redirect — so the
-header cannot be forwarded to a host nobody named — uses no ambient proxy, bounds every response
-at 32 MiB, and pages 500 records at a time for at most 20 pages, past which it prints `warning:
-the search stopped after 20 pages of 500 records; narrow --since to see the rest` on stderr. A
-trace identifier is checked against `[A-Za-z0-9._-]{1,128}` before it is interpolated into
-`WHERE trace_id = '…'`, which is what keeps the lookup a lookup. OpenObserve stores an attribute
-named `audit.event` as `audit_event` — its field names admit letters, digits, and underscores, and
-fold every other character to an underscore — so the listing query is
-`SELECT * FROM "dekopon" WHERE audit_event = 'accounting.model.turn' ORDER BY _timestamp DESC`,
-and the reader accepts either spelling of every attribute it reads. The same fold is what makes
-`SELECT * FROM "dekopon" WHERE audit_event = 'agent.improvement.suggested'` the query that reads
-suggestions back.
-
-In telemetry, `list` searches under a `runner.session.list` span carrying `session.limit`, a
-`--trace-id` fetch under `runner.session.fetch`, and a replay under `runner.session.replay`, which
-carries the model identifier and backend, `provider.count`, `prompt.max_steps`, `prompt.skills`,
-`prompt.suggestions`, and `replay.system_replaced`. The commands report to `runner.command.failed`
-as `session.list`, `session.show`, and `session.replay`, with `error.type` including
-`observe-url-missing`, `observe-credential-missing`, `observe` (rejected settings or a failed
-request), `observe-task`, `recording` (no records, no transcript, or a malformed one),
-`recording-json` (a `--from-file` document that is not a `session show --json` transcript),
-`since`, `file-read`, `file-too-large`, `file-utf8`, or `clock`.
-
 ## Redacting secrets
 
 `dekopon_core::Redacted<T>` wraps a value that must never be rendered in the clear. `Debug`,
@@ -733,8 +644,7 @@ not grow with frontend process nodes or with the command words a script runs; a 
 may enable them. Three kinds exist. `legacy-shell` is the one non-interruptible node
 `dekopon-run shell` wraps provider loading and the whole interpreter in, keeping the existing
 `shell.script`/`shell.command` spans beneath it. `direct-command` is one non-interruptible node per
-provider command word a direct-mode script runs (`shell`, `prompt`, and `session replay
---provider`), nested under the command's `shell.command` span; it stays non-interruptible because
+provider command word a direct-mode script runs (`shell` and `prompt`), nested under the command's `shell.command` span; it stays non-interruptible because
 the guest call blocks a thread the supervisor could not join. `broker-command` is one cancellable
 node per command word the broker leg runs: `dekopond` ties it to the session's Stop, which aborts
 and joins the round trip before the script reads `session-cancelled`, while `dekopon-run prompt

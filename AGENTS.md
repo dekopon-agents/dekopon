@@ -2,7 +2,7 @@
 
 ## What this repository is
 
-Dekopon is early-stage security infrastructure for AI agents: a model may *propose* an invocation, only the separate privileged broker may *authorize* and execute it, and providers are import-free WebAssembly components. It is one Rust workspace (`Cargo.toml`, edition 2024, shared version `0.12.0`) of 26 crates under `crates/`, 25 of them published, with four binaries: `dekopon` (operator CLI), `dekopon-run` (direct read-only runner), `dekopon-brokerd` (the broker), and `dekopond` (the unprivileged chat gateway). Skills, `read_skill`, `suggest_improvement`, and `dekopon-run session list|show|replay` are post-0.12.0 work recorded under `[Unreleased]` in `CHANGELOG.md`; do not describe them as released.
+Dekopon is early-stage security infrastructure for AI agents: a model may *propose* an invocation, only the separate privileged broker may *authorize* and execute it, and providers are import-free WebAssembly components. It is one Rust workspace (`Cargo.toml`, edition 2024, shared version `0.12.0`) of 26 crates under `crates/`, 25 of them published, with four binaries: `dekopon` (operator CLI), `dekopon-run` (direct read-only runner), `dekopon-brokerd` (the broker), and `dekopond` (the unprivileged chat gateway). Skills, `read_skill`, and `suggest_improvement` are post-0.12.0 work recorded under `[Unreleased]` in `CHANGELOG.md`; do not describe them as released.
 
 ## Required reading
 
@@ -33,7 +33,7 @@ Then read the documents selected by the work:
 | Model requests, prompt caching, cache retention, conversation memory, or long-lived agent memory | [`docs/inference.md`](docs/inference.md): current wire behavior versus provider guarantees and future memory design |
 | Immediate providers, Wasm components, prompt tools, model endpoints, or limits | [`docs/run.md`](docs/run.md): the experimental runner and the privileges it must not gain |
 | Runner traces, OTLP logs, telemetry redaction, audit event names, or OpenObserve | [`docs/observability.md`](docs/observability.md): signal contents, configuration, and the CI-gated audit-event list |
-| Skills, `read_skill`, `suggest_improvement`, session replay, or evaluating a changed instruction before it ships | [`docs/improvement.md`](docs/improvement.md): the operator-driven improvement loop and what is deliberately absent |
+| Skills, `read_skill`, `suggest_improvement`, or evaluating a changed instruction before it ships | [`docs/improvement.md`](docs/improvement.md): the operator-driven improvement loop and what is deliberately absent |
 | Provider source, WIT, generated Wasm, tests, CI, dependencies, packaging, or releases | [`docs/development.md`](docs/development.md): repository mechanics and validation traps root commands do not cover |
 | The `Dockerfile`, the container image workflow, or a container deployment | [`docs/container-image.md`](docs/container-image.md): release-archive reuse, the numeric runtime UID, baked provider paths, and the ownership the broker refuses to start without |
 | Broker-mediated provider HTTP, host imports, or broker client mode | [`docs/broker-http.md`](docs/broker-http.md): the process boundary, buffered HTTP contract, authorization inputs, and staged delivery |

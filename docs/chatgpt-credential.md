@@ -29,8 +29,8 @@ predecessor, and any copy of the file taken before that refresh is dead.
 on a sibling `chatgpt-auth.json.lock` before refreshing, then re-reads the credential file and
 adopts the stored record when its `expiresAt` is later than the one in memory. That is the whole
 defence against the rotation trap: `dekopond` shares one client per configured model, but each
-concurrent turn runs on a credential snapshot taken before the lock, and a `dekopon-run` prompt or
-replay, or a second daemon on the same host, can open the same file; two arriving near the refresh
+concurrent turn runs on a credential snapshot taken before the lock, and a `dekopon-run` prompt
+or a second daemon on the same host, can open the same file; two arriving near the refresh
 margin would otherwise both present the same refresh token, and OAuth reuse detection can revoke the
 entire token family rather than just failing the second call. The same
 adoption runs before the forced refresh a `401` triggers. If the lock cannot be taken at all — a

@@ -7,6 +7,10 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Removed
+
+- Remove recorded-session listing, transcript reconstruction, and model replay from the runner and agent library. Live agent tools and telemetry remain.
+
 ### Fixed
 
 - Policy-world construction reports every reserved and duplicate capability together; gateway startup reports every transport connection failure with its name and cause.
@@ -118,8 +122,7 @@ All notable changes to Dekopon are documented here. The format is based on
   notes per session on how its operator could improve it, each a `category` (`instructions`,
   `skill`, `capability`, `tool`, `limits`, `other`), a `target` (at most 128 bytes), a `summary`
   (512), an `evidence` and a `proposal` (2048 each), and a `confidence` (`low`, `medium`, `high`).
-  It is off everywhere by default: `dekopon-run prompt --suggestions` and `session replay
-  --suggestions` offer it and print each note to standard error, keeping standard output for the
+  It is off everywhere by default: `dekopon-run prompt --suggestions` offers it and prints each note to standard error, keeping standard output for the
   answer, and `routes[].improvementSuggestions: true` offers it on a gateway route, where a note
   reaches telemetry and never the chat. An accepted note is one `agent.improvement.suggested`
   record carrying every field; a note outside an enum, blank, past a bound, or past the session
@@ -129,36 +132,6 @@ All notable changes to Dekopon are documented here. The format is based on
   because offering the tool is the consent to put model-authored text in the log. A suggestion
   changes nothing: no instruction, skill, limit, or grant moves because a model asked. Embedders
   read them back from `PromptOutcome.suggestions`.
-- Added `dekopon-run session list|show|replay`, which read sessions back from the OpenObserve log
-  stream the runner and gateway export to. The receiver is `--openobserve-url`
-  (`DEKOPON_OPENOBSERVE_URL`), the organization base the OTLP exporter posts to, with
-  `--openobserve-stream` (`DEKOPON_OPENOBSERVE_STREAM`, default `dekopon`) and
-  `--openobserve-auth-env` (default `DEKOPON_OPENOBSERVE_AUTHORIZATION`), the name of the variable
-  holding the complete `Authorization` header value, so no credential value appears in an
-  argument; the client follows no redirect, uses no ambient proxy, reads at most 20 pages of 500
-  records and warns when it stops there, bounds a response at 32 MiB, and validates a trace
-  identifier before interpolating it into SQL. `list` groups `accounting.model.turn` records by
-  trace within `--since` (default `7d`; a count followed by `s`, `m`, `h`, or `d`), newest first,
-  so it also lists sessions recorded metadata-only; `show` reconstructs one session — system
-  messages, earlier exchanges, prompt, every turn's scripts and their outputs, the answer — from
-  `agent.model.prompt`, `agent.model.answer`, and the accounting records, and `--json` prints the
-  exact shape `replay --from-file` reads back, so a recording can be kept, edited, and replayed
-  with no backend in the loop. A session recorded with payload telemetry off is reported as
-  accounted turns with no transcript rather than guessed at. Under the runner's root span the
-  command is `session.list`, `session.show`, or `session.replay`.
-- `session replay` puts a recorded conversation to a model again — the recorded instructions
-  unless `--system` or `--system-file` replaces them, the recorded skills listing unless `--skill`
-  replaces it, and whichever `--model` the operator names — and answers every script the model
-  writes from the recording, so by default no capability runs and no effect happens. The first
-  script the recording never ran is the divergence: the replay stops there and exits 0 unless
-  `--provider` components were supplied, in which case that script runs live in direct mode and
-  the report says so. The report compares recorded and replayed scripts index by index (`same`,
-  `differs`, `recorded only`, `replayed only`) beside both answers and token totals, `--json`
-  prints it whole, and the exit code is 1 only when the replayed session failed for a reason other
-  than a divergence stop. Turns before the divergence are a faithful comparison and turns after a
-  live one are a new session; replay never invents tool output. There is deliberately no durable
-  store, no automatic rewriting, and no grader: the loop is `list`, `show`, edit, `replay`, commit.
-
 ### Changed
 
 - `dekopon-shell`'s `CapabilityInvoker::run_command` replaces `resolve_command`: it receives the
@@ -204,9 +177,7 @@ All notable changes to Dekopon are documented here. The format is based on
   `missing-skill-name`, `unexpected-skill-arguments`, `invalid-suggestion`), which end a session
   as every other malformed tool call does; an exhaustive match downstream must name them.
 - `dekopon-agent` now depends on `dekopon-config`, for the loaded `Skill` a session shows a model,
-  and `dekopon-run` on `dekopon-config` (the same loader behind `--skill`), `ureq` (the OpenObserve
-  client, on the HTTP stack the model clients already use), and `time` (RFC 3339 timestamps in
-  `session list`). `dekopon-run` still reaches no broker crate; the CI `cargo tree` gate checks it.
+  and `dekopon-run` on `dekopon-config` (the same loader behind `--skill`). `dekopon-run` still reaches no broker crate; the CI `cargo tree` gate checks it.
   `dekopon-agent` and `dekopond` now also depend on `dekopon-process`, for the node each broker
   command run executes in and the cancel signal a gateway session hands it; it is not a broker
   crate, and the same gate covers `dekopond`.

@@ -1118,12 +1118,10 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.20",
- "time",
  "tokio",
  "tracing",
  "tracing-chrome",
  "tracing-subscriber",
- "ureq",
 ]
 
 [[package]]

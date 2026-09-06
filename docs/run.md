@@ -11,9 +11,6 @@ dekopon-run prompt --provider <COMPONENT>... --model <MODEL> [--endpoint <URL> |
 dekopon-run shell --provider <COMPONENT>... [--curl-capability <CAPABILITY>] <SCRIPT>
 dekopon-run broker capabilities [--socket <PATH>] [--server-uid <UID>]
 dekopon-run broker invoke [--socket <PATH>] [--server-uid <UID>] --invocation-id <ID> --trace-id <ID> <CAPABILITY> [--input <JSON> | --input-file <PATH>]
-dekopon-run session list [--openobserve-url <URL>] [--since <DURATION>] [--limit <COUNT>] [--json]
-dekopon-run session show (--trace-id <TRACE_ID> | --from-file <PATH>) [--json]
-dekopon-run session replay (--trace-id <TRACE_ID> | --from-file <PATH>) --model <MODEL> [--endpoint <URL> | --chatgpt-subscription] [--system <TEXT> | --system-file <PATH>] [--skill <DIRECTORY>]... [--suggestions] [--provider <COMPONENT>]... [--max-steps <COUNT>] [--json]
 dekopon-run chat --gateway <SOCKET> --subject <SUBJECT> [--conversation <ID>]
 dekopon auth chatgpt <login | status | logout | export>
 ```
@@ -22,7 +19,7 @@ Every `--provider <COMPONENT>` is a component file or a directory, which expands
 
 **`prompt` and `chat` have different execution models, and the difference is the whole point of having both.** `prompt` runs the model and tool loop **in this process**: it compiles provider components, calls a model endpoint, and executes each script itself. `chat` runs **no loop at all**. It loads no component, contacts no model, and holds no provider authority; it writes a JSON line to a running [`dekopond`](dekopond.md)'s development socket and prints the line that comes back, while routing, attestation, authorization, and the model call all happen inside that daemon on exactly the path a Slack message takes.
 
-Each direct `inspect`, `invoke`, `shell`, or `prompt` command (and a `session replay` given `--provider`) builds one `ProviderRegistry`, compiles every selected component once, and retains that machine code only for the registry's lifetime. `--compile-cache <DIRECTORY>` (or `DEKOPON_RUN_COMPILE_CACHE`) additionally points Wasmtime's content-addressed cache at a directory, so a later process reads compiled code back instead of running Cranelift again; without it every process recompiles every selected component. Description and invocation calls receive a fresh Wasmtime store and component instance with configured memory, table, instance, fuel, wall-clock, input, and output limits; one shared runtime mutex serializes component calls, and one long-lived worker thread arms each call's wall-clock deadline. Repeating `--provider` creates one deterministic capability registry, and duplicate provider IDs, duplicate capability IDs, and command-word conflicts fail before invocation — all of them in one report, the same conflicts `dekopon-brokerd` refuses to start with, so a provider that loads here also loads there. Success exits `0`, runtime/model/provider failures exit `1`, and Clap usage failures exit `2`. Broker invocations always print the typed result; `Denied` or `Failed` outcomes exit `1`, while `Succeeded` exits `0`.
+Each direct `inspect`, `invoke`, `shell`, or `prompt` command builds one `ProviderRegistry`, compiles every selected component once, and retains that machine code only for the registry's lifetime. `--compile-cache <DIRECTORY>` (or `DEKOPON_RUN_COMPILE_CACHE`) additionally points Wasmtime's content-addressed cache at a directory, so a later process reads compiled code back instead of running Cranelift again; without it every process recompiles every selected component. Description and invocation calls receive a fresh Wasmtime store and component instance with configured memory, table, instance, fuel, wall-clock, input, and output limits; one shared runtime mutex serializes component calls, and one long-lived worker thread arms each call's wall-clock deadline. Repeating `--provider` creates one deterministic capability registry, and duplicate provider IDs, duplicate capability IDs, and command-word conflicts fail before invocation — all of them in one report, the same conflicts `dekopon-brokerd` refuses to start with, so a provider that loads here also loads there. Success exits `0`, runtime/model/provider failures exit `1`, and Clap usage failures exit `2`. Broker invocations always print the typed result; `Denied` or `Failed` outcomes exit `1`, while `Succeeded` exits `0`.
 
 The standalone Rust echo provider is immediately runnable after fetching its exact v0.1.0 release
 fixture:
@@ -272,139 +269,7 @@ suggestion 1/1 [capability, high confidence] gh.pull-request.read: The read capa
   proposal: Grant gh.pull-request.read to this agent.
 ```
 
-A line break inside `evidence` or `proposal` is indented to sit under its label. A suggestion changes nothing — no instruction, skill, limit, or grant moves because a model asked — and without the flag the tool is not offered. A `dekopond` route opts in with `improvementSuggestions: true` and leaves the records to telemetry; reading them back from OpenObserve is `SELECT * FROM "dekopon" WHERE audit_event = 'agent.improvement.suggested'`. [Session replay](#session-replay-and-evaluation) is how a proposal is checked before it ships.
-
-## Session replay and evaluation
-
-`dekopon-run session` reads sessions back from the OpenObserve stream the runner and the gateway export to, and replays one against a model with an operator's change applied. The three subcommands contact no broker and hold no provider authority; only `replay` runs a model, only a `replay` given `--provider` loads a component, and the scripts that model writes are answered from the recording rather than executed. They close a loop that is deliberately operator-driven: run sessions, `list` them, `show` a bad one, edit the instructions or write a skill, `replay` with `--system-file` and `--skill` and compare, then commit the change to the catalog. There is no store beyond the telemetry backend, no automatic prompt rewriting, and no grader; every artifact is either in the catalog or in the records.
-
-The source is the transcript [`observability.md`](observability.md#model-and-tool-transcript) defines. `accounting.model.turn` fires in either payload mode, so `list` covers every session a deployment ran; the transcript events (`agent.model.prompt`, `agent.model.answer`, `agent.tool.script`, `agent.tool.output`) exist only for sessions that ran with payload telemetry on — `--otel-telemetry-payloads true` on this runner, `telemetryPayloads` on the gateway — and `show` or `replay` of one recorded without them fails with `has N accounted model turn(s) but no transcript`, naming the trace.
-
-### Reaching the receiver
-
-`list`, and `show` or `replay` given `--trace-id`, query OpenObserve's search endpoint (`POST <base>/_search?type=logs`) with the same flags:
-
-- `--openobserve-url <URL>` (or `DEKOPON_OPENOBSERVE_URL`): the organization base, such as `http://127.0.0.1:5080/api/default` — the same base the OTLP exporter posts to, so one deployment's `OTEL_EXPORTER_OTLP_ENDPOINT` is also its query base. It must carry no query, fragment, or `user:password@` userinfo. Missing, the command fails with `no OpenObserve URL; pass --openobserve-url or set DEKOPON_OPENOBSERVE_URL`.
-- `--openobserve-stream <STREAM>` (or `DEKOPON_OPENOBSERVE_STREAM`; default `dekopon`): the log stream the exporters wrote to; letters, digits, and underscores only.
-- `--openobserve-auth-env <NAME>` (default `DEKOPON_OPENOBSERVE_AUTHORIZATION`): the **name** of the environment variable holding the complete `Authorization` header value. The value never appears in an argument, and its absence is the failure: `environment variable DEKOPON_OPENOBSERVE_AUTHORIZATION is not set; it must hold the OpenObserve Authorization header value`.
-- `--openobserve-timeout-ms <MILLISECONDS>` (default `10000`): the whole-request deadline for each search page.
-- `--since <DURATION>` (default `7d`): how far back to look — a count followed by `s`, `m`, `h`, or `d`; zero is refused. For `--trace-id` it is the window the trace is searched in.
-
-The client follows no redirects and uses no ambient proxy, so the credential cannot be forwarded to a host nobody named. A search reads pages of 500 records and follows at most 20, then warns on standard error to `narrow --since to see the rest`; each response is read to at most 32 MiB. A trace identifier is interpolated into the search SQL, so it is checked first: 1-128 characters from letters, digits, `-`, `_`, and `.`. OpenObserve stores the `audit.event` attribute as `audit_event`, folding every character outside letters, digits, and underscores; the reader accepts both spellings.
-
-### `session list`
-
-`dekopon-run session list [--limit <COUNT>] [--json]` groups every `accounting.model.turn` record in the window by `trace_id` and prints the newest sessions first, at most `--limit` (default `50`):
-
-```text
-TRACE                             STARTED               TURNS    TOKENS  OUTCOME    SERVICE
-4bf92f3577b34da6a3ce929d0e0e4736  2026-08-31T09:15:02Z      2        41  answered   dekopon-run
-7c1e9a0b2d3f4e5a6b7c8d9e0f1a2b3c  2026-08-30T17:04:40Z      3         -  failed     dekopond
-```
-
-`STARTED` is the earliest accounted turn, RFC 3339 UTC to the second; `TURNS` the highest turn accounted; `TOKENS` the sum over every turn that reported `usage.total_tokens`, or `-`; `OUTCOME` is `failed` when any turn was accounted as failed, otherwise `answered` or `no-answer` by whether the last turn carried an answer; `SERVICE` is the records' `service_name`, or `-`. An empty window prints `(no sessions in the window)`. `--json` prints the same rows as an array of `{traceId, service, startedUs, endedUs, modelTurns, totalTokens, failed, answered}`, with microsecond epoch timestamps and `null` where nothing was reported.
-
-### `session show`
-
-`dekopon-run session show (--trace-id <TRACE_ID> | --from-file <PATH>) [--json]` reconstructs one transcript. Exactly one source is required; naming both or neither is a usage error. `--trace-id` fetches every record of that trace from the receiver; `--from-file` reads a transcript an earlier `session show --json` printed and touches no backend, so the receiver flags are not needed. The message vector is rebuilt from the first turn's `full` prompt plus each later turn's `delta`, the final answer from its own `agent.model.answer` record, each tool result by call identifier, and usage and duration per turn from the accounting records. Records may arrive in any order; a transcript that is not the shape the loop writes is refused as malformed, naming the event.
-
-The text rendering shows `trace:`, each leading `system:` message, the exchanges a persistent route replayed as `user (earlier):` and `assistant (earlier):`, the `user:` prompt, then `turn N:` for each model turn — with `[<ms> ms, <tokens> tokens]` when the accounting record carried them — holding its `assistant:` text and every `script:` with its `output:` (`(not recorded)` when the session ended before answering it; a call that was not a script shows as `tool <name>:` with its arguments), and finally `answer:`, or `answer: (none recorded)`. `--json` prints the exact document `replay --from-file` reads back:
-
-```json
-{
-  "traceId": "4bf92f3577b34da6a3ce929d0e0e4736",
-  "system": ["Be brief."],
-  "history": [],
-  "prompt": "Upcase hello",
-  "turns": [
-    {
-      "turn": 1,
-      "toolCalls": [
-        {
-          "id": "call-1",
-          "name": "bash",
-          "arguments": "{\"script\":\"echo.upcase --message hello | jq -r .message\"}",
-          "result": "HELLO\n[exit code: 0]"
-        }
-      ],
-      "usage": { "inputTokens": 10, "outputTokens": 5, "totalTokens": 15 },
-      "durationMs": 12.0
-    },
-    {
-      "turn": 2,
-      "content": "The script printed HELLO.",
-      "toolCalls": [],
-      "usage": { "inputTokens": 20, "outputTokens": 6, "totalTokens": 26 },
-      "durationMs": 3.0
-    }
-  ],
-  "answer": "The script printed HELLO."
-}
-```
-
-`history` lists `{user, answer}` exchanges oldest first; `usage` may also carry `cachedInputTokens` and `reasoningOutputTokens`; a field that was not recorded is omitted. The file is the recording, so it can be kept, edited by hand, and replayed with no backend in the loop.
-
-### `session replay`
-
-```text
-dekopon-run session replay (--trace-id <TRACE_ID> | --from-file <PATH>) \
-  --model <MODEL> [--chatgpt-subscription [--chatgpt-auth-file <PATH>] | --endpoint <URL> --api-key-env <NAME>] [--model-timeout-ms <MILLISECONDS>] \
-  [--system <TEXT> | --system-file <PATH>] [--skill <DIRECTORY>]... [--suggestions] \
-  [--provider <COMPONENT>]... [--compile-cache <DIRECTORY>] [--max-steps <COUNT>] [--json]
-```
-
-Replay puts the recorded conversation to a model again — the recorded system messages unless replaced, the earlier exchanges, then the prompt — and answers every script the model writes from the recording, so **no capability runs and no effect happens** by default. The prompt is real, the scripts the recorded model wrote are known, and every output was recorded, which makes a recording the cheapest evaluation of a changed instruction, a new skill, or a different model. The model flags are `prompt`'s: `--model`, `--chatgpt-subscription` with `--chatgpt-auth-file`, or `--endpoint` (default `http://127.0.0.1:11434/v1`) with `--api-key-env` (default `OPENAI_API_KEY`), and `--model-timeout-ms` (default `120000`). `--max-steps` (default `8`) bounds the replayed session's model turns, the final answer included.
-
-- `--system <TEXT>` or `--system-file <PATH>` (one or the other) replaces **every** recorded system message with these standing instructions; absent, the recorded ones are replayed. The file is read whole, must be UTF-8, and is bounded at 64 MiB — as is a `--from-file` transcript.
-- `--skill <DIRECTORY>` mounts skills exactly as in `prompt` and drops any `Skills mounted for this agent` listing the recording carried, so the replay lists exactly the skills the model can read. Without it, a recorded listing is replayed as text like every other system message, but no `read_skill` tool is offered; mount the skill again to let the model read it.
-- `--suggestions` offers `suggest_improvement` to the replayed model; what it records is printed to standard error as in `prompt` and carried in the report.
-- `--provider <COMPONENT>` (repeatable; a file, or a directory of `*.wasm`) supplies read-only, import-free components that run a script the recording cannot answer, in direct mode under the same `--compile-cache` (or `DEKOPON_RUN_COMPILE_CACHE`), Wasm bounds (`--max-memory-bytes`, `--max-input-bytes`, `--max-output-bytes`, `--fuel`, `--timeout-ms`), and interpreter bounds (the `--shell-*` flags) as `prompt`. Nothing is loaded unless the flag is passed, so the default replay is provably effect-free; with it, a diverging script can compute but never reach the network, and `curl` has no capability to assemble for. Their command words are served exactly as `prompt` serves them, so a diverging script that runs `probe --help` renders the live component's page. `--shell-max-capability-calls` bounds the whole replayed session as it does in `prompt`; a script answered from the recording spends none of it.
-
-A script is answered from the recording when its text exactly matches a recorded script whose output was recorded and not yet consumed, wherever that script sits, so a replayed model that reorders two independent scripts stays on the recorded trajectory, and the tool result is byte-for-byte what was recorded. The first script the recording cannot answer is the **divergence**, and what replay honestly cannot do is invent tool output for it:
-
-- Without `--provider`, the script is answered with `[replay stopped: the recorded session never ran this script and no live providers were supplied to run it]` and the session ends there. The report's `divergence.handling` is `stopped`, the replayed answer is absent, and the exit code is `0`: stopping at a divergence is the replay doing its job, and the turns before it are a faithful comparison.
-- With `--provider`, the script runs live and the session continues; `handling` is `live`. Later scripts are still answered from the recording when they match and run live when they do not, and only the first divergence is reported. From that point the report describes a new session, not a comparison.
-
-The report (`--json`) is `{traceId, recorded, replayed, divergence, suggestions, error}`. `recorded` and `replayed` are each `{modelTurns, scripts, answer, usage}` — the scripts in order, the final answer or `null`, and usage summed over the session. `divergence` is `null` or `{turn, script, unusedRecordedScripts, handling}`: the replayed turn that wrote the script, the script, and the recorded scripts not yet consumed. `suggestions` lists what `--suggestions` recorded. `error` is `null` unless the replayed session failed for a reason other than a divergence stop — a model failure, `--max-steps` exhausted, a malformed tool call — in which case the report is still printed and the exit code is `1`. The text rendering summarizes both sessions, states `divergence: none` or `divergence: turn N (stopped there | ran live), K recorded script(s) unused` with the script, compares scripts index by index as `script N (same | differs | recorded only | replayed only):` — the recorded text, and the replayed text when it is not the same — and ends with `answer (recorded):` and `answer (replayed):`:
-
-```text
-trace: 4bf92f3577b34da6a3ce929d0e0e4736
-recorded: 2 turn(s), 1 script(s), 41 token(s), answer: yes
-replayed: 1 turn(s), 1 script(s), 18 token(s), answer: no
-divergence: turn 1 (stopped there), 1 recorded script(s) unused
-  script:
-    echo.downcase --message HELLO
-script 1 (differs):
-  recorded:
-    echo.upcase --message hello | jq -r .message
-  replayed:
-    echo.downcase --message HELLO
-answer (recorded):
-    The script printed HELLO.
-answer (replayed): (none)
-```
-
-Failures before a model is reached — an unreadable or oversized file, a `--from-file` that is not a transcript `session show --json` printed, a missing receiver URL or credential, a trace with no records or no transcript, a `--skill` that does not mount, a `--provider` that does not load — exit `1` with no report; usage errors exit `2`. In traces the `runner.command` root span names these commands `session.list`, `session.show`, and `session.replay`, and the replay span records the model identifier and backend, the provider count, the skill count, whether suggestions were offered, and whether the system prompt was replaced — not its text.
-
-The loop end to end, with the receiver named by environment and the credential read by name:
-
-```console
-export DEKOPON_OPENOBSERVE_URL=http://127.0.0.1:5080/api/default
-# DEKOPON_OPENOBSERVE_AUTHORIZATION holds the Authorization header value.
-dekopon-run session list --since 24h
-
-dekopon-run session show --trace-id 4bf92f3577b34da6a3ce929d0e0e4736 --json > session.json
-
-dekopon-run session replay --from-file session.json \
-  --model "$MODEL" \
-  --system-file instructions.md \
-  --skill examples/local/skills/pull-request-review
-
-dekopon-run session replay --trace-id 4bf92f3577b34da6a3ce929d0e0e4736 \
-  --model "$MODEL" \
-  --provider examples/providers/echo-provider.wasm \
-  --json
-```
+A line break inside `evidence` or `proposal` is indented to sit under its label. A suggestion changes nothing — no instruction, skill, limit, or grant moves because a model asked — and without the flag the tool is not offered. A `dekopond` route opts in with `improvementSuggestions: true` and leaves the records to telemetry; reading them back from OpenObserve is `SELECT * FROM "dekopon" WHERE audit_event = 'agent.improvement.suggested'`.
 
 ## Rust provider interface
 
@@ -429,7 +294,7 @@ Build providers for `wasm32-unknown-unknown`, then componentize the embedded WIT
 
 Prompt text, model responses, model-authored script text and its output, provider input/output, bearer tokens, OTLP authorization headers, and raw errors are intentionally excluded from telemetry. Two opt-ins widen that on purpose: `--otel-telemetry-payloads true` adds the transcript events [`observability.md`](observability.md#model-and-tool-transcript) defines, and `--suggestions` records the model's bounded suggestion fields as `agent.improvement.suggested` in either mode. Lifecycle logs record stable command/session/model/script/guest events and share generated trace and span IDs with performance traces. They are operational audit telemetry, not broker authorization evidence or a replacement for durable broker audit. See [`observability.md`](observability.md) for configuration, event semantics, data minimization, and the single-container OpenObserve example.
 
-Direct-operation bounds are configurable on `inspect`, `invoke`, `shell`, `prompt`, and `session replay` (for its `--provider` components) with:
+Direct-operation bounds are configurable on `inspect`, `invoke`, `shell` and `prompt` with:
 
 - `--max-memory-bytes`
 - `--max-input-bytes`
