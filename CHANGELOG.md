@@ -9,6 +9,10 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Added
 
+- Broker IPC supports distinct mapped peer UIDs through a broker-owned `0660` socket
+  in a non-writable shared-group directory. Owner-only `0600` clients remain supported;
+  real peer authentication, server-UID pinning and private credential/store checks remain
+  enforced. Group membership grants reachability, never identity or authorization.
 - Added strict route-level `conversation.scope` for persistent gateway history:
   `privateConversation` remains the omitted-field default and keys transcript plus attachment state
   by agent, configured transport, transport-derived conversation, and canonical authenticated

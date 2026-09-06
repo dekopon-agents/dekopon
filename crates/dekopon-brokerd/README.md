@@ -4,11 +4,11 @@
 
 Authorization and execution constraints are two separate files on purpose. `policiesPath` decides *who may do what*; `constraintSets` decides *how narrowly the broker then does it*. A policy edit can never widen a timeout, reach a new host, or bind a credential that was not already bound.
 
-The owner-only socket intentionally supports one Unix UID trust domain. Every process running under that UID can act as its configured principal/actor; use a dedicated service/client UID when process-level separation matters. Request payloads cannot provide or override identity, policy, constraints, credentials, or authorization.
+The broker accepts configured Unix peer UIDs, including a dedicated gateway UID. Every process running under a mapped UID can act as its configured principal/actor; group membership permits a connection, not an identity grant. Request payloads cannot provide or override identity, policy, constraints, credentials, or authorization.
 
 ## Configuration
 
-The configuration must be a regular single-link file owned by the server UID and must not be group/world writable. Socket, audit, checkpoint, and checkpoint-lock parent directories must be owner-only. Provider components must be regular single-link files owned by the server UID and must not be group/world writable; their canonical parent directories must also be server-owned and not group/world writable. Writable non-sticky path ancestors are rejected.
+The configuration must be a regular single-link file owned by the server UID and must not be group/world writable. Audit, checkpoint, and checkpoint-lock parent directories must be owner-only. The socket has the separate IPC directory contract below. Provider components must be regular single-link files owned by the server UID and must not be group/world writable; their canonical parent directories must also be server-owned and not group/world writable. Writable non-sticky path ancestors are rejected.
 
 ```yaml
 # broker.yaml
@@ -421,11 +421,33 @@ outside its namespaces), `unmapped-subject` (granted, but no mapping names that 
 `agent-denied` (attested and mapped, but no policy lets that principal drive that agent). Startup
 rejects duplicate mapping subjects and malformed namespaces.
 
-The example uses the server's own UID because that is what the owner-only socket currently permits:
-every configured peer UID must equal the server's. In that single-UID deployment a grant buys
-attribution and deny-by-default scoping, not separation — any process under that UID can already
-act as the configured peer. Running the gateway under its own UID, where `via` and namespace
-scoping become real isolation, is committed direction rather than current behavior.
+### IPC directory and distinct peer UIDs
+
+A broker-owned `0700` socket parent retains a `0600` socket for owner-only clients.
+For a distinct gateway UID, give the broker-owned parent the shared IPC group and mode
+`0710` (or `0750`). Group traversal selects a `0660` socket in that exact parent group;
+there is no extra configuration key. The broker must itself belong to that group to set
+the socket GID. Neither group writes nor any permissions for others are permitted on
+the IPC parent. A symlink parent, unsafe ancestors, wrong owner, socket symlink, hard
+link, wrong group, unsafe mode, or live listener replacement is refused.
+
+Give the gateway membership in that IPC group, map its actual UID in `identities`, and
+set its existing `broker.serverUid` to the broker UID. The protocol client checks socket
+ownership and the live server peer UID before writing a request. Unmapped peers receive
+no capabilities even if their group lets them connect. Owner-only clients remain valid.
+
+Keep broker config, credentials, provider files, audit/cache and storage in their separate
+broker-owned protected paths; the IPC directory is not a credential or data directory.
+The gateway's local development **chat** socket stays `0600` under its own private parent.
+The chart's distinct container identities and init layout are documented in the chart.
+
+The package's `tests/ipc_process.rs` runs real broker/client subprocesses. Unprivileged
+runs exercise owner-UID access, not cross-UID isolation. In a disposable Linux root
+container, require the full UID-switch, unmapped-peer, wrong-server and private-file proof:
+
+```console
+DEKOPON_REQUIRE_CROSS_UID=1 cargo test -p dekopon-brokerd --test ipc_process --locked -- --nocapture
+```
 
 An optional `telemetry` section enables OTLP export of broker spans:
 
@@ -468,7 +490,7 @@ hostLimits:
 socket binds only after that work finishes — the cost a startup probe has to cover. Present, the
 broker keeps Wasmtime's content-addressed cache there and a restart reads compiled code back
 instead. The directory holds code this privileged process executes, so its parent must be
-owner-only under the same rule as the socket and audit paths; the broker creates the directory
+owner-only under the same rule as the audit paths; the broker creates the directory
 itself. Components already compile concurrently rather than one at a time either way.
 
 `hostLimits.maxMemoryBytes` bounds one invocation. Nothing bounds all of them at once, so the worst

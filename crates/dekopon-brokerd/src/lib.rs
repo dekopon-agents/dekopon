@@ -124,15 +124,7 @@ where
             .is_some_and(|telemetry| telemetry.telemetry_payloads),
     );
     let frame_limits = config.server_limits.frame_limits()?;
-    for identity in &config.identities {
-        if identity.uid != uid {
-            return Err(BrokerdError::UnreachablePeerUid {
-                configured: identity.uid,
-                server: uid,
-            });
-        }
-    }
-    socket::validate_private_parent(&config.socket_path, uid)?;
+    socket::validate_socket_parent(&config.socket_path, uid)?;
     socket::validate_private_parent(&config.audit_path, uid)?;
     socket::validate_private_parent(&config.checkpoint_path, uid)?;
     socket::validate_private_parent(&config.checkpoint_lock_path, uid)?;
@@ -141,7 +133,7 @@ where
     }
     // A compilation cache holds compiled code the broker will execute. Anyone who can write into
     // it can choose what the privileged process runs, so it lives under the same private-parent
-    // rule as the socket and the audit log.
+    // rule as the audit log.
     if let Some(cache) = &config.host_options.compile_cache_dir {
         socket::validate_private_parent(cache, uid)?;
     }
@@ -741,11 +733,6 @@ pub enum BrokerdError {
     /// A configured transport identity could not be bound.
     #[error("broker peer identity is invalid")]
     Context(#[source] dekopon_broker::ContextError),
-    /// Owner-only socket permissions make a different UID unreachable.
-    #[error(
-        "configured peer UID {configured} cannot reach owner-only socket for server UID {server}"
-    )]
-    UnreachablePeerUid { configured: u32, server: u32 },
     /// Listener serving or bounded shutdown failed.
     #[error("broker server failed")]
     Server(#[from] ServerError),

@@ -333,6 +333,14 @@ realize the boundary. Crates: brokerd, broker-protocol, dekopond only if its alr
 existing broker.serverUid plumbing needs adjustment. Owner-only local clients must
 remain valid. Do not add generic transport abstractions or weaken credential-file checks.
 
+**D6a focused-repair exception (owner authorized).** The surviving
+`framing_and_audit_failures_name_their_cause` fixture may send only the encoded oversized
+`runCommand` frame's length prefix. Its `write_all` of a >128 KiB buffer is not atomic:
+the server rejects the length before reading a body and can close between partial writes.
+Preserve every existing wire-code, log-cause, bound and redaction assertion; neither drain
+oversized broker payloads nor raise limits. This fixture correction and its validation
+belong in the same amended D6a work commit, not a separate repair commit.
+
 **D6b — chart, init ownership and docs.** Integrate after D6a in wave 0; it can prepare
 independently against this boundary. Keep pod-level runAsUser **65532** unchanged:
 `_helpers.tpl:208` hard-fails any other value for provider ownership. Set gateway's

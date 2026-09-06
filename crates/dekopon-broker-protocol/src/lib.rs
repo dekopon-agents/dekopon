@@ -2010,12 +2010,30 @@ async fn validate_socket_path(path: &Path, expected_uid: u32) -> Result<(), Clie
     let metadata = tokio::fs::symlink_metadata(path)
         .await
         .map_err(|source| ClientError::SocketMetadata { source })?;
+    let mode = metadata.permissions().mode() & 0o7777;
     if !metadata.file_type().is_socket()
         || metadata.uid() != expected_uid
-        || metadata.permissions().mode() & 0o077 != 0
         || metadata.nlink() != 1
+        || !matches!(mode, 0o600 | 0o660)
     {
         return Err(ClientError::UnsafeSocket);
+    }
+    // Preserve owner-only clients. Group access additionally needs the broker-controlled
+    // IPC parent: a client in that group may connect, but cannot replace the listener.
+    if mode == 0o660 {
+        let parent = path.parent().ok_or(ClientError::UnsafeSocket)?;
+        let parent = tokio::fs::symlink_metadata(parent)
+            .await
+            .map_err(|source| ClientError::SocketMetadata { source })?;
+        let parent_mode = parent.permissions().mode();
+        if !parent.file_type().is_dir()
+            || parent.uid() != expected_uid
+            || parent_mode & 0o027 != 0
+            || !matches!(parent_mode & 0o070, 0o010 | 0o050)
+            || metadata.gid() != parent.gid()
+        {
+            return Err(ClientError::UnsafeSocket);
+        }
     }
     Ok(())
 }
@@ -2031,8 +2049,8 @@ pub enum ClientError {
         #[source]
         source: io::Error,
     },
-    /// Socket was not a private, single-link socket owned by the expected UID.
-    #[error("broker socket is not private or owned by the expected server UID")]
+    /// Socket or parent violated the server-owned private/shared IPC boundary.
+    #[error("broker socket or parent has unsafe permissions or ownership")]
     UnsafeSocket,
     /// Connecting exceeded the configured deadline.
     #[error("broker connection timed out")]

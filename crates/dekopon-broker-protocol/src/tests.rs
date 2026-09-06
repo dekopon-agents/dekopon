@@ -1559,3 +1559,80 @@ async fn a_refused_attested_surface_is_a_stable_failure_rather_than_an_empty_ans
     };
     assert_eq!(code, ERROR_UNAUTHENTICATED);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shared_socket_requires_protected_matching_parent_and_preserves_server_pinning() {
+    use super::{BrokerClient, ClientError, validate_socket_path};
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("broker.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).unwrap();
+    let uid = std::fs::metadata(&path).unwrap().uid();
+    for mode in [0o710, 0o750, 0o2710] {
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        validate_socket_path(&path, uid)
+            .await
+            .expect("protected shared socket");
+    }
+    for mode in [0o700, 0o740, 0o770, 0o711, 0o751, 0o1770] {
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        assert!(
+            matches!(
+                validate_socket_path(&path, uid).await,
+                Err(ClientError::UnsafeSocket)
+            ),
+            "parent {mode:o}"
+        );
+    }
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o710)).unwrap();
+    assert!(matches!(
+        validate_socket_path(&path, uid.wrapping_add(1)).await,
+        Err(ClientError::UnsafeSocket)
+    ));
+    let alias = directory.path().join("alias.sock");
+    std::os::unix::fs::symlink(&path, &alias).unwrap();
+    assert!(matches!(
+        validate_socket_path(&alias, uid).await,
+        Err(ClientError::UnsafeSocket)
+    ));
+    let parent_alias = directory.path().join("parent-alias");
+    std::os::unix::fs::symlink(directory.path(), &parent_alias).unwrap();
+    assert!(matches!(
+        validate_socket_path(&parent_alias.join("broker.sock"), uid).await,
+        Err(ClientError::UnsafeSocket)
+    ));
+
+    let limits = FrameLimits {
+        max_frame_bytes: 4096,
+        io_timeout: Duration::from_secs(1),
+    };
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_frame::<_, RequestEnvelope>(&mut stream, limits)
+            .await
+            .unwrap();
+        assert!(matches!(
+            request.request,
+            BrokerRequest::Capabilities { attestation: None }
+        ));
+        write_frame(
+            &mut stream,
+            &ResponseEnvelope::capabilities(Vec::new(), Vec::new()),
+            limits,
+        )
+        .await
+        .unwrap();
+    });
+    let client = BrokerClient::new(&path, uid, limits).unwrap();
+    assert!(
+        client
+            .capabilities()
+            .await
+            .expect("owner still connects to group socket")
+            .is_empty()
+    );
+    server.await.unwrap();
+}

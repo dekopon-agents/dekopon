@@ -10,6 +10,14 @@ The authority-bearing half of the wire carries only capability inspection reques
 
 Two additional operations let a mapped gateway attestor publish bounded informational state for `dekopon-webui`: a normalized catalog-agent inventory and provider-reported model-token deltas. They contain no instructions, prompts, answers, subjects, principals, credentials, policy, constraints, or authorization. A broker may display them and must never use them for identity, authorization, routing, execution, evidence, replay, or durable audit.
 
+Unix clients accept server-owned, single-link `0600` sockets and shared IPC `0660`
+sockets. A shared socket must match the GID of its server-owned, non-symlink parent,
+which permits group traversal but no group writes or access for others. Filesystem
+metadata is not server authentication: the connected peer UID must also match the
+configured server UID before any request bytes are sent. Group access never supplies
+caller identity; the broker still maps the actual peer UID. See the broker's
+[IPC directory contract](../dekopon-brokerd/README.md#ipc-directory-and-distinct-peer-uids).
+
 Frames use a four-byte big-endian length followed by strict JSON. Reads, writes, connection setup, and complete frames have independent positive limits and deadlines; oversized lengths are rejected before allocation, and an in-bound length is a claim the reader never pre-allocates against — payload buffers grow with the bytes that actually arrive, and a frame shorter than its prefix fails rather than decoding. One frame is one write. Each client operation uses a fresh Unix connection and validates the exact protocol version and response variant.
 
 `ClientError` distinguishes the phase a framing failure belongs to, because the wire's `broker-unavailable` / `outcome-unaudited` split is worth nothing if a client-local timeout erases it. A request-phase failure delivered nothing and is safe to resubmit under a fresh invocation identifier; a response-phase failure delivered the complete request and could not read the answer, so a write may already have happened. `ClientError::may_have_executed` answers that question for both cases and for the broker's own `outcome-unaudited` code; a caller that writes must surface it as non-retryable rather than resubmitting.

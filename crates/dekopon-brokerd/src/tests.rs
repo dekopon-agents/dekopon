@@ -1347,3 +1347,86 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
     validate_capability_responses(&broker, &identities, ceiling_bytes)
         .expect("a frame that carries the widest answer starts");
 }
+
+#[tokio::test]
+async fn ipc_group_socket_keeps_private_paths_private_and_replaces_only_safe_stale_sockets() {
+    use dekopon_broker_protocol::{BrokerClient, ClientError, FrameLimits};
+    use std::os::unix::fs::MetadataExt as _;
+
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("IPC fixture");
+    let path = directory.path().join("broker.sock");
+    for mode in [0o700, 0o710, 0o750, 0o2710] {
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(mode)).unwrap();
+        let (listener, mut guard) = socket::bind(&path, uid).await.expect("safe IPC parent");
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        assert_eq!(metadata.uid(), uid);
+        assert_eq!(
+            metadata.permissions().mode() & 0o7777,
+            if mode == 0o700 { 0o600 } else { 0o660 }
+        );
+        if mode != 0o700 {
+            assert_eq!(
+                metadata.gid(),
+                fs::metadata(directory.path()).unwrap().gid()
+            );
+            assert!(
+                socket::validate_private_parent(&path, uid).is_err(),
+                "audit/cache/checkpoint parents stay private"
+            );
+        }
+        assert!(matches!(
+            socket::bind(&path, uid).await,
+            Err(super::SocketError::AlreadyRunning { .. })
+        ));
+        drop(listener);
+        // Keep the inode at the original path while relinquishing the first guard.
+        let parked = directory.path().join("parked.sock");
+        fs::rename(&path, &parked).unwrap();
+        guard.cleanup().unwrap();
+        fs::rename(&parked, &path).unwrap();
+        let (listener, mut replacement) = socket::bind(&path, uid)
+            .await
+            .expect("safe stale IPC socket");
+        drop(listener);
+        replacement.cleanup().unwrap();
+    }
+    for mode in [0o770, 0o730, 0o740, 0o711, 0o751, 0o777, 0o1770] {
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(mode)).unwrap();
+        assert!(
+            matches!(
+                socket::bind(&path, uid).await,
+                Err(super::SocketError::InsecureParent { .. })
+            ),
+            "unsafe parent {mode:o}"
+        );
+    }
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o710)).unwrap();
+    assert!(socket::bind(&path, uid.wrapping_add(1)).await.is_err());
+    let alias = directory.path().join("alias");
+    std::os::unix::fs::symlink(directory.path(), &alias).unwrap();
+    assert!(socket::bind(&alias.join("broker.sock"), uid).await.is_err());
+    fs::remove_file(&alias).unwrap();
+    fs::write(&path, "not a socket").unwrap();
+    assert!(socket::bind(&path, uid).await.is_err());
+    fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink("missing", &path).unwrap();
+    assert!(socket::bind(&path, uid).await.is_err());
+    fs::remove_file(&path).unwrap();
+
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    for mode in [0o666, 0o661, 0o670, 0o760, 0o1660] {
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        assert!(matches!(
+            socket::bind(&path, uid).await,
+            Err(super::SocketError::InsecureSocket { .. })
+        ));
+        let client = BrokerClient::new(&path, uid, FrameLimits::default()).unwrap();
+        assert!(matches!(
+            client.capabilities().await,
+            Err(ClientError::UnsafeSocket)
+        ));
+    }
+    drop(listener);
+    fs::remove_file(path).unwrap();
+}
