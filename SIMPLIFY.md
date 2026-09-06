@@ -6,8 +6,9 @@ No releases, crate publication, yanks, PR merges, or live deployments are author
 
 ## Milestone state
 
-Brief corrections applied before implementation. Next: install/test the residue gate,
-then wave 0 with D6 first. Initial physical free space: 90 GiB; at most two simultaneous
+Brief corrections committed as `5a8687c` before implementation. The residue gate and
+seven regression tests are installed in the gate commit (`Simplify-Unit: gate`). Next:
+wave 0 with D6 first. Initial physical free space: 90 GiB; at most two simultaneous
 build workers until measured headroom permits more. Other pre-existing worktrees remain
 untouched. No targets existed in the inspected core/console worktrees at preflight.
 

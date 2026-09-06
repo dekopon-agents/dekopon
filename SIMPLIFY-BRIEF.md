@@ -461,8 +461,12 @@ brief requests. The amended brief stays committed.
 
 ### Per-unit mechanical gate
 
-Install the non-Rust residue check **before any low-effort deletion worker relies on it**.
-No worker may waive a gate or hide a hit. Evidence must identify the exact unit commit.
+The non-Rust residue check is `.github/scripts/check_simplify_residue.py`; its regression
+tests are `.github/scripts/test_check_simplify_residue.py`. Install and pass these
+**before any low-effort deletion worker relies on the check**. Run it with `--repo <root>
+--symbols <inventory-file>`, one literal removed symbol/path per line. Exit 0 means no
+hits, 1 reports residue, and 2 is a scanning/setup error; never hide either nonzero status.
+No worker may waive a gate. Evidence must identify the exact unit commit.
 
 1. `cargo check -p <each touched surviving crate> --locked`.
 2. `cargo test -p <each touched surviving crate> --locked`. Fetch the checksum-pinned
