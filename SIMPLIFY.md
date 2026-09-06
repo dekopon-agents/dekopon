@@ -4,7 +4,55 @@ Authority: [SIMPLIFY-BRIEF.md](SIMPLIFY-BRIEF.md). Core integration branch:
 `simplify/2026-09`, base `542430e`. Console base `ef0bf3f`, separate repository and branch.
 No releases, crate publication, yanks, PR merges, or live deployments are authorized.
 
-## Milestone state
+## Current milestone — wave 0 accepted
+
+All six planned wave-0 units are freshly reviewed and integrated. Stable full-workspace
+fmt, warnings-denied all-target/all-feature Clippy, all-feature tests with no-fail-fast,
+separate doctests, warnings-denied rustdoc, machete, dependency policy, both privilege
+boundaries, docs/audit/release-metadata/regressions, corrected mechanical checks and
+selected workspace archive verification passed at the integrated D1b head
+`124ff2cd6bcb8c27070af53b413dfa7f23d0fa37`. This final D1b amendment changes only this
+ledger; source/archive-input equivalence is recorded, not a relabeled fresh build.
+The full stable suite's existing ignored SDK doctest example remains explicitly reported.
+
+Helm's nine actual CI run bodies passed, including render/schema/archive parity and
+actual rendered init commands on amd64 and arm64. All 224 inputs match batch 3's exact-head
+real Linux cross-UID daemon proof: mapped/owner success, unmapped/pin/live-peer/GID/private-
+file refusals. No redundant provider rebuild: all defined provider/WIT/source inputs remain
+byte-identical to the pinned base. Raw removal residue is D6a's two brief hits and D1b's
+five brief/history hits; other wave-0 inventories have no hits. No suppression or surviving
+assertion weakening was introduced.
+
+Known integrated work identities: D6a `302cff4922c189a7783248ce159764a29765c522`,
+D6b `020f0bd72b7ad5ff1b2a14e857c703cbac6a052f`,
+D1a `88bc2d6da32ebdf901fe03f159a8ec0794b14816`,
+D1b self `Simplify-Unit: D1b` (prior validated integrated SHA above),
+console D8a `97e8625617aa44dbc4b62a58d6f005b98d0c7af6` and
+D8b `e3896db08d675921070b5e17d021ee70c5293904`.
+
+Console final housekeeping removed only its ledger at
+`18c3d890c52bea72fc45ed5bad320788b2ef6ecb`. Complete actual CI/local scope passed on
+stable and Rust 1.89.0 (97 distinct tests per run, no failures/ignores); published pins
+remain exactly `=0.11.1`. Exact-head Linux CI run `34058770775` passed. Its one PR is open,
+ready for human review, not approved or merged:
+https://github.com/dekopon-agents/dekopon-console/pull/1 .
+No physical-TTY or deployed/live-credential acceptance is claimed.
+
+The six clean inactive integrated unit worktrees were normally removed and pruned after
+patch/source-equivalence checks; all branches and evidence remain. Console's inactive
+ignored target was removed after exact-head CI; no console/provider targets remain.
+Physical free space is 53.43 GiB after cleanup (serial width 1; below two-worker budget).
+Core target is retained only for immediate wave-1 integration gates; reclaim after those
+gates, before handing off without immediate local builds, or before free space falls below
+the serial >30 GiB budget. Shared sccache/wrapper/cache/incremental settings are untouched.
+
+Acceptance/evidence and remaining exact §8 final-only coverage:
+workspace `.validation/simplify-2026-09/wave0-final.md` and `w0-full-gate/`.
+Final core MSRV/release/feature-off/provider variants, daemon help/install and rewritten
+OTLP smoke, final metrics and exact-head core CI remain outstanding. No core PR yet;
+core integration stays open for wave 1. No new feature work or stop trigger at this gate.
+
+## Prior milestone receipts (historical)
 
 **Native child startup cleared; wave 0 implementation reached validation.** The successful
 native async smoke receipt is `19a218a8-f0d8-472a-8465-2fe3d73c9151`, supplied to the
@@ -170,7 +218,39 @@ same unit amended under `Simplify-Unit: D1a`. Rust source and tests unchanged.
 Repair validation: workspace `.validation/simplify-2026-09/D1a/review-repair.md`.
 
 ### D1b
-pending — policy and transport aggregate refusals; commit: —; discoveries: —.
+landed — freshly re-reviewed and integrated into `simplify/2026-09`.
+Reviewed worker: `7a846d9be351bc130d49209cfa17f0b8cdc715c5`; fresh review:
+workspace `.validation/simplify-2026-09/D1b/rereview.md`.
+D1a integrated SHA: `88bc2d6da32ebdf901fe03f159a8ec0794b14816`.
+Batch gates, reviewed-to-integrated differences and cleanup receipts are recorded in
+workspace `.validation/simplify-2026-09/wave0-batch-3.md`. Auto-merged disjoint
+changelog/test/ledger additions; no semantic resolution. Integration amendments
+change only ledger metadata; D1a source additions are preserved.
+Self identity: `Simplify-Unit: D1b`, branch `simplify/unit-D1b` (one work commit).
+Base/prior D6b integrated SHA: `020f0bd72b7ad5ff1b2a14e857c703cbac6a052f`;
+D6a: `302cff4922c189a7783248ce159764a29765c522`; console D8a:
+`97e8625617aa44dbc4b62a58d6f005b98d0c7af6`; D8b:
+`e3896db08d675921070b5e17d021ee70c5293904`.
+Both conflict classes and every transport connect failure are reported together, without
+changing credential resolution, protocol inventory validation or authority boundaries.
+The two authorized policy assertions are re-expressed more precisely; the mixed four-name
+case and two real local-transport refusals pass. Package check/test, scoped Clippy,
+format, docs/audit-event, metadata and corrected mechanical gates pass. Raw non-Rust
+removal residue is confined to the canonical execution brief and a historical CHANGELOG
+entry (reported, not suppressed).
+Evidence: workspace `.validation/simplify-2026-09/D1b/report.md`; focused R1 repair:
+`.validation/simplify-2026-09/D1b/review-repair.md`.
+Review of `6a8e866d43d5f8afd684f9dcc99fc6d2f4ccb1b6` identified credential-bearing
+Telegram request URLs in aggregate diagnostics. The same amended unit strips reqwest URLs
+at getMe send and shared response-body error construction, preserving typed causes and
+underlying sources. A bounded two-synthetic-token loopback regression covers send failure,
+truncated body, Display, Debug and the gateway exit-chain renderer. It fails before the
+repair and passes after; all prior assertions and scoped package/mechanical/boundary gates
+remain green. No unrelated transport paths changed. Fresh re-review passed at the identity above.
+Discoveries: R1 resolved by this focused repair. Worker target was verified inactive,
+ignored and rebuildable and removed immediately after cherry-pick. Registered source
+stays until wave boundary; integration target stays only for the immediate full wave-0
+gate, then is reclaimed.
 
 ### D8a
 landed — console chat mode, freshly re-reviewed and integrated in the console repo;

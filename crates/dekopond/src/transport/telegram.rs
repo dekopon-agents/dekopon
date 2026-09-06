@@ -256,7 +256,8 @@ impl ChatTransport for TelegramTransport {
                     .get(self.method("getMe"))
                     .send()
                     .await
-                    .map_err(|source| TransportError::Request(Box::new(source)))?,
+                    // Telegram puts the credential in the URL, which reqwest retains on failure.
+                    .map_err(|source| TransportError::Request(Box::new(source.without_url())))?,
             )
             .await?;
             let handle = body["result"]["username"]
@@ -667,7 +668,8 @@ async fn decode(response: reqwest::Response) -> Result<Value, TransportError> {
     let bytes = response
         .bytes()
         .await
-        .map_err(|source| TransportError::Request(Box::new(source)))?;
+        // Body-read failures retain the same credential-bearing request URL as send failures.
+        .map_err(|source| TransportError::Request(Box::new(source.without_url())))?;
     let body =
         serde_json::from_slice::<Value>(&bytes).map_err(TransportError::MalformedResponse)?;
     if status.is_success() && body["ok"] == Value::Bool(true) {

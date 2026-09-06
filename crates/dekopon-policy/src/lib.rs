@@ -149,9 +149,8 @@ impl PolicyWorld {
     ///
     /// # Errors
     ///
-    /// Returns [`PolicyBuildError::DuplicateCapability`] when one capability identifier is declared
-    /// twice, and [`PolicyBuildError::ReservedAction`] when a capability collides with
-    /// [`AGENT_PROMPT_ACTION`].
+    /// Returns [`PolicyBuildError::WorldConflicts`] naming every reserved-action collision and
+    /// duplicate capability identifier together, with each list in identifier order.
     pub fn new(
         principals: impl IntoIterator<Item = PrincipalId>,
         capabilities: impl IntoIterator<Item = (CapabilityId, ProviderId)>,
@@ -160,9 +159,11 @@ impl PolicyWorld {
         for principal in principals {
             world.principals.insert(principal);
         }
+        let mut reserved = BTreeSet::new();
+        let mut duplicates = BTreeSet::new();
         for (capability, provider) in capabilities {
             if matches!(capability.as_str(), AGENT_PROMPT_ACTION | SECRET_USE_ACTION) {
-                return Err(PolicyBuildError::ReservedAction { capability });
+                reserved.insert(capability.clone());
             }
             world.providers.insert(provider.clone());
             if world
@@ -170,8 +171,14 @@ impl PolicyWorld {
                 .insert(capability.clone(), provider)
                 .is_some()
             {
-                return Err(PolicyBuildError::DuplicateCapability { capability });
+                duplicates.insert(capability);
             }
+        }
+        if !reserved.is_empty() || !duplicates.is_empty() {
+            return Err(PolicyBuildError::WorldConflicts {
+                reserved: reserved.into_iter().collect(),
+                duplicates: duplicates.into_iter().collect(),
+            });
         }
         Ok(world)
     }
@@ -1280,17 +1287,15 @@ pub enum PolicyBuildError {
         /// Duplicated identifier.
         policy: String,
     },
-    /// One capability identifier was declared twice.
-    #[error("policy world declares capability {capability} more than once")]
-    DuplicateCapability {
-        /// Duplicated capability.
-        capability: CapabilityId,
-    },
-    /// A capability collided with the fixed `agent.prompt` action.
-    #[error("capability {capability} collides with the reserved agent.prompt action")]
-    ReservedAction {
-        /// Colliding capability.
-        capability: CapabilityId,
+    /// Every reserved-action collision and duplicate capability in the declared world.
+    #[error(
+        "policy world conflicts: reserved actions {reserved:?}; duplicate capabilities {duplicates:?}"
+    )]
+    WorldConflicts {
+        /// Reserved capability identifiers, sorted and unique.
+        reserved: Vec<CapabilityId>,
+        /// Duplicate capability identifiers, sorted and unique; at least one list is nonempty.
+        duplicates: Vec<CapabilityId>,
     },
     /// The declared world could not be turned into a Cedar entity store.
     #[error("policy entity store could not be built: {message}")]

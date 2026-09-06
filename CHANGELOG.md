@@ -7,6 +7,10 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- Policy-world construction reports every reserved and duplicate capability together; gateway startup reports every transport connection failure with its name and cause.
+
 ### Added
 
 - Helm deployment separates gateway UID 65533 from broker UID 65532, using IPC group

@@ -189,15 +189,18 @@ where
     let mut asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>> = HashMap::new();
     let mut activities: HashMap<String, Arc<dyn ChatActivity>> = HashMap::new();
     let mut thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>> = HashMap::new();
+    let mut connect_problems = Vec::new();
     for (spec, mut transport) in config.transports.iter().zip(built_transports) {
-        let identity =
-            transport
-                .connect()
-                .await
-                .map_err(|source| DekopondError::TransportConnect {
+        let identity = match transport.connect().await {
+            Ok(identity) => identity,
+            Err(source) => {
+                connect_problems.push(TransportConnectProblem {
                     transport: spec.name().to_owned(),
                     source,
-                })?;
+                });
+                continue;
+            }
+        };
         tracing::info!(
             event = "gateway_transport_connected",
             transport = spec.name(),
@@ -217,6 +220,12 @@ where
             thread_ownership.insert(spec.name().to_owned(), ownership);
         }
         transports.push(transport);
+    }
+
+    if !connect_problems.is_empty() {
+        return Err(DekopondError::TransportConnect {
+            problems: connect_problems,
+        });
     }
 
     let (usage_sender, usage_receiver) = mpsc::channel(USAGE_REPORT_BUFFER);
@@ -980,13 +989,11 @@ pub enum DekopondError {
     /// The configured broker did not answer a capability probe at startup.
     #[error("broker is not reachable; start dekopon-brokerd before the gateway")]
     BrokerProbe(#[source] dekopon_broker_protocol::ClientError),
-    /// A transport could not authenticate or open its wakeup path.
-    #[error("chat transport {transport} could not connect")]
+    /// Every transport that could not authenticate or open its wakeup path.
+    #[error("{}", render_problems(.problems))]
     TransportConnect {
-        /// Configured transport name.
-        transport: String,
-        #[source]
-        source: TransportError,
+        /// Transport names and connection failures, in configured order.
+        problems: Vec<TransportConnectProblem>,
     },
     /// Every transport ended on its own, with no shutdown asked for.
     ///
@@ -994,6 +1001,17 @@ pub enum DekopondError {
     /// difference between a supervisor restarting the gateway and a pod that stays green.
     #[error("every chat transport ended; the gateway can no longer be reached")]
     TransportsLost,
+}
+
+/// A configured transport and its connection failure.
+#[derive(Debug, Error)]
+#[error("chat transport {transport} could not connect")]
+pub struct TransportConnectProblem {
+    /// Configured transport name included in the diagnostic.
+    pub transport: String,
+    /// The underlying transport failure.
+    #[source]
+    pub source: TransportError,
 }
 
 /// One thing the daemon must hold before any transport authenticates.

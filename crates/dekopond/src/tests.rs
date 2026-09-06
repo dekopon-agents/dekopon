@@ -1375,6 +1375,168 @@ async fn every_missing_transport_credential_is_named_before_anything_connects() 
 }
 
 #[tokio::test]
+async fn every_failing_transport_connection_is_named_in_one_refusal() {
+    let directory = temporary();
+    fs::write(
+        directory.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .expect("write catalog");
+    let (broker, mut observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let mut document = document(directory.path());
+    document["broker"]["serverUid"] = json!(broker.server_uid);
+    let paths = [
+        directory.path().join("first.sock"),
+        directory.path().join("second.sock"),
+    ];
+    for path in &paths {
+        fs::write(path, "not a socket").expect("write protected non-socket fixture");
+    }
+    document["transports"] = json!([
+        { "name": "first", "kind": "local", "socketPath": paths[0] },
+        { "name": "second", "kind": "local", "socketPath": paths[1] }
+    ]);
+    document["routes"][0]["transport"] = json!("first");
+    let path = write_config(directory.path(), &document);
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::run(&path, std::future::pending()),
+    )
+    .await
+    .expect("startup is bounded")
+    .expect_err("both non-socket paths refuse transport startup");
+    let crate::DekopondError::TransportConnect { problems } = &error else {
+        panic!("expected aggregate connect refusal: {error:?}");
+    };
+    assert_eq!(problems.len(), 2);
+    let rendered = error.to_string();
+    for ((problem, name), path) in problems.iter().zip(["first", "second"]).zip(&paths) {
+        assert_eq!(problem.transport, name);
+        assert!(
+            matches!(&problem.source, TransportError::InsecureSocket { path: refused }
+            if refused == &path.display().to_string())
+        );
+        assert!(rendered.contains(&format!("chat transport {name} could not connect")));
+        assert!(
+            rendered.contains(&problem.source.to_string()),
+            "cause is rendered: {rendered}"
+        );
+        assert_eq!(
+            fs::read_to_string(path).expect("fixture survives"),
+            "not a socket"
+        );
+    }
+    assert!(observed.try_recv().is_ok(), "startup broker probe ran");
+    assert!(observed.try_recv().is_ok(), "startup inventory report ran");
+}
+
+#[tokio::test]
+async fn aggregate_telegram_connect_failures_never_render_bot_tokens() {
+    use std::error::Error as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    // Both sentinels are synthetic. One peer closes before headers; the other truncates the body.
+    let tokens = [
+        "synthetic-telegram-token-first",
+        "synthetic-telegram-token-second",
+    ];
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback peer");
+    let endpoint = format!("http://{}", listener.local_addr().expect("bound address"));
+    let peer = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for token in tokens {
+                let (mut stream, _) = listener.accept().await.expect("accept getMe");
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert!(request.len() < 8192, "bounded request headers");
+                    request.push(stream.read_u8().await.expect("read request byte"));
+                }
+                assert!(
+                    String::from_utf8(request)
+                        .expect("ASCII headers")
+                        .starts_with(&format!("GET /bot{token}/getMe "))
+                );
+                if token == tokens[1] {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{",
+                        )
+                        .await
+                        .expect("send truncated body");
+                }
+            }
+        })
+        .await
+        .expect("peer lifetime is bounded");
+    });
+    let mut problems = Vec::new();
+    for (name, token) in ["first-telegram", "second-telegram"]
+        .into_iter()
+        .zip(tokens)
+    {
+        let mut transport = crate::transport::telegram::TelegramTransport::new(
+            name.to_owned(),
+            endpoint.clone(),
+            token.to_owned(),
+            ActivityMode::Off,
+        )
+        .expect("build token-owning transport");
+        let source = tokio::time::timeout(Duration::from_secs(5), transport.connect())
+            .await
+            .expect("connect is bounded")
+            .expect_err("broken peer refuses startup");
+        let TransportError::Request(cause) = &source else {
+            panic!("expected typed request failure");
+        };
+        let request = cause
+            .downcast_ref::<reqwest::Error>()
+            .expect("reqwest cause preserved");
+        assert!(request.is_request() || request.is_body() || request.is_decode());
+        assert!(request.url().is_none(), "credential-bearing URL is removed");
+        assert!(
+            request.source().is_some(),
+            "underlying failure remains inspectable"
+        );
+        problems.push(crate::TransportConnectProblem {
+            transport: name.to_owned(),
+            source,
+        });
+    }
+    peer.await.expect("peer completed");
+    let error = crate::DekopondError::TransportConnect { problems };
+    for rendered in [
+        error.to_string(),
+        format!("{error:?}"),
+        dekopon_core::error_chain(&error).to_string(),
+    ] {
+        for token in tokens {
+            assert!(
+                !rendered.contains(token),
+                "bot token must never be rendered"
+            );
+        }
+        for name in ["first-telegram", "second-telegram"] {
+            assert!(
+                rendered.contains(name),
+                "both failing transports remain named"
+            );
+        }
+    }
+    let display = error.to_string();
+    assert_eq!(display.matches("chat service request failed").count(), 2);
+    assert!(
+        display.contains("error sending request"),
+        "send cause remains useful"
+    );
+    assert!(
+        display.contains("error decoding response body"),
+        "body cause remains useful"
+    );
+}
+
+#[tokio::test]
 async fn a_discord_transport_resolves_its_pinned_rest_endpoint() {
     let directory = temporary();
     let mut document = document(directory.path());
