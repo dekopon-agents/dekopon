@@ -67,6 +67,9 @@ assert security["capabilities"]=={"drop":["ALL"],"add":["CHOWN","FOWNER"]}
 assert security["readOnlyRootFilesystem"] and not security["allowPrivilegeEscalation"]
 gateway=next(c for c in pod["containers"] if c["name"]=="gateway")
 broker=next(c for c in pod["initContainers"] if c["name"]=="broker")
+for probe in ("startupProbe", "readinessProbe"):
+    assert broker[probe]["exec"]["command"] == ["dekopon-brokerd", "probe", "--socket", "/run/dekopon/broker.sock"]
+assert "livenessProbe" not in broker
 for c,uid in ((gateway,65533),(broker,65532)):
     assert c["securityContext"]["runAsUser"]==c["securityContext"]["runAsGroup"]==uid
     assert c["securityContext"]["capabilities"]=={"drop":["ALL"]}

@@ -6,6 +6,21 @@ Authorization and execution constraints are two separate files on purpose. `poli
 
 The broker accepts configured Unix peer UIDs, including a dedicated gateway UID. Every process running under a mapped UID can act as its configured principal/actor; group membership permits a connection, not an identity grant. Request payloads cannot provide or override identity, policy, constraints, credentials, or authorization.
 
+## Health probe
+
+```console
+dekopon-brokerd probe --socket /run/dekopon/broker.sock
+```
+
+Run as the broker owner UID, mapped separately from the gateway in `identities`.
+The existing protocol client verifies socket safety and the live server UID against
+its own effective UID, then requests capabilities with a two-second complete-exchange
+deadline and the default frame ceiling. An empty authorized listing is healthy.
+Success exits 0 without output; absent, refused, unmapped, wrong-server, malformed or
+stalled endpoints exit 1 with a diagnostic. Missing arguments exit 2. The probe rejects
+`--config` and `--http-bind`, loads no components or credentials, invokes nothing and
+initializes no telemetry.
+
 ## Configuration
 
 The configuration must be a regular single-link file owned by the server UID and must not be group/world writable. Audit, checkpoint, and checkpoint-lock parent directories must be owner-only. The socket has the separate IPC directory contract below. Provider components must be regular single-link files owned by the server UID and must not be group/world writable; their canonical parent directories must also be server-owned and not group/world writable. Writable non-sticky path ancestors are rejected.

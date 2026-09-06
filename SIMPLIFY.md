@@ -8,13 +8,16 @@ No releases, tags, crate publication/yanks, merges, live deployment or core PR y
 
 ## Current milestone — wave1-pair1-resumed integration
 
-D3a is freshly reviewed and cherry-picked; D3g is freshly reviewed and awaits serial
-integration. Batch scoped integration gates and push remain pending. One writer, serial
+D3a and D3g are freshly reviewed and serially integrated. Only ledger metadata and
+the independent Unreleased changelog entries required conflict resolution; source is
+unchanged from the reviewed unit patches. Batch scoped gates pass; validated push is
+recorded externally after this same-unit ledger amendment. One writer, serial
 builds with strictly >30 GiB free (two need >60 GiB; maximum two). D3a's exact inactive,
 ignored 4.8 GiB target was removed immediately after cherry-pick (physical free 76.84 →
 81.46 GiB); D3g target is absent. Registered worker sources stay until the wave boundary.
-Integration target is absent; its next named use is this pair's touched-package gates.
-Reclaim after those gates if no immediate next build is scheduled, or earlier for headroom.
+Integration target grew 0 → 1.1 → 7.2 → 7.7 GiB across check/test/Clippy-doc gates and
+was safely reclaimed after the final named local gate (physical free 73.71 → 81.00 GiB).
+No local builds remain scheduled for this pair; no speculative target retention.
 Shared sccache/wrapper/cache/incremental settings remain unchanged.
 
 Mechanical consequences are repaired inside their owning unit, recorded, re-gated and
@@ -23,6 +26,15 @@ behavior/meaningful API/credential-boundary changes stop; a required gate still 
 after bounded in-scope repair stops. No suppressions, weakened assertions or hidden residue.
 Integration may resolve independent mechanical conflicts and ledger metadata only.
 Evidence: `wave1-pair1-resumed-integrated.md`; detailed receipts in `wave1-pair1-resumed/`.
+
+Pair gate source head `72db95f540b6d507a871ccfc8afd9583b6163b27`: scoped locked
+check/test (481 distinct tests, zero failed/ignored, plus three IPC child reruns),
+all-target/all-feature warnings-denied Clippy, fmt, doctests/rustdoc, machete/deny,
+docs/audit/release metadata/regressions, scripts/actionlint, all nine Helm CI bodies
+including rendered init, cleanup controls, both privilege directions and mechanical
+checks pass. The final D3g amendment changes only this ledger; source equivalence and
+exact final non-build checks are recorded, not relabeled fresh builds. Raw residue
+remains D3a seven lines (eight expanded hits) and D3g nine hits, fully classified.
 
 ## Accepted receipts and remaining gates
 
@@ -99,17 +111,18 @@ prior stop at `wave1-stop.md`; historical free-space figures are not current hea
   integrated `e3896db08d675921070b5e17d021ee70c5293904`. Existing shell avoids model
   credential access, normal turn/chat and prior assertions preserved; seven published pins
   unchanged. Evidence: `D8b/review.md`; discoveries: none.
-- **D3a — integrated; batch gates pending.** Reviewed worker
+- **D3a — landed; batch gates pass.** Reviewed worker
   `ea3d0e0a56dacaf9590e2134506172be4e64bea4`, base `6537a0823567ba6e9e0dd6cb1c515c3651ca29c1`;
-  integrated self identity `Simplify-Unit: D3a` (resolved at next unit update).
+  integrated `8635680ccb7b0d16501237b992204c7cdb1c8461`.
   Authorized boxing/equivalent guard plus unused import and replay-only helper removal;
   175 scoped tests/Clippy/check/docs/dependency gates pass; only integration ledger differs.
   Recovery refs preserve `fb4a007a8aac69029b18cb822c28f692ae9d9104` and `045d643`.
   Evidence: `D3a/wave1-pair1-resumed-gate-repair.md`, `D3a/wave1-pair1-resumed-review.md`.
   Discoveries: seven classified raw brief/history/lexical lines (expanded reviewer eight hits);
   inert recorded-session test comment remains above cli_probe_path, not an executable consumer.
-- **D3g — reviewed, integration pending.** Worker/reviewed
+- **D3g — landed; batch gates pass.** Worker/reviewed
   `e79eb2c999b2d202263c70bfd6131a0f8276728a`, base `2e5d7a892602ea672579f0e54e1889eea724b8b6`.
+  Integrated self identity `Simplify-Unit: D3g` (exact SHA in batch evidence).
   Bounded owner-authenticated probe/chart command, 98 tests/full Helm bodies pass;
   no existing assertions/boundaries changed. Evidence: `D3g/report.md`,
   `D3g/wave1-pair1-resumed-review.md`; discovery: nine raw hits are brief/still-live runner

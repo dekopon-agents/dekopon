@@ -225,6 +225,13 @@ async fn ipc_process_boundary() {
         let mut client = Process(command.spawn().unwrap());
         wait(&mut client.0);
     };
+    let mut probe = Command::new(env!("CARGO_BIN_EXE_dekopon-brokerd"));
+    probe.args(["probe", "--socket", socket.to_str().unwrap()]);
+    if root {
+        probe.uid(server_uid).gid(gid);
+    }
+    let mut probe = Process(probe.spawn().unwrap());
+    wait(&mut probe.0);
     run_client("mapped", client_uid, server_uid, &socket);
     run_client("owner", server_uid, server_uid, &socket);
     run_client("wrong-pin", client_uid, server_uid.wrapping_add(1), &socket);

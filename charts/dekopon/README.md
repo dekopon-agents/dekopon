@@ -186,7 +186,7 @@ and renames it atomically.
 ## Probes
 
 There is no HTTP health endpoint, and the image is distroless with no shell, so an `exec` probe can
-only run one of the four binaries. Both probes run `dekopon-run broker capabilities`, which connects
+run `dekopon-brokerd probe --socket /run/dekopon/broker.sock`, which connects
 over the real socket, passes `SO_PEERCRED` in both directions, and gets back the capability list
 policy exposes to this peer. It is evaluated from the constraint catalog and the policy set and
 appends **no audit record**, so probing does not consume the audit log's bounded record budget.
@@ -206,10 +206,10 @@ appends **no audit record**, so probing does not consume the audit log's bounded
 - **No `livenessProbe`.** An automatic restart could kill a broker mid-invocation or lose an
   acknowledged in-memory webhook delivery. Process failure and readiness already remain visible.
 
-One consequence worth knowing: the probe runs `dekopon-run`, which reads
-`OTEL_EXPORTER_OTLP_ENDPOINT` from its environment. Do not set that variable on the broker
-container, or every probe exports a trace. `OTEL_EXPORTER_OTLP_HEADERS` is safe and is what the
-broker's own telemetry block needs.
+The probe runs as broker UID 65532, separately mapped from gateway UID 65533, and pins the
+server to its own effective UID. Its authenticated exchange has a two-second deadline and the
+protocol frame ceiling; absent, refused, unauthenticated or wrong-server sockets fail nonzero.
+It loads no configuration, components or credentials and initializes no telemetry.
 
 ## Draining takes both graces, in sequence
 

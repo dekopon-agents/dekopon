@@ -241,15 +241,13 @@ broker:
   # broker wants is RUST_LOG and, if broker.yaml has a telemetry section, OTEL_EXPORTER_OTLP_HEADERS
   # (the OpenTelemetry SDK reads ingest auth from there so a token never enters the config file).
   #
-  # Do not set OTEL_EXPORTER_OTLP_ENDPOINT on this container: the readiness probe runs dekopon-run,
-  # which reads that variable and would export a trace on every probe.
   env:
     - name: RUST_LOG
       value: info
   envFrom: []
 
   # There is no HTTP health endpoint and the image has no shell, so both probes run a real broker
-  # client: `dekopon-run broker capabilities` connects over the socket, passes SO_PEERCRED both
+  # client: `dekopon-brokerd probe` connects over the socket, passes SO_PEERCRED both
   # ways, and gets an authorized capability list back. It appends no audit record.
   #
   # The startup probe is also the ordering primitive: Kubernetes does not start dekopond until the

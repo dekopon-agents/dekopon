@@ -7,6 +7,10 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- `dekopon-brokerd probe --socket <path>` performs a bounded owner-authenticated health check; chart broker probes use it without loading credentials or telemetry.
+
 ### Removed
 
 - Remove recorded-session listing, transcript reconstruction, and model replay from the runner and agent library. Live agent tools and telemetry remain.

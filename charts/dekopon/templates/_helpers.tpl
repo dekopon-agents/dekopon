@@ -487,11 +487,11 @@ Arguments: dict "ctx" $ "sidecar" bool
   # audit log's bounded record budget.
   startupProbe:
     exec:
-      command: ["dekopon-run", "broker", "capabilities", "--socket", "{{ $.Values.paths.runtimeDir }}/broker.sock"]
+      command: ["dekopon-brokerd", "probe", "--socket", "{{ $.Values.paths.runtimeDir }}/broker.sock"]
     {{- toYaml $.Values.broker.startupProbe | nindent 4 }}
   readinessProbe:
     exec:
-      command: ["dekopon-run", "broker", "capabilities", "--socket", "{{ $.Values.paths.runtimeDir }}/broker.sock"]
+      command: ["dekopon-brokerd", "probe", "--socket", "{{ $.Values.paths.runtimeDir }}/broker.sock"]
     {{- toYaml $.Values.broker.readinessProbe | nindent 4 }}
   resources:
     {{- toYaml $.Values.broker.resources | nindent 4 }}

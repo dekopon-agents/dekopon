@@ -28,7 +28,7 @@ struct Cli {
     /// Bind the unauthenticated, read-only operational web UI.
     #[arg(long, value_name = "ADDRESS")]
     http_bind: Option<SocketAddr>,
-    /// Offline operator mode. Omit to serve the broker.
+    /// Maintenance or health-check mode. Omit to serve the broker.
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -36,6 +36,12 @@ struct Cli {
 #[cfg(unix)]
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Check the broker as its mapped owner UID without loading configuration.
+    Probe {
+        /// Broker-owned Unix socket; the server must have this process's UID.
+        #[arg(long, value_name = "PATH")]
+        socket: PathBuf,
+    },
     /// Resolve, materialize, and verify a startup-fixed provider set.
     Provider(ProviderArgs),
     /// Inspect a durable audit log without starting the broker.
@@ -127,6 +133,16 @@ async fn main() -> ExitCode {
             eprintln!("dekopon-brokerd: could not print command-line error: {print_error}");
         }
         return ExitCode::from(2);
+    }
+    // Health checks do not discover credentials or initialize telemetry/provider machinery.
+    if let Some(Command::Probe { socket }) = &cli.command {
+        return match probe(socket).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("dekopon-brokerd: probe failed: {}", error_chain(&error));
+                ExitCode::FAILURE
+            }
+        };
     }
     let provider_mode = cli.command.is_some();
 
@@ -235,6 +251,7 @@ fn validate_cli(cli: &Cli) -> Result<(), clap::Error> {
 #[cfg(unix)]
 async fn execute(cli: Cli) -> Result<(), AppError> {
     match cli.command {
+        Some(Command::Probe { socket }) => probe(&socket).await,
         Some(Command::Provider(provider)) => execute_provider(provider).await,
         Some(Command::Audit(audit)) => execute_audit(audit),
         None => {
@@ -246,6 +263,22 @@ async fn execute(cli: Cli) -> Result<(), AppError> {
             .await
         }
     }
+}
+
+#[cfg(unix)]
+async fn probe(socket: &std::path::Path) -> Result<(), AppError> {
+    use dekopon_broker_protocol::{BrokerClient, FrameLimits};
+    let client = BrokerClient::new(
+        socket,
+        dekopon_brokerd::current_uid(),
+        FrameLimits::default(),
+    )
+    .map_err(AppError::Probe)?;
+    tokio::time::timeout(std::time::Duration::from_secs(2), client.capabilities())
+        .await
+        .map_err(AppError::ProbeTimeout)?
+        .map_err(AppError::Probe)?;
+    Ok(())
 }
 
 #[cfg(unix)]
@@ -367,6 +400,10 @@ fn render<T: Serialize>(
 #[cfg(unix)]
 #[derive(Debug, Error)]
 enum AppError {
+    #[error("broker probe exceeded two-second deadline")]
+    ProbeTimeout(#[source] tokio::time::error::Elapsed),
+    #[error("broker probe failed")]
+    Probe(#[source] dekopon_broker_protocol::ClientError),
     #[error("could not install termination signal handler")]
     Signal(#[source] io::Error),
     #[error("broker service failed")]
@@ -389,6 +426,28 @@ mod tests {
     use clap::{CommandFactory as _, Parser as _};
 
     use super::{AuditCommand, Cli, Command, OutputFormat, ProviderCommand, validate_cli};
+
+    #[test]
+    fn probe_requires_only_a_socket_and_rejects_authority_arguments() {
+        let cli = Cli::try_parse_from(["dekopon-brokerd", "probe", "--socket", "/run/broker.sock"])
+            .unwrap();
+        assert!(validate_cli(&cli).is_ok());
+        assert!(
+            matches!(cli.command, Some(Command::Probe { socket }) if socket == Path::new("/run/broker.sock"))
+        );
+        assert!(Cli::try_parse_from(["dekopon-brokerd", "probe"]).is_err());
+        for flag in ["--server-uid", "--principal", "--provider", "--credential"] {
+            assert!(
+                Cli::try_parse_from(["dekopon-brokerd", "probe", "--socket", "x", flag, "x"])
+                    .is_err()
+            );
+        }
+        for flag in ["--config=x", "--http-bind=127.0.0.1:8080"] {
+            let cli =
+                Cli::try_parse_from(["dekopon-brokerd", flag, "probe", "--socket", "x"]).unwrap();
+            assert!(validate_cli(&cli).is_err());
+        }
+    }
 
     #[test]
     fn cli_definition_is_internally_consistent() {
