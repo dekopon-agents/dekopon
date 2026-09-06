@@ -6,11 +6,28 @@ No releases, crate publication, yanks, PR merges, or live deployments are author
 
 ## Milestone state
 
-Brief corrections committed as `5a8687c` before implementation. The residue gate and
-seven regression tests are installed in the gate commit (`Simplify-Unit: gate`). Next:
-wave 0 with D6 first. Initial physical free space: 90 GiB; at most two simultaneous
-build workers until measured headroom permits more. Other pre-existing worktrees remain
-untouched. No targets existed in the inspected core/console worktrees at preflight.
+**Blocked before implementation: native async child startup failed.** Brief corrections
+are committed as `5a8687c`; the residue gate is `2010f55` and its seven regression tests
+pass. Workflow `e8209c58-a289-47fd-89b7-1402eef7fb73` failed at `review-foundation` before
+any child session was created (attempt `06cff1ef-0486-4a77-b678-650402a1c5af`). No unit
+worker ran. The run cannot resume: no child session file was persisted.
+
+Exact setup failure: the installed `@earendil-works/pi-coding-agent` package does not
+provide `@earendil-works/pi-server`, `@earendil-works/pi-server/unix`, or
+`@earendil-works/pi-client/unix`; its async runner therefore cannot create child sessions.
+Repair native package/dependency availability before a clear same-protocol retry. Do not
+switch to foreground agents, standalone CLI runners, or another execution mode.
+
+At failure inspection: core integration and all 16 core unit worktrees are clean at
+`2010f55`; console integration and its two unit worktrees are clean at `9b6c068` (base
+`ef0bf3f`). All are preserved. No cargo/rustc processes or owned target directories exist.
+Core brief/gate were pushed to `origin/simplify/2026-09`; no PR was opened. This failure
+checkpoint records infrastructure state only, not a separately updated implementation unit.
+
+Initial physical free space: 90 GiB; after preparing worktrees, 89 GiB. Permit at most two
+simultaneous build workers until measured headroom allows more. Other pre-existing
+worktrees and the shared compiler cache remain untouched. Next executable action after
+repair: rerun the bounded native workflow, starting with foundation review and D6a.
 
 ## Contract reconciliation and discoveries
 
