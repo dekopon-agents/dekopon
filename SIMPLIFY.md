@@ -32,8 +32,7 @@ Evidence: workspace `.validation/simplify-2026-09/D6a/repair-report.md`, commit 
 `5741a42817c78b3ee4d8d779c51686f5dfbd8f69` (`D6a/review.md` in that evidence directory).
 Console D8a integrated commit: `97e8625617aa44dbc4b62a58d6f005b98d0c7af6`, reviewed
 worker `b5aa18afbe862ff48c85ac9a6c209b85fc4a6873` (`D8a/rereview.md`).
-This commit identifies itself by `Simplify-Unit: D6a`; resolve its integrated SHA in
-the next work metadata. Pair results and exact heads are recorded in workspace
+D6a integrated at `302cff4922c189a7783248ce159764a29765c522`. Pair results and exact heads are recorded in workspace
 `.validation/simplify-2026-09/wave0-pair1-integrated.md`. Integrated touched-package
 check/test (core 132, console 91; zero failed/ignored), fmt, scoped Clippy, doctest/rustdoc,
 doc/script/release-metadata/residue and privilege gates passed. All 224 Linux acceptance
@@ -89,7 +88,7 @@ publication, tag or merge is authorized at this boundary.
 ### D6a
 landed — implementation, unit acceptance and fresh review complete; integrated on
 `simplify/2026-09`. Reviewed worker: `5741a42817c78b3ee4d8d779c51686f5dfbd8f69`;
-integrated self identity `Simplify-Unit: D6a`; evidence: workspace
+integrated commit `302cff4922c189a7783248ce159764a29765c522`; evidence: workspace
 `.validation/simplify-2026-09/D6a/repair-report.md`. Owner-approved oversized-frame fixture
 repair preserves every existing assertion; all scoped gates and required real cross-UID
 acceptance passed. IPC GID derives from the broker-owned parent (no new config field).
@@ -97,7 +96,50 @@ Private credential/config/provider/store boundaries and owner-only clients are p
 Discoveries: broad deployment/architecture prose and chart init proof remain D6b-owned.
 
 ### D6b
-pending — chart/init ownership and deployment proof/docs, after D6a; commit: —; discoveries: —.
+landed — freshly re-reviewed and integrated into `simplify/2026-09`.
+Reviewed worker: `c4e471a09f85da7ced8018dc11a50afad8e2dbf7`; review:
+workspace `.validation/simplify-2026-09/D6b/rereview.md`. Only integration ledger metadata
+differs from the reviewed tree. Batch exact-head gates and cleanup receipts are recorded
+in workspace `.validation/simplify-2026-09/wave0-batch-2.md`. Worker target was absent
+immediately after cherry-pick; registered source stays until the wave boundary. Integration
+target stays only for immediate D1a/D1b and full wave-0 gates, then is reclaimed.
+Self identity: `Simplify-Unit: D6b`, branch `simplify/unit-D6b` (one amended work commit).
+Base/D6a integrated SHA: `302cff4922c189a7783248ce159764a29765c522`; prior console D8a
+integrated SHA: `97e8625617aa44dbc4b62a58d6f005b98d0c7af6`. Evidence: workspace
+`.validation/simplify-2026-09/D6b/report.md`.
+
+Chart pod/broker stays 65532:65532; gateway container is 65533:65533; supplementary
+IPC group 65534 reaches the broker-owned 0710 parent / 0660 socket. Gateway pins
+serverUid 65532 and realistic broker configuration maps UID 65533 separately from
+owner probes. Config tmpfs, temporary volumes and state subdirectory mounts are separate;
+private files stay 0600, directories 0700, with no fsGroup. The claim root stays root-owned.
+Rendered init commands and distinct-UID Linux OS processes prove mutual private-file
+denials, group connection and socket replacement refusal. Real-daemon mapped/unmapped,
+server pin/live-peer acceptance remains D6a's unchanged Linux proof, not the Python layout
+fixture: 223 of its 224 source/fixture hashes match; only the gateway README changed.
+Full Helm CI lane (render variants, schema, package parity, refusal and init tests),
+arm64 init acceptance, docs/audit-event, format, metadata and corrected mechanical gates
+passed. No Rust source or assertion changed; seven literal removed resource/anchor names
+have zero raw non-Rust residue. No Cargo target was created; owned disposable Docker
+containers/volumes were cleaned. Physical free space stayed above the two-worker 60 GiB gate.
+
+Focused review repair of `53b198be21a09d63967b9c8f7e5f5a03fdb939f0`: register each
+non-preexisting volume before interruptible creation. The actual allocation/cleanup prefix
+now has bounded Docker-stub controls for allocation-then-failure (42), TERM (143), preserved
+preexisting-object refusal, and successful cleanup. The original prefix fails the negative
+control with an allocated but untracked volume; the repaired prefix cleans every allocation.
+These are cleanup-control tests, not substitutes for real Docker layout or daemon proof.
+Restored the released 0.4 roadmap socket fact without changing current D6 documentation.
+Full Helm lane and existing boundary/seed/refusal assertions pass after this focused repair;
+no other implementation or assertion changed. Evidence: workspace
+`.validation/simplify-2026-09/D6b/review-repair.md` (amended exact identity resolved there).
+
+Discoveries for following owners: D2b must also remove checkpoint names from the new
+old-layout refusal loop; D2d still owns broad durability prose, and D7a owns retirement of
+broker-http.md. Existing claim upgrades require offline broker/ subdirectory and gateway
+credential ownership migration; init refuses unmigrated default broker files without
+changing their bytes. This unreleased chart requires a matching image containing D6a;
+no image publication/deployment, D3g probe change or D7 auth move was performed.
 
 ### D1a
 pending — Slack single 429 retry; commit: —; discoveries: —.
@@ -112,7 +154,11 @@ commit: `97e8625617aa44dbc4b62a58d6f005b98d0c7af6`; reviewed worker:
 `.validation/simplify-2026-09/D8a/rereview.md`; discoveries: D8b remains separate.
 
 ### D8b
-pending — existing console shell without model credential (console repo); commit: —; discoveries: —.
+landed — existing console shell without model credential, freshly reviewed and integrated
+in the console repository; commit: `e3896db08d675921070b5e17d021ee70c5293904`; reviewed worker:
+`943636e6c60bd3635d4447404d6f5616709f7551`; evidence: workspace
+`.validation/simplify-2026-09/D8b/review.md`. Normal turn/chat modes and all prior
+assertions remain; seven published requirements stay `=0.11.1`. Discoveries: none.
 
 ### D3a
 pending — recorded-session/replay deletion; commit: —; discoveries: —.

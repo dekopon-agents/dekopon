@@ -86,10 +86,9 @@ These are invariants, not defaults, and no operational convenience overrides the
 is [`dekopon-brokerd` § Boundaries](../crates/dekopon-brokerd/README.md#boundaries); the two that
 most often come up while operating are:
 
-- **The owner-only socket is one UID trust domain.** Every process running under that UID can act as
-  its configured principal. An attestor grant buys attribution and deny-by-default scoping in that
-  shape, not process separation. A dedicated gateway UID is committed direction, not current
-  behavior.
+- **IPC group membership is not identity.** The [current local process boundary](security-model.md#current-local-process-boundary)
+  separates gateway and broker UIDs; the broker maps the real peer UID, not its group.
+  Each mapped UID remains its own trust domain, not independent process attestation.
 - **The checkpoint is local integrity evidence, not tamper-proof storage.** It detects truncation and
   rollback relative to a retained checkpoint. Coordinated deletion of both files by whoever owns the
   host is not detectable from local state; retain or export checkpoint generations elsewhere if that

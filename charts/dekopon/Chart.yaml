@@ -2,9 +2,9 @@ apiVersion: v2
 name: dekopon
 description: Dekopon capability broker and chat gateway as one pod, sharing a Unix socket
 
-# The two daemons are one deployment because dekopon-brokerd binds a 0600 Unix socket and
+# The two daemons are one deployment because dekopon-brokerd binds a protected Unix socket and
 # authenticates its peer with SO_PEERCRED. There is no TCP transport, so the gateway can only
-# reach the broker through a shared filesystem namespace — one pod, one UID.
+# reach the broker through a shared filesystem namespace — one pod, distinct UIDs.
 type: application
 
 # Chart version. Independent of the application: this moves when the chart changes, and it is

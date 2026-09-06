@@ -19,7 +19,7 @@ One image, `ghcr.io/dekopon-agents/dekopon`, carrying all four binaries for `lin
 `dekopon/provider`, `dekopon/http`, and `dekopon/storage`, which are OCI artifacts rather than images.
 
 One image rather than four is a deployment fact, not a convenience. `dekopon-brokerd` binds a
-`0600` Unix socket and authenticates its peer with `SO_PEERCRED`; there is no TCP transport. A
+protected Unix socket and authenticates its peer with `SO_PEERCRED`; there is no TCP transport. A
 gateway can therefore only reach a broker through a shared filesystem namespace — in Kubernetes, a
 shared pod. Two containers in one pod running two images that must be version-locked buys nothing
 that one image with two `command`s does not.
@@ -152,21 +152,11 @@ In Kubernetes the same selection is `command: ["dekopon-brokerd"]` or `command: 
 
 ## Deployment notes
 
-`dekopon-brokerd` validates its runtime directories at startup and refuses to serve if they are
-wrong. The socket, audit, and checkpoint parents must be directories **owned by UID 65532 with mode
-`0700`** — group or world access of any kind is refused, read included.
-
-A bare `emptyDir` does not satisfy that: it is created root-owned and world-writable, and
-`fsGroup` only changes the group and adds group access, which the check rejects for the opposite
-reason. An init container running as root that creates the directory, `chown`s it to `65532:65532`,
-and `chmod`s it to `0700` is the shape that works. [`../charts/dekopon/`](../charts/dekopon/README.md)
-is that shape worked out in full — one pod, two containers, one UID — and is the intended consumer
-of this image.
-
-Configured peer UIDs must equal the broker's own UID — `65532` in this image — so a gateway sharing
-the pod's UID is the configuration the broker accepts today. That single-UID trust domain is a
-current limitation, recorded in [`security-model.md`](security-model.md), not something the image
-changes.
+The chart enforces the [current local process boundary](security-model.md#current-local-process-boundary).
+The image's default UID remains the broker/provider owner; the gateway container overrides it.
+Private credentials and state do not acquire group permissions. The init container creates
+separate private mounts and the broker-owned IPC directory; a bare `emptyDir` is insufficient.
+See the [chart layout and upgrade instructions](../charts/dekopon/README.md#paths-the-chart-owns).
 
 ## Publication
 

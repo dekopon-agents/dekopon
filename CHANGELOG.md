@@ -9,6 +9,11 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Added
 
+- Helm deployment separates gateway UID 65533 from broker UID 65532, using IPC group
+  65534 only for its socket. Init copies each daemon's private configuration separately,
+  isolates state and temporary mounts, and preserves seed-once model credentials. Existing
+  state claims require the offline ownership/layout migration in the chart README.
+
 - Broker IPC supports distinct mapped peer UIDs through a broker-owned `0660` socket
   in a non-writable shared-group directory. Owner-only `0600` clients remain supported;
   real peer authentication, server-UID pinning and private credential/store checks remain

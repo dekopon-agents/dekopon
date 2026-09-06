@@ -146,9 +146,9 @@ maintained [outside this tree](https://github.com/dekopon-agents/dekopon-provide
 not used by any shipped memory path. Optional durable chat turns carry across broker
 and gateway restarts only inside one provider/agent/sender/transport/channel/conversation scope and
 are retrieved on demand with `memory recent` or `memory search`. JSONL deduplication is permanent
-but finite; recording stops with `dedup-capacity` while reads continue. `dekopond` also runs under
-the same UID as the broker, so its attestor grant buys attribution and deny-by-default scoping
-rather than isolation; a dedicated gateway UID remains committed direction.
+but finite; recording stops with `dedup-capacity` while reads continue. The chart enforces the
+[current local process boundary](docs/security-model.md#current-local-process-boundary),
+with separate gateway and broker UIDs and private credential mounts.
 
 There is still no independently retained/signed/remote audit checkpoint service and no operator-CLI integration with the broker or the daemon — `dekopon` reads the catalog and manages the ChatGPT model-account login, nothing else. Secret sources currently use explicit strict bootstrap files: Vault dynamic leases, AWS ambient role chains/IRSA, GCP ADC/WIF, Azure managed identity, kubeconfig exec plugins, custom source CAs, caching/stale fallback, and transformed-reflection prevention do not exist. Catalog provider and status resources remain declarations only. The broker's provider manager currently has exact-reference sync/list/verify only: no SemVer ranges, private-registry credentials/custom roots, publisher-provenance verification, update/install/remove/prune lifecycle, revocation response, or container-staging integration. A digest proves bytes rather than publisher identity, so existing image staging retains its separate GitHub attestation checks. The immediate `dekopon-run` host exposes no WASI or custom imports and rejects every mutating capability, so it cannot read GitHub or post the review comment represented by the catalog example; only the broker can.
 
@@ -308,7 +308,7 @@ Read [`docs/security-model.md`](docs/security-model.md) for trust assumptions an
 
 ## Roadmap
 
-The next architectural milestones are independent checkpoint retention or signing, operator-CLI integration with the broker and the daemon, a dedicated gateway UID, and memory lifecycle UX (deletion/export) beyond the current optional on-demand durable chat-turn store. Broker-owned credentials, Cedar, identity/attestation, the unprivileged `dekopond`, and its bounded private-per-subject conversation history shipped in 0.3.0; persistent history now also offers an explicit exact-conversation shared scope, while 0.4.0 added distribution rather than authority. See [`docs/roadmap.md`](docs/roadmap.md); roadmap items are intentions, not shipped features.
+The next architectural milestones are independent checkpoint retention or signing, operator-CLI integration with the broker and the daemon, and memory lifecycle UX (deletion/export) beyond the current optional on-demand durable chat-turn store. Broker-owned credentials, Cedar, identity/attestation, the unprivileged `dekopond`, and its bounded private-per-subject conversation history shipped in 0.3.0; persistent history now also offers an explicit exact-conversation shared scope, while 0.4.0 added distribution rather than authority. See [`docs/roadmap.md`](docs/roadmap.md); roadmap items are intentions, not shipped features.
 
 ## Maintainer release process
 

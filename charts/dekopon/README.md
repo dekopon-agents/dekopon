@@ -23,6 +23,11 @@ Read [`crates/dekopon-brokerd/README.md`](https://github.com/dekopon-agents/deko
 permissions; it does not define or validate their contents, and the two daemons' own documentation
 is the only description of what goes in them.
 
+This unreleased chart boundary requires lockstep daemon binaries containing distinct-UID IPC
+support; select an image built from that source with `image.tag` or `image.digest`. The historical
+`appVersion` default alone does not prove those unreleased binaries are present. No image release
+or deployment is performed by these source changes.
+
 ## What it deploys
 
 One `Deployment`, `replicas: 1`, `strategy: Recreate`, and no chart-owned `Ingress`. An opt-in
@@ -35,11 +40,14 @@ routing; it is disabled by default. The broker never receives a TCP surface.
 | `broker` | native sidecar (`restartPolicy: Always`) when the gateway is enabled, otherwise the pod's only regular container | `dekopon-brokerd --config /etc/dekopon/broker.yaml` |
 | `gateway` | regular container, only when `gateway.enabled` | `dekopond --config /etc/dekopon/dekopond.yaml` |
 
-Both daemons run as UID/GID `65532:65532` and share `/run/dekopon`, an in-memory `emptyDir` holding
-the broker's `0600` Unix socket. That is the whole transport: the socket is owner-only, both ends
-verify the other with `SO_PEERCRED`, and `dekopon-brokerd` refuses to start when a configured peer
-UID is not its own euid, so one pod and one UID is not a simplification — it is the only shape the
-broker accepts today.
+The chart enforces the [current local process boundary](../../docs/security-model.md#current-local-process-boundary).
+Pod defaults and broker stay `65532:65532`; the gateway container is `65533:65533`.
+Supplementary group `65534` reaches only the broker's `0660` socket in its `0710` IPC
+directory. Gateway configuration must explicitly pin `broker.serverUid: 65532` and broker
+`identities` must map gateway UID `65533`; keep a separate UID `65532` mapping for broker
+probes. Inline gateway configuration without the pin is refused; existing Secrets are opaque
+and their owner must supply it. The gateway receives no broker configuration, secret, or storage
+mount, and the broker receives no gateway configuration, model credential, or temporary volume.
 
 The broker is a native sidecar rather than a second regular container because ordering matters in
 both directions. `dekopond` probes the broker once at startup and exits non-zero when the socket
@@ -58,11 +66,13 @@ wrong:
 
 | Tier | Applies to | Rule |
 |---|---|---|
-| A | `broker-credentials.yaml`, `secret-map.yaml`, the audit JSONL, the checkpoint, the checkpoint lock, every socket | rejected if `mode & 0o077 != 0` |
+| A | `broker-credentials.yaml`, `secret-map.yaml`, the audit JSONL, the checkpoint, the checkpoint lock | rejected if `mode & 0o077 != 0` |
 | B | `broker.yaml`, `policies.cedar`, `dekopond.yaml`, provider `.wasm` files and their parents | rejected if `mode & 0o022 != 0` |
-| C | socket, audit and checkpoint parent directories | must be `0700` and owned by the runtime UID |
+| C | audit and checkpoint parent directories | must be `0700` and owned by the runtime UID |
 | D | every ancestor up to `/` | must be a directory that is not group- or world-writable unless sticky |
 | E | `catalogPath` | no checks at all |
+
+Broker IPC instead uses the exact owner/group/mode checks in the [current boundary](../../docs/security-model.md#current-local-process-boundary); local chat remains private.
 
 Tier A and B additionally require `uid == geteuid()`, `nlink == 1`, and an open with `O_NOFOLLOW`.
 
@@ -76,7 +86,7 @@ No Kubernetes volume can present a file that satisfies A or B:
 
 `fsGroup` is worth calling out on its own, because it is the reflex fix for "the pod cannot read its
 volume" and here it is the thing that breaks the credentials file specifically. It is deliberately
-absent from `podSecurityContext` and adding it will produce a broker that starts and then refuses.
+absent from `podSecurityContext` and adding it is a chart render refusal.
 
 So the chart mounts nothing the daemons read. A `projected` volume gathers every source into
 `/dekopon-source`, visible only to the init container, and the init container copies:
@@ -128,12 +138,29 @@ failure naming that file rather than a broker that starts and then refuses to se
 `podSecurityContext.runAsUser` is `65532` because the image bakes the provider components under that
 UID and `validate_owned_file` compares a provider's owner against the broker's own euid. Any other
 value makes every provider fail to load, which fails startup. The chart refuses to render when
-`runAsUser` is changed while `image.repository` is still the stock image.
+the broker UID/GID is changed, even with a custom image. Gateway container UID/GID is pinned separately; shared `securityContext` cannot override either identity.
 
 ## Paths the chart owns
 
 Your `broker.yaml` and `dekopond.yaml` must name files inside these directories. The chart places
 files; it does not rewrite configuration.
+
+Both containers use `paths.configDir` at runtime, but these are **different tmpfs volumes**.
+Init mounts the gateway volume at `paths.gatewayConfigDir` (default `/etc/dekopon-gateway`)
+only to copy its `dekopond.yaml` as UID 65533. Broker copies remain UID 65532.
+The state claim root stays root-owned `0700`; the broker mounts only its `broker/`
+subdirectory at `paths.stateDir`, and the gateway mounts only the configured ChatGPT
+subdirectory (which must not be `broker`). Neither daemon can rename the other's directory.
+Private subdirectories are `0700`; files are `0600` with one link. Each daemon gets a separate
+`/tmp` volume. The broker alone mounts provider storage and its namespace key.
+
+**Upgrade with both daemons stopped:** move existing broker-owned files from the state
+claim root into a `broker/` directory owned by `65532:65532`, mode `0700`, preserving
+file bytes and private modes. The init container refuses the old root audit/checkpoint
+layout rather than silently starting elsewhere. Change an existing ChatGPT directory and
+its live credential to `65533:65533`, keeping directory `0700` and file `0600`; do not
+reseed a rotated token. Update the gateway peer mapping and explicit server pin in operator
+configuration. These are offline operator steps, not a live-cluster action performed by this chart.
 
 | File | Path | Tier | Written by |
 |---|---|---|---|
@@ -143,7 +170,7 @@ files; it does not rewrite configuration.
 | private `secret-map.yaml` | `/etc/dekopon/secret-map.yaml` | A | init container; broker only |
 | optional secret source projection | operator-selected absolute path | source-specific | mounted read-only into broker only through `broker.secretSourceVolumes` |
 | `dekopond.yaml` | `/etc/dekopon/dekopond.yaml` | B | init container |
-| broker socket | `/run/dekopon/broker.sock` | A + C | the broker, at bind |
+| broker socket | `/run/dekopon/broker.sock` | protected IPC | the broker, at bind |
 | audit chain | `/var/lib/dekopon/audit.jsonl` | A + C | the broker |
 | checkpoint | `/var/lib/dekopon/audit-checkpoint.json` | A + C | the broker |
 | checkpoint lock | `/var/lib/dekopon/audit-checkpoint.lock` | A + C | the broker |
@@ -240,8 +267,8 @@ gateway:
     existingSecret: dekopon-chatgpt-auth   # what `dekopon auth chatgpt export --expose-credential --namespace <ns>` emits
 ```
 
-The chart then places `/var/lib/dekopon/chatgpt/chatgpt-auth.json`, `0600`, owned by `65532`, in a
-`0700` directory owned by `65532`, **and never touches it again**.
+The chart then places `/var/lib/dekopon/chatgpt/chatgpt-auth.json`, `0600`, owned by `65533`, in a
+`0700` directory owned by `65533`, **and never touches it again**.
 
 ### Why this one file is different
 
@@ -269,16 +296,16 @@ So the guard is the whole mechanism, because `install` overwrites unconditionall
 [ -d /var/lib/dekopon/chatgpt ] || mkdir -p /var/lib/dekopon/chatgpt
 chown 0:0 /var/lib/dekopon/chatgpt && chmod 0700 /var/lib/dekopon/chatgpt
 if [ ! -e /var/lib/dekopon/chatgpt/chatgpt-auth.json ]; then
-  install -m 0600 -o 65532 -g 65532 \
+  install -m 0600 -o 65533 -g 65533 \
     /dekopon-source/chatgpt-auth.json /var/lib/dekopon/chatgpt/chatgpt-auth.json
 fi
-chmod 0700 /var/lib/dekopon/chatgpt && chown 65532:65532 /var/lib/dekopon/chatgpt
+chmod 0700 /var/lib/dekopon/chatgpt && chown 65533:65533 /var/lib/dekopon/chatgpt
 ```
 
 `-e`, not `-f` and not `-s`: anything at that path — zero bytes, odd type, a leftover from a crash —
 means *seeded*, and a credential this chart cannot interpret is not a credential it should
 overwrite. The directory is reclaimed to `root` first for the same reason the other directories
-are: after a previous run it is `0700` and owned by `65532`, and root without `DAC_OVERRIDE` cannot
+are: after a previous run it is `0700` and owned by `65533`, and root without `DAC_OVERRIDE` cannot
 read through it to run the test at all.
 
 ### It lives on the claim, and that is the point
@@ -289,9 +316,8 @@ on every reschedule — the same bug, just rarer and harder to see. Making the l
 rather than configured means it cannot be pointed somewhere ephemeral by accident.
 
 The gateway mounts that directory with `subPath`, so it gets the credential directory and nothing
-else on the claim — it never holds a path to the audit chain. Same UID, so this is reachability
-rather than isolation, but the unprivileged half has no business being able to open the broker's
-durable state.
+else on the claim. The broker mounts its separate sibling; neither daemon mounts the claim
+root, and distinct UID ownership additionally denies access to the other's private files.
 
 `DEKOPON_CHATGPT_AUTH_FILE` is set on the gateway container to that path. Without it, a model with
 no explicit `authFile` falls back to `$XDG_CONFIG_HOME` and then `$HOME`, which is on the read-only
@@ -394,8 +420,8 @@ moment somebody sets `state.existingClaim` or the chart source fails to resolve.
 covers the sync, `Delete=false` covers the `Application` itself being deleted, and Argo reads both
 off the live object. Both annotations follow `state.keepOnUninstall`.
 
-`state.existingClaim` points the pod at a claim you manage. The init container still takes its root
-to `65532:0700`.
+`state.existingClaim` points the pod at a claim you manage. Init keeps its root at `0:0:0700`
+and gives each daemon only its own private subdirectory, as in [Paths the chart owns](#paths-the-chart-owns).
 
 ## seccomp
 
@@ -654,7 +680,11 @@ own volume. It may post one review comment and has no approval, request-changes,
   command has been run verbatim on `linux/arm64` and `linux/amd64` under its rendered
   `securityContext` against a fixture built to match a projected volume's symlink layout, but no
   `kubectl apply` has happened.
-- The daemons have never been started from this configuration. The image an empty `image.tag`
+- The complete provider/model deployment has not been started from this configuration. The
+  real-daemon Linux `ipc_process.rs` suite proves mapped/unmapped cross-UID connections and
+  server pin/live-peer refusals. `ci/verify-init-permissions.sh` executes actual rendered init
+  commands, checks mounts/identities, and runs distinct-UID OS processes against that layout;
+  its Python socket fixture is not a real daemon. The image an empty `image.tag`
   resolves to does exist — `ghcr.io/dekopon-agents/dekopon` carries a tag for every release from
   `v0.4.0` — but nothing here has watched one boot.
 - **The pull path is unproven.** `dekopon-chart-0.3.0` ran `chart-publish.yml` and chart `0.3.0`
@@ -670,7 +700,7 @@ own volume. It may post one review comment and has no approval, request-changes,
   start, a simulated rotation, two restart shapes, and the gated re-seed — including a negative
   control confirming that removing the `[ -e ]` test does revert the credential. But no real
   `dekopond` has refreshed a real token through it. What was exercised is the file-level contract
-  (`0600`, owner `65532`, one link, a `0700` directory, temp sibling plus rename by UID 65532), not
+  (`0600`, owner `65533`, one link, a `0700` directory, temp sibling plus rename by UID 65533), not
   a live refresh against OpenAI.
 - The `PodSecurity` `restricted` profile would reject this pod: the init container runs as root.
   `baseline` is fine.

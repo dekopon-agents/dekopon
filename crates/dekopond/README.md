@@ -99,7 +99,7 @@ nothing by doing so — the broker's attestor grant and identity mapping still g
 everything — but it is a development tool, not a production transport.
 
 Configuration, transport semantics, session bounds, telemetry, the conversation contract,
-and the single-UID caveat are documented in
+and the distinct-UID deployment boundary are documented in
 [`docs/dekopond.md`](../../docs/dekopond.md).
 
 ## Run

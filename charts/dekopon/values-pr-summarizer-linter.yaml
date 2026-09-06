@@ -27,7 +27,7 @@ broker:
       providers:
         - /opt/dekopon/providers/gh-provider.wasm
       identities:
-        - uid: 65532
+        - uid: 65533
           principal: dekopond-gateway
           actor:
             type: service
@@ -38,6 +38,11 @@ broker:
               - breadth: transportWide
                 kind: slack
                 transport: workspace-slack
+        - uid: 65532
+          principal: dekopond-gateway
+          actor:
+            type: service
+            principal: dekopond-gateway
       identityMappings:
         - subject: slack.t0123abcd.u0123abcd
           principal: maintainer
