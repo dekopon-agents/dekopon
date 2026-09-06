@@ -181,9 +181,10 @@ The session:
    A failed session says exactly one thing instead: `The agent could not complete this request.` A
    model's own error text, a provider message, and a transport diagnostic are all things chat is
    the last place for; the operator reads the category from telemetry.
-4. **What the next message remembers.** The route is `mode: persistent`, so this exchange is kept
-   as one `(question, answer)` pair in the gateway's memory and replayed ahead of the next message
-   from *this sender in this conversation* — which is what makes a follow-up like "and 4712?"
+4. **What the next message remembers.** The route is `mode: persistent` with
+   `scope: privateConversation`, so this exchange is kept as one `(question, answer)` pair in the
+   gateway's memory and replayed ahead of the next message from *this sender in this conversation*
+   — which is what makes a follow-up like "and 4712?"
    answerable. Only the question and the answer are kept: the `http-probe.fetch` output above is
    dropped at write-back and never replayed. Nothing is written to disk, nothing reaches the broker, and
    fifteen idle minutes or a narrowed grant drops it. Set the route to `mode: oneShot` — or leave
@@ -302,9 +303,10 @@ already act as the configured gateway peer. `via` and namespace scoping become r
 when the gateway has its own UID, and that deployment is committed direction rather than current
 behavior. [`../../docs/security-model.md`](../../docs/security-model.md) states this in full.
 
-This route is `mode: persistent`, so the gateway replays a bounded window of earlier turns
-from the same sender into the next prompt. Nothing carries beyond that conversation: the
-agent has no memory that outlives it.
+This route is `mode: persistent` and explicitly pins `scope: privateConversation`, so the gateway
+replays a bounded window of earlier turns from the same authenticated sender into the next prompt.
+Nothing carries beyond that conversation: the agent has no memory that outlives it. The broader
+`sharedConversation` option is intentionally not enabled in this deployment walkthrough.
 
 ## Related
 

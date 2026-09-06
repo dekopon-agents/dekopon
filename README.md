@@ -308,7 +308,7 @@ Read [`docs/security-model.md`](docs/security-model.md) for trust assumptions an
 
 ## Roadmap
 
-The next architectural milestones are independent checkpoint retention or signing, operator-CLI integration with the broker and the daemon, a dedicated gateway UID, and memory lifecycle UX (deletion/export) beyond the current optional on-demand durable chat-turn store. Broker-owned credentials, Cedar, identity/attestation, the unprivileged `dekopond`, and its bounded per-sender conversation history shipped in 0.3.0; 0.4.0 added distribution rather than authority. See [`docs/roadmap.md`](docs/roadmap.md); roadmap items are intentions, not shipped features.
+The next architectural milestones are independent checkpoint retention or signing, operator-CLI integration with the broker and the daemon, a dedicated gateway UID, and memory lifecycle UX (deletion/export) beyond the current optional on-demand durable chat-turn store. Broker-owned credentials, Cedar, identity/attestation, the unprivileged `dekopond`, and its bounded private-per-subject conversation history shipped in 0.3.0; persistent history now also offers an explicit exact-conversation shared scope, while 0.4.0 added distribution rather than authority. See [`docs/roadmap.md`](docs/roadmap.md); roadmap items are intentions, not shipped features.
 
 ## Maintainer release process
 

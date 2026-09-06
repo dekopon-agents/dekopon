@@ -108,6 +108,13 @@ The subject is still routing metadata rather than authority. The broker alone re
 `identityMappings`, and Cedar must separately permit that principal to drive the routed agent.
 An unmapped Discord sender is refused before any model call.
 
+A persistent route remains `privateConversation` when `scope` is omitted. If an operator explicitly
+sets `scope: sharedConversation` on a guild-channel route, Discord's conversation identity is the
+**whole channel** (a native thread is its own channel), so every independently authorized
+participant there can receive prior turns and attachment references from that window. Shared turns
+also send each canonical Discord subject identifier to the model provider even when telemetry
+payloads are disabled. This example does not enable that audience expansion.
+
 ## Photos and files
 
 A Discord attachment contributes its untrusted filename, media type, and reported size to the

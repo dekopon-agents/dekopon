@@ -8,14 +8,15 @@
 //!
 //! # Why the key is minted rather than derived
 //!
-//! The obvious key for a conversation is the thing that already identifies it: the canonical
-//! subject, or a hash of it. Both are refused here. A canonical subject can be a phone number
-//! (`tel.16035550100`), so sending it as a cache key would hand a model provider the sender's
-//! identity for no benefit at all — the request routes the same either way. Hashing does not fix
-//! it: a hash of a stable subject is a stable pseudonym, which is exactly the linkability this
-//! project declines to put in its own telemetry when `telemetryPayloads` is off, and it would be
-//! worse to hand one to a third party. A configured salt is worse still, because it is a new secret
-//! to manage whose only purchase is a pseudonym that survives restarts.
+//! The obvious key for a conversation is the thing that already identifies its audience: a
+//! canonical subject or service-native conversation identifier, or a hash of either. All are
+//! refused here. A canonical subject can be a phone number (`tel.16035550100`), and a channel or
+//! thread identifier can identify a small group, so sending either as a cache key would hand a model
+//! provider extra identity for no benefit — the request routes the same either way. Hashing does
+//! not fix it: a hash of a stable identifier is a stable pseudonym, which is exactly the linkability
+//! this project declines to put in its own telemetry when `telemetryPayloads` is off, and it would
+//! be worse to hand one to a third party. A configured salt is worse still, because it is a new
+//! secret to manage whose only purchase is a pseudonym that survives restarts.
 //!
 //! So the identifier is minted from entropy and carries nothing at all. It rotates whenever the
 //! thing it names is recreated — a conversation evicted for idleness, capacity, or a changed grant

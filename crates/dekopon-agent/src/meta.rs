@@ -38,14 +38,26 @@ pub struct EffectiveCapabilityView {
     pub idempotency: String,
 }
 
+/// Effective audience of a persistent replay window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConversationScopeView {
+    /// One authenticated transport subject sees only its own transcript.
+    PrivateConversation,
+    /// Authenticated subjects in one exact routed conversation share a transcript.
+    SharedConversation,
+}
+
 /// Conversation behavior of the route serving this session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "mode", rename_all = "camelCase")]
 pub enum ConversationConfigView {
     /// Every message starts with no remembered conversation.
     OneShot,
-    /// A bounded per-sender history is replayed.
+    /// A bounded private or intentionally shared history is replayed.
     Persistent {
+        /// Effective audience selected by trusted route configuration.
+        scope: ConversationScopeView,
         /// Milliseconds after which an idle conversation is no longer replayed.
         idle_timeout_ms: u64,
         /// Maximum remembered exchanges.
@@ -209,7 +221,7 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        AgentConfigView, ConversationConfigView, EffectiveCapabilityView,
+        AgentConfigView, ConversationConfigView, ConversationScopeView, EffectiveCapabilityView,
         MAX_AGENT_CONFIG_TOOL_BYTES, SessionConfigView, SkillView,
     };
 
@@ -223,6 +235,7 @@ mod tests {
                 max_steps: 8,
                 max_capability_calls: 16,
                 conversation: ConversationConfigView::Persistent {
+                    scope: ConversationScopeView::PrivateConversation,
                     idle_timeout_ms: 900_000,
                     max_turns: 12,
                     max_bytes: 65_536,
@@ -247,11 +260,45 @@ mod tests {
         assert_eq!(value["agent"]["id"], "reviewer");
         assert_eq!(value["prompt"]["instructions"], "Be concise.");
         assert_eq!(value["session"]["maxSteps"], 8);
-        assert_eq!(value["session"]["conversation"]["mode"], "persistent");
+        assert_eq!(
+            value["session"]["conversation"],
+            serde_json::json!({
+                "mode": "persistent",
+                "scope": "privateConversation",
+                "idle_timeout_ms": 900_000,
+                "max_turns": 12,
+                "max_bytes": 65_536
+            })
+        );
         assert_eq!(value["effectiveAuthorization"]["engine"], "Cedar");
         assert_eq!(
             value["effectiveAuthorization"]["capabilities"][0]["id"],
             "gh.pull-request.read"
+        );
+    }
+
+    #[test]
+    fn conversation_inspection_is_mode_only_for_one_shot_and_names_shared_scope() {
+        assert_eq!(
+            serde_json::to_value(ConversationConfigView::OneShot).expect("view serializes"),
+            serde_json::json!({"mode": "oneShot"}),
+            "persistent-only fields stay absent from one-shot inspection"
+        );
+        assert_eq!(
+            serde_json::to_value(ConversationConfigView::Persistent {
+                scope: ConversationScopeView::SharedConversation,
+                idle_timeout_ms: 1,
+                max_turns: 2,
+                max_bytes: 3,
+            })
+            .expect("view serializes"),
+            serde_json::json!({
+                "mode": "persistent",
+                "scope": "sharedConversation",
+                "idle_timeout_ms": 1,
+                "max_turns": 2,
+                "max_bytes": 3
+            })
         );
     }
 
