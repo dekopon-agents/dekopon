@@ -1,6 +1,6 @@
 # The gateway's catalog: which agent answers, and which capabilities it may propose.
 #
-# This file grants nothing. It is read by `dekopond` (and by the `dekopon` CLI) to decide which
+# This file grants nothing. It is read by `dekopond` to decide which
 # agent a route names and which capability words its shell session may even spell. Every one of
 # those proposals still has to pass the broker's Cedar policy in `policies.cedar`, and the broker
 # reads this file never. Deleting a capability here narrows what the agent can attempt; it does

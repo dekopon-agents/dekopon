@@ -329,8 +329,28 @@ prior stop at `wave1-stop.md`; historical free-space figures are not current hea
   Final ledger-only head is not a new native/smoke execution; full-wave gates remain.
 - **D7a — pending.** Webui embedding and broker-http retirement; commit: —;
   preserve surviving HTTP/storage security invariants at their canonical home.
-- **D7b — pending.** Move ChatGPT auth to gateway before CLI deletion; commit: —;
-  examples/local has surviving config/skill readers requiring authorized fixture migration.
+- **D7b — landed; fresh review and integration gates passed.** Commit: `Simplify-Unit: D7b`
+  on `simplify/2026-09`; reviewed worker `a8eaf672eec75b19f685997f86f6ed9b79e77fb3`.
+  Auth dispatches in the gateway before configuration/telemetry/runtime; the standalone
+  catalog CLI/package is retired. Three catalog/skill fixtures moved byte-for-byte;
+  surviving auth/renderer assertions remain. The bounded diagnostic repair uses a typed
+  credential-parse projection and two added regressions; current reader docs distinguish
+  retained metadata from real presentation, including protocol schema descriptions.
+  Fresh CORE five-package native, CLI, chart/Linux, offline Homebrew/Ruby, twelve-case
+  diagnostic and real two-daemon smoke execution: `4365e686bbe24e204d380545b92a083dfa1fff4f`,
+  preserved at `refs/checkpoints/simplify-D7b-integration-native-4365e68`.
+  Actual native union: 404 (397 plus protocol union 7 from 6/7 executions), zero doctests.
+  Smoke: five span families, two independent native daemon correlations, full bounded
+  ingestion/retrieval and redaction, ten controls; eleven additional auth controls passed.
+  Current worker/native/smoke non-ledger aggregate:
+  `1453651acd4402a4c92284c9cb031588f0f7fc8898d1ba726b54fb9a0bc00cdc`.
+  Historical owner execution `688f73e41be2e9ada58083023e7f47dde2bce5bc` stays separately named;
+  reader-tail config's 23-test execution is not another full-suite run. Original/repair
+  STOP, RED and auxiliary helper failures remain preserved in external D7b evidence.
+  This final ledger-only amendment is not a new native/CLI/smoke execution; final static
+  identity/residue, guarded artifact cleanup and push receipts belong in D7b/final-accepted.md.
+  Guest inputs remain equivalent; zero provider rebuilds. No unresolved D7b discovery;
+  named future-unit residue and full-wave/package-archive/MSRV/exact-head CI gates remain.
 - **D2c — pending.** Append-only JSONL; requires D2b; commit: —; discoveries: —.
 - **D3c — pending.** Atomic runner/provider-host/manifests/lock/release/packaging retirement
   includes D3d; needs D8a/D8b/D3a/D3b/D3g; commit: —; no orphan interval.

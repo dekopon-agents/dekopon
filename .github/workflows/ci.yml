@@ -97,7 +97,7 @@ jobs:
       # Path installation uses the debug profile so it can reuse the smoke-test build. Keep a
       # release-profile compile gate here; tag workflows still perform the final linked builds.
       - name: Check release CLIs
-        run: cargo check --release --locked -p dekopon -p dekopon-run -p dekopon-brokerd -p dekopond
+        run: cargo check --release --locked -p dekopon-run -p dekopon-brokerd -p dekopond
       # Every other gate builds --all-features, so nothing else compiles the foundational crates
       # with their opt-in `schemars` feature off — the state a crates.io consumer gets by default.
       - name: Check foundational crates without the schemars feature
@@ -109,15 +109,6 @@ jobs:
         run: |
           set -euo pipefail
           tree=$(cargo tree --locked -p dekopon-run --edges normal --prefix none)
-          if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host|storage-host|policy) v' <<<"$tree"; then
-            printf '%s\n' "$tree" >&2
-            exit 1
-          fi
-      - name: Verify the operator CLI excludes privileged broker machinery
-        shell: bash
-        run: |
-          set -euo pipefail
-          tree=$(cargo tree --locked -p dekopon --edges normal --prefix none)
           if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host|storage-host|policy) v' <<<"$tree"; then
             printf '%s\n' "$tree" >&2
             exit 1
@@ -566,29 +557,17 @@ jobs:
           restore-keys: |
             cargo-registry-v1-${{ runner.os }}-
       - name: Build CLIs
-        run: cargo build --locked -p dekopon -p dekopon-run -p dekopon-brokerd -p dekopond
+        run: cargo build --locked -p dekopon-run -p dekopon-brokerd -p dekopond
       - name: Fetch exact standalone echo fixture
         run: ci/fetch-external-provider-components.sh examples/providers echo
       - name: Exercise generated help and example commands
         shell: bash
         run: |
           set -euo pipefail
-          bin=target/debug/dekopon
           runner=target/debug/dekopon-run
           broker=target/debug/dekopon-brokerd
           gateway=target/debug/dekopond
-          config=examples/local/dekopon.yaml
           provider=examples/providers/echo-provider.wasm
-          "$bin" --help >/dev/null
-          "$bin" get --help >/dev/null
-          "$bin" --config "$config" get agents >/dev/null
-          "$bin" --config "$config" get agents -o wide >/dev/null
-          "$bin" --config "$config" get agent reviewer -o yaml >/dev/null
-          "$bin" --config "$config" get capabilities -o name >/dev/null
-          "$bin" --config "$config" get providers >/dev/null
-          "$bin" --config "$config" describe agent reviewer >/dev/null
-          "$bin" --config "$config" validate >/dev/null
-          "$bin" --config "$config" config view -o json >/dev/null
           "$runner" --help >/dev/null
           "$runner" broker --help >/dev/null
           "$runner" broker invoke --help >/dev/null
@@ -597,9 +576,9 @@ jobs:
           "$broker" --version >/dev/null
           "$gateway" --help >/dev/null
           "$gateway" --version >/dev/null
-          "$bin" auth chatgpt export --help >/dev/null
+          "$gateway" auth chatgpt export --help >/dev/null
           DEKOPON_CHATGPT_AUTH_FILE="$RUNNER_TEMP/dekopon-chatgpt-test-auth.json" \
-            "$bin" auth chatgpt status >/dev/null
+            "$gateway" auth chatgpt status >/dev/null
           "$runner" inspect --provider "$provider" >/dev/null
           "$runner" invoke --provider "$provider" echo.echo --input '{}' >/dev/null
           "$runner" invoke --provider "$provider" echo.ransom-case \
@@ -612,7 +591,7 @@ jobs:
           cat >"$auth" <<'JSON'
           {"version":1,"access":"access-token-fixture","refresh":"refresh-token-fixture","expiresAt":1700000000,"accountId":"acct-fixture"}
           JSON
-          target/debug/dekopon auth chatgpt export --auth-file "$auth" \
+          target/debug/dekopond auth chatgpt export --auth-file "$auth" \
             --expose-credential --namespace dekopon >"$RUNNER_TEMP/chatgpt-secret.yaml"
           grep -q '^apiVersion: v1$' "$RUNNER_TEMP/chatgpt-secret.yaml"
           grep -q '^kind: Secret$' "$RUNNER_TEMP/chatgpt-secret.yaml"
@@ -622,44 +601,23 @@ jobs:
             | base64 -d | diff - "$auth"
           # An export with no credential must fail rather than emit a half-formed secret.
           set +e
-          target/debug/dekopon auth chatgpt export --auth-file "$RUNNER_TEMP/absent-auth.json" \
+          target/debug/dekopond auth chatgpt export --auth-file "$RUNNER_TEMP/absent-auth.json" \
             --expose-credential >/dev/null 2>&1
-          status=$?
-          set -e
-          test "$status" -eq 1
-      - name: Verify invalid configuration exit behavior
-        shell: bash
-        run: |
-          set -euo pipefail
-          invalid="$RUNNER_TEMP/invalid-dekopon.yaml"
-          cat >"$invalid" <<'YAML'
-          apiVersion: dekopon.dev/v1alpha1
-          kind: Agent
-          metadata:
-            name: invalid
-          spec:
-            description: Missing declared capability
-            capabilities: [github.missing]
-          YAML
-          set +e
-          target/debug/dekopon --config "$invalid" validate >/dev/null 2>&1
           status=$?
           set -e
           test "$status" -eq 1
       - name: Verify path installation
         if: ${{ needs.changes.outputs.run_cli_install != 'false' }}
         shell: bash
-        # Reuse the debug workspace build rather than creating four independent release targets.
+        # Reuse the debug workspace build rather than creating three independent release targets.
         # The quality lane checks release-profile compilation in one unified dependency graph.
         env:
           CARGO_TARGET_DIR: target
         run: |
           set -euo pipefail
-          cargo install --debug --locked --path crates/dekopon --root "$RUNNER_TEMP/dekopon-install"
           cargo install --debug --locked --path crates/dekopon-run --root "$RUNNER_TEMP/dekopon-install"
           cargo install --debug --locked --path crates/dekopon-brokerd --root "$RUNNER_TEMP/dekopon-install"
           cargo install --debug --locked --path crates/dekopond --root "$RUNNER_TEMP/dekopon-install"
-          "$RUNNER_TEMP/dekopon-install/bin/dekopon" version
           "$RUNNER_TEMP/dekopon-install/bin/dekopon-run" --version
           "$RUNNER_TEMP/dekopon-install/bin/dekopon-brokerd" --version
           "$RUNNER_TEMP/dekopon-install/bin/dekopond" --version

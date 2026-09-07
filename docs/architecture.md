@@ -34,20 +34,10 @@ engine, is now available to providers the same way.
 
 The release otherwise retains the two deliberately separate synchronous execution surfaces introduced in 0.1, the privileged asynchronous host, authorization/evidence/audit libraries, separately deployed authenticated Unix broker, sandboxed one-tool scripting surface, and cross-process OpenTelemetry added in 0.2, and the unprivileged agent daemon `dekopond` added in 0.3, which connects to chat services and submits attested on-behalf-of proposals to the broker. Version 0.4 added distribution through release archives, a container image, a Helm chart, and a Homebrew tap; 0.5 added bounded chat attachments; 0.6 added `dekopon-webui`, a GET-only operational renderer embedded in the broker behind an explicit TCP bind; 0.7 added credential-free gateway self-inspection; 0.8 added Discord Gateway transport; 0.8.1 raised the per-turn tool-call guard from four to ten; 0.9 added opt-in transport-native in-flight activity with authenticated cooperative Stop; and 0.10 added a text-only Meta WhatsApp Cloud API gateway transport, opt-in route-scoped OpenAI image generation, broker-owned namespace-bound provider storage with the optional generated `memory-chat` provider, and a 145-finding deep-review hardening pass. None moved a responsibility between processes. Explicit `dekopon-run broker` commands remain unprivileged clients. The unsupported, mock-only Skylight provider exploration is removed from this tree and its public standalone source is [`dekopon-provider-skylight-private`](https://github.com/dekopon-agents/dekopon-provider-skylight-private). No standalone release is claimed, and it remains absent from default catalogs, images, policies, and deployments.
 
-The operator CLI retains its local catalog path:
+The gateway executable owns model-account lifecycle without starting its daemon runtime or loading configuration:
 
 ```text
-dekopon
-  -> discover one local config file
-  -> load and validate a typed catalog
-  -> execute a typed read command
-  -> render a typed result
-```
-
-Command execution is separated from configuration: `LocalConfigReader` owns every catalog read, and the typed `CatalogCommand` it is executed against excludes the two commands that never load a catalog, so no YAML handling spreads into command dispatch. The same operator surface owns model-account lifecycle without loading the catalog:
-
-```text
-dekopon auth chatgpt
+dekopond auth chatgpt
   -> fixed OpenAI device-auth host
   -> isolated Dekopon credential file
 ```
@@ -67,7 +57,7 @@ dekopon-run
   -> optionally export payload-free execution spans and lifecycle logs over OTLP/HTTP
 ```
 
-The immediate host links no WASI or custom imports, rejects non-read-only manifests, resolves no credentials, and cannot access external systems. It is provider computation tooling, not the privileged provider host. The unprivileged agent daemon is now present as `dekopond`, which holds chat and model credentials, no provider credentials, and no broker authority. The broker resolves legacy destination-bound credentials from an owner-only credentials file. It also accepts inert public DRNs as typed proposal metadata, requires separate `secret.use` authorization plus an owner-only private binding, resolves one source snapshot per invocation, and injects native Basic/Bearer material after guest-header validation. The separate Unix broker can expose policy-authorized provider effects through explicit `dekopon-run broker` commands, while `dekopon` and the direct runner subcommands cannot request them. Audit checkpoints are durably written to a separate atomic local file, but are not independently retained, signed, or remotely anchored.
+The immediate host links no WASI or custom imports, rejects non-read-only manifests, resolves no credentials, and cannot access external systems. It is provider computation tooling, not the privileged provider host. The unprivileged agent daemon is now present as `dekopond`, which holds chat and model credentials, no provider credentials, and no broker authority. The broker resolves legacy destination-bound credentials from an owner-only credentials file. It also accepts inert public DRNs as typed proposal metadata, requires separate `secret.use` authorization plus an owner-only private binding, resolves one source snapshot per invocation, and injects native Basic/Bearer material after guest-header validation. The separate Unix broker can expose policy-authorized provider effects through explicit `dekopon-run broker` commands, while auth and the direct runner subcommands cannot request them. Audit checkpoints are durably written to a separate atomic local file, but are not independently retained, signed, or remotely anchored.
 
 Of the crate boundaries below, the skill loader, `read_skill`, `suggest_improvement`, and `improvementSuggestions` entries are that unreleased post-`0.12.0` work. Crate boundaries are:
 
@@ -98,11 +88,10 @@ Of the crate boundaries below, the skill loader, `read_skill`, `suggest_improvem
 - `dekopond`: Unix-only unprivileged chat gateway and agent daemon with strict owner-controlled configuration, Slack Socket Mode / Discord Gateway / Telegram long-poll / text-only Meta WhatsApp Cloud API / local development transports, first-match routing to catalog agents, explicitly named route-scoped OpenAI image generators, typed text/image replies, authorization-fed bounded Slack Agent thread ownership, request-scoped optional no-reply decisions, opt-in transport-native in-flight activity after authorization, Slack Agent Stop handling through cooperative prompt/tool cancellation that also abandons an in-flight broker command run, admission-bounded sessions on the shared `dekopon-agent` loop, credential-free self-inspection built from gateway-owned prompt metadata plus the broker's fresh effective grant, the agent's catalog skills mounted on every session of its route with per-route opt-in `improvementSuggestions`, and attested on-behalf-of proposals to the broker. The WhatsApp listener is plain HTTP behind operator-owned TLS termination, authenticates exact raw webhook bytes before parsing, and answers text only through the pinned Graph messages endpoint without retrying outcome-unknown sends. It holds chat and model credentials, never a provider credential, and its dependency set excludes every privileged broker crate under the same CI check applied to `dekopon-run`. Generation, activity, and continuation targets come only from owner configuration and authenticated transport envelopes; filenames, endpoints, credentials, status content, and its fixed Slack reaction fallback are gateway-owned rather than model-selected, and the model cannot select a thread or sender.
 - `dekopon-provider-sdk-testkit`: in-process fake broker for provider test suites. It mints its own authorization through `AuthorizationGate`, skipping Cedar and the constraint catalog, and runs the real component against a real `StorageHost` over a temporary root. Consumed by out-of-tree provider repositories; it holds no authority of its own and nothing in the daemon path depends on it.
 - `dekopon-test-support`: unpublished shared test scaffolding (`publish = false`), reached only as a path `[dev-dependencies]` entry so it never enters a published manifest or the CI dependency-tree gates; see [`development.md`](development.md#repository-map).
-- `dekopon`: catalog and model-auth command parsing, resource reads, rendering, and process exits.
 
 ## Deployment boundary
 
-The deployment is three operator-visible roles, two of which are separate running processes:
+The deployment is two separate running processes; model auth is an offline gateway command:
 
 ```text
 dekopond
@@ -113,9 +102,6 @@ dekopond
 dekopon-brokerd
     authorization, credentials, provider execution, external effects,
     optional GET-only operational web view
-
-dekopon
-    human/operator control CLI
 ```
 
 `dekopond` is unprivileged and holds no broker authority. It may report a bounded, content-free catalog inventory and provider-reported model-token deltas for the broker-hosted UI; those reports are informational state, not trusted identity or authorization input, and reset with the broker process. `dekopon-brokerd` is a separate process for local Unix deployment; a future pod boundary needs a different authenticated transport. Direct requests carry no principal or actor fields: the broker derives exact context from OS peer UID and trusted configuration, while unique invocation IDs and verified durable history provide replay rejection. Attested requests add one typed on-behalf-of claim — a canonical external subject and the agent orchestrating for it — which the broker honors only under an owner-configured attestor grant, resolves to a principal through owner-controlled mappings alone, and admits only if policy permits that principal to drive that agent.

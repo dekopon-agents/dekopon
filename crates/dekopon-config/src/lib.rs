@@ -186,7 +186,7 @@ impl LocalCatalog {
         self.skills.get(id).map_or(&[], Vec::as_slice)
     }
 
-    /// Creates an owned, serializable view for `dekopon config view`.
+    /// Creates an owned, serializable view of the loaded catalog.
     #[must_use]
     pub fn snapshot(&self) -> CatalogSnapshot {
         CatalogSnapshot {
@@ -651,7 +651,7 @@ fn render_problems(problems: &[CatalogProblem]) -> String {
 /// One semantic problem in an otherwise parseable catalog.
 ///
 /// A catalog is scanned to the end before it is refused, so an operator fixing three mistakes
-/// runs `dekopon validate` once rather than three times. Problems are reported through
+/// loads the catalog once rather than three times. Problems are reported through
 /// [`ConfigError::Invalid`], which owns the source path they all share.
 #[derive(Debug, Error)]
 pub enum CatalogProblem {

@@ -81,7 +81,6 @@ The broker owns the only authority transition in this flow. The authenticated re
 
 | Component | Authority and responsibility | Status |
 |---|---|---|
-| `dekopon` | Human/operator CLI; reads typed resources, renders results, and owns model-account lifecycle commands | **Current**, local catalog plus isolated model auth; it contacts no other process |
 | `dekopon-core` | Validated identifiers and dependency-light domain types, including the `SkillId` name grammar | **Current** |
 | `dekopon-protocol` | Versioned, transport-independent resource shapes | **Current** |
 | `dekopon-config` | Config discovery, decoding, duplicate detection, reference validation, and bounded in-memory `Skill` loading from `SKILL.md` directories | **Current** |
@@ -96,7 +95,7 @@ The broker owns the only authority transition in this flow. The authenticated re
 | `dekopon-broker` | Trusted context binding, Cedar-decided authorization over owner-authored execution constraints, replay rejection/recovery, provider execution, digest evidence, and metadata-only hash-linked audit coordination | **Current** library with bounded in-memory and owner-only durable JSONL audit |
 | `dekopon-policy` | Bounded, deterministic Cedar adapter: generated schema, strict startup validation, declared entity world, deny-on-error decisions, determining policy identifiers, policy-set digest | **Current** library consumed only by `dekopon-broker` and `dekopon-brokerd` |
 | `dekopon-broker-protocol` | Lightweight strict versioned bounded frames and Unix client with identity/authority-free payloads and server peer-UID verification | **Current** shared broker/runner API with no privileged host or native-HTTP dependency |
-| `dekopon-model` | Bounded chat-model contract, OpenAI-compatible transport, ChatGPT/Codex subscription auth and Responses client, plus a fixed-endpoint bounded OpenAI Images client | **Current**, consumed by both CLIs and the gateway |
+| `dekopon-model` | Bounded chat-model contract, OpenAI-compatible transport, ChatGPT/Codex subscription auth and Responses client, plus a fixed-endpoint bounded OpenAI Images client | **Current**, consumed by the runner and gateway |
 | `dekopon-shell` | Sandboxed bash-flavored interpreter whose command words dispatch to capabilities through one abstract seam, with its own step, recursion, output, deadline, and capability-call bounds | **Current**; it links no Wasmtime, broker, HTTP, or filesystem code |
 | `dekopon-process` | Unprivileged one-run/one-node Tokio lifecycle seam whose internal supervisor preserves a typed operation result or Tokio task failure and delivers it to a required abandonment observer if the outer caller is dropped while the runtime remains alive | **Current** library with three consumers: the runner's `legacy-shell` and nested `direct-command` nodes, both non-interruptible, whose runtime lives through normal command completion, and `dekopon-agent`'s `broker-command` node, the one cancellable consumer, which a gateway session's Stop abandons through the cooperative abort-then-join `CancelHandle`/`CancelSignal` pair; scopes, ports, deadlines, and stage scheduling remain future |
 | `dekopon-agent` | The shared agent session layer: the bounded scripting prompt loop, optional bounded meta tools (asset fetch, `inspect_agent_config`, image generation, `read_skill`, and `suggest_improvement`) each offered only when the embedder supplies or enables it, the script runtime spending a session-wide capability budget, a broker-leg facade over the protocol client whose command-word runs are cancellable process nodes | **Current**, holding no authority; it depends on `dekopon-config` for the `Skill` type, on `dekopon-process` for that node, and on no broker crate beyond the protocol client; consumed by `dekopon-run` and `dekopond` in this tree, and by out-of-tree clients such as `dekopon-console` |
@@ -143,23 +142,14 @@ if no model turn remains, the gateway posts a fixed warning to inspect audit bef
 
 ## Current control paths
 
-The current tree — the published `0.12.0` release plus the work recorded under `CHANGELOG.md` `[Unreleased]` — retains the local catalog read path introduced in 0.1:
-
-```text
-parse dekopon CLI
-  -> resolve one config source
-  -> parse YAML/JSON once
-  -> validate a typed catalog
-  -> execute through LocalConfigReader
-  -> render a typed result
-```
-
-Command handlers do not manipulate YAML. `LocalConfigReader` is the one reader; a read abstraction returns when a second implementation exists rather than in anticipation of one. Configuration is deterministic, rejects unknown authored fields, and validates duplicate names and cross-resource references.
+The gateway loads a typed catalog through `dekopon-config`, which rejects unknown fields,
+invalid identifiers, duplicates and cross-resource reference problems in one refusal.
+The standalone catalog CLI has been retired.
 
 Model-account lifecycle is a separate operator path that does not resolve or parse the catalog:
 
 ```text
-parse dekopon auth chatgpt CLI
+parse dekopond auth chatgpt CLI
   -> contact OpenAI's fixed device-auth endpoint
   -> store, inspect, or remove Dekopon's isolated credential file
 ```
@@ -176,7 +166,7 @@ parse dekopon-run CLI
   -> JSON result/timings and optional local Chrome plus remote OTLP telemetry
 ```
 
-The immediate linker supplies no guest imports, so providers have no filesystem, network, clock, random, environment, or credential access. Prompt mode performs model HTTP requests, but model tool calls remain untrusted: a call selects the one scripting tool or ends the session, and the script it carries can reach only loaded capability IDs plus, with `--broker`, whatever a separate broker authorizes for this peer. With `--skill` the session also offers `read_skill` over operator-authored text held in memory, and with `--suggestions` the `suggest_improvement` note the runner prints to stderr and records as an audit event; neither reaches a capability. Explicit `dekopon-run broker` commands load no components and use a fresh bounded Unix connection to submit identity-free proposals after validating the configured server UID. Separately, `dekopon-brokerd` evaluates Cedar authorization decisions against owner-authored execution constraints, resolves legacy destination-bound credentials or separately authorized public DRNs from owner-only storage, can execute policy-constrained provider HTTP, and produces durable audit evidence; the operator CLI does not invoke it.
+The immediate linker supplies no guest imports, so providers have no filesystem, network, clock, random, environment, or credential access. Prompt mode performs model HTTP requests, but model tool calls remain untrusted: a call selects the one scripting tool or ends the session, and the script it carries can reach only loaded capability IDs plus, with `--broker`, whatever a separate broker authorizes for this peer. With `--skill` the session also offers `read_skill` over operator-authored text held in memory, and with `--suggestions` the `suggest_improvement` note the runner prints to stderr and records as an audit event; neither reaches a capability. Explicit `dekopon-run broker` commands load no components and use a fresh bounded Unix connection to submit identity-free proposals after validating the configured server UID. Separately, `dekopon-brokerd` evaluates Cedar authorization decisions against owner-authored execution constraints, resolves legacy destination-bound credentials or separately authorized public DRNs from owner-only storage, can execute policy-constrained provider HTTP, and produces durable audit evidence; auth does not invoke it.
 
 ## Resource and API design
 
@@ -295,18 +285,11 @@ provider input or request bodies. Upstream credential scope remains the boundary
 
 ## Operator interface
 
-The CLI is the stable operator surface, analogous to `kubectl` where that improves discovery. Its pipeline remains parse → resolve → read → execute → render. Human-readable output may evolve; machine-readable resources, output formats, and documented exit behavior require compatibility consideration.
-
-Future commands should continue the resource-oriented vocabulary (`get tasks`, `logs agent/reviewer`, `auth can-i`, `policy explain`, `apply`, `delete`) but must not be added as nonfunctional placeholders.
-
-Every command here stays inside that pipeline: `dekopon` contacts no other process. The interactive
-console that once broke it moved to [`dekopon-console`](https://github.com/dekopon-agents/dekopon-console),
-where it composes the same published `dekopon-agent` and `dekopon-broker-protocol` crates any other
-out-of-tree client would. That is the shape a session-running client takes — a gateway for one
-terminal, holding a model credential exactly as `dekopond` does and no policy, provider credential,
-or authorization exactly as `dekopond` does not — and it does not have to live here to take it.
-
-See [`cli.md`](cli.md) for the current command contract.
+The daemon executables own their operator commands: `dekopond auth chatgpt` manages the
+isolated model credential before any gateway runtime/configuration, while `dekopon-brokerd`
+owns provider lifecycle operations. The runner remains separate and unprivileged.
+The interactive [dekopon-console](https://github.com/dekopon-agents/dekopon-console) ships independently.
+See [`cli.md`](cli.md) for authentication syntax, formats, guards, and exit codes.
 
 ## Accepted implementation decisions
 
@@ -354,7 +337,7 @@ If authority ownership is unclear, stop and update the design before adding code
 - [`security-model.md`](security-model.md) — trust assumptions, threat boundaries, and limitations.
 - [`architecture.md`](architecture.md) — current crate structure and deployment topology.
 - [`development.md`](development.md) — source/test map, generated artifacts, validation, CI, and PR workflow.
-- [`cli.md`](cli.md) — current catalog and model-auth operator contract, discovery, output, and exit codes.
+- [`cli.md`](cli.md) — current model-auth operator contract, output, and exit codes.
 - [`run.md`](run.md) — experimental immediate provider, prompt, limit, and tracing contract.
 - [`inference.md`](inference.md) — model request types and wire shape, cache optimization and retention caveats, current conversation memory, and exploratory long-term memory.
 - [`dekopond.md`](dekopond.md) — the unprivileged chat gateway's configuration, transports, session bounds, authorization flow, and committed conversation contract.

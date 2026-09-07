@@ -32,15 +32,15 @@ empty and does not restore previous data.
 
 ## Two rules that apply to every upgrade
 
-### Upgrade all four executables together
+### Upgrade all three executables together
 
-`dekopon`, `dekopon-run`, `dekopon-brokerd`, and `dekopond` are separately installable — Homebrew,
+`dekopon-run`, `dekopon-brokerd`, and `dekopond` are separately installable — Homebrew,
 crates.io, release archives, the container image, and the Helm chart with its own `image.tag` — so a
 mixed set is easy to end up with by accident. Do not. The local broker protocol has one version
 constant and both envelopes are strict-decoded; a newer broker adding a field to a response an older
 client already understands makes that response undecodable, which is the failure a partial upgrade
 most reliably produces. [`broker-http.md`](broker-http.md#version-and-compatibility) has the exact
-mechanics. The container image and the chart ship all four from one release for this reason.
+mechanics. The container image and the chart ship all three from one release for this reason.
 
 ### Restart the broker first and stop it last
 
@@ -183,7 +183,7 @@ bootstrap limitations.
   and follows no redirect, so an exported proxy variable no longer carries a bearer token, the
   device-code exchange, or a prompt through a host nobody named to Dekopon. That is the stance
   `dekopon-http-host` already took for provider HTTP. It reaches `dekopond`, `dekopon-run`, and
-  `dekopon auth chatgpt login`; nothing in a configuration file changes, and there is no field or
+  `dekopond auth chatgpt login`; nothing in a configuration file changes, and there is no field or
   flag to opt back in, so a model endpoint that was only reachable through that proxy is
   unreachable after the upgrade.
 
@@ -386,3 +386,12 @@ audit chain in place.
   does on the wire.
 - [`catalog.md`](catalog.md) — the catalog schema an upgrade may need you to re-read.
 - [`container-image.md`](container-image.md) — how the image is assembled and what it pins.
+
+## Unreleased: standalone catalog CLI retirement
+
+The standalone `dekopon` package/executable and its get/describe/validate/config commands are
+removed. Install the matching `dekopond` from this source revision and use
+`dekopond auth chatgpt {login,status,logout,export}` instead. Auth flags belong after `auth`;
+serving still requires `dekopond --config PATH`. Existing isolated credential files, export
+Secret labels/keys/default names, and refresh behavior are unchanged. Published 0.12.0 archives
+remain historical artifacts; they do not provide the new gateway auth command.

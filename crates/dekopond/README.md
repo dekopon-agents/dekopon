@@ -119,3 +119,9 @@ When the broker returns an effective all-three memory surface, the prompt notes 
 requires complete service/kernel transport acceptance, and sends exactly one fresh hidden record
 request containing the original bounded sender text and exact accepted answer. It never retries;
 record failure cannot change an already delivered answer. Receipts do not prove human receipt.
+
+## Isolated model authentication
+
+`dekopond auth chatgpt {login,status,logout,export}` runs before gateway configuration,
+telemetry, transports, or runtime creation. It uses only Dekopon's isolated model credential;
+ordinary serving still requires `--config PATH`. See [`docs/cli.md`](../../docs/cli.md) for auth-only flags, output, exit codes and both export guards.

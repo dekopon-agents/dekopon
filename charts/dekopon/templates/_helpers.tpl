@@ -289,7 +289,7 @@ that starts and then refuses to serve, which is much harder to read than a templ
 {{- fail "gateway.chatgpt.inline and gateway.chatgpt.existingSecret are mutually exclusive" -}}
 {{- end -}}
 {{- if and (not .Values.gateway.chatgpt.inline) (not .Values.gateway.chatgpt.existingSecret) -}}
-{{- fail "gateway.chatgpt.enabled is true, so a credential is required: set gateway.chatgpt.inline or gateway.chatgpt.existingSecret. Produce one with `dekopon auth chatgpt export`." -}}
+{{- fail "gateway.chatgpt.enabled is true, so a credential is required: set gateway.chatgpt.inline or gateway.chatgpt.existingSecret. Produce one with `dekopond auth chatgpt export`." -}}
 {{- end -}}
 {{- if not (regexMatch "^[A-Za-z0-9._-]+$" .Values.gateway.chatgpt.subdir) -}}
 {{- fail (printf "gateway.chatgpt.subdir must be one path segment joined onto paths.stateDir, got %q; the credential has to live on the claim" .Values.gateway.chatgpt.subdir) -}}

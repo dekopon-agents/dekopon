@@ -10,7 +10,7 @@ transport-acceptance receipts, and optional broker-owned durable chat memory are
 tested. A route is `oneShot` unless configured otherwise; durable
 memory is a separate broker/agent opt-in and never changes that default into automatic replay. The chart enforces the [current local process boundary](security-model.md#current-local-process-boundary).
 
-Its dependency set excludes `dekopon-broker`, `dekopon-broker-host`, `dekopon-http-host`, `dekopon-storage-host`, `dekopon-policy`, and `dekopon-brokerd`, and CI rejects any of them appearing in the gateway's normal dependency tree — the same discipline already applied to `dekopon-run` and `dekopon`.
+Its dependency set excludes `dekopon-broker`, `dekopon-broker-host`, `dekopon-http-host`, `dekopon-storage-host`, `dekopon-policy`, and `dekopon-brokerd`, and CI rejects any of them appearing in the gateway's normal dependency tree — the same discipline already applied to `dekopon-run`.
 
 [`../examples/conditional-write/`](../examples/conditional-write/README.md) is the complete
 worked deployment: a Slack DM from an owner-mapped sender, two narrow `http-probe` capabilities, a
@@ -683,3 +683,9 @@ declared subject.
 - [`run.md`](run.md) — the one-shot runner that shares the same session layer.
 - [`inference.md`](inference.md) — request types and wire JSON, cache retention caveats, current chat memory, and the unexplored long-term-memory boundary.
 - [`observability.md`](observability.md) — span semantics, payload gating, and data minimization.
+
+## Isolated model authentication
+
+`dekopond auth chatgpt {login,status,logout,export}` runs before gateway configuration,
+telemetry, transports, or runtime creation. It uses only Dekopon's isolated model credential;
+ordinary serving still requires `--config PATH`. See [`cli.md`](cli.md) for auth-only flags, output, exit codes and both export guards.

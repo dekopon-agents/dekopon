@@ -315,7 +315,7 @@ requires the chart's broker-only copy step.
 
 One credential does not fit the pattern at all. The `chatgptSubscription` model kind's credential file holds a refresh token that **rotates**: each refresh invalidates its predecessor and the replacement is written back through a same-directory temporary file and an atomic rename. That needs a writable *directory*, not a writable file, and it means a read-only projected Secret breaks at the first refresh and presents an already-invalidated token on the next restart.
 
-The lifecycle it needs instead is seed-once: export a working local credential, store it in the vault, project it, copy it into a writable directory on first start only, and let refreshes persist there while the vault copy drifts out of date. `dekopon auth chatgpt export` and [`chatgpt-credential.md`](chatgpt-credential.md) are current; the chart implements the seed-once copy and an explicit destructive re-seed gate. Treat that document as the authority on the rotating credential rather than reasoning about it from this provider-storage section.
+The lifecycle it needs instead is seed-once: export a working local credential, store it in the vault, project it, copy it into a writable directory on first start only, and let refreshes persist there while the vault copy drifts out of date. `dekopond auth chatgpt export` and [`chatgpt-credential.md`](chatgpt-credential.md) are current; the chart implements the seed-once copy and an explicit destructive re-seed gate. Treat that document as the authority on the rotating credential rather than reasoning about it from this provider-storage section.
 
 ## Related documents
 

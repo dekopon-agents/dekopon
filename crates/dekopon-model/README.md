@@ -23,7 +23,7 @@ a scaled unit.
 only to the embedding delivery path. The Images client never reuses the undocumented ChatGPT/Codex
 subscription endpoint and never accepts a model-selected endpoint.
 
-The `dekopon` CLI owns account lifecycle through `dekopon auth`; execution clients such as
+The gateway executable owns account lifecycle through `dekopond auth`; execution clients such as
 `dekopon-run` consume the resulting credentials. Model credentials are never passed to Wasm
 provider components. [`docs/inference.md`](../../docs/inference.md) traces these types into literal
 ChatGPT wire JSON and distinguishes cache affinity, gateway conversation history, optional broker-provider durable chat-turn retrieval, and broader agent memory.

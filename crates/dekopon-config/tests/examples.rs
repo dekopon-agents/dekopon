@@ -1,5 +1,5 @@
 //! The checked-in example catalogs are load-bearing documentation, so they are held to the same
-//! parser the CLI and gateway use.
+//! parser the gateway uses.
 //!
 //! A catalog that stops parsing, or an agent whose capability list drifts from the workflow the
 //! example promises, breaks instructions a reader follows literally. Both review examples may
@@ -25,12 +25,29 @@ fn load(path: &Path) -> LocalCatalog {
 
 #[test]
 fn the_local_reviewer_example_has_comment_but_no_approval_authority() {
-    let catalog = load(&example("local/dekopon.yaml"));
+    let catalog = load(&example("catalog/dekopon.yaml"));
     let reviewer = catalog
         .agent(&"reviewer".parse().expect("valid agent id"))
         .expect("the reviewer agent exists");
 
     assert!(reviewer.spec.enabled);
+    let comment = catalog
+        .capability(
+            &"github.pull-request.comment"
+                .parse()
+                .expect("valid capability id"),
+        )
+        .expect("comment is declared");
+    assert_eq!(comment.spec.effect, EffectKind::ExternalWrite);
+    let skills = catalog.agent_skills(&"reviewer".parse().expect("valid agent id"));
+    assert_eq!(skills.len(), 1);
+    assert_eq!(skills[0].name().as_str(), "pull-request-review");
+    assert_eq!(skills[0].resources().len(), 1);
+    assert_eq!(
+        skills[0].resources()[0].path,
+        "references/risk-checklist.md"
+    );
+    assert!(!skills[0].body().is_empty());
     let capabilities = reviewer
         .spec
         .capabilities

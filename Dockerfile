@@ -1,8 +1,8 @@
-# Dekopon container image: one image, all four binaries, assembled from a published release.
+# Dekopon container image: one image, all three binaries, assembled from a published release.
 #
 # Nothing is compiled here. `release.yml` already builds, checksums, and provenance-attests
 # `dekopon-<version>-<target>.tar.gz` for `x86_64-unknown-linux-gnu` and
-# `aarch64-unknown-linux-gnu`, each carrying all four executables. The image ships exactly those
+# `aarch64-unknown-linux-gnu`, each carrying all three executables. The image ships exactly those
 # bytes — the ones users download and can verify — rather than a second, independently compiled
 # set that merely ought to match. `ci/stage-image-context.sh` verifies each archive against its
 # `.sha256` sidecar and its attestation before extracting the executables into the context, and
@@ -20,7 +20,7 @@
 #
 # This file expects a staged context and is not buildable from the repository root. The context is
 # constructed by `ci/stage-image-context.sh` rather than filtered out of a checkout: it contains
-# the Dockerfile, `dist/<arch>/` with the four executables from each release archive, `providers/`
+# the Dockerfile, `dist/<arch>/` with the three executables from each release archive, `providers/`
 # plus `optional-providers/` with checked-in components, and the two licences — nothing else, because nothing else was
 # put there. A `.dockerignore` denylist would have to keep excluding the rest of the repository
 # correctly forever; an allowlist is true by construction.
@@ -47,7 +47,6 @@ FROM gcr.io/distroless/cc-debian13:nonroot@sha256:c31ff9abcb1910f3ab25c7957bdaf0
 ARG TARGETARCH
 
 COPY --chmod=0755 \
-     dist/${TARGETARCH}/dekopon \
      dist/${TARGETARCH}/dekopon-run \
      dist/${TARGETARCH}/dekopon-brokerd \
      dist/${TARGETARCH}/dekopond \
@@ -84,10 +83,10 @@ WORKDIR /home/nonroot
 
 # No ENTRYPOINT on purpose. The command selects the binary, so `docker run <image> dekopond
 # --config ...` and a Kubernetes `command: ["dekopon-brokerd"]` both work without `--entrypoint`.
-CMD ["dekopon", "--help"]
+CMD ["dekopond", "--help"]
 
 LABEL org.opencontainers.image.title="dekopon" \
-      org.opencontainers.image.description="Dekopon operator CLI, runner, capability broker, and chat gateway" \
+      org.opencontainers.image.description="Dekopon runner, capability broker, and chat gateway with isolated model auth" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0" \
       org.opencontainers.image.source="https://github.com/dekopon-agents/dekopon" \
       org.opencontainers.image.url="https://github.com/dekopon-agents/dekopon" \

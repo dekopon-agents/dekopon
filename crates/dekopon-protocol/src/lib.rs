@@ -193,15 +193,15 @@ pub struct AgentSpec {
     pub providers: Vec<ProviderId>,
     /// Model class `dekopond` resolves against its configured models.
     ///
-    /// Required for any agent a gateway route references: `dekopond` fails at startup when a
-    /// routed agent leaves it unset, and the value decides which model receives the agent's
-    /// instructions. It is optional here only because an agent the gateway never routes — one read
-    /// by the CLI alone — does not need one.
+    /// Gateway resolution (`crates/dekopond/src/routes.rs`, `RoutingTable::bind`) requires this
+    /// for a routed agent only when the route has no explicit model. It selects the first
+    /// configured model offering the class; no matching model fails startup. An explicit
+    /// route model overrides it, and an unrouted agent needs no model class.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_class: Option<String>,
     /// Reserved declarative policy profile name, consumed by no shipped component.
     ///
-    /// Authored and rendered by `dekopon get`/`describe`, and nothing else reads it. Broker
+    /// Authored catalog metadata; no runtime authority reader consumes it. Broker
     /// authority comes from the owner-authored Cedar policy file and per-capability constraint
     /// sets in `broker.yaml`; naming a profile here selects no policy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -252,8 +252,8 @@ pub struct CapabilitySpec {
 
 /// Availability authored for a capability.
 ///
-/// Nothing in Dekopon observes provider availability, so every value here came from the catalog
-/// file the CLI is echoing back.
+/// This is authored catalog metadata, not observed availability. The typed catalog loader
+/// preserves it; no component populates or refreshes this status.
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "PascalCase")]
@@ -302,7 +302,7 @@ pub struct ProviderSpec {
     pub provider_type: String,
     /// Reserved symbolic credential reference, consumed by no shipped component.
     ///
-    /// Authored and rendered by `dekopon get`/`describe`, and nothing else reads it. Credential
+    /// Authored catalog metadata; no runtime authority reader consumes it. Credential
     /// binding is owned by the broker's per-capability constraint sets and its `0600` credentials
     /// file, neither of which consults the catalog.
     pub credential_ref: String,
@@ -310,8 +310,8 @@ pub struct ProviderSpec {
 
 /// Availability authored for a provider.
 ///
-/// Nothing in Dekopon observes provider availability, so every value here came from the catalog
-/// file the CLI is echoing back.
+/// This is authored catalog metadata, not observed availability. The typed catalog loader
+/// preserves it; no component populates or refreshes this status.
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "PascalCase")]

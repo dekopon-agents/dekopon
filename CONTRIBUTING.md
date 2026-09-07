@@ -43,8 +43,8 @@ Exercise the affected executable before submitting a CLI, config, or provider-ho
 
 ```console
 ci/fetch-external-provider-components.sh examples/providers
-cargo run -p dekopon -- --config examples/local/dekopon.yaml validate
-cargo run -p dekopon -- --config examples/local/dekopon.yaml get agents
+cargo test -p dekopon-config --test examples --locked
+cargo run -p dekopond -- auth chatgpt --help
 cargo run -p dekopon-run -- inspect --provider examples/providers/echo-provider.wasm
 cargo run -p dekopon-run -- invoke --provider examples/providers/echo-provider.wasm echo.echo --input '{}'
 ```

@@ -11,6 +11,15 @@ class ClassifyCiChangesTests(unittest.TestCase):
         expected = {category: category in selected for category in CATEGORIES}
         self.assertEqual(result, expected)
 
+    def test_catalog_fixture_family_selects_its_real_readers(self) -> None:
+        for path in (
+            "examples/catalog/dekopon.yaml",
+            "examples/catalog/skills/pull-request-review/SKILL.md",
+            "examples/catalog/skills/pull-request-review/references/risk-checklist.md",
+        ):
+            with self.subTest(path=path):
+                self.assert_selected([path], "run_rust", "run_otel", "run_cli_install", "run_docs")
+
     def test_prose_selects_only_the_documentation_lane(self) -> None:
         self.assert_selected(["docs/design.md", "README.md"], "run_docs")
 

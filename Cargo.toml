@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "crates/dekopon",
     "crates/dekopon-agent",
     "crates/dekopon-broker",
     "crates/dekopon-broker-host",

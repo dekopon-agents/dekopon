@@ -388,7 +388,7 @@ impl ChatGptCredentialExport {
 /// access token and a *rotating* refresh token. Each refresh mints a replacement and invalidates
 /// its predecessor, so an exported copy is stale the moment the credential it came from refreshes.
 /// A caller must gate this behind an explicit operator instruction and must say that out loud;
-/// [`crate::chatgpt`]'s operator surface, `dekopon auth chatgpt export`, requires
+/// [`crate::chatgpt`]'s operator surface, `dekopond auth chatgpt export`, requires
 /// `--expose-credential`, refuses a terminal destination, and warns on standard error.
 ///
 /// The bytes are identical to what [`login`] would have written, so a file seeded from this
@@ -1581,7 +1581,7 @@ pub enum ChatGptError {
     #[error("invalid ChatGPT configuration: {0}")]
     Configuration(String),
     /// No Dekopon-owned login exists.
-    #[error("not logged in to ChatGPT; run `dekopon auth chatgpt login` (expected {})", path.display())]
+    #[error("not logged in to ChatGPT; run `dekopond auth chatgpt login` (expected {})", path.display())]
     NotLoggedIn {
         /// Expected credential path.
         path: PathBuf,
@@ -1814,7 +1814,7 @@ mod tests {
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("dekopon auth chatgpt login"));
+        assert!(error.to_string().contains("dekopond auth chatgpt login"));
     }
 
     #[test]
@@ -2873,7 +2873,7 @@ mod tests {
 
         let error = export_credentials(Some(&path)).expect_err("missing credentials must fail");
 
-        assert!(error.to_string().contains("dekopon auth chatgpt login"));
+        assert!(error.to_string().contains("dekopond auth chatgpt login"));
     }
 
     /// A credential file that parses but carries empty tokens must fail too; a half-formed export

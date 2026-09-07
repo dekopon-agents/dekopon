@@ -1,8 +1,8 @@
-# Publishes ghcr.io/dekopon-agents/dekopon: one image, all four binaries, linux/amd64 and
+# Publishes ghcr.io/dekopon-agents/dekopon: one image, all three binaries, linux/amd64 and
 # linux/arm64.
 #
 # The image is assembled from the release archives, not compiled here. `release.yml` already
-# builds, checksums, and provenance-attests the four executables for both Linux targets, so this
+# builds, checksums, and provenance-attests the three executables for both Linux targets, so this
 # workflow verifies those archives and copies their contents into an image. Recompiling would
 # produce a second set of binaries nobody has verified, from a toolchain that can drift, and would
 # cost a native build matrix to arrive somewhere less trustworthy than the artifacts users already
@@ -187,7 +187,7 @@ jobs:
 
             # The claim this whole design rests on: the executable in the image is the executable
             # the release published, byte for byte.
-            for binary in dekopon dekopon-run dekopon-brokerd dekopond; do
+            for binary in dekopon-run dekopon-brokerd dekopond; do
               in_image=$(tar -xOf "$rootfs" "usr/local/bin/$binary" | sha256sum | cut -d' ' -f1)
               in_release=$(sha256sum "$CONTEXT/dist/$arch/$binary" | cut -d' ' -f1)
               if [ "$in_image" != "$in_release" ]; then
@@ -225,7 +225,7 @@ jobs:
           done
 
           # The runner is amd64, so that image runs here for real.
-          docker run --rm dekopon-proof:amd64 dekopon version
+          docker run --rm dekopon-proof:amd64 dekopond --help
           docker run --rm dekopon-proof:amd64 dekopon-run --version
           docker run --rm dekopon-proof:amd64 dekopon-brokerd --version
           docker run --rm dekopon-proof:amd64 dekopond --version

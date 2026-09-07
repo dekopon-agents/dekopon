@@ -246,10 +246,10 @@ A longer shutdown window does not promise crash recovery.
 
 ## The ChatGPT credential is seeded once
 
-`dekopon auth chatgpt login` is a device-authorization flow: it prints a URL and a short code and
+`dekopond auth chatgpt login` is a device-authorization flow: it prints a URL and a short code and
 waits for a human with a browser. Nothing in a pod can do that, so a `kind: chatgptSubscription`
 model has to be handed a credential exported from a local login.
-`dekopon auth chatgpt export --expose-credential` produces it, and
+`dekopond auth chatgpt export --expose-credential` produces it, and
 [`docs/chatgpt-credential.md`](https://github.com/dekopon-agents/dekopon/blob/main/docs/chatgpt-credential.md)
 is the full lifecycle.
 
@@ -259,7 +259,7 @@ Set `gateway.chatgpt.enabled` and point it at the Secret:
 gateway:
   chatgpt:
     enabled: true
-    existingSecret: dekopon-chatgpt-auth   # what `dekopon auth chatgpt export --expose-credential --namespace <ns>` emits
+    existingSecret: dekopon-chatgpt-auth   # what `dekopond auth chatgpt export --expose-credential --namespace <ns>` emits
 ```
 
 The chart then places `/var/lib/dekopon/chatgpt/chatgpt-auth.json`, `0600`, owned by `65533`, in a

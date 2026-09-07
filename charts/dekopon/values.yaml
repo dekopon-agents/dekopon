@@ -294,9 +294,9 @@ gateway:
 
   # Seed a ChatGPT subscription credential once, and never again.
   #
-  # `dekopon auth chatgpt login` is a device-authorization flow: it prints a URL and waits for a
+  # `dekopond auth chatgpt login` is a device-authorization flow: it prints a URL and waits for a
   # human with a browser. Nothing in a pod can do that, so a `kind: chatgptSubscription` model has
-  # to be handed a credential exported from a local login — `dekopon auth chatgpt export`, which
+  # to be handed a credential exported from a local login — `dekopond auth chatgpt export`, which
   # lands with the auth-export change.
   #
   # This is the one file the chart writes that the daemon then OWNS. The refresh token rotates on
@@ -310,7 +310,7 @@ gateway:
   # dies with the pod, which would quietly turn "seed once" into "seed on every reschedule".
   chatgpt:
     enabled: false
-    # Prefer existingSecret. `dekopon auth chatgpt export --expose-credential --namespace <ns>`
+    # Prefer existingSecret. `dekopond auth chatgpt export --expose-credential --namespace <ns>`
     # emits exactly this Secret, named dekopon-chatgpt-auth with the key chatgpt-auth.json; an
     # External Secrets Operator ExternalSecret against a 1Password item projects the same shape.
     # An inline value is stored in the release and returned by `helm get values`.

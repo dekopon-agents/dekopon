@@ -219,7 +219,7 @@ pub struct ModelArgs {
     #[arg(long, value_name = "MODEL")]
     pub model: String,
 
-    /// Use the ChatGPT/Codex login managed by `dekopon auth chatgpt`.
+    /// Use the ChatGPT/Codex login managed by `dekopond auth chatgpt`.
     #[arg(long)]
     pub chatgpt_subscription: bool,
 

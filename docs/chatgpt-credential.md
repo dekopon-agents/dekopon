@@ -1,6 +1,6 @@
 # Deploying a ChatGPT subscription credential
 
-`dekopon auth chatgpt login` runs OpenAI's device authorization flow: it prints a URL and a short
+`dekopond auth chatgpt login` runs OpenAI's device authorization flow: it prints a URL and a short
 code and waits for a human to approve the login in a browser. Nothing in a pod can do that. A
 containerized `dekopond` configured with `kind: chatgptSubscription` therefore cannot obtain a
 credential on its own, and it never will — the flow is interactive by design.
@@ -10,7 +10,7 @@ keeping it correct afterwards. Read [`cli.md`](cli.md) for the command's contrac
 for the inference boundary, and [`dekopond.md`](dekopond.md) for the `models[].authFile` setting that
 names the file in a pod.
 
-**Status: Current.** `dekopon auth chatgpt export` and the chart-side seed-once copy are both
+**Status: Current.** `dekopond auth chatgpt export` and the chart-side seed-once copy are both
 implemented: [`charts/dekopon`](../charts/dekopon/README.md#the-chatgpt-credential-is-seeded-once)
 places the credential once under `gateway.chatgpt.*` and re-seeds only on an explicit
 `gateway.chatgpt.reseed: true`.
@@ -50,7 +50,7 @@ temporary file in the credential file's own directory — `chatgpt-auth.tmp-<pid
 name — opens it `create_new` at mode `0600`, writes, `sync_all`s, renames it over the target, and
 `fsync`s the parent directory so the rename itself survives a power failure. A `subPath` mount of a
 single file satisfies none of that: the rename needs a writable parent directory, not merely a
-writable inode. Every save and every `dekopon auth chatgpt logout` also sweeps abandoned
+writable inode. Every save and every `dekopond auth chatgpt logout` also sweeps abandoned
 `chatgpt-auth.tmp-*` siblings, which a `SIGKILL` between create and rename leaves behind holding the
 same plaintext access and refresh tokens as the credential itself.
 
@@ -68,8 +68,8 @@ has to reach a writable directory that survives a restart, and it has to get the
 Sign in locally first, on a machine with a browser:
 
 ```console
-dekopon auth chatgpt login
-dekopon auth chatgpt status
+dekopond auth chatgpt login
+dekopond auth chatgpt status
 ```
 
 `export` then reads the same credential file `login`, `status`, and `logout` use — `--auth-file`, then
@@ -83,7 +83,7 @@ flag contract is in [`cli.md`](cli.md#exporting-a-credential-for-a-secret-store)
 This is the production route when External Secrets Operator already runs against a 1Password vault.
 
 ```console
-dekopon auth chatgpt export --expose-credential --format raw | pbcopy   # or your clipboard tool
+dekopond auth chatgpt export --expose-credential --format raw | pbcopy   # or your clipboard tool
 ```
 
 `--format raw` emits exactly the bytes a login would have written, so one concealed field holds a
@@ -98,7 +98,7 @@ the namespace as a Secret key.
 This is the quick route, and it puts the credential in the API server without a vault in between.
 
 ```console
-dekopon auth chatgpt export --expose-credential --namespace dekopon | kubectl apply -f -
+dekopond auth chatgpt export --expose-credential --namespace dekopon | kubectl apply -f -
 ```
 
 The default form is a `v1` `Secret` named `dekopon-chatgpt-auth` carrying the document under the key
@@ -168,6 +168,6 @@ and restart the pod. That is five steps because each one is a decision; none of 
 implicitly. With the chart, the last two steps are one: set `gateway.chatgpt.reseed: true` for a
 single roll, then set it back to `false`.
 
-Revoking is separate: `dekopon auth chatgpt logout` deletes only Dekopon's local file. It does not
+Revoking is separate: `dekopond auth chatgpt logout` deletes only Dekopon's local file. It does not
 invalidate the exported copy, the Secret, the vault item, or the credential the pod is running on.
 Revoke the session with OpenAI if that is what you need.

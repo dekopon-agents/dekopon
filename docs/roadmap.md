@@ -44,7 +44,7 @@ Version 0.3.0 is published as provenance-attested CLI archives and a Git tag cov
 - A multi-architecture container image assembled from the release archives rather than compiled a second time, verified byte for byte against them before anything is pushed.
 - A Helm chart running `dekopon-brokerd` and `dekopond` as one pod sharing the broker's `0600` Unix socket, versioned and tagged separately from the application.
 - A Homebrew tap whose formula is regenerated from the archives each release actually published.
-- `dekopon auth chatgpt export`, which prints an existing local ChatGPT subscription credential as a `v1` Secret manifest or as the credential document itself, so a containerized gateway can be seeded with a credential an interactive device flow cannot obtain in a pod.
+- `dekopond auth chatgpt export`, which prints an existing local ChatGPT subscription credential as a `v1` Secret manifest or as the credential document itself, so a containerized gateway can be seeded with a credential an interactive device flow cannot obtain in a pod.
 - macOS on Intel dropped from the release matrix, leaving three archives.
 
 Version 0.4.0 adds no crate and no privilege: the same 20 public crates, the same process boundary, the same deny-by-default broker. It is a packaging release.
@@ -177,7 +177,7 @@ broker upgrade together.
   (`crates/dekopon-tui/src/run.rs:218-219`) and mouse capture was dropped, so nothing in this tree
   fixes them.
 - Nothing loses authority: the console held a model credential and no policy, provider credential,
-  or authorization. `dekopon` is a local catalog and model-account CLI again, and the operator CLI
+  or authorization. At 0.12.0, `dekopon` was a local catalog and model-account CLI again, and the operator CLI
   contacts no other process.
 - `ratatui`, `crossterm`, and the five duplicate-version `deny.toml` exemptions they caused leave
   the control plane with it. So does the `dev.<surface>.<name>` subject service and the broker's
@@ -308,4 +308,4 @@ A crate should be added only with meaningful, tested behavior needed by an imple
 
 ## Explicit non-goals for 0.1
 
-Daemon networking, shell-completion installation, provider credential access, operator-accessible provider host I/O, policy evaluation, durable evidence/audit, and local or external effect execution are intentionally absent from 0.1. An interactive TUI was on that list; 0.11.0 built one and this tree no longer holds it, because it moved to [dekopon-console](https://github.com/dekopon-agents/dekopon-console) the way the `gh` provider moved to `dekopon-provider-gh`. It is an unprivileged broker client holding a model credential, so it acquired none of the operator-accessible provider or policy paths this sentence still rules out, and taking it out of tree acquires nothing either. Their accepted broker-mediated HTTP direction is documented in [`broker-http.md`](broker-http.md), but documentation does not make those paths current. Model-account lifecycle is exposed through `dekopon auth`; the operator CLI itself performs no model inference and loads no component. Inference lives in the explicitly experimental `dekopon-run` and in `dekopond`, and component loading in `dekopon-run` (import-free, read-only) and `dekopon-brokerd`.
+Daemon networking, shell-completion installation, provider credential access, operator-accessible provider host I/O, policy evaluation, durable evidence/audit, and local or external effect execution are intentionally absent from 0.1. An interactive TUI was on that list; 0.11.0 built one and this tree no longer holds it, because it moved to [dekopon-console](https://github.com/dekopon-agents/dekopon-console) the way the `gh` provider moved to `dekopon-provider-gh`. It is an unprivileged broker client holding a model credential, so it acquired none of the operator-accessible provider or policy paths this sentence still rules out, and taking it out of tree acquires nothing either. Their accepted broker-mediated HTTP direction is documented in [`broker-http.md`](broker-http.md), but documentation does not make those paths current. Model-account lifecycle is exposed through `dekopond auth`; auth itself performs no model inference and loads no component. Inference lives in the explicitly experimental `dekopon-run` and in `dekopond`, and component loading in `dekopon-run` (import-free, read-only) and `dekopon-brokerd`.

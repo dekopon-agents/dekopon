@@ -21,9 +21,9 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Domain identifiers and enums | `crates/dekopon-core/src/lib.rs`; the skill-name grammar (`SkillId`) in `crates/dekopon-core/src/skill.rs` | Inline unit and compile-fail tests |
 | Proposal/authorization typestate | `crates/dekopon-capability/src/lib.rs` | Inline unit tests |
 | Resource wire types | `crates/dekopon-protocol/src/lib.rs` | Inline schema and round-trip tests |
-| Config discovery and validation | `crates/dekopon-config/src/`; skill-directory loading (`SKILL.md` front matter, resources, and size/depth/count bounds) in `crates/dekopon-config/src/skill.rs` | `crates/dekopon-config/src/tests.rs`, including catalog-relative skill loading and one-refusal reporting of every unmountable skill; inline front-matter, bound, and symlink-refusal tests in `skill.rs`; `crates/dekopon-config/tests/examples.rs` loads `examples/local/dekopon.yaml`, which mounts `examples/local/skills/pull-request-review/`, and `examples/conditional-write/dekopon.yaml` |
+| Config discovery and validation | `crates/dekopon-config/src/`; skill-directory loading (`SKILL.md` front matter, resources, and size/depth/count bounds) in `crates/dekopon-config/src/skill.rs` | `crates/dekopon-config/src/tests.rs`, including catalog-relative skill loading and one-refusal reporting of every unmountable skill; inline front-matter, bound, and symlink-refusal tests in `skill.rs`; `crates/dekopon-config/tests/examples.rs` loads `examples/catalog/dekopon.yaml`, which mounts `examples/catalog/skills/pull-request-review/`, and `examples/conditional-write/dekopon.yaml` |
 | OTLP exporter settings and subscriber wiring | `crates/dekopon-telemetry/src/` | Inline endpoint, transport, environment-credential, and OTLP-filter tests |
-| Operator CLI and model auth commands | `crates/dekopon/src/`; the `describe agent` `Skills:` section and the wide `get agent` `SKILLS` column in `render.rs` | `crates/dekopon/tests/cli.rs`, including the example `reviewer` agent's skill described by name and resource count without its body |
+| Isolated model auth commands | `crates/dekopond/src/{cli,auth,auth_result,auth_render,auth_output}.rs` | `crates/dekopond/tests/auth.rs` and inline parser/renderer/export-guard tests |
 | Model clients, bounded OpenAI image generation, and ChatGPT auth | `crates/dekopon-model/src/` | Inline mock HTTP/OAuth/SSE/base64/byte-bound tests |
 | Provider guest API and adapter | `crates/dekopon-provider-sdk/src/lib.rs`, `crates/dekopon-provider-sdk/wit/` | Inline adapter tests |
 | Buffered HTTP WIT and guest facade | `wit/http/`, `crates/dekopon-provider-http/` | Guest validation and mirrored-contract tests plus WIT package workflow |
@@ -45,7 +45,7 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Provider component test harness | `crates/dekopon-provider-sdk-testkit/src/lib.rs` | `crates/dekopon-provider-sdk-testkit/tests/harness.rs`, driving exact fetched `echo`/`memory-chat` releases plus the checked `storage-probe` and `cli-probe` fixtures |
 | Rust provider fixtures | `examples/providers/cli-probe/`, `http-probe/`, `memory-reservation-probe/`, `provider-v0-1-compat/`, `provider-v0-2-compat/`, and `storage-probe/` | Separate-workspace tests, checked-component import inspection, host/runner rejection, loopback mocks, and broker/VFS tests; exact standalone echo/JSONPlaceholder/memory-chat fixtures are fetched by `ci/fetch-external-provider-components.sh` |
 | End-to-end deployment example | `examples/conditional-write/` | `crates/dekopon-brokerd/tests/examples.rs`, `crates/dekopon-config/tests/examples.rs`, `crates/dekopond/tests/examples.rs` |
-| Agent skill example | `examples/local/skills/pull-request-review/` (`SKILL.md` plus `references/risk-checklist.md`), mounted by the `reviewer` agent in `examples/local/dekopon.yaml` | Loaded with the catalog by `crates/dekopon-config/tests/examples.rs`; described by `crates/dekopon/tests/cli.rs` |
+| Agent skill example | `examples/catalog/skills/pull-request-review/` (`SKILL.md` plus `references/risk-checklist.md`), mounted by the `reviewer` agent in `examples/catalog/dekopon.yaml` | Loaded with the catalog by `crates/dekopon-config/tests/examples.rs` |
 | Shared test scaffolding | `crates/dekopon-test-support/src/` | Not published and never a normal dependency: `provider_fixture`, the `LoopbackServer` builder, `content_length`, one `tracing` `CaptureLayer`, `snapshot_tree`, and `shutdown_on`, reached only as a path `[dev-dependencies]` entry |
 | CI, dependency policy, release | `.github/workflows/`, `deny.toml`, `release.toml` | Required GitHub checks and `cargo package` |
 | Container image | `Dockerfile`, `ci/stage-image-context.sh`, `.github/workflows/container-image.yml` | Assembled from a published release into a constructed context, verified against it on pull requests; see [`container-image.md`](container-image.md) |
@@ -58,15 +58,15 @@ Scaffolding that more than one suite needs lives in `dekopon-test-support` inste
 
 ### Catalog resources or validation
 
-Update protocol types first, then config validation, CLI rendering, examples, schemas, and docs as applicable. Authored fields are strict: unknown fields fail rather than being silently ignored. Parse config once; command handlers should consume typed resources, not YAML values.
+Update protocol types first, then config validation, surviving typed gateway/agent consumers, examples, schemas, and docs as applicable. Authored fields are strict: unknown fields fail rather than being silently ignored. Parse config once; command handlers should consume typed resources, not YAML values.
 
-Skills are catalog resources too. `Agent.spec.skills` (`dekopon-protocol`) names directories, resolved relative to the catalog file unless absolute; `SkillId` in `crates/dekopon-core/src/skill.rs` owns the name grammar; `crates/dekopon-config/src/skill.rs` reads each directory into memory at load time under its size, depth, and count bounds, so no session touches the filesystem; and the catalog loader reports every unmountable or same-named skill in one refusal (`CatalogProblem::Skill`, `CatalogProblem::DuplicateSkill`) and serves the loaded set through `LocalCatalog::agent_skills`. `dekopon describe agent` renders each skill's name, resource count, and description without its body, and the wide `get agent` table carries a `SKILLS` column.
+Skills are catalog resources too. `Agent.spec.skills` (`dekopon-protocol`) names directories, resolved relative to the catalog file unless absolute; `SkillId` in `crates/dekopon-core/src/skill.rs` owns the name grammar; `crates/dekopon-config/src/skill.rs` reads each directory into memory at load time under its size, depth, and count bounds, so no session touches the filesystem; and the catalog loader reports every unmountable or same-named skill in one refusal (`CatalogProblem::Skill`, `CatalogProblem::DuplicateSkill`) and serves the loaded set through `LocalCatalog::agent_skills`.
 
 ### CLI behavior
 
 Keep Clap syntax in `cli.rs`, execution separate from rendering, and process exits documented. Add parser tests and black-box tests. Machine-readable JSON/YAML shapes and exit codes need compatibility consideration even when table output can evolve.
 
-`dekopon auth` does not load the catalog. `dekopon-run` consumes model credentials but does not own account-lifecycle commands. Its explicit broker subcommands must remain identity-free clients; do not add principal, actor, policy, constraints, credentials, or authorization arguments.
+`dekopond auth` does not load the catalog. `dekopon-run` consumes model credentials but does not own account-lifecycle commands. Its explicit broker subcommands must remain identity-free clients; do not add principal, actor, policy, constraints, credentials, or authorization arguments.
 
 ### Model clients or prompt tools
 
@@ -175,7 +175,7 @@ Privileged broker path:
 - `dekopon-broker-protocol` frames strict JSON under a hard byte ceiling and complete-operation deadline; its invocation type cannot carry identity, policy, constraints, credentials, or authorization, its client authenticates the configured server UID, and its normal dependency graph contains no broker host or native HTTP engine.
 - `dekopon-brokerd` derives context from connected Unix peer UID and exact owner-controlled mapping, owns secure socket lifecycle, maps distinct configured peer UIDs, bounds concurrent connections, verifies/reconciles its durable audit checkpoint, and restores audit/replay state before listening. `--http-bind` separately opens the unauthenticated GET-only `dekopon-webui`; absent means no TCP listener.
 - `dekopon-brokerd provider` is a separate operator mode. Exact-reference `sync` and `sync --locked` are the only network-capable lifecycle commands; `list`, `verify`, and daemon startup construct no registry request. A managed lock passes expected component length, SHA-256, and provider ID into the host so its one artifact read is both verified and compiled. The incompatible standard-Wasm-package assumptions in `wasm-pkg-client` are not used; the daemon embeds a narrow strict OCI-reference parser and bounded distribution path over `http-auth` and the existing rustls `reqwest` client.
-- The service enforces the [current local process boundary](security-model.md#current-local-process-boundary), has no independently retained, signed, or remote checkpoint anchor, and is not integrated with the operator CLI. Explicit `dekopon-run broker` commands are unprivileged fresh-connection clients; direct runner subcommands remain on the independent empty-linker host. CI rejects `dekopon-broker`, `dekopon-broker-host`, `dekopon-brokerd`, `dekopon-http-host`, `dekopon-storage-host`, or `dekopon-policy` in the normal dependency tree of `dekopon-run`, `dekopon`, and `dekopond`.
+- The service enforces the [current local process boundary](security-model.md#current-local-process-boundary), has no independently retained, signed, or remote checkpoint anchor. Auth does not invoke it. Explicit `dekopon-run broker` commands are unprivileged fresh-connection clients; direct runner subcommands remain on the independent empty-linker host. CI rejects `dekopon-broker`, `dekopon-broker-host`, `dekopon-brokerd`, `dekopon-http-host`, `dekopon-storage-host`, or `dekopon-policy` in the normal dependency tree of `dekopon-run` and `dekopond`.
 - `dekopond` is the unprivileged agent daemon on the other side of that boundary: strict owner-controlled configuration naming environment variables rather than secrets, chat transports, first-match routing to catalog agents, admission-bounded sessions, optional bounded conversation history in process memory (private per authenticated subject by default, explicitly shareable only within one agent/transport/conversation), and attested on-behalf-of proposals. Its attested `capabilities` gate refuses an unauthorized subject before any model call; the broker answers it only when policy permits `agent.prompt` for that principal and agent. It also best-effort reports a content-free normalized agent inventory and provider-reported model usage for the web UI; those values are informational and never feed authorization. See [`dekopond.md`](dekopond.md).
 
 See [`run.md`](run.md) for the user-facing contract, [`observability.md`](observability.md) for OTLP signal and redaction behavior, and [`security-model.md`](security-model.md) for the trust boundary.
@@ -193,14 +193,14 @@ This is the complete list of root-workspace commands behind the required `qualit
 cargo fmt --all --check
 # Lint every target with warnings denied.
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-# Release-profile compile of the four binaries; tag workflows perform the final linked builds.
-cargo check --release --locked -p dekopon -p dekopon-run -p dekopon-brokerd -p dekopond
+# Release-profile compile of the three binaries; tag workflows perform the final linked builds.
+cargo check --release --locked -p dekopon-run -p dekopon-brokerd -p dekopond
 # The foundational crates with their opt-in `schemars` feature off, which no other gate compiles.
 cargo check -p dekopon-core -p dekopon-capability -p dekopon-protocol --locked
 # Unused dependencies; CI pins cargo-machete 0.9.2.
 cargo machete
-# The runner, operator CLI, and gateway must not carry privileged broker machinery in their normal dependency trees; any line this prints is a failure.
-for p in dekopon-run dekopon dekopond; do
+# The runner and gateway must not carry privileged broker machinery in their normal dependency trees; any line this prints is a failure.
+for p in dekopon-run dekopond; do
   cargo tree --locked -p "$p" --edges normal --prefix none \
     | grep -E '^dekopon-(broker|broker-host|brokerd|http-host|storage-host|policy) v' \
     && echo "privileged crate in the normal dependency tree of $p" >&2
@@ -241,7 +241,7 @@ For package metadata, include lists, or dependency-boundary changes, run from a 
 cargo package --workspace --locked
 ```
 
-Only `dekopon`, `dekopon-run`, and `dekopond` package `tests/**`; every other published crate's `include` list omits it, so Cargo may warn that an integration file such as `tests/storage.rs`, `tests/host.rs`, `tests/broker.rs`, `tests/memory.rs`, `tests/policy_decisions.rs`, `tests/refusal_logging.rs`, `tests/span_parenting.rs`, `tests/server.rs`, `tests/examples.rs`, `tests/failure_logging.rs`, `tests/span_redaction.rs`, `tests/wit_mirror.rs`, `tests/dashboard.rs`, `tests/request_tracing.rs`, or `tests/harness.rs` is not included in the published package. Release packaging runs `.github/scripts/prepare-package-cache.sh` before its target-cache save to remove unpacked test-source directories from `target/package`; they are not compiler artifacts, and leaving them there makes `rust-cache` misclassify them as nested target directories and emit false `ENOENT` annotations.
+Only `dekopon-run` and `dekopond` package `tests/**`; every other published crate's `include` list omits it, so Cargo may warn that an integration file such as `tests/storage.rs`, `tests/host.rs`, `tests/broker.rs`, `tests/memory.rs`, `tests/policy_decisions.rs`, `tests/refusal_logging.rs`, `tests/span_parenting.rs`, `tests/server.rs`, `tests/examples.rs`, `tests/failure_logging.rs`, `tests/span_redaction.rs`, `tests/wit_mirror.rs`, `tests/dashboard.rs`, `tests/request_tracing.rs`, or `tests/harness.rs` is not included in the published package. Release packaging runs `.github/scripts/prepare-package-cache.sh` before its target-cache save to remove unpacked test-source directories from `target/package`; they are not compiler artifacts, and leaving them there makes `rust-cache` misclassify them as nested target directories and emit false `ENOENT` annotations.
 
 ### Documentation gates
 
@@ -426,13 +426,13 @@ work=$(mktemp -d)
 ci/stage-image-context.sh v0.3.0 "$work"
 docker buildx build --platform linux/arm64 --load -t dekopon:local "$work/context"
 docker buildx build --platform linux/amd64 --load -t dekopon:local-amd64 "$work/context"
-docker run --rm dekopon:local dekopon version
+docker run --rm dekopon:local dekopond --help
 docker run --rm dekopon:local dekopon-run invoke \
   --provider /opt/dekopon/providers/echo-provider.wasm echo.echo --input '{}'
 docker export "$(docker create dekopon:local unused)" | tar -tvf - opt/dekopon/providers
 ```
 
-The script prints the sixteen files it staged and the digest of each executable, then the build
+The script prints the fourteen files it staged and the digest of each executable, then the build
 context is exactly those files: there is no `.dockerignore` denylist to keep correct as the
 repository grows. The repository root cannot be used as a context and fails in about a second if
 someone tries.
@@ -443,7 +443,7 @@ image that matches the machine.
 
 Do not add a compile stage to the Dockerfile: the point of the image is that its binaries are the
 release's binaries, verifiable with `sha256sum` against the published archive. The workflow checks
-exactly that for all eight before it pushes anything, and the staging script refuses to stage a
+exactly that for all six before it pushes anything, and the staging script refuses to stage a
 binary that needs a glibc newer than the runtime base provides.
 
 `echo` is the only baked component the direct runner can load — the other default components

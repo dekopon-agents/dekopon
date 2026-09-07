@@ -2,7 +2,7 @@
 
 Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.12.0** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, an unprivileged chat gateway, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
 
-> **Status:** this tree is a substantial, testable foundation, but it is not production-ready. `dekopon` manages the local catalog and model-account login. `dekopon-run` can call an operator-selected model, execute import-free read-only components, or submit identity-free proposals as an unprivileged broker client; it has no broker authority or provider credentials. The separate Unix-only `dekopon-brokerd` executable authenticates one owner-UID trust domain, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, resolves legacy destination-bound credentials or separately authorized public DRNs through an owner-only private map, invokes constrained providers, records durable audit, and can explicitly bind an unauthenticated GET-only operational web view. The Unix-only `dekopond` daemon connects to chat services and routes messages to catalog agents, holding chat and model credentials but no broker authority. The operator CLI is integrated with neither.
+> **Status:** this tree is a substantial, testable foundation, but it is not production-ready. `dekopond auth` manages isolated model-account login without starting the gateway. `dekopon-run` can call an operator-selected model, execute import-free read-only components, or submit identity-free proposals as an unprivileged broker client; it has no broker authority or provider credentials. The separate Unix-only `dekopon-brokerd` executable authenticates one owner-UID trust domain, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, resolves legacy destination-bound credentials or separately authorized public DRNs through an owner-only private map, invokes constrained providers, records durable audit, and can explicitly bind an unauthenticated GET-only operational web view. The Unix-only `dekopond` daemon connects to chat services and routes messages to catalog agents, holding chat and model credentials but no broker authority.
 
 ## Design documentation
 
@@ -12,7 +12,7 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 
 - Strict YAML and JSON resources for agents, capabilities, and providers.
 - Cross-reference validation with duplicate and unknown-field detection.
-- A local, deterministic `dekopon` operator CLI with catalog commands, model-account authentication, and table, wide, JSON, YAML, and name output.
+- Isolated model-account authentication through `dekopond auth`, with table, wide, JSON, YAML, and name status output.
 - Strongly typed identifiers and an invocation typestate that distinguishes proposals from broker authorization.
 - A realistic broker-configured example — Cedar policy, credential template, and audit chain on its own volume — exercising two authorized calls in one invocation (`examples/conditional-write/`).
 - A Rust provider SDK plus a bounded Wasmtime component host with a fresh store per call, and an in-process fake-broker testkit (`dekopon-provider-sdk-testkit`) that runs a provider component against real storage for end-to-end tests.
@@ -57,7 +57,7 @@ New in 0.12.0 — a structural scrub of the whole tree:
 - The interactive console moved out of this tree to
   [dekopon-console](https://github.com/dekopon-agents/dekopon-console), the way the `gh` provider
   did. It was an unprivileged broker client holding a model credential, so nothing here loses
-  authority; the operator CLI is a local catalog and model-account tool again.
+  authority. Model-account commands now live in `dekopond auth`; the local catalog CLI is retired.
 - The local broker protocol is `dekopon.dev/broker/v1alpha2`. Attestation is one optional field on
   the request rather than a shape multiplied across eleven request variants, thirteen client
   methods, and nine broker entry points, so the six `*_for` / `*_for_chat` constructors and their
@@ -150,7 +150,11 @@ but finite; recording stops with `dedup-capacity` while reads continue. The char
 [current local process boundary](docs/security-model.md#current-local-process-boundary),
 with separate gateway and broker UIDs and private credential mounts.
 
-There is still no independently retained/signed/remote audit checkpoint service and no operator-CLI integration with the broker or the daemon — `dekopon` reads the catalog and manages the ChatGPT model-account login, nothing else. Secret sources currently use explicit strict bootstrap files: Vault dynamic leases, AWS ambient role chains/IRSA, GCP ADC/WIF, Azure managed identity, kubeconfig exec plugins, custom source CAs, caching/stale fallback, and transformed-reflection prevention do not exist. Catalog provider and status resources remain declarations only. The broker's provider manager currently has exact-reference sync/list/verify only: no SemVer ranges, private-registry credentials/custom roots, publisher-provenance verification, update/install/remove/prune lifecycle, revocation response, or container-staging integration. A digest proves bytes rather than publisher identity, so existing image staging retains its separate GitHub attestation checks. The immediate `dekopon-run` host exposes no WASI or custom imports and rejects every mutating capability, so it cannot read GitHub or post the review comment represented by the catalog example; only the broker can.
+There is still no independently retained/signed/remote audit checkpoint service and no catalog operator CLI. `dekopond auth` owns the ChatGPT model-account login. Secret sources currently use explicit strict bootstrap files: Vault dynamic leases, AWS ambient role chains/IRSA, GCP ADC/WIF, Azure managed identity, kubeconfig exec plugins, custom source CAs, caching/stale fallback, and transformed-reflection prevention do not exist. Catalog provider and status resources remain declarations only. The broker's provider manager currently has exact-reference sync/list/verify only: no SemVer ranges, private-registry credentials/custom roots, publisher-provenance verification, update/install/remove/prune lifecycle, revocation response, or container-staging integration. A digest proves bytes rather than publisher identity, so existing image staging retains its separate GitHub attestation checks. The immediate `dekopon-run` host exposes no WASI or custom imports and rejects every mutating capability, so it cannot read GitHub or post the review comment represented by the catalog example; only the broker can.
+
+**Unreleased source change:** model-account commands have moved to `dekopond auth` and the
+standalone catalog executable has been removed. Published 0.12.0 artifacts below are historical;
+build this revision from source for the new command. No release or tap publication is implied.
 
 ## Install
 
@@ -162,7 +166,7 @@ brew trust dekopon-agents/tap
 brew install dekopon
 ```
 
-That installs **all four** executables — `dekopon`, `dekopon-run`, `dekopon-brokerd`, and `dekopond` — plus the example JSONPlaceholder provider component, so one machine can run the broker and the gateway and actually exercise the authority boundary rather than only read the catalog. `brew install` prints where `BROKER.md`, `GATEWAY.md`, and the component landed. `brew trust` is not optional: Homebrew 6 refuses to load a formula from a non-official tap until you trust it.
+That installs **all three** executables — `dekopon-run`, `dekopon-brokerd`, and `dekopond` — plus the example JSONPlaceholder provider component, so one machine can run the broker and the gateway and actually exercise the authority boundary rather than only read the catalog. `brew install` prints where `BROKER.md`, `GATEWAY.md`, and the component landed. `brew trust` is not optional: Homebrew 6 refuses to load a formula from a non-official tap until you trust it.
 
 The tap is [`dekopon-agents/homebrew-tap`](https://github.com/dekopon-agents/homebrew-tap), and its formula is regenerated from the archives each release actually publishes rather than from a platform list maintained by hand. It covers **macOS on ARM64, and Linux on ARM64 and x86-64**.
 
@@ -188,13 +192,12 @@ tar xzf dekopon-0.12.0-aarch64-apple-darwin.tar.gz
 The workspace contains twenty-five public crates, and each application release tag publishes that version's packages in checked dependency order through crates.io trusted publishing:
 
 ```console
-cargo install --locked --version 0.12.0 dekopon
 cargo install --locked --version 0.12.0 dekopon-run
 cargo install --locked --version 0.12.0 dekopon-brokerd
 cargo install --locked --version 0.12.0 dekopond
 ```
 
-`0.12.0` is not on crates.io yet: the `v0.12.0` tag's `publish crates.io packages` job failed partway through `Publish in dependency order` (only `dekopon-core` and `dekopon-provider-http`, the first two in publication order, landed), so the four commands above fail until a maintainer dispatches the `Release` workflow against the existing `v0.12.0` tag with `publish_to_crates=true`, the recovery described under [Maintainer release process](#maintainer-release-process). The four executables top out at `0.11.1` there; substitute `--version 0.11.1` to install from crates.io today, or take 0.12.0 from the tap or archives above or from a checkout below.
+`0.12.0` is not on crates.io yet: the `v0.12.0` tag's `publish crates.io packages` job failed partway through `Publish in dependency order` (only `dekopon-core` and `dekopon-provider-http`, the first two in publication order, landed), so the three commands above fail until a maintainer dispatches the `Release` workflow against the existing `v0.12.0` tag with `publish_to_crates=true`, the recovery described under [Maintainer release process](#maintainer-release-process). The four executables top out at `0.11.1` there; substitute `--version 0.11.1` to install from crates.io today, or take 0.12.0 from the tap or archives above or from a checkout below.
 
 `0.3.0` was never published and is being left that way — its tag and GitHub release exist, but no crate carries that version. `dekopon` additionally carries `0.1.0` and `0.2.0` from before the workspace was split.
 
@@ -207,11 +210,10 @@ With stable Rust (MSRV 1.89.0, edition 2024):
 ```console
 git clone https://github.com/dekopon-agents/dekopon.git
 cd dekopon
-cargo install --locked --path crates/dekopon
 cargo install --locked --path crates/dekopon-run
 cargo install --locked --path crates/dekopon-brokerd
 cargo install --locked --path crates/dekopond
-dekopon version
+dekopond --version
 dekopon-run --version
 ```
 
@@ -239,22 +241,14 @@ For Kubernetes, [`charts/dekopon`](charts/dekopon/README.md) runs both daemons a
 
 The GitHub reviewer that used to live here moved out with its provider; it is [`examples/pr-summarizer-linter`](https://github.com/dekopon-agents/dekopon-provider-gh/blob/main/examples/pr-summarizer-linter/README.md) in `dekopon-provider-gh`.
 
-## Run the catalog example
+## Catalog example
 
-```console
-dekopon --config examples/local/dekopon.yaml get agents
-dekopon --config examples/local/dekopon.yaml get agents -o wide
-dekopon --config examples/local/dekopon.yaml get agent reviewer -o yaml
-dekopon --config examples/local/dekopon.yaml get capabilities -o name
-dekopon --config examples/local/dekopon.yaml get providers
-dekopon --config examples/local/dekopon.yaml describe agent reviewer
-dekopon --config examples/local/dekopon.yaml validate
-dekopon --config examples/local/dekopon.yaml config view -o json
-```
+[`examples/catalog/dekopon.yaml`](examples/catalog/dekopon.yaml) is the library/gateway catalog fixture.
+Run its loading and authority tests with `cargo test -p dekopon-config --test examples --locked`.
 
-The `reviewer` may read pull requests and may propose a review comment only through the explicit `github.pull-request.comment` external-write capability. The `reviewer` also mounts one skill directory, `skills/pull-request-review`, whose `SKILL.md` name and description the model sees and whose body it reads on demand with `read_skill`; `describe agent reviewer` lists it under `Skills:`. It has no approval capability, just like the end-to-end example above: approval is a separately named action rather than a stronger grade of “write.” This local file is catalog-only; the flagship example adds the broker policy, execution constraints, credential boundary, gateway route, and audit proof needed to make its comment real. The disabled `snooper` has one read-only repository capability.
+The `reviewer` may read pull requests and may propose a review comment only through the explicit `github.pull-request.comment` external-write capability. The `reviewer` also mounts one skill directory, `skills/pull-request-review`, whose `SKILL.md` name and description the model sees and whose body it reads on demand with `read_skill`. It has no approval capability, just like the end-to-end example above: approval is a separately named action rather than a stronger grade of “write.” This local file is catalog-only; the flagship example adds the broker policy, execution constraints, credential boundary, gateway route, and audit proof needed to make its comment real. The disabled `snooper` has one read-only repository capability.
 
-See [`docs/cli.md`](docs/cli.md) for discovery precedence, formats, and exit codes.
+See [`docs/cli.md`](docs/cli.md) for model-auth commands, formats, and exit codes.
 
 ## Run a Rust provider immediately
 
@@ -284,7 +278,7 @@ OTEL_EXPORTER_OTLP_HEADERS='Authorization=Basic%20<INGESTION_TOKEN>,organization
 
 [`examples/otel-traces`](examples/otel-traces/README.md) provides a one-container OpenObserve receiver, UI walkthrough, and automated smoke test.
 
-Prompt mode targets an OpenAI-compatible endpoint (defaulting to local Ollama at `http://127.0.0.1:11434/v1`) or uses the isolated ChatGPT/Codex device login managed by `dekopon auth chatgpt`. See [`docs/run.md`](docs/run.md) for subscription login, provider builds, prompt usage, limits, benchmarking, and authority restrictions.
+Prompt mode targets an OpenAI-compatible endpoint (defaulting to local Ollama at `http://127.0.0.1:11434/v1`) or uses the isolated ChatGPT/Codex device login managed by `dekopond auth chatgpt`. See [`docs/run.md`](docs/run.md) for subscription login, provider builds, prompt usage, limits, benchmarking, and authority restrictions.
 
 ## Script several capability calls as one plan
 
@@ -351,7 +345,7 @@ An App rather than a personal access token: the minted token expires within the 
 
 ## Organization and package names
 
-[`dekopon-agents`](https://github.com/dekopon-agents) is the GitHub organization that hosts the project. **Dekopon** is the product, `dekopon` is the CLI binary and Cargo workspace, and `dekopon` is the intended primary crates.io package. Organization naming does not change the product or package name.
+[`dekopon-agents`](https://github.com/dekopon-agents) is the GitHub organization that hosts the project. **Dekopon** is the product and Cargo workspace. The executables are `dekopond`, `dekopon-brokerd`, and `dekopon-run`; the standalone catalog CLI is retired. Organization naming does not change the product name.
 
 ## Contributing and license
 

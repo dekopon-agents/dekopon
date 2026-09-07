@@ -56,7 +56,7 @@ Keep the host, SDK, HTTP and storage facades, provider WIT, HTTP WIT, storage WI
 | Crates, protocols, daemon/broker split, or dependencies | [`architecture.md`](architecture.md) | Defines implementation and deployment boundaries and explains intentionally absent machinery. |
 | Source locations, tests, WIT, generated Wasm, CI, dependencies, packaging, or releases | [`development.md`](development.md) | Records the practical repository workflow and scope-specific checks. |
 | The container image, its publication workflow, or a container deployment | [`container-image.md`](container-image.md) | Records that the image reuses the published release archives, what it contains, the numeric runtime UID, the baked provider paths, and the directory ownership both daemons demand. |
-| Operator auth, catalog commands, config discovery, rendering, or exit codes | [`cli.md`](cli.md) | Records the current operator contract. |
+| Operator auth parsing, rendering, or exit codes | [`cli.md`](cli.md) | Records the current operator contract. |
 | Agent, capability, or provider resource fields, or what a catalog value actually decides | [`catalog.md`](catalog.md) | Records every `v1alpha1` field, its consumer, and which fields are reserved and read by nothing. |
 | Running a deployment: startup refusals, audit recovery, draining, or where an operational contract lives | [`operations.md`](operations.md) | Indexes the per-crate operational contracts by operator question rather than by crate. |
 | Moving a deployment between releases, or a breaking configuration change | [`upgrading.md`](upgrading.md) | Records the migrations the changelog only names, the lockstep rule, and the restart order. |

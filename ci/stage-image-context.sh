@@ -25,7 +25,7 @@
 #   <work>/archives/        the release archives and their published .sha256 sidecars
 #   <work>/context/         the build context: Dockerfile, dist/<arch>/<binary>, providers/,
 #                           optional-providers/, LICENSE-APACHE, LICENSE-MIT — and nothing else
-#   <work>/binaries.sha256  the eight staged executables, for the byte-identity check after the
+#   <work>/binaries.sha256  the six staged executables, for the byte-identity check after the
 #                           image is built
 set -euo pipefail
 
@@ -47,7 +47,7 @@ context="$work/context"
 # a build can bake in a binary that cannot start.
 max_glibc="2.41"
 
-binaries="dekopon dekopon-run dekopon-brokerd dekopond"
+binaries="dekopon-run dekopon-brokerd dekopond"
 providers="http-probe"
 standalone_default_providers="echo jsonplaceholder"
 # Other out-of-tree providers, as <owner>/<repo>@<tag>. These ship in the image so it is useful

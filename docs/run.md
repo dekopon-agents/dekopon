@@ -1,6 +1,6 @@
 # Direct provider runner and broker client
 
-`dekopon-run` is an **experimental current** one-shot runner for developing and measuring read-only import-free providers, plus explicit unprivileged clients for two separately running processes: `dekopon-brokerd` and `dekopond`. It is separate from the `dekopon` operator CLI and is not a daemon, policy engine, authorization broker, or production provider boundary.
+`dekopon-run` is an **experimental current** one-shot runner for developing and measuring read-only import-free providers, plus explicit unprivileged clients for two separately running processes: `dekopon-brokerd` and `dekopond`. It is not a daemon, policy engine, authorization broker, or production provider boundary.
 
 ## Commands
 
@@ -12,7 +12,7 @@ dekopon-run shell --provider <COMPONENT>... [--curl-capability <CAPABILITY>] <SC
 dekopon-run broker capabilities [--socket <PATH>] [--server-uid <UID>]
 dekopon-run broker invoke [--socket <PATH>] [--server-uid <UID>] --invocation-id <ID> --trace-id <ID> <CAPABILITY> [--input <JSON> | --input-file <PATH>]
 dekopon-run chat --gateway <SOCKET> --subject <SUBJECT> [--conversation <ID>]
-dekopon auth chatgpt <login | status | logout | export>
+dekopond auth chatgpt <login | status | logout | export>
 ```
 
 Every `--provider <COMPONENT>` is a component file or a directory, which expands to the `*.wasm` files directly inside it in filename order, so two runs over one directory agree about which provider claimed a duplicate capability. `--input-file -` reads the capability input from standard input on both `invoke` and `broker invoke`.
@@ -221,14 +221,14 @@ For authenticated endpoints, `--api-key-env <NAME>` names an environment variabl
 Dekopon implements OpenAI's Codex device authorization and streaming Responses protocol directly; OpenClaw, the Codex CLI, and pi are not runtime dependencies. Sign in once:
 
 ```console
-target/release/dekopon auth chatgpt login
+target/release/dekopond auth chatgpt login
 ```
 
 The command prints `https://auth.openai.com/codex/device` and a short code, waits for authorization, then stores refreshable credentials in Dekopon's own credential file. Check or remove that login with:
 
 ```console
-target/release/dekopon auth chatgpt status
-target/release/dekopon auth chatgpt logout
+target/release/dekopond auth chatgpt status
+target/release/dekopond auth chatgpt logout
 ```
 
 Then select the subscription backend explicitly:
@@ -243,9 +243,9 @@ target/release/dekopon-run prompt \
 
 Use an exact model exposed to the signed-in Codex account; `gpt-5.5` is a recovery choice when the account does not expose GPT-5.6. Dekopon automatically refreshes an expiring access token and replays opaque encrypted reasoning items only in memory when a tool call requires another model turn.
 
-Dekopon refreshes an expiring access token by rotating the refresh token and writing the replacement back, so the credential file's directory has to be writable. [`chatgpt-credential.md`](chatgpt-credential.md) follows what that means for a container, including `dekopon auth chatgpt export`.
+Dekopon refreshes an expiring access token by rotating the refresh token and writing the replacement back, so the credential file's directory has to be writable. [`chatgpt-credential.md`](chatgpt-credential.md) follows what that means for a container, including `dekopond auth chatgpt export`.
 
-The default credential file is `~/.config/dekopon/chatgpt-auth.json` (`0600` on Unix). `DEKOPON_CHATGPT_AUTH_FILE`, `dekopon auth chatgpt ... --auth-file`, or `dekopon-run prompt --chatgpt-auth-file` can override it. Dekopon intentionally never imports OAuth material from pi, OpenClaw, or the Codex CLI. The model request is sent only to `auth.openai.com` during login and `chatgpt.com/backend-api/codex/responses` during inference; those endpoints are fixed rather than user-configurable.
+The default credential file is `~/.config/dekopon/chatgpt-auth.json` (`0600` on Unix). `DEKOPON_CHATGPT_AUTH_FILE`, `dekopond auth chatgpt ... --auth-file`, or `dekopon-run prompt --chatgpt-auth-file` can override it. Dekopon intentionally never imports OAuth material from pi, OpenClaw, or the Codex CLI. The model request is sent only to `auth.openai.com` during login and `chatgpt.com/backend-api/codex/responses` during inference; those endpoints are fixed rather than user-configurable.
 
 The subscription transport receives the prompt, system instruction, the single scripting tool schema, the scripts the model writes, and their output. Credentials are never passed to Wasm providers or trace fields. Subscription quotas and model availability remain controlled by OpenAI and are distinct from Platform API billing.
 
@@ -253,7 +253,7 @@ The subscription transport receives the prompt, system instruction, the single s
 
 ### Mounting skills
 
-`--skill <DIRECTORY>` mounts one skill and repeats for several. A skill is a directory named after the skill, holding a `SKILL.md` that opens with YAML front matter — `name`, which must equal the directory name, and a one-line `description` — followed by Markdown instructions; every other regular file under the directory is a *resource* of the skill, addressed by its `/`-separated relative path. This is the Agent Skills directory format, so a `SKILL.md` written for another agent loads here unchanged; [`examples/local/skills/pull-request-review`](../examples/local/skills/pull-request-review/SKILL.md) is one, with a `references/risk-checklist.md` resource. Everything is read into memory before the session starts, bounded (a 64 KiB `SKILL.md`, 256 KiB per resource, 64 resources, 1 MiB in all), so the session itself never opens a file. A directory that does not load — no `SKILL.md`, a `name` that differs from the directory, an unknown front-matter key, a symlink anywhere in the tree, a file past its bound — fails the command before any model call with `error: a --skill directory could not be mounted` and exit `1`; `-v` prints the cause. Two mounted skills with one name are refused the same way (`was mounted twice`), because the model could not tell them apart.
+`--skill <DIRECTORY>` mounts one skill and repeats for several. A skill is a directory named after the skill, holding a `SKILL.md` that opens with YAML front matter — `name`, which must equal the directory name, and a one-line `description` — followed by Markdown instructions; every other regular file under the directory is a *resource* of the skill, addressed by its `/`-separated relative path. This is the Agent Skills directory format, so a `SKILL.md` written for another agent loads here unchanged; [`examples/catalog/skills/pull-request-review`](../examples/catalog/skills/pull-request-review/SKILL.md) is one, with a `references/risk-checklist.md` resource. Everything is read into memory before the session starts, bounded (a 64 KiB `SKILL.md`, 256 KiB per resource, 64 resources, 1 MiB in all), so the session itself never opens a file. A directory that does not load — no `SKILL.md`, a `name` that differs from the directory, an unknown front-matter key, a symlink anywhere in the tree, a file past its bound — fails the command before any model call with `error: a --skill directory could not be mounted` and exit `1`; `-v` prints the cause. Two mounted skills with one name are refused the same way (`was mounted twice`), because the model could not tell them apart.
 
 What the model sees is deliberately less than what was loaded. A second system message follows the standing instructions: it begins `Skills mounted for this agent`, lists each skill as `- name: description`, and tells the model to call `read_skill` before doing work a skill covers. Bodies and resources stay out of the prompt, and the listing is deterministic for one mounted set, so it does not disturb a cached prompt prefix. The session offers `read_skill` beside `bash`, with `name` (required) and `resource` (optional, a resource path). Without `resource` it returns the skill's instructions framed with its name, description, and the list of its resource files; with one, that file's text. A second read of the same instructions or resource in one session is answered with a one-line pointer at the earlier result rather than a second copy, because a tool result stays in the conversation and is re-sent on every later turn. An unknown skill name or resource path is a refusal the model reads — naming the mounted skills, or the skill's resource files — and the session continues; malformed arguments (not an object, no `name`, an unexpected key) end the session exactly as a malformed `bash` call does. Each read fires `agent.skill.read` with the skill name, resource path, byte count, and whether it repeated an earlier one; each refusal fires `agent.skill.refused` with its reason (`unknown-skill` or `unknown-resource`). Both fire in either payload mode and carry operator-authored names only; the text reaches telemetry solely through the transcript events payload mode adds. Without `--skill` there is no listing and no tool. A skill is operator-authored text handed to the model, exactly as `--system` is: it grants no authority, it is readable by the model in full, and nothing secret belongs in one. A `dekopond` route mounts the skills its agent's catalog entry lists on every session.
 

@@ -795,25 +795,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dekopon"
-version = "0.12.0"
-dependencies = [
- "base64 0.23.1",
- "clap",
- "dekopon-config",
- "dekopon-core",
- "dekopon-model",
- "dekopon-protocol",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "tempfile",
- "thiserror 2.0.20",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "dekopon-agent"
 version = "0.12.0"
 dependencies = [

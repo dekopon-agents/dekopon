@@ -1,8 +1,8 @@
 # Catalog resource reference
 
 **Status: current.** This is the field-by-field contract for the `dekopon.dev/v1alpha1` catalog —
-the `Agent`, `Capability`, and `Provider` documents in the file `dekopon --config` and `dekopond`'s
-`catalogPath` both point at. [`cli.md`](cli.md) covers discovery, output formats, and exit codes;
+the `Agent`, `Capability`, and `Provider` documents in the file `dekopond`'s
+`catalogPath` points at. [`cli.md`](cli.md) covers the separate model-auth commands;
 this document covers the schema and, for every field, what actually consumes it today.
 
 That last part is the reason this document exists. The catalog looks like a permission system and is
@@ -14,7 +14,6 @@ which is which.
 
 | Process | Reads the catalog? | What it does with it |
 |---|---|---|
-| `dekopon` | Yes | Renders and validates it, and with it every skill directory an agent's `spec.skills` names, because loading the catalog reads them. Every catalog command is this file and those directories, nothing else. |
 | `dekopond` | Yes, at startup | Binds each route to an agent, resolves that agent's model, hands its `instructions` to the model as a system prompt, mounts its `skills` on every session the route serves, and publishes a bounded content-free inventory to the broker's web UI. |
 | `dekopon-brokerd` | **No** | The broker does not link `dekopon-config` and never sees this file. It declares the `Dekopon::Agent` Cedar type and matches instances by name without enumerating them. |
 | `dekopon-run` | **No** | The runner loads Wasm components by path and has no catalog concept; it links `dekopon-config` only for `load_skill`, which its `--skill <DIRECTORY>` flag uses to mount a skill directory in the format below without a catalog. |
@@ -46,7 +45,7 @@ status: Ready          # optional
 | `apiVersion` | yes | Exactly `dekopon.dev/v1alpha1`. Any other value fails to decode. |
 | `kind` | yes | Must match the document's own shape; a `spec` for one kind under another kind's name is a load failure. |
 | `metadata.name` | yes | Validated as the kind's identifier type. |
-| `metadata.labels` | no | A string-to-string map with stable ordering. **Consumed by nothing.** It round-trips through `-o yaml`/`-o json` and is never selected on, filtered by, or reported. |
+| `metadata.labels` | no | A string-to-string map with stable ordering. Stored by protocol `ObjectMeta` serde; no shipped selector, filter, or inventory reader consumes it (source map below). |
 | `spec` | yes | Kind-specific, below. |
 | `status` | no | Kind-specific. Authored, never observed — see [Reserved and inert fields](#reserved-and-inert-fields). |
 
@@ -91,15 +90,15 @@ status: Ready
 
 | Field | Type | Required | What consumes it |
 |---|---|---|---|
-| `description` | string | yes | Rendered by `dekopon get`/`describe`, and reported in the broker web UI inventory (bounded to 4 KiB). |
-| `enabled` | bool | no, defaults `true` | **Load-bearing in `dekopond`.** A route naming a disabled agent is a startup failure. It also overrides `status` in CLI rendering: a disabled agent always displays `Disabled`. |
+| `description` | string | yes | Reported in the broker web UI inventory (bounded to 4 KiB). |
+| `enabled` | bool | no, defaults `true` | **Load-bearing in `dekopond`.** A route naming a disabled agent is a startup failure. Also reported as an enabled flag in the inventory; authored status does not override it. |
 | `instructions` | string | no | **Load-bearing in `dekopond`.** Handed to the model verbatim as the session's system prompt. Absent means the agent runs with no standing orders. |
-| `skills` | list of directory paths | no | **Load-bearing in `dekopond`.** Each names a skill directory — relative paths resolve against the catalog file's own directory — that the loader reads whole at load time. `dekopond` mounts them on every session of a route bound to the agent; `dekopon describe agent` lists them by name, description, and resource count. See [`skills` are directories the model reads on demand](#skills-are-directories-the-model-reads-on-demand). |
-| `capabilities` | list of capability IDs | no | Cross-checked at load: every entry must name a `Capability` in the same catalog or the file is rejected. Rendered by the CLI, expanded into the web UI inventory. **Grants nothing.** |
-| `providers` | list of provider IDs | no | Cross-checked at load: every entry must name a `Provider`, and the list must match exactly the providers the agent's `capabilities` route to. Rendered and reported. **Grants nothing.** |
+| `skills` | list of directory paths | no | **Load-bearing in `dekopond`.** Each names a skill directory — relative paths resolve against the catalog file's own directory — that the loader reads whole at load time. `dekopond` mounts them on every session of a route bound to the agent. See [`skills` are directories the model reads on demand](#skills-are-directories-the-model-reads-on-demand). |
+| `capabilities` | list of capability IDs | no | Cross-checked at load: every entry must name a `Capability` in the same catalog or the file is rejected. Expanded into the web UI inventory as IDs, provider IDs and permissions. **Grants nothing.** |
+| `providers` | list of provider IDs | no | Cross-checked at load: every entry must name a `Provider`, and the list must match exactly the providers the agent's `capabilities` route to. Reported as provider IDs in the inventory. **Grants nothing.** |
 | `modelClass` | string | no, but see below | **Load-bearing in `dekopond`.** Selects which configured model serves the agent. |
 | `policyProfile` | string | no | **Reserved.** Nothing reads it. See [Reserved and inert fields](#reserved-and-inert-fields). |
-| `status` | `Ready` \| `Pending` \| `Disabled` \| `Error` | no | Authored, never observed. Rendered by the CLI; absent renders as `Pending`. |
+| `status` | `Ready` \| `Pending` \| `Disabled` \| `Error` | no | Stored typed authored metadata, never observed or reported; omission stays `None`, with no presentation fallback. |
 
 ### `instructions` is untrusted model text, and it is readable
 
@@ -125,10 +124,10 @@ here: an unknown key is a load failure naming it.
 |---|---|---|
 | `name` | yes | Lowercase ASCII letters, digits, and single hyphens; at most 64 bytes; starts and ends with a letter or digit. **Must equal the directory's name.** The grammar is narrower than the catalog's [identifier grammar](#identifier-grammar) on purpose — it is the one the format fixes — so `pull-request-review` loads and `Pdf`, `pdf_tools`, and `pdf--tools` do not. |
 | `description` | yes | Trimmed, non-blank, at most 1024 bytes. The one line a model reads to decide whether the skill applies; it sits in every prompt on a route that mounts the skill. |
-| `license` | no | Recorded and rendered. Blank is treated as absent. |
-| `compatibility` | no | Declared environment requirements. Recorded and rendered; blank is treated as absent. |
+| `license` | no | Stored by `Skill::license`; no shipped presentation reader. Blank is treated as absent. |
+| `compatibility` | no | Declared environment requirements stored by `Skill::compatibility`; no shipped presentation reader; blank is treated as absent. |
 | `metadata` | no | A map of scalar values — strings, booleans, numbers, or null — kept as text. A list or map value is refused. |
-| `allowed-tools` | no | A string, carried through and rendered. **Not enforced:** a session has one scripting tool whatever a skill says, and authority comes from broker policy, never from a file a model reads. |
+| `allowed-tools` | no | A string stored by `Skill::allowed_tools`; no shipped presentation reader. **Not enforced:** a session has one scripting tool whatever a skill says, and authority comes from broker policy, never from a file a model reads. |
 
 Every other regular file in the directory tree is a *resource* of the skill, addressed by its
 `/`-separated path relative to the skill directory, such as `references/risk-checklist.md`, and
@@ -154,10 +153,6 @@ What consumes a loaded skill:
   [`observability.md`](observability.md).
 - `inspect_agent_config` lists mounted skills by name, description, and resource paths — never the
   text. Skills are not part of the web UI inventory.
-- `dekopon describe agent` renders a `Skills:` section, one `- <name> [<N> resource file(s)]:
-  <description>` line per skill or `(none)`; `dekopon get agents -o wide` adds a `SKILLS` column
-  counting the agent's `spec.skills` entries. `-o yaml`, `-o json`, and `config view` show the
-  authored paths, never the skill text.
 - `dekopon-run --skill <DIRECTORY>` mounts the same format with no catalog; see
   [`run.md`](run.md#mounting-skills).
 
@@ -174,8 +169,8 @@ token, credential, or internal hostname belongs in a `SKILL.md` or in any resour
 route, the agent's `modelClass` picks the first configured model offering that class, in declaration
 order, so an operator controls preference by ordering `models` rather than by a hidden score.
 
-It is optional in the schema only because an agent the gateway never routes — one read by the CLI
-alone — does not need one. For a routed agent it is effectively required:
+It is optional for an unrouted agent or a route with an explicit model. Gateway
+`RoutingTable::bind` requires it only when the route does not name a model:
 
 - a route that names `model:` explicitly overrides the class, and then `modelClass` selects nothing
   (it is still reported to the web UI and to `inspect_agent_config`);
@@ -207,13 +202,13 @@ status: Unknown
 
 | Field | Type | Required | What consumes it |
 |---|---|---|---|
-| `description` | string | yes | Rendered by the CLI and reported in the web UI inventory. |
+| `description` | string | yes | Stored typed metadata; not included in the gateway inventory (which carries capability IDs, provider IDs and permissions). |
 | `provider` | provider ID | yes | Cross-checked at load: must name a `Provider` in the same catalog. |
-| `effect` | `read-only` \| `local-write` \| `external-write` | yes | Rendered by the CLI in the default and wide capability tables. |
-| `risk` | `Low` \| `Medium` \| `High` \| `Critical` | yes | Rendered by `-o wide`. |
-| `idempotency` | `idempotent` \| `conditional` \| `non-idempotent` | yes | Rendered by `-o wide`. |
-| `permissions` | list of `{ operation, resource? }` | no | Rendered as a count by `-o wide`, expanded in the web UI inventory. |
-| `status` | `Available` \| `Unavailable` \| `Unknown` | no | Authored, never observed; absent renders as `Unknown`. |
+| `effect` | `read-only` \| `local-write` \| `external-write` | yes | Stored typed catalog metadata; not used for gateway authorization or reported in its inventory. |
+| `risk` | `Low` \| `Medium` \| `High` \| `Critical` | yes | Stored typed catalog metadata; not reported in the gateway inventory. |
+| `idempotency` | `idempotent` \| `conditional` \| `non-idempotent` | yes | Stored typed catalog metadata; not reported in the gateway inventory. |
+| `permissions` | list of `{ operation, resource? }` | no | Expanded in the gateway inventory for web UI display; no authority is granted. |
+| `status` | `Available` \| `Unavailable` \| `Unknown` | no | Stored typed authored metadata, never observed or reported; omission stays `None`, with no presentation fallback. |
 
 **The broker does not read any of this.** The trusted `effect`, `risk`, and `idempotency` a policy
 decision actually sees come from the capability's `constraintSets` entry in `broker.yaml`, validated
@@ -238,10 +233,10 @@ status: Unknown
 
 | Field | Type | Required | What consumes it |
 |---|---|---|---|
-| `description` | string | yes | Rendered by the CLI. |
-| `type` | string | yes | Free-form implementation family, such as `github`. Rendered by the CLI; matched against nothing. |
+| `description` | string | yes | Stored typed catalog metadata; not reported in the gateway inventory. |
+| `type` | string | yes | Free-form implementation family, such as `github`. Stored typed metadata; matched against nothing and not reported in the gateway inventory. |
 | `credentialRef` | string | yes | **Reserved.** Nothing resolves it. See below. |
-| `status` | `Ready` \| `Unavailable` \| `Unknown` | no | Authored, never observed; absent renders as `Unknown`. |
+| `status` | `Ready` \| `Unavailable` \| `Unknown` | no | Stored typed authored metadata, never observed or reported; omission stays `None`, with no presentation fallback. |
 
 A catalog `Provider` is not the Wasm component. The component is a `.wasm` file the broker loads by
 path from its own `providers:` list, and its manifest — not this document — declares the capability
@@ -250,18 +245,44 @@ declaration that such a provider is part of the deployment.
 
 ## Reserved and inert fields
 
-Four fields are authored, validated, rendered, and consumed by nothing. They are listed here rather
+Four fields are decoded and retained as typed metadata but have no shipped behavioral reader. They are listed here rather
 than left to be discovered, because each one reads like it selects a behavior.
 
 | Field | Looks like | Actually |
 |---|---|---|
-| `spec.policyProfile` (Agent) | Selects a named policy for the agent | Read by `dekopon get`/`describe` and nothing else. Broker authority comes from the owner-authored Cedar policy file and the per-capability `constraintSets` in `broker.yaml`; naming a profile here selects no policy and changes no decision. |
-| `spec.credentialRef` (Provider) | Names the credential the provider will present | Rendered in the wide provider table (`dekopon get -o wide`, `config view -o wide`), carried through every `-o json`/`-o yaml` form, and read by nothing else. Legacy credential binding is owned by `constraintSets` (`credential:` / `credentialByAgent:`) and the broker's `0600` credentials file. Model-selected public DRNs are owned by the separate typed proposal/private-map/`secret.use` path. Neither mechanism consults this catalog field. A `credentialRef` that matches nothing is not an error, and one that matches a real credential name still binds nothing. |
-| `status` (all three kinds) | Observed availability | Authored. No probe, daemon, or reconciler ever writes it, so `dekopon get capabilities` reports the file, not the deployment. |
-| `metadata.labels` | Selection or grouping | Round-tripped through `-o yaml`/`-o json`. Nothing filters, selects, or reports on them. |
+| `spec.policyProfile` (Agent) | Selects a named policy for the agent | Not consumed by runtime authority. Broker authority comes from the owner-authored Cedar policy file and the per-capability `constraintSets` in `broker.yaml`; naming a profile here selects no policy and changes no decision. |
+| `spec.credentialRef` (Provider) | Names the credential the provider will present | Preserved in the typed catalog but read by no credential resolver. Legacy credential binding is owned by `constraintSets` (`credential:` / `credentialByAgent:`) and the broker's `0600` credentials file. Model-selected public DRNs are owned by the separate typed proposal/private-map/`secret.use` path. Neither mechanism consults this catalog field. A `credentialRef` that matches nothing is not an error, and one that matches a real credential name still binds nothing. |
+| `status` (all three kinds) | Observed availability | Authored. No probe, daemon, or reconciler ever writes it, so the catalog records the file, not the deployment. |
+| `metadata.labels` | Selection or grouping | Retained by protocol serde. Nothing filters, selects, or reports on them. |
 
 `credentialRef` is required by the schema, so a `Provider` document must carry one even though the
 value is inert. `policyProfile`, `status`, and `labels` are optional and may simply be omitted.
+
+### Source map for stored metadata and shipped readers
+
+- [`dekopon-protocol/src/lib.rs`](../crates/dekopon-protocol/src/lib.rs):
+  `ObjectMeta`, `AgentSpec`, `CapabilitySpec`, `ProviderSpec` and resource status fields own
+  the typed serde storage of labels, policyProfile, credentialRef, descriptions, classifications
+  and optional authored statuses. Storage and serialization are not a catalog display command.
+  Optional Schemars derives consume Rustdoc as schema description metadata, not validation rules.
+- [`dekopon-config/src/lib.rs`](../crates/dekopon-config/src/lib.rs), `validate_references`:
+  checks agent capabilities/providers and capability provider references; it grants no authority.
+- [`dekopond/src/routes.rs`](../crates/dekopond/src/routes.rs), `RoutingTable::bind`:
+  checks enabled, resolves explicit model or modelClass, and binds instructions and loaded skills.
+- [`dekopond/src/lib.rs`](../crates/dekopond/src/lib.rs), `agent_inventory`:
+  reports agent description, enabled, modelClass, provider IDs, capability IDs and permissions.
+  It does not report catalog capability descriptions/effect/risk/idempotency, provider
+  description/type/credentialRef, labels, policyProfile or authored statuses.
+  [`dekopon-webui/src`](../crates/dekopon-webui/src/) renders that informational inventory;
+  its loaded-provider views instead consume broker component metadata, not catalog providers.
+- [`dekopon-config/src/skill.rs`](../crates/dekopon-config/src/skill.rs), `Skill` and `load_skill`:
+  retain license, compatibility, scalar metadata and allowed-tools with typed accessors.
+  [`dekopon-agent/src/skills.rs`](../crates/dekopon-agent/src/skills.rs), `prompt_block` and
+  `render_skill`, use name, description, body and resource paths/text, not those optional
+  front-matter fields. [`dekopond/src/session.rs`](../crates/dekopond/src/session.rs)
+  constructs self-inspection with name, description and resource paths only. The runner mounts
+  the same loaded skills through the shared agent layer; no surviving renderer promises to
+  display the optional front matter. Metadata scalars remain converted to text by the loader.
 
 ## What the loader checks
 
@@ -286,13 +307,12 @@ naming the file and each offending document or skill directory:
 - no two skills one agent mounts share a `name`; the second is refused rather than shadowing the
   first, because a model could not tell two `read_skill` targets apart.
 
-`dekopon validate` runs exactly this and reports the result; `dekopon get`, `describe`, and `config
-view` run it before rendering anything. A catalog is therefore either wholly loadable or wholly
-refused — there is no partial mode where some resources are usable.
+`dekopon-config` runs these checks whenever a catalog loads. A catalog is either wholly
+loadable or wholly refused — there is no partial mode where some resources are usable.
 
 ## Related documents
 
-- [`cli.md`](cli.md) — configuration discovery order, output formats, and exit codes.
+- [`cli.md`](cli.md) — model-auth formats and exit codes.
 - [`dekopond.md`](dekopond.md) — routes, model endpoints, sessions, and conversations; the consumer
   that makes `instructions`, `skills`, `enabled`, and `modelClass` load-bearing.
 - [`run.md`](run.md#mounting-skills) — the runner's `--skill` flag, which mounts the same skill
@@ -301,6 +321,6 @@ refused — there is no partial mode where some resources are usable.
   configuration is what decides authority.
 - [`crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.md) — the broker
   configuration this catalog is deliberately separate from.
-- [`examples/local/dekopon.yaml`](../examples/local/dekopon.yaml) — a complete authored catalog.
-- [`examples/local/skills/pull-request-review/SKILL.md`](../examples/local/skills/pull-request-review/SKILL.md)
+- [`examples/catalog/dekopon.yaml`](../examples/catalog/dekopon.yaml) — a complete authored catalog.
+- [`examples/catalog/skills/pull-request-review/SKILL.md`](../examples/catalog/skills/pull-request-review/SKILL.md)
   — the skill that catalog's `reviewer` agent mounts, with one resource file.

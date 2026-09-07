@@ -9,7 +9,7 @@ One-shot direct execution for read-only Dekopon WebAssembly providers plus an ex
 - `dekopon-run broker capabilities` inspects the capabilities broker policy allows this authenticated Unix peer.
 - `dekopon-run broker invoke` submits one identity-free, caller-ID-bearing proposal to `dekopon-brokerd`.
 - `dekopon-run chat` holds a conversation with a running [`dekopond`](../dekopond/README.md) over its local development socket. It loads no component and runs no model or tool loop of its own: unlike `prompt`, which runs that loop in process, `chat` sends one JSON line per message and prints the daemon's reply.
-- `dekopon auth chatgpt` manages Dekopon's isolated subscription login.
+- `dekopond auth chatgpt` manages Dekopon's isolated subscription login.
 - `--provider` takes a component file or a directory of them; a directory loads every `*.wasm` directly inside it, in filename order. Load order decides route-table construction, so the sort is what keeps repeated runs over one directory identical. Unlike `dekopon-brokerd`, the runner applies no ownership check: it loads components the invoking user already owns, under their own authority.
 - `--trace <PATH>` exports Chrome/Perfetto-compatible spans without inputs or outputs, unless `--otel-telemetry-payloads true` opts that file in like any other sink.
 - `--otlp-endpoint <URL>` exports correlated OTLP traces and audit-safe lifecycle logs, over HTTP/protobuf by default or gRPC with `--otlp-transport grpc` (`OTEL_EXPORTER_OTLP_PROTOCOL_KIND`); standard OTLP header environment variables carry receiver authentication and routing.

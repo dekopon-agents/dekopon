@@ -14,7 +14,7 @@ been validated, and audit records `credentialInjected: true` and never a value.
 
 | File | What it is | Who reads it |
 |---|---|---|
-| [`dekopon.yaml`](dekopon.yaml) | The catalog: one agent, two capabilities, one provider | `dekopond`, `dekopon` |
+| [`dekopon.yaml`](dekopon.yaml) | The catalog: one agent, two capabilities, one provider | `dekopond` |
 | [`broker.yaml`](broker.yaml) | Broker configuration: identities, mappings, constraint sets | `dekopon-brokerd` |
 | [`policies.cedar`](policies.cedar) | Who may do what, and through which gateway | `dekopon-brokerd` |
 | [`broker-credentials.yaml.example`](broker-credentials.yaml.example) | The API token, after you copy it | `dekopon-brokerd` |
@@ -92,15 +92,9 @@ chmod 600 broker.yaml policies.cedar dekopond.yaml
 
 The catalog half is checkable before anything runs:
 
-```console
-$ dekopon --config dekopon.yaml validate
-configuration valid: 1 agent(s), 2 capability(ies), 1 provider(s)
-
-$ dekopon --config dekopon.yaml describe agent xaviers-conditional-writer
-```
-
-That validates cross-references and capability metadata, and nothing else — the `dekopon` CLI reads
-the catalog and never contacts the broker. What the agent may actually do is decided two files away.
+The gateway loads and validates the complete typed catalog before starting transports.
+The example's cross-references and read/comment-without-approval boundary are also pinned by
+`cargo test -p dekopon-config --test examples --locked`.
 
 ## 4. Run the broker
 
@@ -312,4 +306,4 @@ Nothing carries beyond that conversation: the agent has no memory that outlives 
 - [`../../docs/dekopond.md`](../../docs/dekopond.md) — transports, routing, session bounds, and the authorization flow.
 - [`../../crates/dekopon-brokerd/README.md`](../../crates/dekopon-brokerd/README.md) — every configuration field, and the audit and shutdown contract.
 - [`../../crates/dekopon-policy/README.md`](../../crates/dekopon-policy/README.md) — what Cedar decides here and what it deliberately does not.
-- [`../local/dekopon.yaml`](../local/dekopon.yaml) — the catalog-only example, whose `reviewer` may comment and deliberately holds no approval capability.
+- [`../catalog/dekopon.yaml`](../catalog/dekopon.yaml) — the catalog-only example, whose `reviewer` may comment and deliberately holds no approval capability.

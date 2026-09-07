@@ -17,6 +17,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Removed
 
+- Retired the standalone catalog CLI and package; model-account login, status, logout, and guarded credential export now live in `dekopond auth chatgpt`, without gateway configuration or startup.
+
 - Remove the broker audit checkpoint sidecar and its required configuration keys. The broker opens the verified audit directly; service run functions return unit on clean shutdown.
 
 - Remove recorded-session listing, transcript reconstruction, and model replay from the runner and agent library. Live agent tools and telemetry remain.
