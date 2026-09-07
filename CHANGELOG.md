@@ -9,6 +9,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Changed
 
+- Provider storage applies writes per host call through a direct invocation handle, with namespace, key, quota and private-file isolation retained. Failed invocations can leave completed writes; there is no invocation rollback, crash recovery or automatic generation collection.
+
 - `dekopon-brokerd probe --socket <path>` performs a bounded owner-authenticated health check; chart broker probes use it without loading credentials or telemetry.
 
 ### Removed

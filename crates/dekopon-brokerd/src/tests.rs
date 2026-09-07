@@ -1161,7 +1161,7 @@ fn storage_section_is_optional_all_or_nothing_and_strict() {
 
 /// The shutdown budget is one grace, not one per listener. Both listeners have already stopped
 /// accepting when this runs, so a broker drain that spends the whole grace must not then hand the
-/// storage GC and the web UI a fresh full grace each — that is how a 120 s `shutdownGraceMs`
+/// web UI a fresh full grace — that is how a 120 s `shutdownGraceMs`
 /// became a 360 s exit against a 180 s `terminationGracePeriodSeconds`.
 #[tokio::test(start_paused = true)]
 async fn every_drain_shares_one_grace() {
@@ -1173,7 +1173,6 @@ async fn every_drain_shares_one_grace() {
             tokio::time::sleep(grace).await;
             Ok(())
         },
-        tokio::time::sleep(grace * 3 / 4),
         Some(async {
             tokio::time::sleep(grace * 3 / 4).await;
             Ok(())
@@ -1187,7 +1186,6 @@ async fn every_drain_shares_one_grace() {
         "three drains that each fit one grace must not take three: {elapsed:?}"
     );
     assert!(report.broker.is_ok());
-    assert!(!report.storage_gc_timed_out);
     assert!(!report.web_timed_out);
     assert!(matches!(report.web, Some(Ok(()))));
 }
@@ -1204,7 +1202,6 @@ async fn a_drain_past_the_shared_deadline_times_out() {
             tokio::time::sleep(grace / 2).await;
             Ok(())
         },
-        tokio::time::sleep(grace * 4),
         Some(async {
             tokio::time::sleep(grace * 4).await;
             Ok(())
@@ -1214,7 +1211,6 @@ async fn a_drain_past_the_shared_deadline_times_out() {
 
     let elapsed = started.elapsed();
     assert!(elapsed < grace * 2, "{elapsed:?}");
-    assert!(report.storage_gc_timed_out);
     assert!(report.web_timed_out);
     assert!(report.web.is_none());
 }

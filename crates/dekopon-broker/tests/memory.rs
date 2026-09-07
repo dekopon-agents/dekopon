@@ -1467,6 +1467,155 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn generated_wasm_compacts_at_default_threshold_exactly_and_plus_one() {
+    generated_wasm_compaction(StorageLimits::default()).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn generated_wasm_compacts_at_direct_peak_exactly_and_plus_one() {
+    let config = memory_config();
+    generated_wasm_compaction(StorageLimits {
+        max_namespace_bytes: config.compaction_threshold_bytes
+            + config.max_turn_bytes
+            + config.max_dedup_bytes
+            + 32 * 4_096,
+        ..StorageLimits::default()
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn generated_wasm_b1_original_loads_are_independent_of_write_growth() {
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let directory = temporary.path().canonicalize().expect("canonical tempdir");
+    let root = directory.join("provider-storage");
+    let key = directory.join("storage-key.yaml");
+    fs::write(&key, "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n").expect("key");
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
+    let mut config = memory_config();
+    config.continuity_policy = ContinuityPolicy::Stable;
+    config.max_lookback_turns = 1;
+    config.max_recent_turns = 1;
+    config.max_search_results = 1;
+    config.max_turn_bytes = 1_000;
+    config.max_dedup_records = 2_000;
+    config.max_dedup_bytes = 262_144;
+    config.compaction_target_bytes = 200_000;
+    config.compaction_threshold_bytes = 262_144;
+    let limits = StorageLimits {
+        max_read_bytes_per_invocation: 524_288,
+        ..StorageLimits::default()
+    };
+    let conversation = "c0123abc:1712345678.000430";
+    let turns = seed_turn_file(262_000, 1_000);
+    let mut dedup = Vec::new();
+    for index in 0..1_153 {
+        // Field order matches the checksum-pinned provider's canonical Dedup struct.
+        let line = format!(
+            "{{\"format\":\"dekopon.chat-memory.dedup\",\"version\":1,\"id\":\"hmac-sha256:{index:064x}\",\"commitment\":\"hmac-sha256:{}\"}}\n",
+            "0".repeat(64)
+        );
+        assert_eq!(line.len(), 227);
+        dedup.extend_from_slice(line.as_bytes());
+    }
+    assert_eq!(dedup.len(), 261_731);
+    let user = "B1 user";
+    let assistant = "x".repeat((1_000 - canonical_turn_line_bytes(user, "")) as usize);
+    assert_eq!(canonical_turn_line_bytes(user, &assistant), 1_000);
+    assert_eq!(turns.len() + dedup.len(), 523_731);
+    assert!(turns.len() + dedup.len() + 1_000 > 524_288);
+    let storage = StorageHost::open(&root, &key, StorageLimits::default()).expect("seed host");
+    let grant = storage
+        .grant(StorageGrantRequest::new(
+            "b1-seed".parse().expect("invocation"),
+            MEMORY_RECORD.parse().expect("capability"),
+            "memory-chat".parse().expect("provider"),
+            StorageInterface::Jsonl,
+            StorageAccess::ReadWrite,
+            StorageNamespace::Chat,
+            "reviewer".parse().expect("agent"),
+            "slack.t0123abc.u9xyz".parse().expect("subject"),
+            "slack",
+            "scientist-slack",
+            "c0123abc",
+            conversation,
+            ContinuityPolicy::Stable,
+            b"b1-seed-authority".to_vec(),
+        ))
+        .expect("seed grant");
+    let mut handle = storage.begin(grant).expect("seed handle");
+    handle
+        .jsonl_replace("turns.jsonl", 0, &turns)
+        .expect("seed turns");
+    handle
+        .jsonl_replace("dedup.jsonl", 0, &dedup)
+        .expect("seed dedup");
+    handle.commit().expect("seed finish");
+    drop(storage);
+    let broker = build_broker_with(
+        &root,
+        &key,
+        Arc::new(InMemoryAuditLog::new(32).expect("audit")),
+        config.clone(),
+        limits,
+        BrokerHostLimits::default(),
+        false,
+    )
+    .await;
+    let attestor = grant_for(&[conversation]);
+    let session = claim_for(conversation);
+    let result = record_turn_in(
+        &broker,
+        &session,
+        &attestor,
+        "b1-record",
+        "1712345678.000530",
+        user,
+        &assistant,
+    )
+    .await;
+    assert_eq!(
+        result.outcome,
+        dekopon_capability::InvocationOutcome::Succeeded,
+        "B1: separately write-charged growth must not consume original-load budget: {result:?}"
+    );
+    let data = walk(&root)
+        .into_iter()
+        .filter(|path| path.parent().is_some_and(|parent| parent.ends_with("data")))
+        .map(|path| fs::read(path).expect("private data"))
+        .collect::<Vec<_>>();
+    let actual_dedup = data
+        .iter()
+        .find(|bytes| bytes.starts_with(&dedup))
+        .expect("dedup preserved");
+    assert_eq!(actual_dedup.len(), 261_731 + 227);
+    assert_eq!(
+        actual_dedup.iter().filter(|byte| **byte == b'\n').count(),
+        1_154
+    );
+    let compacted = data
+        .iter()
+        .find(|bytes| {
+            bytes
+                .windows(b"dekopon.chat-memory.turn".len())
+                .any(|window| window == b"dekopon.chat-memory.turn")
+        })
+        .expect("compacted turns");
+    assert!(compacted.len() <= config.compaction_target_bytes as usize);
+    assert!(compacted.len() < turns.len());
+    let recent = query_memory_in(
+        &broker,
+        &session,
+        &attestor,
+        "b1-recent",
+        MEMORY_RECENT,
+        json!({"last": 1}),
+    )
+    .await;
+    assert_eq!(recent["turns"][0]["user"], user);
+    assert_eq!(recent["turns"][0]["assistant"], assistant);
+}
+
+async fn generated_wasm_compaction(storage_limits: StorageLimits) {
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
     let root = directory.join("provider-storage");
@@ -1541,7 +1690,7 @@ async fn generated_wasm_compacts_at_default_threshold_exactly_and_plus_one() {
         &key,
         Arc::new(InMemoryAuditLog::new(32).expect("audit")),
         config.clone(),
-        StorageLimits::default(),
+        storage_limits,
         BrokerHostLimits::default(),
         false,
     )

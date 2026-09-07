@@ -379,7 +379,7 @@ impl FakeBrokerBuilder {
 /// A loaded provider component with a real storage host behind it.
 ///
 /// One `FakeBroker` is one durable namespace. Invocations made against it see each other's
-/// committed writes, which is the property most storage provider tests actually need to assert.
+/// completed per-call writes, even if an invocation fails; there is no invocation-wide rollback.
 #[derive(Debug)]
 pub struct FakeBroker {
     /// Owned so the storage root outlives every invocation; dropping this deletes the tree.

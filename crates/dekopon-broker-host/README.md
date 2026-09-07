@@ -44,7 +44,8 @@ The linker also implements `dekopon:storage@0.1.0`. A storage call succeeds only
 `StorageGrant` matching host, invocation, capability, provider, interface, access, namespace, and
 limits. Description and command runs get a disabled sticky context. Wrong-interface,
 permission/quota/budget/corruption/timeout errors stay terminal after a guest catches the WIT enum.
-A successful provider result is returned only after storage commit finalization. Its deadline starts
+Writes take effect per host call and completed writes are not undone by invocation failure.
+A successful provider result still requires storage resource finalization. Its deadline starts
 before already-dispatched blocking jobs drain, and no later filesystem step starts after expiry.
 Storage spans and metrics omit identity/scope/provider/capability and exact provider byte totals;
 only content-free operation/sync/quota counts and coarse byte buckets are retained.

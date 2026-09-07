@@ -9,8 +9,7 @@ use std::{
 };
 
 use dekopon_storage_host::{
-    Durability, FileStat, LockLevel, OpenOptions, StorageEvidence, StorageHostError,
-    StorageTransaction,
+    Durability, FileStat, LockLevel, OpenOptions, StorageEvidence, StorageHandle, StorageHostError,
 };
 use wasmtime::component::{Resource, ResourceTable};
 
@@ -66,7 +65,7 @@ impl Drop for JobGuard {
 
 #[derive(Debug)]
 pub(crate) struct ActiveStorage {
-    transaction: Arc<Mutex<Option<StorageTransaction>>>,
+    transaction: Arc<Mutex<Option<StorageHandle>>>,
     jobs: Arc<ActiveJobs>,
     finalization_budget: Duration,
 }
@@ -88,7 +87,7 @@ impl StorageState {
     pub(crate) const fn disabled() -> Self {
         Self::Disabled { attempted: false }
     }
-    pub(crate) fn active(transaction: StorageTransaction) -> Self {
+    pub(crate) fn active(transaction: StorageHandle) -> Self {
         let finalization_budget = transaction.finalization_budget();
         Self::Active {
             active: ActiveStorage {
@@ -117,7 +116,7 @@ impl StorageState {
     async fn call<R, F>(&mut self, operation: F) -> Result<R, StorageHostError>
     where
         R: Send + 'static,
-        F: FnOnce(&mut StorageTransaction) -> Result<R, StorageHostError> + Send + 'static,
+        F: FnOnce(&mut StorageHandle) -> Result<R, StorageHostError> + Send + 'static,
     {
         let active = match self {
             Self::Disabled { attempted } => {
@@ -141,7 +140,7 @@ impl StorageState {
             Ok(result) => result,
             // A blocking worker panic/cancellation is an internal I/O-class failure, but it must
             // still pass through the terminal-state path below. Returning early here would let a
-            // guest catch the mapped WIT error and commit earlier writes after the host job failed.
+            // guest catch the mapped WIT error and report success despite the terminal host failure.
             Err(_) => Err(StorageHostError::Io),
         };
         if let Err(error) = &result
@@ -476,7 +475,7 @@ impl durable::Host for StoreState {
     async fn monotonic_time_ns(&mut self) -> wasmtime::Result<Result<u64, durable::StorageError>> {
         Ok(self
             .storage
-            .call(StorageTransaction::vfs_monotonic_time_ns)
+            .call(StorageHandle::vfs_monotonic_time_ns)
             .await
             .map_err(map_durable_error))
     }
@@ -484,7 +483,7 @@ impl durable::Host for StoreState {
     async fn wall_time_ms(&mut self) -> wasmtime::Result<Result<u64, durable::StorageError>> {
         Ok(self
             .storage
-            .call(StorageTransaction::vfs_wall_time_ms)
+            .call(StorageHandle::vfs_wall_time_ms)
             .await
             .map_err(map_durable_error))
     }
@@ -682,10 +681,17 @@ mod tests {
                     .expect("read grant"),
             )
             .expect("reader");
-        assert!(matches!(
-            reader.jsonl_size("turns.jsonl"),
-            Err(StorageHostError::NotFound)
-        ));
+        let expected = b"{\"provisional\":true}\n";
+        assert_eq!(
+            reader.jsonl_size("turns.jsonl").expect("persisted size"),
+            expected.len() as u64
+        );
+        let chunk = reader
+            .jsonl_read_chunk("turns.jsonl", 0, 1024)
+            .expect("persisted record");
+        assert_eq!(chunk.bytes, expected);
+        assert_eq!(chunk.next_offset, expected.len() as u64);
+        assert!(chunk.eof);
         reader.finish_read().expect("finish reader");
     }
 

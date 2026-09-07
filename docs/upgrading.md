@@ -8,6 +8,21 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Provider storage direct-write contract
+
+Provider storage applies each write immediately; provider traps, invalid responses and cancellation
+can leave completed writes. Applications must not assume invocation-wide rollback, atomic
+cross-file commit, or crash recovery. Inactive generations remain charged to the root quota.
+
+The strict storage limits object accepts only live bounds. Configure the complete object using
+`StorageLimits` defaults/current fields; omit all GC scheduling/TTL and startup recovery-count
+settings. `maxPendingTransactions` remains the compatibility spelling for concurrent invocation
+handle admission. Keep the existing namespace key private and unchanged. Retained stores with
+unknown root or generation entries are refused or quarantined; there is no automatic migration,
+recursive cleanup or trusted import of legacy layout bytes. Preserve such data offline rather
+than deleting entries to bypass a refusal. A separately provisioned private storage root starts
+empty and does not restore previous data.
+
 ## Two rules that apply to every upgrade
 
 ### Upgrade all four executables together

@@ -91,7 +91,7 @@ The broker owns the only authority transition in this flow. The authenticated re
 | `dekopon-provider-storage` | Feature-gated JSONL and durable-files guest bindings; contains no path, namespace, transaction, SQL, or authority API | **Current**, bindings only |
 | `dekopon-provider-host` | Import-free Wasmtime component loading, limits, and read-only routing | **Current**, experimental and unprivileged |
 | `dekopon-http-host` | Statically linked native buffered HTTP engine consuming exact grants beneath independent ceilings; contains no WIT or Wasmtime integration | **Current** library |
-| `dekopon-storage-host` | Wasmtime-independent opaque namespace derivation, key/root hygiene, logical quotas, leases, invocation overlays, durable manifests/recovery, JSONL, durable files, and bounded GC | **Current** privileged library |
+| `dekopon-storage-host` | Wasmtime-independent opaque namespace derivation, key/root hygiene, logical quotas, leases, direct invocation handles, JSONL, and durable-files imports | **Current** privileged library |
 | `dekopon-broker-host` | Privileged async Wasmtime adapter consuming authorized invocations and exact optional storage grants, linking only versioned Dekopon HTTP/storage imports, and emitting bounded metadata | **Current** library used by the separate broker process |
 | `dekopon-broker` | Trusted context binding, Cedar-decided authorization over owner-authored execution constraints, replay rejection/recovery, provider execution, digest evidence, and metadata-only hash-linked audit coordination | **Current** library with bounded in-memory and owner-only durable JSONL audit |
 | `dekopon-policy` | Bounded, deterministic Cedar adapter: generated schema, strict startup validation, declared entity world, deny-on-error decisions, determining policy identifiers, policy-set digest | **Current** library consumed only by `dekopon-broker` and `dekopon-brokerd` |
@@ -118,8 +118,8 @@ The agent daemon must not gain effect authority merely because it coordinates a 
 **Status: current.** `dekopon-brokerd` may opt into a separate broker-only
 storage root and namespace key. Exact `jsonl` or `durable-files` plus read-only/read-write authority
 is bound to one authorization; HTTP and storage cannot coexist in one v1 capability. Raw scope and
-logical names never select paths. Mutations remain provisional until a successful, bounded,
-decoded provider result and then cross a synchronized transaction marker before becoming success.
+logical names never select paths. Each host call applies its mutation directly. A failed provider result or trap does not undo
+completed writes; there is no invocation-wide atomicity or crash-recovery guarantee.
 
 The independently released optional `memory-chat` provider uses JSONL only. Which capabilities make up
 the surface is the owner's declaration — one `route:` per record/recent/search role in

@@ -488,7 +488,7 @@ rejects exports without it, so include `organization=<org>` alongside the token 
 telemetry and log the reason rather than preventing startup. Broker logs are structured JSON on
 stdout, filtered by `RUST_LOG`.
 
-Host, broker, and server limits have conservative defaults (including a 2 MiB frame ceiling) when their entire sections are omitted. `hostLimits` and `brokerLimits` also default field by field, so a partial section keeps the absent-section value for everything it does not name — which is what lets a deployment set `maxTotalMemoryBytes` or `maxReplayIds` alone. `serverLimits` stays all-or-nothing: when it is present every field is required. Unknown fields and unknown API versions are rejected. Startup also requires aggregate provider metadata, every mapped peer's capability response, and the *widest* response any session could receive to fit the frame ceiling. That last bound is the one that matters in a gateway deployment: the connecting peer is typically granted nothing itself, while the principals its `identityMappings` name hold the capability sets that actually reach the wire through an attested `capabilities`. The agent catalog belongs to the gateway, so those contexts cannot be enumerated here and are bounded instead. Shutdown grace must cover one configured host deadline plus two complete frame deadlines, and it is one grace for the whole process: the Unix drain, the provider-storage GC drain, and the web-UI drain share a single deadline rather than taking one each.
+Host, broker, and server limits have conservative defaults (including a 2 MiB frame ceiling) when their entire sections are omitted. `hostLimits` and `brokerLimits` also default field by field, so a partial section keeps the absent-section value for everything it does not name — which is what lets a deployment set `maxTotalMemoryBytes` or `maxReplayIds` alone. `serverLimits` stays all-or-nothing: when it is present every field is required. Unknown fields and unknown API versions are rejected. Startup also requires aggregate provider metadata, every mapped peer's capability response, and the *widest* response any session could receive to fit the frame ceiling. That last bound is the one that matters in a gateway deployment: the connecting peer is typically granted nothing itself, while the principals its `identityMappings` name hold the capability sets that actually reach the wire through an attested `capabilities`. The agent catalog belongs to the gateway, so those contexts cannot be enumerated here and are bounded instead. Shutdown grace must cover one configured host deadline plus two complete frame deadlines, and it is one grace for the whole process: the Unix drain and the web-UI drain share a single deadline rather than taking one each.
 
 `maxReplayIds` should be at least `auditMaxRecords`; the Helm chart's default configuration sets both to 200 000. The built-in default does not satisfy this: `brokerLimits.maxReplayIds` defaults to 100 000 while `serverLimits.auditMaxRecords` defaults to 200 000, so a configuration that omits `brokerLimits` refuses every invocation with `capacity-exhausted` at half its audit budget; set `brokerLimits: { maxReplayIds: 200000 }` explicitly. Both bounds are permanent when reached — the ledger never evicts, is restored from durable history on restart, and the audit log does not rotate — and a denial spends one audit record but a full ledger slot, so an undersized ledger refuses every invocation with `capacity-exhausted` long before the audit bound it was meant to outlast.
 
@@ -615,14 +615,7 @@ storage:
   finalizationBudgetMs: 5000
   maxPendingTransactions: 64
   startupMaxEntries: 100000
-  startupMaxTransactions: 1024
   maxQuarantinedNamespaces: 128
-  retiredGenerationGraceMs: 86400000
-  retiredGenerationTtlMs: 604800000
-  inactiveNamespaceTtlMs: 31536000000
-  gcIntervalMs: 3600000
-  gcMaxNamespacesPerPass: 64
-  gcMaxBytesPerPass: 67108864
 
 chatMemory:
   continuityPolicy: authority-bound # safe default; stable must be explicit
@@ -691,8 +684,9 @@ Each recent/search constraint set's `maxOutputBytes` must leave 1024 bytes beyon
 `chatMemory.maxResultBytes` for the SDK response envelope; record must leave the same fixed envelope
 headroom. Enabling `chatMemory` also requires the routed provider to declare exactly those three
 capabilities and no fourth. Memory/storage composition also rounds each 256 KiB JSONL read request when checking the
-invocation and host-call budgets, requires both logical files, and reserves the post-append old file,
-staged replacement, permanent dedup copies, and transaction metadata. Startup accounts the
+invocation and host-call budgets, requires both logical files, and reserves the direct peak: the
+post-append turn file, live permanent dedup file, and conservative namespace entry metadata
+(including authority-pointer/manifest temporaries), without staged JSONL file copies. Startup accounts the
 worst-case JSON escaping of a bounded search query and additionally proves that raw/decoded files
 plus canonical-ABI compaction copies and fixed allocator headroom fit the independent Wasm
 linear-memory ceiling.

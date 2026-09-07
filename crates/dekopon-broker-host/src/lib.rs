@@ -332,7 +332,7 @@ pub struct BrokerInvocationFailure {
     pub error: Box<BrokerHostError>,
     /// Sanitized metadata for every HTTP call dispatched before the failure.
     pub http_calls: Vec<HttpCallEvidence>,
-    /// Content-free storage evidence when a storage transaction began.
+    /// Content-free storage evidence when a storage invocation began.
     pub storage: Option<StorageEvidence>,
 }
 
@@ -954,7 +954,7 @@ impl BrokerWasmProvider {
         input: &Value,
         constraints: &ExecutionConstraints,
         credential: Option<BoundCredential>,
-        storage_transaction: Option<dekopon_storage_host::StorageTransaction>,
+        storage_transaction: Option<dekopon_storage_host::StorageHandle>,
     ) -> Result<BrokerInvocationOutput, BrokerInvocationFailure> {
         validate_authorized_constraints(constraints, &self.runtime.limits)?;
         if !self
@@ -1806,7 +1806,7 @@ pub enum BrokerHostError {
     /// The single-use storage grant did not match the authorized invocation.
     #[error("storage grant does not match authorized invocation")]
     StorageGrantMismatch,
-    /// Native storage setup, transaction, or finalization failed.
+    /// Native storage setup, operation, or finalization failed.
     #[error("broker provider storage failed")]
     Storage {
         #[source]

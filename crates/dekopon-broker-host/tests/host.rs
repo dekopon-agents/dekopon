@@ -1776,12 +1776,12 @@ async fn generated_wasm_storage_denials_are_sticky_and_commit_nothing() {
         assert_eq!(
             snapshot_storage_tree(&root),
             before,
-            "mode {mode} committed provisional storage after a terminal denial"
+            "mode {mode} mutated storage despite denial before mutation"
         );
     }
 }
 
-/// Every entry under `root` with the mode, length, and contents a provisional write would change.
+/// Every entry under `root` with the mode, length, and contents a mutation would change.
 fn snapshot_storage_tree(root: &Path) -> Vec<(PathBuf, u32, u64, Vec<u8>)> {
     snapshot_tree(root)
         .into_iter()

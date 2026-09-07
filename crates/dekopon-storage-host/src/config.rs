@@ -6,7 +6,6 @@ use thiserror::Error;
 const TIB: u64 = 1024 * 1024 * 1024 * 1024;
 const GIB: u64 = 1024 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
-const TEN_YEARS_MS: u64 = 10 * 366 * 24 * 60 * 60 * 1000;
 
 /// Broker-owned process and invocation storage ceilings.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -28,16 +27,10 @@ pub struct StorageLimits {
     pub max_entropy_bytes_per_invocation: u64,
     pub lock_timeout_ms: u64,
     pub finalization_budget_ms: u64,
+    /// Compatibility spelling: bounds concurrently active invocation handles.
     pub max_pending_transactions: u64,
     pub startup_max_entries: u64,
-    pub startup_max_transactions: u64,
     pub max_quarantined_namespaces: u64,
-    pub retired_generation_grace_ms: u64,
-    pub retired_generation_ttl_ms: u64,
-    pub inactive_namespace_ttl_ms: u64,
-    pub gc_interval_ms: u64,
-    pub gc_max_namespaces_per_pass: u64,
-    pub gc_max_bytes_per_pass: u64,
 }
 
 impl Default for StorageLimits {
@@ -53,7 +46,7 @@ impl Default for StorageLimits {
             max_host_calls_per_invocation: 4_096,
             max_read_bytes_per_call: 256 * 1024,
             max_read_bytes_per_invocation: 16 * MIB,
-            // JSONL replacement is one atomic host call. The default memory compaction target is
+            // JSONL replacement is one host call. The default memory compaction target is
             // 8 MiB, so the host-call ceiling must admit that complete replacement rather than
             // letting a valid store become permanently unable to compact.
             max_write_bytes_per_call: 16 * MIB,
@@ -64,14 +57,7 @@ impl Default for StorageLimits {
             finalization_budget_ms: 5_000,
             max_pending_transactions: 64,
             startup_max_entries: 100_000,
-            startup_max_transactions: 1_024,
             max_quarantined_namespaces: 128,
-            retired_generation_grace_ms: 86_400_000,
-            retired_generation_ttl_ms: 604_800_000,
-            inactive_namespace_ttl_ms: 31_536_000_000,
-            gc_interval_ms: 3_600_000,
-            gc_max_namespaces_per_pass: 64,
-            gc_max_bytes_per_pass: 64 * MIB,
         }
     }
 }
@@ -110,14 +96,7 @@ impl StorageLimits {
             ("finalizationBudgetMs", self.finalization_budget_ms),
             ("maxPendingTransactions", self.max_pending_transactions),
             ("startupMaxEntries", self.startup_max_entries),
-            ("startupMaxTransactions", self.startup_max_transactions),
             ("maxQuarantinedNamespaces", self.max_quarantined_namespaces),
-            ("retiredGenerationGraceMs", self.retired_generation_grace_ms),
-            ("retiredGenerationTtlMs", self.retired_generation_ttl_ms),
-            ("inactiveNamespaceTtlMs", self.inactive_namespace_ttl_ms),
-            ("gcIntervalMs", self.gc_interval_ms),
-            ("gcMaxNamespacesPerPass", self.gc_max_namespaces_per_pass),
-            ("gcMaxBytesPerPass", self.gc_max_bytes_per_pass),
         ];
         if let Some((field, _)) = positive.into_iter().find(|(_, value)| *value == 0) {
             return Err(StorageConfigError::Zero { field });
@@ -179,29 +158,9 @@ impl StorageLimits {
             ),
             ("startupMaxEntries", self.startup_max_entries, 1_000_000),
             (
-                "startupMaxTransactions",
-                self.startup_max_transactions,
-                4_096,
-            ),
-            (
                 "maxQuarantinedNamespaces",
                 self.max_quarantined_namespaces,
                 1_024,
-            ),
-            (
-                "retiredGenerationGraceMs",
-                self.retired_generation_grace_ms,
-                TEN_YEARS_MS,
-            ),
-            (
-                "retiredGenerationTtlMs",
-                self.retired_generation_ttl_ms,
-                TEN_YEARS_MS,
-            ),
-            (
-                "inactiveNamespaceTtlMs",
-                self.inactive_namespace_ttl_ms,
-                TEN_YEARS_MS,
             ),
         ];
         if let Some((field, value, maximum)) = ceilings
@@ -239,26 +198,6 @@ impl StorageLimits {
             (
                 self.max_handles_per_invocation <= self.max_open_handles,
                 "invocation handles <= process handles",
-            ),
-            (
-                self.max_pending_transactions <= self.startup_max_transactions,
-                "pending transactions <= startup transactions",
-            ),
-            (
-                self.retired_generation_grace_ms <= self.retired_generation_ttl_ms,
-                "retired grace <= retired TTL",
-            ),
-            (
-                self.retired_generation_ttl_ms <= self.inactive_namespace_ttl_ms,
-                "retired TTL <= inactive TTL",
-            ),
-            (
-                self.gc_max_namespaces_per_pass <= self.max_namespaces,
-                "GC namespaces <= namespaces",
-            ),
-            (
-                self.gc_max_bytes_per_pass <= self.max_root_bytes,
-                "GC bytes <= root",
             ),
         ];
         if let Some((_, relationship)) = relationships.into_iter().find(|(valid, _)| !valid) {
@@ -304,6 +243,39 @@ pub enum StorageConfigError {
 #[cfg(test)]
 mod tests {
     use super::{StorageConfigError, StorageLimits};
+
+    #[test]
+    fn retired_gc_and_recovery_keys_are_unknown() {
+        let defaults = StorageLimits::default();
+        let valid = serde_json::to_value(&defaults).expect("serialize defaults");
+        assert_eq!(
+            serde_json::from_value::<StorageLimits>(valid.clone()).expect("valid defaults"),
+            defaults
+        );
+        for key in [
+            "startupMaxTransactions",
+            "retiredGenerationGraceMs",
+            "retiredGenerationTtlMs",
+            "inactiveNamespaceTtlMs",
+            "gcIntervalMs",
+            "gcMaxNamespacesPerPass",
+            "gcMaxBytesPerPass",
+        ] {
+            let mut value = valid.clone();
+            value
+                .as_object_mut()
+                .expect("limits object")
+                .insert(key.to_owned(), 1.into());
+            let error =
+                serde_json::from_value::<StorageLimits>(value).expect_err("retired key refused");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("unknown field `{key}`")),
+                "{error}"
+            );
+        }
+    }
 
     #[test]
     fn defaults_are_composed() {

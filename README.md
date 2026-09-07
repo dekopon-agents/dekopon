@@ -97,7 +97,7 @@ New in 0.10.0 — a deep-review hardening pass, and three new surfaces:
   deduplication, and canonical `whatsapp.<wa_id>` subjects.
 - Opt-in route-scoped OpenAI image generation with bounded generated-PNG replies on Slack, Discord,
   Telegram, and the local development transport.
-- Broker-owned, namespace-bound provider storage with strict quotas and transactional JSONL, plus
+- Broker-owned, namespace-bound provider storage with strict quotas and direct-write JSONL, plus
   the independently released `memory-chat` provider and on-demand `memory recent` / `memory search` commands.
 - 145 verified review findings landed across the workspace: every broker failure now carries a
   diagnosable cause, the hot paths dropped redundant work — one authorization pass, one audit

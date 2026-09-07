@@ -82,7 +82,7 @@ Of the crate boundaries below, the skill loader, `read_skill`, `suggest_improvem
 - `dekopon-provider-host`: bounded synchronous Wasmtime host and deterministic capability registry for immediate import-free execution.
 - `dekopon-http-host`: statically linked native buffered HTTP engine that consumes HTTP constraints beneath independent ceilings; it equality-checks authorization-bound DRN credentials, enforces secret-specific authority/method/path/query/injection scope, renders Basic/Bearer, and refuses direct reflection.
 - `dekopon-storage-host`: privileged Wasmtime-independent namespace/key/layout/quota/lease/
-  transaction/recovery/JSONL/durable-file engine. It is absent from the normal dependency trees of `dekopon-run` and `dekopond` — `dekopond`'s integration tests name it as a dev-dependency and `dekopon-run`'s reach it only through the broker crates they name as dev-dependencies — which the CI `cargo tree --edges normal` gate enforces.
+  direct-write/JSONL/durable-file engine. It is absent from the normal dependency trees of `dekopon-run` and `dekopond` — `dekopond`'s integration tests name it as a dev-dependency and `dekopon-run`'s reach it only through the broker crates they name as dev-dependencies — which the CI `cargo tree --edges normal` gate enforces.
 - `dekopon-broker-host`: privileged asynchronous Wasmtime component host adapting project-owned HTTP and storage imports, accepting only authorized invocations and exact single-use storage grants.
 - `dekopon-policy`: the bounded, deterministic Cedar adapter — a schema generated from the deployment's declared principals, providers, and capabilities; strict startup validation; entity literals proved against that world; deny on any evaluation error; determining policy identifiers and a policy-set digest per decision. It is consumed only by `dekopon-broker` and `dekopon-brokerd`, and it holds no execution authority: constraint sets stay outside the policy language.
 - `dekopon-broker`: deny-by-default Cedar authorization over owner-authored execution constraint sets, trusted context binding, single-use authorization, replay rejection/recovery, public evidence, and bounded in-memory or durable owner-only single-writer hash-linked audit coordination around the component host.
@@ -160,11 +160,12 @@ decline tool.
 A storage-enabled operation follows the ordinary authorization transition and additionally consumes
 one non-cloneable `StorageGrant`. The grant binds the exact component interface and access mode;
 wrong-interface and denied/quota/budget calls become sticky even when guest code catches the WIT
-error. A base-then-generation lease order serializes one scope's pointer, lifecycle, invocation, and
-GC work while distinct opaque namespaces can overlap; grant/begin run as tracked blocking work so a
-lease wait cannot stall Tokio workers. Guest writes land only in an invocation overlay. A valid successful component response triggers the
-MACed manifest → synchronized commit marker → idempotent apply sequence; every earlier failure
-aborts. A live post-marker failure is structurally outcome-unaudited.
+error. A base-then-generation lease order serializes one scope's authority pointer and invocation
+access while distinct opaque namespaces can overlap; grant/begin run as tracked blocking work so
+a lease wait cannot stall Tokio workers. Each authorized host write applies directly. Failed
+responses, traps and cancellation do not roll back completed writes. Quota headroom and leases
+remain held while started native jobs drain; the host makes no invocation-wide atomicity or
+crash-recovery promise.
 
 The exact standalone memory-chat release is staged under `/opt/dekopon/optional-providers`, not the default provider
 scan. The chart mounts its retained provider-storage claim and copied operator-managed namespace key

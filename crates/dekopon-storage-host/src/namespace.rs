@@ -2,7 +2,7 @@
 
 use std::{
     fs::{File, TryLockError},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -22,17 +22,16 @@ const POINTER_VERSION: &str = "dekopon.dev/storage-authority-pointer/v1alpha1";
 pub(crate) struct Namespace {
     pub(crate) base_token: String,
     pub(crate) generation_token: String,
-    pub(crate) base_directory: Directory,
     pub(crate) directory: Directory,
     pub(crate) data_directory: Directory,
     pub(crate) scope_commitment: String,
-    /// Held before the generation lease is acquired and retained through transaction finalization.
+    /// Held before the generation lease is acquired and retained through the invocation.
     pub(crate) _base_lease: File,
 }
 
 /// A fully materialized, non-mutating namespace plan.
 ///
-/// Random epochs, timestamps, MACed documents, existing target lengths, and the base lease are all
+/// Random epochs, MACed pointers, existing target lengths, and the base lease are all
 /// fixed here. The host can therefore reserve the exact peak before [`apply`](Self::apply) performs
 /// the first mutation.
 pub(crate) struct NamespacePlan {
@@ -41,10 +40,6 @@ pub(crate) struct NamespacePlan {
     generation_token: String,
     authority_pointer: Option<Vec<u8>>,
     remove_authority_pointer: bool,
-    previous_generation: Option<String>,
-    retired_marker: Option<Vec<u8>>,
-    clear_selected_retired: bool,
-    last_access_marker: Vec<u8>,
     existing_base: Option<Directory>,
     existing_base_lease: Option<File>,
     before_usage: Usage,
@@ -93,16 +88,6 @@ impl NamespacePlan {
                 if !namespaces_root.retains_child(&base_token, &base)? {
                     return Err(StorageHostError::Busy);
                 }
-                if base.exists("poisoned")? {
-                    if file_length(&base, "poisoned")? != Some(0) {
-                        return Err(StorageHostError::Corrupt {
-                            scope: "poison-marker",
-                        });
-                    }
-                    return Err(StorageHostError::Corrupt {
-                        scope: "poisoned-namespace",
-                    });
-                }
                 let mut usage = scan_usage(&base, maximum_entries)?;
                 usage.entries = usage
                     .entries
@@ -122,88 +107,43 @@ impl NamespacePlan {
             None => None,
         };
         let stable_generation = key.token(DOMAIN_GENERATION, &[base_token.as_bytes(), b"stable"]);
-        let stable_exists = match &existing_base {
-            Some(base) => match base.metadata(&stable_generation)? {
-                None => false,
-                Some(metadata) if metadata.kind == EntryKind::Directory => true,
-                Some(_) => {
-                    return Err(StorageHostError::Corrupt {
-                        scope: "stable-generation-type",
-                    });
-                }
-            },
-            None => false,
-        };
-        let (
-            generation_token,
-            authority_pointer,
-            remove_authority_pointer,
-            previous_generation,
-            generation_must_exist,
-        ) = match request.continuity_policy() {
-            ContinuityPolicy::Stable => {
-                // A stale authority pointer must not survive a period of explicit stable
-                // continuity. Otherwise authority-bound A -> stable -> A would reopen A's old
-                // random epoch instead of minting the required non-reusing generation.
-                let previous = previous_pointer.as_ref().map(|pointer| {
-                    key.token(
-                        DOMAIN_GENERATION,
-                        &[base_token.as_bytes(), pointer.epoch.as_bytes()],
-                    )
-                });
-                (
-                    stable_generation.clone(),
-                    None,
-                    previous_pointer.is_some(),
-                    previous,
-                    false,
-                )
-            }
-            ContinuityPolicy::AuthorityBound => {
-                if let Some(pointer) = &previous_pointer
-                    && pointer.authority == authority
-                {
+        let (generation_token, authority_pointer, remove_authority_pointer, generation_must_exist) =
+            match request.continuity_policy() {
+                ContinuityPolicy::Stable => {
+                    // A stale authority pointer must not survive a period of explicit stable
+                    // continuity. Otherwise authority-bound A -> stable -> A would reopen A's old
+                    // random epoch instead of minting the required non-reusing generation.
                     (
-                        key.token(
-                            DOMAIN_GENERATION,
-                            &[base_token.as_bytes(), pointer.epoch.as_bytes()],
-                        ),
+                        stable_generation.clone(),
                         None,
+                        previous_pointer.is_some(),
                         false,
-                        None,
-                        true,
                     )
-                } else {
-                    let epoch = crate::key::hex(&random_bytes(32)?);
-                    let generation = key.token(
-                        DOMAIN_GENERATION,
-                        &[base_token.as_bytes(), epoch.as_bytes()],
-                    );
-                    let pointer = encode_pointer(key, &base_token, authority, epoch)?;
-                    let previous = previous_pointer
-                        .map(|pointer| {
+                }
+                ContinuityPolicy::AuthorityBound => {
+                    if let Some(pointer) = &previous_pointer
+                        && pointer.authority == authority
+                    {
+                        (
                             key.token(
                                 DOMAIN_GENERATION,
                                 &[base_token.as_bytes(), pointer.epoch.as_bytes()],
-                            )
-                        })
-                        .or_else(|| stable_exists.then(|| stable_generation.clone()));
-                    (generation, Some(pointer), false, previous, false)
+                            ),
+                            None,
+                            false,
+                            true,
+                        )
+                    } else {
+                        let epoch = crate::key::hex(&random_bytes(32)?);
+                        let generation = key.token(
+                            DOMAIN_GENERATION,
+                            &[base_token.as_bytes(), epoch.as_bytes()],
+                        );
+                        let pointer = encode_pointer(key, &base_token, authority, epoch)?;
+                        (generation, Some(pointer), false, false)
+                    }
                 }
-            }
-        };
-
-        let timestamp = now_ms()?.to_string();
-        let last_access_marker = lifecycle_marker(
-            key,
-            b"last-access",
-            &base_token,
-            &generation_token,
-            &timestamp,
-        );
-        let retired_marker = previous_generation.as_ref().map(|generation| {
-            lifecycle_marker(key, b"retired", &base_token, generation, &timestamp)
-        });
+            };
 
         let mut simulation = Simulation::default();
         let base = existing_base.as_ref();
@@ -220,41 +160,18 @@ impl NamespacePlan {
             });
         }
         let maximum_generation_peak_bytes;
-        let selected_retired_length;
         if let Some(generation) = &generation {
             require_directory(generation, "data")?;
             require_private_file(generation, "lease.lock")?;
-            let usage = usage_with_directory_entry(scan_usage(generation, maximum_entries)?)?;
-            maximum_generation_peak_bytes = replacement_peak(
-                usage.bytes,
-                file_length(generation, "last-access")?,
-                last_access_marker.len() as u64,
-            )?;
-            selected_retired_length = file_length(generation, "retired")?;
+            maximum_generation_peak_bytes =
+                usage_with_directory_entry(scan_usage(generation, maximum_entries)?)?.bytes;
         } else {
             simulation.create_entry(0)?; // generation directory
             simulation.create_entry(0)?; // data directory
             simulation.create_entry(0)?; // lease.lock
-            maximum_generation_peak_bytes = 4_u64
+            maximum_generation_peak_bytes = 3_u64
                 .checked_mul(ENTRY_CHARGE)
-                .and_then(|bytes| bytes.checked_add(last_access_marker.len() as u64))
                 .ok_or(StorageHostError::Arithmetic)?;
-            selected_retired_length = None;
-        }
-
-        // Fully prepare the selected generation before publishing a pointer to it. If pointer
-        // publication later fails, the inaccessible generation remains valid and TTL-collectable
-        // rather than becoming a current generation with no authenticated lifecycle marker.
-        simulation.replace(
-            generation
-                .as_ref()
-                .map(|generation| file_length(generation, "last-access"))
-                .transpose()?
-                .flatten(),
-            last_access_marker.len() as u64,
-        )?;
-        if let Some(length) = selected_retired_length {
-            simulation.remove(length)?;
         }
 
         let old_pointer_length = base
@@ -267,26 +184,12 @@ impl NamespacePlan {
                 scope: "missing-authority-pointer",
             })?)?;
         }
-        if let (Some(previous), Some(marker)) = (&previous_generation, &retired_marker)
-            && let Some(base) = base
-        {
-            let previous = base.open_directory(previous)?;
-            // A retired generation remains root-accounted under the limits that admitted it. A
-            // later namespace-limit reduction must still be able to rotate into a new empty
-            // generation rather than being blocked by historical bytes it is trying to leave.
-            simulation.replace(file_length(&previous, "retired")?, marker.len() as u64)?;
-        }
-
         Ok(Self {
             base_token,
             scope_commitment,
             generation_token,
             authority_pointer,
             remove_authority_pointer,
-            previous_generation,
-            retired_marker,
-            clear_selected_retired: selected_retired_length.is_some(),
-            last_access_marker,
             existing_base,
             existing_base_lease,
             before_usage,
@@ -334,35 +237,15 @@ impl NamespacePlan {
         };
 
         let (directory, data_directory) = ensure_generation(&base, &self.generation_token)?;
-        directory.replace_private("last-access", &self.last_access_marker)?;
-        if self.clear_selected_retired {
-            // Reactivating stable continuity must make the selected generation non-retired before
-            // removing the authority pointer publishes it. A stale marker would otherwise let GC
-            // delete freshly accessed stable data after the transition back from authority-bound.
-            directory.remove_file("retired")?;
-            directory.sync()?;
-        }
         if let Some(pointer) = &self.authority_pointer {
             base.replace_private("current", pointer)?;
         } else if self.remove_authority_pointer {
-            // Removing the authority pointer publishes stable mode. Retirement follows that
-            // publication, so a failure cannot make the still-current authority generation
-            // collectable while its pointer continues to name it.
             base.remove_file("current")?;
             base.sync()?;
-        }
-        // Retirement follows pointer publication/removal. A failure may delay collection of the
-        // old generation, but can never make a still-current generation GC-eligible.
-        if let (Some(previous), Some(marker)) = (&self.previous_generation, &self.retired_marker)
-            && previous != &self.generation_token
-        {
-            let old = base.open_directory(previous)?;
-            old.replace_private("retired", marker)?;
         }
         Ok(Namespace {
             base_token: self.base_token,
             generation_token: self.generation_token,
-            base_directory: base,
             directory,
             data_directory,
             scope_commitment: self.scope_commitment,
@@ -432,7 +315,7 @@ impl Simulation {
                   carrying only out-of-range, which Arithmetic already states"
     )]
     fn observe(&mut self) -> Result<(), StorageHostError> {
-        // A plan may shrink an existing pointer/marker, so its net delta can be negative. Only the
+        // A plan may shrink an existing pointer, so its net delta can be negative. Only the
         // positive peak needs reserving above the already-accounted baseline.
         if self.current_bytes > 0 {
             self.peak_bytes = self
@@ -458,29 +341,6 @@ fn usage_with_directory_entry(mut usage: Usage) -> Result<Usage, StorageHostErro
         .checked_add(ENTRY_CHARGE)
         .ok_or(StorageHostError::Arithmetic)?;
     Ok(usage)
-}
-
-fn replacement_peak(
-    baseline: u64,
-    old_length: Option<u64>,
-    new_length: u64,
-) -> Result<u64, StorageHostError> {
-    let temporary = ENTRY_CHARGE
-        .checked_add(new_length)
-        .ok_or(StorageHostError::Arithmetic)?;
-    let peak = baseline
-        .checked_add(temporary)
-        .ok_or(StorageHostError::Arithmetic)?;
-    if let Some(old_length) = old_length {
-        let _final = peak
-            .checked_sub(
-                ENTRY_CHARGE
-                    .checked_add(old_length)
-                    .ok_or(StorageHostError::Arithmetic)?,
-            )
-            .ok_or(StorageHostError::Arithmetic)?;
-    }
-    Ok(peak)
 }
 
 fn open_optional_directory(
@@ -635,7 +495,7 @@ pub(crate) fn current_generation(
             &[base_token.as_bytes(), document.epoch.as_bytes()],
         ),
         // Absence of an authority pointer is the explicit stable publication state. Treat the
-        // deterministic stable generation as current everywhere, including bounded GC.
+        // deterministic stable generation as current.
         None => key.token(DOMAIN_GENERATION, &[base_token.as_bytes(), b"stable"]),
     }))
 }
@@ -675,13 +535,7 @@ pub(crate) fn validate_namespace_base(
                 // Full decoding/MAC verification follows below.
                 let _ = file_length(base_directory, "current")?;
             }
-            ("poisoned", EntryKind::File) => {
-                if file_length(base_directory, "poisoned")? != Some(0) {
-                    return Err(StorageHostError::Corrupt {
-                        scope: "poison-marker",
-                    });
-                }
-            }
+
             (_, EntryKind::Directory) if is_token(&name) => generations.push(name),
             _ => {
                 return Err(StorageHostError::Corrupt {
@@ -707,28 +561,14 @@ pub(crate) fn validate_namespace_base(
     }
     for generation_token in generations {
         let generation = base_directory.open_directory(&generation_token)?;
-        validate_generation(&generation, key, base_token, &generation_token)?;
-        if current.as_deref() == Some(generation_token.as_str())
-            && lifecycle_timestamp(&generation, "retired", key, base_token, &generation_token)?
-                .is_some()
-        {
-            return Err(StorageHostError::Corrupt {
-                scope: "retired-current-generation",
-            });
-        }
+        validate_generation(&generation)?;
     }
     Ok(())
 }
 
-fn validate_generation(
-    generation: &Directory,
-    key: &StorageKey,
-    base_token: &str,
-    generation_token: &str,
-) -> Result<(), StorageHostError> {
+fn validate_generation(generation: &Directory) -> Result<(), StorageHostError> {
     let mut saw_data = false;
     let mut saw_lease = false;
-    let mut saw_last_access = false;
     for name in generation.entries()? {
         let metadata = generation
             .metadata(&name)?
@@ -764,26 +604,7 @@ fn validate_generation(
                 }
                 saw_lease = true;
             }
-            ("last-access", EntryKind::File) => {
-                lifecycle_timestamp(generation, "last-access", key, base_token, generation_token)?
-                    .ok_or(StorageHostError::Corrupt {
-                        scope: "last-access-marker",
-                    })?;
-                saw_last_access = true;
-            }
-            ("retired", EntryKind::File) => {
-                lifecycle_timestamp(generation, "retired", key, base_token, generation_token)?
-                    .ok_or(StorageHostError::Corrupt {
-                        scope: "retired-marker",
-                    })?;
-            }
-            ("poisoned", EntryKind::File) => {
-                if file_length(generation, "poisoned")? != Some(0) {
-                    return Err(StorageHostError::Corrupt {
-                        scope: "poison-marker",
-                    });
-                }
-            }
+
             _ => {
                 return Err(StorageHostError::Corrupt {
                     scope: "generation-entry",
@@ -791,100 +612,12 @@ fn validate_generation(
             }
         }
     }
-    if !saw_data || !saw_lease || !saw_last_access {
+    if !saw_data || !saw_lease {
         return Err(StorageHostError::Corrupt {
             scope: "generation-layout",
         });
     }
     Ok(())
-}
-
-fn lifecycle_marker(
-    key: &StorageKey,
-    label: &[u8],
-    base: &str,
-    generation: &str,
-    timestamp: &str,
-) -> Vec<u8> {
-    let commitment = key.commitment(
-        crate::key::DOMAIN_LIFECYCLE,
-        &[
-            label,
-            base.as_bytes(),
-            generation.as_bytes(),
-            timestamp.as_bytes(),
-        ],
-    );
-    format!("{timestamp}\n{commitment}\n").into_bytes()
-}
-
-pub(crate) fn lifecycle_timestamp(
-    directory: &Directory,
-    marker: &str,
-    key: &StorageKey,
-    base: &str,
-    generation: &str,
-) -> Result<Option<u64>, StorageHostError> {
-    if !directory.exists(marker)? {
-        return Ok(None);
-    }
-    let bytes = directory.read_bounded(marker, 4_096)?;
-    #[allow(
-        clippy::map_err_ignore,
-        reason = "Utf8Error reports only a byte offset inside a marker whose every other \
-                  malformation—missing line, extra line, unparsable timestamp—already collapses to \
-                  the same `lifecycle-marker` scope"
-    )]
-    let text = std::str::from_utf8(&bytes).map_err(|_| StorageHostError::Corrupt {
-        scope: "lifecycle-marker",
-    })?;
-    let mut lines = text.lines();
-    let timestamp_text = lines.next().ok_or(StorageHostError::Corrupt {
-        scope: "lifecycle-marker",
-    })?;
-    let commitment = lines.next().ok_or(StorageHostError::Corrupt {
-        scope: "lifecycle-marker",
-    })?;
-    if lines.next().is_some() {
-        return Err(StorageHostError::Corrupt {
-            scope: "lifecycle-marker",
-        });
-    }
-    #[allow(
-        clippy::map_err_ignore,
-        reason = "ParseIntError separates only empty, non-digit, and overflow for a line whose one \
-                  valid form is a decimal millisecond timestamp; the MAC check below rejects every \
-                  such line anyway"
-    )]
-    let timestamp = timestamp_text
-        .parse::<u64>()
-        .map_err(|_| StorageHostError::Corrupt {
-            scope: "lifecycle-marker",
-        })?;
-    let label = match marker {
-        "retired" => b"retired".as_slice(),
-        "last-access" => b"last-access".as_slice(),
-        _ => {
-            return Err(StorageHostError::Corrupt {
-                scope: "lifecycle-marker",
-            });
-        }
-    };
-    let expected = key.commitment(
-        crate::key::DOMAIN_LIFECYCLE,
-        &[
-            label,
-            base.as_bytes(),
-            generation.as_bytes(),
-            timestamp_text.as_bytes(),
-        ],
-    );
-    if commitment != expected {
-        return Err(StorageHostError::Corrupt {
-            scope: "lifecycle-marker-mac",
-        });
-    }
-    Ok(Some(timestamp))
 }
 
 /// Takes a lease, polling until another holder releases it or `timeout_ms` elapses.
@@ -922,19 +655,6 @@ fn lease_lock_failure(error: TryLockError, expired: bool) -> Option<StorageHostE
         TryLockError::WouldBlock => Some(StorageHostError::Timeout),
         TryLockError::Error(_) => Some(StorageHostError::Io),
     }
-}
-
-#[allow(
-    clippy::map_err_ignore,
-    reason = "SystemTimeError carries only how far the clock sits before the epoch and \
-              TryFromIntError only out-of-range; Clock and Arithmetic already state both, and \
-              neither value may be exported as storage telemetry"
-)]
-fn now_ms() -> Result<u64, StorageHostError> {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| StorageHostError::Clock)?;
-    u64::try_from(duration.as_millis()).map_err(|_| StorageHostError::Arithmetic)
 }
 
 pub(crate) fn is_token(value: &str) -> bool {

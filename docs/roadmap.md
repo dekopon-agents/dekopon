@@ -116,7 +116,7 @@ out of scope.
 - Independent `dekopon:storage@0.1.0` JSONL and durable-files interfaces, feature-gated guest
   bindings, and a Wasmtime-independent secure native storage host.
 - Exact storage interface/access authority, opaque keyed namespaces, non-reusing authority-bound
-  generations, logical quotas, namespace leases, transactional commit/recovery, and bounded GC.
+  generations, logical quotas, namespace leases, and direct per-call writes.
 - Optional independently released JSONL `memory-chat` provider: hidden post-acceptance record, visible on-demand
   recent/literal search, finite permanent dedup, and compaction hysteresis.
 - Invocation-bound chat attestation plus owner-authored `chatScopes` and Cedar scope context; legacy

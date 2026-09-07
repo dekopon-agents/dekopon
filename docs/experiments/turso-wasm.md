@@ -117,11 +117,9 @@ Full-text search is absent — `tantivy` is `cfg(not(target_family = "wasm"))`-g
 `MATCH` and the `fts` module do not exist on this target. A provider needing search maintains its
 own inverted-index table.
 
-The value case is reads, not writes. The storage host materializes a whole file on the first write
-of an invocation, so SQLite's usual write-path advantage — touch three pages instead of rewriting
-the file — does not exist here. That is a property of the invocation overlay and applies equally to
-the JSONL backend, so it argues for neither engine. What SQL actually buys is indexed point queries,
-aggregation, and schema.
+The storage host applies positional writes directly and charges their logical growth. SQL
+provides indexed point queries, aggregation, and schema; the host does not atomically commit a
+database and its write-ahead log together. Failed invocations can leave partial file changes.
 
 `parking_lot_core`'s wasm thread parker panics "Parking not supported on this platform" and no
 feature removes it. In a single-threaded guest it converts a would-be deadlock into a loud panic,

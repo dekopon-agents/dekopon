@@ -203,17 +203,12 @@ impl ChatMemoryConfig {
             .compaction_threshold_bytes
             .checked_add(self.max_turn_bytes)
             .ok_or(BrokerBuildError::InvalidChatMemory)?;
-        let namespace_headroom = self
-            // Immediately before compaction, the old turn file may sit just below the high
-            // threshold and then receive one maximum turn. Its staged replacement can approach
-            // the target. Using two thresholds is conservative for the replacement, but the
-            // post-append maximum turn is independent and must not disappear into entry overhead.
-            .compaction_threshold_bytes
-            .checked_mul(2)
-            .and_then(|value| value.checked_add(self.max_turn_bytes))
-            .and_then(|value| value.checked_add(self.max_dedup_bytes.checked_mul(2)?))
-            // Generation/transaction directories, files, markers, manifest, and replacement
-            // temporaries. The fixed memory transaction has only two logical files; 32 logical
+        // Direct compaction peaks at the threshold plus one bounded append and the live dedup
+        // file. JSONL replacement does not retain an on-disk staged copy.
+        let namespace_headroom = threshold_with_append
+            .checked_add(self.max_dedup_bytes)
+            // Generation directories, files, authority pointers, and replacement
+            // temporaries. The fixed memory invocation has only two logical files; 32 logical
             // entry charges conservatively cover its canonical manifest as well.
             .and_then(|value| value.checked_add(32 * 4_096))
             .ok_or(BrokerBuildError::InvalidChatMemory)?;
@@ -4662,38 +4657,6 @@ where
             .invoke_with_storage(authorized, credential, storage_grant)
             .await;
         let duration_ms = duration_millis(started.elapsed());
-        // An unaudited storage outcome is the most consequential failure this path can have, and
-        // it used to be anonymous: the guest saw the opaque mapped error, and the broker recorded
-        // a variant with no source and no log, so a full filesystem and an exhausted quota read
-        // the same to whoever had to clear the poisoned namespace.
-        let execution = match execution {
-            Err(dekopon_broker_host::BrokerInvocationFailure {
-                error,
-                http_calls,
-                storage,
-            }) => match *error {
-                BrokerHostError::Storage {
-                    source: source @ dekopon_storage_host::StorageHostError::OutcomeUnaudited { .. },
-                } => {
-                    tracing::error!(
-                        event = "broker_storage_outcome_unaudited",
-                        invocation = %invocation_id,
-                        cause = %source.class(),
-                        error = %error_chain(&source),
-                    );
-                    return Err(BrokerError::StorageOutcome {
-                        invocation: invocation_id,
-                        source,
-                    });
-                }
-                error => Err(dekopon_broker_host::BrokerInvocationFailure {
-                    error: Box::new(error),
-                    http_calls,
-                    storage,
-                }),
-            },
-            Ok(output) => Ok(output),
-        };
         let (result, audit_event) = match execution {
             Ok(output) => {
                 let output_digest = output.storage.as_ref().map_or_else(
@@ -5121,31 +5084,9 @@ fn encode_storage_limits(
         ),
         ("storage.startupMaxEntries", limits.startup_max_entries),
         (
-            "storage.startupMaxTransactions",
-            limits.startup_max_transactions,
-        ),
-        (
             "storage.maxQuarantinedNamespaces",
             limits.max_quarantined_namespaces,
         ),
-        (
-            "storage.retiredGenerationGraceMs",
-            limits.retired_generation_grace_ms,
-        ),
-        (
-            "storage.retiredGenerationTtlMs",
-            limits.retired_generation_ttl_ms,
-        ),
-        (
-            "storage.inactiveNamespaceTtlMs",
-            limits.inactive_namespace_ttl_ms,
-        ),
-        ("storage.gcIntervalMs", limits.gc_interval_ms),
-        (
-            "storage.gcMaxNamespacesPerPass",
-            limits.gc_max_namespaces_per_pass,
-        ),
-        ("storage.gcMaxBytesPerPass", limits.gc_max_bytes_per_pass),
     ] {
         encoded.number(label, u128::from(value));
     }
@@ -5568,15 +5509,6 @@ pub enum BrokerError {
         #[source]
         source: serde_json::Error,
     },
-    /// Storage crossed its durable marker but live finalization failed.
-    #[error("storage outcome for {invocation} is unaudited")]
-    StorageOutcome {
-        /// Invocation whose durable write may already have landed.
-        invocation: InvocationId,
-        /// The storage failure that ended finalization, naming its coarse cause.
-        #[source]
-        source: dekopon_storage_host::StorageHostError,
-    },
     /// Terminal execution could not be audited after provider work ended.
     #[error("broker could not audit terminal execution for {invocation}")]
     OutcomeAudit {
@@ -5644,7 +5576,6 @@ impl BrokerError {
             | Self::DecisionAudit { .. }
             | Self::AuthorizedFailureAudit { .. }
             | Self::OutcomeEvidence { .. }
-            | Self::StorageOutcome { .. }
             | Self::OutcomeAudit { .. } => None,
         }
     }
@@ -5663,9 +5594,9 @@ impl BrokerError {
     #[must_use]
     pub const fn unaudited_outcome(&self) -> Option<&InvocationId> {
         match self {
-            Self::OutcomeEvidence { invocation, .. }
-            | Self::OutcomeAudit { invocation, .. }
-            | Self::StorageOutcome { invocation, .. } => Some(invocation),
+            Self::OutcomeEvidence { invocation, .. } | Self::OutcomeAudit { invocation, .. } => {
+                Some(invocation)
+            }
             Self::ReplayLedgerFull { .. }
             | Self::MemoryUnavailable
             | Self::InvalidMemoryInput

@@ -333,7 +333,8 @@ This detects valid-prefix truncation relative to the retained checkpoint and mak
 Constraint sets select exactly `jsonl` or `durable-files`, read-only or read-write, and chat
 namespace; combining HTTP and storage is refused. The broker derives every opaque namespace from
 the authorized context, consumes a host-instance/invocation/capability/provider-bound grant, and
-commits only a valid `Succeeded` response. Stable public classes are `storage-quota`,
+applies writes per host call. Completed writes survive invocation failure; there is no
+invocation-wide rollback. Stable public classes are `storage-quota`,
 `storage-busy`, `storage-timeout`, `storage-corrupt`, `storage-io`, and
 `outcome-unaudited`. A chat-memory-routed capability additionally allowlists only
 `memory-corrupt`, `result-too-large`, `dedup-conflict`, and `dedup-capacity`; arbitrary provider

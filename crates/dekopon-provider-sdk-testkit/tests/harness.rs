@@ -54,7 +54,7 @@ async fn runs_a_storage_backed_component_against_a_real_storage_host() {
     assert_eq!(output.output["clocksCalled"], true);
     assert_eq!(output.output["entropyBytes"], 32);
     assert_eq!(output.output["identityNonzero"], true);
-    // Storage evidence exists because a transaction actually ran, which is the part a hand-written
+    // Storage evidence exists because real host calls ran, which is the part a hand-written
     // fake would have had to invent.
     let evidence = output
         .storage
@@ -67,7 +67,7 @@ async fn runs_a_storage_backed_component_against_a_real_storage_host() {
 ///
 /// Each invocation gets a fresh id and a freshly minted, separately consumed grant; only the scope
 /// material around them is held constant. That constancy is what makes the third call able to read
-/// what the first two committed, and it is the part a caller would otherwise have to know to
+/// what the first two wrote through completed host calls, and it is the part a caller would otherwise have to know to
 /// reproduce by hand.
 #[tokio::test(flavor = "multi_thread")]
 async fn successive_invocations_reach_one_durable_namespace() {

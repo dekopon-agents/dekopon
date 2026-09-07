@@ -283,15 +283,15 @@ or outcome-unknown. Its already delivered answer remains answered.
 
 Storage audit records omit principal, actor/agent, via/subject, provider, broker principal/policy
 revision, policy IDs/digest, and credential. Separate HMAC domains keep physical paths, audit scope,
-record IDs, content/dedup, evidence, authority, generation, and manifests unlinkable by equality.
+record IDs, content/dedup, evidence, authority, generation, and authority pointers unlinkable by equality.
 Storage spans omit identity/scope/provider/capability and exact payload bytes; only operation/sync/
 quota counts and powers-of-two byte buckets remain. Existing non-storage records retain their prior
 serialized bytes and chain hashes.
 
 The filesystem boundary retains directory descriptors and uses descriptor-relative no-follow
 opens, scans, creates, renames, and unlinks. It detects/refuses ordinary symlinks, hard links, wrong
-identities, unsafe modes, malformed transaction states, and a second conforming writer. Base then
-generation lease ordering serializes authority pointers, lifecycle markers, grants, and GC; isolated
+identities, unsafe modes, malformed namespace layouts, and a second conforming writer. Base then
+generation lease ordering serializes authority pointers, grants, and invocation access; isolated
 namespace corruption is quarantined while retaining quota. An actively malicious same-UID process
 racing filesystem mutation is out of scope. Native filesystem operations can remain blocked after
 a timeout signal; the finalization budget prevents starting the next bounded finalization step after
@@ -302,8 +302,8 @@ is well-formedness bookkeeping rather than an access control. There is still no 
 multiprocess-database claim. A single-instance WAL engine needs neither and runs on these primitives
 unchanged; the out-of-tree `turso-sql` provider ships one, calls `lock` zero times, and opens
 exactly two files.
-The durability boundary is the invocation transaction, not the guest's `sync` — a trap mid-write
-leaves the reopened database at the last committed state.
+Writes apply per host call. A trap can leave partial database/log changes; neither sync nor
+invocation success promises cross-file atomicity or crash recovery.
 
 Memory text is not encrypted by Dekopon at rest, has no deletion/export UX, and is never
 automatically replayed. JSONL dedup records are permanent but finite; at the explicit record/byte

@@ -149,10 +149,82 @@ prior stop at `wave1-stop.md`; historical free-space figures are not current hea
   no unit commit. Required log correlation exposed missing native stdout IDs; owner approved
   the narrow correlated-stdout/stdlib-shipper expansion. Other contracts/gates unchanged.
   Evidence: `D3b/wave1-pair2-worker.md`, `wave1-pair2-stop.md`; no review/acceptance yet.
-- **D2a — pending implementation.** Clean at `86802b1`; two inventory-only attempts made
-  no source changes/commit or failed compiler gate. Parent owns execution recovery, not
-  an owner decision. Direct handle/GC removal includes brokerd GC task; no scope expansion
-  beyond that mechanical consumer. Evidence: `D2a/wave1-pair2-gate-repair.md`.
+- **D2a — B1 owner validation complete; fresh review/integration pending.**
+  B1 repair: real pinned memory-chat RED reproduced storage-quota at the
+  failed-success assertion with unchanged 512 KiB read bound (exit 101).
+  Restored `native_loaded_bytes` as LIVE private original-load containment state,
+  initialized at begin, checked/read before loading, updated only after successful
+  bounded size-verified reads; no refund or repeated-load charge. Historical raw
+  removed inventory remains preserved: this one counter is no longer retired.
+  Removed only the replacement's grown-candidate/read-ceiling comparison; independent
+  write/read requests and all file/root/namespace/grant bounds remain. No transaction
+  machinery restored, no new rollback/atomicity/eviction or RSS guarantee.
+  Added native positive/negative boundaries and real pinned-provider B1 regression;
+  all previous assertions survive. Clean native execution checkpoint
+  `a3a82d1` passed locked seven-package all-feature check/tests, all-target Clippy
+  with warnings denied, warnings-denied rustdoc and separate doctests:
+  275 distinct native tests + 9 doctests (focused/child/reruns excluded).
+  Real B1 GREEN uses identical failing fixture limits and proves dedup append,
+  compaction and readback. Native exact-boundary tests preserve bytes/tree on
+  load, read-request and per-call/per-invocation write refusals.
+  All 388 outside-repair mode/type/blobs equal 0a94e0c, including guest inputs.
+  Six prior ACTUAL consumer provider comparisons verified by receipt hashes and
+  current immutable bytes; ZERO provider builds this pass. Every prior test body
+  is byte-preserved. No new assertion suppression. Raw 340-literal inventory/history
+  retained; active inventory removes only the explicitly restored live counter
+  (339 literals), not an alias or scanner waiver. Current hits remain classified.
+  Fresh fmt/diff/docs/audit/scanner/release metadata and seven package LIST/content
+  proof pass; LIST is not archive compilation. Safe inactive 9.2 GiB target removal
+  reclaimed 8.97 GiB physical; free space 69.14 to 78.11 GiB, all seven targets absent.
+  Final ledger-only amendment is source-equivalent to the executed native checkpoint.
+  Fresh HIGH review, combined native integration, archive/CI and real two-daemon
+  OpenObserve smoke remain unperformed downstream gates; no push or integration.
+  Evidence: `pair2-buffer-triage/buffer-worker.md` and `buffer-*` receipts.
+  Unit ref `Simplify-Unit: D2a`; base `0074ee38e8a5bbf5af56a33d9f7ddc575c86fb0b`.
+  Direct per-call namespace/VFS writes replace transaction/GC state; private-key/path,
+  authority/continuity, quota and drain bounds remain. Four-package final-source
+  locked check/tests/Clippy/doc/doctests, metadata/dependency/docs/script/privilege
+  and actual chart-container gates pass. Full inventories classify historical and
+  unrelated lexical residue openly. The namespace housekeeping refusal fixture now
+  uses one byte below the three-entry live peak; every refusal/no-mutation assertion
+  remains. Approved mixed rollback migration preserves exact visible bytes and drain
+  assertions. R1–R4 review repair corrects empty positional growth, rejects retired
+  poison entries at both layout levels, removes the no-op scan callback, and corrects
+  canonical WIT prose. Two added regressions preserve size/stat/zero/quota/reopen and
+  quarantine/data/neighbor assertions; the reopened test handle is closed before finish.
+  Fresh invalidated four-package and doc/metadata/mechanical gates pass. Evidence:
+  `D2a/review-tail-worker.md`; prior closure receipts reused only by input equality.
+  Rustdoc consumer closure corrects the facade JSONL per-call promise only; fresh
+  locked facade check/test (3 tests, zero failed/ignored), all-target/all-feature Clippy,
+  warnings-denied rustdoc/doctest (0 doctests), three wasm feature checks and docs/fmt pass.
+  All six pinned provider rebuilds validate and byte-match original fixtures; each target
+  is reclaimed serially. Runtime/tests/WIT/locks and all other tracked source equal
+  reviewed cbde6b6; prior native 477-test evidence is reused, not rerun.
+  Evidence: `pair2-doc-closure/worker.md`; final root target cleanup follows validation.
+  Those four-package/477-test and six-build receipts are historical, not current-input
+  acceptance. The classified ten-consumer repair corrects per-call descriptions and
+  the broker namespace formula only: threshold + append + live dedup + 32 entry charges.
+  The named mixed sizing test replaces the retired 30 MiB staged-copy rejection with
+  a below-direct-peak 16 MiB rejection, explicitly accepts 30 MiB, and preserves exact/
+  one-below and all other quota/budget assertions. Real generated-provider compaction
+  now also runs at direct peak; the default-limit run and its assertions remain.
+  No new authority, credential, WIT or guest-memory budget change. Negative capability:
+  invocation failure cannot roll back completed calls; file sizing no longer reserves
+  removed staged JSONL copies. Current seven-package gates and six new comparisons
+  ran: 273 distinct native tests plus 9 doctests and six byte-equal comparisons.
+  Historical release invocation omitted arguments (exit 2), preserved unchanged.
+  Authorized completion ran fresh metadata and explicit release arguments successfully.
+  Static Schemars description-only and saved rendered HTML proof complete; seven scanner
+  regressions pass with current literal classifications. Native inputs equal all 391
+  saved non-ledger paths at dirty execution HEAD 9676f67, not clean old HEAD.
+  Manifest-aware Cargo LIST/content inclusion is complete; integration tests are
+  intentionally excluded by unchanged include patterns, not missing package source.
+  No archive compilation claim; full-wave archive acceptance remains later work.
+  Saved rendered pages preceded safe removal of the inactive ignored 581 MiB doc
+  target (physical free space rounded 78 GiB before/after); six provider targets absent.
+  Final source maps exactly to the dirty-input proof; no native/provider gate rerun.
+  No independent review, integration or push; completion evidence below.
+  Evidence: `pair2-storage-docs/consumer-worker.md`, `pair2-consumer-finish/worker-completion.md`.
 - **D2b — pending.** Checkpoint removal/config/fixtures plus D6b refusal-loop names;
   commit: —; temporary checkpoint methods explicitly D2c-owned.
 - **D7a — pending.** Webui embedding and broker-http retirement; commit: —;

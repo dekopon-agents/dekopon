@@ -195,13 +195,17 @@ fn memory_composition_reserves_dedup_calls_and_pre_compaction_peak() {
         "two final partial chunks are charged at their requested 256 KiB bounds"
     );
 
-    // The old threshold + target estimate fit in 30 MiB; the real old+staged peak can hold two
-    // near-threshold turn files plus both permanent-dedup copies and transaction metadata.
+    // The direct live peak includes the post-append turn file, permanent dedup, and metadata.
     let too_small_namespace = dekopon_storage_host::StorageLimits {
-        max_namespace_bytes: 30 * 1024 * 1024,
+        max_namespace_bytes: 16 * 1024 * 1024,
         ..dekopon_storage_host::StorageLimits::default()
     };
     assert!(memory.validate(&too_small_namespace).is_err());
+    let formerly_staged_copy_rejection = dekopon_storage_host::StorageLimits {
+        max_namespace_bytes: 30 * 1024 * 1024,
+        ..dekopon_storage_host::StorageLimits::default()
+    };
+    assert!(memory.validate(&formerly_staged_copy_rejection).is_ok());
 
     let exact_write_call = dekopon_storage_host::StorageLimits {
         max_write_bytes_per_call: memory.compaction_target_bytes,
@@ -226,9 +230,9 @@ fn memory_composition_reserves_dedup_calls_and_pre_compaction_peak() {
     };
     assert!(memory.validate(&one_below_file_limit).is_err());
 
-    let exact_namespace = memory.compaction_threshold_bytes * 2
+    let exact_namespace = memory.compaction_threshold_bytes
         + memory.max_turn_bytes
-        + memory.max_dedup_bytes * 2
+        + memory.max_dedup_bytes
         + 32 * 4_096;
     let exact_namespace_limit = dekopon_storage_host::StorageLimits {
         max_namespace_bytes: exact_namespace,
@@ -439,26 +443,9 @@ fn every_authority_ceiling_is_canonical_and_semantic() {
             v.max_pending_transactions += 1
         }),
         ("startupMaxEntries", |v| v.startup_max_entries += 1),
-        ("startupMaxTransactions", |v| {
-            v.startup_max_transactions += 1
-        }),
         ("maxQuarantinedNamespaces", |v| {
             v.max_quarantined_namespaces += 1
         }),
-        ("retiredGenerationGraceMs", |v| {
-            v.retired_generation_grace_ms += 1
-        }),
-        ("retiredGenerationTtlMs", |v| {
-            v.retired_generation_ttl_ms += 1
-        }),
-        ("inactiveNamespaceTtlMs", |v| {
-            v.inactive_namespace_ttl_ms += 1
-        }),
-        ("gcIntervalMs", |v| v.gc_interval_ms += 1),
-        ("gcMaxNamespacesPerPass", |v| {
-            v.gc_max_namespaces_per_pass += 1
-        }),
-        ("gcMaxBytesPerPass", |v| v.gc_max_bytes_per_pass += 1),
     ];
     assert_rotations(&storage, storage_mutations, encoded_storage);
 
@@ -669,48 +656,6 @@ async fn a_panicking_storage_materialization_keeps_its_panic_and_its_public_cate
             .to_string()
             .contains("namespace generation pointer is missing"),
         "the panic message was discarded: {cause}"
-    );
-}
-
-/// `storage-outcome-unaudited` used to be the one broker failure with no cause anywhere.
-///
-/// The wire code says the effect may already have happened; the fieldless `OutcomeUnaudited`
-/// behind it said nothing about what made the outcome unknown, and the variant carried no
-/// `#[source]`, so the chain stopped at "storage outcome is unaudited". An operator holding a
-/// poisoned namespace could not tell a full filesystem from an exhausted quota.
-#[test]
-fn an_unaudited_storage_outcome_carries_the_cause_that_ended_finalization() {
-    let invocation = "invoke-unaudited"
-        .parse::<InvocationId>()
-        .expect("valid invocation fixture");
-    let mut rendered = Vec::new();
-    for cause in [
-        dekopon_storage_host::StorageFailureClass::Quota,
-        dekopon_storage_host::StorageFailureClass::Io,
-    ] {
-        let error = super::BrokerError::StorageOutcome {
-            invocation: invocation.clone(),
-            source: dekopon_storage_host::StorageHostError::OutcomeUnaudited { cause },
-        };
-        assert_eq!(
-            error.unaudited_outcome(),
-            Some(&invocation),
-            "naming the cause must not change what the client is told about resubmission"
-        );
-        assert!(
-            std::error::Error::source(&error).is_some(),
-            "the storage failure is not reachable as a source"
-        );
-        let chain = dekopon_core::error_chain(&error);
-        assert!(
-            chain.contains(cause.label()),
-            "{chain} does not name its cause"
-        );
-        rendered.push(chain);
-    }
-    assert_ne!(
-        rendered[0], rendered[1],
-        "a quota failure and an I/O failure must not render identically"
     );
 }
 

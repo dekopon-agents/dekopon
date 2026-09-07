@@ -2,7 +2,8 @@
 
 Canonical WIT source for Dekopon's broker-owned, namespace-bound provider storage interfaces.
 
-The `jsonl` interface offers invocation-transactional chunk reads, append, and replacement. The
+The `jsonl` interface offers bounded chunk reads and direct per-call append and replacement.
+Completed writes survive invocation failure; there is no invocation-wide rollback or atomicity. The
 `durable-files` interface offers engine-neutral positional files, rollback-journal lock levels,
 bounded entropy, and bounded clocks. Neither interface exposes host paths, namespace selection,
 SQL, sockets, environment variables, or WASI. An import is only a structural requirement; only

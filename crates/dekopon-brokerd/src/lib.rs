@@ -22,7 +22,6 @@ use std::{
     net::SocketAddr,
     path::Path,
     sync::Arc,
-    time::Duration,
 };
 
 use dekopon_broker::{
@@ -188,11 +187,6 @@ where
         })
         .transpose()
         .map_err(BrokerdError::Storage)?;
-    let storage_gc = storage_host.clone();
-    let storage_gc_interval = config
-        .storage
-        .as_ref()
-        .map(|storage| Duration::from_millis(storage.limits.gc_interval_ms));
     // Stated once at startup because nothing else in the process can: per-store limits are visible
     // in the host stats, but the product with the connection ceiling is what a container limit has
     // to cover, and an unbounded aggregate is a deliberate operator choice rather than a default.
@@ -392,8 +386,6 @@ where
 
     let (shutdown_sender, shutdown_receiver) = tokio::sync::watch::channel(false);
     let broker_serve = server.serve(listener, wait_for_shutdown(shutdown_receiver.clone()));
-    let storage_gc_serve =
-        storage_gc_loop(storage_gc, storage_gc_interval, shutdown_receiver.clone());
     let web_serve = async move {
         match web_listener {
             Some(listener) => {
@@ -404,7 +396,6 @@ where
         }
     };
     tokio::pin!(broker_serve);
-    tokio::pin!(storage_gc_serve);
     tokio::pin!(web_serve);
     tokio::pin!(shutdown);
 
@@ -429,7 +420,6 @@ where
                 None => broker_serve.await,
             }
         },
-        &mut storage_gc_serve,
         (web_enabled && web_result.is_none()).then_some(&mut web_serve),
     )
     .await;
@@ -446,9 +436,7 @@ where
             error = %error_chain(error)
         );
     }
-    if drained.storage_gc_timed_out {
-        return Err(BrokerdError::StorageGcShutdownTimeout);
-    }
+
     drained.broker?;
     if drained.web_timed_out {
         return Err(BrokerdError::WebUiShutdownTimeout);
@@ -471,8 +459,6 @@ where
 struct DrainReport {
     /// The Unix listener's own verdict, including its internally bounded drain.
     broker: Result<(), ServerError>,
-    /// Whether a started blocking provider-storage GC pass outlived the grace.
-    storage_gc_timed_out: bool,
     /// The informational HTTP server's verdict, absent when it was not draining here.
     web: Option<Result<(), dekopon_webui::WebUiError>>,
     /// Whether open informational HTTP connections outlived the grace.
@@ -487,15 +473,13 @@ struct DrainReport {
 /// to exit, while the pod's `terminationGracePeriodSeconds` and this service's own configuration
 /// rule ("shutdown grace must cover one host deadline plus two frame deadlines") each describe
 /// exactly one. Overshooting that budget is a SIGKILL, and the broker takes it mid-drain.
-async fn drain_services<B, G, W>(
+async fn drain_services<B, W>(
     deadline: tokio::time::Instant,
     broker: B,
-    storage_gc: G,
     web: Option<W>,
 ) -> DrainReport
 where
     B: Future<Output = Result<(), ServerError>>,
-    G: Future<Output = ()>,
     W: Future<Output = Result<(), dekopon_webui::WebUiError>>,
 {
     let web = async {
@@ -504,48 +488,14 @@ where
             None => None,
         }
     };
-    let (broker, storage_gc, web) =
-        tokio::join!(broker, tokio::time::timeout_at(deadline, storage_gc), web);
+    let (broker, web) = tokio::join!(broker, web);
     DrainReport {
         broker,
-        storage_gc_timed_out: storage_gc.is_err(),
         web_timed_out: matches!(web, Some(Err(_))),
         web: match web {
             Some(Ok(result)) => Some(result),
             Some(Err(_)) | None => None,
         },
-    }
-}
-
-async fn storage_gc_loop(
-    host: Option<dekopon_storage_host::StorageHost>,
-    interval: Option<Duration>,
-    mut shutdown: tokio::sync::watch::Receiver<bool>,
-) {
-    let (Some(host), Some(interval)) = (host, interval) else {
-        wait_for_shutdown(shutdown).await;
-        return;
-    };
-    loop {
-        tokio::select! {
-            () = tokio::time::sleep(interval) => {
-                let host = host.clone();
-                match tokio::task::spawn_blocking(move || host.gc_once()).await {
-                    Ok(Ok(report)) => tracing::debug!(
-                        event = "broker_storage_gc_completed",
-                        namespace.count = report.namespaces_removed,
-                        storage.byte_bucket = if report.bytes_removed == 0 { 0 } else { 64 - report.bytes_removed.leading_zeros() },
-                    ),
-                    Ok(Err(_)) | Err(_) => tracing::warn!(
-                        event = "broker_storage_gc_failed",
-                        category = "storage",
-                    ),
-                }
-            }
-            changed = shutdown.changed() => {
-                if changed.is_err() || *shutdown.borrow() { return; }
-            }
-        }
     }
 }
 
@@ -671,12 +621,9 @@ pub enum BrokerdError {
     /// Durable checkpoint could not be locked, verified, reconciled, or synchronized.
     #[error("broker audit checkpoint is unavailable")]
     Checkpoint(#[source] CheckpointError),
-    /// Provider storage root/key/recovery could not start.
+    /// Provider storage root/key validation could not start.
     #[error("broker provider storage could not start")]
     Storage(#[source] dekopon_storage_host::StorageHostError),
-    /// A blocking provider-storage GC pass did not drain inside shutdown grace.
-    #[error("broker provider storage GC did not stop inside shutdown grace")]
-    StorageGcShutdownTimeout,
     /// Provider components could not be validated and compiled.
     #[error("broker provider host could not start")]
     Host(#[source] dekopon_broker_host::BrokerHostError),
