@@ -64,7 +64,7 @@ Exactly these, and nothing else:
 
 | Placeholder | File | Replace with |
 |---|---|---|
-| `/home/xavier/.local/{run,state}/dekopon/…` | `broker.yaml` | your own paths — four entries: socket, audit, checkpoint, checkpoint lock |
+| `/home/xavier/.local/{run,state}/dekopon/…` | `broker.yaml` | your own paths — two entries: socket and audit |
 | `/home/xavier/.local/run/dekopon/broker.sock` | `dekopond.yaml` | the same socket path as `broker.yaml` |
 | `uid: 501` | `broker.yaml` | your UID (`id -u`) |
 | `serverUid: 501` | `dekopond.yaml` | the same UID |
@@ -109,12 +109,8 @@ dekopon-brokerd --config broker.yaml
 ```
 
 ```json
-{"timestamp":"2026-01-14T09:12:03.114Z","level":"INFO","event":"broker_started","audit_records":0,"audit_head":"none","target":"dekopon_brokerd"}
+{"timestamp":"2026-01-14T09:12:03.114Z","level":"INFO","event":"broker_started","target":"dekopon_brokerd"}
 ```
-
-`audit_records: 0` and `audit_head: "none"` are a fresh chain. On the next start they are the
-retained count and the verified head — and if the audit file and its checkpoint disagree by more
-than the one-record crash window, the broker refuses to start rather than continuing over a gap.
 
 Everything the broker will ever permit was decided by the time this line printed: the policy is
 compiled and strictly validated, every capability it can permit has a constraint set, and the
@@ -314,6 +310,6 @@ Nothing carries beyond that conversation: the agent has no memory that outlives 
 - [`../providers/http-probe/`](../providers/http-probe/README.md) — the component this deployment executes, and the `http-probe.purge` it deliberately never grants.
 - [`dekopon-provider-gh`](https://github.com/dekopon-agents/dekopon-provider-gh) — the same shape at nineteen capabilities, shipped from its own repository.
 - [`../../docs/dekopond.md`](../../docs/dekopond.md) — transports, routing, session bounds, and the authorization flow.
-- [`../../crates/dekopon-brokerd/README.md`](../../crates/dekopon-brokerd/README.md) — every configuration field, and the checkpoint/recovery contract.
+- [`../../crates/dekopon-brokerd/README.md`](../../crates/dekopon-brokerd/README.md) — every configuration field, and the audit and shutdown contract.
 - [`../../crates/dekopon-policy/README.md`](../../crates/dekopon-policy/README.md) — what Cedar decides here and what it deliberately does not.
 - [`../local/dekopon.yaml`](../local/dekopon.yaml) — the catalog-only example, whose `reviewer` may comment and deliberately holds no approval capability.

@@ -28,7 +28,7 @@ what happened. Recovery means restoring both files from copies you trust.
 live log or a retained copy, without starting the broker.
 
 Full mechanics, filesystem requirements, and the limits of local integrity evidence:
-[`crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.md#audit-checkpoint-and-recovery).
+[`crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.md#audit).
 
 ## By the question you arrived with
 

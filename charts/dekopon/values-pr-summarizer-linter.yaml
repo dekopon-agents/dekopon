@@ -17,8 +17,6 @@ broker:
       apiVersion: dekopon.dev/brokerd/v1alpha1
       socketPath: /run/dekopon/broker.sock
       auditPath: /var/lib/dekopon/audit.jsonl
-      checkpointPath: /var/lib/dekopon/audit-checkpoint.json
-      checkpointLockPath: /var/lib/dekopon/audit-checkpoint.lock
       brokerPrincipal: local-broker
       policyRevision: pr-summarizer-linter-2026-01
       credentialsPath: /etc/dekopon/broker-credentials.yaml

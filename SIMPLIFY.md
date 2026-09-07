@@ -6,7 +6,39 @@ Core: `simplify/2026-09`, original base `542430e`; accepted pre-batch head `6537
 Evidence paths below are relative to workspace `.validation/simplify-2026-09/`.
 No releases, tags, crate publication/yanks, merges, live deployment or core PR yet.
 
-## Current milestone — wave-1 pair-2 combined local acceptance complete
+## Current milestone — D2b scoped local integration accepted
+
+Accepted base `9f38371022e696cc69a04a433cd4c7ccafe880e7`; independently reviewed worker
+`d3032cc5cbb59dc9c23ae233333d7e04bc8268ac` replayed as one D2b commit. Fresh native and
+real two-daemon smoke execution both ran at clean
+`26f3b20b63234e4ef323e20f0f2f37205e003969`, preserved before this ledger-only amendment
+by create-only ref `refs/checkpoints/simplify-D2b-validated-before-ledger-20260907`.
+Every non-ledger path/mode/blob equals that execution and the reviewed worker:
+source aggregate `4262b69fb3d463368ebe3a45606d13c4428173c6cd72c5737d93a249352b5798`
+(SHA-256 of raw NUL-terminated Git tree records excluding exactly `SIMPLIFY.md`).
+This final metadata head is not a new native or smoke execution.
+
+Fresh locked two-package check/test, all-target/all-feature Clippy, warnings-denied
+rustdoc/doctests, package LIST, dependency/privilege, docs/audit/metadata/release,
+seven scanner regressions, scripts and actual chart package/render/strict-schema/Linux
+permissions gates passed: 302 distinct native tests (305 successful rows less three
+IPC child repetitions), 0 doctests, no failed/ignored tests. Unchanged guest/WIT/lock
+inputs require no provider builds. Real updated-driver smoke passed with 16 spans,
+five required families, both independent native daemon correlations, 15 local/shipped =
+15 successfully ingested = 15 retrieved rows, no rejected/partial/truncated rows,
+all signal redaction and ten negative controls. Owned smoke resources are absent.
+Pre-amendment literal scanner status 1 has 74 classified hits; broad inventory has
+114, unknowns 0. Named D2c/D2d/D7a residue is not a blanket documentation exemption.
+
+Only this ledger is amended after execution. Exact final affected non-build checks,
+fresh residue classifications, guarded removal of the two inactive ignored targets,
+physical free-space receipts and conditional normal FF push/remote equality are recorded
+externally in `D2b/integration-report.md` and `D2b/accepted.md`; no future push is claimed
+here. Other worktrees, sources and shared cache remain preserved. Full-wave workspace,
+MSRV, archive and exact-head remote CI remain downstream. No next unit, PR, release,
+publication, console change or deployment is included in this scoped acceptance.
+
+## Accepted milestone — wave-1 pair-2 combined local acceptance complete
 
 Accepted pre-pair base `0074ee38e8a5bbf5af56a33d9f7ddc575c86fb0b`; exact D2a/D3b reviews
 pass. Integrated D2a is `0a18d30a7ea7ad65847d01bafa3f9f88615fb78e`; final integrated
@@ -282,8 +314,19 @@ prior stop at `wave1-stop.md`; historical free-space figures are not current hea
   That historical completion performed no independent review, integration or push;
   current reviewed/combined acceptance is above. Historical completion evidence below.
   Evidence: `pair2-storage-docs/consumer-worker.md`, `pair2-consumer-finish/worker-completion.md`.
-- **D2b — pending.** Checkpoint removal/config/fixtures plus D6b refusal-loop names;
-  commit: —; temporary checkpoint methods explicitly D2c-owned.
+- **D2b — landed; independent review and scoped integration passed.** Checkpoint
+  module, config and direct consumers removed; real audit counts 2/3/4, nonempty
+  restart without sidecars, both strict unknown keys and surviving-path collision
+  coverage retained. This commit: `Simplify-Unit: D2b`. Reviewed worker
+  `d3032cc5cbb59dc9c23ae233333d7e04bc8268ac`; fresh native/chart and real smoke head
+  `26f3b20b63234e4ef323e20f0f2f37205e003969` (302 distinct native tests; 0 doctests).
+  Owner execution was `d47cb1b749b84c5cb08652a148b2207d4aaa0c5c`: one mechanical
+  repair qualified two test-only ConfigError references after the first compile
+  failed; original failure and complete successful rerun remain in D2b/owner-gates
+  and D2b/repair-gates. Fresh review: D2b/review.md, zero material findings.
+  Integration/cleanup/push receipts: D2b/integration-report.md and D2b/accepted.md.
+  Temporary chain methods are D2c-owned; exact broad prose residue is D2d/D7a-owned.
+  Final ledger-only head is not a new native/smoke execution; full-wave gates remain.
 - **D7a — pending.** Webui embedding and broker-http retirement; commit: —;
   preserve surviving HTTP/storage security invariants at their canonical home.
 - **D7b — pending.** Move ChatGPT auth to gateway before CLI deletion; commit: —;

@@ -1,6 +1,6 @@
 # dekopon-brokerd
 
-`dekopon-brokerd` is the separately deployed privileged Unix service for Dekopon provider components. It derives caller identity from Unix peer credentials, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, restores replay identifiers from a verified owner-only audit chain, maintains a separate atomic audit checkpoint, executes only statically linked Dekopon host interfaces, and can explicitly bind the unauthenticated `GET`/`HEAD`-only `dekopon-webui` operational view.
+`dekopon-brokerd` is the separately deployed privileged Unix service for Dekopon provider components. It derives caller identity from Unix peer credentials, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, restores replay identifiers from a verified owner-only audit chain, executes only statically linked Dekopon host interfaces, and can explicitly bind the unauthenticated `GET`/`HEAD`-only `dekopon-webui` operational view.
 
 Authorization and execution constraints are two separate files on purpose. `policiesPath` decides *who may do what*; `constraintSets` decides *how narrowly the broker then does it*. A policy edit can never widen a timeout, reach a new host, or bind a credential that was not already bound.
 
@@ -23,15 +23,13 @@ initializes no telemetry.
 
 ## Configuration
 
-The configuration must be a regular single-link file owned by the server UID and must not be group/world writable. Audit, checkpoint, and checkpoint-lock parent directories must be owner-only. The socket has the separate IPC directory contract below. Provider components must be regular single-link files owned by the server UID and must not be group/world writable; their canonical parent directories must also be server-owned and not group/world writable. Writable non-sticky path ancestors are rejected.
+The configuration must be a regular single-link file owned by the server UID and must not be group/world writable. Audit parent directories must be owner-only. The socket has the separate IPC directory contract below. Provider components must be regular single-link files owned by the server UID and must not be group/world writable; their canonical parent directories must also be server-owned and not group/world writable. Writable non-sticky path ancestors are rejected.
 
 ```yaml
 # broker.yaml
 apiVersion: dekopon.dev/brokerd/v1alpha1
 socketPath: /home/dekopon/.local/run/dekopon/broker.sock
 auditPath: /home/dekopon/.local/state/dekopon/audit.jsonl
-checkpointPath: /home/dekopon/.local/state/dekopon/audit-checkpoint.json
-checkpointLockPath: /home/dekopon/.local/state/dekopon/audit-checkpoint.lock
 brokerPrincipal: local-broker
 policyRevision: policy-2026-01
 policiesPath: /home/dekopon/.config/dekopon/policies.cedar
@@ -525,7 +523,7 @@ dekopon-brokerd --config /path/to/broker.yaml
 dekopon-brokerd --config /path/to/broker.yaml --http-bind=0.0.0.0:8080
 ```
 
-SIGINT and SIGTERM stop Unix and HTTP acceptance together, drain bounded in-flight connections concurrently under one shutdown grace, synchronize audit/checkpoint appends, log the verified chain head, and remove only the Unix socket inode created by this process.
+SIGINT and SIGTERM stop Unix and HTTP acceptance together, drain bounded in-flight connections concurrently under one shutdown grace, finish audit appends, log `broker_stopped`, and remove only the Unix socket inode created by this process.
 
 ## Read-only web UI
 
@@ -545,13 +543,11 @@ Agent and token state still belongs to the unprivileged gateway. A mapped attest
 
 “No login” makes the surrounding network the access boundary. Agent names, provider schemas, artifact paths/digests, OTLP endpoints, and runtime limits/activity are deployment information. `--http-bind=0.0.0.0:8080` deliberately exposes it on every interface; choose that address only when everyone who can reach it may read those facts.
 
-## Audit checkpoint and recovery
+## Audit
 
-The checkpoint is one strict, hard-4-KiB-bounded, newline-terminated JSON object with API version `dekopon.dev/audit-checkpoint/v1alpha1`, the retained record count, and the SHA-256 chain head. A dedicated owner-only lock permits one broker writer. Every audit append is synchronized before the checkpoint is written to a new owner-only file, synchronized, atomically renamed, and followed by a parent-directory synchronization.
-
-At startup, the checkpoint must identify an exact prefix of the fully verified audit chain. This detects replacement, truncation, and valid-prefix rollback relative to the retained checkpoint. An audit that is exactly one record ahead of a valid checkpoint is the recoverable crash window and advances the checkpoint; a larger gap fails closed. A non-empty audit without a checkpoint, or any checkpoint that is not a retained prefix, fails closed and requires explicit operator recovery from trusted copies. Do not delete only one file to bypass recovery.
-
-The backing filesystem must honor Unix no-follow opens, advisory exclusive locks, same-directory atomic rename, and file/directory synchronization. Retain or export checkpoint generations in an independently protected system if rollback by the host owner or storage administrator is in scope. Deleting or rolling back both local files together cannot be detected by local state alone.
+The broker opens the owner-only audit file directly, verifies its chain, and restores replay
+identifiers before listening. A readable valid nonempty audit can start on its own.
+`run` and `run_with_http` return `Result<(), BrokerdError>` after clean shutdown.
 
 ### Verifying a chain offline
 
@@ -582,7 +578,7 @@ The whole chain is held in memory while it is checked, so a log past the default
 - Audit records carry the determining `policy_ids`, the `policy_digest` of the evaluated set, and
   the symbolic name of the `credential` the invocation selected.
 - Generic WASI and ambient I/O imports remain unavailable.
-- The durable JSONL chain is mutation-evident and replay-restoring. The separate atomic checkpoint makes the retained head externally inspectable, but is not signed, remote, append-only, or a transparency service by itself.
+- The durable JSONL chain is mutation-evident and replay-restoring.
 - Credential resolution is destination-bound, capability-scoped, and optionally agent-scoped. Providers receive only explicitly linked Dekopon host interfaces and policy constraints; an injected credential exists solely inside the native HTTP engine and is never observable by guest code.
 - Direct `dekopon-run` subcommands retain their import-free host. Only explicit `dekopon-run broker` subcommands connect as unprivileged identity-free clients.
 

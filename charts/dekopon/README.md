@@ -66,9 +66,9 @@ wrong:
 
 | Tier | Applies to | Rule |
 |---|---|---|
-| A | `broker-credentials.yaml`, `secret-map.yaml`, the audit JSONL, the checkpoint, the checkpoint lock | rejected if `mode & 0o077 != 0` |
+| A | `broker-credentials.yaml`, `secret-map.yaml`, the audit JSONL | rejected if `mode & 0o077 != 0` |
 | B | `broker.yaml`, `policies.cedar`, `dekopond.yaml`, provider `.wasm` files and their parents | rejected if `mode & 0o022 != 0` |
-| C | audit and checkpoint parent directories | must be `0700` and owned by the runtime UID |
+| C | audit parent directories | must be `0700` and owned by the runtime UID |
 | D | every ancestor up to `/` | must be a directory that is not group- or world-writable unless sticky |
 | E | `catalogPath` | no checks at all |
 
@@ -156,7 +156,7 @@ Private subdirectories are `0700`; files are `0600` with one link. Each daemon g
 
 **Upgrade with both daemons stopped:** move existing broker-owned files from the state
 claim root into a `broker/` directory owned by `65532:65532`, mode `0700`, preserving
-file bytes and private modes. The init container refuses the old root audit/checkpoint
+file bytes and private modes. The init container refuses the old root audit
 layout rather than silently starting elsewhere. Change an existing ChatGPT directory and
 its live credential to `65533:65533`, keeping directory `0700` and file `0600`; do not
 reseed a rotated token. Update the gateway peer mapping and explicit server pin in operator
@@ -172,16 +172,12 @@ configuration. These are offline operator steps, not a live-cluster action perfo
 | `dekopond.yaml` | `/etc/dekopon/dekopond.yaml` | B | init container |
 | broker socket | `/run/dekopon/broker.sock` | protected IPC | the broker, at bind |
 | audit chain | `/var/lib/dekopon/audit.jsonl` | A + C | the broker |
-| checkpoint | `/var/lib/dekopon/audit-checkpoint.json` | A + C | the broker |
-| checkpoint lock | `/var/lib/dekopon/audit-checkpoint.lock` | A + C | the broker |
 | agent catalog | `/etc/dekopon-catalog/dekopon.yaml` | E | ConfigMap mount |
 | ChatGPT credential | `/var/lib/dekopon/chatgpt/chatgpt-auth.json` | none | init container, **once**; then `dekopond` owns it |
 | providers | `/opt/dekopon/providers/*.wasm` | B | baked into the image |
 
 `/etc/dekopon` and `/run/dekopon` are memory-backed `emptyDir`s, so the credentials file and the
-socket never reach the node's disk. `/var/lib/dekopon` is the claim: audit, checkpoint and lock have
-to be one directory on one volume, because the checkpoint stages to a same-directory temporary file
-and renames it atomically.
+socket never reach the node's disk. `/var/lib/dekopon` is the retained audit and model-credential claim.
 
 ## Probes
 
@@ -246,8 +242,7 @@ and an inline config may leave the key out and take the daemon's default, so
 the assertion believes in those cases. They configure nothing. If your Secret says something other
 than `120000`, correct them there or the arithmetic is guarding a number you are not running.
 
-None of this makes shutdown grace-window-dependent: a longer window is not a durability mechanism,
-and every append, checkpoint and rename still has to be crash-safe on its own.
+A longer shutdown window does not promise crash recovery.
 
 ## The ChatGPT credential is seeded once
 
@@ -342,7 +337,7 @@ is authoritative, so an annotation would restart a working gateway to achieve no
 ### One replica, now for two reasons
 
 `replicas: 1` and `strategy: Recreate` were already forced by the broker's exclusive `flock` on the
-audit log and checkpoint. With this model kind they are load-bearing a second time:
+audit log. With this model kind they are load-bearing a second time:
 `ChatGptCodexModel` serializes refreshes behind a per-process mutex and cannot coordinate across
 processes, so two pods sharing one credential file would race the rotation and the loser would be
 left holding an invalidated refresh token. Neither value is exposed.
@@ -406,12 +401,8 @@ until someone edits a values file and rolls the pod. Raise the two together.
 
 ## Storage, uninstall, and recovery
 
-The claim carries `helm.sh/resource-policy: keep`, so `helm uninstall` leaves it. This is not
-politeness. A non-empty audit with a missing checkpoint, or a checkpoint that is not an exact prefix
-of the verified chain, makes `dekopon-brokerd` fail closed and demand explicit operator recovery;
-deleting one of the two files to dodge that is precisely the thing the design refuses, and deleting
-both together is a rollback local state cannot detect. Move the volume deliberately, with both files,
-or not at all.
+The claim carries `helm.sh/resource-policy: keep`, so `helm uninstall` leaves the audit
+and live model credential intact. Move or delete retained state only deliberately.
 
 It carries `argocd.argoproj.io/sync-options: Prune=false,Delete=false` for the same reason, because
 Helm's annotation means nothing to a GitOps controller. Argo CD syncing with `prune: true` deletes

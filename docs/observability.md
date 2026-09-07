@@ -455,7 +455,6 @@ only place the cause exists. These events carry it:
 | `broker_capacity_exhausted` | error | `dekopon-brokerd` | `category`, and the chain naming which bound was reached |
 | `broker_accept_retried` | warn | `dekopon-brokerd` | `error.kind` (`process-descriptor-limit`, `system-descriptor-limit`, `kernel-memory`, `connection-aborted`, `connection-reset`, `interrupted`), `backoff_ms`, and the errno's chain |
 | `webui_accept_failed` | debug for `error.kind=connection`, warn otherwise | `dekopon-webui` | `error.kind` (the same names as `broker_accept_retried`, plus `connection` and `unrecoverable`), `backoff_ms`, and the errno's chain |
-| `broker_checkpoint_poisoned` | error | `dekopon-brokerd` | `audit_records` and the checkpoint failure's chain |
 | `broker_socket_cleanup_failed` | warn | `dekopon-brokerd` | the socket error's chain |
 
 `broker_capabilities_refused` exists because an attested `capabilities` and an attested
@@ -494,8 +493,8 @@ survived an `accept` failure it used to exit on. A steady stream of it at
 alerting on precisely because the service is no longer failing loudly.
 
 `broker_socket_cleanup_failed` is reported but does not preempt the shutdown result. A stale socket
-path is a smaller problem than the failure that ended service, so the serve error, the final audit
-checkpoint, and `broker_stopped` all come first and the cleanup error surfaces only when nothing
+path is a smaller problem than the failure that ended service, so the serve error
+and `broker_stopped` come first and the cleanup error surfaces only when nothing
 more significant failed.
 
 ## Storage telemetry and audit privacy

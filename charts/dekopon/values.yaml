@@ -86,8 +86,6 @@ initSecurityContext:
 #   <configDir>/dekopond.yaml             0600 65533  (gateway-only volume)
 #   <runtimeDir>/broker.sock              0710 dir, 65532:65534; broker binds the 0660 socket
 #   <stateDir>/audit.jsonl                0700 dir, 65532-owned; broker creates the 0600 file
-#   <stateDir>/audit-checkpoint.json      same directory — the checkpoint stages to a sibling
-#   <stateDir>/audit-checkpoint.lock      .tmp and renames atomically, so it cannot be split
 #   <catalogDir>/<catalog key>            no checks at all; a plain ConfigMap mount
 paths:
   configDir: /etc/dekopon
@@ -114,8 +112,6 @@ broker:
       apiVersion: dekopon.dev/brokerd/v1alpha1
       socketPath: /run/dekopon/broker.sock
       auditPath: /var/lib/dekopon/audit.jsonl
-      checkpointPath: /var/lib/dekopon/audit-checkpoint.json
-      checkpointLockPath: /var/lib/dekopon/audit-checkpoint.lock
       brokerPrincipal: local-broker
       policyRevision: chart-default
       policiesPath: /etc/dekopon/policies.cedar
@@ -369,14 +365,11 @@ gateway:
 # ---------------------------------------------------------------------------------------------
 # Audit state
 # ---------------------------------------------------------------------------------------------
-# Audit, checkpoint, and checkpoint lock live in one directory on one volume, because the
-# checkpoint stages to a same-directory temporary file and renames it atomically. Splitting them
-# across volumes breaks the atomicity the recovery rules depend on.
+# Persistent audit and model-credential state is retained across releases.
 state:
   # local-path is the target cluster's only StorageClass. It is RWO and — this is the part that
   # matters — ALLOWVOLUMEEXPANSION is false. This claim CANNOT BE GROWN LATER. Replacing it means
-  # copying audit.jsonl and audit-checkpoint.json to the new volume together: deleting one to
-  # dodge recovery makes the broker fail closed, and deleting both is an undetectable rollback.
+  # deliberately moving the retained audit and live model credential to the new volume.
   storageClassName: local-path
   accessModes: [ReadWriteOnce]
   # Arithmetic in README.md ("Sizing the audit volume"). Short version: a measured external-write

@@ -16,8 +16,8 @@ use dekopon_broker_protocol::{
     ReportedAgentCapability, RequestEnvelope, ResponseEnvelope, read_frame, write_frame,
 };
 use dekopon_brokerd::{
-    AuditCheckpoint, BrokerServer, BrokerdError, CHECKPOINT_API_VERSION, CONFIG_API_VERSION,
-    CheckpointError, MappedPeer, ServerLimits, current_uid, run, run_with_http,
+    BrokerServer, BrokerdError, CONFIG_API_VERSION, MappedPeer, ServerLimits, current_uid, run,
+    run_with_http,
 };
 use dekopon_capability::{
     EffectKind, ExecutionConstraints, HttpConstraints, Idempotency, InvocationOutcome,
@@ -673,8 +673,6 @@ async fn full_service_restores_replay_state_from_verified_audit() {
         "apiVersion": CONFIG_API_VERSION,
         "socketPath": &socket_path,
         "auditPath": &audit_path,
-        "checkpointPath": &checkpoint_path,
-        "checkpointLockPath": &checkpoint_lock_path,
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "policiesPath": &policies_path,
@@ -707,11 +705,18 @@ async fn full_service_restores_replay_state_from_verified_audit() {
         .expect("first invocation completes");
     assert_eq!(result.outcome, InvocationOutcome::Succeeded);
     stop.send(()).expect("stop first service");
-    let checkpoint = first
+    first
         .await
         .expect("first service task exits")
         .expect("first service stops cleanly");
-    assert_eq!(checkpoint.records, 2);
+    assert_eq!(
+        dekopon_brokerd::verify_audit_file(&audit_path)
+            .expect("verified audit")
+            .records,
+        2
+    );
+    assert!(!checkpoint_path.exists());
+    assert!(!checkpoint_lock_path.exists());
 
     let (stop, stopped) = oneshot::channel::<()>();
     let second_config = config_path.clone();
@@ -726,29 +731,24 @@ async fn full_service_restores_replay_state_from_verified_audit() {
     assert_eq!(replay.outcome, InvocationOutcome::Denied);
     assert_eq!(replay.error.as_deref(), Some("replayed-invocation"));
     stop.send(()).expect("stop second service");
-    let checkpoint = second
+    second
         .await
         .expect("second service task exits")
         .expect("second service stops cleanly");
-    assert_eq!(checkpoint.records, 3);
-    let stored: Value =
-        serde_json::from_slice(&fs::read(&checkpoint_path).expect("read durable checkpoint"))
-            .expect("checkpoint JSON decodes");
-    assert_eq!(stored.as_object().expect("checkpoint object").len(), 3);
-    assert_eq!(stored["apiVersion"], CHECKPOINT_API_VERSION);
-    assert_eq!(stored["records"], 3);
-    assert!(stored["head"].as_str().is_some());
-
+    assert_eq!(
+        dekopon_brokerd::verify_audit_file(&audit_path)
+            .expect("verified audit")
+            .records,
+        3
+    );
+    assert!(!checkpoint_path.exists());
+    assert!(!checkpoint_lock_path.exists());
     let audit = fs::read_to_string(&audit_path).expect("read audit before truncation");
     let first = audit.lines().next().expect("audit has a first record");
     fs::write(&audit_path, format!("{first}\n")).expect("write valid-prefix truncation");
-    let error = run(&config_path, async {})
+    run(&config_path, async {})
         .await
-        .expect_err("checkpoint must reject valid-prefix audit rollback");
-    assert!(matches!(
-        error,
-        BrokerdError::Checkpoint(CheckpointError::AuditMismatch)
-    ));
+        .expect("valid audit prefix starts without a sidecar");
     assert!(!socket_path.exists());
 }
 
@@ -846,8 +846,6 @@ when { context.capability == "http-probe.fetch"
         "apiVersion": CONFIG_API_VERSION,
         "socketPath": &socket_path,
         "auditPath": &audit_path,
-        "checkpointPath": directory.path().join("checkpoint.json"),
-        "checkpointLockPath": directory.path().join("checkpoint.lock"),
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "policiesPath": &policies_path,
@@ -920,11 +918,16 @@ when { context.capability == "http-probe.fetch"
     assert_eq!(denied.outcome, InvocationOutcome::Failed);
 
     stop.send(()).expect("stop service");
-    let checkpoint = service
+    service
         .await
         .expect("service task exits")
         .expect("service stops");
-    assert_eq!(checkpoint.records, 4);
+    assert_eq!(
+        dekopon_brokerd::verify_audit_file(&audit_path)
+            .expect("verified audit")
+            .records,
+        4
+    );
     let audit = fs::read_to_string(audit_path).expect("read audit");
     assert!(audit.contains("drn:com.xrl:secret:test:api/token"));
     assert!(!audit.contains("brokerd-secret-value"));
@@ -943,8 +946,6 @@ async fn full_service_serves_the_explicit_read_only_http_listener() {
         "apiVersion": CONFIG_API_VERSION,
         "socketPath": &socket_path,
         "auditPath": directory.path().join("audit.jsonl"),
-        "checkpointPath": directory.path().join("checkpoint.json"),
-        "checkpointLockPath": directory.path().join("checkpoint.lock"),
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "policiesPath": &policies_path,
@@ -1055,7 +1056,7 @@ async fn http_get(address: std::net::SocketAddr, path: &str) -> String {
 /// polling on `exists()` alone makes the suite flaky under parallel load.
 async fn wait_for_socket(
     path: &Path,
-    task: &mut tokio::task::JoinHandle<Result<AuditCheckpoint, BrokerdError>>,
+    task: &mut tokio::task::JoinHandle<Result<(), BrokerdError>>,
 ) {
     for _ in 0..3_000 {
         if std::fs::symlink_metadata(path)
@@ -1463,8 +1464,6 @@ async fn strict_startup_refuses_every_policy_that_names_something_absent() {
         "apiVersion": CONFIG_API_VERSION,
         "socketPath": directory.path().join("broker.sock"),
         "auditPath": directory.path().join("audit.jsonl"),
-        "checkpointPath": directory.path().join("checkpoint.json"),
-        "checkpointLockPath": directory.path().join("checkpoint.lock"),
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "policiesPath": &policies_path,
@@ -1540,8 +1539,6 @@ async fn default_startup_tolerates_names_no_loaded_provider_declares() {
         "apiVersion": CONFIG_API_VERSION,
         "socketPath": directory.path().join("broker.sock"),
         "auditPath": directory.path().join("audit.jsonl"),
-        "checkpointPath": directory.path().join("checkpoint.json"),
-        "checkpointLockPath": directory.path().join("checkpoint.lock"),
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "policiesPath": &policies_path,

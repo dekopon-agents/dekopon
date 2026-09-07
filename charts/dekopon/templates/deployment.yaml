@@ -19,7 +19,7 @@ metadata:
     {{- include "dekopon.labels" . | nindent 4 }}
 spec:
   # Not configurable. dekopon-brokerd is a singleton: it holds an exclusive flock on the audit log
-  # and a second on the checkpoint lock, and a second broker against the same volume cannot start.
+  # and a second broker against the same volume cannot start.
   replicas: 1
   revisionHistoryLimit: 2
   strategy:
@@ -108,7 +108,7 @@ spec:
                 chmod 0700 "$d"
               done
               # A prior chart used the claim root for broker files. Refuse an unmigrated claim.
-              for f in audit.jsonl audit-checkpoint.json audit-checkpoint.lock; do
+              for f in audit.jsonl; do
                 if [ -e "{{ $state }}/$f" ]; then
                   echo "move broker state into the claim's broker/ directory before upgrading" >&2
                   exit 1
@@ -212,7 +212,7 @@ spec:
               fi
 {{- end }}
 
-              # Private config, audit, checkpoint and checkpoint-lock parents must be 0700 and owned by
+              # Private config and audit parents must be 0700 and owned by
               # the runtime UID, and every ancestor up to / must be a directory that is not
               # group- or world-writable unless it is sticky. An emptyDir arrives root-owned and
               # 0777 and a local-path volume arrives root-owned and 0777, so both need this.
@@ -377,7 +377,7 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: {{ .Values.volumeSizes.tmp }}
-        # Audit, checkpoint and checkpoint lock, together on one real filesystem. The backing
+        # Retained audit and model-credential state on one real filesystem. The backing
         # store has to honour no-follow opens, advisory exclusive locks, same-directory atomic
         # rename, and file and directory fsync. tmpfs does not qualify and neither does anything
         # networked; local-path on ext4 does.

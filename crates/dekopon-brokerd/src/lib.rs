@@ -7,7 +7,6 @@
 #![cfg(unix)]
 
 mod audit;
-mod checkpoint;
 mod config;
 mod credentials;
 mod provider_manager;
@@ -34,7 +33,6 @@ use dekopon_core::error_chain;
 use thiserror::Error;
 
 pub use audit::{AuditVerification, AuditVerificationError, verify_audit_file};
-pub use checkpoint::{CHECKPOINT_API_VERSION, CheckpointError, HARD_MAX_CHECKPOINT_BYTES};
 pub use config::{
     BrokerdConfig, CONFIG_API_VERSION, ConfigApiVersion, ConfigError, HostLimitsConfig,
     IdentityMapping, ManagedProviderSetConfig, PeerIdentity, ResolvedConfig, ResolvedTelemetry,
@@ -61,15 +59,6 @@ pub use socket::{SocketError, SocketGuard, current_uid};
 /// Maximum provider components in either legacy configuration or a managed lock.
 pub const HARD_MAX_PROVIDERS: usize = 64;
 
-/// Verified durable chain state at clean shutdown.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AuditCheckpoint {
-    /// Number of retained records.
-    pub records: usize,
-    /// Current hash-chain head, absent only for an empty log.
-    pub head: Option<String>,
-}
-
 /// Reads only the export settings, so the process can install its subscriber before serving.
 ///
 /// The configuration is parsed again by [`run`], which reports every configuration failure with
@@ -92,10 +81,7 @@ pub async fn telemetry_settings(
 ///
 /// This compatibility entry point does not open the informational HTTP listener. Use
 /// [`run_with_http`] to enable the web UI explicitly.
-pub async fn run<F>(
-    config_path: impl AsRef<Path>,
-    shutdown: F,
-) -> Result<AuditCheckpoint, BrokerdError>
+pub async fn run<F>(config_path: impl AsRef<Path>, shutdown: F) -> Result<(), BrokerdError>
 where
     F: Future<Output = ()> + Send,
 {
@@ -108,7 +94,7 @@ pub async fn run_with_http<F>(
     config_path: impl AsRef<Path>,
     http_bind: Option<SocketAddr>,
     shutdown: F,
-) -> Result<AuditCheckpoint, BrokerdError>
+) -> Result<(), BrokerdError>
 where
     F: Future<Output = ()> + Send,
 {
@@ -125,8 +111,6 @@ where
     let frame_limits = config.server_limits.frame_limits()?;
     socket::validate_socket_parent(&config.socket_path, uid)?;
     socket::validate_private_parent(&config.audit_path, uid)?;
-    socket::validate_private_parent(&config.checkpoint_path, uid)?;
-    socket::validate_private_parent(&config.checkpoint_lock_path, uid)?;
     for provider in &config.providers {
         socket::validate_owned_file(provider, uid)?;
     }
@@ -149,14 +133,6 @@ where
     };
     let secret_drns = secret_catalog.drns().cloned().collect::<Vec<_>>();
 
-    let (checkpoint_store, stored_checkpoint) = checkpoint::CheckpointStore::open(
-        &config.checkpoint_path,
-        &config.checkpoint_lock_path,
-        uid,
-    )
-    .await
-    .map_err(BrokerdError::Checkpoint)?;
-    let checkpoint_store = Arc::new(checkpoint_store);
     let file_audit = Arc::new(
         FileAuditLog::open(
             &config.audit_path,
@@ -167,14 +143,8 @@ where
         .map_err(BrokerdError::Audit)?,
     );
     socket::validate_owned_file(&config.audit_path, uid)?;
-    checkpoint::reconcile(&file_audit, &checkpoint_store, stored_checkpoint.as_ref())
-        .await
-        .map_err(BrokerdError::Checkpoint)?;
     let replay_ids = file_audit.take_replay_ids().await;
-    let audit = Arc::new(checkpoint::CheckpointedAuditLog::new(
-        file_audit,
-        checkpoint_store,
-    ));
+    let audit = file_audit;
     let storage_host = config
         .storage
         .as_ref()
@@ -369,12 +339,7 @@ where
         .map_err(|source| BrokerdError::WebUiAddress { source })?;
     let web_enabled = web_listener.is_some();
     let (listener, mut socket_guard) = socket::bind(&config.socket_path, uid).await?;
-    let (records, head) = audit.checkpoint().await;
-    tracing::info!(
-        event = "broker_started",
-        audit_records = records,
-        audit_head = head.as_deref().unwrap_or("none")
-    );
+    tracing::info!(event = "broker_started");
     if let Some(address) = web_address {
         tracing::info!(
             event = "broker_webui_started",
@@ -428,7 +393,7 @@ where
     // The socket must not outlive its listener, so cleanup still runs here — but its result is
     // held rather than returned. A stale socket path is a smaller problem than the failure that
     // ended service, and returning it first would replace the real cause and skip the final
-    // checkpoint and `broker_stopped` entirely.
+    // `broker_stopped` entirely.
     let cleanup = socket_guard.cleanup();
     if let Err(error) = &cleanup {
         tracing::warn!(
@@ -445,14 +410,9 @@ where
         result.map_err(BrokerdError::WebUi)?;
         tracing::info!(event = "broker_webui_stopped");
     }
-    let (records, head) = audit.checkpoint().await;
-    tracing::info!(
-        event = "broker_stopped",
-        audit_records = records,
-        audit_head = head.as_deref().unwrap_or("none")
-    );
+    tracing::info!(event = "broker_stopped");
     cleanup?;
-    Ok(AuditCheckpoint { records, head })
+    Ok(())
 }
 
 /// What one bounded shutdown produced.
@@ -618,9 +578,6 @@ pub enum BrokerdError {
     /// Owner-only durable audit could not be opened and verified.
     #[error("broker durable audit is unavailable")]
     Audit(#[source] dekopon_broker::FileAuditError),
-    /// Durable checkpoint could not be locked, verified, reconciled, or synchronized.
-    #[error("broker audit checkpoint is unavailable")]
-    Checkpoint(#[source] CheckpointError),
     /// Provider storage root/key validation could not start.
     #[error("broker provider storage could not start")]
     Storage(#[source] dekopon_storage_host::StorageHostError),

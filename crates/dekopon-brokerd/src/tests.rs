@@ -65,8 +65,6 @@ fn attested_document(uid: u32) -> serde_json::Value {
         "apiVersion": config::CONFIG_API_VERSION,
         "socketPath": "broker.sock",
         "auditPath": "audit.jsonl",
-        "checkpointPath": "checkpoint.json",
-        "checkpointLockPath": "checkpoint.lock",
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "policiesPath": "policies.cedar",
@@ -345,8 +343,6 @@ async fn strict_configuration_resolves_paths_and_rejects_unknown_fields() {
         "apiVersion": config::CONFIG_API_VERSION,
         "socketPath": "broker.sock",
         "auditPath": "audit.jsonl",
-        "checkpointPath": "checkpoint.json",
-        "checkpointLockPath": "checkpoint.lock",
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "providers": ["echo.wasm"],
@@ -373,24 +369,34 @@ async fn strict_configuration_resolves_paths_and_rejects_unknown_fields() {
         canonical_directory.join("broker.sock")
     );
     assert_eq!(resolved.audit_path, canonical_directory.join("audit.jsonl"));
-    assert_eq!(
-        resolved.checkpoint_path,
-        canonical_directory.join("checkpoint.json")
-    );
-    assert_eq!(
-        resolved.checkpoint_lock_path,
-        canonical_directory.join("checkpoint.lock")
-    );
     assert_eq!(resolved.providers, [canonical_directory.join("echo.wasm")]);
 
     let mut conflicting = document.clone();
-    conflicting["checkpointLockPath"] = json!("checkpoint.json.tmp");
+    conflicting["auditPath"] = json!("broker.sock");
     fs::write(
         &path,
         serde_json::to_vec(&conflicting).expect("conflict fixture serializes"),
     )
     .expect("replace config fixture");
-    assert!(config::load(&path, uid).await.is_err());
+    assert!(matches!(
+        config::load(&path, uid).await,
+        Err(config::ConfigError::ConflictingPaths)
+    ));
+
+    for key in ["checkpointPath", "checkpointLockPath"] {
+        let mut retired = document.clone();
+        retired[key] = json!("retired");
+        fs::write(
+            &path,
+            serde_json::to_vec(&retired).expect("fixture serializes"),
+        )
+        .expect("replace config fixture");
+        let error = config::load(&path, uid)
+            .await
+            .expect_err("retired key is unknown");
+        assert!(matches!(error, config::ConfigError::Decode { source }
+            if source.to_string().contains("unknown field") && source.to_string().contains(key)));
+    }
 
     let mut invalid = document;
     invalid["principal"] = json!("payload-forgery");
@@ -412,8 +418,6 @@ async fn telemetry_section_is_optional_and_strict() {
         "apiVersion": config::CONFIG_API_VERSION,
         "socketPath": "broker.sock",
         "auditPath": "audit.jsonl",
-        "checkpointPath": "checkpoint.json",
-        "checkpointLockPath": "checkpoint.lock",
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "providers": ["echo.wasm"],
@@ -585,8 +589,6 @@ fn provider_config(uid: u32, providers: serde_json::Value) -> serde_json::Value 
         "apiVersion": config::CONFIG_API_VERSION,
         "socketPath": "broker.sock",
         "auditPath": "audit.jsonl",
-        "checkpointPath": "checkpoint.json",
-        "checkpointLockPath": "checkpoint.lock",
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "providers": providers,
@@ -1368,7 +1370,7 @@ async fn ipc_group_socket_keeps_private_paths_private_and_replaces_only_safe_sta
             );
             assert!(
                 socket::validate_private_parent(&path, uid).is_err(),
-                "audit/cache/checkpoint parents stay private"
+                "audit/cache parents stay private"
             );
         }
         assert!(matches!(

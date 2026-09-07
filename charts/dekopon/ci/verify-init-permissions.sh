@@ -253,9 +253,8 @@ owned_file("/etc/dekopon/broker-credentials.yaml", 0o077, "credentials")
 print("== Tier B: broker.yaml, policies.cedar (mode & 0o022) ==")
 for f in ("broker.yaml", "policies.cedar"):
     owned_file(f"/etc/dekopon/{f}", 0o022, "config")
-print("== Tier C and D: socket, audit, checkpoint and lock parents, and every ancestor ==")
-for p in ("/var/lib/dekopon/broker/audit.jsonl",
-          "/var/lib/dekopon/broker/audit-checkpoint.json", "/var/lib/dekopon/broker/audit-checkpoint.lock"):
+print("== Tier C and D: audit parents, and every ancestor ==")
+for p in ("/var/lib/dekopon/broker/audit.jsonl",):
     private_parent(p)
 print("== what the broker creates for itself ==")
 fd = os.open("/var/lib/dekopon/broker/audit.jsonl",

@@ -128,8 +128,6 @@ fn broker_config(directory: &Path, uid: u32) -> Value {
         "apiVersion": dekopon_brokerd::CONFIG_API_VERSION,
         "socketPath": directory.join("broker.sock"),
         "auditPath": directory.join("audit.jsonl"),
-        "checkpointPath": directory.join("checkpoint.json"),
-        "checkpointLockPath": directory.join("checkpoint.lock"),
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-gateway",
         "policiesPath": directory.join("policies.cedar"),
@@ -442,9 +440,7 @@ fn audit_events(path: &Path) -> Vec<Value> {
 
 struct Fixture {
     directory: tempfile::TempDir,
-    broker: tokio::task::JoinHandle<
-        Result<dekopon_brokerd::AuditCheckpoint, dekopon_brokerd::BrokerdError>,
-    >,
+    broker: tokio::task::JoinHandle<Result<(), dekopon_brokerd::BrokerdError>>,
     stop_broker: oneshot::Sender<()>,
     gateway: tokio::task::JoinHandle<Result<(), dekopond::DekopondError>>,
     stop_gateway: oneshot::Sender<()>,

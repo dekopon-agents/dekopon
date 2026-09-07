@@ -176,7 +176,7 @@ async fn ipc_process_boundary() {
     }
     fs::write(&config, serde_json::to_vec(&json!({
         "apiVersion": "dekopon.dev/brokerd/v1alpha1", "socketPath": socket,
-        "auditPath": private.join("audit.jsonl"), "checkpointPath": private.join("checkpoint.json"), "checkpointLockPath": private.join("checkpoint.lock"),
+        "auditPath": private.join("audit.jsonl"),
         "brokerPrincipal": "broker", "policyRevision": "ipc-test", "policiesPath": policy,
         "providers": [provider], "credentialsPath": credentials, "identities": identities,
         "constraintSets": {"echo.echo": {"provider": "echo", "effect": "read-only", "risk": "Low", "idempotency": "idempotent", "constraints": {"timeoutMs": 30000, "maxOutputBytes": 1048576}}}

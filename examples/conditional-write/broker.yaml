@@ -14,8 +14,6 @@ apiVersion: dekopon.dev/brokerd/v1alpha1
 
 socketPath: /home/xavier/.local/run/dekopon/broker.sock
 auditPath: /home/xavier/.local/state/dekopon/audit.jsonl
-checkpointPath: /home/xavier/.local/state/dekopon/audit-checkpoint.json
-checkpointLockPath: /home/xavier/.local/state/dekopon/audit-checkpoint.lock
 
 brokerPrincipal: local-broker
 policyRevision: conditional-write-2026-01

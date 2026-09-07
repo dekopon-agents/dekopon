@@ -8,6 +8,13 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Broker audit configuration (unreleased)
+
+Remove `checkpointPath` and `checkpointLockPath` from broker configuration before starting
+the new binary: both are rejected as unknown fields. Keep the private audit file and its
+existing limits; startup still verifies its chain and restores replay identifiers.
+Library callers of `run` and `run_with_http` now receive unit on clean shutdown.
+
 ## Provider storage direct-write contract
 
 Provider storage applies each write immediately; provider traps, invalid responses and cancellation
@@ -46,8 +53,7 @@ Dekopon ships no service units, so the order is yours to enforce whatever superv
 
 1. Stop `dekopond`.
 2. Signal `dekopon-brokerd` with `SIGINT` or `SIGTERM` and let it finish. It stops accepting, drains
-   bounded in-flight connections, synchronizes the audit and checkpoint appends, logs the verified
-   chain head, and removes only the socket inode it created.
+   bounded in-flight connections, finishes audit appends, logs `broker_stopped`, and removes only the socket inode it created.
 3. Replace the binaries and make any configuration edits the release notes below call for.
 4. Start `dekopon-brokerd` and wait for it to be answering on its socket.
 5. Start `dekopond`.

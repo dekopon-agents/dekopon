@@ -46,8 +46,6 @@ pub struct BrokerdConfig {
     pub api_version: ConfigApiVersion,
     pub socket_path: PathBuf,
     pub audit_path: PathBuf,
-    pub checkpoint_path: PathBuf,
-    pub checkpoint_lock_path: PathBuf,
     pub broker_principal: PrincipalId,
     pub policy_revision: String,
     /// Optional owner-only credentials file resolved into the broker's credential store.
@@ -341,8 +339,6 @@ pub struct ResolvedConfig {
     pub source: PathBuf,
     pub socket_path: PathBuf,
     pub audit_path: PathBuf,
-    pub checkpoint_path: PathBuf,
-    pub checkpoint_lock_path: PathBuf,
     pub broker_principal: PrincipalId,
     pub policy_revision: String,
     pub credentials_path: Option<PathBuf>,
@@ -451,13 +447,6 @@ fn resolve_future_path(path: PathBuf) -> Result<PathBuf, ConfigError> {
     Ok(parent.join(name))
 }
 
-fn sibling_with_suffix(path: &Path, suffix: &str) -> Result<PathBuf, ConfigError> {
-    let name = path.file_name().ok_or(ConfigError::MissingFileName)?;
-    let mut sibling = name.to_os_string();
-    sibling.push(suffix);
-    Ok(path.with_file_name(sibling))
-}
-
 /// Expands one configured provider entry into the component files it names.
 ///
 /// A regular file is itself. A directory is every `*.wasm` directly inside it — not recursively, so
@@ -557,9 +546,6 @@ async fn resolve(
     let source = resolve_future_path(source)?;
     let socket_path = resolve_future_path(resolve_path(config.socket_path))?;
     let audit_path = resolve_future_path(resolve_path(config.audit_path))?;
-    let checkpoint_path = resolve_future_path(resolve_path(config.checkpoint_path))?;
-    let checkpoint_lock_path = resolve_future_path(resolve_path(config.checkpoint_lock_path))?;
-    let checkpoint_temporary_path = sibling_with_suffix(&checkpoint_path, ".tmp")?;
     let canonical = |path: Option<PathBuf>| {
         path.map(|path| {
             let unresolved = resolve_path(path);
@@ -684,14 +670,7 @@ async fn resolve(
     if providers.is_empty() {
         return Err(ConfigError::NoProviders);
     }
-    let mut reserved = vec![
-        source.clone(),
-        socket_path.clone(),
-        audit_path.clone(),
-        checkpoint_path.clone(),
-        checkpoint_lock_path.clone(),
-        checkpoint_temporary_path,
-    ];
+    let mut reserved = vec![source.clone(), socket_path.clone(), audit_path.clone()];
     if let Some(credentials_path) = &credentials_path {
         reserved.push(credentials_path.clone());
     }
@@ -712,7 +691,6 @@ async fn resolve(
     if let Some(storage) = &storage {
         reserved.push(storage.namespace_key_path.clone());
         if audit_path.starts_with(&storage.root_path)
-            || checkpoint_path.starts_with(&storage.root_path)
             || storage.root_path == audit_path.parent().unwrap_or(Path::new("/"))
         {
             return Err(ConfigError::StorageStateCollision);
@@ -866,8 +844,6 @@ async fn resolve(
         source,
         socket_path,
         audit_path,
-        checkpoint_path,
-        checkpoint_lock_path,
         broker_principal: config.broker_principal,
         policy_revision: config.policy_revision,
         credentials_path,
@@ -928,7 +904,7 @@ pub enum ConfigError {
     },
     #[error("configured path has no parent")]
     MissingParent,
-    #[error("configured socket, audit, or checkpoint path has no file name")]
+    #[error("configured socket or audit path has no file name")]
     MissingFileName,
     #[error("could not resolve configured path: {path}")]
     ResolvePath {
@@ -967,9 +943,7 @@ pub enum ConfigError {
     TooManyProviders { maximum: usize },
     #[error("broker configuration must map at least one peer identity")]
     NoIdentities,
-    #[error(
-        "configuration, socket, audit, checkpoint, lock, temporary, and provider paths must not conflict"
-    )]
+    #[error("configuration, socket, audit, lock, temporary, and provider paths must not conflict")]
     ConflictingPaths,
     #[error("provider component path is repeated: {path}")]
     DuplicateProviderPath { path: PathBuf },
