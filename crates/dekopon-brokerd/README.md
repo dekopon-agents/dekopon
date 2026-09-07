@@ -1,6 +1,6 @@
 # dekopon-brokerd
 
-`dekopon-brokerd` is the separately deployed privileged Unix service for Dekopon provider components. It derives caller identity from Unix peer credentials, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, restores replay identifiers from a verified owner-only audit chain, executes only statically linked Dekopon host interfaces, and can explicitly bind the unauthenticated `GET`/`HEAD`-only `dekopon-webui` operational view.
+`dekopon-brokerd` is the separately deployed privileged Unix service for Dekopon provider components. It derives caller identity from Unix peer credentials, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, restores replay identifiers from a verified owner-only audit chain, executes only statically linked Dekopon host interfaces.
 
 Authorization and execution constraints are two separate files on purpose. `policiesPath` decides *who may do what*; `constraintSets` decides *how narrowly the broker then does it*. A policy edit can never widen a timeout, reach a new host, or bind a credential that was not already bound.
 
@@ -18,7 +18,7 @@ its own effective UID, then requests capabilities with a two-second complete-exc
 deadline and the default frame ceiling. An empty authorized listing is healthy.
 Success exits 0 without output; absent, refused, unmapped, wrong-server, malformed or
 stalled endpoints exit 1 with a diagnostic. Missing arguments exit 2. The probe rejects
-`--config` and `--http-bind`, loads no components or credentials, invokes nothing and
+`--config`, loads no components or credentials, invokes nothing and
 initializes no telemetry.
 
 ## Configuration
@@ -158,7 +158,7 @@ dekopon-brokerd provider verify \
 `--output json` gives deterministic machine-readable command results. Successful lock changes say
 that they apply on the next broker restart; there is no hot reload.
 
-Operator commands never take `--config` or `--http-bind`; combining them is a usage error.
+Operator commands never take `--config`; combining them is a usage error.
 `provider` requires `--lock-file` and `--store`, `sync` also `--provider-set`, and `audit verify`
 requires `--audit-path`. Usage errors exit 2; a failed command exits 1. Operator modes print
 results on stdout and text diagnostics on stderr at `warn` (override with `RUST_LOG`); the daemon
@@ -486,7 +486,7 @@ rejects exports without it, so include `organization=<org>` alongside the token 
 telemetry and log the reason rather than preventing startup. Broker logs are structured JSON on
 stdout, filtered by `RUST_LOG`.
 
-Host, broker, and server limits have conservative defaults (including a 2 MiB frame ceiling) when their entire sections are omitted. `hostLimits` and `brokerLimits` also default field by field, so a partial section keeps the absent-section value for everything it does not name — which is what lets a deployment set `maxTotalMemoryBytes` or `maxReplayIds` alone. `serverLimits` stays all-or-nothing: when it is present every field is required. Unknown fields and unknown API versions are rejected. Startup also requires aggregate provider metadata, every mapped peer's capability response, and the *widest* response any session could receive to fit the frame ceiling. That last bound is the one that matters in a gateway deployment: the connecting peer is typically granted nothing itself, while the principals its `identityMappings` name hold the capability sets that actually reach the wire through an attested `capabilities`. The agent catalog belongs to the gateway, so those contexts cannot be enumerated here and are bounded instead. Shutdown grace must cover one configured host deadline plus two complete frame deadlines, and it is one grace for the whole process: the Unix drain and the web-UI drain share a single deadline rather than taking one each.
+Host, broker, and server limits have conservative defaults (including a 2 MiB frame ceiling) when their entire sections are omitted. `hostLimits` and `brokerLimits` also default field by field, so a partial section keeps the absent-section value for everything it does not name — which is what lets a deployment set `maxTotalMemoryBytes` or `maxReplayIds` alone. `serverLimits` stays all-or-nothing: when it is present every field is required. Unknown fields and unknown API versions are rejected. Startup also requires aggregate provider metadata, every mapped peer's capability response, and the *widest* response any session could receive to fit the frame ceiling. That last bound is the one that matters in a gateway deployment: the connecting peer is typically granted nothing itself, while the principals its `identityMappings` name hold the capability sets that actually reach the wire through an attested `capabilities`. The agent catalog belongs to the gateway, so those contexts cannot be enumerated here and are bounded instead. Shutdown grace must cover one configured host deadline plus two complete frame deadlines, and it is one grace for the whole process: all Unix connections drain under that one deadline rather than each taking a fresh grace period.
 
 `maxReplayIds` should be at least `auditMaxRecords`; the Helm chart's default configuration sets both to 200 000. The built-in default does not satisfy this: `brokerLimits.maxReplayIds` defaults to 100 000 while `serverLimits.auditMaxRecords` defaults to 200 000, so a configuration that omits `brokerLimits` refuses every invocation with `capacity-exhausted` at half its audit budget; set `brokerLimits: { maxReplayIds: 200000 }` explicitly. Both bounds are permanent when reached — the ledger never evicts, is restored from durable history on restart, and the audit log does not rotate — and a denial spends one audit record but a full ledger slot, so an undersized ledger refuses every invocation with `capacity-exhausted` long before the audit bound it was meant to outlast.
 
@@ -519,35 +519,15 @@ rotate stored authority.
 chmod 0700 /home/dekopon/.local/run/dekopon /home/dekopon/.local/state/dekopon
 chmod 0600 /path/to/broker.yaml
 dekopon-brokerd --config /path/to/broker.yaml
-# Explicitly expose the unauthenticated informational UI on every interface:
-dekopon-brokerd --config /path/to/broker.yaml --http-bind=0.0.0.0:8080
 ```
 
-SIGINT and SIGTERM stop Unix and HTTP acceptance together, drain bounded in-flight connections concurrently under one shutdown grace, finish audit appends, log `broker_stopped`, and remove only the Unix socket inode created by this process.
-
-## Read-only web UI
-
-`--http-bind <ADDRESS>` enables a second, TCP listener; without the flag the broker opens no HTTP port. `/` returns a permanent redirect to `/ui`. The HTTP router accepts only `GET`/`HEAD`, has no login and no mutation endpoint, sends `no-store`, `nosniff`, `no-referrer`, and a closed content-security policy, and escapes every authored or component-provided string.
-
-The overview includes:
-
-- the latest bounded catalog-agent inventory reported by `dekopond`, including declared providers, capabilities, and least-privilege provider permissions;
-- provider-reported input/output token totals and explicit counts of model calls that omitted each usage field;
-- a table of provider components loaded into this broker;
-- host-observed Wasmtime compilation, store, instantiation, invocation, fuel, memory/table limiter, HTTP count/byte statistics, plus every configured host ceiling; and
-- credential-free OTLP endpoint, transport, service name, timeout, and payload mode. Header and resource-attribute **values** are never retained or rendered.
-
-A provider page is intentionally rustdoc-like: local artifact path, source byte count and SHA-256, Wasmtime-visible imports/exports and nested interface functions, command words, every capability's description/effect/risk/idempotency/input schema, and the complete validated manifest. The host executes local WebAssembly component bytes and reports the digest of its exact compile buffer. A managed lock separately retains the OCI source and manifest digest, but the UI is not yet given that lock context and says so rather than presenting the component digest as publisher provenance.
-
-Agent and token state still belongs to the unprivileged gateway. A mapped attestor may publish a content-free normalized inventory and bounded usage deltas over the authenticated Unix protocol. Reports omit instructions, prompts, answers, subjects, principals, credentials, policy, constraints, and authorization; are held only in process memory; reset on broker restart; and are never consulted by Cedar, routing, execution, evidence, replay, or durable audit. Reporting is best effort, so the live totals are not billing reconciliation—use the displayed OTLP configuration and `accounting.model.turn` for retained accounting.
-
-“No login” makes the surrounding network the access boundary. Agent names, provider schemas, artifact paths/digests, OTLP endpoints, and runtime limits/activity are deployment information. `--http-bind=0.0.0.0:8080` deliberately exposes it on every interface; choose that address only when everyone who can reach it may read those facts.
+SIGINT and SIGTERM stop Unix acceptance, drain bounded in-flight connections under one shutdown grace, finish audit appends, log `broker_stopped`, and remove only the Unix socket inode created by this process.
 
 ## Audit
 
 The broker opens the owner-only audit file directly, verifies its chain, and restores replay
 identifiers before listening. A readable valid nonempty audit can start on its own.
-`run` and `run_with_http` return `Result<(), BrokerdError>` after clean shutdown.
+`run` returns `Result<(), BrokerdError>` after clean shutdown.
 
 ### Verifying a chain offline
 
@@ -712,3 +692,12 @@ identities:
           channel: c0123abc
           conversation: c0123abc:1712345678.000100
 ```
+
+## Catalog ownership at policy startup
+
+The agent catalog belongs to the gateway. Cedar declares `Dekopon::Agent` but does not enumerate
+agent instances: a misspelled agent literal can validate and then deny every session. The gateway
+rejects a route naming an absent catalog agent; operators must cross-check policy agent literals
+against that catalog. Principal literals are always checked; undeclared providers/capabilities
+are fatal with `strict: true`, otherwise reported as schema-only phantoms. Policy cannot widen
+owner-authored execution constraints or bind another credential.

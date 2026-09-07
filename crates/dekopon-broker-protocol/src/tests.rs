@@ -5,12 +5,10 @@ use serde_json::json;
 use tokio::io::{AsyncWriteExt as _, duplex};
 
 use super::{
-    AgentInventory, Attestation, BrokerRequest, ChatScopeClaim, ChatTransportKind,
-    CommandRunOutcome, ComponentFailure, DeliveredTurnRequest, DeliveryIdentity, FrameLimits,
-    InventoryError, InvocationRequest, MAX_REPORTED_AGENT_PROVIDERS, MAX_REPORTED_MODEL_CALLS,
-    MAX_REPORTED_TEXT_BYTES, MAX_REPORTED_TOKENS, ModelUsageReport, PROTOCOL_VERSION, Permission,
-    ProtocolError, ProtocolVersion, ReportedAgent, ReportedAgentCapability, RequestEnvelope,
-    ResponseEnvelope, TraceParent, TraceParentError, UsageReportError, read_frame, write_frame,
+    Attestation, BrokerRequest, ChatScopeClaim, ChatTransportKind, CommandRunOutcome,
+    ComponentFailure, DeliveredTurnRequest, DeliveryIdentity, FrameLimits, InvocationRequest,
+    PROTOCOL_VERSION, ProtocolError, ProtocolVersion, RequestEnvelope, ResponseEnvelope,
+    TraceParent, TraceParentError, read_frame, write_frame,
 };
 
 fn subject() -> dekopon_core::ExternalSubject {
@@ -392,88 +390,6 @@ fn public_drn_is_typed_optional_proposal_data_and_never_provider_input() {
     );
 }
 
-#[test]
-fn informational_reports_are_bounded_and_carry_no_authority_or_prompt_content() {
-    let inventory = AgentInventory {
-        agents: vec![ReportedAgent {
-            id: "reviewer".parse().expect("valid agent"),
-            description: "Reviews pull requests".to_owned(),
-            enabled: true,
-            model_class: Some("reasoning".to_owned()),
-            providers: vec!["gh".parse().expect("valid provider")],
-            capabilities: vec![ReportedAgentCapability {
-                id: "gh.pull-request.read".parse().expect("valid capability"),
-                provider: "gh".parse().expect("valid provider"),
-                permissions: vec![Permission {
-                    operation: "pull_requests:read".to_owned(),
-                    resource: Some("dekopon-agents/*".to_owned()),
-                }],
-            }],
-        }],
-        truncated: false,
-    };
-    assert!(inventory.is_valid());
-    let encoded =
-        serde_json::to_string(&RequestEnvelope::publish_agent_inventory(inventory.clone()))
-            .expect("inventory serializes");
-    for prohibited in [
-        "instructions",
-        "prompt",
-        "credential",
-        "principal",
-        "policy",
-    ] {
-        assert!(
-            !encoded.contains(prohibited),
-            "inventory leaked {prohibited}"
-        );
-    }
-
-    let mut duplicated = inventory.clone();
-    duplicated.agents.push(inventory.agents[0].clone());
-    assert!(!duplicated.is_valid());
-    let mut oversized = inventory;
-    oversized.agents[0].description = "x".repeat(MAX_REPORTED_TEXT_BYTES + 1);
-    assert!(!oversized.is_valid());
-
-    let usage = ModelUsageReport {
-        model_calls: 2,
-        input_tokens: 100,
-        input_unreported_calls: 1,
-        output_tokens: 12,
-        ..ModelUsageReport::default()
-    };
-    assert!(usage.is_valid());
-    assert!(matches!(
-        RequestEnvelope::publish_model_usage(usage).request,
-        BrokerRequest::PublishModelUsage { .. }
-    ));
-    assert!(!ModelUsageReport::default().is_valid());
-    assert!(
-        !ModelUsageReport {
-            model_calls: MAX_REPORTED_MODEL_CALLS + 1,
-            ..ModelUsageReport::default()
-        }
-        .is_valid()
-    );
-    assert!(
-        !ModelUsageReport {
-            model_calls: 1,
-            input_tokens: MAX_REPORTED_TOKENS + 1,
-            ..ModelUsageReport::default()
-        }
-        .is_valid()
-    );
-    assert!(
-        !ModelUsageReport {
-            model_calls: 1,
-            output_unreported_calls: 2,
-            ..ModelUsageReport::default()
-        }
-        .is_valid()
-    );
-}
-
 #[cfg(unix)]
 #[tokio::test]
 async fn unix_client_authenticates_private_socket_and_response_variant() {
@@ -627,130 +543,6 @@ async fn framing_failures_keep_the_executed_or_not_distinction() {
         .may_have_executed()
     );
     assert!(!ClientError::ConnectTimeout.may_have_executed());
-}
-
-/// A rejected inventory must name the agent and the bound, not just fail.
-#[test]
-fn inventory_and_usage_validation_name_the_offending_agent_and_bound() {
-    let inventory = AgentInventory {
-        agents: vec![ReportedAgent {
-            id: "reviewer".parse().expect("valid agent"),
-            description: "Reviews pull requests".to_owned(),
-            enabled: true,
-            model_class: None,
-            providers: vec!["gh".parse().expect("valid provider")],
-            capabilities: vec![ReportedAgentCapability {
-                id: "gh.pull-request.read".parse().expect("valid capability"),
-                provider: "gh".parse().expect("valid provider"),
-                permissions: Vec::new(),
-            }],
-        }],
-        truncated: false,
-    };
-    assert_eq!(inventory.validate(), Ok(()));
-
-    let mut oversized = inventory.clone();
-    oversized.agents[0].description = "x".repeat(MAX_REPORTED_TEXT_BYTES + 1);
-    let error = oversized
-        .validate()
-        .expect_err("an oversized description is rejected");
-    assert_eq!(
-        error,
-        InventoryError::TextTooLong {
-            agent: "reviewer".parse().expect("valid agent"),
-            field: "description",
-            bytes: MAX_REPORTED_TEXT_BYTES + 1,
-            maximum: MAX_REPORTED_TEXT_BYTES,
-        }
-    );
-    let rendered = error.to_string();
-    assert!(rendered.contains("reviewer"), "rendered {rendered}");
-    assert!(
-        rendered.contains(&MAX_REPORTED_TEXT_BYTES.to_string()),
-        "rendered {rendered}"
-    );
-    // The bound is named, the operator-authored text that broke it is not.
-    assert!(!rendered.contains("xxxx"), "rendered {rendered}");
-
-    let mut undeclared = inventory.clone();
-    undeclared.agents[0].capabilities[0].provider = "slack".parse().expect("valid provider");
-    assert_eq!(
-        undeclared
-            .validate()
-            .expect_err("a capability may not name an undeclared provider"),
-        InventoryError::UndeclaredProvider {
-            agent: "reviewer".parse().expect("valid agent"),
-            capability: "gh.pull-request.read".parse().expect("valid capability"),
-            provider: "slack".parse().expect("valid provider"),
-        }
-    );
-
-    let mut duplicated = inventory.clone();
-    duplicated.agents.push(inventory.agents[0].clone());
-    assert_eq!(
-        duplicated.validate().expect_err("duplicate agents fail"),
-        InventoryError::DuplicateAgent {
-            agent: "reviewer".parse().expect("valid agent"),
-        }
-    );
-
-    let mut providers = inventory;
-    providers.agents[0].providers = (0..=MAX_REPORTED_AGENT_PROVIDERS)
-        .map(|index| {
-            format!("gh{index}")
-                .parse()
-                .expect("generated provider identifier")
-        })
-        .collect();
-    assert_eq!(
-        providers
-            .validate()
-            .expect_err("a provider list past its bound fails"),
-        InventoryError::TooMany {
-            agent: "reviewer".parse().expect("valid agent"),
-            collection: "providers",
-            count: MAX_REPORTED_AGENT_PROVIDERS + 1,
-            maximum: MAX_REPORTED_AGENT_PROVIDERS,
-        }
-    );
-
-    assert_eq!(
-        ModelUsageReport::default()
-            .validate()
-            .expect_err("an empty delta fails"),
-        UsageReportError::ModelCalls {
-            count: 0,
-            maximum: MAX_REPORTED_MODEL_CALLS,
-        }
-    );
-    assert_eq!(
-        ModelUsageReport {
-            model_calls: 1,
-            output_unreported_calls: 2,
-            ..ModelUsageReport::default()
-        }
-        .validate()
-        .expect_err("more missing calls than calls fails"),
-        UsageReportError::UnreportedCalls {
-            field: "output",
-            count: 2,
-            calls: 1,
-        }
-    );
-    assert_eq!(
-        ModelUsageReport {
-            model_calls: 1,
-            input_tokens: MAX_REPORTED_TOKENS + 1,
-            ..ModelUsageReport::default()
-        }
-        .validate()
-        .expect_err("an oversized token count fails"),
-        UsageReportError::Tokens {
-            field: "input",
-            count: MAX_REPORTED_TOKENS + 1,
-            maximum: MAX_REPORTED_TOKENS,
-        }
-    );
 }
 
 /// One version identifier, three renderings, nothing keeping them equal but this.
@@ -1190,13 +982,6 @@ fn every_verb_is_one_operation_whatever_attestation_accompanies_it() {
             "recordDeliveredTurn",
             RequestEnvelope::record_delivered_turn(chat.bound_to(turn.id.clone()), turn),
         ),
-        (
-            "publishModelUsage",
-            RequestEnvelope::publish_model_usage(ModelUsageReport {
-                model_calls: 1,
-                ..ModelUsageReport::default()
-            }),
-        ),
     ] {
         let encoded = serde_json::to_value(&envelope).expect("envelope serializes");
         assert_eq!(
@@ -1227,7 +1012,7 @@ fn the_previous_protocol_version_and_its_retired_operation_tags_both_fail_to_dec
     assert!(
         serde_json::from_value::<ResponseEnvelope>(json!({
             "apiVersion": "dekopon.dev/broker/v1alpha1",
-            "response": {"type": "acknowledged"}
+            "response": {"type": "capabilities", "capabilities": [], "commandWords": []}
         }))
         .is_err()
     );
@@ -1635,4 +1420,12 @@ async fn shared_socket_requires_protected_matching_parent_and_preserves_server_p
             .is_empty()
     );
     server.await.unwrap();
+}
+
+#[test]
+fn retired_reporting_operations_are_refused() {
+    for operation in ["publishAgentInventory", "publishModelUsage"] {
+        let value = json!({"apiVersion": PROTOCOL_VERSION, "request": {"operation": operation}});
+        assert!(serde_json::from_value::<RequestEnvelope>(value).is_err());
+    }
 }

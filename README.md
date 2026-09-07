@@ -2,7 +2,7 @@
 
 Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.12.0** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, an unprivileged chat gateway, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
 
-> **Status:** this tree is a substantial, testable foundation, but it is not production-ready. `dekopond auth` manages isolated model-account login without starting the gateway. `dekopon-run` can call an operator-selected model, execute import-free read-only components, or submit identity-free proposals as an unprivileged broker client; it has no broker authority or provider credentials. The separate Unix-only `dekopon-brokerd` executable authenticates one owner-UID trust domain, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, resolves legacy destination-bound credentials or separately authorized public DRNs through an owner-only private map, invokes constrained providers, records durable audit, and can explicitly bind an unauthenticated GET-only operational web view. The Unix-only `dekopond` daemon connects to chat services and routes messages to catalog agents, holding chat and model credentials but no broker authority.
+> **Status:** this tree is a substantial, testable foundation, but it is not production-ready. `dekopond auth` manages isolated model-account login without starting the gateway. `dekopon-run` can call an operator-selected model, execute import-free read-only components, or submit identity-free proposals as an unprivileged broker client; it has no broker authority or provider credentials. The separate Unix-only `dekopon-brokerd` executable authenticates one owner-UID trust domain, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, resolves legacy destination-bound credentials or separately authorized public DRNs through an owner-only private map, invokes constrained providers, records durable audit. The Unix-only `dekopond` daemon connects to chat services and routes messages to catalog agents, holding chat and model credentials but no broker authority.
 
 ## Design documentation
 
@@ -122,13 +122,6 @@ New in 0.7.0 — credential-free self-inspection without moving authority:
 - **Effective grants, not configuration access.** The view is built from the fresh attested `capabilities(subject, agent)` response the gateway already needs. Denied or merely declared capabilities are absent, as are raw Cedar, policy identifiers and digests, principal/subject/channel/transport identity, execution constraints, endpoints, paths, legacy credential names, private secret-map inventory, and credential values. Exact standing instructions remain visible and may intentionally contain an inert public DRN.
 - **Bounded and non-authoritative.** Each result has a 128 KiB all-or-nothing ceiling and calls are repeatable under the prompt loop's shared per-turn tool and model-step bounds. Inspection spends no capability budget, makes no broker invocation, grants nothing, and creates no durable broker audit record.
 
-New in 0.6.0 — operational visibility without moving authority:
-
-- **An explicitly enabled web UI.** `dekopon-webui` is embedded in `dekopon-brokerd` behind `--http-bind`; without that flag there is no TCP listener. `/` redirects to `/ui`, and the unauthenticated surface accepts only GET and HEAD. The network around the selected bind address is the access boundary.
-- **Provider documentation from the loaded components.** The index and rustdoc-like detail pages show validated manifests, capability schemas and command words, plus the local artifact path, byte length, SHA-256 digest, and Wasmtime-visible component imports and exports.
-- **Process-local runtime visibility.** Host-observed compilation, store, instantiation, invocation, fuel, resource-limiter, and HTTP counters appear beside every configured host ceiling. Credential-free OTLP endpoint, transport, service, timeout, and payload settings are shown without header or resource-attribute values.
-- **Content-free gateway reporting.** `dekopond` best-effort reports a bounded normalized agent inventory and provider-reported model usage. Those summaries reset with the broker and never feed identity, Cedar policy, constraints, credentials, execution, evidence, replay, or durable audit.
-
 New in 0.5.0 — chat that can see what you sent it. One documented invariant was deliberately rewritten to get there, and it is the only thing in this release that moved:
 
 - **Files in chat.** A message carrying a screenshot used to be dropped before it was routed, because Slack stamps `subtype: file_share` on any upload. It routes now, and each attachment becomes a numbered chat asset named in the prompt — `Chat Asset #1 — screenshot.png (image/png, 214 KB)` — that a model opens with a `fetch_chat_asset` tool. Pull rather than push: bytes cost tokens on every turn they appear in, most turns do not need them, and one base64 screenshot is larger than a conversation's entire history budget. The audit log records `agent.asset.fetched`, so "did it actually look" is a question with an answer. Images and documents, over Slack and Telegram. See [`docs/dekopond.md`](docs/dekopond.md#chat-assets).
@@ -227,8 +220,6 @@ A multi-architecture container image publishes to `ghcr.io/dekopon-agents/dekopo
 
 ```console
 dekopon-brokerd --config /path/to/broker.yaml
-# Optional unauthenticated informational UI:
-dekopon-brokerd --config /path/to/broker.yaml --http-bind=0.0.0.0:8080
 ```
 
 See [`crates/dekopon-brokerd/README.md`](crates/dekopon-brokerd/README.md) before enabling this privileged process. `inspect`, `invoke`, and `shell` never connect to it, and `prompt` does not either unless `--broker` is passed; only explicit `dekopon-run broker ...` commands and `dekopon-run prompt --broker` do.

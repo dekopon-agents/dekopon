@@ -14,7 +14,7 @@ which is which.
 
 | Process | Reads the catalog? | What it does with it |
 |---|---|---|
-| `dekopond` | Yes, at startup | Binds each route to an agent, resolves that agent's model, hands its `instructions` to the model as a system prompt, mounts its `skills` on every session the route serves, and publishes a bounded content-free inventory to the broker's web UI. |
+| `dekopond` | Yes, at startup | Binds each route to an agent, resolves that agent's model, hands its `instructions` to the model as a system prompt, mounts its `skills` on every session the route serves. |
 | `dekopon-brokerd` | **No** | The broker does not link `dekopon-config` and never sees this file. It declares the `Dekopon::Agent` Cedar type and matches instances by name without enumerating them. |
 | `dekopon-run` | **No** | The runner loads Wasm components by path and has no catalog concept; it links `dekopon-config` only for `load_skill`, which its `--skill <DIRECTORY>` flag uses to mount a skill directory in the format below without a catalog. |
 
@@ -22,7 +22,7 @@ The consequence worth internalizing: **nothing an agent may actually do comes fr
 broker's `constraintSets` and Cedar policy decide that, and neither reads the catalog. An agent's
 `capabilities` list is a declaration of intent that grants nothing, and a name misspelled in a
 policy's `Dekopon::Agent::"…"` literal cannot be caught by validating this file — see
-[`broker-http.md`](broker-http.md#startup-validation).
+[`dekopon-brokerd` contract](../crates/dekopon-brokerd/README.md#catalog-ownership-at-policy-startup).
 
 ## The document envelope
 
@@ -90,12 +90,12 @@ status: Ready
 
 | Field | Type | Required | What consumes it |
 |---|---|---|---|
-| `description` | string | yes | Reported in the broker web UI inventory (bounded to 4 KiB). |
-| `enabled` | bool | no, defaults `true` | **Load-bearing in `dekopond`.** A route naming a disabled agent is a startup failure. Also reported as an enabled flag in the inventory; authored status does not override it. |
+| `description` | string | yes | Bound into the gateway route and returned by `inspect_agent_config`. |
+| `enabled` | bool | no, defaults `true` | **Load-bearing in `dekopond`.** A route naming a disabled agent is a startup failure. Authored status does not override it. |
 | `instructions` | string | no | **Load-bearing in `dekopond`.** Handed to the model verbatim as the session's system prompt. Absent means the agent runs with no standing orders. |
 | `skills` | list of directory paths | no | **Load-bearing in `dekopond`.** Each names a skill directory — relative paths resolve against the catalog file's own directory — that the loader reads whole at load time. `dekopond` mounts them on every session of a route bound to the agent. See [`skills` are directories the model reads on demand](#skills-are-directories-the-model-reads-on-demand). |
-| `capabilities` | list of capability IDs | no | Cross-checked at load: every entry must name a `Capability` in the same catalog or the file is rejected. Expanded into the web UI inventory as IDs, provider IDs and permissions. **Grants nothing.** |
-| `providers` | list of provider IDs | no | Cross-checked at load: every entry must name a `Provider`, and the list must match exactly the providers the agent's `capabilities` route to. Reported as provider IDs in the inventory. **Grants nothing.** |
+| `capabilities` | list of capability IDs | no | Cross-checked at load: every entry must name a `Capability` in the same catalog or the file is rejected. **Grants nothing.** |
+| `providers` | list of provider IDs | no | Cross-checked at load: every entry must name a `Provider`, and the list must match exactly the providers the agent's `capabilities` route to. **Grants nothing.** |
 | `modelClass` | string | no, but see below | **Load-bearing in `dekopond`.** Selects which configured model serves the agent. |
 | `policyProfile` | string | no | **Reserved.** Nothing reads it. See [Reserved and inert fields](#reserved-and-inert-fields). |
 | `status` | `Ready` \| `Pending` \| `Disabled` \| `Error` | no | Stored typed authored metadata, never observed or reported; omission stays `None`, with no presentation fallback. |
@@ -152,7 +152,7 @@ What consumes a loaded skill:
   `agent.skill.read`. See [`dekopond.md`](dekopond.md#sessions) and
   [`observability.md`](observability.md).
 - `inspect_agent_config` lists mounted skills by name, description, and resource paths — never the
-  text. Skills are not part of the web UI inventory.
+  text.
 - `dekopon-run --skill <DIRECTORY>` mounts the same format with no catalog; see
   [`run.md`](run.md#mounting-skills).
 
@@ -173,7 +173,7 @@ It is optional for an unrouted agent or a route with an explicit model. Gateway
 `RoutingTable::bind` requires it only when the route does not name a model:
 
 - a route that names `model:` explicitly overrides the class, and then `modelClass` selects nothing
-  (it is still reported to the web UI and to `inspect_agent_config`);
+  (it is still returned by `inspect_agent_config`);
 - a route with no `model:` and an agent with no `modelClass` is a **`dekopond` startup failure**;
 - a route with no `model:`, an agent with a `modelClass`, and no configured model offering that
   class is also a startup failure.
@@ -202,12 +202,12 @@ status: Unknown
 
 | Field | Type | Required | What consumes it |
 |---|---|---|---|
-| `description` | string | yes | Stored typed metadata; not included in the gateway inventory (which carries capability IDs, provider IDs and permissions). |
+| `description` | string | yes | Stored typed catalog metadata; not an authorization input. |
 | `provider` | provider ID | yes | Cross-checked at load: must name a `Provider` in the same catalog. |
-| `effect` | `read-only` \| `local-write` \| `external-write` | yes | Stored typed catalog metadata; not used for gateway authorization or reported in its inventory. |
-| `risk` | `Low` \| `Medium` \| `High` \| `Critical` | yes | Stored typed catalog metadata; not reported in the gateway inventory. |
-| `idempotency` | `idempotent` \| `conditional` \| `non-idempotent` | yes | Stored typed catalog metadata; not reported in the gateway inventory. |
-| `permissions` | list of `{ operation, resource? }` | no | Expanded in the gateway inventory for web UI display; no authority is granted. |
+| `effect` | `read-only` \| `local-write` \| `external-write` | yes | Stored typed catalog metadata; not used for gateway authorization. |
+| `risk` | `Low` \| `Medium` \| `High` \| `Critical` | yes | Stored typed catalog metadata. |
+| `idempotency` | `idempotent` \| `conditional` \| `non-idempotent` | yes | Stored typed catalog metadata. |
+| `permissions` | list of `{ operation, resource? }` | no | Stored typed catalog metadata; no authority is granted. |
 | `status` | `Available` \| `Unavailable` \| `Unknown` | no | Stored typed authored metadata, never observed or reported; omission stays `None`, with no presentation fallback. |
 
 **The broker does not read any of this.** The trusted `effect`, `risk`, and `idempotency` a policy
@@ -233,8 +233,8 @@ status: Unknown
 
 | Field | Type | Required | What consumes it |
 |---|---|---|---|
-| `description` | string | yes | Stored typed catalog metadata; not reported in the gateway inventory. |
-| `type` | string | yes | Free-form implementation family, such as `github`. Stored typed metadata; matched against nothing and not reported in the gateway inventory. |
+| `description` | string | yes | Stored typed catalog metadata. |
+| `type` | string | yes | Free-form implementation family, such as `github`. Stored typed metadata; matched against nothing. |
 | `credentialRef` | string | yes | **Reserved.** Nothing resolves it. See below. |
 | `status` | `Ready` \| `Unavailable` \| `Unknown` | no | Stored typed authored metadata, never observed or reported; omission stays `None`, with no presentation fallback. |
 
@@ -269,12 +269,6 @@ value is inert. `policyProfile`, `status`, and `labels` are optional and may sim
   checks agent capabilities/providers and capability provider references; it grants no authority.
 - [`dekopond/src/routes.rs`](../crates/dekopond/src/routes.rs), `RoutingTable::bind`:
   checks enabled, resolves explicit model or modelClass, and binds instructions and loaded skills.
-- [`dekopond/src/lib.rs`](../crates/dekopond/src/lib.rs), `agent_inventory`:
-  reports agent description, enabled, modelClass, provider IDs, capability IDs and permissions.
-  It does not report catalog capability descriptions/effect/risk/idempotency, provider
-  description/type/credentialRef, labels, policyProfile or authored statuses.
-  [`dekopon-webui/src`](../crates/dekopon-webui/src/) renders that informational inventory;
-  its loaded-provider views instead consume broker component metadata, not catalog providers.
 - [`dekopon-config/src/skill.rs`](../crates/dekopon-config/src/skill.rs), `Skill` and `load_skill`:
   retain license, compatibility, scalar metadata and allowed-tools with typed accessors.
   [`dekopon-agent/src/skills.rs`](../crates/dekopon-agent/src/skills.rs), `prompt_block` and
@@ -317,7 +311,7 @@ loadable or wholly refused — there is no partial mode where some resources are
   that makes `instructions`, `skills`, `enabled`, and `modelClass` load-bearing.
 - [`run.md`](run.md#mounting-skills) — the runner's `--skill` flag, which mounts the same skill
   format with no catalog in the loop.
-- [`broker-http.md`](broker-http.md) — `constraintSets`, Cedar policy, and why the broker's own
+- [`dekopon-brokerd` contract](../crates/dekopon-brokerd/README.md#boundaries) — `constraintSets`, Cedar policy, and why the broker's own
   configuration is what decides authority.
 - [`crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.md) — the broker
   configuration this catalog is deliberately separate from.

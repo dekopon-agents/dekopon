@@ -205,6 +205,9 @@ Startup guards. Every one of these is a configuration mistake whose only other s
 that starts and then refuses to serve, which is much harder to read than a template error.
 */}}
 {{- define "dekopon.validate" -}}
+{{- if hasKey .Values.broker "httpBind" -}}
+{{- fail "broker.httpBind is not supported" -}}
+{{- end -}}
 {{- $uid := .Values.podSecurityContext.runAsUser | int -}}
 {{- if and (ne $uid 65532) (eq .Values.image.repository "ghcr.io/dekopon-agents/dekopon") -}}
 {{- fail (printf "podSecurityContext.runAsUser is %d, but %s bakes /opt/dekopon/providers/*.wasm owned by 65532 and dekopon-brokerd loads a provider only when its owner equals the broker's own euid. Every provider would fail to load. Use 65532 for the broker; the gateway has a separate container identity." $uid .Values.image.repository) -}}
@@ -468,10 +471,7 @@ Arguments: dict "ctx" $ "sidecar" bool
   imagePullPolicy: {{ $.Values.image.pullPolicy }}
   # No ENTRYPOINT in the image: the command selects which of the four binaries runs.
   command: ["dekopon-brokerd"]
-  # broker.httpBind is empty by default, so the unauthenticated read-only web UI stays absent:
-  # without the flag dekopon-brokerd opens no TCP listener. The chart adds no Service or Ingress
-  # for it either; see values.yaml and docs/security-model.md.
-  args: ["--config", "{{ $.Values.paths.configDir }}/broker.yaml"{{ with $.Values.broker.httpBind }}, "--http-bind", "{{ . }}"{{ end }}]
+  args: ["--config", "{{ $.Values.paths.configDir }}/broker.yaml"]
   securityContext:
     {{- toYaml (mergeOverwrite (deepCopy $.Values.securityContext) (dict "runAsUser" ($.Values.podSecurityContext.runAsUser | int) "runAsGroup" ($.Values.podSecurityContext.runAsGroup | int))) | nindent 4 }}
   env:

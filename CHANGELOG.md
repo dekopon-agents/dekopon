@@ -17,6 +17,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Removed
 
+- Retire the broker web UI, its listener configuration, and gateway inventory/token reporting; daemon traces, model accounting, and provider execution remain.
+
 - Retired the standalone catalog CLI and package; model-account login, status, logout, and guarded credential export now live in `dekopond auth chatgpt`, without gateway configuration or startup.
 
 - Remove the broker audit checkpoint sidecar and its required configuration keys. The broker opens the verified audit directly; service run functions return unit on clean shutdown.

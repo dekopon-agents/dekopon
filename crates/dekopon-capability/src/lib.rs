@@ -857,7 +857,7 @@ mod tests {
         )
     }
 
-    /// `Display` feeds the web UI and operator errors; serde feeds manifests and constraint-set
+    /// `Display` feeds operator errors; serde feeds manifests and constraint-set
     /// decoding. Both spellings are hand-written once each, so nothing but this test stops a new
     /// variant from rendering one string to an operator and a different one to the audit record.
     #[test]

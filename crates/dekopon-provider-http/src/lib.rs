@@ -161,8 +161,8 @@ pub enum HttpErrorCode {
 impl HttpErrorCode {
     /// Returns the WIT enum name for this class.
     ///
-    /// These are the stable machine-readable identifiers of the `dekopon:http@1.0.0` contract and
-    /// the spelling `docs/broker-http.md` uses. The Rust variant name is not part of any contract,
+    /// These are the stable machine-readable identifiers of the `dekopon:http@1.0.0` contract,
+    /// defined by its `error-code` enum. The Rust variant name is not part of that contract,
     /// so anything a provider stringifies must use this instead.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -363,7 +363,7 @@ mod tests {
     ///
     /// A provider that stringifies an error emits an identifier that flows into `ProviderError`
     /// messages, `InvocationResult`, and payload-carrying telemetry. Rendering the Rust variant
-    /// spelling there would match neither `dekopon:http@1.0.0` nor `docs/broker-http.md`.
+    /// spelling there would not match the contract's `error-code` enum.
     #[test]
     fn error_codes_render_the_wit_names() {
         let block = HTTP_WIT

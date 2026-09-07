@@ -41,11 +41,7 @@ use std::{
     time::Duration,
 };
 
-use dekopon_broker_protocol::{
-    AgentInventory, BrokerClient, MAX_REPORTED_AGENT_CAPABILITIES, MAX_REPORTED_AGENT_PROVIDERS,
-    MAX_REPORTED_AGENTS, MAX_REPORTED_PERMISSIONS, MAX_REPORTED_TEXT_BYTES, ModelUsageReport,
-    ReportedAgent, ReportedAgentCapability,
-};
+use dekopon_broker_protocol::BrokerClient;
 use dekopon_config::LocalCatalog;
 use dekopon_model::image::ImageGenerator;
 use thiserror::Error;
@@ -85,8 +81,6 @@ use crate::{
 /// growing a queue the daemon can never work through. Admission control refuses the overflow with
 /// a sentence, which is a better answer than an unbounded backlog.
 const INBOUND_BUFFER: usize = 64;
-/// Informational model-usage deltas waiting to be coalesced for the broker-hosted web UI.
-const USAGE_REPORT_BUFFER: usize = 64;
 /// How often a transport that ended for good is announced again while the daemon keeps serving.
 ///
 /// A transport whose reader stops is gone until the process restarts, and the deployment has no
@@ -94,11 +88,6 @@ const USAGE_REPORT_BUFFER: usize = 64;
 /// later. Re-stating it on an interval is what lets an alert fire on the condition rather than on
 /// catching the edge.
 const TRANSPORT_HEALTH_INTERVAL: Duration = Duration::from_secs(60);
-/// Informational reporting must not delay gateway startup, an answer, or shutdown.
-const STATUS_REPORT_TIMEOUT: Duration = Duration::from_secs(2);
-/// Re-publishes static inventory so a restarted broker recovers its in-memory view.
-const STATUS_INVENTORY_INTERVAL: Duration = Duration::from_secs(60);
-
 /// Independent fallback timeout for attachment inventories after their last message.
 ///
 /// Persistent access dies earlier whenever its conversation generation does. This remains longer
@@ -150,8 +139,6 @@ where
         image_generator,
         transports: built_transports,
     } = prepare(&config, &routes)?;
-    let inventory = agent_inventory(&catalog);
-    let heartbeat_inventory = inventory.clone();
 
     // One probe before anything connects, so "the broker is not running" is a startup failure with
     // a clear message rather than every session failing identically an hour later.
@@ -169,20 +156,6 @@ where
         event = "gateway_broker_ready",
         capability.count = capabilities.len()
     );
-    match report_failure(
-        timeout(
-            STATUS_REPORT_TIMEOUT,
-            broker_client.publish_agent_inventory(inventory),
-        )
-        .await,
-    ) {
-        None => tracing::info!(event = "gateway_agent_inventory_reported"),
-        Some(category) => tracing::warn!(
-            event = "gateway_agent_inventory_report_failed",
-            category = category
-        ),
-    }
-
     let mut transports = Vec::with_capacity(config.transports.len());
     let mut identities = BTreeMap::new();
     let mut repliers: BTreeMap<String, Arc<dyn ChatReplier>> = BTreeMap::new();
@@ -228,12 +201,6 @@ where
         });
     }
 
-    let (usage_sender, usage_receiver) = mpsc::channel(USAGE_REPORT_BUFFER);
-    let mut usage_reporter = tokio::spawn(report_status(
-        config.broker.clone(),
-        heartbeat_inventory,
-        usage_receiver,
-    ));
     let runner = Arc::new(SessionRunner {
         broker: config.broker.clone(),
         models: Arc::new(ModelCache::new(Arc::new(ConfiguredModels))),
@@ -251,7 +218,6 @@ where
         activities,
         thread_ownership,
         active_sessions: session::ActiveSessions::default(),
-        usage_reports: Some(usage_sender),
     });
 
     let (sender, receiver) = mpsc::channel::<TransportEvent>(INBOUND_BUFFER);
@@ -294,20 +260,6 @@ where
                   this shutdown requested rather than an outcome anything can act on"
     )]
     let _ = health_reporter.await;
-    if timeout(STATUS_REPORT_TIMEOUT, &mut usage_reporter)
-        .await
-        .is_err()
-    {
-        usage_reporter.abort();
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "reaping a handle this line just aborted, which yields JoinError::Cancelled; \
-                      a reporter that had failed on its own would have completed the timeout above"
-        )]
-        let _ = usage_reporter.await;
-        tracing::warn!(event = "gateway_usage_reporter_abandoned");
-    }
-
     match outcome {
         ServeOutcome::Shutdown => {
             tracing::info!(event = "gateway_stopped", reason = "shutdown");
@@ -321,266 +273,6 @@ where
             Err(DekopondError::TransportsLost)
         }
     }
-}
-
-fn agent_inventory(catalog: &LocalCatalog) -> AgentInventory {
-    let mut truncated = catalog.agents().len() > MAX_REPORTED_AGENTS;
-    let agents = catalog
-        .agents()
-        .take(MAX_REPORTED_AGENTS)
-        .map(|agent| {
-            let mut providers = BTreeSet::new();
-            let mut capabilities = Vec::new();
-            if agent.spec.capabilities.len() > MAX_REPORTED_AGENT_CAPABILITIES {
-                truncated = true;
-            }
-            for capability_id in agent
-                .spec
-                .capabilities
-                .iter()
-                .take(MAX_REPORTED_AGENT_CAPABILITIES)
-            {
-                let Some(capability) = catalog.capability(capability_id) else {
-                    // Catalog validation already proved this reference. Keeping this defensive
-                    // branch makes reporting incapable of turning a future loader regression into
-                    // gateway authority or a panic.
-                    truncated = true;
-                    continue;
-                };
-                if !providers.contains(&capability.spec.provider)
-                    && providers.len() == MAX_REPORTED_AGENT_PROVIDERS
-                {
-                    truncated = true;
-                    continue;
-                }
-                providers.insert(capability.spec.provider.clone());
-                if capability.spec.permissions.len() > MAX_REPORTED_PERMISSIONS {
-                    truncated = true;
-                }
-                capabilities.push(ReportedAgentCapability {
-                    id: capability_id.clone(),
-                    provider: capability.spec.provider.clone(),
-                    permissions: capability
-                        .spec
-                        .permissions
-                        .iter()
-                        .take(MAX_REPORTED_PERMISSIONS)
-                        .cloned()
-                        .map(|mut permission| {
-                            permission.operation =
-                                bounded_report_text(&permission.operation, &mut truncated);
-                            permission.resource = permission
-                                .resource
-                                .as_deref()
-                                .map(|resource| bounded_report_text(resource, &mut truncated));
-                            permission
-                        })
-                        .collect(),
-                });
-            }
-            for provider in &agent.spec.providers {
-                if !providers.contains(provider) && providers.len() == MAX_REPORTED_AGENT_PROVIDERS
-                {
-                    truncated = true;
-                    continue;
-                }
-                providers.insert(provider.clone());
-            }
-            ReportedAgent {
-                id: agent
-                    .metadata
-                    .name
-                    .parse()
-                    .expect("catalog validation produces valid agent identifiers"),
-                description: bounded_report_text(&agent.spec.description, &mut truncated),
-                enabled: agent.spec.enabled,
-                model_class: agent
-                    .spec
-                    .model_class
-                    .as_deref()
-                    .map(|class| bounded_report_text(class, &mut truncated)),
-                providers: providers.into_iter().collect(),
-                capabilities,
-            }
-        })
-        .collect();
-    AgentInventory { agents, truncated }
-}
-
-fn bounded_report_text(value: &str, truncated: &mut bool) -> String {
-    if value.len() <= MAX_REPORTED_TEXT_BYTES {
-        return value.to_owned();
-    }
-    *truncated = true;
-    let mut end = MAX_REPORTED_TEXT_BYTES;
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value[..end].to_owned()
-}
-
-async fn report_status(
-    broker: config::ResolvedBroker,
-    inventory: AgentInventory,
-    mut reports: mpsc::Receiver<ModelUsageReport>,
-) {
-    let mut heartbeat = tokio::time::interval(STATUS_INVENTORY_INTERVAL);
-    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // `interval` fires immediately once. The synchronous startup report already did that job.
-    heartbeat.tick().await;
-    loop {
-        tokio::select! {
-            report = reports.recv() => {
-                let Some(mut report) = report else { break };
-                while let Ok(next) = reports.try_recv() {
-                    merge_usage(&mut report, next);
-                }
-                bound_usage_report(&mut report);
-                let client = match BrokerClient::new(
-                    &broker.socket_path,
-                    broker.server_uid,
-                    broker.frame,
-                ) {
-                    Ok(client) => client,
-                    Err(error) => {
-                        tracing::warn!(
-                            event = "gateway_usage_report_failed",
-                            category = client_error_category(&error)
-                        );
-                        continue;
-                    }
-                };
-                if let Some(category) = report_failure(
-                    timeout(STATUS_REPORT_TIMEOUT, client.publish_model_usage(report)).await,
-                ) {
-                    tracing::warn!(event = "gateway_usage_report_failed", category = category);
-                }
-            }
-            _ = heartbeat.tick() => {
-                let client = match BrokerClient::new(
-                    &broker.socket_path,
-                    broker.server_uid,
-                    broker.frame,
-                ) {
-                    Ok(client) => client,
-                    Err(error) => {
-                        tracing::warn!(
-                            event = "gateway_agent_inventory_report_failed",
-                            category = client_error_category(&error)
-                        );
-                        continue;
-                    }
-                };
-                match report_failure(
-                    timeout(
-                        STATUS_REPORT_TIMEOUT,
-                        client.publish_agent_inventory(inventory.clone()),
-                    ).await,
-                ) {
-                    None => tracing::debug!(event = "gateway_agent_inventory_refreshed"),
-                    Some(category) => tracing::warn!(
-                        event = "gateway_agent_inventory_report_failed",
-                        category = category
-                    ),
-                }
-            }
-        }
-    }
-}
-
-/// Why one bounded report attempt did not land, or [`None`] when it did.
-///
-/// Reporting is informational and never retried, so the log line is the whole record of it. Without
-/// a category, "the web UI shows stale inventory" cannot be told apart from "the broker socket is
-/// gone", which is the triage the report exists for.
-fn report_failure(
-    result: Result<Result<(), dekopon_broker_protocol::ClientError>, tokio::time::error::Elapsed>,
-) -> Option<&'static str> {
-    match result {
-        Ok(Ok(())) => None,
-        Ok(Err(error)) => Some(client_error_category(&error)),
-        // Distinct from every client failure: the broker was reachable and simply did not answer
-        // inside [`STATUS_REPORT_TIMEOUT`], which is a busy broker rather than a missing one.
-        Err(_) => Some("timeout"),
-    }
-}
-
-/// Stable low-cardinality category for a broker client failure, never its message.
-///
-/// [`dekopon_broker_protocol::ClientError`] carries socket paths and bounded remote text, and
-/// `docs/observability.md` keeps both out of exported telemetry. Matched exhaustively so a new
-/// variant has to be given a name here rather than silently arriving as "other".
-fn client_error_category(error: &dekopon_broker_protocol::ClientError) -> &'static str {
-    use dekopon_broker_protocol::ClientError;
-    match error {
-        ClientError::SocketMetadata { .. } => "socket-metadata",
-        ClientError::UnsafeSocket => "unsafe-socket",
-        ClientError::ConnectTimeout => "connect-timeout",
-        ClientError::Connect { .. } => "connect",
-        ClientError::PeerCredentials { .. } => "peer-credentials",
-        ClientError::ServerIdentity { .. } => "server-identity",
-        ClientError::Limits(_) => "limits",
-        // Flat rather than split by `ExchangePhase`: that distinction exists to decide whether work
-        // may be resubmitted, and these two reports are never retried.
-        ClientError::Protocol { .. } => "protocol",
-        ClientError::Remote { .. } => "remote",
-        ClientError::UnexpectedResponse => "unexpected-response",
-    }
-}
-
-fn bound_usage_report(report: &mut ModelUsageReport) {
-    report.model_calls = report
-        .model_calls
-        .min(dekopon_broker_protocol::MAX_REPORTED_MODEL_CALLS);
-    report.input_unreported_calls = report.input_unreported_calls.min(report.model_calls);
-    report.cached_input_unreported_calls =
-        report.cached_input_unreported_calls.min(report.model_calls);
-    report.output_unreported_calls = report.output_unreported_calls.min(report.model_calls);
-    report.reasoning_unreported_calls = report.reasoning_unreported_calls.min(report.model_calls);
-    report.total_unreported_calls = report.total_unreported_calls.min(report.model_calls);
-    report.input_tokens = report
-        .input_tokens
-        .min(dekopon_broker_protocol::MAX_REPORTED_TOKENS);
-    report.cached_input_tokens = report
-        .cached_input_tokens
-        .min(dekopon_broker_protocol::MAX_REPORTED_TOKENS);
-    report.output_tokens = report
-        .output_tokens
-        .min(dekopon_broker_protocol::MAX_REPORTED_TOKENS);
-    report.reasoning_output_tokens = report
-        .reasoning_output_tokens
-        .min(dekopon_broker_protocol::MAX_REPORTED_TOKENS);
-    report.total_tokens = report
-        .total_tokens
-        .min(dekopon_broker_protocol::MAX_REPORTED_TOKENS);
-}
-
-fn merge_usage(total: &mut ModelUsageReport, next: ModelUsageReport) {
-    total.model_calls = total.model_calls.saturating_add(next.model_calls);
-    total.input_tokens = total.input_tokens.saturating_add(next.input_tokens);
-    total.input_unreported_calls = total
-        .input_unreported_calls
-        .saturating_add(next.input_unreported_calls);
-    total.cached_input_tokens = total
-        .cached_input_tokens
-        .saturating_add(next.cached_input_tokens);
-    total.cached_input_unreported_calls = total
-        .cached_input_unreported_calls
-        .saturating_add(next.cached_input_unreported_calls);
-    total.output_tokens = total.output_tokens.saturating_add(next.output_tokens);
-    total.output_unreported_calls = total
-        .output_unreported_calls
-        .saturating_add(next.output_unreported_calls);
-    total.reasoning_output_tokens = total
-        .reasoning_output_tokens
-        .saturating_add(next.reasoning_output_tokens);
-    total.reasoning_unreported_calls = total
-        .reasoning_unreported_calls
-        .saturating_add(next.reasoning_unreported_calls);
-    total.total_tokens = total.total_tokens.saturating_add(next.total_tokens);
-    total.total_unreported_calls = total
-        .total_unreported_calls
-        .saturating_add(next.total_unreported_calls);
 }
 
 /// Why the routing loop stopped.

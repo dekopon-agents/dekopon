@@ -187,8 +187,8 @@ pub struct AgentSpec {
     ///
     /// Catalog validation holds this to exactly that: every provider the agent's declared
     /// capabilities route to must appear here, and a provider listed here must be reachable
-    /// through one of them. The list still grants nothing; it is the inventory operator tools
-    /// render, and drift from the capabilities is refused rather than displayed.
+    /// through one of them. The list grants nothing; catalog validation refuses drift
+    /// from the declared capabilities.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ProviderId>,
     /// Model class `dekopond` resolves against its configured models.

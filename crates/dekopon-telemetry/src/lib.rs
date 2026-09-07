@@ -132,7 +132,7 @@ impl ExporterSettings {
             )));
         }
         // Ingest credentials belong in OTEL_EXPORTER_OTLP_HEADERS. Userinfo would put one in a
-        // parsed configuration value, exporter diagnostics, and the informational web UI.
+        // parsed configuration value or exporter diagnostics.
         let endpoint_authority = endpoint
             .split_once("://")
             .map_or(endpoint, |(_, rest)| rest)

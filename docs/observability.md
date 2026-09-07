@@ -54,7 +54,7 @@ consume a rate limit:
 All duplicate fields that also appear on a span, and that is deliberate — the span answers "why
 was this request slow", the accounting record answers "how many did we make last month". Image
 accounting never carries the model-authored generation prompt or PNG bytes; the success byte count
-is metadata and provider token usage is not currently normalized into the live token view. None is
+is metadata. None is
 a substitute for broker audit, which remains the only record of what was authorized.
 
 Token usage is the cost half of that accounting. Whatever the provider reports lands as
@@ -75,10 +75,6 @@ The byte counts are `dekopon.http.request.accounted_bytes` and
 the host accounts is a conservative envelope estimate covering encoding overhead, method, URL, and
 headers as well as the body, so publishing it under the payload-size name would misreport transfer
 volume by the size of the headers.
-
-### The broker-hosted live token view
-
-The optional `dekopon-brokerd --http-bind <ADDRESS>` web UI mirrors provider-reported model usage into process-local counters. `dekopond` observes every successfully decoded model response — including one followed by a later tool/session failure and one whose provider omitted usage — coalesces bounded deltas, and reports them over the authenticated Unix protocol. Input, cached input, output, reasoning output, and total counts keep separate “unreported call” totals, so an omitted value never becomes zero. Reporting is best effort and cannot delay or fail an answer; a dropped report remains present in normal `accounting.model.turn` telemetry when that exporter received it. The UI therefore answers “what this broker process has heard since startup,” not billing reconciliation. It resets on broker restart, is self-reported by the gateway, and never replaces OTLP accounting or durable authorization audit.
 
 ## Refusals, errors, and outcomes
 
@@ -211,10 +207,9 @@ With `transport: grpc` the endpoint is an authority that names no organization, 
 must carry `organization=<org>` — the receiver otherwise rejects every export, and says so through
 the SDK's own diagnostics on stdout.
 
-The web UI renders the endpoint, transport, service name, timeout, and payload setting from this section. It reports only whether standard OTLP header/resource-attribute variables are present; their values are never retained or rendered.
 
 Telemetry never blocks startup. An exporter that cannot be built disables export and logs why;
-authorization and durable audit are the service's contract, and a missing dashboard must not cost a
+authorization and durable audit are the service's contract, and a missing exporter must not cost a
 working authority boundary. Flush failures at shutdown are logged and do not change the exit code,
 because the audit chain rather than telemetry is the record of what happened.
 
@@ -284,11 +279,7 @@ emits `gateway_activity_degraded` with `transport=slack` and `surface` (`agent-s
 `reaction`). `gateway_session_stop_requested` carries only the transport. None records channel,
 thread, message, subject, status text, emoji, raw service response, or credential.
 
-The informational broker reports behind the web UI are never retried, so their warning is the whole
-record of a failure. `gateway_agent_inventory_report_failed` and `gateway_usage_report_failed` carry
-a stable `category` — `unsafe-socket`, `connect`, `protocol`, `remote`, and the rest of the broker
-client's failure surface, with `timeout` reserved for a broker that did not answer inside the
-two-second report deadline. Stale inventory in the web UI is then a log query rather than a guess.
+
 
 ### The WhatsApp webhook is the one signal a stranger can drive
 
@@ -454,7 +445,6 @@ only place the cause exists. These events carry it:
 | `broker_connection_failed` / `broker_outcome_unaudited` | warn / error | `dekopon-brokerd` | `category`, the failure's source chain, and — for an unaudited outcome — `invocation.id` |
 | `broker_capacity_exhausted` | error | `dekopon-brokerd` | `category`, and the chain naming which bound was reached |
 | `broker_accept_retried` | warn | `dekopon-brokerd` | `error.kind` (`process-descriptor-limit`, `system-descriptor-limit`, `kernel-memory`, `connection-aborted`, `connection-reset`, `interrupted`), `backoff_ms`, and the errno's chain |
-| `webui_accept_failed` | debug for `error.kind=connection`, warn otherwise | `dekopon-webui` | `error.kind` (the same names as `broker_accept_retried`, plus `connection` and `unrecoverable`), `backoff_ms`, and the errno's chain |
 | `broker_socket_cleanup_failed` | warn | `dekopon-brokerd` | the socket error's chain |
 
 `broker_capabilities_refused` exists because an attested `capabilities` and an attested
@@ -478,12 +468,6 @@ filesystem shared with anything else — lives one or two levels down, and these
 whole chain as one `a: b: c` line. Frame contents never join it: a decode failure names its kind, not
 the bytes that failed to decode.
 
-`broker_accept_retried` and `webui_accept_failed` classify with one shared table,
-`dekopon_core::retryable_accept_error`, so the two listeners in the broker process cannot disagree
-about which failures a socket recovers from. The web UI's loop cannot abort — `axum`'s `Listener`
-trait has no error path — so `error.kind=unrecoverable` is what `EBADF` looks like there: named on
-every attempt at the 1 s ceiling rather than retried in silence, which is what it used to be.
-
 `broker_capacity_exhausted` and `broker_accept_retried` are the two events that report a condition
 outside any one request. The first says a bounded broker resource — the replay ledger or the audit
 log — is full; every caller now receives `capacity-exhausted`, no retry can clear it, and a restart
@@ -502,9 +486,9 @@ more significant failed.
 Storage-backed invocations deliberately do not follow the ordinary provider span shape. The
 `broker.execute` and `provider.invoke` storage spans omit provider, capability, agent, subject,
 transport scope, logical names, offsets, search terms, and exact bytes even when payload telemetry
-is enabled. Provider input/output byte totals receive zero for storage calls. The live UI may show
-only storage invocation/operation/sync/quota counts and the largest powers-of-two read/write bucket,
-plus public ceilings; it never receives root/key paths or opaque tokens.
+is enabled. Provider input/output byte totals receive zero for storage calls. Storage metrics retain
+only invocation/operation/sync/quota counts and the largest powers-of-two read/write bucket;
+these metrics and public ceilings never contain root/key paths or opaque tokens.
 
 Storage audit decisions and outcomes omit principal, actor/agent, via/subject, provider, broker
 principal/policy revision, policy IDs/digest, and credential. A separate keyed audit-scope

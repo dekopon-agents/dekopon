@@ -121,7 +121,7 @@ under the same hard 1 MiB read ceiling as other trusted inputs. `mapRevision` is
 authority metadata: bump it whenever a physical source, selector, projection, or binding meaning
 changes. Effective secret bindings plus that revision enter authority-bound durable-memory
 continuity, while values never do. Physical locators and bootstrap paths are sensitive deployment
-inventory and never appear in prompts, audit, evidence, provider metadata, or the web UI.
+inventory and never appear in prompts, audit, evidence, or provider metadata.
 Bootstrap credentials are never DRN-addressable, preventing resolver cycles and use of a source-store token as application material. The map file itself is likewise prohibited as a `secureFile` source. In the Helm chart,
 `broker.secretBootstrapFiles` copies operator-managed Secret keys into broker-only `0600` files;
 `broker.secretSourceVolumes` mounts AtomicWriter sources read-only into the broker only. Expiring AWS

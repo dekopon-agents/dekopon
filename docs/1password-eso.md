@@ -322,5 +322,5 @@ The lifecycle it needs instead is seed-once: export a working local credential, 
 - [`security-model.md`](security-model.md) — the trust boundaries the file hygiene above enforces, and the current distinct-UID deployment boundary.
 - [`../crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.md) — the configuration, credentials, and policy file contracts in full, including the credentials file this guide's Secret would eventually become.
 - [`dekopond.md`](dekopond.md) — the gateway's configuration, which names environment variables rather than secrets and so consumes an ESO-provisioned Secret differently from the broker.
-- [`broker-http.md`](broker-http.md) — how a resolved credential is bound to a destination and injected, once it exists as a file.
+- [`dekopon-brokerd` contract](../crates/dekopon-brokerd/README.md#boundaries) — how a resolved credential is bound to a destination and injected, once it exists as a file.
 - [`observability.md`](observability.md) — the other half of this cluster's deployment story, including the OpenObserve endpoint the same host serves.

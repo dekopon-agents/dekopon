@@ -1,5 +1,5 @@
 #[cfg(unix)]
-use std::{io, net::SocketAddr, path::PathBuf, process::ExitCode};
+use std::{io, path::PathBuf, process::ExitCode};
 
 #[cfg(unix)]
 use clap::{Args, CommandFactory as _, Parser, Subcommand, ValueEnum, error::ErrorKind};
@@ -25,9 +25,6 @@ struct Cli {
     /// Strict owner-controlled broker YAML/JSON configuration.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
-    /// Bind the unauthenticated, read-only operational web UI.
-    #[arg(long, value_name = "ADDRESS")]
-    http_bind: Option<SocketAddr>,
     /// Maintenance or health-check mode. Omit to serve the broker.
     #[command(subcommand)]
     command: Option<Command>,
@@ -215,20 +212,16 @@ async fn main() -> ExitCode {
 
 #[cfg(unix)]
 fn validate_cli(cli: &Cli) -> Result<(), clap::Error> {
-    match (&cli.command, &cli.config, &cli.http_bind) {
-        (None, None, _) => Err(Cli::command().error(
+    match (&cli.command, &cli.config) {
+        (None, None) => Err(Cli::command().error(
             ErrorKind::MissingRequiredArgument,
             "--config <PATH> is required when serving the broker",
         )),
-        (Some(_), Some(_), _) => Err(Cli::command().error(
+        (Some(_), Some(_)) => Err(Cli::command().error(
             ErrorKind::ArgumentConflict,
             "--config cannot be used with an offline operator command",
         )),
-        (Some(_), _, Some(_)) => Err(Cli::command().error(
-            ErrorKind::ArgumentConflict,
-            "--http-bind cannot be used with an offline operator command",
-        )),
-        (Some(Command::Provider(provider)), _, _)
+        (Some(Command::Provider(provider)), _)
             if provider.lock_file.is_none()
                 || provider.store.is_none()
                 || (matches!(provider.command, ProviderCommand::Sync { .. })
@@ -239,7 +232,7 @@ fn validate_cli(cli: &Cli) -> Result<(), clap::Error> {
                 "provider mode requires --lock-file and --store; sync also requires --provider-set",
             ))
         }
-        (Some(Command::Audit(audit)), _, _) if audit.audit_path.is_none() => Err(Cli::command()
+        (Some(Command::Audit(audit)), _) if audit.audit_path.is_none() => Err(Cli::command()
             .error(
                 ErrorKind::MissingRequiredArgument,
                 "audit mode requires --audit-path",
@@ -258,7 +251,6 @@ async fn execute(cli: Cli) -> Result<(), AppError> {
             execute_server(
                 cli.config
                     .expect("validate_cli requires daemon configuration"),
-                cli.http_bind,
             )
             .await
         }
@@ -282,7 +274,7 @@ async fn probe(socket: &std::path::Path) -> Result<(), AppError> {
 }
 
 #[cfg(unix)]
-async fn execute_server(config: PathBuf, http_bind: Option<SocketAddr>) -> Result<(), AppError> {
+async fn execute_server(config: PathBuf) -> Result<(), AppError> {
     let mut terminate = signal(SignalKind::terminate()).map_err(AppError::Signal)?;
     let shutdown = async move {
         tokio::select! {
@@ -294,7 +286,7 @@ async fn execute_server(config: PathBuf, http_bind: Option<SocketAddr>) -> Resul
             _ = terminate.recv() => {}
         }
     };
-    dekopon_brokerd::run_with_http(config, http_bind, shutdown)
+    dekopon_brokerd::run(config, shutdown)
         .await
         .map_err(AppError::Broker)?;
     Ok(())
@@ -418,10 +410,7 @@ enum AppError {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::{
-        net::{IpAddr, Ipv4Addr, SocketAddr},
-        path::Path,
-    };
+    use std::path::Path;
 
     use clap::{CommandFactory as _, Parser as _};
 
@@ -442,11 +431,9 @@ mod tests {
                     .is_err()
             );
         }
-        for flag in ["--config=x", "--http-bind=127.0.0.1:8080"] {
-            let cli =
-                Cli::try_parse_from(["dekopon-brokerd", flag, "probe", "--socket", "x"]).unwrap();
-            assert!(validate_cli(&cli).is_err());
-        }
+        let cli = Cli::try_parse_from(["dekopon-brokerd", "--config=x", "probe", "--socket", "x"])
+            .unwrap();
+        assert!(validate_cli(&cli).is_err());
     }
 
     #[test]
@@ -455,21 +442,14 @@ mod tests {
     }
 
     #[test]
-    fn http_listener_is_explicit_and_accepts_the_documented_spelling() {
-        let disabled = Cli::try_parse_from(["dekopon-brokerd", "--config", "broker.yaml"])
-            .expect("HTTP is optional");
-        assert!(disabled.http_bind.is_none());
-        assert!(validate_cli(&disabled).is_ok());
-
-        let enabled = Cli::try_parse_from([
-            "dekopon-brokerd",
-            "--config=broker.yaml",
-            "--http-bind=0.0.0.0:8080",
-        ])
-        .expect("documented HTTP bind parses");
-        assert_eq!(
-            enabled.http_bind,
-            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080))
+    fn retired_http_listener_flag_is_refused() {
+        assert!(
+            Cli::try_parse_from([
+                "dekopon-brokerd",
+                "--config=broker.yaml",
+                "--http-bind=0.0.0.0:8080"
+            ])
+            .is_err()
         );
     }
 

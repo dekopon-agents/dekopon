@@ -65,11 +65,6 @@ and replies with the answer.
   skill directories, and all credential names and values. Calls are repeatable under the prompt
   loop's shared bounds, with no inspection-specific counter; a repeat points at the copy already
   in the conversation instead of appending a second one.
-- **Informational status** — after the broker probe, the gateway best-effort reports a bounded
-  content-free catalog inventory; each session separately coalesces provider-reported model usage.
-  These feed only the broker-hosted web UI, reset with the broker process, and never affect a
-  session, policy, credentials, execution, evidence, or durable audit.
-
 ## Authority
 
 `dekopond` has none. It holds chat bot credentials and model credentials — the things it

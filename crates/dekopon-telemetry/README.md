@@ -40,8 +40,7 @@ This crate configures transport and never resolves credentials. Ingest authentic
 the OpenTelemetry SDK from the standard `OTEL_EXPORTER_OTLP_HEADERS` environment variable, so a
 token is never accepted as a command-line argument, never written to a configuration file this
 crate parses, and never attached to a span attribute or log field. Endpoint URL userinfo is
-rejected; ingest credentials must use the standard header variables and are never exposed by the
-broker web UI.
+rejected; ingest credentials must use the standard header variables..
 
 ## Trace context
 

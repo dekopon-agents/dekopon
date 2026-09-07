@@ -23,7 +23,6 @@ members = [
     "crates/dekopon-storage-host",
     "crates/dekopon-telemetry",
     "crates/dekopon-test-support",
-    "crates/dekopon-webui",
     "crates/dekopond",
 ]
 resolver = "3"
@@ -112,7 +111,6 @@ dekopon-protocol = { version = "0.12.0", path = "crates/dekopon-protocol", defau
 dekopon-shell = { version = "0.12.0", path = "crates/dekopon-shell" }
 dekopon-storage-host = { version = "0.12.0", path = "crates/dekopon-storage-host" }
 dekopon-telemetry = { version = "0.12.0", path = "crates/dekopon-telemetry" }
-dekopon-webui = { version = "0.12.0", path = "crates/dekopon-webui" }
 dekopond = { version = "0.12.0", path = "crates/dekopond" }
 
 [workspace.lints.rust]

@@ -327,8 +327,15 @@ prior stop at `wave1-stop.md`; historical free-space figures are not current hea
   Integration/cleanup/push receipts: D2b/integration-report.md and D2b/accepted.md.
   Temporary chain methods are D2c-owned; exact broad prose residue is D2d/D7a-owned.
   Final ledger-only head is not a new native/smoke execution; full-wave gates remain.
-- **D7a — pending.** Webui embedding and broker-http retirement; commit: —;
-  preserve surviving HTTP/storage security invariants at their canonical home.
+- **D7a — integrated; full-wave acceptance pending.** Commit: `Simplify-Unit: D7a`
+  on `simplify/2026-09`; reviewed worker `1415bbc450deda9298eee8bea7a45e18d575b176`.
+  Retires UI embedding and its reporting-only wire/gateway feed; preserves the console
+  observer, tracing, provider metadata and credential/UID boundaries. Surviving HTTP/storage
+  contracts and UI-specific comments are closed in their owning docs.
+  Scoped owner/consumer/provider receipts: `../.validation/simplify-2026-09/D7a/review-close/evidence.md`.
+  Independent review passed: `../.validation/simplify-2026-09/D7a/review-close/review.md`.
+  CORE wave-1 acceptance receipt: `../.validation/simplify-2026-09/D7a/accepted.md`;
+  full-wave gates and push remain pending until that external receipt records success.
 - **D7b — landed; fresh review and integration gates passed.** Commit: `Simplify-Unit: D7b`
   on `simplify/2026-09`; reviewed worker `a8eaf672eec75b19f685997f86f6ed9b79e77fb3`.
   Auth dispatches in the gateway before configuration/telemetry/runtime; the standalone

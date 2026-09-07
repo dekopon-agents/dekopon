@@ -891,7 +891,6 @@ dependencies = [
  "dekopon-storage-host",
  "dekopon-telemetry",
  "dekopon-test-support",
- "dekopon-webui",
  "futures-util",
  "hmac",
  "http-auth",
@@ -1161,24 +1160,6 @@ dependencies = [
 name = "dekopon-test-support"
 version = "0.12.0"
 dependencies = [
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "dekopon-webui"
-version = "0.12.0"
-dependencies = [
- "axum",
- "dekopon-broker-host",
- "dekopon-broker-protocol",
- "dekopon-core",
- "dekopon-test-support",
- "libc",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
- "tower",
  "tracing",
  "tracing-subscriber",
 ]

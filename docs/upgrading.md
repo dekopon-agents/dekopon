@@ -8,12 +8,18 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Broker dashboard retirement (unreleased)
+
+Remove the broker listener flag and chart value when upgrading. The UI and its reporting feed
+are retired; see the [lockstep and refusal contract](../crates/dekopon-broker-protocol/README.md#version-and-compatibility).
+Provider HTTP, gateway webhooks, model accounting and daemon tracing remain.
+
 ## Broker audit configuration (unreleased)
 
 Remove `checkpointPath` and `checkpointLockPath` from broker configuration before starting
 the new binary: both are rejected as unknown fields. Keep the private audit file and its
 existing limits; startup still verifies its chain and restores replay identifiers.
-Library callers of `run` and `run_with_http` now receive unit on clean shutdown.
+Library callers of `run` receive unit on clean shutdown.
 
 ## Provider storage direct-write contract
 
@@ -39,7 +45,7 @@ crates.io, release archives, the container image, and the Helm chart with its ow
 mixed set is easy to end up with by accident. Do not. The local broker protocol has one version
 constant and both envelopes are strict-decoded; a newer broker adding a field to a response an older
 client already understands makes that response undecodable, which is the failure a partial upgrade
-most reliably produces. [`broker-http.md`](broker-http.md#version-and-compatibility) has the exact
+most reliably produces. [`dekopon-brokerd` contract](../crates/dekopon-broker-protocol/README.md#version-and-compatibility) has the exact
 mechanics. The container image and the chart ship all three from one release for this reason.
 
 ### Restart the broker first and stop it last
@@ -135,8 +141,7 @@ bootstrap limitations.
   omits it means exactly what it meant before. The wire protocol and audit record shapes are
   unchanged.
 - **The local broker protocol moved to `dekopon.dev/broker/v1alpha2`; upgrade all four executables
-  in one step.** The eleven request operations collapsed into six — `capabilities`,
-  `resolveCommand`, `invoke`, `recordDeliveredTurn`, `publishAgentInventory`, `publishModelUsage` —
+  in one step.** The request operations collapsed to one per verb,
   because whether a caller speaks as its own peer, on behalf of a subject, or inside a chat scope is
   now an optional `attestation` field rather than a separate operation per shape. The retired tags
   (`capabilitiesFor`, `capabilitiesForChat`, `invokeFor`, `invokeForChat`, `resolveCommandForChat`,
@@ -292,7 +297,7 @@ Mechanical steps:
 
 Startup validates the result against a schema generated from the deployment's own world, so a typo
 in a principal or capability name is refused rather than becoming dead policy — with one exception,
-agent names, described in [`broker-http.md`](broker-http.md#startup-validation).
+agent names, described in [`dekopon-brokerd` contract](../crates/dekopon-brokerd/README.md#catalog-ownership-at-policy-startup).
 
 0.3 also introduced `dekopond`. Adding it is not part of this migration; the broker upgrade stands
 alone.
@@ -322,12 +327,6 @@ If `telemetry.endpoint` contains userinfo (`http://user:pass@collector`), the br
 start. Move the credential to `OTEL_EXPORTER_OTLP_HEADERS`, where it never enters the configuration
 file, the process command line, or a span attribute. See
 [`observability.md`](observability.md).
-
-0.6 also added the `dekopon-webui` dashboard. It is **off unless `--http-bind` is supplied** and
-opens no port otherwise, so upgrading changes no network surface by itself. If you do enable it,
-read the access-boundary note in
-[`crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.md#read-only-web-ui) first: it
-is unauthenticated and read-only, and the address you bind is the whole access control.
 
 ### 0.6 → 0.7 — standing instructions became readable
 
@@ -382,7 +381,7 @@ audit chain in place.
 
 - [`CHANGELOG.md`](../CHANGELOG.md) — the authoritative record of what each release contains.
 - [`operations.md`](operations.md) — the running-system runbook, including audit recovery.
-- [`broker-http.md`](broker-http.md#version-and-compatibility) — what a version mismatch actually
+- [`dekopon-brokerd` contract](../crates/dekopon-broker-protocol/README.md#version-and-compatibility) — what a version mismatch actually
   does on the wire.
 - [`catalog.md`](catalog.md) — the catalog schema an upgrade may need you to re-read.
 - [`container-image.md`](container-image.md) — how the image is assembled and what it pins.

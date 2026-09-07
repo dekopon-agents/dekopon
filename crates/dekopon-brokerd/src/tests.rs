@@ -1161,62 +1161,6 @@ fn storage_section_is_optional_all_or_nothing_and_strict() {
     );
 }
 
-/// The shutdown budget is one grace, not one per listener. Both listeners have already stopped
-/// accepting when this runs, so a broker drain that spends the whole grace must not then hand the
-/// web UI a fresh full grace — that is how a 120 s `shutdownGraceMs`
-/// became a 360 s exit against a 180 s `terminationGracePeriodSeconds`.
-#[tokio::test(start_paused = true)]
-async fn every_drain_shares_one_grace() {
-    let grace = std::time::Duration::from_secs(120);
-    let started = tokio::time::Instant::now();
-    let report = super::drain_services(
-        started + grace,
-        async {
-            tokio::time::sleep(grace).await;
-            Ok(())
-        },
-        Some(async {
-            tokio::time::sleep(grace * 3 / 4).await;
-            Ok(())
-        }),
-    )
-    .await;
-
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < grace * 2,
-        "three drains that each fit one grace must not take three: {elapsed:?}"
-    );
-    assert!(report.broker.is_ok());
-    assert!(!report.web_timed_out);
-    assert!(matches!(report.web, Some(Ok(()))));
-}
-
-/// And the deadline is shared rather than restarted, so a drain that outlives it is reported
-/// instead of being given the grace over again.
-#[tokio::test(start_paused = true)]
-async fn a_drain_past_the_shared_deadline_times_out() {
-    let grace = std::time::Duration::from_secs(120);
-    let started = tokio::time::Instant::now();
-    let report = super::drain_services(
-        started + grace,
-        async {
-            tokio::time::sleep(grace / 2).await;
-            Ok(())
-        },
-        Some(async {
-            tokio::time::sleep(grace * 4).await;
-            Ok(())
-        }),
-    )
-    .await;
-
-    let elapsed = started.elapsed();
-    assert!(elapsed < grace * 2, "{elapsed:?}");
-    assert!(report.web_timed_out);
-    assert!(report.web.is_none());
-}
-
 /// The startup frame check exists so an oversized capability response fails here rather than on
 /// the first session. It used to measure only the direct peers, and in the deployment it is written
 /// for the direct peer is the gateway — granted almost nothing. The capability sets that actually

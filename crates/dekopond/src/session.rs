@@ -21,25 +21,24 @@ use dekopon_agent::{
         SkillView,
     },
     prompt::{
-        CancellationProbe, GeneratedImageOutput, History, ModelUsageObserver, PromptError,
-        ReplyDisposition, SessionInputs, run_prompt_session,
+        CancellationProbe, GeneratedImageOutput, History, PromptError, ReplyDisposition,
+        SessionInputs, run_prompt_session,
     },
 };
 use dekopon_broker_protocol::{
     Attestation, BrokerClient, ChatScopeClaim, ClientError, DeliveredTurnRequest, DeliveryIdentity,
     ERROR_STORAGE_BUSY, ERROR_STORAGE_CORRUPT, ERROR_STORAGE_IO, ERROR_STORAGE_QUOTA,
     ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED, InvocationOutcome, InvocationResult,
-    ModelUsageReport,
 };
 use dekopon_model::{
     chatgpt::ChatGptCodexModel,
     image::{ImageGenerationError, ImageGenerator, OpenAiImageGenerator},
-    model::{ChatModel, CompletionOptions, ModelError, ModelUsage, OpenAiChatModel},
+    model::{ChatModel, CompletionOptions, ModelError, OpenAiChatModel},
 };
 use dekopon_process::{CancelHandle, CancelSignal};
 use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, Limits as ShellLimits};
 use thiserror::Error;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument as _;
 
 use crate::{
@@ -561,69 +560,6 @@ pub(crate) struct SessionRunner {
     pub thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>>,
     /// Native Agent sessions that can receive authenticated Stop events.
     pub active_sessions: ActiveSessions,
-    /// Best-effort informational usage deltas for the broker-hosted web UI.
-    pub usage_reports: Option<mpsc::Sender<ModelUsageReport>>,
-}
-
-#[derive(Default)]
-struct UsageAccumulator(Mutex<ModelUsageReport>);
-
-impl UsageAccumulator {
-    fn report(&self) -> ModelUsageReport {
-        *self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
-
-impl ModelUsageObserver for UsageAccumulator {
-    fn observe(&self, usage: Option<ModelUsage>) {
-        let mut report = self
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        report.model_calls = report.model_calls.saturating_add(1);
-        let usage = usage.unwrap_or_default();
-        (report.input_tokens, report.input_unreported_calls) = accumulated(
-            report.input_tokens,
-            report.input_unreported_calls,
-            usage.input_tokens,
-        );
-        (
-            report.cached_input_tokens,
-            report.cached_input_unreported_calls,
-        ) = accumulated(
-            report.cached_input_tokens,
-            report.cached_input_unreported_calls,
-            usage.cached_input_tokens,
-        );
-        (report.output_tokens, report.output_unreported_calls) = accumulated(
-            report.output_tokens,
-            report.output_unreported_calls,
-            usage.output_tokens,
-        );
-        (
-            report.reasoning_output_tokens,
-            report.reasoning_unreported_calls,
-        ) = accumulated(
-            report.reasoning_output_tokens,
-            report.reasoning_unreported_calls,
-            usage.reasoning_output_tokens,
-        );
-        (report.total_tokens, report.total_unreported_calls) = accumulated(
-            report.total_tokens,
-            report.total_unreported_calls,
-            usage.total_tokens,
-        );
-    }
-}
-
-fn accumulated(total: u64, unreported: u64, value: Option<u64>) -> (u64, u64) {
-    match value {
-        Some(value) => (total.saturating_add(value), unreported),
-        None => (total, unreported.saturating_add(1)),
-    }
 }
 
 /// Selects the state audience solely from trusted bound-route configuration.
@@ -934,8 +870,6 @@ async fn session(
     // — a model round trip, a script that sleeps, a broker call per command. Running that on a
     // runtime worker would stall every other session in the process.
     let blocking_span = span.clone();
-    let usage = Arc::new(UsageAccumulator::default());
-    let observed_usage = Arc::clone(&usage);
     let prompt_cancellation = cancellation.clone();
     let reply_optional = message
         .thread_continuation
@@ -970,7 +904,6 @@ async fn session(
             .with_skills(&skills)
             .with_options(&options)
             .with_assets(&assets)
-            .with_usage_observer(observed_usage.as_ref())
             .with_agent_config(&agent_config)
             .with_cancellation(&prompt_cancellation);
         if let Some(generator) = image_generator.as_deref() {
@@ -997,16 +930,6 @@ async fn session(
         (outcome, turn, image)
     })
     .await;
-
-    let usage = usage.report();
-    if usage.model_calls > 0
-        && let Some(reports) = &runner.usage_reports
-        && reports.try_send(usage).is_err()
-    {
-        // Informational accounting must never delay or fail a paid-for answer. A bounded full or
-        // closed queue loses a live dashboard delta and leaves OTLP accounting unchanged.
-        tracing::warn!(event = "gateway_usage_report_dropped");
-    }
 
     let (outcome, turn, generated_image) = match result {
         Ok(session) => session,

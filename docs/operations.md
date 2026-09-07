@@ -40,24 +40,24 @@ Full mechanics, filesystem requirements, and the limits of local integrity evide
 | How do I resolve, materialize, list, or verify a managed provider set? | [`dekopon-brokerd` § Managed provider sets](../crates/dekopon-brokerd/README.md#managed-provider-sets) — normal startup, `list`, and `verify` are offline; successful lock changes apply after restart |
 | Is a retained audit log still intact? | [`dekopon-brokerd` § Verifying a chain offline](../crates/dekopon-brokerd/README.md#verifying-a-chain-offline) — `audit verify` reports the record count and head, or names the record that broke the chain |
 | Why did a managed provider refuse to load? | The same section distinguishes desired references, the generated manifest/component lock, installed blob hygiene, and complete host validation. A digest proves bytes, not publisher provenance. |
-| Why did the broker refuse to start? | [`dekopon-brokerd` § Configuration](../crates/dekopon-brokerd/README.md#configuration) for path and permission refusals; [`broker-http.md` § Startup validation](broker-http.md#startup-validation) for policy refusals |
+| Why did the broker refuse to start? | [`dekopon-brokerd` § Configuration](../crates/dekopon-brokerd/README.md#configuration) for path and permission refusals; [`dekopon-brokerd` contract § Startup validation](../crates/dekopon-brokerd/README.md#catalog-ownership-at-policy-startup) for policy refusals |
 | Why did the gateway refuse to start? | [`dekopond.md` § Startup fails closed](dekopond.md#startup-fails-closed) |
 | What does shutdown actually do, and how long may it take? | [`dekopon-brokerd` § Configuration](../crates/dekopon-brokerd/README.md#configuration) — signals, draining, and the grace that must cover one host deadline plus two frame deadlines |
 | Why does startup take so long, and can a restart skip recompiling every component? | [`dekopon-brokerd` § Compilation cache and the concurrent memory budget](../crates/dekopon-brokerd/README.md#compilation-cache-and-the-concurrent-memory-budget) — `compileCachePath` is optional; absent, Cranelift recompiles every component before the socket binds, which is what the chart's startup probe budget ([`charts/dekopon/README.md` § Probes](../charts/dekopon/README.md#probes)) is sized to cover |
 | In what order do I restart the two daemons? | [`upgrading.md`](upgrading.md#restart-the-broker-first-and-stop-it-last) |
 | This release changed configuration — what do I edit? | [`upgrading.md`](upgrading.md) |
-| Can I run a newer broker against an older gateway? | No. [`broker-http.md` § Version and compatibility](broker-http.md#version-and-compatibility) |
+| Can I run a newer broker against an older gateway? | No. [`dekopon-brokerd` contract § Version and compatibility](../crates/dekopon-broker-protocol/README.md#version-and-compatibility) |
 
 ### Authority, policy, and credentials
 
 | Question | Read |
 |---|---|
 | Who may drive which agent, and where is that written? | [`dekopon-brokerd` § Policy](../crates/dekopon-brokerd/README.md#policy) |
-| How narrowly does an authorized invocation actually run? | [`broker-http.md` § Broker HTTP enforcement](broker-http.md#broker-http-enforcement) |
-| Where do legacy provider credentials live, and how are they bound to a destination? | [`broker-http.md` § Broker HTTP enforcement](broker-http.md#broker-http-enforcement) and [`dekopon-brokerd` § One capability, one token per agent](../crates/dekopon-brokerd/README.md#one-capability-one-token-per-agent) |
+| How narrowly does an authorized invocation actually run? | [`dekopon-brokerd` contract § Broker HTTP enforcement](../crates/dekopon-http-host/README.md#request-and-credential-boundary) |
+| Where do legacy provider credentials live, and how are they bound to a destination? | [`dekopon-brokerd` contract § Broker HTTP enforcement](../crates/dekopon-http-host/README.md#request-and-credential-boundary) and [`dekopon-brokerd` § One capability, one token per agent](../crates/dekopon-brokerd/README.md#one-capability-one-token-per-agent) |
 | How may an agent name a secret without seeing it, and which stores can back it? | [`secrets.md`](secrets.md) — DRNs, dual policy, private bindings, source adapters, path scope, bootstrap, rotation and reflection limits |
 | Why did a DRN return `secret-denied`? | The same document: unknown, unbound, wrong-sink/username and policy-denied names intentionally share one result; inspect broker-side policy/map validation rather than probing names. |
-| A grant looks right and every session is denied. | Check the agent name. [`broker-http.md` § Startup validation](broker-http.md#startup-validation) — agent literals are the one class that is not proved at startup |
+| A grant looks right and every session is denied. | Check the agent name. [`dekopon-brokerd` contract § Startup validation](../crates/dekopon-brokerd/README.md#catalog-ownership-at-policy-startup) — agent literals are the one class that is not proved at startup |
 | What does an agent's catalog entry actually decide? | [`catalog.md`](catalog.md) |
 | How do I get a ChatGPT credential onto a host or into a pod? | [`chatgpt-credential.md`](chatgpt-credential.md), and [`1password-eso.md`](1password-eso.md) for the secret store |
 
@@ -66,8 +66,7 @@ Full mechanics, filesystem requirements, and the limits of local integrity evide
 | Question | Read |
 |---|---|
 | What do the traces, spans, and audit-safe logs contain? | [`observability.md`](observability.md) |
-| What is the dashboard, and what does exposing it disclose? | [`dekopon-brokerd` § Read-only web UI](../crates/dekopon-brokerd/README.md#read-only-web-ui) |
-| A client got a failure code — is it safe to resubmit? | [`broker-http.md` § Failure codes](broker-http.md#failure-codes) |
+| A client got a failure code — is it safe to resubmit? | [`dekopon-brokerd` contract § Failure codes](../crates/dekopon-broker-protocol/README.md#failure-codes) |
 | An invocation may have taken effect and was not recorded. | `outcome-unaudited`, in the same table. The durable audit is the only record; do not resubmit under any identifier |
 
 ### Deploying
