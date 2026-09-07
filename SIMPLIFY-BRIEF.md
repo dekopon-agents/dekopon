@@ -170,7 +170,9 @@ or GC. Keep method names used by `broker-host/src/storage.rs`, including
 Remove `GcReport` (lib.rs:65). Keep namespace, layout, quota, vfs, key, jsonl, config,
 metrics: ownership, derivation, binding and filesystem isolation are containment.
 **Authorized public API change:** remove StorageTransaction/GcReport and export the
-replacement handle. Crates: storage-host, broker-host. Delete overlay/commit/recovery
+replacement handle. Crates: storage-host, broker-host, plus the mechanically dependent
+brokerd `host.gc_once()` task and its GC-only lifecycle plumbing (three crates, not a
+new daemon refactor). Delete overlay/commit/recovery
 tests with their mechanism. Broker-host tests asserting visible writes survive
 unmodified; rollback/crash-recovery tests may be deleted only with their names in the
 commit body. Preserve quota/path/grant isolation tests; re-express through the direct
@@ -265,6 +267,19 @@ Old queries for runner.command/runner.invoke do **not** carry over. Assert
 plus the existing trace/log correlation and credential/payload sentinel-redaction
 properties. Retain time bounds, failed-process diagnostics and unconditional cleanup.
 The broker fixture is real: testkit FakeBroker has no socket and cannot substitute.
+
+**D3b correlated-stdout expansion (owner approved).** The daemons currently export
+traces only, and their JSON stdout records lack native OTel IDs. D3b may add the active
+native `trace_id` and `span_id` to structured daemon stdout through the existing shared
+telemetry formatter, and ship those actual records in the smoke test with Python stdlib.
+Preserve production stdout-only log delivery: do not install daemon OTLP log exporters,
+add a credential path, or introduce another logging framework. Keep existing fields,
+filtering, redaction and no-context behavior; attach IDs only from valid native context,
+never by joining queried traces or inventing IDs. The shared-formatter Rust/tests and
+necessary owning documentation/dependency updates belong in this same D3b commit.
+Prove native ID correctness, no fabricated IDs without context, preserved credential/
+payload redaction, and real independent remote-log correlation with both daemon processes.
+This extends the earlier smoke/CI/docs scope only at that required logging seam.
 
 **D3c — atomic runner + provider-host retirement (includes old D3d).** Needs D8a/D8b,
 D3a/D3b/D3g. Delete both crates, their manifests/dependency entries, regenerate the root

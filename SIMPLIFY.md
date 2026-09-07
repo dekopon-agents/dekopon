@@ -6,7 +6,25 @@ Core: `simplify/2026-09`, original base `542430e`; accepted pre-batch head `6537
 Evidence paths below are relative to workspace `.validation/simplify-2026-09/`.
 No releases, tags, crate publication/yanks, merges, live deployment or core PR yet.
 
-## Current milestone — wave1-pair1-resumed integration
+## Current milestone — wave-1 pair-2 recovery authorized
+
+Owner approved D3b's native trace/span IDs in daemon JSON stdout and smoke-only shipping;
+production log delivery stays stdout-only, with no new exporter or credential path.
+The amended D3b contract owns this narrow formatter/test/docs seam. D2a's brokerd GC
+caller is explicitly recorded as mechanical cleanup within its existing retirement.
+D2a did no implementation in two incomplete attempts; this was not an exhausted compiler
+gate. The controller now distinguishes incomplete execution from actual failed repair.
+Recovery uses a source-and-check implementation checkpoint, then the same low-effort
+worker completes validation and amends its one unit commit; no repeated inventory-only
+handoff counts as progress. D3b continues its three preserved partial files.
+
+Accepted implementation/remote head remains `86802b1d72de7ba09af48667529f85d18624901f`;
+this approval amendment changes only brief/ledger. Pair 2 has no work commits, review,
+integration or acceptance yet. Evidence: `wave1-pair2-stop.md`; D3b target reclaimed,
+physical free 74.4072 → 78.1813 GiB; source/branches/partial hashes and shared cache preserved.
+Continue after required gates and fresh review, not after missing verification.
+
+## Accepted milestone — wave1-pair1-resumed integration
 
 D3a and D3g are freshly reviewed and serially integrated. Only ledger metadata and
 the independent Unreleased changelog entries required conflict resolution; source is
@@ -122,13 +140,19 @@ prior stop at `wave1-stop.md`; historical free-space figures are not current hea
   inert recorded-session test comment remains above cli_probe_path, not an executable consumer.
 - **D3g — landed; batch gates pass.** Worker/reviewed
   `e79eb2c999b2d202263c70bfd6131a0f8276728a`, base `2e5d7a892602ea672579f0e54e1889eea724b8b6`.
-  Integrated self identity `Simplify-Unit: D3g` (exact SHA in batch evidence).
+  Integrated `86802b1d72de7ba09af48667529f85d18624901f`.
   Bounded owner-authenticated probe/chart command, 98 tests/full Helm bodies pass;
   no existing assertions/boundaries changed. Evidence: `D3g/report.md`,
   `D3g/wave1-pair1-resumed-review.md`; discovery: nine raw hits are brief/still-live runner
   instructions and D7a-owned broker-http history, not chart residue.
-- **D3b — pending.** Two-daemon OTLP driver/stub/queries; commit: —; discoveries: —.
-- **D2a — pending.** Direct storage handle, remove transactions/GC; commit: —; discoveries: —.
+- **D3b — in-progress.** Partial real daemon/stub/trace driver preserved at base `86802b1`;
+  no unit commit. Required log correlation exposed missing native stdout IDs; owner approved
+  the narrow correlated-stdout/stdlib-shipper expansion. Other contracts/gates unchanged.
+  Evidence: `D3b/wave1-pair2-worker.md`, `wave1-pair2-stop.md`; no review/acceptance yet.
+- **D2a — pending implementation.** Clean at `86802b1`; two inventory-only attempts made
+  no source changes/commit or failed compiler gate. Parent owns execution recovery, not
+  an owner decision. Direct handle/GC removal includes brokerd GC task; no scope expansion
+  beyond that mechanical consumer. Evidence: `D2a/wave1-pair2-gate-repair.md`.
 - **D2b — pending.** Checkpoint removal/config/fixtures plus D6b refusal-loop names;
   commit: —; temporary checkpoint methods explicitly D2c-owned.
 - **D7a — pending.** Webui embedding and broker-http retirement; commit: —;
