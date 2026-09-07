@@ -6,23 +6,55 @@ Core: `simplify/2026-09`, original base `542430e`; accepted pre-batch head `6537
 Evidence paths below are relative to workspace `.validation/simplify-2026-09/`.
 No releases, tags, crate publication/yanks, merges, live deployment or core PR yet.
 
-## Current milestone — wave-1 pair-2 recovery authorized
+## Current milestone — wave-1 pair-2 combined local acceptance complete
 
-Owner approved D3b's native trace/span IDs in daemon JSON stdout and smoke-only shipping;
-production log delivery stays stdout-only, with no new exporter or credential path.
-The amended D3b contract owns this narrow formatter/test/docs seam. D2a's brokerd GC
-caller is explicitly recorded as mechanical cleanup within its existing retirement.
-D2a did no implementation in two incomplete attempts; this was not an exhausted compiler
-gate. The controller now distinguishes incomplete execution from actual failed repair.
-Recovery uses a source-and-check implementation checkpoint, then the same low-effort
-worker completes validation and amends its one unit commit; no repeated inventory-only
-handoff counts as progress. D3b continues its three preserved partial files.
+Accepted pre-pair base `0074ee38e8a5bbf5af56a33d9f7ddc575c86fb0b`; exact D2a/D3b reviews
+pass. Integrated D2a is `0a18d30a7ea7ad65847d01bafa3f9f88615fb78e`; final integrated
+D3b is this commit (`Simplify-Unit: D3b`), with that exact parent and two unit commits.
+Independent changelog/doc edits are composed; this closing amendment changes ledger
+metadata only. Actual nativeRustHead and smokeHead both remain
+`fefa4364acf739f33bea73bcf27391cb68b7cb09`, preserved by the create-only recovery ref
+`recovery/pair2-validated-before-ledger-close-202609`. All 393 non-ledger source paths
+retain aggregate `f6bb24c63930145cb7b72eb8b220a366114299070eac4a4d0b1f0ab81465c3f8`.
 
-Accepted implementation/remote head remains `86802b1d72de7ba09af48667529f85d18624901f`;
-this approval amendment changes only brief/ledger. Pair 2 has no work commits, review,
-integration or acceptance yet. Evidence: `wave1-pair2-stop.md`; D3b target reclaimed,
-physical free 74.4072 → 78.1813 GiB; source/branches/partial hashes and shared cache preserved.
-Continue after required gates and fresh review, not after missing verification.
+Current-source nine-package locked check/test/no-fail-fast, all-target/all-feature
+Clippy with warnings denied, warnings-denied rustdoc and separate doctests pass:
+496 distinct native tests plus 9 doctests, zero failed/ignored; raw 499 native successes
+exclude three IPC child repeats. Actual docs/audit, scripts/actionlint, metadata/release,
+dependency/privilege, nine chart CI bodies, mechanical and current-residue gates pass.
+Nine actual package LIST/content receipts pass, not archive compilation. Six prior
+actual deterministic provider comparisons/variant receipts are verified by exact
+input/log/artifact identity; no new provider builds. Saved fresh rendered HTML and
+static Schemars description metadata proof close the consumers; the latter is not a
+generated-schema byte-identity claim.
+
+Fresh real two-daemon smoke passes: 16 spans across all five required families,
+15 local/shipped = 15 ingested = 15 retrieved rows, no rejected/partial/truncated rows,
+both actual native daemon correlations, all ten controls and complete payload/dummy-
+credential redaction. Production logs remain stdout-only. Current original D2a 340 /
+active 339 literal and D3b eight-literal inventories remain explicit: pre-amendment raw
+statuses 1, hits 7401/7400/6, zero unknowns, not zero raw residue or a blanket waiver.
+The restored private native_loaded_bytes has four live producer/reader/init/declaration
+occurrences; it is not retired transaction state. Final ledger line classifications
+and affected non-build checks are recorded externally at their actual final head.
+
+Prior auxiliary lookup used provider-storage's mirror-test filename under broker-host;
+actual mirror tests and byte proof passed. This was inspection incompleteness, not a
+failed product or missing required gate (`pair2-core-resume/parent-close-cause-proof.json`).
+Prior stops/raw receipts remain historical. This closing call runs no native/provider
+builds, Cargo test/doc/package reruns or smoke executions. Safe prior CORE target cleanup
+reclaimed 9.513 GiB physical (68.554 → 78.068 GiB); no duplicate closing-call credit.
+CORE/D2a/D3b root/provider targets and owned smoke resources were already absent; final
+absence/free-space verification and any guarded metadata-only cleanup are external.
+Shared cache/settings, worker sources and all previous recovery refs remain preserved.
+
+No push is claimed inside this amendment: normal fast-forward push requires all affected
+final non-build/source/residue gates green and live remote still at the accepted base.
+Exact final head, push/remote equality and cleanup receipts live in
+`pair2-core-resume/close-result.md` and `pair2-consumers-accepted.md`. Earlier integration
+history remains in `pair2-integrate/` and `pair2-review-tail-integrated.md`. Final-source
+full-wave workspace/archive/MSRV and exact-head core CI remain downstream; this scoped
+pair acceptance is not final-wave or final-PR acceptance.
 
 ## Accepted milestone — wave1-pair1-resumed integration
 
@@ -78,8 +110,9 @@ for human review, not approved/merged; do not edit it. No physical-TTY or live-c
 acceptance claimed. Six integrated inactive wave-0 worktrees were normally removed/pruned;
 branches/evidence preserved. Console target removed after exact-head CI; no provider targets.
 
-Final-only core MSRV/release/feature-off/provider variants, daemon help/install, rewritten
-OTLP smoke, final metrics and exact-head core CI remain outstanding. Full workspace gates
+Final-source core MSRV/release/feature-off/provider variants, daemon help/install, final
+OTLP smoke, final metrics and exact-head core CI remain downstream despite the current
+pair's actual smoke and verified prior provider receipts. Full workspace gates
 run at a complete wave boundary, not for each pair. Core publication/console re-pin are
 unauthorized follow-ups. No final-PR acceptance is implied by a scoped batch pass.
 
@@ -145,11 +178,33 @@ prior stop at `wave1-stop.md`; historical free-space figures are not current hea
   no existing assertions/boundaries changed. Evidence: `D3g/report.md`,
   `D3g/wave1-pair1-resumed-review.md`; discovery: nine raw hits are brief/still-live runner
   instructions and D7a-owned broker-http history, not chart residue.
-- **D3b — in-progress.** Partial real daemon/stub/trace driver preserved at base `86802b1`;
-  no unit commit. Required log correlation exposed missing native stdout IDs; owner approved
-  the narrow correlated-stdout/stdlib-shipper expansion. Other contracts/gates unchanged.
-  Evidence: `D3b/wave1-pair2-worker.md`, `wave1-pair2-stop.md`; no review/acceptance yet.
-- **D2a — B1 owner validation complete; fresh review/integration pending.**
+- **D3b — integrated; fresh review and combined local gates pass.** Reviewed
+  `bb552bc85dd5ba053978c4d0f1d3d7f3d255641a`, base `0074ee38e8a5bbf5af56a33d9f7ddc575c86fb0b`.
+  Integrated identity: this commit (`Simplify-Unit: D3b`). Real daemon/local0600/stub/provider
+  smoke, native stdout IDs and independent startup/invocation correlation; complete bounded
+  retrieval/ingestion counts. Current execution at `fefa4364acf739f33bea73bcf27391cb68b7cb09`
+  proves 16 spans/five families, 15 complete rows, both native daemon pairs, ten controls
+  and redaction; no smoke rerun in ledger closure. No product capability removed by D3b;
+  the smoke can no longer pass on a direct in-process runner or retain owned resources.
+  Evidence: `D3b/review-tail-review.md`, `pair2-core-resume/smoke-proof.json` and
+  `pair2-core-resume/close-result.md` (actual final head/push/cleanup).
+  Discovery: `examples/otel-traces/drive-turn.py` checkpoint keys are D2b-owned.
+- **D2a — integrated; fresh review and combined local gates pass.**
+  Reviewed/integrated parent `0a18d30a7ea7ad65847d01bafa3f9f88615fb78e`;
+  fresh review PASS: `pair2-buffer-triage/buffer-review.md`.
+  Current combined execution at `fefa4364acf739f33bea73bcf27391cb68b7cb09` passes
+  nine-package 496 distinct native tests + 9 doctests, real two-daemon smoke, nine
+  package LIST/content and all prepared secondary gates. Six prior actual deterministic
+  comparisons are verified; no new provider builds. Original340/active339 inventories
+  preserve the explicit live private counter reconciliation. D2a cannot roll back an
+  invocation, atomically commit multiple calls, recover transaction manifests or
+  automatically collect old generations; authorized completed writes can remain visible.
+  Current evidence: `pair2-core-resume/parent-close-cause-proof.json` and
+  `pair2-core-resume/close-result.md`.
+  Full-wave archive/MSRV/workspace/exact-head CI remain downstream.
+  All following owner-stage statements through this entry's final evidence line are
+  explicitly historical, including their then-pending review/integration/smoke/push
+  and earlier counts; they are not current outstanding gates or combined acceptance.
   B1 repair: real pinned memory-chat RED reproduced storage-quota at the
   failed-success assertion with unchanged 512 KiB read bound (exit 101).
   Restored `native_loaded_bytes` as LIVE private original-load containment state,
@@ -177,8 +232,9 @@ prior stop at `wave1-stop.md`; historical free-space figures are not current hea
   proof pass; LIST is not archive compilation. Safe inactive 9.2 GiB target removal
   reclaimed 8.97 GiB physical; free space 69.14 to 78.11 GiB, all seven targets absent.
   Final ledger-only amendment is source-equivalent to the executed native checkpoint.
-  Fresh HIGH review, combined native integration, archive/CI and real two-daemon
-  OpenObserve smoke remain unperformed downstream gates; no push or integration.
+  At that historical owner handoff, HIGH review, combined native integration and real
+  two-daemon OpenObserve smoke were still unperformed; they have since passed above.
+  Archive/CI remains downstream; that owner handoff performed no push or integration.
   Evidence: `pair2-buffer-triage/buffer-worker.md` and `buffer-*` receipts.
   Unit ref `Simplify-Unit: D2a`; base `0074ee38e8a5bbf5af56a33d9f7ddc575c86fb0b`.
   Direct per-call namespace/VFS writes replace transaction/GC state; private-key/path,
@@ -210,8 +266,8 @@ prior stop at `wave1-stop.md`; historical free-space figures are not current hea
   now also runs at direct peak; the default-limit run and its assertions remain.
   No new authority, credential, WIT or guest-memory budget change. Negative capability:
   invocation failure cannot roll back completed calls; file sizing no longer reserves
-  removed staged JSONL copies. Current seven-package gates and six new comparisons
-  ran: 273 distinct native tests plus 9 doctests and six byte-equal comparisons.
+  removed staged JSONL copies. That historical seven-package execution and six new
+  comparisons ran: 273 distinct native tests plus 9 doctests and six byte-equal comparisons.
   Historical release invocation omitted arguments (exit 2), preserved unchanged.
   Authorized completion ran fresh metadata and explicit release arguments successfully.
   Static Schemars description-only and saved rendered HTML proof complete; seven scanner
@@ -223,7 +279,8 @@ prior stop at `wave1-stop.md`; historical free-space figures are not current hea
   Saved rendered pages preceded safe removal of the inactive ignored 581 MiB doc
   target (physical free space rounded 78 GiB before/after); six provider targets absent.
   Final source maps exactly to the dirty-input proof; no native/provider gate rerun.
-  No independent review, integration or push; completion evidence below.
+  That historical completion performed no independent review, integration or push;
+  current reviewed/combined acceptance is above. Historical completion evidence below.
   Evidence: `pair2-storage-docs/consumer-worker.md`, `pair2-consumer-finish/worker-completion.md`.
 - **D2b — pending.** Checkpoint removal/config/fixtures plus D6b refusal-loop names;
   commit: —; temporary checkpoint methods explicitly D2c-owned.

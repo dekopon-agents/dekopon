@@ -368,7 +368,9 @@ jobs:
         run: |
           printf '%s' '${{ secrets.GITHUB_TOKEN }}' \
             | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
-      - name: Export runner traces to OpenObserve
+      - name: Check smoke failure controls
+        run: python3 examples/otel-traces/test-smoke.py
+      - name: Export daemon traces to OpenObserve
         env:
           OPENOBSERVE_PORT: "15080"
           OPENOBSERVE_IMAGE: ghcr.io/${{ github.repository_owner }}/openobserve:v0.92.0@sha256:a40c420d5d25f013243dbd7e025db1e39980385dcb9e5de924ce5a6a80957527

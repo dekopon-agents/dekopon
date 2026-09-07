@@ -220,7 +220,10 @@ because the audit chain rather than telemetry is the record of what happened.
 
 The broker's log output is structured JSON on stdout, filtered by `RUST_LOG` and defaulting to
 `info`. Shipping those logs to storage is deliberately left to whatever reads stdout, so the broker
-holds one credential rather than two.
+holds one credential rather than two. Both daemon JSON formatters preserve existing fields
+and attach native `trace_id` and `span_id` only when the active OpenTelemetry context is
+valid. Outside that context (including disabled trace export), neither ID is fabricated.
+This does not install a daemon log exporter or change `RUST_LOG` filtering.
 
 ## Trace context across the socket
 
@@ -734,7 +737,15 @@ The immediate Wasm world has no logging import, so this records host-observed gu
 
 [`../examples/otel-traces/`](../examples/otel-traces/README.md) starts one pinned OpenObserve container with one Docker volume, documents authenticated OTLP/HTTP export, and explains how to inspect traces in the UI.
 
-`examples/otel-traces/smoke-test.sh` is the repository-level black-box check. It starts an isolated OpenObserve instance, executes a real direct provider invocation, and searches both signal streams. The trace query asserts that the root runner span and provider spans arrived without the sentinel provider input; the log query asserts that a correlated record carrying the same trace ID arrived and that the sentinel stayed absent there too. CI runs the same script and removes the container and volume afterward.
+`examples/otel-traces/smoke-test.sh` is the repository-level black-box check. It runs real
+broker and gateway processes, a stdlib model stub, and one private local-transport turn
+that executes an authorized echo provider. It asserts `gateway.message`, `gateway.session`,
+`broker.invocation`, `provider.compile`, and `provider.invoke`, including cross-process
+invocation trace continuity. A smoke-only stdout shipper checks ingestion-record counts;
+complete bounded remote log queries independently correlate each daemon's native ID pair
+with an actual exported span. Startup compilation may have a separate trace. Local,
+shipped, and remote records must exclude payload and fake credential sentinels. CI runs
+the same script and its negative controls, with unconditional owned-resource cleanup.
 
 ### Raspberry Pi storage snapshot
 

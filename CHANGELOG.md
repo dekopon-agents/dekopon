@@ -11,6 +11,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 - Provider storage applies writes per host call through a direct invocation handle, with namespace, key, quota and private-file isolation retained. Failed invocations can leave completed writes; there is no invocation rollback, crash recovery or automatic generation collection.
 
+- OTLP smoke CI exercises a real broker/gateway local turn with a stub model and authorized provider. Daemon JSON stdout includes valid active native trace/span IDs; smoke-only shipping verifies independent remote correlation and redaction without a production log exporter.
+
 - `dekopon-brokerd probe --socket <path>` performs a bounded owner-authenticated health check; chart broker probes use it without loading credentials or telemetry.
 
 ### Removed
