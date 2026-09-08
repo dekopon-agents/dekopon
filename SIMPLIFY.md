@@ -358,7 +358,31 @@ prior stop at `wave1-stop.md`; historical free-space figures are not current hea
   identity/residue, guarded artifact cleanup and push receipts belong in D7b/final-accepted.md.
   Guest inputs remain equivalent; zero provider rebuilds. No unresolved D7b discovery;
   named future-unit residue and full-wave/package-archive/MSRV/exact-head CI gates remain.
-- **D2c — pending.** Append-only JSONL; requires D2b; commit: —; discoveries: —.
+- **D2c — reviewed and integrated; CORE validation/push pending.**
+  Reviewed worker `239ebbcc4cdf7a62b0176de3562958e251753d2a`, parent
+  `9dcb54c5ae13fde390d0be69594e78b87100c098`; provenance cherry-pick in this
+  `Simplify-Unit: D2c` commit. Append-only JSONL replaces chain verification,
+  durable replay restoration and the file-record cap; private-file, bounded live
+  memory audit, credential and authority boundaries remain. Authorized decoded-count,
+  raw_value and exact comment/consumer corrections are included; historical failures
+  and mixed-head owner evidence remain immutable.
+  Owner d2c-suspension-owner and independent d2c-whole-review PASS receipts:
+  `D2c/suspension-close/owner-report.md`, `owner-manifest.json`, `review.md`,
+  `review-manifest.json` in that external directory. Non-ledger reviewed aggregate:
+  `bea1f54beb67021810e97354e744ce3fbc596a44c113361f630b997a6b7c977a`.
+  This metadata precedes actual CORE five-package native, non-Rust, consumer,
+  real two-daemon smoke, exact guest-input/UID proofs and guarded cleanup gates.
+  No unrun gate or push is claimed; exact results belong in
+  `D2c/suspension-close/integration-report.md`, `integration-manifest.json`,
+  and `accepted.md`. No late amendment is planned.
+  C1 can-suspend rationale is closed without runtime/assertion changes. C2 SECURITY
+  audit/recovery/integrity and coupled UID clauses, AGENTS checkpoint-recovery map,
+  and core trusted_file private-tier example are explicit D2d obligations under
+  `D2d/consumer-handoff-from-D2c.json`, not correctness claims or exemptions.
+  Conditional-write README one-UID/future-separation paragraph remains parent-owned
+  adjacent D6 documentation work before final PR readiness. D3c owns SECURITY's
+  runner/executable surface. Parent acceptance precedes D3c; full-wave2, D2d, final
+  workspace/archive/install/MSRV/CI/provider/metrics/housekeeping/PR work remains.
 - **D3c — pending.** Atomic runner/provider-host/manifests/lock/release/packaging retirement
   includes D3d; needs D8a/D8b/D3a/D3b/D3g; commit: —; no orphan interval.
 - **D3e — pending.** Both daemon dependency directions after D3c; commit: —; discoveries: —.

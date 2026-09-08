@@ -4,7 +4,7 @@
 //! from trusted peer identity, never payload claims. [`Broker`] asks a `dekopon-policy`
 //! [`PolicyEngine`] whether that context may act, binds an allow to the owner-authored
 //! [`ConstraintSet`] for the requested capability, creates a single-use authorization, executes it
-//! through `dekopon-broker-host`, and records metadata-only hash-linked audit events.
+//! through `dekopon-broker-host`, and records metadata-only audit events.
 //!
 //! Authorization and execution constraints are deliberately separate concerns. Cedar decides *who
 //! may do what*; the constraint catalog decides *how narrowly the broker will then do it*, and it
@@ -31,7 +31,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     future::Future,
-    io::{self, SeekFrom},
+    io,
     ops::ControlFlow,
     path::{Path, PathBuf},
     sync::Arc,
@@ -67,12 +67,11 @@ use dekopon_storage_host::{
     StorageScopeCommitment,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::value::RawValue;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio::{
     fs::{File, OpenOptions},
-    io::{AsyncBufReadExt as _, AsyncSeekExt as _, AsyncWriteExt as _, BufReader},
+    io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
     sync::Mutex,
 };
 use tracing::Instrument as _;
@@ -81,7 +80,6 @@ const MAX_POLICY_REVISION_BYTES: usize = 256;
 const MAX_POLICY_SCOPE_ENTRIES: usize = 64;
 /// Maximum owner-authored secret-use bindings one broker retains.
 pub const MAX_SECRET_BINDINGS: usize = 1024;
-const AUDIT_HASH_DOMAIN: &[u8] = b"dekopon-audit-record-v1\0";
 const EVIDENCE_HASH_DOMAIN: &[u8] = b"dekopon-evidence-v1\0";
 const POLICY_EVIDENCE_MEDIA_TYPE: &str = "application/vnd.dekopon.policy-decision+json";
 const PROVIDER_EVIDENCE_MEDIA_TYPE: &str = "application/vnd.dekopon.provider-response+json";
@@ -315,8 +313,6 @@ fn round_up(value: u64, multiple: u64) -> Result<u64, BrokerBuildError> {
 pub const DEFAULT_MAX_CONSTRAINT_SETS: usize = 1_024;
 /// Default process-lifetime invocation identifiers retained for replay rejection.
 pub const DEFAULT_MAX_REPLAY_IDS: usize = 100_000;
-/// Default maximum records retained by an in-memory or durable audit log.
-pub const DEFAULT_MAX_AUDIT_RECORDS: usize = 200_000;
 /// Default maximum serialized bytes in one durable JSONL audit record (64 KiB).
 pub const DEFAULT_MAX_AUDIT_LINE_BYTES: usize = 64 * 1024;
 
@@ -1434,14 +1430,7 @@ impl IdentityDirectory {
 pub struct BrokerLimits {
     /// Maximum owner-authored constraint sets accepted at construction.
     pub max_constraint_sets: usize,
-    /// Maximum invocation IDs retained for this process lifetime.
-    ///
-    /// Size this against `auditMaxRecords` rather than below it. The ledger never evicts, and
-    /// restart restores one entry per durable Decision event, so the bound is cumulative across
-    /// restarts rather than per process. A denial costs one audit record and one ledger slot,
-    /// which means a denial-heavy history exhausts a ledger sized at half the audit budget first
-    /// — before the designed [`AuditError::Full`] refusal ever fires. Reaching this bound is
-    /// `capacity-exhausted`: permanent, and an operator's problem rather than a client's.
+    /// Maximum invocation IDs retained for this process lifetime; exhaustion fails closed.
     pub max_replay_ids: usize,
 }
 
@@ -1805,12 +1794,6 @@ pub enum BrokerBuildError {
         /// Capability referenced by policy with no constraint set.
         capability: CapabilityId,
     },
-    /// Verified durable state contained more IDs than the replay ledger can retain.
-    #[error("durable replay state exceeds its {maximum}-identifier bound")]
-    TooManyReplayIds {
-        /// Configured maximum.
-        maximum: usize,
-    },
     /// One capability was given two constraint sets.
     #[error("configuration duplicates a constraint set for capability {capability}")]
     DuplicateConstraintSet {
@@ -1985,7 +1968,7 @@ pub enum BrokerBuildError {
     },
 }
 
-/// Metadata-only event committed to the broker audit chain.
+/// Metadata-only event appended to the broker audit log.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum AuditEvent {
@@ -2129,24 +2112,19 @@ pub enum AuditEvent {
     },
 }
 
-/// One immutable record in a process-local audit hash chain.
+/// One metadata-only audit record.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AuditRecord {
-    /// One-based contiguous sequence.
+    /// One-based ordinal in the file, or in the process-local in-memory log.
     pub sequence: u64,
-    /// Previous record hash, absent only for the first record.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub previous_hash: Option<String>,
     /// Metadata-only event.
     pub event: AuditEvent,
-    /// Domain-separated SHA-256 of sequence, previous hash, and event.
-    pub record_hash: String,
 }
 
 /// Asynchronous append boundary owned by a broker deployment.
 pub trait AuditLog: Send + Sync {
-    /// Atomically appends one event after the current chain head.
+    /// Appends one event, reporting failure rather than claiming an unrecorded success.
     fn append(
         &self,
         event: AuditEvent,
@@ -2190,28 +2168,21 @@ impl AuditLog for InMemoryAuditLog {
             .ok()
             .and_then(|value| value.checked_add(1))
             .ok_or(AuditError::SequenceOverflow)?;
-        let previous_hash = records.last().map(|record| record.record_hash.clone());
-        let record_hash = audit_record_hash(sequence, previous_hash.as_deref(), &event)?;
-        let record = AuditRecord {
-            sequence,
-            previous_hash,
-            event,
-            record_hash,
-        };
+        let record = AuditRecord { sequence, event };
         records.push(record.clone());
         Ok(record)
     }
 }
 
-/// Durable, owner-only JSONL audit chain.
+/// Append-only, owner-only JSONL audit file.
 ///
-/// Existing records are bounded and verified before the log accepts an append. Each append is
-/// flushed and synchronized before it returns. A partial write poisons the open handle, and a
-/// later reopen rejects the unterminated or invalid record.
+/// Open counts newline-delimited records in bounded space solely for the next ordinal, enforcing
+/// the line-size limit but neither decoding nor verifying history. Unterminated tails are refused;
+/// no bytes are repaired or migrated. Appends are flushed, not fsynced. A failed or cancelled append
+/// can leave partial bytes and poisons this handle; there is no rollback or crash-recovery promise.
 #[derive(Debug)]
 pub struct FileAuditLog {
     path: PathBuf,
-    maximum_records: usize,
     maximum_line_bytes: usize,
     state: Mutex<FileAuditState>,
 }
@@ -2219,27 +2190,16 @@ pub struct FileAuditLog {
 #[derive(Debug)]
 struct FileAuditState {
     file: File,
-    count: usize,
-    head: Option<String>,
-    /// The hash before `head`: the whole reconcile window, since an audit log can be at most one
-    /// append ahead of its checkpoint. Retaining every verified hash instead would hold roughly
-    /// 20 MB at the production record cap for the process lifetime, for a startup-only check.
-    previous_head: Option<String>,
-    /// Decision identifiers restored at startup, until the broker's replay ledger takes them.
-    replay_ids: Option<BTreeSet<InvocationId>>,
+    count: u64,
     poisoned: bool,
 }
 
 impl FileAuditLog {
-    /// Opens or creates an owner-only log and verifies every retained record.
+    /// Opens or creates a private single-writer file and counts its bounded lines.
     pub async fn open(
         path: impl AsRef<Path>,
-        maximum_records: usize,
         maximum_line_bytes: usize,
     ) -> Result<Self, FileAuditError> {
-        if maximum_records == 0 {
-            return Err(FileAuditError::ZeroMaximumRecords);
-        }
         if maximum_line_bytes == 0 {
             return Err(FileAuditError::ZeroMaximumLineBytes);
         }
@@ -2274,22 +2234,14 @@ impl FileAuditLog {
         let file = File::from_std(standard_file);
 
         let mut reader = BufReader::new(file);
-        let (count, head, previous_head, replay_ids) =
-            scan_audit_file(&mut reader, maximum_records, maximum_line_bytes).await?;
-        let mut file = reader.into_inner();
-        file.seek(SeekFrom::End(0))
-            .await
-            .map_err(|source| FileAuditError::Io { source })?;
+        let count = count_audit_lines(&mut reader, maximum_line_bytes).await?;
+        let file = reader.into_inner();
         Ok(Self {
             path,
-            maximum_records,
             maximum_line_bytes,
             state: Mutex::new(FileAuditState {
                 file,
                 count,
-                head,
-                previous_head,
-                replay_ids: Some(replay_ids),
                 poisoned: false,
             }),
         })
@@ -2300,45 +2252,6 @@ impl FileAuditLog {
     pub fn path(&self) -> &Path {
         &self.path
     }
-
-    /// Returns the verified record count and current chain head.
-    pub async fn checkpoint(&self) -> (usize, Option<String>) {
-        let state = self.state.lock().await;
-        (state.count, state.head.clone())
-    }
-
-    /// Reports whether a retained sequence/head pair is an exact verified chain prefix.
-    ///
-    /// Only the reconcile window is answered for: the current head, the record before it, and the
-    /// empty chain. A checkpoint further behind than one append is not a prefix this log will
-    /// confirm — reconciliation rejects that gap on its own, and confirming it would mean keeping
-    /// every verified hash resident forever.
-    pub async fn contains_checkpoint(&self, count: usize, head: Option<&str>) -> bool {
-        let state = self.state.lock().await;
-        match count {
-            0 => head.is_none(),
-            count if count == state.count => head == state.head.as_deref(),
-            count if Some(count) == state.count.checked_sub(1) => {
-                head == state.previous_head.as_deref()
-            }
-            _ => false,
-        }
-    }
-
-    /// Returns invocation IDs reconstructed from verified decision records, once.
-    ///
-    /// Consuming on purpose. The only caller hands them straight to the broker's replay ledger,
-    /// which owns them from then on; keeping a second copy here would duplicate the ledger at
-    /// startup and then grow it forever on a path nothing reads again. A later call returns
-    /// nothing, and appends stop recording once they have been taken.
-    pub async fn take_replay_ids(&self) -> Vec<InvocationId> {
-        let mut state = self.state.lock().await;
-        state
-            .replay_ids
-            .take()
-            .map(|ids| ids.into_iter().collect())
-            .unwrap_or_default()
-    }
 }
 
 impl AuditLog for FileAuditLog {
@@ -2347,32 +2260,13 @@ impl AuditLog for FileAuditLog {
         if state.poisoned {
             return Err(AuditError::Poisoned);
         }
-        if state.count >= self.maximum_records {
-            return Err(AuditError::Full {
-                maximum: self.maximum_records,
-            });
-        }
-        let sequence = u64::try_from(state.count)
-            .ok()
-            .and_then(|value| value.checked_add(1))
+        let sequence = state
+            .count
+            .checked_add(1)
             .ok_or(AuditError::SequenceOverflow)?;
-        let previous_hash = state.head.clone();
-        let encoded = encode_audit_event(&event)?;
-        let record_hash = encoded_audit_record_hash(sequence, previous_hash.as_deref(), &encoded)?;
-        // The one serialization of the event covers both the hash material and the durable line.
-        let mut line = serde_json::to_vec(&AuditRecordLine {
-            sequence,
-            previous_hash: previous_hash.as_deref(),
-            event: &encoded,
-            record_hash: &record_hash,
-        })
-        .map_err(|source| AuditError::Serialize { source })?;
-        let record = AuditRecord {
-            sequence,
-            previous_hash,
-            event,
-            record_hash,
-        };
+        let record = AuditRecord { sequence, event };
+        let mut line =
+            serde_json::to_vec(&record).map_err(|source| AuditError::Serialize { source })?;
         if line.len() > self.maximum_line_bytes {
             return Err(AuditError::RecordTooLarge {
                 length: line.len(),
@@ -2388,158 +2282,54 @@ impl AuditLog for FileAuditLog {
         if let Err(source) = state.file.flush().await {
             return Err(AuditError::Io { source });
         }
-        if let Err(source) = state.file.sync_all().await {
-            return Err(AuditError::Io { source });
-        }
-        state.count += 1;
-        state.previous_head = state.head.replace(record.record_hash.clone());
-        if let Some(ids) = state.replay_ids.as_mut()
-            && let AuditEvent::Decision { invocation, .. } = &record.event
-        {
-            ids.insert(invocation.clone());
-        }
+        state.count = sequence;
         state.poisoned = false;
         Ok(record)
     }
 }
 
-async fn scan_audit_file(
-    reader: &mut BufReader<File>,
-    maximum_records: usize,
-    maximum_line_bytes: usize,
-) -> Result<
-    (
-        usize,
-        Option<String>,
-        Option<String>,
-        BTreeSet<InvocationId>,
-    ),
-    FileAuditError,
-> {
-    let mut count = 0_usize;
-    let mut previous = None::<String>;
-    let mut before_previous = None::<String>;
-    let mut replay_ids = BTreeSet::new();
-    loop {
-        let Some(line) = read_bounded_line(reader, maximum_line_bytes, count + 1).await? else {
-            return Ok((count, previous, before_previous, replay_ids));
-        };
-        if count >= maximum_records {
-            return Err(FileAuditError::TooManyRecords {
-                maximum: maximum_records,
-            });
-        }
-        let record = serde_json::from_slice::<AuditRecord>(&line).map_err(|source| {
-            FileAuditError::InvalidRecord {
-                line: count + 1,
-                source,
-            }
-        })?;
-        verify_file_record(count, previous.as_deref(), &record)?;
-        if let AuditEvent::Decision { invocation, .. } = &record.event {
-            replay_ids.insert(invocation.clone());
-        }
-        before_previous = previous.replace(record.record_hash);
-        count += 1;
-    }
-}
-
-async fn read_bounded_line(
+// Count delimiters, not JSON identities or integrity state. Memory is the fixed BufReader buffer.
+async fn count_audit_lines(
     reader: &mut BufReader<File>,
     maximum: usize,
-    line_number: usize,
-) -> Result<Option<Vec<u8>>, FileAuditError> {
-    let mut line = Vec::new();
+) -> Result<u64, FileAuditError> {
+    let mut count = 0_u64;
+    let mut length = 0_usize;
     loop {
         let available = reader
             .fill_buf()
             .await
             .map_err(|source| FileAuditError::Io { source })?;
         if available.is_empty() {
-            if line.is_empty() {
-                return Ok(None);
+            if length == 0 {
+                return Ok(count);
             }
-            return Err(FileAuditError::UnterminatedRecord { line: line_number });
-        }
-        let newline = available.iter().position(|byte| *byte == b'\n');
-        let chunk_length = newline.unwrap_or(available.len());
-        let length =
-            line.len()
-                .checked_add(chunk_length)
-                .ok_or(FileAuditError::RecordTooLarge {
-                    line: line_number,
-                    maximum,
-                })?;
-        if length > maximum {
-            return Err(FileAuditError::RecordTooLarge {
-                line: line_number,
-                maximum,
+            return Err(FileAuditError::UnterminatedRecord {
+                line: count
+                    .checked_add(1)
+                    .ok_or(FileAuditError::SequenceOverflow)?,
             });
         }
-        line.extend_from_slice(&available[..chunk_length]);
-        let consumed = chunk_length + usize::from(newline.is_some());
-        reader.consume(consumed);
+        let line = count
+            .checked_add(1)
+            .ok_or(FileAuditError::SequenceOverflow)?;
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let chunk = newline.unwrap_or(available.len());
+        length = length
+            .checked_add(chunk)
+            .filter(|length| *length <= maximum)
+            .ok_or(FileAuditError::RecordTooLarge { line, maximum })?;
+        reader.consume(chunk + usize::from(newline.is_some()));
         if newline.is_some() {
-            return Ok(Some(line));
+            count = line;
+            length = 0;
         }
     }
 }
 
-fn verify_file_record(
-    index: usize,
-    previous: Option<&str>,
-    record: &AuditRecord,
-) -> Result<(), FileAuditError> {
-    let expected_sequence = u64::try_from(index)
-        .ok()
-        .and_then(|value| value.checked_add(1))
-        .ok_or(FileAuditError::Integrity {
-            line: index + 1,
-            source: AuditIntegrityError::Sequence { index },
-        })?;
-    if record.sequence != expected_sequence {
-        return Err(FileAuditError::Integrity {
-            line: index + 1,
-            source: AuditIntegrityError::Sequence { index },
-        });
-    }
-    if record.previous_hash.as_deref() != previous {
-        return Err(FileAuditError::Integrity {
-            line: index + 1,
-            source: AuditIntegrityError::PreviousHash { index },
-        });
-    }
-    #[allow(
-        clippy::map_err_ignore,
-        reason = "the only failure `audit_record_hash` reports is `AuditError::Serialize`, and \
-                  `AuditHashMaterial` is a derived-Serialize tree of integers, bools, strings, \
-                  and string newtypes — no map with non-string keys and no float, so serde_json \
-                  has no failure to describe"
-    )]
-    let expected = audit_record_hash(
-        record.sequence,
-        record.previous_hash.as_deref(),
-        &record.event,
-    )
-    .map_err(|_| FileAuditError::Integrity {
-        line: index + 1,
-        source: AuditIntegrityError::Serialize { index },
-    })?;
-    if record.record_hash != expected {
-        return Err(FileAuditError::Integrity {
-            line: index + 1,
-            source: AuditIntegrityError::RecordHash { index },
-        });
-    }
-    Ok(())
-}
-
-/// Failure to open and verify a durable audit chain.
+/// Failure to open or count a private append-only audit file.
 #[derive(Debug, Error)]
 pub enum FileAuditError {
-    /// Record bound was zero.
-    #[error("durable audit record maximum must be greater than zero")]
-    ZeroMaximumRecords,
     /// Per-record byte bound was zero.
     #[error("durable audit line maximum must be greater than zero")]
     ZeroMaximumLineBytes,
@@ -2556,17 +2346,11 @@ pub enum FileAuditError {
         #[source]
         source: io::Error,
     },
-    /// Existing log exceeded its configured record bound.
-    #[error("durable audit log exceeds its {maximum}-record bound")]
-    TooManyRecords {
-        /// Configured maximum.
-        maximum: usize,
-    },
     /// One existing record exceeded its byte bound.
     #[error("durable audit record on line {line} exceeds {maximum} bytes")]
     RecordTooLarge {
         /// One-based line number.
-        line: usize,
+        line: u64,
         /// Configured maximum.
         maximum: usize,
     },
@@ -2574,26 +2358,11 @@ pub enum FileAuditError {
     #[error("durable audit record on line {line} is not newline-terminated")]
     UnterminatedRecord {
         /// One-based line number.
-        line: usize,
+        line: u64,
     },
-    /// Existing JSONL record was malformed or had unknown fields.
-    #[error("durable audit record on line {line} is invalid JSON")]
-    InvalidRecord {
-        /// One-based line number.
-        line: usize,
-        /// JSON failure.
-        #[source]
-        source: serde_json::Error,
-    },
-    /// Existing record failed sequence or hash verification.
-    #[error("durable audit record on line {line} failed integrity verification")]
-    Integrity {
-        /// One-based line number.
-        line: usize,
-        /// Verification failure.
-        #[source]
-        source: AuditIntegrityError,
-    },
+    /// The next file ordinal cannot be represented.
+    #[error("audit sequence overflowed")]
+    SequenceOverflow,
     /// File operation failed.
     #[error("durable audit file operation failed")]
     Io {
@@ -2634,14 +2403,14 @@ pub enum AuditError {
     /// Sequence could not be represented.
     #[error("audit sequence overflowed")]
     SequenceOverflow,
-    /// Event could not be deterministically serialized for hashing.
+    /// Record could not be serialized.
     #[error("could not serialize audit event")]
     Serialize {
         /// JSON failure.
         #[source]
         source: serde_json::Error,
     },
-    /// Durable append, flush, or sync failed.
+    /// File append or flush failed.
     #[error("durable audit append failed")]
     Io {
         /// I/O failure.
@@ -2667,119 +2436,6 @@ impl AuditError {
             Self::Io { .. } => "io",
         }
     }
-}
-
-/// Audit-chain verification failure.
-#[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum AuditIntegrityError {
-    /// Record sequence was not one-based and contiguous.
-    #[error("audit record at index {index} has a non-contiguous sequence")]
-    Sequence {
-        /// Zero-based index.
-        index: usize,
-    },
-    /// Previous hash did not match the preceding record.
-    #[error("audit record at index {index} has an invalid previous hash")]
-    PreviousHash {
-        /// Zero-based index.
-        index: usize,
-    },
-    /// Record content did not match its digest.
-    #[error("audit record at index {index} has an invalid record hash")]
-    RecordHash {
-        /// Zero-based index.
-        index: usize,
-    },
-    /// Record could not be reserialized.
-    #[error("could not serialize audit record at index {index}")]
-    Serialize {
-        /// Zero-based index.
-        index: usize,
-    },
-}
-
-/// Verifies sequence, linkage, and record hashes for a retained chain.
-pub fn verify_audit_chain(records: &[AuditRecord]) -> Result<(), AuditIntegrityError> {
-    let mut previous = None::<&str>;
-    for (index, record) in records.iter().enumerate() {
-        let expected_sequence = u64::try_from(index)
-            .ok()
-            .and_then(|value| value.checked_add(1))
-            .ok_or(AuditIntegrityError::Sequence { index })?;
-        if record.sequence != expected_sequence {
-            return Err(AuditIntegrityError::Sequence { index });
-        }
-        if record.previous_hash.as_deref() != previous {
-            return Err(AuditIntegrityError::PreviousHash { index });
-        }
-        #[allow(
-            clippy::map_err_ignore,
-            reason = "the only failure `audit_record_hash` reports is `AuditError::Serialize`, \
-                      and `AuditHashMaterial` is a derived-Serialize tree of integers, bools, \
-                      strings, and string newtypes — no map with non-string keys and no float, \
-                      so serde_json has no failure to describe"
-        )]
-        let expected = audit_record_hash(
-            record.sequence,
-            record.previous_hash.as_deref(),
-            &record.event,
-        )
-        .map_err(|_| AuditIntegrityError::Serialize { index })?;
-        if record.record_hash != expected {
-            return Err(AuditIntegrityError::RecordHash { index });
-        }
-        previous = Some(record.record_hash.as_str());
-    }
-    Ok(())
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AuditHashMaterial<'a> {
-    sequence: u64,
-    previous_hash: Option<&'a str>,
-    event: &'a RawValue,
-}
-
-/// The durable JSONL shape of [`AuditRecord`], over an already-serialized event.
-///
-/// Field names, order, and the absent-`previousHash` rule must stay identical to `AuditRecord`'s
-/// derived encoding: this is the same bytes on disk, written without serializing the event a
-/// second time. `durable_line_matches_the_record_encoding` fails if the two ever diverge.
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AuditRecordLine<'a> {
-    sequence: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    previous_hash: Option<&'a str>,
-    event: &'a RawValue,
-    record_hash: &'a str,
-}
-
-fn encode_audit_event(event: &AuditEvent) -> Result<Box<RawValue>, AuditError> {
-    serde_json::value::to_raw_value(event).map_err(|source| AuditError::Serialize { source })
-}
-
-fn audit_record_hash(
-    sequence: u64,
-    previous_hash: Option<&str>,
-    event: &AuditEvent,
-) -> Result<String, AuditError> {
-    encoded_audit_record_hash(sequence, previous_hash, &encode_audit_event(event)?)
-}
-
-fn encoded_audit_record_hash(
-    sequence: u64,
-    previous_hash: Option<&str>,
-    event: &RawValue,
-) -> Result<String, AuditError> {
-    let bytes = serde_json::to_vec(&AuditHashMaterial {
-        sequence,
-        previous_hash,
-        event,
-    })
-    .map_err(|source| AuditError::Serialize { source })?;
-    Ok(domain_digest(AUDIT_HASH_DOMAIN, &bytes))
 }
 
 #[derive(Debug)]
@@ -2844,34 +2500,6 @@ where
         audit: Arc<A>,
         limits: BrokerLimits,
     ) -> Result<Self, BrokerBuildError> {
-        Self::new_with_replay_ids(
-            registry,
-            broker_principal,
-            policy_revision,
-            policy,
-            constraints,
-            credentials,
-            identities,
-            audit,
-            limits,
-            std::iter::empty(),
-        )
-    }
-
-    /// Builds a broker while restoring invocation IDs from a verified durable audit chain.
-    #[allow(clippy::too_many_arguments)]
-    pub fn new_with_replay_ids(
-        registry: BrokerProviderRegistry,
-        broker_principal: PrincipalId,
-        policy_revision: String,
-        policy: PolicyEngine,
-        constraints: ConstraintCatalog,
-        credentials: CredentialStore,
-        identities: IdentityDirectory,
-        audit: Arc<A>,
-        limits: BrokerLimits,
-        replay_ids: impl IntoIterator<Item = InvocationId>,
-    ) -> Result<Self, BrokerBuildError> {
         Self::start(
             registry,
             broker_principal,
@@ -2883,15 +2511,13 @@ where
             audit,
             limits,
             Leniency::Strict,
-            replay_ids,
         )
         .map(|(broker, _)| broker)
     }
 
     /// Builds a broker, choosing whether configuration that cannot apply refuses startup.
     ///
-    /// This is the full constructor [`Broker::new`] and [`Broker::new_with_replay_ids`] delegate
-    /// to; both pin [`Leniency::Strict`], which is exactly today's behavior.
+    /// This is the full constructor [`Broker::new`] delegates to with [`Leniency::Strict`].
     ///
     /// Under [`Leniency::Tolerant`] two startup refusals become [`StartupWarning`]s instead:
     /// a constraint set naming a capability no loaded provider routes is dropped, and a capability
@@ -2921,7 +2547,6 @@ where
         audit: Arc<A>,
         limits: BrokerLimits,
         leniency: Leniency,
-        replay_ids: impl IntoIterator<Item = InvocationId>,
     ) -> Result<(Self, Vec<StartupWarning>), BrokerBuildError> {
         let mut constraints = constraints;
         let mut warnings = Vec::new();
@@ -2963,15 +2588,6 @@ where
                 }
             }
         }
-        let mut restored_replay_ids = BTreeSet::new();
-        for invocation in replay_ids {
-            restored_replay_ids.insert(invocation);
-            if restored_replay_ids.len() > limits.max_replay_ids {
-                return Err(BrokerBuildError::TooManyReplayIds {
-                    maximum: limits.max_replay_ids,
-                });
-            }
-        }
         Ok((
             Self {
                 registry,
@@ -2987,7 +2603,7 @@ where
                 audit,
                 replay: ReplayLedger {
                     maximum: limits.max_replay_ids,
-                    ids: Mutex::new(restored_replay_ids),
+                    ids: Mutex::new(BTreeSet::new()),
                 },
                 chat_memory: None,
             },
@@ -4028,7 +3644,7 @@ where
             authorize.record("input", tracing::field::display(&request.input));
         }
         // Instrumented rather than entered with a guard: this section awaits the replay ledger and,
-        // on every denial, a durable audit append that fsyncs. A guard held across those awaits
+        // on every denial, an audit append that can suspend. A guard held across those awaits
         // stays entered on the worker thread while this task is suspended, so another connection's
         // spans parent under this request's authorization and this request's own events lose it
         // when the task resumes elsewhere.
@@ -5316,10 +4932,6 @@ fn evidence_digest(label: &str, value: &impl Serialize) -> Result<String, serde_
     ))
 }
 
-fn domain_digest(domain: &[u8], bytes: &[u8]) -> String {
-    digest_parts(domain, &[bytes])
-}
-
 fn digest_parts(domain: &[u8], parts: &[&[u8]]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(domain);
@@ -5549,11 +5161,9 @@ impl BrokerError {
     /// Stable class for an exhaustion that no resubmission can outlast.
     ///
     /// The retriable class is for a broker that could not complete *this* request. These two
-    /// cannot complete any request. The replay ledger never evicts and restart restores it from
-    /// durable history, so a fresh invocation identifier fails identically and keeps failing; the
-    /// audit log does not rotate, so a full one refuses every append until an operator raises the
-    /// bound or moves the file. Reporting either as `broker-unavailable` invites an unbounded
-    /// retry loop against a permanently capped broker.
+    /// cannot complete any request. The process-local replay ledger and bounded embedding audit
+    /// log never evict during their lifetime. A fresh identifier cannot fix that exhaustion;
+    /// reporting it as `broker-unavailable` invites an unbounded retry loop.
     ///
     /// A *terminal* audit failure is deliberately absent: [`Self::OutcomeAudit`] is an unaudited
     /// outcome first, whatever exhausted it, and that classification must not be weakened here.

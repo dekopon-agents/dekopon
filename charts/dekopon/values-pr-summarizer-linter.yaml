@@ -145,7 +145,6 @@ broker:
         maxFrameBytes: 2097152
         ioTimeoutMs: 30000
         maxConnections: 64
-        auditMaxRecords: 200000
         auditMaxLineBytes: 8192
         shutdownGraceMs: 120000
       telemetry:

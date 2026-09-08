@@ -468,7 +468,7 @@ where
             }
             // Correlation identifiers only. Input, output, and every provider-facing value stay
             // out of this span for the same reason they stay out of audit records: telemetry is a
-            // second egress path and must not carry what the audit chain deliberately redacts.
+            // second egress path and must not carry what the audit log deliberately redacts.
             let span = invocation_span(
                 &invocation,
                 attestation.as_ref(),

@@ -6,7 +6,6 @@
 #![forbid(unsafe_code)]
 #![cfg(unix)]
 
-mod audit;
 mod config;
 mod credentials;
 mod provider_manager;
@@ -25,7 +24,6 @@ use dekopon_broker_protocol::ResponseEnvelope;
 use dekopon_core::error_chain;
 use thiserror::Error;
 
-pub use audit::{AuditVerification, AuditVerificationError, verify_audit_file};
 pub use config::{
     BrokerdConfig, CONFIG_API_VERSION, ConfigApiVersion, ConfigError, HostLimitsConfig,
     IdentityMapping, ManagedProviderSetConfig, PeerIdentity, ResolvedConfig, ResolvedTelemetry,
@@ -113,14 +111,12 @@ where
     let file_audit = Arc::new(
         FileAuditLog::open(
             &config.audit_path,
-            config.server_limits.audit_max_records,
             config.server_limits.audit_max_line_bytes,
         )
         .await
         .map_err(BrokerdError::Audit)?,
     );
     socket::validate_owned_file(&config.audit_path, uid)?;
-    let replay_ids = file_audit.take_replay_ids().await;
     let audit = file_audit;
     let storage_host = config
         .storage
@@ -249,7 +245,6 @@ where
         Arc::clone(&audit),
         config.broker_limits,
         leniency,
-        replay_ids,
     )
     .map_err(BrokerdError::Broker)?;
     let broker = broker
@@ -395,7 +390,7 @@ pub enum BrokerdError {
     /// Owner-only public-DRN to private-source map failed validation.
     #[error("broker private secret map is unavailable or invalid")]
     Secrets(#[from] SecretMapError),
-    /// Owner-only durable audit could not be opened and verified.
+    /// Owner-only audit could not be opened.
     #[error("broker durable audit is unavailable")]
     Audit(#[source] dekopon_broker::FileAuditError),
     /// Provider storage root/key validation could not start.
@@ -444,7 +439,7 @@ pub enum BrokerdError {
         /// Configured frame maximum.
         maximum: usize,
     },
-    /// Policy, restored replay state, or constraints were invalid.
+    /// Policy or constraints were invalid.
     #[error("broker policy could not start")]
     Broker(#[source] dekopon_broker::BrokerBuildError),
     /// The Cedar policy set could not be parsed, schema-validated, or bounded.

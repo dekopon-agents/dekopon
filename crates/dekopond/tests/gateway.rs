@@ -634,7 +634,7 @@ async fn a_chat_message_reaches_a_provider_under_the_senders_own_principal() {
         .unwrap_or_else(|| panic!("an execution record exists: {events:#?}"));
     assert_eq!(execution["principal"], MAPPED_PRINCIPAL);
     assert_eq!(execution["via"], GATEWAY_PRINCIPAL);
-    // The audit chain's own field naming: `AuditEvent` renames variants, not fields.
+    // The audit log's own field naming: `AuditEvent` renames variants, not fields.
     assert_eq!(execution["attested_subject"], MAPPED_SUBJECT);
     assert_eq!(execution["actor"]["agent"], AGENT);
     assert_eq!(execution["capability"], "echo.echo");

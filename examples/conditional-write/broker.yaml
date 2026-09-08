@@ -1,6 +1,6 @@
 # dekopon-brokerd — the only process in this example that holds any authority.
 #
-# It owns the socket, the policy, the constraint sets, the the upstream API credential, and the audit chain.
+# It owns the socket, the policy, the constraint sets, the the upstream API credential, and the audit log.
 # The gateway holds none of those; it holds a Slack token and a model endpoint.
 #
 # Hygiene, all checked at startup and all fatal:

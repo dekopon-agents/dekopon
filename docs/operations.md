@@ -24,9 +24,6 @@ recoverable crash window and is advanced before the broker listens. A larger gap
 Deleting the checkpoint does not repair the state — it destroys the evidence that would have told you
 what happened. Recovery means restoring both files from copies you trust.
 
-`dekopon-brokerd audit verify --audit-path <PATH>` runs that same chain check offline, against a
-live log or a retained copy, without starting the broker.
-
 Full mechanics, filesystem requirements, and the limits of local integrity evidence:
 [`crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.md#audit).
 
@@ -38,7 +35,6 @@ Full mechanics, filesystem requirements, and the limits of local integrity evide
 |---|---|
 | What files and directories must exist, and with what ownership and modes? | [`dekopon-brokerd` § Configuration](../crates/dekopon-brokerd/README.md#configuration) |
 | How do I resolve, materialize, list, or verify a managed provider set? | [`dekopon-brokerd` § Managed provider sets](../crates/dekopon-brokerd/README.md#managed-provider-sets) — normal startup, `list`, and `verify` are offline; successful lock changes apply after restart |
-| Is a retained audit log still intact? | [`dekopon-brokerd` § Verifying a chain offline](../crates/dekopon-brokerd/README.md#verifying-a-chain-offline) — `audit verify` reports the record count and head, or names the record that broke the chain |
 | Why did a managed provider refuse to load? | The same section distinguishes desired references, the generated manifest/component lock, installed blob hygiene, and complete host validation. A digest proves bytes, not publisher provenance. |
 | Why did the broker refuse to start? | [`dekopon-brokerd` § Configuration](../crates/dekopon-brokerd/README.md#configuration) for path and permission refusals; [`dekopon-brokerd` contract § Startup validation](../crates/dekopon-brokerd/README.md#catalog-ownership-at-policy-startup) for policy refusals |
 | Why did the gateway refuse to start? | [`dekopond.md` § Startup fails closed](dekopond.md#startup-fails-closed) |

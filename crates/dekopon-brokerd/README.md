@@ -1,6 +1,6 @@
 # dekopon-brokerd
 
-`dekopon-brokerd` is the separately deployed privileged Unix service for Dekopon provider components. It derives caller identity from Unix peer credentials, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, restores replay identifiers from a verified owner-only audit chain, executes only statically linked Dekopon host interfaces.
+`dekopon-brokerd` is the separately deployed privileged Unix service for Dekopon provider components. It derives caller identity from Unix peer credentials, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, appends owner-only JSONL audit records, and executes only statically linked Dekopon host interfaces.
 
 Authorization and execution constraints are two separate files on purpose. `policiesPath` decides *who may do what*; `constraintSets` decides *how narrowly the broker then does it*. A policy edit can never widen a timeout, reach a new host, or bind a credential that was not already bound.
 
@@ -159,8 +159,7 @@ dekopon-brokerd provider verify \
 that they apply on the next broker restart; there is no hot reload.
 
 Operator commands never take `--config`; combining them is a usage error.
-`provider` requires `--lock-file` and `--store`, `sync` also `--provider-set`, and `audit verify`
-requires `--audit-path`. Usage errors exit 2; a failed command exits 1. Operator modes print
+`provider` requires `--lock-file` and `--store`; `sync` also requires `--provider-set`. Usage errors exit 2; a failed command exits 1. Operator modes print
 results on stdout and text diagnostics on stderr at `warn` (override with `RUST_LOG`); the daemon
 logs JSON on stdout at `info`.
 
@@ -488,7 +487,10 @@ stdout, filtered by `RUST_LOG`.
 
 Host, broker, and server limits have conservative defaults (including a 2 MiB frame ceiling) when their entire sections are omitted. `hostLimits` and `brokerLimits` also default field by field, so a partial section keeps the absent-section value for everything it does not name — which is what lets a deployment set `maxTotalMemoryBytes` or `maxReplayIds` alone. `serverLimits` stays all-or-nothing: when it is present every field is required. Unknown fields and unknown API versions are rejected. Startup also requires aggregate provider metadata, every mapped peer's capability response, and the *widest* response any session could receive to fit the frame ceiling. That last bound is the one that matters in a gateway deployment: the connecting peer is typically granted nothing itself, while the principals its `identityMappings` name hold the capability sets that actually reach the wire through an attested `capabilities`. The agent catalog belongs to the gateway, so those contexts cannot be enumerated here and are bounded instead. Shutdown grace must cover one configured host deadline plus two complete frame deadlines, and it is one grace for the whole process: all Unix connections drain under that one deadline rather than each taking a fresh grace period.
 
-`maxReplayIds` should be at least `auditMaxRecords`; the Helm chart's default configuration sets both to 200 000. The built-in default does not satisfy this: `brokerLimits.maxReplayIds` defaults to 100 000 while `serverLimits.auditMaxRecords` defaults to 200 000, so a configuration that omits `brokerLimits` refuses every invocation with `capacity-exhausted` at half its audit budget; set `brokerLimits: { maxReplayIds: 200000 }` explicitly. Both bounds are permanent when reached — the ledger never evicts, is restored from durable history on restart, and the audit log does not rotate — and a denial spends one audit record but a full ledger slot, so an undersized ledger refuses every invocation with `capacity-exhausted` long before the audit bound it was meant to outlast.
+`brokerLimits.maxReplayIds` bounds the process-local invocation-ID ledger (default 100 000;
+chart default 200 000). The ledger never evicts during a process lifetime; exhaustion returns
+`capacity-exhausted`, not a retryable outage. Restart starts an empty ledger. Audit file growth
+is independent of this memory bound and requires operator disk monitoring.
 
 ### Compilation cache and the concurrent memory budget
 
@@ -525,27 +527,19 @@ SIGINT and SIGTERM stop Unix acceptance, drain bounded in-flight connections und
 
 ## Audit
 
-The broker opens the owner-only audit file directly, verifies its chain, and restores replay
-identifiers before listening. A readable valid nonempty audit can start on its own.
+The broker appends metadata-only JSONL records with `sequence` (one-based file line ordinal) and
+`event`. Open counts bounded newline-delimited lines in fixed memory without decoding events,
+verifying integrity, or restoring invocation IDs. Old bytes remain untouched; existing sequence
+fields are not trusted as ordinals. A private readable nonempty file can start on its own.
 `run` returns `Result<(), BrokerdError>` after clean shutdown.
 
-### Verifying a chain offline
-
-`audit verify` runs the same sequence, previous-hash, and record-hash check the daemon runs at
-startup, without binding a socket, reading daemon configuration, or taking the daemon's exclusive
-lock — so it also answers for a retained copy the broker is no longer serving:
-
-```console
-dekopon-brokerd audit verify \
-  --audit-path /home/dekopon/.local/state/dekopon/audit.jsonl
-```
-
-It prints the record count and the chain head, takes the same `--output json` and the same usage
-and exit rules as the provider commands above, and exits non-zero with the reason on any failure.
-A broken chain is reported separately from a file that could not be read: an interrupted append
-leaves an unterminated final record, which is not the same finding as a record that was edited.
-The whole chain is held in memory while it is checked, so a log past the default
-`auditMaxRecords` is refused rather than read.
+The file must be regular, single-link, owner-only and exclusively writer-locked, without symlink
+following; its owner and private parent are checked before listening. `auditMaxLineBytes` bounds
+both existing lines and new serialized records (excluding the newline). Unterminated tails are
+refused without truncation or repair. Appends write and flush, not fsync; a failed or cancelled
+append can leave partial bytes and poisons the open handle. There is no rollback, crash-recovery,
+file rotation, or total file-size bound. Monitor disk space; I/O failure remains explicit and a
+failed terminal append still reports that provider work may already have completed.
 
 ## Boundaries
 
@@ -558,7 +552,7 @@ The whole chain is held in memory while it is checked, so a log past the default
 - Audit records carry the determining `policy_ids`, the `policy_digest` of the evaluated set, and
   the symbolic name of the `credential` the invocation selected.
 - Generic WASI and ambient I/O imports remain unavailable.
-- The durable JSONL chain is mutation-evident and replay-restoring.
+- Audit appends contain metadata only; replay rejection is bounded process-local state.
 - Credential resolution is destination-bound, capability-scoped, and optionally agent-scoped. Providers receive only explicitly linked Dekopon host interfaces and policy constraints; an injected credential exists solely inside the native HTTP engine and is never observable by guest code.
 - Direct `dekopon-run` subcommands retain their import-free host. Only explicit `dekopon-run broker` subcommands connect as unprivileged identity-free clients.
 

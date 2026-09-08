@@ -589,7 +589,7 @@ async fn unmapped_peer_receives_no_capability_information() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn full_service_restores_replay_state_from_verified_audit() {
+async fn full_service_appends_after_restart_without_replay_restoration() {
     let uid = current_uid();
     let directory = tempfile::tempdir().expect("create service fixture");
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
@@ -641,13 +641,19 @@ async fn full_service_restores_replay_state_from_verified_audit() {
         .expect("first service task exits")
         .expect("first service stops cleanly");
     assert_eq!(
-        dekopon_brokerd::verify_audit_file(&audit_path)
-            .expect("verified audit")
-            .records,
+        fs::read_to_string(&audit_path)
+            .expect("read audit")
+            .lines()
+            .inspect(|line| {
+                let _: dekopon_broker::AuditRecord =
+                    serde_json::from_str(line).expect("complete audit record");
+            })
+            .count(),
         2
     );
     assert!(!checkpoint_path.exists());
     assert!(!checkpoint_lock_path.exists());
+    let prior = fs::read(&audit_path).expect("read prior audit bytes");
 
     let (stop, stopped) = oneshot::channel::<()>();
     let second_config = config_path.clone();
@@ -658,23 +664,38 @@ async fn full_service_restores_replay_state_from_verified_audit() {
     let replay = client
         .invoke(None, request("invoke-durable-service"))
         .await
-        .expect("replay receives an accounted denial");
-    assert_eq!(replay.outcome, InvocationOutcome::Denied);
-    assert_eq!(replay.error.as_deref(), Some("replayed-invocation"));
+        .expect("restarted invocation receives an accounted result");
+    assert_eq!(replay.outcome, InvocationOutcome::Succeeded);
+    assert_eq!(replay.error, None);
     stop.send(()).expect("stop second service");
     second
         .await
         .expect("second service task exits")
         .expect("second service stops cleanly");
     assert_eq!(
-        dekopon_brokerd::verify_audit_file(&audit_path)
-            .expect("verified audit")
-            .records,
-        3
+        fs::read_to_string(&audit_path)
+            .expect("read audit")
+            .lines()
+            .inspect(|line| {
+                let _: dekopon_broker::AuditRecord =
+                    serde_json::from_str(line).expect("complete audit record");
+            })
+            .count(),
+        4
     );
     assert!(!checkpoint_path.exists());
     assert!(!checkpoint_lock_path.exists());
     let audit = fs::read_to_string(&audit_path).expect("read audit before truncation");
+    assert!(audit.as_bytes().starts_with(&prior));
+    let ordinals = audit
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<dekopon_broker::AuditRecord>(line)
+                .expect("complete audit record")
+                .sequence
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ordinals, [1, 2, 3, 4]);
     let first = audit.lines().next().expect("audit has a first record");
     fs::write(&audit_path, format!("{first}\n")).expect("write valid-prefix truncation");
     run(&config_path, async {})
@@ -854,9 +875,14 @@ when { context.capability == "http-probe.fetch"
         .expect("service task exits")
         .expect("service stops");
     assert_eq!(
-        dekopon_brokerd::verify_audit_file(&audit_path)
-            .expect("verified audit")
-            .records,
+        fs::read_to_string(&audit_path)
+            .expect("read audit")
+            .lines()
+            .inspect(|line| {
+                let _: dekopon_broker::AuditRecord =
+                    serde_json::from_str(line).expect("complete audit record");
+            })
+            .count(),
         4
     );
     let audit = fs::read_to_string(audit_path).expect("read audit");
@@ -940,9 +966,8 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
     else {
         panic!("expected a remote broker failure, got {never_ran}");
     };
-    // Nothing executed, so this is safe to resubmit — and futile. The audit log does not rotate,
-    // so every fresh invocation identifier fails on the same append until an operator raises
-    // `auditMaxRecords` or moves the file, which is why it is not the retriable class.
+    // Nothing executed, so this is safe to resubmit — and futile in this bounded in-memory log.
+    // Every fresh identifier fails on the same append until the embedding addresses capacity.
     assert_eq!(unran_code, ERROR_CAPACITY_EXHAUSTED);
     assert!(
         unran_message.contains("operator action"),
@@ -959,9 +984,9 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
         .expect("server shuts down");
 }
 
-/// The other permanent exhaustion, and the one a restart cannot clear: the replay ledger restores
-/// every Decision identifier from durable history, so a bound reached once is reached again on the
-/// next boot. Reporting it as `broker-unavailable` invited a client to retry forever.
+/// The other process-lifetime exhaustion: the replay ledger retains
+/// every reserved identifier until restart. Reporting it as `broker-unavailable` would invite
+/// a client to retry forever against that same exhausted process.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_exhausted_replay_ledger_is_not_reported_as_a_transient_outage() {
     let uid = current_uid();

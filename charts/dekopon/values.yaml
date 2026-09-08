@@ -135,20 +135,17 @@ broker:
             maxOutputBytes: 1048576
       serverLimits:
         # A present section requires every field. These are the daemon's own defaults except
-        # auditMaxLineBytes, which the chart lowers so the record cap binds before the volume
-        # does — see "Sizing the audit volume" in README.md.
+        # auditMaxLineBytes, which bounds each record, not lifetime file growth.
+        # Monitor disk space — see "Sizing the audit volume" in README.md.
         maxFrameBytes: 2097152
         ioTimeoutMs: 30000
         maxConnections: 64
-        auditMaxRecords: 200000
         auditMaxLineBytes: 8192
         shutdownGraceMs: 120000
       brokerLimits:
         # Unlike serverLimits, brokerLimits and hostLimits default field by field: everything
-        # omitted here keeps the daemon's own value. The replay ledger never evicts and is
-        # restored from durable history at startup, so the stock 100 000 would answer every
-        # invocation `capacity-exhausted` at half the auditMaxRecords budget above — see
-        # "Size maxReplayIds with it" in README.md.
+        # omitted here keeps the daemon's own value. Replay IDs are bounded process-local memory;
+        # restart starts an empty ledger. This limit does not bound audit file growth.
         maxReplayIds: 200000
       hostLimits:
         # maxMemoryBytes bounds one invocation (64 MiB by default); nothing bounds all of them at

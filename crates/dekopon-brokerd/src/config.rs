@@ -7,7 +7,7 @@ use std::{
 
 use dekopon_broker::{
     AttestorGrant, AuthenticatedContext, BrokerLimits, ChatMemoryConfig, ConstraintSet,
-    ContextError, DEFAULT_MAX_AUDIT_LINE_BYTES, DEFAULT_MAX_AUDIT_RECORDS,
+    ContextError, DEFAULT_MAX_AUDIT_LINE_BYTES,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerHostOptions, LockedProviderSource};
 use dekopon_broker_protocol::{
@@ -300,7 +300,6 @@ pub struct ServerLimitsConfig {
     pub max_frame_bytes: usize,
     pub io_timeout_ms: u64,
     pub max_connections: usize,
-    pub audit_max_records: usize,
     pub audit_max_line_bytes: usize,
     pub shutdown_grace_ms: u64,
 }
@@ -311,7 +310,6 @@ impl Default for ServerLimitsConfig {
             max_frame_bytes: DEFAULT_MAX_FRAME_BYTES,
             io_timeout_ms: u64::try_from(DEFAULT_IO_TIMEOUT.as_millis()).unwrap_or(u64::MAX),
             max_connections: DEFAULT_MAX_CONNECTIONS,
-            audit_max_records: DEFAULT_MAX_AUDIT_RECORDS,
             audit_max_line_bytes: DEFAULT_MAX_AUDIT_LINE_BYTES,
             shutdown_grace_ms: u64::try_from(DEFAULT_SHUTDOWN_GRACE.as_millis())
                 .unwrap_or(u64::MAX),
@@ -755,7 +753,6 @@ async fn resolve(
     }
     if config.server_limits.max_connections == 0
         || config.server_limits.max_connections > HARD_MAX_CONNECTIONS
-        || config.server_limits.audit_max_records == 0
         || config.server_limits.audit_max_line_bytes == 0
         || config.server_limits.audit_max_line_bytes > HARD_MAX_FRAME_BYTES
         || config.server_limits.shutdown_grace_ms == 0

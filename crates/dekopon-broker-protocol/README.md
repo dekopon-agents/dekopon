@@ -95,9 +95,13 @@ pre-execution storage setup failures above.
 
 The server logs `broker_outcome_unaudited` with the invocation identifier for exactly this case, so the invocation needing manual reconciliation is identifiable without correlating client-side state.
 
-`capacity-exhausted` separates a permanent exhaustion from a momentary one. `broker-unavailable` invites a retry under a fresh invocation identifier; the replay ledger and the audit log are conditions under which that retry can never succeed. Neither structure evicts or rotates, and restart does not clear the ledger — `scan_audit_file` restores an entry for every Decision event in durable history — so a client told `broker-unavailable` would loop against a permanently capped broker. The server logs `broker_capacity_exhausted` alongside the refusal; the fix is an operator raising `brokerLimits.maxReplayIds` or `serverLimits.auditMaxRecords`, or moving the audit file aside, not anything the caller can do.
+`capacity-exhausted` separates an exhausted process-local replay ledger or bounded embedding
+in-memory audit log from a momentary outage. Neither evicts during its lifetime, so clients must
+not retry automatically. The server logs `broker_capacity_exhausted`; an operator must address
+capacity. A broker restart starts an empty replay ledger; the append-only file has no record cap.
+See [chart sizing](../../charts/dekopon/README.md#size-maxreplayids-with-it) for the separate
+resident-memory and disk-growth budgets.
 
-Size `brokerLimits.maxReplayIds` at or above `serverLimits.auditMaxRecords`, and raise the two together; the reasoning and the chart defaults are in [chart sizing](../../charts/dekopon/README.md#size-maxreplayids-with-it).
 
 A refused or unresolvable DRN is never a failure response: refusal is a normal `Denied` invocation
 (`secret-denied`) and a post-authorization source failure is a normal `Failed` invocation

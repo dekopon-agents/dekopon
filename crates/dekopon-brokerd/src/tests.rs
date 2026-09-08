@@ -398,6 +398,22 @@ async fn strict_configuration_resolves_paths_and_rejects_unknown_fields() {
             if source.to_string().contains("unknown field") && source.to_string().contains(key)));
     }
 
+    let mut retired = document.clone();
+    retired["serverLimits"] = json!({
+        "maxFrameBytes": dekopon_broker_protocol::DEFAULT_MAX_FRAME_BYTES,
+        "ioTimeoutMs": 30000,
+        "maxConnections": config::DEFAULT_MAX_CONNECTIONS,
+        "auditMaxLineBytes": dekopon_broker::DEFAULT_MAX_AUDIT_LINE_BYTES,
+        "shutdownGraceMs": 120000,
+        "auditMaxRecords": 200000
+    });
+    write_config(&path, &retired);
+    let error = config::load(&path, uid)
+        .await
+        .expect_err("retired server limit is unknown");
+    assert!(matches!(error, config::ConfigError::Decode { source }
+        if source.to_string().contains("unknown field") && source.to_string().contains("auditMaxRecords")));
+
     let mut invalid = document;
     invalid["principal"] = json!("payload-forgery");
     fs::write(
@@ -1041,7 +1057,6 @@ async fn refused_storage_and_frame_bounds_keep_the_field_that_refused_them() {
         "maxFrameBytes": dekopon_broker_protocol::DEFAULT_MAX_FRAME_BYTES,
         "ioTimeoutMs": 0,
         "maxConnections": config::DEFAULT_MAX_CONNECTIONS,
-        "auditMaxRecords": dekopon_broker::DEFAULT_MAX_AUDIT_RECORDS,
         "auditMaxLineBytes": dekopon_broker::DEFAULT_MAX_AUDIT_LINE_BYTES,
         "shutdownGraceMs": 120_000
     });

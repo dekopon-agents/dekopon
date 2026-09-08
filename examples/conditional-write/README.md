@@ -7,7 +7,7 @@ the record moved between the read and the write, and nobody's edit gets silently
 The gateway authenticates the message and vouches for the sender; it decides nothing. The broker
 maps that Slack identity to the principal `cpetersen`, checks a Cedar policy, resolves the two
 capabilities that policy permits, injects an API token bound to `api.example.com`, executes the
-`http-probe` WebAssembly component, and hash-links the result into an audit chain naming the person
+`http-probe` WebAssembly component, and appends metadata-only audit records naming the person
 who asked. The token is never visible to the model, the shell session, the agent, or the component
 that uses it — the broker's native HTTP engine adds the header after the guest's own headers have
 been validated, and audit records `credentialInjected: true` and never a value.
@@ -198,7 +198,7 @@ constraint set allows two requests and two methods: one `GET`, then one `POST` c
 that was true a moment ago. A retry against an unchanged record converges; a retry after someone
 else's edit refuses instead of overwriting work nobody read.
 
-## 7. What the audit chain now holds
+## 7. What the audit log holds
 
 ```console
 tail -1 ~/.local/state/dekopon/audit.jsonl | jq .
@@ -207,7 +207,6 @@ tail -1 ~/.local/state/dekopon/audit.jsonl | jq .
 ```json
 {
   "sequence": 6,
-  "previousHash": "sha256:1d0a…",
   "event": {
     "type": "execution",
     "invocation": "dekopond-session-9f1c4a7b0e35d268-3",
@@ -236,8 +235,7 @@ tail -1 ~/.local/state/dekopon/audit.jsonl | jq .
       { "method": "POST", "authority": "api.example.com", "status": 200,
         "requestBytes": 486, "responseBytes": 1204, "credentialInjected": true }
     ]
-  },
-  "recordHash": "sha256:c7e2…"
+  }
 }
 ```
 
@@ -258,13 +256,13 @@ What each part is doing:
   credential per agent is one where the two organizations' writes would otherwise be identical
   records.
 - No record body, no request payload, no written text, no Slack message, no URL path or query. The
-  chain records that something happened and to what; provider output is a digest.
+  log records that something happened and to what; provider output is a digest.
 
 Records 1 through 5 are the rest of the same session — among them a `decision` and an `execution`
 for the read, then the `decision` that allowed this write. Every identifier in the session shares
 the `trace`, and each invocation extends it with a counter, so `grep dekopond-session-9f1c4a7b0e35d268`
-recovers the whole conversation's effects. Each record carries `previousHash` and `recordHash`, and
-the broker verifies the entire chain on every start.
+recovers the whole conversation's effects. Each JSONL record contains its `sequence` ordinal
+and metadata-only `event`.
 
 ## 8. When it does not work
 
@@ -281,7 +279,7 @@ the broker verifies the entire chain on every start.
 | Gateway exits: broker unreachable | the broker is not running, or the two socket paths disagree | the `gateway_broker_ready` probe never logs |
 
 The split matters when you are debugging: a session refused *before* it starts leaves a gateway log
-line and an empty audit chain, while anything refused *during* one leaves an audited denial naming
+line without a broker audit record for that request, while anything refused *during* one leaves an audited denial naming
 the gateway, the subject, and the reason. Both refuse; only one of them ever proposed anything.
 
 ## What this deployment does not buy yet

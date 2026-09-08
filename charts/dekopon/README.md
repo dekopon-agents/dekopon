@@ -354,50 +354,22 @@ then either delete the file in the volume and restart, or set `reseed` for one r
 `local-path` is the target cluster's only StorageClass, it is RWO, and **`ALLOWVOLUMEEXPANSION` is
 `false`**. `state.size` is final for the life of the volume.
 
-The audit log does not rotate. At `auditMaxRecords` it returns `AuditError::Full` and refuses
-further appends; on open it refuses outright. So the file's size is bounded, and the arithmetic
-is:
+The audit log is append-only and does not rotate or have a total record/byte cap. Monitor disk
+space and provision the volume for expected traffic and retention. The default `state.size` is
+**2Gi**; filling it can fail an append with partial bytes left behind, not a clean capacity refusal.
 
-| Quantity | Value |
-|---|---|
-| `auditMaxRecords` default | 200 000 |
-| `auditMaxLineBytes` default | 64 KiB |
-| Absolute ceiling at stock limits | 200 000 × 64 KiB = **12.2 GiB** |
-| A measured `external-write` record with two HTTP calls, full-length hashes, compact JSONL | **1 279 bytes** |
-| A full log of records that size | 200 000 × 1 279 B ≈ **244 MiB** |
-
-12.2 GiB is not a volume you fund on an 8 GB Raspberry Pi, and 244 MiB has no margin for a chattier
-record. `state.size` defaults to **2Gi**, which is ~10.7 KiB per record at the record cap — eight
-times the measured record — so the daemon's own bound, not the disk, is what stops the broker.
-
-The chart's default `broker.yaml` also sets `auditMaxLineBytes: 8192`, which pulls the absolute
-ceiling to 200 000 × 8 KiB = 1.53 GiB, strictly inside a 2Gi volume. That is the point: you want the
-record cap to bind before the filesystem does, because `AuditError::Full` is a clean designed
-refusal and `ENOSPC` in the middle of an append is not. If you raise `auditMaxLineBytes`, raise
-`state.size` in the same change — and remember you cannot raise it after the volume exists.
-
-`serverLimits` is all-or-nothing: when the section is present every field is required.
-`brokerLimits` and `hostLimits` are not — each of their fields defaults on its own to the value an
-absent section would have produced, which is why the chart's default configuration can set
-`maxReplayIds` and `maxTotalMemoryBytes` without restating the fifteen bounds around them.
+The chart sets `auditMaxLineBytes: 8192` (the daemon default is 64 KiB), bounding each serialized
+record but not lifetime file growth. Existing lines are subject to the same per-line ceiling.
+`serverLimits` is all-or-nothing: when present every field is required. `brokerLimits` and
+`hostLimits` instead default each field independently.
 
 ### Size `maxReplayIds` with it
 
-`auditMaxRecords` is not the only bound that ends in a permanent refusal, and it is not the first
-one a busy deployment reaches. The broker's replay ledger holds `brokerLimits.maxReplayIds`
-invocation identifiers (stock **100 000**), never evicts, and is restored from durable history at
-startup — one entry per Decision event — so it is cumulative across restarts exactly like the audit
-file. A *denial* costs one audit record and one full ledger slot, while an executed invocation costs
-two audit records and one slot, so with the stock ledger against `auditMaxRecords: 200000` a
-denial-heavy history exhausts the ledger at half the audit budget, before the designed
-`AuditError::Full` refusal ever fires.
-
-Either bound reached answers every client `capacity-exhausted` and logs
-`broker_capacity_exhausted`. Neither is recoverable by retry or by restart. `maxReplayIds` must be
-at least `auditMaxRecords`, so the chart's default `broker.yaml` sets it to **200 000**, matching
-its `auditMaxRecords`. The ledger holds one bounded identifier string per entry, so matching
-200 000 costs tens of MiB of resident memory — cheaper than a broker that refuses every invocation
-until someone edits a values file and rolls the pod. Raise the two together.
+`brokerLimits.maxReplayIds` bounds process-local invocation identifiers, not file records.
+The chart keeps **200 000** entries (daemon default **100 000**); the ledger never evicts during
+that process lifetime. Exhaustion returns `capacity-exhausted` and logs `broker_capacity_exhausted`,
+so clients must not retry automatically. Restart starts an empty ledger, without reading IDs
+from audit history. Budget this resident memory separately from append-only disk growth.
 
 ## Storage, uninstall, and recovery
 

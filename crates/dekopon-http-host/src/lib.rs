@@ -645,7 +645,7 @@ impl BufferedHttpClient {
     /// Executes one request beneath both the broker grant and native ceilings.
     pub async fn send(&mut self, request: Request) -> Result<Response, HttpError> {
         // Fields mirror `HttpCallEvidence` exactly, and that is the point rather than a
-        // coincidence: this span is a second egress path for the same call the audit chain
+        // coincidence: this span is a second egress path for the same call the audit log
         // records, so it carries the same sanitized set and no more. URL paths and queries,
         // request and response headers, and both bodies are absent here for the same reason they
         // are absent from evidence — a trace backend is not an audit boundary.

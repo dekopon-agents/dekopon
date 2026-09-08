@@ -22,9 +22,7 @@ dekopon-core.workspace = true
 dekopon-policy.workspace = true
 dekopon-storage-host.workspace = true
 serde.workspace = true
-# `raw_value` lets one serialization of an audit event be spliced into both the hash material and
-# the durable line, without either JSON document being assembled by hand.
-serde_json = { workspace = true, features = ["raw_value"] }
+serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

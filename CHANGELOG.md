@@ -17,6 +17,11 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Removed
 
+- Broker audit-chain verification, replay restoration from disk, and the `audit verify` command.
+  Audit records now append only `sequence` and `event`; existing bytes are not migrated or
+  integrity-checked. Remove `serverLimits.auditMaxRecords` from broker configuration; unknown
+  fields remain errors. The file has no total record cap or crash-durability guarantee.
+
 - Retire the broker web UI, its listener configuration, and gateway inventory/token reporting; daemon traces, model accounting, and provider execution remain.
 
 - Retired the standalone catalog CLI and package; model-account login, status, logout, and guarded credential export now live in `dekopond auth chatgpt`, without gateway configuration or startup.

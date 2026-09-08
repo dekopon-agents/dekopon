@@ -70,7 +70,6 @@ New in 0.12.0 — a structural scrub of the whole tree:
   naming the check that refused rather than the message it printed.
 - `grep -E` and `sed -E` accept real regular expressions in the sandboxed shell, bounded in pattern
   size and nesting; without `-E` patterns stay literal.
-- `dekopon-brokerd audit verify --audit-path <PATH>` verifies a durable audit chain offline.
 - `brokerLimits` and `hostLimits` default field by field, so naming one field no longer drops the
   defaults of every other field in its block.
 - The `schemars` feature of `dekopon-core`, `dekopon-capability`, and `dekopon-protocol` is opt-in.
