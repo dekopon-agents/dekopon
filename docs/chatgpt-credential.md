@@ -6,7 +6,7 @@ containerized `dekopond` configured with `kind: chatgptSubscription` therefore c
 credential on its own, and it never will — the flow is interactive by design.
 
 This document is the whole lifecycle for getting a credential from a local login into a cluster and
-keeping it correct afterwards. Read [`cli.md`](cli.md) for the command's contract, [`run.md`](run.md)
+keeping it correct afterwards. Read [`cli.md`](cli.md) for the command's contract, [`inference.md`](inference.md)
 for the inference boundary, and [`dekopond.md`](dekopond.md) for the `models[].authFile` setting that
 names the file in a pod.
 
@@ -29,7 +29,7 @@ predecessor, and any copy of the file taken before that refresh is dead.
 on a sibling `chatgpt-auth.json.lock` before refreshing, then re-reads the credential file and
 adopts the stored record when its `expiresAt` is later than the one in memory. That is the whole
 defence against the rotation trap: `dekopond` shares one client per configured model, but each
-concurrent turn runs on a credential snapshot taken before the lock, and a `dekopon-run` prompt
+concurrent turn runs on a credential snapshot taken before the lock, and an external embedding
 or a second daemon on the same host, can open the same file; two arriving near the refresh
 margin would otherwise both present the same refresh token, and OAuth reuse detection can revoke the
 entire token family rather than just failing the second call. The same

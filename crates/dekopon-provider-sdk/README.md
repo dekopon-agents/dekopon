@@ -21,7 +21,7 @@ impl Provider for Example {
 dekopon_provider_sdk::export_provider!(Example);
 ```
 
-The immediate host accepts only read-only manifests and supplies no WASI imports. The SDK WIT file is mirrored by `dekopon-provider-host`; update both copies together and keep their equality test passing.
+The SDK owns the canonical provider WIT. Update every surviving broker and guest mirror together; the mirror list and equality gates are in `docs/development.md`.
 
 Two more paths exist for a provider that contributes words to the sandboxed shell: [command-line providers](#command-line-providers) (`run-command`, the current contract: help pages, usage errors, stdin, and proposals, hand-rolled or through the optional [`clap` layer](#the-clap-layer)) and the legacy [command words](#command-words) rewrite (`resolve-command`).
 
@@ -49,13 +49,13 @@ mod bindings {
 dekopon_provider_sdk::export_provider_with_bindings!(Example, bindings);
 ```
 
-The composed world must retain the root `describe` and `invoke` exports. Additional imports are embedded in the component type and fail closed unless an authorized broker linker implements them. The direct `dekopon-run` host remains empty and rejects such components; see the [`http-probe`](../../examples/providers/http-probe/README.md) fixture.
+The composed world must retain the root `describe` and `invoke` exports. Additional imports are embedded in the component type and fail closed unless an authorized broker linker implements them. See the [`http-probe`](../../examples/providers/http-probe/README.md) fixture.
 
 ## Host feature
 
 Providers never enable it, and the default feature set is empty, so a `wasm32-unknown-unknown` build
 never compiles it. The optional `host` feature adds `dekopon_provider_sdk::host`: the Wasmtime
-plumbing `dekopon-provider-host` and `dekopon-broker-host` both need — manifest validation behind an
+plumbing consumed by `dekopon-broker-host` and external embeddings — manifest validation behind an
 effect gate, the report a whole conflicting provider set fails with, the bounds on one store, the
 engine constructor, and the command-export plumbing: `command_export` reads which of `run-command`
 and `resolve-command` a compiled component offers (the newer one wins when both exist),

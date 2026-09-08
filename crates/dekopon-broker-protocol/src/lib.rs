@@ -1766,9 +1766,9 @@ impl ResolvedBrokerSocket {
 
 /// Inputs used to resolve the broker socket precedence.
 ///
-/// This is the one definition of that precedence. `dekopon-run`, `dekopond`, and the operator
-/// console all consult it, so a socket a client finds here is the socket the documentation
-/// describes, and a change lands in one place rather than three that must be kept in step.
+/// This is the one definition of that precedence. `dekopond` and the operator
+/// console consult it, so a socket a client finds here is the socket the documentation
+/// describes, and a change lands in one place rather than multiple copies that must be kept in step.
 ///
 /// Unlike configuration discovery, no candidate is probed for existence: a broker socket is absent
 /// whenever the daemon is not running, so the tightest resolved tier is always trusted and

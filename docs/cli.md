@@ -4,7 +4,7 @@
 It dispatches synchronously before gateway configuration discovery, telemetry, runtime creation,
 or transport startup. `--config` is required only for ordinary gateway serving and is ignored by auth.
 The standalone catalog CLI has been retired; catalogs remain loaded and validated by `dekopon-config`.
-The runner remains documented in [`run.md`](run.md), and daemon serving in [`dekopond.md`](dekopond.md).
+Daemon serving is documented in [`dekopond.md`](dekopond.md).
 
 ## Commands
 
@@ -32,7 +32,7 @@ Non-parse failures retain their error causes and additional debug context.
 
 ## ChatGPT subscription authentication
 
-`dekopond auth chatgpt login` uses OpenAI's Codex device authorization flow and writes only to Dekopon's credential file. `status` reports state without revealing tokens, and `logout` removes only Dekopon's file. The credential file is resolved in this exact order: `--auth-file <PATH>`, `DEKOPON_CHATGPT_AUTH_FILE`, `$XDG_CONFIG_HOME/dekopon/chatgpt-auth.json`, `$HOME/.config/dekopon/chatgpt-auth.json`, then `%APPDATA%/dekopon/chatgpt-auth.json`; when no tier applies the command fails asking for `DEKOPON_CHATGPT_AUTH_FILE`. Discovery treats a variable exported with an empty value as unset and falls through to the next tier, and refuses a discovered path that is not absolute — a relative `DEKOPON_CHATGPT_AUTH_FILE` or `XDG_CONFIG_HOME` would otherwise leave the rotating refresh token in whatever directory the process started in. Only `--auth-file` is taken verbatim. See [`run.md`](run.md) for inference behavior and the complete security boundary.
+`dekopond auth chatgpt login` uses OpenAI's Codex device authorization flow and writes only to Dekopon's credential file. `status` reports state without revealing tokens, and `logout` removes only Dekopon's file. The credential file is resolved in this exact order: `--auth-file <PATH>`, `DEKOPON_CHATGPT_AUTH_FILE`, `$XDG_CONFIG_HOME/dekopon/chatgpt-auth.json`, `$HOME/.config/dekopon/chatgpt-auth.json`, then `%APPDATA%/dekopon/chatgpt-auth.json`; when no tier applies the command fails asking for `DEKOPON_CHATGPT_AUTH_FILE`. Discovery treats a variable exported with an empty value as unset and falls through to the next tier, and refuses a discovered path that is not absolute — a relative `DEKOPON_CHATGPT_AUTH_FILE` or `XDG_CONFIG_HOME` would otherwise leave the rotating refresh token in whatever directory the process started in. Only `--auth-file` is taken verbatim. See [`inference.md`](inference.md) for inference behavior and [`security-model.md`](security-model.md) for the boundary.
 
 ### Exporting a credential for a secret store
 

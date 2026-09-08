@@ -1122,7 +1122,7 @@ fn per_agent_credentials_decode_validate_their_keys_and_select_by_actor() {
         set.credential_for(&agent("dekoponville-github")),
         Some("github-pat")
     );
-    // No agent, no override: the shape a direct `dekopon-run` peer arrives in.
+    // No agent, no override: the shape a direct service peer arrives in.
     assert_eq!(
         set.credential_for(&Actor::Service {
             principal: "local-user"

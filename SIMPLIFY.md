@@ -383,8 +383,16 @@ prior stop at `wave1-stop.md`; historical free-space figures are not current hea
   adjacent D6 documentation work before final PR readiness. D3c owns SECURITY's
   runner/executable surface. Parent acceptance precedes D3c; full-wave2, D2d, final
   workspace/archive/install/MSRV/CI/provider/metrics/housekeeping/PR work remains.
-- **D3c — pending.** Atomic runner/provider-host/manifests/lock/release/packaging retirement
-  includes D3d; needs D8a/D8b/D3a/D3b/D3g; commit: —; no orphan interval.
+- **D3c — landed; full-wave validation pending.** Reviewed source commit
+  `5c88ed93fe890131f48ab8bbda4a9fa9e7cf31f2`, integrated with provenance in this
+  unit commit. Independent HIGH review accepts atomic runner/provider-host retirement,
+  22 members, shared runtime/assertion preservation, scoped tests, complete consumer
+  dispositions and six deterministic guest comparisons. Integration metadata precedes
+  actual workspace/non-Rust/real two-daemon smoke gates; their exact-head receipts are
+  external, not a claim of completion here. No runner command or test migration.
+  D3f retains final architecture/design ownership and changelog; D2d retains durability
+  prose and named D6 documentation obligations. Final archive/install/MSRV/hosted gates
+  remain pending. Negative capability: no direct runner or import-free host executable.
 - **D3e — pending.** Both daemon dependency directions after D3c; commit: —; discoveries: —.
 - **D2d — pending.** Remaining durability prose after D2c; commit: —;
   named future-owned hits must remain explicitly reported, never silently excluded.

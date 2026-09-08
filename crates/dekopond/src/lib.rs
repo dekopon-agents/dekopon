@@ -14,7 +14,7 @@
 //! drives is submitted to `dekopon-brokerd` as an *attested*
 //! proposal naming the sender's canonical subject, and the broker alone maps that subject to a
 //! principal, decides what it may do, and executes it. The daemon's dependency set excludes every
-//! privileged broker crate for the same reason `dekopon-run`'s does, and CI enforces it.
+//! privileged broker crate: orchestration holds no effect authority, and CI enforces it.
 //!
 //! Everything arriving from a chat service is untrusted, including the agent's own standing orders
 //! from the catalog: neither can assert identity, name a principal, or widen a grant.

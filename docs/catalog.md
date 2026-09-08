@@ -16,7 +16,6 @@ which is which.
 |---|---|---|
 | `dekopond` | Yes, at startup | Binds each route to an agent, resolves that agent's model, hands its `instructions` to the model as a system prompt, mounts its `skills` on every session the route serves. |
 | `dekopon-brokerd` | **No** | The broker does not link `dekopon-config` and never sees this file. It declares the `Dekopon::Agent` Cedar type and matches instances by name without enumerating them. |
-| `dekopon-run` | **No** | The runner loads Wasm components by path and has no catalog concept; it links `dekopon-config` only for `load_skill`, which its `--skill <DIRECTORY>` flag uses to mount a skill directory in the format below without a catalog. |
 
 The consequence worth internalizing: **nothing an agent may actually do comes from this file.** The
 broker's `constraintSets` and Cedar policy decide that, and neither reads the catalog. An agent's
@@ -153,8 +152,6 @@ What consumes a loaded skill:
   [`observability.md`](observability.md).
 - `inspect_agent_config` lists mounted skills by name, description, and resource paths — never the
   text.
-- `dekopon-run --skill <DIRECTORY>` mounts the same format with no catalog; see
-  [`run.md`](run.md#mounting-skills).
 
 A skill is operator-authored text handed to the model, exactly as `instructions` is. It shapes how
 the agent answers and nothing else: it cannot widen a capability, name a principal, or influence an
@@ -274,8 +271,8 @@ value is inert. `policyProfile`, `status`, and `labels` are optional and may sim
   [`dekopon-agent/src/skills.rs`](../crates/dekopon-agent/src/skills.rs), `prompt_block` and
   `render_skill`, use name, description, body and resource paths/text, not those optional
   front-matter fields. [`dekopond/src/session.rs`](../crates/dekopond/src/session.rs)
-  constructs self-inspection with name, description and resource paths only. The runner mounts
-  the same loaded skills through the shared agent layer; no surviving renderer promises to
+  constructs self-inspection with name, description and resource paths only. The gateway mounts
+  the loaded skills through the shared agent layer; no surviving renderer promises to
   display the optional front matter. Metadata scalars remain converted to text by the loader.
 
 ## What the loader checks
@@ -309,8 +306,7 @@ loadable or wholly refused — there is no partial mode where some resources are
 - [`cli.md`](cli.md) — model-auth formats and exit codes.
 - [`dekopond.md`](dekopond.md) — routes, model endpoints, sessions, and conversations; the consumer
   that makes `instructions`, `skills`, `enabled`, and `modelClass` load-bearing.
-- [`run.md`](run.md#mounting-skills) — the runner's `--skill` flag, which mounts the same skill
-  format with no catalog in the loop.
+- [`improvement.md`](improvement.md) — catalog-mounted skills and opt-in suggestions.
 - [`dekopon-brokerd` contract](../crates/dekopon-brokerd/README.md#boundaries) — `constraintSets`, Cedar policy, and why the broker's own
   configuration is what decides authority.
 - [`crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.md) — the broker

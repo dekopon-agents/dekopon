@@ -99,7 +99,7 @@ pub(crate) trait ModelFactory: Send + Sync {
     fn build(&self, model: &ModelConfig) -> Result<SharedModel, SessionError>;
 }
 
-/// The real factory: whatever `models:` configured, constructed exactly as `dekopon-run` does.
+/// The real factory: whatever `models:` configured, constructed by the shared model library.
 pub(crate) struct ConfiguredModels;
 
 /// Builds the gateway's image generator once at startup, reading its credential only when a bound

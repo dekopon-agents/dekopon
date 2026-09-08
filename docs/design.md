@@ -335,7 +335,7 @@ If authority ownership is unclear, stop and update the design before adding code
 - [`architecture.md`](architecture.md) — current crate structure and deployment topology.
 - [`development.md`](development.md) — source/test map, generated artifacts, validation, CI, and PR workflow.
 - [`cli.md`](cli.md) — current model-auth operator contract, output, and exit codes.
-- [`run.md`](run.md) — experimental immediate provider, prompt, limit, and tracing contract.
+- [`dekopon-agent`](../crates/dekopon-agent/README.md) — shared prompt and session limits.
 - [`inference.md`](inference.md) — model request types and wire shape, cache optimization and retention caveats, current conversation memory, and exploratory long-term memory.
 - [`dekopond.md`](dekopond.md) — the unprivileged chat gateway's configuration, transports, session bounds, authorization flow, and committed conversation contract.
 - [`dekopon-brokerd` contract](../crates/dekopon-brokerd/README.md#boundaries) — committed broker-mediated HTTP contract and authority boundary.

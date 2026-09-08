@@ -658,7 +658,7 @@ Compute it only over calls where both fields were reported. A key proves Dekopon
 
 - [`dekopond.md`](dekopond.md) — routing, persistent-conversation bounds, cache-key privacy, and telemetry.
 - [`security-model.md`](security-model.md#conversation-memory-as-a-trust-surface) — retained text and prompt-injection dwell time.
-- [`run.md`](run.md#chatgptcodex-subscription) — account login and the one-shot subscription runner.
+- [`cli.md`](cli.md) — isolated model-account login.
 - [`chatgpt-credential.md`](chatgpt-credential.md) — rotating subscription credential lifecycle.
 - [`observability.md`](observability.md) — model usage fields and payload gating.
 - [OpenAI Prompt Caching](https://developers.openai.com/api/docs/guides/prompt-caching) — public API behavior, not a subscription-endpoint guarantee.

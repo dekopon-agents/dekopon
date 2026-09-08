@@ -16,9 +16,7 @@ dekopon-provider-sdk-testkit
 dekopon-broker-protocol
 dekopon-config
 dekopon-agent
-dekopon-provider-host
 dekopon-policy
 dekopon-broker
 dekopon-brokerd
-dekopon-run
 dekopond

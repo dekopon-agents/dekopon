@@ -2,7 +2,13 @@
 
 Broker-owned asynchronous Wasmtime host for provider components that import the project-owned `dekopon:http@1.0.0` or `dekopon:storage@0.1.0` interfaces.
 
-Unlike `dekopon-provider-host`, this crate is privileged machinery. Its public invocation API consumes one non-cloneable `AuthorizedInvocation`; each call receives a fresh bounded store, exact HTTP constraints, and a statically linked native HTTP implementation. It is intended for `dekopon-brokerd`, never direct `dekopon-run` execution.
+This crate is privileged machinery. Its public invocation API consumes one non-cloneable `AuthorizedInvocation`; each call receives a fresh bounded store, exact HTTP constraints, and a statically linked native HTTP implementation. It is intended for `dekopon-brokerd`, never unprivileged orchestration.
+
+Output limits bound what the host parses, not peak allocation: the JSON-over-WIT adapter
+lifts the whole guest string before measuring it. Per-memory size and memory/table/instance
+count ceilings bound that allocation path independently. For command words the input
+ceiling counts argv plus the piped value before creating a store. A refusal remains an
+opaque routed `provider-error` response; only broker-side diagnostics name the bound.
 
 ## Execution boundary
 

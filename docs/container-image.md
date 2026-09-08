@@ -14,11 +14,11 @@ any published tag works.
 
 ## What it is
 
-One image, `ghcr.io/dekopon-agents/dekopon`, carrying all three binaries for `linux/amd64` and
+One image, `ghcr.io/dekopon-agents/dekopon`, carrying both daemon binaries for `linux/amd64` and
 `linux/arm64`. It is a separate GHCR package from the published WIT interface packages
 `dekopon/provider`, `dekopon/http`, and `dekopon/storage`, which are OCI artifacts rather than images.
 
-One image rather than three is a deployment fact, not a convenience. `dekopon-brokerd` binds a
+One image rather than two is a deployment fact, not a convenience. `dekopon-brokerd` binds a
 protected Unix socket and authenticates its peer with `SO_PEERCRED`; there is no TCP transport. A
 gateway can therefore only reach a broker through a shared filesystem namespace — in Kubernetes, a
 shared pod. Two containers in one pod running two images that must be version-locked buys nothing
@@ -26,7 +26,6 @@ that one image with two `command`s does not.
 
 | Path | Contents |
 |---|---|
-| `/usr/local/bin/dekopon-run` | Direct runner and broker client |
 | `/usr/local/bin/dekopon-brokerd` | Authenticated local capability broker |
 | `/usr/local/bin/dekopond` | Unprivileged chat gateway |
 | `/opt/dekopon/providers/*.wasm` | One in-tree conformance fixture plus exact pinned standalone Echo, JSONPlaceholder, and GitHub releases |
@@ -52,7 +51,7 @@ means the image and the tarball are the same bytes, and `sha256sum` proves it.
 
 [`../ci/stage-image-context.sh`](../ci/stage-image-context.sh) verifies before it trusts: it
 downloads each Linux archive, checks it against its published `.sha256`, runs `gh attestation
-verify --repo dekopon-agents/dekopon` on it, and only then extracts the three executables into the
+verify --repo dekopon-agents/dekopon` on it, and only then extracts the two executables into the
 build context. The workflow runs that script and so does a human building locally — two
 implementations of a verification path would drift, and the local one is the one nobody would
 run. The `Dockerfile` performs no network access at all.
@@ -73,7 +72,7 @@ naming a version node the runtime lacks — which is what forced the move.
 
 The image needs three things: the release executables, exact checksum- and provenance-verified
 provider components, and the two licences. The staging script copies exactly those into a scratch directory alongside the
-`Dockerfile`, asserts that the result is precisely that fourteen-file set, and builds from there.
+`Dockerfile`, asserts that the result is precisely that twelve-file set, and builds from there.
 
 The alternative — keeping the whole repository as the context and excluding the rest with a
 `.dockerignore` — is correct only for as long as every file added later stays matched by it. That
@@ -107,8 +106,9 @@ The `COPY` that places them uses `--chown` and deliberately no `--chmod`, becaus
 components therefore keep the mode they carry in the staged context, which the staging script
 normalises to `0644`.
 
-Only the fetched `echo-provider.wasm` loads on the direct runner. The other default components import
-HTTP, and fetched optional `memory-chat` imports JSONL; the immediate linker is empty and rejects all of them.
+The fetched `echo-provider.wasm` is import-free. The other default components import HTTP,
+and fetched optional `memory-chat` imports JSONL. All are loaded only through the broker,
+whose exact grants and independent ceilings constrain every invocation.
 Memory lives outside `/opt/dekopon/providers`, so a default directory scan cannot silently enable
 retention. An operator must name the exact optional file or explicitly scan its directory. The
 `storage-probe` and malicious `memory-reservation-probe` fixtures are not packaged anywhere in
@@ -128,10 +128,17 @@ mount will not, because those are symlink farms.
 
 ```console
 docker run --rm ghcr.io/dekopon-agents/dekopon:<VERSION> dekopond --help
-docker run --rm ghcr.io/dekopon-agents/dekopon:<VERSION> dekopon-run --version
-docker run --rm ghcr.io/dekopon-agents/dekopon:<VERSION> dekopon-run invoke \
-  --provider /opt/dekopon/providers/echo-provider.wasm echo.echo --input '{}'
+docker run --rm ghcr.io/dekopon-agents/dekopon:<VERSION> dekopon-brokerd --version
+ci/verify-image-broker.sh ghcr.io/dekopon-agents/dekopon:<VERSION>
 ```
+
+The Linux verifier requires Docker, Python 3 and sudo to create broker-owned private files.
+It starts the real broker with the baked echo component and waits under a deadline for the
+socket, which is bound only after compilation and description succeed. New releases also run
+the existing `probe` command; pre-retirement immutable releases lack it and require checkpoint
+configuration, so those prove component-load/startup only. Owned containers and private files
+are removed on exit. This proves the selected release's bytes, not a build of source HEAD.
+There is no replacement general invocation CLI.
 
 In Kubernetes the same selection is `command: ["dekopon-brokerd"]` or `command: ["dekopond"]` with
 `args` carrying `--config`.
@@ -194,16 +201,15 @@ provider ownership, and the byte-identity check.
 
 ## Build and check it locally
 
-The image is assembled from a release, so stage one first. Any published release works; the
-`Dockerfile` never cares which. This is the same script the workflow runs, with the same arguments.
+The image is assembled from a release, so stage one first. A release must contain both daemon archives and supported provider inputs; the
+`Dockerfile` copies their bytes without compiling them. This is the same script the workflow runs, with the same arguments.
 
 ```console
 work=$(mktemp -d)
 ci/stage-image-context.sh v0.3.0 "$work"
 docker buildx build --platform linux/arm64 --load -t dekopon:local "$work/context"
 docker run --rm dekopon:local dekopond --help
-docker run --rm dekopon:local dekopon-run invoke \
-  --provider /opt/dekopon/providers/echo-provider.wasm echo.echo --input '{}'
+ci/verify-image-broker.sh dekopon:local
 ```
 
 The script prints what it staged and the digest of each executable, so the allowlist is visible
@@ -238,4 +244,4 @@ sha256sum "$work/context/dist/arm64/dekopond"
 ```
 
 The last two must print the same digest. That is the assertion the whole design rests on, and
-`$work/binaries.sha256` records all six so the workflow can make it after the build.
+`$work/binaries.sha256` records all four so the workflow can make it after the build.

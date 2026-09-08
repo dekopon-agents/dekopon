@@ -15,7 +15,7 @@ include = ["src/**", "wit/**", "README.md", "Cargo.toml"]
 
 [features]
 default = []
-# Host-side plumbing shared by `dekopon-provider-host` and `dekopon-broker-host`. It pulls in
+# Host-side plumbing consumed by `dekopon-broker-host` and external embeddings. It pulls in
 # Wasmtime, so it is off by default and no `wasm32-unknown-unknown` guest build enables it.
 host = ["dep:thiserror", "dep:wasmtime"]
 # The `clap` layer over `Provider::run_command`: `dekopon_provider_sdk::cli::run_command` renders

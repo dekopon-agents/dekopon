@@ -17,14 +17,14 @@ This document follows one agent from a session that went badly to a catalog chan
 
 | Mechanism | Where it lives | What the model can do with it | What it never does |
 |---|---|---|---|
-| Skills | The catalog's `spec.skills` directories, `dekopon-run prompt --skill`, the agent a `dekopond` route binds | Read operator-authored instructions and resource files on demand | Grant authority, hold a secret, change between sessions |
+| Skills | The catalog's `spec.skills` directories and the agent a `dekopond` route binds | Read operator-authored instructions and resource files on demand | Grant authority, hold a secret, change between sessions |
 | `suggest_improvement` | The session, when the embedder opted in; the record in the telemetry backend | Record a typed, bounded note for the operator | Change an instruction, skill, limit, or grant; reach the person in chat |
 
 ### Skills: progressive disclosure of operator-authored knowledge
 
 A skill is a directory named after the skill holding a `SKILL.md` — YAML front matter with `name` (equal to the directory name; lowercase ASCII letters, digits, and single hyphens, at most 64 bytes) and `description` (non-blank, at most 1024 bytes), then Markdown instructions — and, optionally, supporting files beside it, each addressed by its `/`-separated relative path. This is the Agent Skills directory layout, so a `SKILL.md` that uses the specification's front-matter keys loads here unchanged, while a key the specification does not define is refused rather than ignored. [`catalog.md`](catalog.md#skills-are-directories-the-model-reads-on-demand) is the field-by-field contract and carries every bound: a 64 KiB `SKILL.md`, 256 KiB per resource, 64 resources, 1 MiB in all, four directory levels; hidden files skipped, symbolic links refused. [`examples/catalog/skills/pull-request-review`](../examples/catalog/skills/pull-request-review/SKILL.md) is one, mounted by the `reviewer` agent in [`examples/catalog/dekopon.yaml`](../examples/catalog/dekopon.yaml); its body tells the model to read the `references/risk-checklist.md` resource only when a diff touches authorization, credentials, or an external write.
 
-Where a skill lives decides who mounts it. An agent's `spec.skills` names directories relative to the catalog file. The loader reads every one whole at catalog load, reports every directory that does not load alongside the catalog's other problems — one catalog load diagnoses them all — and refuses two skills with one name for one agent, because a model could not tell two `read_skill` targets apart. `dekopond` binds the loaded skills to every route naming the agent and mounts them on every session of that route, shared rather than re-read, so a session never touches the filesystem. `dekopon-run prompt --skill <DIRECTORY>` mounts the same format with no catalog and fails before any model call when a directory does not load.
+Where a skill lives decides who mounts it. An agent's `spec.skills` names directories relative to the catalog file. The loader reads every one whole at catalog load, reports every directory that does not load alongside the catalog's other problems — one catalog load diagnoses them all — and refuses two skills with one name for one agent, because a model could not tell two `read_skill` targets apart. `dekopond` binds the loaded skills to every route naming the agent and mounts them on every session of that route, shared rather than re-read, so a session never touches the filesystem.
 
 The model meets a skill in three steps, each paid for only when the model decides it needs it:
 
@@ -44,7 +44,7 @@ A skill is operator-authored text handed to the model, exactly as `instructions`
 
 An agent that hit a limit, reached for a capability it was never granted, or found its standing instructions wrong has learned something its operator would pay to know — and can otherwise say so only in chat, to a person who may not be the operator. `suggest_improvement` gives that observation a typed shape and a tagged telemetry record, so an operator can aggregate a month of sessions by category and target instead of reading transcripts.
 
-**It is opt-in everywhere, and the opt-in is consent.** The tool is never offered unless the embedder asked for it: `dekopon-run prompt --suggestions` or `improvementSuggestions: true` on a `dekopond` route ([`dekopond.md`](dekopond.md#configuration)). The record carries model-authored text and is written in **either** payload mode — a suggestion nobody can read is not a suggestion — so offering the tool is what declares the telemetry sink in scope for that text. Nothing else widens with it: the record carries no chat text the gateway holds and no subject, only what the model chose to write into six bounded fields.
+**It is opt-in everywhere, and the opt-in is consent.** The tool is never offered unless the embedder asked for it: `improvementSuggestions: true` on a `dekopond` route ([`dekopond.md`](dekopond.md#configuration)). The record carries model-authored text and is written in **either** payload mode — a suggestion nobody can read is not a suggestion — so offering the tool is what declares the telemetry sink in scope for that text. Nothing else widens with it: the record carries no chat text the gateway holds and no subject, only what the model chose to write into six bounded fields.
 
 The tool's own description tells the model when to call it: after the task is done or when it is genuinely blocked, at most three times per session, never instead of answering, and that the note goes to the operator's telemetry rather than to the person it is talking with. A call is a JSON object of six strings:
 
@@ -61,7 +61,6 @@ Every text field is trimmed and stripped of control characters other than newlin
 
 Where a suggestion goes depends on who ran the session; in no case is it applied:
 
-- `dekopon-run` prints each one to **standard error** after the answer, so standard output stays the model's text: `suggestion i/n [category, confidence confidence] target: summary`, then an `  evidence:` line and a `  proposal:` line.
 - `dekopond` relays nothing to chat; the sender sees only the answer. The record exists in telemetry alone.
 - An embedder of `dekopon-agent` receives them as `PromptOutcome.suggestions`, already written to telemetry by the time they arrive.
 
@@ -84,7 +83,6 @@ Each of these is a decision, not a gap. Every artifact of the loop is either in 
 
 ## Related documents
 
-- [`run.md`](run.md#mounting-skills) — `--skill` and `--suggestions`.
 - [`dekopond.md`](dekopond.md#sessions) — how a route mounts its agent's catalog skills and opts into `improvementSuggestions`, and why nothing a suggestion records reaches chat.
 - [`catalog.md`](catalog.md#skills-are-directories-the-model-reads-on-demand) — the `spec.skills` field, the `SKILL.md` front matter, every bound, and what the loader refuses.
 - [`observability.md`](observability.md#refusals-errors-and-outcomes) — `agent.skill.read`, `agent.skill.refused`, `agent.improvement.suggested`, and `agent.improvement.refused`; transcript payloads remain opt-in.

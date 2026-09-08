@@ -20,7 +20,7 @@ Frames use a four-byte big-endian length followed by strict JSON. Reads, writes,
 
 `ClientError` distinguishes the phase a framing failure belongs to, because the wire's `broker-unavailable` / `outcome-unaudited` split is worth nothing if a client-local timeout erases it. A request-phase failure delivered nothing and is safe to resubmit under a fresh invocation identifier; a response-phase failure delivered the complete request and could not read the answer, so a write may already have happened. `ClientError::may_have_executed` answers that question for both cases and for the broker's own `outcome-unaudited` code; a caller that writes must surface it as non-retryable rather than resubmitting.
 
-This crate depends only on wire/domain/provider-metadata types, not `dekopon-broker`, `dekopon-broker-host`, or the native HTTP engine. It does not bind a socket or grant authority. `BrokerClient` can submit proposals and receive public capabilities/results only. Direct `dekopon-run` remains on its separate import-free component host. Explicit `dekopon-run broker` commands use this client, load no component, and gain no effect authority. `dekopond` is the other consumer, reaching the broker through `dekopon-agent`, carrying the attested on-behalf-of claim this protocol defines.
+This crate depends only on wire/domain/provider-metadata types, not `dekopon-broker`, `dekopon-broker-host`, or the native HTTP engine. It does not bind a socket or grant authority. `BrokerClient` can submit proposals and receive public capabilities/results only. `dekopond` is a consumer, reaching the broker through `dekopon-agent`, carrying the attested on-behalf-of claim this protocol defines.
 
 A chat claim carries a fully redacted bounded scope over configured transport ID, transport kind,
 canonical channel, and canonical conversation. Bounded string deserializers reject an oversized
@@ -37,6 +37,14 @@ direction rather than misinterpreting it. Pre-execution storage setup failures
 retain the stable public codes `storage-quota`, `storage-busy`, `storage-timeout`,
 `storage-corrupt`, and `storage-io`; `outcome-unaudited` remains reserved for a durable point that
 may already have been crossed.
+
+Shared socket discovery (`BrokerSocketDiscovery`) resolves an explicit path, then
+`DEKOPON_BROKER_SOCKET`, then `$XDG_RUNTIME_DIR/dekopon/broker.sock`, then
+`$HOME/.local/run/dekopon/broker.sock`. No applicable tier is a caller-owned error. Paths
+are not probed for existence: the tightest selected path remains authoritative while a
+daemon is stopped. Discovery never replaces socket metadata or connected server-UID
+validation. See the [current local process boundary](../../docs/security-model.md#current-local-process-boundary)
+for distinct daemon UIDs and protected IPC; the local chat socket remains owner-only.
 
 ## Attestation shape and legacy compatibility
 
@@ -62,7 +70,7 @@ An `attestation` does not gate the run either, but it is still a claim, and a cl
 
 ## Version and compatibility
 
-Upgrade `dekopond`, `dekopon-run`, and `dekopon-brokerd` together. The alpha protocol
+Upgrade `dekopond` and `dekopon-brokerd` together. The alpha protocol
 has no cross-release compatibility promise or negotiation. Start the broker first and
 stop it last: the gateway probes capabilities before connecting transports.
 The reporting-only operations `publishAgentInventory` and `publishModelUsage` and their

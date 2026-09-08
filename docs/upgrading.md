@@ -40,7 +40,7 @@ empty and does not restore previous data.
 
 ### Upgrade all three executables together
 
-`dekopon-run`, `dekopon-brokerd`, and `dekopond` are separately installable — Homebrew,
+`dekopon-brokerd` and `dekopond` are separately installable — Homebrew,
 crates.io, release archives, the container image, and the Helm chart with its own `image.tag` — so a
 mixed set is easy to end up with by accident. Do not. The local broker protocol has one version
 constant and both envelopes are strict-decoded; a newer broker adding a field to a response an older
@@ -82,17 +82,17 @@ swap in the order above.
 Not yet released; the version that carries it is named when it is cut. Nothing here needs a
 configuration edit.
 
-- **Upgrade the broker before its clients, and all four executables together.** The local protocol
-  stays `dekopon.dev/broker/v1alpha2`, but `dekopon-run --broker` and `dekopond` now send a provider
-  command word as `runCommand` — the word, its argv, and the optional piped value — and read back
+- **Upgrade the broker before its clients, and both daemons together.** The local protocol
+  stays `dekopon.dev/broker/v1alpha2`, but `dekopond` now sends a provider
+  command word as `runCommand` — the word, its argv, and the optional piped value — and reads back
   the guest's own outcome. A newer broker still answers the legacy `resolveCommand`, with a
   rendered page degraded to a decline carrying its stdout then stderr, so an older client keeps
   working for one release. The reverse does not hold: an older broker refuses `runCommand` as
   `invalid-request` at the `operation` tag, indistinguishable from a corrupt frame, so a newer
   client against an older broker reports every command word as a failed run until the broker moves.
-- **Upgrade the hosts before a provider adopts `run-command`.** A component built against
-  `dekopon:provider@0.3.0`'s `provider-cli` world exports `run-command`, which only a broker or
-  runner at this version looks up; an older host finds no `resolve-command` behind the manifest's
+- **Upgrade the broker host before a provider adopts `run-command`.** A component built against
+  `dekopon:provider@0.3.0`'s `provider-cli` world exports `run-command`, which the broker host
+  at this version looks up; an older host finds no `resolve-command` behind the manifest's
   `commandWords` and refuses the component at load. Components built against `0.1.0` or `0.2.0`
   keep loading unchanged and never receive a piped value.
 - **Embedders: `BrokerClient::resolve_command`, `RequestEnvelope::resolve_command`, and

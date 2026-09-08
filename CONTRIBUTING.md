@@ -45,11 +45,9 @@ Exercise the affected executable before submitting a CLI, config, or provider-ho
 ci/fetch-external-provider-components.sh examples/providers
 cargo test -p dekopon-config --test examples --locked
 cargo run -p dekopond -- auth chatgpt --help
-cargo run -p dekopon-run -- inspect --provider examples/providers/echo-provider.wasm
-cargo run -p dekopon-run -- invoke --provider examples/providers/echo-provider.wasm echo.echo --input '{}'
 ```
 
-The fixtures under `examples/providers/` are separate Cargo workspaces that root commands do not cover. They, the WIT mirrors, generated `.wasm` files, and the OpenObserve smoke test have their own validation rules: run the commands in [Provider example workspaces](docs/development.md#provider-example-workspaces) for every affected fixture, and [OpenObserve OTLP end-to-end test](docs/development.md#openobserve-otlp-end-to-end-test) for runner telemetry, OpenObserve example, or observability CI changes.
+The fixtures under `examples/providers/` are separate Cargo workspaces that root commands do not cover. They, the WIT mirrors, generated `.wasm` files, and the OpenObserve smoke test have their own validation rules: run the commands in [Provider example workspaces](docs/development.md#provider-example-workspaces) for every affected fixture, and [OpenObserve OTLP end-to-end test](docs/development.md#openobserve-otlp-end-to-end-test) for daemon telemetry, OpenObserve example, or observability CI changes.
 
 ## Change guidelines
 

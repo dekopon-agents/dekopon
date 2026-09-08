@@ -10,7 +10,7 @@ transport-acceptance receipts, and optional broker-owned durable chat memory are
 tested. A route is `oneShot` unless configured otherwise; durable
 memory is a separate broker/agent opt-in and never changes that default into automatic replay. The chart enforces the [current local process boundary](security-model.md#current-local-process-boundary).
 
-Its dependency set excludes `dekopon-broker`, `dekopon-broker-host`, `dekopon-http-host`, `dekopon-storage-host`, `dekopon-policy`, and `dekopon-brokerd`, and CI rejects any of them appearing in the gateway's normal dependency tree — the same discipline already applied to `dekopon-run`.
+Its dependency set excludes `dekopon-broker`, `dekopon-broker-host`, `dekopon-http-host`, `dekopon-storage-host`, `dekopon-policy`, and `dekopon-brokerd`, and CI rejects any of them appearing in the gateway's normal dependency tree.
 
 [`../examples/conditional-write/`](../examples/conditional-write/README.md) is the complete
 worked deployment: a Slack DM from an owner-mapped sender, two narrow `http-probe` capabilities, a
@@ -32,7 +32,7 @@ apiVersion: dekopon.dev/dekopond/v1alpha1
 catalogPath: /path/to/dekopon.yaml            # dekopon-config catalog with the agents routes name
 
 broker:                                       # optional; every field defaults
-  socketPath: /path/to/broker.sock            # default: DEKOPON_BROKER_SOCKET, then dekopon-run's documented discovery order; unresolvable is a startup failure
+  socketPath: /path/to/broker.sock            # default: DEKOPON_BROKER_SOCKET, then XDG_RUNTIME_DIR/dekopon/broker.sock, then HOME/.local/run/dekopon/broker.sock; unresolvable is a startup failure
   serverUid: 501                              # default: the daemon's own effective UID
   maxFrameBytes: 2097152                      # default: the protocol's own bound
   ioTimeoutMs: 30000
@@ -652,7 +652,7 @@ Spans follow [`observability.md`](observability.md):
 
 The prompt loop's own spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `prompt.image_generation`, `shell.script`, `shell.command`) nest under `gateway.session`, and the broker's `broker.invocation` joins the same trace through the proposal's `traceParent` field (a W3C `traceparent` value); [`observability.md`](observability.md#gateway-spans) is the authoritative list.
 
-The metadata-only default carries transport, agent, and outcome and nothing else. Chat text and canonical subject identifiers appear in **telemetry** only under `telemetryPayloads: true`, as the `gateway.message.received` log event — the same gate `dekopon-run` uses for prompts and script text. Enabling it declares the telemetry sink in scope for the messages this daemon handles. This does not gate model input: the gateway-authored canonical participant label is always sent to the selected model on a shared turn. A route with `improvementSuggestions: true` makes one more declaration of the same kind: its `agent.improvement.suggested` records carry the model's bounded suggestion text in either payload mode, which is what setting the flag consents to.
+The metadata-only default carries transport, agent, and outcome and nothing else. Chat text and canonical subject identifiers appear in **telemetry** only under `telemetryPayloads: true`, as the `gateway.message.received` log event. Enabling it declares the telemetry sink in scope for the messages this daemon handles. This does not gate model input: the gateway-authored canonical participant label is always sent to the selected model on a shared turn. A route with `improvementSuggestions: true` makes one more declaration of the same kind: its `agent.improvement.suggested` records carry the model's bounded suggestion text in either payload mode, which is what setting the flag consents to.
 
 The prompt cache key is behind that same gate, as `gateway.session.cache_key`, and not on the metadata-only default. It names nobody — that is the whole design — but within one process it still joins one private or shared conversation's turns, and that linkage is what the default exists to withhold. It rides its own log event rather than joining `gateway.message.received`, so a key and a canonical subject never appear on one line.
 
@@ -673,7 +673,7 @@ declared subject.
 - [`design.md`](design.md) — the authority model this daemon deliberately sits outside of.
 - [`security-model.md`](security-model.md) — attestation, trust boundaries, the distinct-UID boundary, and the trust surface conversation memory accepts.
 - [`dekopon-brokerd` contract](../crates/dekopon-brokerd/README.md#boundaries) — the broker contract the gateway proposes into.
-- [`run.md`](run.md) — the one-shot runner that shares the same session layer.
+- [`dekopon-agent`](../crates/dekopon-agent/README.md) — the shared session layer.
 - [`inference.md`](inference.md) — request types and wire JSON, cache retention caveats, current chat memory, and the unexplored long-term-memory boundary.
 - [`observability.md`](observability.md) — span semantics, payload gating, and data minimization.
 

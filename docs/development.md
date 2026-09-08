@@ -35,14 +35,12 @@ Prefer targeted tests while iterating, then run the scope-appropriate checks bel
 | Broker authorization, evidence, and audit core | `crates/dekopon-broker/src/lib.rs` | Inline context/hash-chain/durable-file tests, `crates/dekopon-broker/tests/broker.rs` constraint-validation, redaction, and replay-restart tests, and `crates/dekopon-broker/tests/policy_decisions.rs` for the workflow decision table |
 | Broker local protocol/client | `crates/dekopon-broker-protocol/src/lib.rs` | Inline strict framing, deadline, authority-omission, socket-metadata, and peer-UID tests |
 | Authenticated Unix broker service, private secret sources, and offline provider manager | `crates/dekopon-brokerd/src/`; strict public-DRN/private-map adapters in `secrets.rs`; provider set/lock, bounded OCI transport, content store, and lifecycle commands in `provider_manager.rs` | Inline strict-config/socket/CLI tests; secret-map aggregate validation, strict JSON/YAML projection, secure-file and mock-backed 1Password/Vault/AWS/GCP/Azure/Kubernetes adapters; local mock-registry resolution, locked-sync, offline list/verify, atomic-activation, and blob-hygiene tests; plus `crates/dekopon-brokerd/tests/server.rs` mapped/unmapped-peer, end-to-end invocation, clean-shutdown, and restart-replay tests, and `crates/dekopon-brokerd/tests/examples.rs` pinning `examples/conditional-write/` against the loaded `http-probe` manifest and Cedar grammar |
-| Immediate Wasmtime host | `crates/dekopon-provider-host/src/lib.rs`, `crates/dekopon-provider-host/wit/` | `crates/dekopon-provider-host/tests/host.rs` |
 | Sandboxed script language | `crates/dekopon-shell/src/` | Per-module unit tests plus the kept-versus-dropped grammar corpus in `crates/dekopon-shell/src/interp/tests.rs` |
-| Tokio process lifecycle | `crates/dekopon-process/src/` | Inline typed-result, Tokio task-panic, cooperative-cancellation, and payload-free tracing tests plus a public doctest; consumed by `dekopon-run`'s `legacy-shell` and `direct-command` nodes and `dekopon-agent`'s cancellable `broker-command` node |
+| Tokio process lifecycle | `crates/dekopon-process/src/` | Inline typed-result, Tokio task-panic, cooperative-cancellation, and payload-free tracing tests plus a public doctest; consumed by `dekopon-agent`'s cancellable `broker-command` node |
 | Shared prompt loop, safe agent-configuration/image-generation meta views, session capability dispatch, mounted skills, and opt-in improvement suggestions | `crates/dekopon-agent/src/`; the skills listing and `read_skill` tool in `skills.rs`, the `suggest_improvement` tool and its bounds in `improvement.rs` | Inline prompt/meta-tool, one-attempt byte-free image output, bounded redaction-shape, composite-dispatch, and stub-broker-socket leg tests, plus inline listing/argument, suggestion-validation tests in those two modules |
-| Direct runner, shell subcommand, broker client, local/OTLP tracing and lifecycle logs | `crates/dekopon-run/src/` | `crates/dekopon-run/tests/cli.rs`, including authenticated broker subprocess exchange, shell limit/rejection coverage, `prompt --skill`/`--suggestions` against a mock model endpoint, and an unmountable skill refused before any model call |
 | Chat gateway configuration, text/image transports, routing, bounded agent sessions, credential-free self-inspection, conversation history, and prompt cache keys | `crates/dekopond/src/` | `crates/dekopond/src/tests.rs` for strict configuration, routing, admission, effective config introspection, conversation replay and eviction, cache-key minting/rotation, generated-image delivery, route-mounted skills read on demand, the per-route `improvementSuggestions` opt-in, and loopback Slack/Discord/Telegram/WhatsApp transports; `crates/dekopond/src/transport/whatsapp.rs` for webhook signature, refusal, saturation, listener, and reply-splitting tests; `crates/dekopond/tests/gateway.rs` for a real `dekopon-brokerd` end to end; `crates/dekopond/tests/examples.rs` for the checked-in walkthrough configuration |
 | Provider component test harness | `crates/dekopon-provider-sdk-testkit/src/lib.rs` | `crates/dekopon-provider-sdk-testkit/tests/harness.rs`, driving exact fetched `echo`/`memory-chat` releases plus the checked `storage-probe` and `cli-probe` fixtures |
-| Rust provider fixtures | `examples/providers/cli-probe/`, `http-probe/`, `memory-reservation-probe/`, `provider-v0-1-compat/`, `provider-v0-2-compat/`, and `storage-probe/` | Separate-workspace tests, checked-component import inspection, host/runner rejection, loopback mocks, and broker/VFS tests; exact standalone echo/JSONPlaceholder/memory-chat fixtures are fetched by `ci/fetch-external-provider-components.sh` |
+| Rust provider fixtures | `examples/providers/cli-probe/`, `http-probe/`, `memory-reservation-probe/`, `provider-v0-1-compat/`, `provider-v0-2-compat/`, and `storage-probe/` | Separate-workspace tests, checked-component import inspection, broker-host validation, loopback mocks, and broker/VFS tests; exact standalone echo/JSONPlaceholder/memory-chat fixtures are fetched by `ci/fetch-external-provider-components.sh` |
 | End-to-end deployment example | `examples/conditional-write/` | `crates/dekopon-brokerd/tests/examples.rs`, `crates/dekopon-config/tests/examples.rs`, `crates/dekopond/tests/examples.rs` |
 | Agent skill example | `examples/catalog/skills/pull-request-review/` (`SKILL.md` plus `references/risk-checklist.md`), mounted by the `reviewer` agent in `examples/catalog/dekopon.yaml` | Loaded with the catalog by `crates/dekopon-config/tests/examples.rs` |
 | Shared test scaffolding | `crates/dekopon-test-support/src/` | Not published and never a normal dependency: `provider_fixture`, the `LoopbackServer` builder, `content_length`, one `tracing` `CaptureLayer`, `snapshot_tree`, and `shutdown_on`, reached only as a path `[dev-dependencies]` entry |
@@ -65,13 +63,13 @@ Skills are catalog resources too. `Agent.spec.skills` (`dekopon-protocol`) names
 
 Keep Clap syntax in `cli.rs`, execution separate from rendering, and process exits documented. Add parser tests and black-box tests. Machine-readable JSON/YAML shapes and exit codes need compatibility consideration even when table output can evolve.
 
-`dekopond auth` does not load the catalog. `dekopon-run` consumes model credentials but does not own account-lifecycle commands. Its explicit broker subcommands must remain identity-free clients; do not add principal, actor, policy, constraints, credentials, or authorization arguments.
+`dekopond auth` does not load the catalog. Broker protocol clients remain identity-free proposal clients; do not add principal, actor, policy, constraints, credentials, or authorization arguments.
 
 ### Model clients or prompt tools
 
-Generic model types and transports belong in `dekopon-model`; the shared bounded prompt/tool loop belongs in `dekopon-agent` (`prompt.rs`), which `dekopon-run prompt` and `dekopond` both embed. Gateway image generation is also a model client: its fixed public endpoint and credential remain in `dekopon-model`, while the shared prompt loop carries generated bytes through a request-local output slot rather than a model message. Keep credentials and generated bytes inside their typed boundaries and out of providers, broker protocol, history, and traces. Mock network protocols in tests; never read or import another application's credential store.
+Generic model types and transports belong in `dekopon-model`; the shared bounded prompt/tool loop belongs in `dekopon-agent` (`prompt.rs`), which `dekopond` and external clients embed. Gateway image generation is also a model client: its fixed public endpoint and credential remain in `dekopon-model`, while the shared prompt loop carries generated bytes through a request-local output slot rather than a model message. Keep credentials and generated bytes inside their typed boundaries and out of providers, broker protocol, history, and traces. Mock network protocols in tests; never read or import another application's credential store.
 
-Skills and the `suggest_improvement` tool live beside the prompt loop in `dekopon-agent` (`skills.rs`, `improvement.rs`), which is why that crate depends on `dekopon-config` for `Skill`. A skill body reaches the model only through `read_skill`, never the prompt prefix; `suggest_improvement` is offered only where the embedder opted in (`--suggestions`, `improvementSuggestions`) because its record carries model-authored text whether or not payload telemetry is on. The contract is in [`improvement.md`](improvement.md).
+Skills and the `suggest_improvement` tool live beside the prompt loop in `dekopon-agent` (`skills.rs`, `improvement.rs`), which is why that crate depends on `dekopon-config` for `Skill`. A skill body reaches the model only through `read_skill`, never the prompt prefix; `suggest_improvement` is offered only where the embedder opted in (`improvementSuggestions`) because its record carries model-authored text whether or not payload telemetry is on. The contract is in [`improvement.md`](improvement.md).
 
 Provider JSON Schemas are exposed to the model, but there is no general JSON Schema validator in the host. The host requires an object-shaped schema and object invocation input; each provider must still validate its capability-specific fields and constraints.
 
@@ -80,7 +78,6 @@ Provider JSON Schemas are exposed to the model, but there is no general JSON Sch
 The SDK and host provider WIT files are mirrored and must remain byte-identical:
 
 - `crates/dekopon-provider-sdk/wit/provider.wit`
-- `crates/dekopon-provider-host/wit/provider.wit`
 
 The buffered HTTP WIT package and guest/host copies are also mirrored:
 
@@ -104,7 +101,7 @@ The broker host and imported guests also mirror the provider package:
 - `examples/providers/memory-reservation-probe/wit/deps/provider.wit`
 - `examples/providers/storage-probe/wit/deps/provider.wit`
 
-Update all copies together and keep their equality checks passing. The SDK copy is the publication source for the `dekopon:provider@0.3.0` WIT package. That package contains the same `provider` world—exactly the `describe` and `invoke` exports and zero imports—plus a `provider-cli` world adding `run-command` and a `provider-commands` world adding the legacy `resolve-command`, and is stored at `ghcr.io/dekopon-agents/dekopon/provider:0.3.0`. The `0.1.0` and `0.2.0` packages remain published and their components remain loadable: a host reads which command export a component's type offers at load and looks it up by name at instantiation rather than requiring it of the bound world, calling `run-command` when both exist. `provider-v0-1-compat/wit/deps/provider.wit` and `provider-v0-2-compat/wit/deps/provider.wit` freeze those historical texts and are deliberately not mirrors; the WIT package workflow fails if a later package version appears under either fixture's `wit/`. Packaging this existing contract adds distribution, not guest authority: the immediate linker remains empty.
+Update all copies together and keep their equality checks passing. The SDK copy is the publication source for the `dekopon:provider@0.3.0` WIT package. That package contains the same `provider` world—exactly the `describe` and `invoke` exports and zero imports—plus a `provider-cli` world adding `run-command` and a `provider-commands` world adding the legacy `resolve-command`, and is stored at `ghcr.io/dekopon-agents/dekopon/provider:0.3.0`. The `0.1.0` and `0.2.0` packages remain published and their components remain loadable: a host reads which command export a component's type offers at load and looks it up by name at instantiation rather than requiring it of the bound world, calling `run-command` when both exist. `provider-v0-1-compat/wit/deps/provider.wit` and `provider-v0-2-compat/wit/deps/provider.wit` freeze those historical texts and are deliberately not mirrors; the WIT package workflow fails if a later package version appears under either fixture's `wit/`. Packaging this existing contract adds distribution, not guest authority: the broker authorizes every effect.
 
 WIT package versions and Rust crate versions are independent. Providers depend on
 the WIT interface versions they import; a broker host crate may register adapters
@@ -113,9 +110,21 @@ require provider rebuilds.
 
 The root [`wkg.toml`](../wkg.toml) and [`wkg.lock`](../wkg.lock) retain the immutable provider package metadata and dependencies. [`../wit/http/wkg.toml`](../wit/http/wkg.toml) plus [`../wit/http/wkg.lock`](../wit/http/wkg.lock), and [`../wit/storage/wkg.toml`](../wit/storage/wkg.toml) plus [`../wit/storage/wkg.lock`](../wit/storage/wkg.lock), independently define the HTTP and storage packages. The shared [`wkg/config.toml`](../wkg/config.toml) maps the namespace to GHCR. The workflow publishes the import-free `dekopon:provider@0.3.0` worlds and the interface-only `dekopon:http@1.0.0` and `dekopon:storage@0.1.0` packages independently. Published package versions are immutable. Change every mirror and increment the affected WIT package version before publishing a changed contract; the publication workflow rebuilds generated components, byte-compares them with the checked artifacts, and rejects different bytes for an existing package version.
 
-Immediate providers must remain read-only and import-free; adding WASI or a host import there is an authority change, not a convenience refactor. The exact fetched echo v0.1.0 component decodes to zero imports even though its standalone source compiles `dekopon-provider-storage` with the empty default feature set, proving that merely depending on the facade grants and imports nothing. `dekopon-broker-host` is the separate privileged adapter: it links only the project-owned HTTP and storage interfaces, consumes `AuthorizedInvocation` plus an exact optional storage grant, and maps WIT values to `dekopon-http-host` or `dekopon-storage-host`. The native engines consume exact grants beneath independent host ceilings. Neither host authenticates callers, evaluates policy, constructs authorization, injects credentials, or writes audit records.
+The exact fetched echo v0.1.0 component decodes to zero imports even though its standalone
+source compiles `dekopon-provider-storage` with the empty default feature set: depending on
+the facade grants and imports nothing. `dekopon-broker-host` links only project-owned HTTP
+and storage interfaces, consumes `AuthorizedInvocation` and an exact optional storage grant,
+and maps WIT values to native engines enforcing exact grants beneath independent ceilings.
+The host does not authenticate callers, evaluate policy, or construct authorization.
 
-Both hosts run on one copy of everything beneath that difference. `dekopon-provider-sdk`'s optional `host` feature owns the manifest rules, the effect gate the immediate host passes and the broker deliberately does not, the report a whole conflicting provider set fails with, the store bounds, and the engine constructor; the seven shared `DEFAULT_MAX_*` constants live there too and remain re-exported, deprecated, from their old paths in both hosts for one minor cycle. The feature is off by default and pulls in Wasmtime, so no `examples/providers/*` guest build compiles it — `cargo check -p dekopon-provider-sdk --target wasm32-unknown-unknown` covers that, and the same check with `--features clap` proves the SDK's optional `clap` layer (`cli::run_command`, built without `env` or `color`) compiles for a guest. What is not shared is each host's linker and how it stops a guest that runs too long: the immediate host ticks an epoch from a deadline thread, and the broker host yields on a fuel interval so a Tokio deadline can cancel the call.
+The SDK's optional `host` feature retains manifest validation (including the opt-in effect
+gate), complete conflicting-provider-set reports, store bounds, engine construction, and the
+seven shared `DEFAULT_MAX_*` constants. The broker host retains deprecated constant re-exports
+for one minor cycle. These SDK APIs also serve external embeddings and are not retired with
+the direct host. The feature is off by default and pulls in Wasmtime, so guest builds must not
+enable it. Check wasm32 both with default features and with `--features clap`; the optional
+`cli::run_command` adapter is built without `env` or `color`. The broker owns its linker and
+yields on fuel so a Tokio deadline can cancel a call.
 
 The repository-owned checked components are generated:
 
@@ -128,7 +137,7 @@ The repository-owned checked components are generated:
 | `examples/providers/provider-v0-2-compat/src/lib.rs` | `examples/providers/provider-v0-2-compat/build.sh` | `examples/providers/provider-v0-2-compat-provider.wasm` |
 | `examples/providers/storage-probe/src/lib.rs` | `examples/providers/storage-probe/build.sh` | `examples/providers/storage-probe-provider.wasm` |
 
-Never edit `.wasm` files directly. Each in-tree source directory is a separate Cargo workspace with its own lockfile, so root workspace format, lint, and test commands do **not** cover it. Echo, JSONPlaceholder, and memory-chat source and Wasm are not tracked here: `ci/fetch-external-provider-components.sh examples/providers` installs their exact ignored v0.1.0 fixtures after verifying core-pinned release checksums. Publication CI rebuilds every repository-owned checked component with the pinned provider artifact toolchain (`rustc 1.97.0`, `wasm-tools 1.236.1`) and byte-compares it before inspection; it separately fetches and inspects the standalone releases. `http-probe` and fetched JSONPlaceholder each decode to exactly one HTTP import. Fetched memory-chat decodes to JSONL only and three provider exports; `cli-probe` (the `clap`-layer guest: three provider exports including `run-command`), `memory-reservation-probe` (the hand-rolled `run-command` guest, same three exports), and the provider-v0.1 and v0.2 compatibility fixtures are import-free; `storage-probe` (the legacy `resolve-command` guest at the current package) decodes to durable-files only and three provider exports. None may import WASI. Direct-host and `dekopon-run inspect` tests reject every imported component.
+Never edit `.wasm` files directly. Each in-tree source directory is a separate Cargo workspace with its own lockfile, so root workspace format, lint, and test commands do **not** cover it. Echo, JSONPlaceholder, and memory-chat source and Wasm are not tracked here: `ci/fetch-external-provider-components.sh examples/providers` installs their exact ignored v0.1.0 fixtures after verifying core-pinned release checksums. Publication CI rebuilds every repository-owned checked component with the pinned provider artifact toolchain (`rustc 1.97.0`, `wasm-tools 1.236.1`) and byte-compares it before inspection; it separately fetches and inspects the standalone releases. `http-probe` and fetched JSONPlaceholder each decode to exactly one HTTP import. Fetched memory-chat decodes to JSONL only and three provider exports; `cli-probe` (the `clap`-layer guest: three provider exports including `run-command`), `memory-reservation-probe` (the hand-rolled `run-command` guest, same three exports), and the provider-v0.1 and v0.2 compatibility fixtures are import-free; `storage-probe` (the legacy `resolve-command` guest at the current package) decodes to durable-files only and three provider exports. None may import WASI. Broker-host tests enforce the exact supported imports and reject WASI.
 
 ### Dependencies, crates, CI, or releases
 
@@ -148,20 +157,12 @@ Neither that workflow nor `.github/workflows/container-image.yml` triggers on `r
 
 ## Runtime facts that are easy to miss
 
-Immediate host:
-
-- A `ProviderRegistry` retains compiled Wasmtime `Component` values for its lifetime. `HostOptions::compile_cache_dir`, exposed as `dekopon-run --compile-cache`, is the only cross-process cache and is off unless a directory is named.
-- Every describe or invoke operation creates a fresh bounded store and component instance.
-- One shared runtime mutex serializes immediate component execution; current calls are not parallel.
-- The linker is empty: no WASI, filesystem, network, environment, clock, random, or credential imports reach a component.
-- The host validates bounds, routing, read-only manifests, object-shaped inputs, and typed wire responses. Capability-specific argument validation remains provider-owned.
-- Immediate provider output is raw JSON. It is not broker evidence, an `InvocationResult`, or an authorization receipt.
-- Prompt mode always offers the `bash` model tool, whose `script` argument runs on `dekopon-shell`; `prompt --skill` adds `read_skill` and `prompt --suggestions` adds `suggest_improvement` (the gateway may add its own meta tools; see `crates/dekopon-agent/src/prompt.rs`). Model tool selection and arguments remain untrusted, and a `bash` call carrying no string `script` ends the session.
-- The prompt loop is bounded by `--max-steps`, at most ten tool calls per model turn, and a whole-session `--shell-max-capability-calls` ceiling spent across every script rather than refreshed per script.
-- `prompt --broker` adds a second dispatch leg for capabilities direct mode cannot serve. Direct capabilities are always preferred; the broker stays the sole authority, so its denials reach the script as exit code `126`.
-- `dekopon-run shell` runs provider loading plus `dekopon-shell` as one opaque, joined, non-interruptible `dekopon-process` node on Tokio's blocking pool. This keeps synchronous provider and interpreter work off runtime workers without changing shell pipeline semantics. Its bounds are independent of the Wasm ones: Wasm fuel bounds one component call, while the interpreter's step, recursion, output, deadline, and capability-call ceilings bound how many such calls a script can drive. The interpreter never reads the host process environment.
-- The one exception to "no clock, no environment" inside a script is the off-by-default `--shell-allow-clock`, which grants the `date` builtin a UTC wall-clock reading and nothing else. Unset, `date` is "command not found"; it never consults an environment variable, so `TZ` stays unobservable either way. This bounds the interpreter only — the Wasm linker's clock import stays absent regardless.
-- Each command word a script runs emits one `shell.command` span carrying its kind, argument count, exit code, and outcome—never argument values. Started/completed log mirrors were deliberately removed; logs are reserved for accounting, refusals, errors, and opt-in payloads. The shape is pinned by the in-process Chrome-trace tests in `crates/dekopon-run/tests/cli.rs` and `crates/dekopon-run/tests/prompt_tracing.rs`. `examples/otel-traces/smoke-test.sh` drives a real broker/gateway local-transport turn against a loopback model stub and authorized echo provider; its OpenObserve assertions cover the five daemon/provider span families and independently shipped native stdout logs, not the direct runner.
+Shared orchestration and shell behavior is documented in
+[`dekopon-agent`](../crates/dekopon-agent/README.md) and
+[`dekopon-shell`](../crates/dekopon-shell/README.md): session-wide capability budgets,
+per-script limits, no environment access, bounded text builtins, and payload-free command spans
+remain unchanged. The production OTLP smoke drives both daemons and five daemon/provider span
+families, not a direct runner.
 
 Privileged broker path:
 
@@ -179,10 +180,10 @@ Privileged broker path:
 - `dekopon-broker-protocol` frames strict JSON under a hard byte ceiling and complete-operation deadline; its invocation type cannot carry identity, policy, constraints, credentials, or authorization, its client authenticates the configured server UID, and its normal dependency graph contains no broker host or native HTTP engine.
 - `dekopon-brokerd` derives context from connected Unix peer UID and exact owner-controlled mapping, owns secure socket lifecycle, maps distinct configured peer UIDs, bounds concurrent connections, verifies/reconciles its durable audit checkpoint, and restores audit/replay state before listening.
 - `dekopon-brokerd provider` is a separate operator mode. Exact-reference `sync` and `sync --locked` are the only network-capable lifecycle commands; `list`, `verify`, and daemon startup construct no registry request. A managed lock passes expected component length, SHA-256, and provider ID into the host so its one artifact read is both verified and compiled. The incompatible standard-Wasm-package assumptions in `wasm-pkg-client` are not used; the daemon embeds a narrow strict OCI-reference parser and bounded distribution path over `http-auth` and the existing rustls `reqwest` client.
-- The service enforces the [current local process boundary](security-model.md#current-local-process-boundary), has no independently retained, signed, or remote checkpoint anchor. Auth does not invoke it. Explicit `dekopon-run broker` commands are unprivileged fresh-connection clients; direct runner subcommands remain on the independent empty-linker host. CI rejects `dekopon-broker`, `dekopon-broker-host`, `dekopon-brokerd`, `dekopon-http-host`, `dekopon-storage-host`, or `dekopon-policy` in the normal dependency tree of `dekopon-run` and `dekopond`.
+- The service enforces the [current local process boundary](security-model.md#current-local-process-boundary), has no independently retained, signed, or remote checkpoint anchor. Auth does not invoke it. CI rejects `dekopon-broker`, `dekopon-broker-host`, `dekopon-brokerd`, `dekopon-http-host`, `dekopon-storage-host`, or `dekopon-policy` in the normal dependency tree of `dekopond`.
 - `dekopond` is the unprivileged agent daemon on the other side of that boundary: strict owner-controlled configuration naming environment variables rather than secrets, chat transports, first-match routing to catalog agents, admission-bounded sessions, optional bounded conversation history in process memory (private per authenticated subject by default, explicitly shareable only within one agent/transport/conversation), and attested on-behalf-of proposals. Its attested `capabilities` gate refuses an unauthorized subject before any model call; the broker answers it only when policy permits `agent.prompt` for that principal and agent. See [`dekopond.md`](dekopond.md).
 
-See [`run.md`](run.md) for the user-facing contract, [`observability.md`](observability.md) for OTLP signal and redaction behavior, and [`security-model.md`](security-model.md) for the trust boundary.
+See [`dekopond.md`](dekopond.md) for the user-facing contract, [`observability.md`](observability.md) for OTLP signal and redaction behavior, and [`security-model.md`](security-model.md) for the trust boundary.
 
 ## Validation
 
@@ -197,14 +198,14 @@ This is the complete list of root-workspace commands behind the required `qualit
 cargo fmt --all --check
 # Lint every target with warnings denied.
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-# Release-profile compile of the three binaries; tag workflows perform the final linked builds.
-cargo check --release --locked -p dekopon-run -p dekopon-brokerd -p dekopond
+# Release-profile compile of the two daemons; tag workflows perform the final linked builds.
+cargo check --release --locked -p dekopon-brokerd -p dekopond
 # The foundational crates with their opt-in `schemars` feature off, which no other gate compiles.
 cargo check -p dekopon-core -p dekopon-capability -p dekopon-protocol --locked
 # Unused dependencies; CI pins cargo-machete 0.9.2.
 cargo machete
-# The runner and gateway must not carry privileged broker machinery in their normal dependency trees; any line this prints is a failure.
-for p in dekopon-run dekopond; do
+# The gateway must not carry privileged broker machinery in their normal dependency trees; any line this prints is a failure.
+for p in dekopond; do
   cargo tree --locked -p "$p" --edges normal --prefix none \
     | grep -E '^dekopon-(broker|broker-host|brokerd|http-host|storage-host|policy) v' \
     && echo "privileged crate in the normal dependency tree of $p" >&2
@@ -245,7 +246,7 @@ For package metadata, include lists, or dependency-boundary changes, run from a 
 cargo package --workspace --locked
 ```
 
-Only `dekopon-run` and `dekopond` package `tests/**`; every other published crate's `include` list omits it, so Cargo may warn that an integration file such as `tests/storage.rs`, `tests/host.rs`, `tests/broker.rs`, `tests/memory.rs`, `tests/policy_decisions.rs`, `tests/refusal_logging.rs`, `tests/span_parenting.rs`, `tests/server.rs`, `tests/examples.rs`, `tests/failure_logging.rs`, `tests/span_redaction.rs`, `tests/wit_mirror.rs`, or `tests/harness.rs` is not included in the published package. Release packaging runs `.github/scripts/prepare-package-cache.sh` before its target-cache save to remove unpacked test-source directories from `target/package`; they are not compiler artifacts, and leaving them there makes `rust-cache` misclassify them as nested target directories and emit false `ENOENT` annotations.
+Only `dekopond` packages `tests/**`; every other published crate's `include` list omits it, so Cargo may warn that an integration file such as `tests/storage.rs`, `tests/host.rs`, `tests/broker.rs`, `tests/memory.rs`, `tests/policy_decisions.rs`, `tests/refusal_logging.rs`, `tests/span_parenting.rs`, `tests/server.rs`, `tests/examples.rs`, `tests/failure_logging.rs`, `tests/span_redaction.rs`, `tests/wit_mirror.rs`, or `tests/harness.rs` is not included in the published package. Release packaging runs `.github/scripts/prepare-package-cache.sh` before its target-cache save to remove unpacked test-source directories from `target/package`; they are not compiler artifacts, and leaving them there makes `rust-cache` misclassify them as nested target directories and emit false `ENOENT` annotations.
 
 ### Documentation gates
 
@@ -316,12 +317,10 @@ ci/fetch-external-provider-components.sh examples/providers
 wasm-tools validate examples/providers/echo-provider.wasm
 wasm-tools validate examples/providers/jsonplaceholder-provider.wasm
 wasm-tools validate examples/providers/memory-chat-provider.wasm
-cargo test -p dekopon-provider-host --test host --locked
 cargo test -p dekopon-broker-host --locked
 cargo test -p dekopon-broker --locked
 cargo test -p dekopon-broker-protocol --locked
 cargo test -p dekopon-brokerd --locked
-cargo test -p dekopon-run --test cli --locked
 ```
 
 A deterministic rebuild should leave the artifact unchanged when the source and toolchain are unchanged.
@@ -395,7 +394,7 @@ cargo test -p dekopon-brokerd --locked
 ```
 
 No test contacts a public secret manager. Remote adapters use literal-loopback mocks; production
-endpoints require HTTPS. Direct runner/gateway dependency-boundary checks must stay green.
+endpoints require HTTPS. Gateway dependency-boundary checks must stay green.
 
 ### Provider manager
 
@@ -431,12 +430,11 @@ ci/stage-image-context.sh v0.3.0 "$work"
 docker buildx build --platform linux/arm64 --load -t dekopon:local "$work/context"
 docker buildx build --platform linux/amd64 --load -t dekopon:local-amd64 "$work/context"
 docker run --rm dekopon:local dekopond --help
-docker run --rm dekopon:local dekopon-run invoke \
-  --provider /opt/dekopon/providers/echo-provider.wasm echo.echo --input '{}'
+ci/verify-image-broker.sh dekopon:local
 docker export "$(docker create dekopon:local unused)" | tar -tvf - opt/dekopon/providers
 ```
 
-The script prints the fourteen files it staged and the digest of each executable, then the build
+The script prints the twelve files it staged and the digest of each executable, then the build
 context is exactly those files: there is no `.dockerignore` denylist to keep correct as the
 repository grows. The repository root cannot be used as a context and fails in about a second if
 someone tries.
@@ -447,13 +445,14 @@ image that matches the machine.
 
 Do not add a compile stage to the Dockerfile: the point of the image is that its binaries are the
 release's binaries, verifiable with `sha256sum` against the published archive. The workflow checks
-exactly that for all six before it pushes anything, and the staging script refuses to stage a
+exactly that for all four before it pushes anything, and the staging script refuses to stage a
 binary that needs a glibc newer than the runtime base provides.
 
-`echo` is the only baked component the direct runner can load — the other default components
-import HTTP and optional memory imports JSONL, while the immediate linker is empty — and loading
-one matters because components compile lazily through Cranelift, so a clean startup proves nothing.
-The `docker export` listing is how ownership and mode are read: the image has no shell. The four
+`ci/verify-image-broker.sh` starts the real broker with the baked echo component and waits
+under a deadline for its post-load socket. Releases exposing `probe` additionally exercise
+that existing command; older immutable releases use their checkpoint configuration and prove
+component-load/startup only. This validates released image bytes, not a native build of source
+HEAD. The `docker export` listing is how ownership and mode are read: the image has no shell. The four
 default components and optional memory component must be regular single-link files owned by `65532` under a `65532`-owned directory that is not
 group- or world-writable, or `dekopon-brokerd` refuses to start.
 

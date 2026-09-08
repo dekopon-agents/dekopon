@@ -282,7 +282,7 @@ pub trait CapabilityInvoker {
     ///
     /// This is deliberately synchronous: this crate carries no async runtime dependency, and the
     /// calling binary's model tool loop is untouched. An implementation that is asynchronous
-    /// underneath bridges here itself, which is what `dekopon-run` does from its blocking task.
+    /// underneath bridges here itself, as a synchronous embedding can do from its blocking task.
     fn invoke(
         &self,
         capability: &str,

@@ -97,22 +97,13 @@ jobs:
       # Path installation uses the debug profile so it can reuse the smoke-test build. Keep a
       # release-profile compile gate here; tag workflows still perform the final linked builds.
       - name: Check release CLIs
-        run: cargo check --release --locked -p dekopon-run -p dekopon-brokerd -p dekopond
+        run: cargo check --release --locked -p dekopon-brokerd -p dekopond
       # Every other gate builds --all-features, so nothing else compiles the foundational crates
       # with their opt-in `schemars` feature off — the state a crates.io consumer gets by default.
       - name: Check foundational crates without the schemars feature
         run: cargo check -p dekopon-core -p dekopon-capability -p dekopon-protocol --locked
       - name: Detect unused dependencies
         run: cargo machete
-      - name: Verify runner excludes privileged broker machinery
-        shell: bash
-        run: |
-          set -euo pipefail
-          tree=$(cargo tree --locked -p dekopon-run --edges normal --prefix none)
-          if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host|storage-host|policy) v' <<<"$tree"; then
-            printf '%s\n' "$tree" >&2
-            exit 1
-          fi
       - name: Verify gateway excludes privileged broker machinery
         shell: bash
         run: |
@@ -557,21 +548,15 @@ jobs:
           restore-keys: |
             cargo-registry-v1-${{ runner.os }}-
       - name: Build CLIs
-        run: cargo build --locked -p dekopon-run -p dekopon-brokerd -p dekopond
+        run: cargo build --locked -p dekopon-brokerd -p dekopond
       - name: Fetch exact standalone echo fixture
         run: ci/fetch-external-provider-components.sh examples/providers echo
       - name: Exercise generated help and example commands
         shell: bash
         run: |
           set -euo pipefail
-          runner=target/debug/dekopon-run
           broker=target/debug/dekopon-brokerd
           gateway=target/debug/dekopond
-          provider=examples/providers/echo-provider.wasm
-          "$runner" --help >/dev/null
-          "$runner" broker --help >/dev/null
-          "$runner" broker invoke --help >/dev/null
-          "$runner" chat --help >/dev/null
           "$broker" --help >/dev/null
           "$broker" --version >/dev/null
           "$gateway" --help >/dev/null
@@ -579,10 +564,6 @@ jobs:
           "$gateway" auth chatgpt export --help >/dev/null
           DEKOPON_CHATGPT_AUTH_FILE="$RUNNER_TEMP/dekopon-chatgpt-test-auth.json" \
             "$gateway" auth chatgpt status >/dev/null
-          "$runner" inspect --provider "$provider" >/dev/null
-          "$runner" invoke --provider "$provider" echo.echo --input '{}' >/dev/null
-          "$runner" invoke --provider "$provider" echo.ransom-case \
-            --input '{"message":"Hello, World!"}' >/dev/null
       - name: Verify credential export emits an applicable Secret
         shell: bash
         run: |
@@ -609,16 +590,14 @@ jobs:
       - name: Verify path installation
         if: ${{ needs.changes.outputs.run_cli_install != 'false' }}
         shell: bash
-        # Reuse the debug workspace build rather than creating three independent release targets.
+        # Reuse the debug workspace build rather than creating two independent release targets.
         # The quality lane checks release-profile compilation in one unified dependency graph.
         env:
           CARGO_TARGET_DIR: target
         run: |
           set -euo pipefail
-          cargo install --debug --locked --path crates/dekopon-run --root "$RUNNER_TEMP/dekopon-install"
           cargo install --debug --locked --path crates/dekopon-brokerd --root "$RUNNER_TEMP/dekopon-install"
           cargo install --debug --locked --path crates/dekopond --root "$RUNNER_TEMP/dekopon-install"
-          "$RUNNER_TEMP/dekopon-install/bin/dekopon-run" --version
           "$RUNNER_TEMP/dekopon-install/bin/dekopon-brokerd" --version
           "$RUNNER_TEMP/dekopon-install/bin/dekopond" --version
       - name: Finish CI metrics

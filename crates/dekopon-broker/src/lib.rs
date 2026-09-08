@@ -578,7 +578,7 @@ pub struct ConstraintSet {
     /// It is also trusted input rather than a caller claim — the agent name arrives in the
     /// [`AuthenticatedContext`] the broker itself derived from an owner-configured attestor grant,
     /// never from an invocation payload. A caller with no agent at all, such as a direct
-    /// `dekopon-run` peer carrying [`Actor::Service`], matches no override and takes the default.
+    /// unprivileged peer carrying [`Actor::Service`], matches no override and takes the default.
     ///
     /// Every override is validated at construction exactly as the default is: the name must exist
     /// in the credential store and its destinations must cover every allowed host of this set.

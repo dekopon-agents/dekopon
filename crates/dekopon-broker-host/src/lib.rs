@@ -1,7 +1,6 @@
 //! Broker-owned bounded asynchronous WebAssembly provider hosting.
 //!
-//! The current immediate host intentionally has an empty linker. This crate is the privileged
-//! counterpart intended only for a separately deployed broker: it accepts an
+//! This crate is the privileged host for the separately deployed broker: it accepts an
 //! [`AuthorizedInvocation`], links only the project-owned buffered HTTP and namespace-bound
 //! storage interfaces, and applies the invocation's exact host-call constraints in a fresh store.
 

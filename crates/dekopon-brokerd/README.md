@@ -344,7 +344,7 @@ The key is the agent, because a route already binds a transport and a match to a
 workspace or one channel selects the agent that answers, and the agent selects the token. The name
 comes from the attested context the broker derived from this file's own `attestor` grant and
 `identityMappings`, so it is trusted configuration selecting on trusted identity — a request
-payload cannot ask for a different token. A caller with no agent, such as a direct `dekopon-run`
+payload cannot ask for a different token. A caller with no agent, such as a direct service
 peer, matches no override and takes the default.
 
 `credential:` may be omitted while `credentialByAgent:` is present, and then an agent with no entry
@@ -554,7 +554,7 @@ failed terminal append still reports that provider work may already have complet
 - Generic WASI and ambient I/O imports remain unavailable.
 - Audit appends contain metadata only; replay rejection is bounded process-local state.
 - Credential resolution is destination-bound, capability-scoped, and optionally agent-scoped. Providers receive only explicitly linked Dekopon host interfaces and policy constraints; an injected credential exists solely inside the native HTTP engine and is never observable by guest code.
-- Direct `dekopon-run` subcommands retain their import-free host. Only explicit `dekopon-run broker` subcommands connect as unprivileged identity-free clients.
+- Unprivileged clients submit proposals over the authenticated protocol; only the broker executes providers.
 
 ## Optional provider storage and chat memory
 

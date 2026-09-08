@@ -49,7 +49,7 @@ ARCH_ORDER = ["arm", "intel"]
 
 DOWNLOAD = "https://github.com/{repository}/releases/download/{tag}/{name}"
 
-TEMPLATE = '''# Dekopon publishes one archive per platform carrying all three executables, so
+TEMPLATE = '''# Dekopon publishes one archive per platform carrying all two executables, so
 # one formula installs the whole system. Three formulae would each download the
 # same tarball.
 #
@@ -66,23 +66,21 @@ class Dekopon < Formula
 
 {platforms}
   def install
-    bin.install "dekopon-run", "dekopon-brokerd", "dekopond"
+    bin.install "dekopon-brokerd", "dekopond"
     pkgshare.install "providers"
     doc.install "README.md", "BROKER.md", "GATEWAY.md", "LICENSE-APACHE", "LICENSE-MIT"
   end
 
   def caveats
     <<~EOS
-      Dekopon installed three executables:
+      Dekopon installed two executables:
 
-        dekopon-run      one-shot runner: components, sandboxed shell, prompt loop
         dekopon-brokerd  the authorization broker daemon (Unix only)
         dekopond         the unprivileged chat gateway daemon (Unix only)
 
-      Inspect a component or manage model authentication without starting a daemon:
+      Manage model authentication without starting a daemon:
 
         dekopond auth chatgpt --help
-        dekopon-run inspect --provider ./some-provider.wasm
 
       dekopon-brokerd and dekopond are daemons. Nothing was started, and neither
       runs until you write it an owner-authored configuration file:
@@ -97,9 +95,8 @@ class Dekopon < Formula
 
         #{{pkgshare}}/providers/jsonplaceholder-provider.wasm
 
-      It imports broker-owned HTTP, which makes it a broker provider: name that
-      path in broker.yaml. `dekopon-run inspect` is deliberately import-free and
-      refuses to instantiate it. The constraint set and Cedar policy it needs are
+      It imports broker-owned HTTP, which makes it a broker provider:
+      name its path in broker.yaml. The constraint set and Cedar policy it needs are
       in #{{pkgshare}}/providers/JSONPLACEHOLDER.md.
 
       The end-to-end walkthrough is examples/conditional-write in the source tree:
@@ -108,7 +105,6 @@ class Dekopon < Formula
   end
 
   test do
-    assert_match "dekopon-run #{{version}}", shell_output("#{{bin}}/dekopon-run --version")
     assert_match "dekopon-brokerd #{{version}}", shell_output("#{{bin}}/dekopon-brokerd --version")
     assert_match "dekopond #{{version}}", shell_output("#{{bin}}/dekopond --version")
 

@@ -14,7 +14,13 @@ Maintainers will acknowledge a report when a human is available, assess scope, c
 
 ## Scope notes
 
-The workspace has three executable surfaces. `dekopond auth` manages an isolated ChatGPT/Codex model login before gateway configuration or runtime startup. The experimental `dekopon-run` can contact an operator-selected model endpoint, execute bounded import-free read-only Wasm components, or explicitly submit identity-free proposals to `dekopon-brokerd`. It can also act as a line-oriented client to a running `dekopond` over its owner-only Unix development transport (`chat`), and mount local skill directories into a prompt (`prompt --skill`). It has no broker authority or provider credentials; direct subcommands retain no provider host I/O, external-read authority, or local/external-write path.
+The workspace has two executable surfaces: the unprivileged `dekopond` gateway and the
+privileged `dekopon-brokerd` broker. `dekopond auth` manages an isolated ChatGPT/Codex model
+login before gateway configuration or runtime startup. The shared agent layer retains the
+bounded model/shell loop and catalog-mounted skills, without broker authority or provider
+credentials. Provider component loading and effect execution belong only to the broker.
+The gateway's owner-only local development transport remains available; no general
+invocation or chat-client CLI replaces the retired runner.
 
 This development line also contains a privileged asynchronous component host, bounded native HTTP engine, Cedar authorization over owner-authored execution constraints, an evidence/audit core, broker-owned destination-bound credential resolution, bounded identity-free Unix client protocol, and `dekopon-brokerd`. The broker executable accepts one owner-UID trust domain over a private socket, maps peer credentials through strict trusted configuration, restores replay state from verified durable audit, rejects rollback relative to an atomic owner-only checkpoint file, resolves legacy credentials or separately authorized public-DRN/private-map sources that no guest component can observe, and may expose policy-authorized provider HTTP. The in-tree `http-probe` fixture and the fetched standalone JSONPlaceholder component separate read-only and external-write capabilities and are tested only with injected or loopback mocks; the `gh` provider is maintained out of tree in [`dekopon-provider-gh`](https://github.com/dekopon-agents/dekopon-provider-gh) with its own release cadence. Findings in framing/deadlines, socket lifecycle/permissions, peer/server-UID validation, configuration ownership, authority omission, trusted-context binding, replay controls, policy matching, audit redaction/integrity, destination validation, DNS/IP controls, bounds, WIT adaptation, Wasmtime isolation, or authorization binding are in scope now.
 

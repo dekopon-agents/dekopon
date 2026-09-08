@@ -223,10 +223,10 @@ Version 0.12.0 adds `dekopon-process`, removes `dekopon-tui`, and leaves twenty-
 
 - `spec.skills` mounts Agent Skills `SKILL.md` directories, read whole at catalog load under fixed
   bounds; a session lists them by name and description and reads a body or one resource on
-  demand through `read_skill`. `dekopon-run prompt --skill` mounts them for one session.
+  demand through `read_skill`.
 - `suggest_improvement`, the tool an agent taps the glass with: at most three bounded structured
   notes per session, off everywhere by default, opt-in per gateway route
-  (`improvementSuggestions: true`) or per runner session (`--suggestions`); a note is telemetry a
+  (`improvementSuggestions: true`); a note is telemetry a
   person reads and changes nothing.
 [`CHANGELOG.md`](../CHANGELOG.md#unreleased) records the detail under `[Unreleased]`.
 
@@ -234,26 +234,23 @@ Version 0.12.0 adds `dekopon-process`, removes `dekopon-tui`, and leaves twenty-
 
 - `dekopon:provider@0.3.0` adds the `provider-cli` world and its `run-command` export: a provider's
   command word answers `--help` with its own page, a bad argv with its own usage error, reads the
-  value piped into the word, or proposes a capability exactly as before. Both hosts serve it, look
+  value piped into the word, or proposes a capability exactly as before. The broker host serves it, looking
   the export up by name so `0.1.0` and `0.2.0` components keep loading, and bound argv plus the
   piped value before a store exists. The SDK's opt-in `clap` feature builds the facade; the
   clap-free trait is the contract.
 - The broker protocol carries the run as `runCommand`, answered with the guest's outcome intact;
   `resolveCommand` is answered for one release with rendered text degraded to a decline.
-- Every command word runs as a `dekopon-process` node: the runner's direct leg serves the words
-  its loaded components declare in a nested non-interruptible `direct-command` node, and the
-  shared broker leg runs a word in a cancellable `broker-command` node that a gateway session's
-  Stop abandons. That makes the broker leg the first cancellable consumer and supersedes the
-  deferred fold-in of `dekopon-process` into `dekopon-run` below (#16): the crate now has three
-  consumers in two binaries, one of them cancellable.
+- The shared broker leg runs each command word in a cancellable `broker-command` process node
+  that gateway session Stop abandons. This is the surviving lifecycle consumer; the direct
+  runner and its nodes are retired without moving them into the broker.
 - Follow-ups accepted rather than dropped: real parent threading of a nested node's span under the
   node that ran it (today both record `parent.id` `root`); deadlines and ports on the process
   seam; per-stage lowering of a shell pipeline into nodes; a broker-side deadline for a command
   run independent of the guest's fuel and wall-clock bounds.
 
 This adds no crate, process boundary, listener, credential path, or effect authority: a proposal is
-authorized where it always was, rendered text authorizes nothing, and `dekopond` and `dekopon-run`
-still reach no broker crate under the CI `cargo tree` gate; `dekopon-agent` and `dekopond` gain a
+authorized where it always was, rendered text authorizes nothing, and `dekopond`
+still reaches no privileged broker crate under the CI `cargo tree` gate; `dekopon-agent` and `dekopond` gain a
 `dekopon-process` dependency. [`CHANGELOG.md`](../CHANGELOG.md#unreleased) records the detail under
 `[Unreleased]`.
 
@@ -284,12 +281,14 @@ Each of these was raised, deliberately scoped out, and accepted as a follow-up r
 The whole-tree audit behind 0.12.0 decided thirty-five findings: the thirty-two executed ones are recorded in [`CHANGELOG.md`](../CHANGELOG.md#0120---2026-08-29)'s 0.12.0 entries, one bullet per landed finding citing its checklist number (the test-only #17, #18, #19, and #35 have no user-visible change and no entry, and the chart wiring of #25 sits under `dekopon-chart-0.3.0`), and these three were decided `DEFER` — revisit in the next scrub — rather than dropped. Each carries the audit's finding and suggested fix; paths are current, the audit's line numbers are not repeated.
 
 - **Secret-source backends (#15, PREMATURE_GENERALIZATION).** `SecretSource` in `crates/dekopon-brokerd/src/secrets.rs` ships ten kinds — `secureFile`, `kubernetesProjection`, `kubernetesApi`, `onePasswordConnect`, `vaultKv1`, `vaultKv2`, `awsSecretsManager`, `awsSsmParameter`, `gcpSecretManager`, and `azureKeyVault` — eight of them hand-written vendor HTTP clients exercised only against in-process mock responses, and the AWS pair hand-rolls SigV4 with no known-answer signature test. No example or chart value sets `secretMapPath`, no `dekopon-brokerd` test authorizes through `secretUse` with `allowQuery: true` or `maxInjections` above one, and the deployment the audit read for context still used `credentialsPath`, including for 1Password. Suggested fix: keep `secureFile` and `kubernetesProjection`; delete the eight remote adapters, `read_aws_credentials`, the SigV4, `hmac`, and `crc32c` helpers, and the `time` and `hmac` dependencies they pull into `dekopon-brokerd`, keeping the `SecretSource` enum shape so a backend returns as one variant; add one end-to-end `dekopon-brokerd` test authorizing through `secretUse` with `allowQuery: true` and `maxInjections: 2`; and until a deployment sets `secretMapPath`, mark the feature **Exploration** in [`design.md`](design.md), or wire one live token through a `secureFile` entry and keep it Current.
-- **`dekopon-process` into `dekopon-run` (#16, CRATE_FACTORIZATION).** A public crate of 309 source and 348 test lines whose `Process` trait has one implementation, its own `ProcessFn`, and one call site, `evaluate_shell` in `crates/dekopon-run/src/lib.rs`, under the kind string `"legacy-shell"`. Its abandonment-observer machinery — the supervisor's nested spawn, `OutcomeEnvelope`, and three of its six tests — exists for a dropped future the only caller cannot produce: nothing above it selects, times out, or aborts. Sibling handoff sites in `dekopond` still call `spawn_blocking` directly, and [`design.md`](design.md)'s "no empty future crates" rule and the package-namespace rule below both refuse a crate without a consuming milestone. Suggested fix: move `lib.rs` to `crates/dekopon-run/src/process.rs` as a private module; delete the crate from `[workspace.members]`, `[workspace.dependencies]`, `.github/release-crates.txt`, and its design and roadmap paragraphs; drop the `Process` trait, `ProcessFn`, `on_unobserved`, `OutcomeEnvelope`, and the three drop-path tests; rename `"legacy-shell"` to `"shell"`. Preserve the `process.run` and `process.node` spans, which `dekopon-run`'s trace tests assert and [`observability.md`](observability.md) names, and `ProcessOutcome::TaskFailed` carrying the raw `JoinError`. The crate is on the crates.io publication plan, so any version of it already published needs a yank or a deprecation pointing at `dekopon-run` when it goes. Superseded, unreleased: the crate now has three consumers in two binaries — the runner's `legacy-shell` and `direct-command` nodes and the agent layer's cancellable `broker-command` node, which the gateway's Stop drives — so the fold-in no longer applies; the unreleased command-word section above records it.
+- **Process fold-in (#16, CRATE_FACTORIZATION): superseded.** The shared agent broker leg
+  consumes `dekopon-process`; it stays unprivileged. Runner retirement does not move the shell
+  into the broker and does not recall any published crate.
 - **WhatsApp and Telegram in or out of tree (#26, SIDE_QUEST).** The deployment the audit read for context ran Slack and Discord only. WhatsApp (`crates/dekopond/src/transport/whatsapp.rs`) is the gateway's only inbound listener, its only HMAC path, and three gateway-held credentials, described in eleven Markdown documents in this tree and served by a chart `ClusterIP` Service that `gateway.service.enabled` leaves off by default. Telegram (`transport/telegram.rs`) has no example directory at all — `telegramLongPoll` appears only in [`dekopond.md`](dekopond.md), the gateway's configuration type, and unit tests — yet `ChatTransportKind::Telegram`, `DeliveryIdentity::Telegram`, and `SubjectService::Telegram` reach the trusted `dekopon-broker-protocol` and `dekopon-core` crates. Both widen the chat-scope authorization surface every change must carry. Suggested fix: decide both together — either `dekopond` grows a transport seam that lives out of tree, or delete both (`whatsapp.rs`, `telegram.rs`, `examples/whatsapp/`, the chart `gateway.service` block, the `ChatTransportKind` and `DeliveryIdentity` variants, and the broker's transport-to-subject match arms). Preserve: `SubjectService` must keep parsing `whatsapp.<id>`, `tel.<n>`, and `telegram.<id>` subjects so existing audit chains stay readable.
 
 ## Intended package namespace
 
-`dekopon-process` is now present with a tested one-run/one-node Tokio lifecycle seam consumed by `dekopon-run` and, through `dekopon-agent`'s broker leg, by `dekopond`. `dekopon-model` is now present with tested OpenAI-compatible and ChatGPT/Codex transports plus model-account authentication. `dekopon-agent` is now present with the shared bounded prompt loop and session capability dispatch, consumed by both `dekopon-run` and `dekopond`. `dekopond` itself is now present as the unprivileged chat gateway. `dekopon-policy` is now present too, as the bounded Cedar adapter behind the broker's authorization decisions. The following remaining names are reserved for future meaningful crates. They are **not** present in the workspace and are not claimed as crates.io reservations or published packages:
+`dekopon-process` is now present with a tested one-run/one-node Tokio lifecycle seam consumed through `dekopon-agent`'s broker leg by `dekopond`. `dekopon-model` is now present with tested OpenAI-compatible and ChatGPT/Codex transports plus model-account authentication. `dekopon-agent` is now present with the shared bounded prompt loop and session capability dispatch, consumed by `dekopond` and external clients. `dekopond` itself is now present as the unprivileged chat gateway. `dekopon-policy` is now present too, as the bounded Cedar adapter behind the broker's authorization decisions. The following remaining names are reserved for future meaningful crates. They are **not** present in the workspace and are not claimed as crates.io reservations or published packages:
 
 - `dekopon-identity`
 - `dekopon-context`
@@ -302,4 +301,4 @@ A crate should be added only with meaningful, tested behavior needed by an imple
 
 ## Explicit non-goals for 0.1
 
-Daemon networking, shell-completion installation, provider credential access, operator-accessible provider host I/O, policy evaluation, durable evidence/audit, and local or external effect execution are intentionally absent from 0.1. An interactive TUI was on that list; 0.11.0 built one and this tree no longer holds it, because it moved to [dekopon-console](https://github.com/dekopon-agents/dekopon-console) the way the `gh` provider moved to `dekopon-provider-gh`. It is an unprivileged broker client holding a model credential, so it acquired none of the operator-accessible provider or policy paths this sentence still rules out, and taking it out of tree acquires nothing either. Their accepted broker-mediated HTTP direction is documented in [`dekopon-brokerd` contract](../crates/dekopon-brokerd/README.md#boundaries), but documentation does not make those paths current. Model-account lifecycle is exposed through `dekopond auth`; auth itself performs no model inference and loads no component. Inference lives in the explicitly experimental `dekopon-run` and in `dekopond`, and component loading in `dekopon-run` (import-free, read-only) and `dekopon-brokerd`.
+Daemon networking, shell-completion installation, provider credential access, operator-accessible provider host I/O, policy evaluation, durable evidence/audit, and local or external effect execution are intentionally absent from 0.1. An interactive TUI was on that list; 0.11.0 built one and this tree no longer holds it, because it moved to [dekopon-console](https://github.com/dekopon-agents/dekopon-console) the way the `gh` provider moved to `dekopon-provider-gh`. It is an unprivileged broker client holding a model credential, so it acquired none of the operator-accessible provider or policy paths this sentence still rules out, and taking it out of tree acquires nothing either. Their accepted broker-mediated HTTP direction is documented in [`dekopon-brokerd` contract](../crates/dekopon-brokerd/README.md#boundaries), but documentation does not make those paths current. Model-account lifecycle is exposed through `dekopond auth`; auth itself performs no model inference and loads no component. Inference lives in `dekopond` and external agent embeddings; provider component loading belongs to `dekopon-brokerd`.

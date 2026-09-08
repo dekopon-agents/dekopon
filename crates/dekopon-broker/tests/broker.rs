@@ -250,7 +250,7 @@ fn direct_http_policy(name: &str, agent_name: &str, capability: &str) -> String 
 }
 
 /// The same HTTP grant for a directly connected peer that is no agent at all — the shape
-/// `dekopon-run` arrives in, carrying `Actor::Service` and therefore no `context.agent`.
+/// a direct service peer arrives in, carrying `Actor::Service` and therefore no `context.agent`.
 const DIRECT_PEER_HTTP_POLICY: &str = r#"permit(principal == Dekopon::Principal::"direct-peer",
        action == Dekopon::Action::"http-probe.fetch",
        resource == Dekopon::Provider::"http-probe")
@@ -1494,7 +1494,7 @@ async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
         agent_context("caller", "dekoponville-github"),
     )
     .await;
-    // A direct peer such as `dekopon-run` is an `Actor::Service`: no agent, no override, default.
+    // A direct peer is an `Actor::Service`: no agent, no override, default.
     fetch("invoke-direct", service_context("direct-peer")).await;
 
     let wire = || server.request_text();

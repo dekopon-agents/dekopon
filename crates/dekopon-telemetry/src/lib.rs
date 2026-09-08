@@ -1,9 +1,9 @@
 //! Shared OTLP exporter construction and W3C trace context for Dekopon processes.
 //!
-//! Every exporting Dekopon process — the unprivileged runner, the privileged broker, and the chat
+//! Both exporting Dekopon daemons — the privileged broker and the unprivileged chat
 //! gateway — exports its own spans, so exporter construction lives here rather than in any one
 //! binary. The crate deliberately depends on no Dekopon crate: it must remain linkable from the
-//! runner without dragging broker code into the runner's dependency tree, which CI rejects.
+//! gateway without dragging broker code into the gateway's dependency tree, which CI rejects.
 //!
 //! # Authority
 //!

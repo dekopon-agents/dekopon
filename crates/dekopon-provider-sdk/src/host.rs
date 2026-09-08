@@ -1,16 +1,11 @@
-//! Host-side plumbing shared by Dekopon's two Wasmtime provider hosts.
+//! Host-side plumbing for Dekopon's Wasmtime embeddings.
 //!
-//! `dekopon-provider-host` runs import-free read-only components synchronously; `dekopon-broker-host`
-//! runs authorized components asynchronously with the project-owned HTTP and storage interfaces
-//! linked. Everything beneath that difference is the same contract: the rules a component manifest
-//! must satisfy, the ambiguities a provider set may not contain, the bounds on one store, the
-//! engine configuration, and which optional command export a component offers. They live here so
-//! a Wasmtime upgrade or a new manifest rule is reviewed once instead of twice.
+//! `dekopon-broker-host` runs authorized components asynchronously with the project-owned HTTP
+//! and storage interfaces linked. This module owns manifest validation, provider-set conflict
+//! reports, store bounds, engine configuration, and optional command-export inspection.
+//! These shared SDK APIs remain available to external hosts as well.
 //!
-//! The hosts' own machinery stays with each host: the immediate host serializes calls behind a
-//! mutex and interrupts them from a deadline thread, while the broker host yields on fuel so a
-//! Tokio deadline can cancel a call. Neither the linkers nor the timeout machinery is shared.
-//!
+//! The broker host owns its linker and yields on fuel so a Tokio deadline can cancel a call.
 //! None of this is guest code. The module sits behind the non-default `host` feature, which pulls
 //! in Wasmtime; a `wasm32-unknown-unknown` provider build never enables it.
 
@@ -630,13 +625,12 @@ pub enum EngineError {
     },
 }
 
-/// The Wasmtime configuration both hosts start from.
+/// Base Wasmtime configuration for the broker host and external embeddings.
 ///
-/// The caller adds exactly one thing to it: how that host interrupts a guest running too long. The
-/// immediate host enables epoch interruption and ticks the epoch from a deadline thread; the broker
-/// host enables async support and yields on a fuel interval so a Tokio deadline can cancel the call.
-/// That split is real, and it stays at the call sites rather than becoming a flag here — sharing one
-/// more line would mean compiling Wasmtime's `async` feature into a synchronous host.
+/// The caller configures how it interrupts a guest running too long. The broker host enables async
+/// support and yields on a fuel interval so a Tokio deadline can cancel the call. External
+/// embeddings must choose their own interruption policy; this shared configuration does not
+/// require Wasmtime's `async` feature.
 #[must_use]
 pub fn config() -> Config {
     let mut config = Config::new();

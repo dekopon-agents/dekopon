@@ -1,6 +1,6 @@
 //! The reusable agent session layer shared by Dekopon's embedding binaries.
 //!
-//! `dekopon-run` drives one prompt session from a CLI; `dekopond` drives many from chat transports. Both need the same four pieces, and this crate is where they live so there is one
+//! `dekopond` drives sessions from chat transports; external clients embed these same pieces. This crate is where they live so there is one
 //! authoritative copy:
 //!
 //! - [`prompt::run_prompt`] — the bounded model tool loop offering one sandboxed scripting tool,
@@ -387,7 +387,7 @@ impl BrokerLeg {
     /// startup failure instead of a capability that inexplicably reports "command not found"
     /// halfway through a script a model already committed to.
     ///
-    /// `trace_prefix` names the embedding surface (for example `dekopon-run-prompt`) and becomes
+    /// `trace_prefix` names the embedding surface (for example `console-prompt`) and becomes
     /// the leading component of the session's trace and invocation identifiers, so every call a
     /// session made is recoverable from the broker's audit log by prefix.
     ///
@@ -447,7 +447,7 @@ impl BrokerLeg {
     ///
     /// A run in flight when `signal` is requested is aborted at its next await and joined before
     /// the leg answers the script with `session-cancelled`; the gateway fires it from a native
-    /// Stop. Without it a run is cancellable in contract only, which is what `dekopon-run` gets.
+    /// Stop. Without it a run is cancellable in contract only, as in an embedder that supplies no signal.
     #[must_use]
     pub fn with_cancel_signal(mut self, signal: CancelSignal) -> Self {
         self.cancel = signal;
