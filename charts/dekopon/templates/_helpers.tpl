@@ -483,8 +483,7 @@ Arguments: dict "ctx" $ "sidecar" bool
     {{- toYaml . | nindent 4 }}
   {{- end }}
   # Both probes are a real broker client over the real socket. `capabilities` is evaluated from
-  # policy and the constraint catalog and appends no audit record, so probing does not consume the
-  # audit log's bounded record budget.
+  # policy and the constraint catalog and appends no audit record.
   startupProbe:
     exec:
       command: ["dekopon-brokerd", "probe", "--socket", "{{ $.Values.paths.runtimeDir }}/broker.sock"]
