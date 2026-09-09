@@ -113,6 +113,17 @@ jobs:
             printf '%s\n' "$tree" >&2
             exit 1
           fi
+      - name: Verify broker excludes unprivileged orchestration
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree=$(cargo tree --locked -p dekopon-brokerd --edges normal --prefix none)
+          if grep -Eq '^dekopon-(agent|shell|model|process|config) v' <<<"$tree"; then
+            printf '%s\n' "$tree" >&2
+            exit 1
+          fi
+      - name: Test daemon dependency boundary gates
+        run: python3 .github/scripts/test_daemon_dependency_gates.py
       - name: Format, lint, and test Rust provider examples
         env:
           CARGO_TARGET_DIR: target/provider-example-native

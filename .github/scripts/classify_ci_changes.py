@@ -29,6 +29,7 @@ FULL_CI_INPUTS = {
     ".github/workflows/cache-warm.yml",
     ".github/scripts/classify_ci_changes.py",
     ".github/scripts/test_classify_ci_changes.py",
+    ".github/scripts/test_daemon_dependency_gates.py",
     ".github/scripts/ci_metrics.sh",
     ".github/scripts/check_docs_duplicates.py",
     ".github/scripts/render-homebrew-formula.py",

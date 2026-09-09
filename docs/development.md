@@ -180,7 +180,7 @@ Privileged broker path:
 - `dekopon-broker-protocol` frames strict JSON under a hard byte ceiling and complete-operation deadline; its invocation type cannot carry identity, policy, constraints, credentials, or authorization, its client authenticates the configured server UID, and its normal dependency graph contains no broker host or native HTTP engine.
 - `dekopon-brokerd` derives context from connected Unix peer UID and exact owner-controlled mapping, owns secure socket lifecycle, maps distinct configured peer UIDs, bounds concurrent connections, verifies/reconciles its durable audit checkpoint, and restores audit/replay state before listening.
 - `dekopon-brokerd provider` is a separate operator mode. Exact-reference `sync` and `sync --locked` are the only network-capable lifecycle commands; `list`, `verify`, and daemon startup construct no registry request. A managed lock passes expected component length, SHA-256, and provider ID into the host so its one artifact read is both verified and compiled. The incompatible standard-Wasm-package assumptions in `wasm-pkg-client` are not used; the daemon embeds a narrow strict OCI-reference parser and bounded distribution path over `http-auth` and the existing rustls `reqwest` client.
-- The service enforces the [current local process boundary](security-model.md#current-local-process-boundary), has no independently retained, signed, or remote checkpoint anchor. Auth does not invoke it. CI rejects `dekopon-broker`, `dekopon-broker-host`, `dekopon-brokerd`, `dekopon-http-host`, `dekopon-storage-host`, or `dekopon-policy` in the normal dependency tree of `dekopond`.
+- The service enforces the [current local process boundary](security-model.md#current-local-process-boundary), has no independently retained, signed, or remote checkpoint anchor. Auth does not invoke it. CI rejects `dekopon-broker`, `dekopon-broker-host`, `dekopon-brokerd`, `dekopon-http-host`, `dekopon-storage-host`, or `dekopon-policy` in the normal dependency tree of `dekopond`. In the reverse direction, CI rejects `dekopon-agent`, `dekopon-shell`, `dekopon-model`, `dekopon-process`, or `dekopon-config` in the normal dependency tree of `dekopon-brokerd`. Both gates allow the shared `dekopon-broker-protocol` client.
 - `dekopond` is the unprivileged agent daemon on the other side of that boundary: strict owner-controlled configuration naming environment variables rather than secrets, chat transports, first-match routing to catalog agents, admission-bounded sessions, optional bounded conversation history in process memory (private per authenticated subject by default, explicitly shareable only within one agent/transport/conversation), and attested on-behalf-of proposals. Its attested `capabilities` gate refuses an unauthorized subject before any model call; the broker answers it only when policy permits `agent.prompt` for that principal and agent. See [`dekopond.md`](dekopond.md).
 
 See [`dekopond.md`](dekopond.md) for the user-facing contract, [`observability.md`](observability.md) for OTLP signal and redaction behavior, and [`security-model.md`](security-model.md) for the trust boundary.
@@ -204,12 +204,22 @@ cargo check --release --locked -p dekopon-brokerd -p dekopond
 cargo check -p dekopon-core -p dekopon-capability -p dekopon-protocol --locked
 # Unused dependencies; CI pins cargo-machete 0.9.2.
 cargo machete
-# The gateway must not carry privileged broker machinery in their normal dependency trees; any line this prints is a failure.
-for p in dekopond; do
-  cargo tree --locked -p "$p" --edges normal --prefix none \
-    | grep -E '^dekopon-(broker|broker-host|brokerd|http-host|storage-host|policy) v' \
-    && echo "privileged crate in the normal dependency tree of $p" >&2
-done
+# Opposite-direction normal-dependency gates; broker-protocol is allowed in both.
+# Run in Bash; fail on Cargo errors as well as forbidden exact package names.
+(
+  set -euo pipefail
+  tree=$(cargo tree --locked -p dekopond --edges normal --prefix none)
+  if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host|storage-host|policy) v' <<<"$tree"; then
+    printf '%s\n' "$tree" >&2
+    exit 1
+  fi
+  tree=$(cargo tree --locked -p dekopon-brokerd --edges normal --prefix none)
+  if grep -Eq '^dekopon-(agent|shell|model|process|config) v' <<<"$tree"; then
+    printf '%s\n' "$tree" >&2
+    exit 1
+  fi
+)
+python3 .github/scripts/test_daemon_dependency_gates.py
 # The guest host-interface bindings must compile for Wasm, each storage feature on its own.
 rustup target add wasm32-unknown-unknown
 cargo check --locked -p dekopon-provider-sdk --target wasm32-unknown-unknown

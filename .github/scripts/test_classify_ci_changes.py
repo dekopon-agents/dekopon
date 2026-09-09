@@ -122,9 +122,10 @@ class ClassifyCiChangesTests(unittest.TestCase):
         self.assert_selected([".github/scripts/ci_metrics.sh"], *CATEGORIES)
 
     def test_gate_scripts_fail_open_to_every_lane(self) -> None:
-        # Neither script has a lane of its own, so an edit to one used to run nothing at all.
+        # Gate scripts have no lane of their own; edits must not run nothing at all.
         for path in (
             ".github/scripts/check_docs_duplicates.py",
+            ".github/scripts/test_daemon_dependency_gates.py",
             ".github/scripts/render-homebrew-formula.py",
         ):
             with self.subTest(path=path):
