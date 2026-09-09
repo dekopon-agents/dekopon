@@ -1,8 +1,8 @@
 # Dekopon
 
-Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.12.0** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, an unprivileged chat gateway, durable hash-linked audit, and correlated OpenTelemetry traces and logs.
+Dekopon is a capability-oriented control plane for self-hosted AI agents. **Version 0.12.0** pairs a declarative local agent catalog with a one-tool model runner, a JSON-native sandboxed scripting language, isolated WebAssembly providers, a separately deployed authorization broker, an unprivileged chat gateway, append-only JSONL audit, and correlated OpenTelemetry traces and logs.
 
-> **Status:** this tree is a substantial, testable foundation, but it is not production-ready. `dekopond auth` manages isolated model-account login without starting the gateway. The separate Unix-only `dekopon-brokerd` executable authenticates one owner-UID trust domain, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, resolves legacy destination-bound credentials or separately authorized public DRNs through an owner-only private map, invokes constrained providers, records durable audit. The Unix-only `dekopond` daemon connects to chat services and routes messages to catalog agents, holding chat and model credentials but no broker authority.
+> **Status:** this tree is a substantial, testable foundation, but it is not production-ready. `dekopond auth` manages isolated model-account login without starting the gateway. The separate Unix-only `dekopon-brokerd` executable authenticates configured peer UIDs under the [current local process boundary](docs/security-model.md#current-local-process-boundary), evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, resolves legacy destination-bound credentials or separately authorized public DRNs through an owner-only private map, invokes constrained providers, records append-only JSONL audit. The Unix-only `dekopond` daemon connects to chat services and routes messages to catalog agents, holding chat and model credentials but no broker authority.
 
 ## Design documentation
 
@@ -14,10 +14,10 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 - Cross-reference validation with duplicate and unknown-field detection.
 - Isolated model-account authentication through `dekopond auth`, with table, wide, JSON, YAML, and name status output.
 - Strongly typed identifiers and an invocation typestate that distinguishes proposals from broker authorization.
-- A realistic broker-configured example — Cedar policy, credential template, and audit chain on its own volume — exercising two authorized calls in one invocation (`examples/conditional-write/`).
+- A realistic broker-configured example — Cedar policy, credential template, and audit log on its own volume — exercising two authorized calls in one invocation (`examples/conditional-write/`).
 - A Rust provider SDK plus a bounded Wasmtime component host with a fresh store per call, and an in-process fake-broker testkit (`dekopon-provider-sdk-testkit`) that runs a provider component against real storage for end-to-end tests.
 - A published buffered `dekopon:http@1.0.0` contract, guest Rust facade, bounded native HTTP engine, asynchronous broker component host, deny-by-default authorization/evidence/audit core, and bounded identity-free Unix protocol.
-- A separately deployed `dekopon-brokerd` that owns a private Unix socket, derives trusted context from peer UID mapping, restores replay state from verified durable audit, atomically checkpoints the count/head and rejects rollback relative to retained local state, and drains bounded connections on shutdown.
+- A separately deployed `dekopon-brokerd` that owns a private Unix socket, derives trusted context from peer UID mapping, bounds replay rejection to the current process, appends owner-only JSONL audit records, and drains bounded connections on shutdown.
 - Public inert secret DRNs with a separate Cedar `secret.use` decision, owner-only private source/use map, invocation-pinned secure-file/Kubernetes/1Password/Vault/AWS/GCP/Azure adapters, canonical host/method/path/query bounds, native Basic/Bearer rendering, binding-swap refusal, and direct-reflection filtering. Providers see neither references nor values; existing implicit credentials remain compatible. See [`docs/secrets.md`](docs/secrets.md).
 - An offline `dekopon-brokerd provider` manager for exact fully qualified OCI tags or manifest digests: strict desired and generated-lock files, a synchronized content-addressed component store, complete provider-set validation before atomic activation, offline list/verify, and startup comparison of locked digest/length/provider ID with the exact Wasmtime input buffer. It adds no daemon-startup network path.
 - An exact standalone JSONPlaceholder v0.1.0 broker provider with separately authorized post-read and external-write capabilities; all automated network tests use loopback mocks.
@@ -140,7 +140,7 @@ but finite; recording stops with `dedup-capacity` while reads continue. The char
 [current local process boundary](docs/security-model.md#current-local-process-boundary),
 with separate gateway and broker UIDs and private credential mounts.
 
-There is still no independently retained/signed/remote audit checkpoint service and no catalog operator CLI. `dekopond auth` owns the ChatGPT model-account login. Secret sources currently use explicit strict bootstrap files: Vault dynamic leases, AWS ambient role chains/IRSA, GCP ADC/WIF, Azure managed identity, kubeconfig exec plugins, custom source CAs, caching/stale fallback, and transformed-reflection prevention do not exist. Catalog provider and status resources remain declarations only. The broker's provider manager currently has exact-reference sync/list/verify only: no SemVer ranges, private-registry credentials/custom roots, publisher-provenance verification, update/install/remove/prune lifecycle, revocation response, or container-staging integration. A digest proves bytes rather than publisher identity, so existing image staging retains its separate GitHub attestation checks. Only the broker can execute the provider effects represented by the catalog example.
+There is no catalog operator CLI. Audit records have no tamper-detection or crash-durability guarantee. `dekopond auth` owns the ChatGPT model-account login. Secret sources currently use explicit strict bootstrap files: Vault dynamic leases, AWS ambient role chains/IRSA, GCP ADC/WIF, Azure managed identity, kubeconfig exec plugins, custom source CAs, caching/stale fallback, and transformed-reflection prevention do not exist. Catalog provider and status resources remain declarations only. The broker's provider manager currently has exact-reference sync/list/verify only: no SemVer ranges, private-registry credentials/custom roots, publisher-provenance verification, update/install/remove/prune lifecycle, revocation response, or container-staging integration. A digest proves bytes rather than publisher identity, so existing image staging retains its separate GitHub attestation checks. Only the broker can execute the provider effects represented by the catalog example.
 
 **Unreleased source change:** model-account commands have moved to `dekopond auth` and the
 standalone catalog executable has been removed. Published 0.12.0 artifacts below are historical;
@@ -210,7 +210,7 @@ A multi-architecture container image publishes to `ghcr.io/dekopon-agents/dekopo
 
 ### Before running the broker
 
-`dekopon-brokerd` requires an owner-controlled strict configuration, private socket/audit/checkpoint directories, and pinned provider component paths:
+`dekopon-brokerd` requires an owner-controlled strict configuration, a protected socket directory and private audit directory, and pinned provider component paths:
 
 ```console
 dekopon-brokerd --config /path/to/broker.yaml
@@ -222,7 +222,7 @@ For Kubernetes, [`charts/dekopon`](charts/dekopon/README.md) runs both daemons a
 
 ## Run the flagship example
 
-[`examples/conditional-write`](examples/conditional-write/README.md) is the whole system in one deployment: a mapped sender asks in Slack for a record to be updated, the gateway attests to the sender and decides nothing, and the broker authorizes one bounded read and one etag-pinned conditional write. The delete the same component exposes is absent, and unreachable: no constraint set describes it. The broker injects a token bound to `api.example.com` and hash-links audit records naming the person who asked; the token is never visible to the model, shell session, or component. Catalog, broker configuration, Cedar policy, credentials template, gateway configuration, and the deny table are pinned against the real machinery by `crates/dekopon-brokerd/tests/examples.rs`.
+[`examples/conditional-write`](examples/conditional-write/README.md) is the whole system in one deployment: a mapped sender asks in Slack for a record to be updated, the gateway attests to the sender and decides nothing, and the broker authorizes one bounded read and one etag-pinned conditional write. The delete the same component exposes is absent, and unreachable: no constraint set describes it. The broker injects a token bound to `api.example.com` and appends owner-only JSONL audit records naming the person who asked; the token is never visible to the model, shell session, or component. Catalog, broker configuration, Cedar policy, credentials template, gateway configuration, and the deny table are pinned against the real machinery by `crates/dekopon-brokerd/tests/examples.rs`.
 
 The GitHub reviewer that used to live here moved out with its provider; it is [`examples/pr-summarizer-linter`](https://github.com/dekopon-agents/dekopon-provider-gh/blob/main/examples/pr-summarizer-linter/README.md) in `dekopon-provider-gh`.
 
@@ -259,7 +259,7 @@ Read [`docs/security-model.md`](docs/security-model.md) for trust assumptions an
 
 ## Roadmap
 
-The next architectural milestones are independent checkpoint retention or signing, operator-CLI integration with the broker and the daemon, and memory lifecycle UX (deletion/export) beyond the current optional on-demand durable chat-turn store. Broker-owned credentials, Cedar, identity/attestation, the unprivileged `dekopond`, and its bounded private-per-subject conversation history shipped in 0.3.0; persistent history now also offers an explicit exact-conversation shared scope, while 0.4.0 added distribution rather than authority. See [`docs/roadmap.md`](docs/roadmap.md); roadmap items are intentions, not shipped features.
+The next architectural milestones are operator-CLI integration with the broker and the daemon, and memory lifecycle UX (deletion/export) beyond the current optional on-demand durable chat-turn store. Broker-owned credentials, Cedar, identity/attestation, the unprivileged `dekopond`, and its bounded private-per-subject conversation history shipped in 0.3.0; persistent history now also offers an explicit exact-conversation shared scope, while 0.4.0 added distribution rather than authority. See [`docs/roadmap.md`](docs/roadmap.md); roadmap items are intentions, not shipped features.
 
 ## Maintainer release process
 

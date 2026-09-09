@@ -135,8 +135,8 @@ ci/verify-image-broker.sh ghcr.io/dekopon-agents/dekopon:<VERSION>
 The Linux verifier requires Docker, Python 3 and sudo to create broker-owned private files.
 It starts the real broker with the baked echo component and waits under a deadline for the
 socket, which is bound only after compilation and description succeed. New releases also run
-the existing `probe` command; pre-retirement immutable releases lack it and require checkpoint
-configuration, so those prove component-load/startup only. Owned containers and private files
+the existing `probe` command; the verifier supplies version-appropriate configuration for
+immutable releases without that command, which prove component-load/startup only. Owned containers and private files
 are removed on exit. This proves the selected release's bytes, not a build of source HEAD.
 There is no replacement general invocation CLI.
 
@@ -150,7 +150,7 @@ In Kubernetes the same selection is `command: ["dekopon-brokerd"]` or `command: 
 - No credentials. `dekopon-brokerd` reads an optional legacy credentials file, an optional private
   secret map, and any source bootstrap files the deployment provides; `dekopond` reads environment
   variables the deployment sets. None is baked.
-- No socket, audit log, or checkpoint. Those are runtime state on a writable volume.
+- No socket or audit log. Those are runtime state on a writable volume.
 - No system CA store dependency. `reqwest` and `ureq` use rustls with compiled-in webpki roots, so
   outbound TLS does not consult `/etc/ssl`.
 

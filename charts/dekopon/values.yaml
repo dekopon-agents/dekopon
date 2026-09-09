@@ -237,7 +237,7 @@ broker:
     timeoutSeconds: 10
     # 5 minutes. Component compilation on a Raspberry Pi 5 is seconds, not minutes; the margin is
     # there because a startup probe that gives up restarts the container, and a restart loop
-    # against durable audit state is the worst failure this chart can produce.
+    # can interrupt work and reset process-local replay protection.
     failureThreshold: 60
   readinessProbe:
     periodSeconds: 30
@@ -356,12 +356,12 @@ state:
   # deliberately moving the retained audit and live model credential to the new volume.
   storageClassName: local-path
   accessModes: [ReadWriteOnce]
-  # Arithmetic in README.md ("Sizing the audit volume"). Short version: a measured external-write
-  # record with two HTTP calls is 1,279 bytes, the record cap is 200,000, so a realistic full log
-  # is ~250 MiB; 2Gi leaves room for ~10.7 KiB per record before the disk, rather than the
-  # daemon's own bound, is what stops the broker.
+  # Audit appends have no total record cap: size for expected traffic and retention, and monitor
+  # disk usage before this fixed-size volume fills. The per-record byte bound is not a disk budget.
+  # maxReplayIds separately bounds process-local replay memory, not audit-file growth; size that
+  # memory independently. See README.md ("Sizing the audit volume").
   size: 2Gi
-  # Named annotation, not a comment: helm uninstall must not delete the audit chain.
+  # Named annotation, not a comment: helm uninstall must not delete the audit log.
   keepOnUninstall: true
   # Bring your own claim instead. Init keeps its root 0:0/0700; each daemon mounts only
   # its own private subdirectory. See the offline layout migration in the chart README.

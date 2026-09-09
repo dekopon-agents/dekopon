@@ -120,7 +120,7 @@ running it. The requirement the chart satisfies, precisely:
 1. **Seed into a writable directory on durable storage.** The credential's directory must be on the
    persistent claim, not an `emptyDir`. An `emptyDir` is discarded when the pod is replaced, so a
    credential seeded there would be re-seeded on every reschedule — which is exactly the failure this
-   design exists to prevent. `/var/lib/dekopon/chatgpt` alongside the audit chain is the natural
+   design exists to prevent. `/var/lib/dekopon/chatgpt` alongside the audit log is the natural
    home; `models[].authFile` in `dekopond.yaml` names the file inside it.
 
 2. **The directory must be `0700` and owned by the runtime UID**, and the file `0600` and owned by

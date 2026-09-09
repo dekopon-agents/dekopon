@@ -284,12 +284,13 @@ the gateway, the subject, and the reason. Both refuse; only one of them ever pro
 
 ## What this deployment does not buy yet
 
-`dekopond` and `dekopon-brokerd` run under one UID here, because the broker's owner-only socket
-currently requires every configured peer UID to equal the server's. Under one UID an attestor grant
-buys attribution and deny-by-default scoping, not isolation — any process running as you can
-already act as the configured gateway peer. `via` and namespace scoping become real separation only
-when the gateway has its own UID, and that deployment is committed direction rather than current
-behavior. [`../../docs/security-model.md`](../../docs/security-model.md) states this in full.
+`dekopond` and `dekopon-brokerd` run under one UID in this local walkthrough. Its attestor grant
+buys attribution and deny-by-default scoping, not OS isolation: any process running as you can
+act as the configured gateway peer. This is an example choice, not a peer-UID equality requirement.
+The chart uses broker UID 65532, gateway UID 65533 and IPC group 65534 with a broker-owned 0710
+parent and a 0660 group-reachable socket. Peer UID mapping supplies identity; group membership
+alone grants none. Owner-only local chat sockets remain 0600 and private stores remain owner-only.
+See the [current local process boundary](../../docs/security-model.md#current-local-process-boundary).
 
 This route is `mode: persistent` and explicitly pins `scope: privateConversation`, so the gateway
 replays a bounded window of earlier turns from the same authenticated sender into the next prompt.

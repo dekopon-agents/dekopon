@@ -13,10 +13,11 @@
 # Every instruction is a COPY, so BuildKit assembles both platforms on one runner with no
 # emulation and no per-architecture build.
 #
-# `dekopon-brokerd` and `dekopond` are separate processes but not separate deployments: the broker
-# socket is `0600`, authenticates its peer with `SO_PEERCRED`, and has no TCP transport, so a
-# gateway can only reach it through a shared filesystem namespace — in Kubernetes, a shared pod.
-# One image whose `command` selects the binary is what that deployment needs.
+# The chart runs broker UID 65532 and gateway UID 65533 in a shared pod, with IPC group 65534.
+# Its broker-owned IPC parent is 0710 and the group-reachable socket is 0660; peer UID mapping
+# authenticates callers, not group membership. Owner-only local chat sockets remain 0600.
+# See docs/security-model.md#current-local-process-boundary; private stores stay owner-only.
+# One image whose `command` selects the binary supports both processes without changing identity.
 #
 # This file expects a staged context and is not buildable from the repository root. The context is
 # constructed by `ci/stage-image-context.sh` rather than filtered out of a checkout: it contains

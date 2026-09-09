@@ -21,7 +21,7 @@ Read in this order:
 9. [`dekopon-brokerd` contract](../crates/dekopon-brokerd/README.md#boundaries) — implemented host/policy foundation and committed authenticated broker-process design, with status called out per slice.
 10. [`secrets.md`](secrets.md) — public inert DRNs, separate `secret.use` authorization, the owner-only private map, executable source adapters, exact HTTP sinks, and rotation/reflection limits.
 11. [`1password-eso.md`](1password-eso.md) — how a secret reaches a deployed daemon through 1Password and External Secrets, including the Kubernetes projection boundary the direct secret-map adapter now handles separately.
-12. [`operations.md`](operations.md) and [`upgrading.md`](upgrading.md) — running a deployment and moving it between releases. `operations.md` is the index into the per-crate operational contracts, including audit checkpoint recovery; `upgrading.md` records the breaking configuration migrations and the restart order.
+12. [`operations.md`](operations.md) and [`upgrading.md`](upgrading.md) — running a deployment and moving it between releases. `operations.md` is the index into the per-crate operational contracts, including audit append failures; `upgrading.md` records the breaking configuration migrations and the restart order.
 13. [`roadmap.md`](roadmap.md) — intended sequence, not a promise that a component exists.
 
 ## Build a provider
@@ -58,7 +58,7 @@ Keep the host, SDK, HTTP and storage facades, provider WIT, HTTP WIT, storage WI
 | The container image, its publication workflow, or a container deployment | [`container-image.md`](container-image.md) | Records that the image reuses the published release archives, what it contains, the numeric runtime UID, the baked provider paths, and the directory ownership both daemons demand. |
 | Operator auth parsing, rendering, or exit codes | [`cli.md`](cli.md) | Records the current operator contract. |
 | Agent, capability, or provider resource fields, or what a catalog value actually decides | [`catalog.md`](catalog.md) | Records every `v1alpha1` field, its consumer, and which fields are reserved and read by nothing. |
-| Running a deployment: startup refusals, audit recovery, draining, or where an operational contract lives | [`operations.md`](operations.md) | Indexes the per-crate operational contracts by operator question rather than by crate. |
+| Running a deployment: startup refusals, audit append failures, draining, or where an operational contract lives | [`operations.md`](operations.md) | Indexes the per-crate operational contracts by operator question rather than by crate. |
 | Moving a deployment between releases, or a breaking configuration change | [`upgrading.md`](upgrading.md) | Records the migrations the changelog only names, the lockstep rule, and the restart order. |
 | Getting a ChatGPT subscription credential into a cluster | [`chatgpt-credential.md`](chatgpt-credential.md) | Records why an interactive login cannot run in a pod, and the seed-once lifecycle that follows from a rotating refresh token. |
 | Model request types, ChatGPT wire JSON, prompt caching, provider retention, chat memory, or memory frameworks | [`inference.md`](inference.md) | Separates request/cache hints, bounded replay, and optional durable on-demand turns from undocumented subscription behavior and broader exploratory memory. |

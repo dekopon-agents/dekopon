@@ -54,7 +54,7 @@ both directions. `dekopond` probes the broker once at startup and exits non-zero
 does not answer, so a plain second container would crash-loop its way to a working state; a sidecar
 with a startup probe means Kubernetes does not start `dekopond` at all until the broker answers a
 real request. Termination runs the other way — the gateway drains first, the broker second — which
-is the order the audit chain wants, and the reason the pod's grace is a sum rather than a maximum;
+is the order the audit log wants, and the reason the pod's grace is a sum rather than a maximum;
 see [Draining takes both graces, in sequence](#draining-takes-both-graces-in-sequence). This needs
 Kubernetes 1.29 or newer, and `Chart.yaml` declares `kubeVersion: ">=1.29.0-0"` so an older cluster
 refuses the install instead of deadlocking on an init container that never exits.
@@ -171,7 +171,7 @@ configuration. These are offline operator steps, not a live-cluster action perfo
 | optional secret source projection | operator-selected absolute path | source-specific | mounted read-only into broker only through `broker.secretSourceVolumes` |
 | `dekopond.yaml` | `/etc/dekopon/dekopond.yaml` | B | init container |
 | broker socket | `/run/dekopon/broker.sock` | protected IPC | the broker, at bind |
-| audit chain | `/var/lib/dekopon/audit.jsonl` | A + C | the broker |
+| audit log | `/var/lib/dekopon/audit.jsonl` | A + C | the broker |
 | agent catalog | `/etc/dekopon-catalog/dekopon.yaml` | E | ConfigMap mount |
 | ChatGPT credential | `/var/lib/dekopon/chatgpt/chatgpt-auth.json` | none | init container, **once**; then `dekopond` owns it |
 | providers | `/opt/dekopon/providers/*.wasm` | B | baked into the image |
@@ -185,7 +185,9 @@ There is no HTTP health endpoint, and the image is distroless with no shell, so 
 run `dekopon-brokerd probe --socket /run/dekopon/broker.sock`, which connects
 over the real socket, passes `SO_PEERCRED` in both directions, and gets back the capability list
 policy exposes to this peer. It is evaluated from the constraint catalog and the policy set and
-appends **no audit record**, so probing does not consume the audit log's bounded record budget.
+appends **no audit record**, so probing adds no audit-file growth. Audit appends have no total
+record cap: monitor disk usage and provision for traffic and retention. `maxReplayIds` separately
+bounds process-local replay memory, not disk usage; size that memory independently.
 
 - **`startupProbe`**, 5 s period, 60 failures — five minutes. The broker compiles every `.wasm`
   component through Cranelift before it binds the socket, so "the socket answers" is exactly "fully
@@ -193,7 +195,7 @@ appends **no audit record**, so probing does not consume the audit log's bounded
   a restart read compiled code back from disk instead of recompiling, but the cold path is still
   Cranelift and the probe budget still has to cover it. The
   margin is large because a startup probe that gives up restarts the container, and a restart loop
-  against durable audit state is the worst thing this chart can produce.
+  against audit state is the worst thing this chart can produce.
 - **Broker `readinessProbe`**, 30 s period. It keeps pod readiness truthful and, when the optional
   webhook Service is enabled, prevents traffic while the broker is unavailable.
 - **Gateway `readinessProbe`**, only with `gateway.service.enabled`. A TCP probe gates the Service
@@ -538,7 +540,7 @@ No credential fields: the package is public and the pull is anonymous.
 
 One more thing this chart does for you: the retained claims carry
 `argocd.argoproj.io/sync-options: Prune=false,Delete=false`, so `syncPolicy.automated.prune: true`
-cannot take the audit chain when the claim stops being rendered. See
+cannot take the audit log when the claim stops being rendered. See
 [Storage, uninstall, and recovery](#storage-uninstall-and-recovery).
 
 ## Configuration values
@@ -618,7 +620,7 @@ helm upgrade --install dekopon charts/dekopon -n dekopon --create-namespace \
 
 [`values-pr-summarizer-linter.yaml`](values-pr-summarizer-linter.yaml) is the
 [PR summarizer and linter](https://github.com/dekopon-agents/dekopon-provider-gh/blob/main/examples/pr-summarizer-linter/README.md) deployment expressed as chart values: Slack Agent sessions with tangerine reaction degradation, one
-agent, six narrow `gh` capabilities, a broker-injected token by reference, and the audit chain on its
+agent, six narrow `gh` capabilities, a broker-injected token by reference, and the audit log on its
 own volume. It may post one review comment and has no approval, request-changes, or merge capability.
 
 ## What is not proven

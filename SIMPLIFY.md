@@ -394,8 +394,15 @@ prior stop at `wave1-stop.md`; historical free-space figures are not current hea
   prose and named D6 documentation obligations. Final archive/install/MSRV/hosted gates
   remain pending. Negative capability: no direct runner or import-free host executable.
 - **D3e — landed; full-wave validation pending.** Reviewed source `629c1b7f9a24d6eee19731b90dc6105fafff3dac`, integrated with provenance in this unit commit. Independent HIGH review accepts both anchored daemon normal-dependency gates, matching local commands and exact-name/allowed-name/Cargo-failure controls. Metadata precedes actual composed Wave3 gates; external exact-head receipts, not this ledger, record their outcome. No runtime capability is removed; CI cannot accept the forbidden opposite-direction dependencies. Discoveries: none.
-- **D2d — pending.** Remaining durability prose after D2c; commit: —;
-  named future-owned hits must remain explicitly reported, never silently excluded.
+- **D2d — landed; full-wave validation pending.** Reviewed source
+  `d5927d9d3d056345239cea438949dc9d9f0f6acb`, integrated with provenance in this
+  unit commit. Independent HIGH review accepts complete durability prose and named
+  D6 example/image UID closure, unchanged runtime and assertions, scoped core gates
+  and six pinned deterministic components at their actual earlier execution head.
+  Current prose states append-only JSONL and bounded process-local replay, not
+  audit-chain integrity, checkpoint rollback detection or restart replay recovery.
+  Metadata precedes actual composed Wave3 gates; external exact-head receipts record
+  their outcome. No runtime capability is removed. Discoveries: none.
 - **D3f — pending.** Final changelog/component ownership after deletions; commit: —;
   no packaging deferral, publication or yanks. D1 has only D1a/D1b, no D1c slot.
 

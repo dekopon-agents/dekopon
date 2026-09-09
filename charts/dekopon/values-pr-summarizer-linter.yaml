@@ -1,6 +1,6 @@
 # A realistic override set: the pr-summarizer-linter deployment, moved onto the chart's paths.
-# Slack in, one agent, six narrow gh capabilities, one broker-injected GitHub token, and a durable
-# audit chain.
+# Slack in, one agent, six narrow gh capabilities, one broker-injected GitHub token, and an owner-only
+# append-only JSONL audit log.
 #
 # The walkthrough itself lives with the provider it exercises, in dekopon-agents/dekopon-provider-gh.
 # This file stays here because it is a test of *this* chart against the component the image ships:

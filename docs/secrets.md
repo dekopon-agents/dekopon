@@ -383,7 +383,7 @@ intend to grant.
 ## Resolution and rotation
 
 Startup parses and validates the map, locators, scopes and bootstrap paths without contacting a
-remote source. After dual authorization and durable decision audit, the broker resolves exactly one
+remote source. After dual authorization and appending the decision audit record, the broker resolves exactly one
 snapshot. There is no cross-invocation cache and no stale fallback:
 
 - a floating alias or projected generation rotates on the next invocation;

@@ -16,10 +16,12 @@ Provider HTTP, gateway webhooks, model accounting and daemon tracing remain.
 
 ## Broker audit configuration (unreleased)
 
-Remove `checkpointPath` and `checkpointLockPath` from broker configuration before starting
-the new binary: both are rejected as unknown fields. Keep the private audit file and its
-existing limits; startup still verifies its chain and restores replay identifiers.
-Library callers of `run` receive unit on clean shutdown.
+Use only the current [broker configuration fields](../crates/dekopon-brokerd/README.md#configuration);
+obsolete audit settings are rejected as unknown fields. Keep the private audit file and its
+line-size bound. Startup counts bounded newline-delimited records without decoding history and
+refuses unterminated tails. Appends are flushed, not fsynced; there is no automatic repair,
+historical integrity check, or crash-durability guarantee. Replay rejection is process-local and
+starts empty after restart. Library callers of `run` receive unit on clean shutdown.
 
 ## Provider storage direct-write contract
 
@@ -53,7 +55,7 @@ mechanics. The container image and the chart ship all three from one release for
 `dekopond` asks the broker for capabilities once at startup and **exits non-zero** if the broker does
 not answer, so a gateway started against a stopped broker crash-loops rather than waiting. Shutdown
 runs the other way: the gateway drains first so no session is mid-invocation when the broker begins
-synchronizing its audit chain.
+finishing its audit appends.
 
 Dekopon ships no service units, so the order is yours to enforce whatever supervises the processes:
 
@@ -68,9 +70,9 @@ Under the Helm chart this ordering is structural rather than procedural: the bro
 sidecar with a startup probe, so Kubernetes will not start `dekopond` until the broker answers a real
 request, and terminates them in the reverse order.
 
-**Never move the audit chain or its checkpoint as part of an upgrade.** Startup requires the
-checkpoint to be an exact verified prefix of the audit file, and a mismatch fails closed and needs
-explicit operator recovery. See [`operations.md`](operations.md#the-audit-chain-and-its-checkpoint).
+Keep audit data when upgrading or investigating a refusal. A fresh process does not recover replay
+state from that file, and restarting does not make an uncertain external effect safe to retry.
+See [`operations.md`](operations.md#append-only-audit-and-process-local-replay).
 
 ## Release-by-release
 
@@ -125,7 +127,7 @@ bootstrap limitations.
   value quietly ignored. Delete every `dev.*` `identityMappings` subject and attestor namespace with
   it: `dev` is no longer a subject service, so those lines no longer parse either. The field was off
   by default and no chart release could set it, so a deployment that never opted in has nothing to
-  edit — and no persisted audit chain can carry a `dev.*` subject.
+  edit — and no persisted audit log can carry a `dev.*` subject.
 - **Declare `route:` on every chat-memory constraint set before upgrading the broker.** Durable chat
   memory used to be recognized by name: any capability spelled `memory.chat.*` and any provider
   called `memory-chat` was reserved, and renaming the shipped provider silently dropped that
@@ -375,12 +377,12 @@ defaults to, so a chart release and an application release are two separate upgr
 application under an existing chart, set `image.tag` (or better, `image.digest`) rather than waiting
 for a chart release. [`charts/dekopon/README.md`](../charts/dekopon/README.md#two-version-numbers)
 has the full account, including the retained-claim behavior that makes `helm uninstall` leave the
-audit chain in place.
+audit log in place.
 
 ## Related documents
 
 - [`CHANGELOG.md`](../CHANGELOG.md) — the authoritative record of what each release contains.
-- [`operations.md`](operations.md) — the running-system runbook, including audit recovery.
+- [`operations.md`](operations.md) — the running-system runbook, including audit append failures.
 - [`dekopon-brokerd` contract](../crates/dekopon-broker-protocol/README.md#version-and-compatibility) — what a version mismatch actually
   does on the wire.
 - [`catalog.md`](catalog.md) — the catalog schema an upgrade may need you to re-read.

@@ -6,25 +6,20 @@ broker is [`crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.
 gateway it is [`dekopond.md`](dekopond.md). This page exists so an operator can find them by the
 question they arrived with, rather than by guessing that a crate README is the operations manual.
 
-One instruction is restated here because it is the most consequential in the project and must not be
-reachable only by guessing.
+## Append-only audit and process-local replay
 
-## The audit chain and its checkpoint
+`dekopon-brokerd` appends metadata-only records to an owner-only JSONL file. Startup counts
+bounded newline-delimited records for the next ordinal without decoding or verifying history;
+unterminated tails are refused, not repaired. Appends are flushed, not fsynced. A failed or
+cancelled append can leave partial bytes and poisons the open handle.
 
-> **A non-empty audit log with no checkpoint fails closed and requires explicit operator recovery
-> from trusted copies. So does any checkpoint that is not an exact verified prefix of the audit
-> file. Do not delete one file to make the broker start.**
+Replay rejection is bounded to the current broker process. Restart creates an empty replay
+ledger: persisted audit records do not restore invocation IDs or establish whether retrying an
+external effect is safe. There is no tamper-detection, rollback protection, or crash-recovery
+promise. Preserve audit data when investigating an append failure; do not erase it to bypass a
+startup refusal.
 
-`dekopon-brokerd` keeps a hash-linked JSONL audit chain and, in a separately locked file, a
-checkpoint holding the retained record count and the SHA-256 chain head. At startup the checkpoint
-must identify an exact prefix of the fully verified chain; that is what detects replacement,
-truncation, and valid-prefix rollback. An audit exactly one record ahead of a valid checkpoint is the
-recoverable crash window and is advanced before the broker listens. A larger gap is not.
-
-Deleting the checkpoint does not repair the state — it destroys the evidence that would have told you
-what happened. Recovery means restoring both files from copies you trust.
-
-Full mechanics, filesystem requirements, and the limits of local integrity evidence:
+Full append mechanics, bounds, and private-file requirements:
 [`crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.md#audit).
 
 ## By the question you arrived with
@@ -63,7 +58,7 @@ Full mechanics, filesystem requirements, and the limits of local integrity evide
 |---|---|
 | What do the traces, spans, and audit-safe logs contain? | [`observability.md`](observability.md) |
 | A client got a failure code — is it safe to resubmit? | [`dekopon-brokerd` contract § Failure codes](../crates/dekopon-broker-protocol/README.md#failure-codes) |
-| An invocation may have taken effect and was not recorded. | `outcome-unaudited`, in the same table. The durable audit is the only record; do not resubmit under any identifier |
+| An invocation may have taken effect and was not recorded. | `outcome-unaudited`, in the same table. The terminal audit record may be missing; the effect may have happened. Do not resubmit under any identifier |
 
 ### Deploying
 
@@ -83,10 +78,9 @@ most often come up while operating are:
 - **IPC group membership is not identity.** The [current local process boundary](security-model.md#current-local-process-boundary)
   separates gateway and broker UIDs; the broker maps the real peer UID, not its group.
   Each mapped UID remains its own trust domain, not independent process attestation.
-- **The checkpoint is local integrity evidence, not tamper-proof storage.** It detects truncation and
-  rollback relative to a retained checkpoint. Coordinated deletion of both files by whoever owns the
-  host is not detectable from local state; retain or export checkpoint generations elsewhere if that
-  is in your threat model.
+- **Audit is append-only evidence, not tamper-proof or crash-durable storage.** Private files and
+  redaction contain access and content; they do not establish historical integrity or recover replay
+  state. A restart is not permission to retry an effect.
 
 [`security-model.md`](security-model.md) is the full statement of what is trusted, what is not, and
 what is presently out of scope.

@@ -11,7 +11,7 @@ spans. Their records meet in the backend, correlated by trace context rather tha
 relaying telemetry for the other.
 
 This is operational observability. It does not replace broker policy evidence, authorized
-invocation results, or the broker's durable hash-linked audit log.
+invocation results, or the broker's append-only JSONL audit log.
 
 ## Which signal carries what
 
@@ -20,7 +20,7 @@ stops the log stream from becoming a worse copy of the trace.
 
 | Signal | Question | Lifetime |
 |---|---|---|
-| **Broker audit** | What was *authorized*? | Permanent, hash-chained, owner-only |
+| **Broker audit** | What was *authorized*? | Append-only JSONL, owner-only; no crash-durability guarantee |
 | **Traces** | What did the code do, and how long did it take? | Sampled; expires with trace retention |
 | **Logs** | What could not be a span, and what must outlive one? | Retained independently |
 
@@ -200,9 +200,9 @@ the SDK's own diagnostics on stdout.
 
 
 Telemetry never blocks startup. An exporter that cannot be built disables export and logs why;
-authorization and durable audit are the service's contract, and a missing exporter must not cost a
+authorization and append-only audit are the service's contract, and a missing exporter must not cost a
 working authority boundary. Flush failures at shutdown are logged and do not change the exit code,
-because the audit chain rather than telemetry is the record of what happened.
+because the audit log rather than telemetry is the record of what happened.
 
 The broker's log output is structured JSON on stdout, filtered by `RUST_LOG` and defaulting to
 `info`. Shipping those logs to storage is deliberately left to whatever reads stdout, so the broker
@@ -217,8 +217,8 @@ This does not install a daemon log exporter or change `RUST_LOG` filtering.
 actually requested the capability, and the broker opens `broker.invocation` beneath it as a remote
 parent, so one trace spans both processes instead of two unrelated traces appearing per run.
 
-This is separate from `TraceId`, which continues to identify a Dekopon session in the audit chain
-and replay accounting. Two identifiers, two jobs: `TraceId` is durable audit correlation and
+This is separate from `TraceId`, which continues to identify a Dekopon session in the audit log
+and replay accounting. Two identifiers, two jobs: `TraceId` is audit correlation and
 `traceParent` is telemetry correlation.
 
 `traceParent` is untrusted like every other request field. It reaches span parenting and nothing
@@ -228,12 +228,12 @@ than sending none; an absent value simply means the client exports no telemetry.
 
 The broker span carries the invocation, capability, and trace identifiers and nothing more. Provider
 input and output, URL paths and queries, headers, and bodies stay out of it for exactly the reason
-they stay out of audit records: telemetry is a second egress path with none of the audit chain's
-guarantees, and it must not carry what audit deliberately redacts.
+they stay out of audit records: telemetry is a separate egress path rather than the broker's owner-only record,
+and it must not carry what audit deliberately redacts.
 
 An attested proposal adds routing fields to both spans: `broker.invocation` records the claimed
 `subject` and `agent`, and `broker.authorize` records the `subject` and the `via` peer the broker
-derived the context through — the same values the audit chain keeps, for the same reason. All of
+derived the context through — the same values the audit log keeps, for the same reason. All of
 them are canonical identifiers (`slack.t0123abc.u9xyz`), never the chat message that prompted the
 invocation. A refusal records the claimed subject and its `outcome` with no `via`, because no
 attested context was derived.
@@ -369,7 +369,7 @@ its own event so that a key and a canonical subject never share a record.
 | `http.request` | `dekopon-http-host` | `http.request.method`, `server.address`, `http.response.status_code`, `dekopon.http.request.accounted_bytes`, `dekopon.http.response.accounted_bytes`, `outcome`; `error.code` and `error.message` on failure |
 
 `http.request` fields mirror `HttpCallEvidence` exactly, and that is deliberate rather than
-incidental: the span reports the same call the audit chain records, so it carries the same sanitized
+incidental: the span reports the same call the audit log records, so it carries the same sanitized
 set and no more. URL paths and queries, request and response headers, and both bodies are absent
 here for the same reason they are absent from evidence. A test in `dekopon-http-host` drives a real
 loopback request whose path, query, header, and body are each a distinct sentinel and asserts that
@@ -454,7 +454,8 @@ its `policy_ids`. A subject-only attested proposal still answers with its own cl
 transport takes that path.
 
 The source chain is the diagnosable half. `ConnectionError::Broker` renders as "broker failed" and
-`AuditError::Io` as "durable audit append failed"; the errno that says *why* — `ENOSPC` on an audit
+`AuditError::Io` as "durable audit append failed" (an error label, not a crash-durability guarantee);
+the errno that says *why* — `ENOSPC` on an audit
 filesystem shared with anything else — lives one or two levels down, and these events render the
 whole chain as one `a: b: c` line. Frame contents never join it: a decode failure names its kind, not
 the bytes that failed to decode.
@@ -518,7 +519,7 @@ those sinks stay metadata-only.
 
 This widens **data**, not credentials. Request and response headers and HTTP bodies stay out in
 both modes, and a `Redacted` value renders its marker in either mode because that is a property of
-the value rather than of the mode. Durable audit records are untouched by this setting: it changes
+the value rather than of the mode. Append-only audit records are untouched by this setting: it changes
 telemetry only.
 
 ## Model and tool transcript
