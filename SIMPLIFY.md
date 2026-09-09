@@ -403,7 +403,13 @@ prior stop at `wave1-stop.md`; historical free-space figures are not current hea
   audit-chain integrity, checkpoint rollback detection or restart replay recovery.
   Metadata precedes actual composed Wave3 gates; external exact-head receipts record
   their outcome. No runtime capability is removed. Discoveries: none.
-- **D3f — pending.** Final changelog/component ownership after deletions; commit: —;
+- **D3f — reviewed source integrated; final Wave4 acceptance pending.** Final retirement
+  changelog and current architecture/design ownership name the two daemons and retained
+  shared libraries. Reviewed source `f0dae3d1786c21eb5dbbc879baf5ac08c5848130`,
+  integrated with provenance under `Simplify-Unit: D3f`; independent scoped review accepted.
+  Metadata precedes integrated scoped checks. Aggregate review, housekeeping, metrics and
+  actual final gates remain pending; external exact-head receipts record their outcomes.
+  No runtime/API capability is added or removed by this documentation-only unit;
   no packaging deferral, publication or yanks. D1 has only D1a/D1b, no D1c slot.
 
 A unit commit cannot contain its own SHA: resolve its trailer at the next same-commit

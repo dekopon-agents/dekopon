@@ -17,6 +17,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Removed
 
+- Retired the `dekopon`, `dekopon-webui`, `dekopon-run`, and `dekopon-provider-host` crates. Only `dekopond` and `dekopon-brokerd` ship as binaries; shared agent, shell, model, SDK, and broker libraries remain. Published versions are not recalled or yanked; publication and a later independent console repin remain follow-ups.
+
 - Broker audit-chain verification, replay restoration from disk, and the `audit verify` command.
   Audit records now append only `sequence` and `event`; existing bytes are not migrated or
   integrity-checked. Remove `serverLimits.auditMaxRecords` from broker configuration; unknown
