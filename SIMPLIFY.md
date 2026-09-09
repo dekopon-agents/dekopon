@@ -409,3 +409,18 @@ prior stop at `wave1-stop.md`; historical free-space figures are not current hea
 A unit commit cannot contain its own SHA: resolve its trailer at the next same-commit
 integration update; exact current head lives in external evidence. Remove this ledger
 only in final housekeeping before the core PR; keep the amended brief committed.
+
+- **W3-G1 — reviewed correction integrated; full-wave gates pending.**
+  Owner-approved test-only mutable-cache observation repair; commit identified by
+  `Simplify-Repair: W3-G1`, reviewed source
+  `610e4f96229090b5784b250de038eaa66776975d` (independent review accepted).
+  This provenance metadata precedes all corrected-head Wave3 gates; their actual
+  results live in external receipts, not a late ledger amendment.
+  Enumerated entries disappearing before metadata lookup
+  contribute no file; all other I/O errors propagate. Deterministic rename, empty,
+  regular-file, symlink and error controls accompany unchanged real echo loads and
+  invocation/cache assertions. Strict shared containment snapshots and runtime are
+  unchanged. Original composed Wave3 failure remains evidence, not acceptance.
+  Negative capability: no runtime capability is removed; the cache fixture can no
+  longer treat a vanished enumerated entry as a required stable snapshot entry.
+  Discoveries: the original disappearing filename was not recorded.
