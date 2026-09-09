@@ -40,7 +40,7 @@ empty and does not restore previous data.
 
 ## Two rules that apply to every upgrade
 
-### Upgrade all three executables together
+### Upgrade both daemon executables together
 
 `dekopon-brokerd` and `dekopond` are separately installable — Homebrew,
 crates.io, release archives, the container image, and the Helm chart with its own `image.tag` — so a
@@ -48,7 +48,7 @@ mixed set is easy to end up with by accident. Do not. The local broker protocol 
 constant and both envelopes are strict-decoded; a newer broker adding a field to a response an older
 client already understands makes that response undecodable, which is the failure a partial upgrade
 most reliably produces. [`dekopon-brokerd` contract](../crates/dekopon-broker-protocol/README.md#version-and-compatibility) has the exact
-mechanics. The container image and the chart ship all three from one release for this reason.
+mechanics. The container image and the chart ship both daemon executables from one release for this reason.
 
 ### Restart the broker first and stop it last
 
