@@ -32,6 +32,11 @@ All notable changes to Dekopon are documented here. The format is based on
   `broker.credential.refresh` span records `outcome` as `current`, `adopted`, `rotated`,
   `rotated-unsaved`, or `failed`. Give the broker its own `dekopond auth chatgpt login --auth-file`:
   sharing one file with the gateway eventually revokes the token family for both.
+- `dekopon-http-host` exposes `destinations_cover`, re-exported by `dekopon-broker-host`, so the
+  policy layer's startup coverage check and `BoundCredential::covers` are one comparison. A
+  refreshing credential has no rendered value to ask at startup, and a second implementation could
+  accept a host the injector then refuses — the runtime mismatch that check exists to make
+  unreachable.
 - `BoundCredential` can carry one fixed companion header beside `authorization`, and
   `BoundCredential::chatgpt_subscription` uses it for `chatgpt-account-id`, whose value is a claim
   inside the access token a guest never sees. It is one credential rather than a generic header sink:

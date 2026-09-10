@@ -425,10 +425,7 @@ impl BoundCredential {
     /// Whether one allowed-host scope is covered verbatim by this credential's destinations.
     #[must_use]
     pub fn covers(&self, allowed_host: &str) -> bool {
-        let allowed = allowed_host.trim().to_ascii_lowercase();
-        self.destinations
-            .iter()
-            .any(|destination| destination.trim().to_ascii_lowercase() == allowed)
+        destinations_cover(&self.destinations, allowed_host)
     }
 
     fn matches(&self, host: &str, port: u16, scheme: &str) -> bool {
@@ -496,6 +493,20 @@ impl BoundCredential {
             (name.clone(), rendered)
         }))
     }
+}
+
+/// Whether one allowed-host scope is covered verbatim by a credential's destination list.
+///
+/// The policy layer's coverage check is what makes a runtime destination mismatch unreachable, so it
+/// has to agree with [`BoundCredential::covers`] exactly. A broker entry whose value only exists at
+/// resolution time has no `BoundCredential` to ask at startup and calls this instead; a second
+/// implementation of the comparison could accept a host the injector then refuses.
+#[must_use]
+pub fn destinations_cover(destinations: &[String], allowed_host: &str) -> bool {
+    let allowed = allowed_host.trim().to_ascii_lowercase();
+    destinations
+        .iter()
+        .any(|destination| destination.trim().to_ascii_lowercase() == allowed)
 }
 
 /// The `allowed_hosts` grammar, applied to credential destinations: a bare authority with no

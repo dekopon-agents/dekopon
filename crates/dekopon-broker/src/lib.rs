@@ -973,15 +973,16 @@ impl From<Arc<dyn RefreshingCredential>> for StoredCredential {
 
 impl StoredCredential {
     /// Whether one allowed-host scope is covered verbatim by this entry's destinations.
+    ///
+    /// Both arms reach the same comparison `BoundCredential::covers` uses. A refreshing entry has no
+    /// rendered credential to ask at startup, and a second implementation of the comparison could
+    /// accept a host the injector then refuses — which is the runtime mismatch this check exists to
+    /// make unreachable.
     fn covers(&self, allowed_host: &str) -> bool {
         match self {
             Self::Fixed(credential) => credential.covers(allowed_host),
             Self::Refreshing(source) => {
-                let allowed = allowed_host.trim().to_ascii_lowercase();
-                source
-                    .destinations()
-                    .iter()
-                    .any(|destination| destination.trim().to_ascii_lowercase() == allowed)
+                dekopon_broker_host::destinations_cover(source.destinations(), allowed_host)
             }
         }
     }

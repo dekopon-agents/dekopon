@@ -44,7 +44,7 @@ mod http;
 mod metadata;
 mod metrics;
 mod storage;
-pub use http::{BoundCredential, HttpCallEvidence, HttpConfigurationError};
+pub use http::{BoundCredential, HttpCallEvidence, HttpConfigurationError, destinations_cover};
 use http::{HttpCeilings, HttpState};
 pub use metadata::{ComponentInterfaceItem, LoadedProviderMetadata};
 use metadata::{component_interface, identify_bytes};
