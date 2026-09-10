@@ -30,7 +30,6 @@ pub struct StorageLimits {
     /// Compatibility spelling: bounds concurrently active invocation handles.
     pub max_pending_transactions: u64,
     pub startup_max_entries: u64,
-    pub max_quarantined_namespaces: u64,
 }
 
 impl Default for StorageLimits {
@@ -57,7 +56,6 @@ impl Default for StorageLimits {
             finalization_budget_ms: 5_000,
             max_pending_transactions: 64,
             startup_max_entries: 100_000,
-            max_quarantined_namespaces: 128,
         }
     }
 }
@@ -96,7 +94,6 @@ impl StorageLimits {
             ("finalizationBudgetMs", self.finalization_budget_ms),
             ("maxPendingTransactions", self.max_pending_transactions),
             ("startupMaxEntries", self.startup_max_entries),
-            ("maxQuarantinedNamespaces", self.max_quarantined_namespaces),
         ];
         if let Some((field, _)) = positive.into_iter().find(|(_, value)| *value == 0) {
             return Err(StorageConfigError::Zero { field });
@@ -157,11 +154,6 @@ impl StorageLimits {
                 1_024,
             ),
             ("startupMaxEntries", self.startup_max_entries, 1_000_000),
-            (
-                "maxQuarantinedNamespaces",
-                self.max_quarantined_namespaces,
-                1_024,
-            ),
         ];
         if let Some((field, value, maximum)) = ceilings
             .into_iter()
@@ -206,10 +198,12 @@ impl StorageLimits {
 
         // `startupMaxEntries` is also enforced as the live root-wide entry cap. It may therefore
         // be lower than the product of independent namespace/file ceilings without admitting a
-        // store that cannot restart. One namespace must still be representable in full.
+        // store that cannot restart. One namespace must still be representable in full: the three
+        // root entries, then the base, its lease, one generation and that generation's data
+        // directory, before any of the namespace's own files.
         let one_namespace = self
             .max_files_per_namespace
-            .checked_add(8)
+            .checked_add(7)
             .ok_or(StorageConfigError::Arithmetic)?;
         if one_namespace > self.startup_max_entries {
             return Err(StorageConfigError::RestartCapacity {
@@ -245,7 +239,7 @@ mod tests {
     use super::{StorageConfigError, StorageLimits};
 
     #[test]
-    fn retired_gc_and_recovery_keys_are_unknown() {
+    fn retired_gc_recovery_and_quarantine_keys_are_unknown() {
         let defaults = StorageLimits::default();
         let valid = serde_json::to_value(&defaults).expect("serialize defaults");
         assert_eq!(
@@ -260,6 +254,7 @@ mod tests {
             "gcIntervalMs",
             "gcMaxNamespacesPerPass",
             "gcMaxBytesPerPass",
+            "maxQuarantinedNamespaces",
         ] {
             let mut value = valid.clone();
             value

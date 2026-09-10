@@ -4868,10 +4868,6 @@ fn encode_storage_limits(
             limits.max_pending_transactions,
         ),
         ("storage.startupMaxEntries", limits.startup_max_entries),
-        (
-            "storage.maxQuarantinedNamespaces",
-            limits.max_quarantined_namespaces,
-        ),
     ] {
         encoded.number(label, u128::from(value));
     }
@@ -5184,6 +5180,7 @@ fn public_host_error(error: &BrokerHostError, route: CapabilityRoute) -> &'stati
             dekopon_storage_host::StorageHostError::Busy => "storage-busy",
             dekopon_storage_host::StorageHostError::Timeout => "storage-timeout",
             dekopon_storage_host::StorageHostError::Corrupt { .. }
+            | dekopon_storage_host::StorageHostError::CorruptNamespace { .. }
             | dekopon_storage_host::StorageHostError::CorruptLayout
             | dekopon_storage_host::StorageHostError::KeyMismatch => "storage-corrupt",
             _ => "storage-io",
@@ -5321,6 +5318,7 @@ impl BrokerError {
             dekopon_storage_host::StorageHostError::Busy => "storage-busy",
             dekopon_storage_host::StorageHostError::Timeout => "storage-timeout",
             dekopon_storage_host::StorageHostError::Corrupt { .. }
+            | dekopon_storage_host::StorageHostError::CorruptNamespace { .. }
             | dekopon_storage_host::StorageHostError::CorruptLayout
             | dekopon_storage_host::StorageHostError::KeyMismatch => "storage-corrupt",
             _ => "storage-io",
