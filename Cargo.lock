@@ -1084,6 +1084,7 @@ dependencies = [
  "dekopon-core",
  "dekopon-test-support",
  "getrandom 0.4.3",
+ "hmac",
  "rustix",
  "serde",
  "serde_json",

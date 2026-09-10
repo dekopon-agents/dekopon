@@ -17,6 +17,7 @@ include = ["src/**", "README.md", "Cargo.toml"]
 dekopon-capability.workspace = true
 dekopon-core.workspace = true
 getrandom.workspace = true
+hmac.workspace = true
 rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true

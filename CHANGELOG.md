@@ -263,6 +263,13 @@ All notable changes to Dekopon are documented here. The format is based on
   their documentation. The [migration requirements](docs/design.md#legacy-credential-bindings)
   preserve per-agent isolation, destination binding, refresh, and native injection; no runtime or
   configuration migration is implemented by this documentation change.
+- `dekopon-storage-host` derives its namespace commitments through the `hmac` crate instead of a
+  hand-rolled HMAC-SHA-256 construction. The output is bit-identical, which is the point: physical
+  paths, generation tokens, record IDs, and audit scopes are HMAC tags, so a changed digest would
+  make every retained namespace unreadable. Equivalence was proven against the removed
+  implementation over empty keys, empty messages, and keys past the 64-byte block before it was
+  deleted, and the RFC 4231 known-answer vectors stay in the suite. Both daemons already linked
+  `hmac`, so the lockfile gains an edge and no crate.
 
 ### Removed
 

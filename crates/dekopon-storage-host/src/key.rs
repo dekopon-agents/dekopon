@@ -8,9 +8,10 @@ use std::{
     path::Path,
 };
 
+use hmac::{Hmac, KeyInit as _, Mac as _};
 use rustix::fs::{Mode, OFlags};
 use serde::Deserialize;
-use sha2::{Digest as _, Sha256};
+use sha2::Sha256;
 
 use crate::StorageHostError;
 
@@ -228,48 +229,10 @@ pub(crate) fn encoded_fields(fields: &[&[u8]]) -> Vec<u8> {
     encoded
 }
 
-struct HmacSha256 {
-    inner: Sha256,
-    outer_pad: [u8; 64],
-}
-
-impl HmacSha256 {
-    fn new(key: &[u8]) -> Self {
-        const BLOCK: usize = 64;
-        let mut normalized = [0_u8; BLOCK];
-        if key.len() > BLOCK {
-            normalized[..32].copy_from_slice(&Sha256::digest(key));
-        } else {
-            normalized[..key.len()].copy_from_slice(key);
-        }
-        let mut inner_pad = [0x36_u8; BLOCK];
-        let mut outer_pad = [0x5c_u8; BLOCK];
-        for index in 0..BLOCK {
-            inner_pad[index] ^= normalized[index];
-            outer_pad[index] ^= normalized[index];
-        }
-        let mut inner = Sha256::new();
-        inner.update(inner_pad);
-        Self { inner, outer_pad }
-    }
-
-    fn update(&mut self, bytes: &[u8]) {
-        self.inner.update(bytes);
-    }
-
-    fn finalize(self) -> [u8; 32] {
-        let inner = self.inner.finalize();
-        let mut outer = Sha256::new();
-        outer.update(self.outer_pad);
-        outer.update(inner);
-        outer.finalize().into()
-    }
-}
-
 fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    let mut hmac = HmacSha256::new(key);
-    hmac.update(message);
-    hmac.finalize()
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts keys of every length");
+    mac.update(message);
+    mac.finalize().into_bytes().into()
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
@@ -299,6 +262,33 @@ mod tests {
         DOMAIN_LOGICAL_PATH, DOMAIN_MANIFEST, DOMAIN_NAMESPACE_PATH, DOMAIN_OPERATION_EVIDENCE,
         DOMAIN_OUTPUT_EVIDENCE, DOMAIN_RECORD_ID, StorageKey,
     };
+
+    /// RFC 4231 section 4 test vectors 1, 2 and 6, the last with a key longer than SHA-256's
+    /// 64-byte block.
+    const RFC_4231: [(&[u8], &[u8], &str); 3] = [
+        (
+            &[0x0b; 20],
+            b"Hi There",
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7",
+        ),
+        (
+            b"Jefe",
+            b"what do ya want for nothing?",
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843",
+        ),
+        (
+            &[0xaa; 131],
+            b"Test Using Larger Than Block-Size Key - Hash Key First",
+            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54",
+        ),
+    ];
+
+    #[test]
+    fn hmac_matches_the_rfc_4231_vectors() {
+        for (key, message, expected) in RFC_4231 {
+            assert_eq!(super::hex(&super::hmac_sha256(key, message)), expected);
+        }
+    }
 
     #[test]
     fn domains_never_reuse_one_commitment() {
