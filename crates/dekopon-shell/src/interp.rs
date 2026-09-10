@@ -811,81 +811,6 @@ impl Evaluator<'_> {
         Ok(CommandResult::status(ExitCode::SUCCESS))
     }
 
-    /// `getopts OPTSTRING NAME`: parses one flag out of the current positional parameters.
-    ///
-    /// Scoped to a shell function, because that is the only place positional parameters exist here.
-    /// `OPTIND` and `OPTARG` are ordinary variables, as in bash, so a script resets and inspects
-    /// them the way it already knows how.
-    fn run_getopts(&mut self, arguments: &[String]) -> Result<CommandResult, CommandFailure> {
-        let [optstring, name] = arguments else {
-            return Err(CommandFailure::usage(
-                "getopts: usage: getopts OPTSTRING NAME",
-            ));
-        };
-        if !is_variable_name(name) {
-            return Err(CommandFailure::usage(format!(
-                "getopts: {name:?} is not a valid variable name"
-            )));
-        }
-        if self.frames.is_empty() {
-            return Err(CommandFailure::usage(
-                "getopts: only valid inside a function; positional parameters exist nowhere else \
-                 in this shell",
-            ));
-        }
-
-        let index = self
-            .lookup("OPTIND")
-            .and_then(Value::as_u64)
-            .map_or(1, |index| index as usize)
-            .max(1);
-        let positional = self.positional().to_vec();
-        let Some(argument) = positional.get(index - 1).map(display) else {
-            return Ok(CommandResult::status(ExitCode::FAILURE));
-        };
-        if argument == "--" {
-            self.assign("OPTIND", Value::from(index + 1))?;
-            return Ok(CommandResult::status(ExitCode::FAILURE));
-        }
-        let Some(letter) = argument.strip_prefix('-').and_then(|rest| {
-            let mut characters = rest.chars();
-            characters
-                .next()
-                .filter(|_| characters.next().is_none() && !rest.is_empty())
-        }) else {
-            return Ok(CommandResult::status(ExitCode::FAILURE));
-        };
-
-        let takes_argument = optstring.contains(&format!("{letter}:"));
-        if !optstring.contains(letter) || letter == ':' {
-            self.assign(name, Value::String("?".to_owned()))?;
-            self.assign("OPTARG", Value::String(letter.to_string()))?;
-            self.assign("OPTIND", Value::from(index + 1))?;
-            self.write_line(&format!(
-                "dekopon-shell: getopts: illegal option -- {letter}"
-            ));
-            return Ok(CommandResult::status(ExitCode::SUCCESS));
-        }
-        if takes_argument {
-            let Some(value) = positional.get(index).map(display) else {
-                self.assign(name, Value::String("?".to_owned()))?;
-                self.assign("OPTARG", Value::String(letter.to_string()))?;
-                self.assign("OPTIND", Value::from(index + 1))?;
-                self.write_line(&format!(
-                    "dekopon-shell: getopts: option requires an argument -- {letter}"
-                ));
-                return Ok(CommandResult::status(ExitCode::SUCCESS));
-            };
-            self.assign("OPTARG", Value::String(value))?;
-            self.assign("OPTIND", Value::from(index + 2))?;
-        } else {
-            self.assign("OPTARG", Value::String(String::new()))?;
-            self.assign("OPTIND", Value::from(index + 1))?;
-        }
-        self.assign(name, Value::String(letter.to_string()))?;
-        Ok(CommandResult::status(ExitCode::SUCCESS))
-    }
-
     /// Applies one `set` invocation.
     ///
     /// Only the three options this shell actually enforces are accepted. Every other letter and
@@ -1739,13 +1664,6 @@ impl Evaluator<'_> {
                 Executed::Flow(Flow::Exit(status))
             }
             "read" => match self.run_read(arguments, input, from_pipe) {
-                Ok(result) => Executed::Result(result),
-                Err(failure) => {
-                    let status = self.absorb(failure)?;
-                    Executed::Result(CommandResult::status(status))
-                }
-            },
-            "getopts" => match self.run_getopts(arguments) {
                 Ok(result) => Executed::Result(result),
                 Err(failure) => {
                     let status = self.absorb(failure)?;

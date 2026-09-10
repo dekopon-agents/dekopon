@@ -59,8 +59,8 @@ pub const PROVIDER_COMPONENT_EXTENSION: &str = "wasm";
 pub const RESERVED_COMMAND_WORDS: &[&str] = &[
     ".", ":", "[", "[[", "]]", "base64", "bg", "break", "cap", "case", "cat", "continue", "curl",
     "cut", "declare", "do", "done", "echo", "elif", "else", "esac", "eval", "exec", "exit",
-    "export", "false", "fg", "fi", "for", "function", "getopts", "grep", "if", "in", "jobs", "jq",
-    "kill", "local", "printf", "read", "return", "sed", "select", "set", "shift", "sleep", "sort",
+    "export", "false", "fg", "fi", "for", "function", "grep", "if", "in", "jobs", "jq", "kill",
+    "local", "printf", "read", "return", "sed", "select", "set", "shift", "sleep", "sort",
     "source", "test", "then", "trap", "true", "uniq", "unset", "until", "wait", "wc", "while",
     "xargs",
 ];

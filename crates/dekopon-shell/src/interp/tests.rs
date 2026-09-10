@@ -899,7 +899,7 @@ for item in "${arr[@]}"; do echo "[$item]"; done"#
 }
 
 // ---------------------------------------------------------------------------
-// `read` and `getopts`
+// `read`
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -969,53 +969,6 @@ fn read_refuses_what_it_does_not_implement() {
             outcome.output
         );
     }
-}
-
-#[test]
-fn getopts_parses_a_functions_own_flags() {
-    assert_eq!(
-        output(
-            r#"parse() {
-  while getopts "vn:" opt; do
-    case $opt in
-      v) echo "verbose" ;;
-      n) echo "name=$OPTARG" ;;
-      *) echo "other" ;;
-    esac
-  done
-}
-parse -v -n dekopon"#
-        ),
-        "verbose\nname=dekopon"
-    );
-}
-
-#[test]
-fn getopts_reports_a_bad_flag_and_a_missing_argument() {
-    assert!(
-        output(
-            r#"parse() { getopts "n:" opt; echo "opt=$opt OPTARG=$OPTARG"; }
-parse -z"#
-        )
-        .contains("opt=? OPTARG=z"),
-    );
-    assert!(
-        output(
-            r#"parse() { getopts "n:" opt; echo "opt=$opt"; }
-parse -n"#
-        )
-        .contains("requires an argument")
-    );
-}
-
-#[test]
-fn getopts_is_scoped_to_a_function_because_positionals_are() {
-    let outcome = run("getopts \"v\" opt");
-    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
-    assert!(
-        outcome.output.contains("only valid inside a function"),
-        "{outcome:?}"
-    );
 }
 
 // ---------------------------------------------------------------------------

@@ -449,6 +449,11 @@ All notable changes to Dekopon are documented here. The format is based on
   `ConflictScan::new` are gone: one host means one wording, and the conflict report itself is
   unchanged — every reserved-word and duplicate collision in a provider set, reported at once,
   fatal at boot.
+- Removed the shell's `getopts`. Nothing calls a function here with flags — a model authors both
+  the caller and the callee, and it writes `f "$x" "$y"` — so a flag parser for the one caller that
+  already knows the argument order was a bash habit rather than a need. `$1`, `$@`, `$#`, and
+  `shift` remain, and `OPTIND`/`OPTARG` are now ordinary variables nothing writes.
+  `dekopon_core::RESERVED_COMMAND_WORDS` loses `getopts` too, so a provider may claim that word.
 - Removed the shell's `date` builtin and the `Limits::allow_clock` opt-in that gated it, along with
   `DEFAULT_ALLOW_CLOCK`. The gate was never set by any embedder, so no session could read a clock,
   and the refusal it produced named a `--shell-allow-clock` flag that never existed. A script that
