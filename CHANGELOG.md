@@ -187,6 +187,9 @@ All notable changes to Dekopon are documented here. The format is based on
   client applies both predicates to owner-only `0600` sockets as well as shared `0660` ones. The
   client therefore refuses every socket whose parent the broker would refuse to bind; only the
   broker additionally walks that parent's ancestors.
+- Documentation states the constitution — three goals in priority order, the non-goals, and the
+  invariants — in `docs/design.md`, drops release narrative, and marks a retired mechanism that
+  remains in code as committed direction rather than as current behavior.
 
 ### Removed
 
