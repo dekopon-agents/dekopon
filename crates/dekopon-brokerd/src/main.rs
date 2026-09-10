@@ -99,6 +99,13 @@ enum ProviderCommand {
 #[cfg(unix)]
 const OTEL_TRACE_FILTER: &str = "dekopon_brokerd=trace,dekopon_broker=trace,dekopon_broker_host=trace,dekopon_http_host=trace,hyper=off,h2=off,tonic=off,reqwest=off";
 
+/// Log records ride the same crate set as spans, because the broker's audit record is one of them.
+///
+/// A trace that carries every decision span but not the `broker.decision` record it produced is
+/// exactly the split the constitution removed, so the two signals select the same targets.
+#[cfg(unix)]
+const OTEL_LOG_FILTER: &str = OTEL_TRACE_FILTER;
+
 #[cfg(unix)]
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -178,10 +185,14 @@ async fn execute(cli: Cli) -> ExitCode {
             // Telemetry must never keep the broker from starting. Authorization and audit are the
             // service's contract; observability is not, and failing closed here would trade a
             // working authority boundary for a missing dashboard.
-            let tracer_provider = dekopon_telemetry::optional_tracer_provider(
-                settings.as_ref().map(|telemetry| &telemetry.settings),
-                "dekopon-brokerd",
-            );
+            let exporter = settings.as_ref().map(|telemetry| &telemetry.settings);
+            let tracer_provider =
+                dekopon_telemetry::optional_tracer_provider(exporter, "dekopon-brokerd");
+            // The audit record is a log record now, so the log signal is not optional decoration:
+            // without this bridge a configured receiver gets every decision span and none of the
+            // decisions.
+            let logger_provider =
+                dekopon_telemetry::optional_logger_provider(exporter, "dekopon-brokerd");
             // Structured JSON on stdout is the daemon log contract; a collector or shipper can
             // pick it up without the broker holding a second credential.
             let mut install = Install::new(Console {
@@ -191,6 +202,9 @@ async fn execute(cli: Cli) -> ExitCode {
             });
             if let Some(provider) = tracer_provider {
                 install = install.with_traces(provider, "dekopon-brokerd", OTEL_TRACE_FILTER);
+            }
+            if let Some(provider) = logger_provider {
+                install = install.with_logs(provider, OTEL_LOG_FILTER);
             }
             observed(install, execute_server(config)).await
         }

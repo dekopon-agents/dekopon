@@ -378,6 +378,25 @@ pub fn optional_tracer_provider(
     }
 }
 
+/// Builds a logger provider for a process that must start even when export cannot.
+///
+/// The mirror of [`optional_tracer_provider`], for the same reason: an audit record that cannot be
+/// exported is worse than one that reaches stdout only, and neither is worse than a broker that
+/// refuses to start.
+#[must_use]
+pub fn optional_logger_provider(
+    settings: Option<&ExporterSettings>,
+    program: &str,
+) -> Option<SdkLoggerProvider> {
+    match settings?.logger_provider() {
+        Ok(provider) => Some(provider),
+        Err(error) => {
+            eprintln!("{program}: log export disabled: {error}");
+            None
+        }
+    }
+}
+
 /// Builds an OTLP layer's filter from a caller's crate directive.
 fn otlp_filter(directive: &str) -> EnvFilter {
     EnvFilter::new(format!("{directive},{EXPORTER_DIAGNOSTICS_OFF}"))

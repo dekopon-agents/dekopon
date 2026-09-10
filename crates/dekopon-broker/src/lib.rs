@@ -34,7 +34,10 @@ use std::{
     io,
     ops::ControlFlow,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Instant,
 };
 
@@ -2286,6 +2289,38 @@ impl AuditLog for InMemoryAuditLog {
     }
 }
 
+/// The audit sink for a deployment whose audit is the log record and nothing else.
+///
+/// Every decision is already a `dekopon_broker::audit` log event inside the live trace before any
+/// sink is reached, so this one writes nothing and only keeps the process-local ordinal the
+/// record shape carries. Losing the log exporter loses audit; that is the accepted consequence of
+/// [the constitution's](../../../docs/design.md#non-goals) rejection of crash-durable audit, and a
+/// deployment that wants a second, durable copy configures [`FileAuditLog`] instead.
+#[derive(Debug, Default)]
+pub struct TraceOnlyAuditLog {
+    count: AtomicU64,
+}
+
+impl TraceOnlyAuditLog {
+    /// Creates a sink whose first record is ordinal 1.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+        }
+    }
+}
+
+impl AuditLog for TraceOnlyAuditLog {
+    async fn append(&self, event: AuditEvent) -> Result<AuditRecord, AuditError> {
+        let previous = self.count.fetch_add(1, Ordering::Relaxed);
+        let sequence = previous
+            .checked_add(1)
+            .ok_or(AuditError::SequenceOverflow)?;
+        Ok(AuditRecord { sequence, event })
+    }
+}
+
 /// Append-only, owner-only JSONL audit file.
 ///
 /// Open counts newline-delimited records in bounded space solely for the next ordinal, enforcing
@@ -3944,49 +3979,48 @@ where
         } else {
             decision_evidence_digest("policy-decision", &material)?
         };
-        self.audit
-            .append(AuditEvent::Decision {
-                invocation: request.id.clone(),
-                trace,
-                principal: (!storage_backed).then(|| context.principal().clone()),
-                actor: (!storage_backed).then(|| context.actor().clone()),
-                via: (!storage_backed).then(|| context.via().cloned()).flatten(),
-                attested_subject: (!storage_backed)
-                    .then(|| context.attested_subject().cloned())
-                    .flatten(),
-                capability: request.capability.clone(),
-                secret: (!storage_backed)
-                    .then(|| {
-                        request
-                            .secret_use
-                            .as_ref()
-                            .map(|secret| secret.secret().clone())
-                    })
-                    .flatten(),
-                secret_sink: (!storage_backed)
-                    .then(|| request.secret_use.as_ref().map(SecretUseProposal::sink))
-                    .flatten(),
-                provider: None,
-                authorized_by: (!storage_backed).then(|| self.broker_principal.clone()),
-                decision_id: decision_id.clone(),
-                policy_revision: (!storage_backed).then(|| self.policy_revision.clone()),
-                policy_ids: if storage_backed {
-                    Vec::new()
-                } else {
-                    policy_ids
-                },
-                policy_digest: (!storage_backed).then(|| self.policy_digest.clone()),
-                allowed: false,
-                reason: Some(reason.to_owned()),
-                decision_digest: digest.clone(),
-                storage_scope_commitment: None,
-                storage: None,
-            })
-            .await
-            .map_err(|source| {
-                report_audit_failure("decision", &request.id, &source);
-                BrokerError::DecisionAudit { source }
-            })?;
+        self.record_audit(AuditEvent::Decision {
+            invocation: request.id.clone(),
+            trace,
+            principal: (!storage_backed).then(|| context.principal().clone()),
+            actor: (!storage_backed).then(|| context.actor().clone()),
+            via: (!storage_backed).then(|| context.via().cloned()).flatten(),
+            attested_subject: (!storage_backed)
+                .then(|| context.attested_subject().cloned())
+                .flatten(),
+            capability: request.capability.clone(),
+            secret: (!storage_backed)
+                .then(|| {
+                    request
+                        .secret_use
+                        .as_ref()
+                        .map(|secret| secret.secret().clone())
+                })
+                .flatten(),
+            secret_sink: (!storage_backed)
+                .then(|| request.secret_use.as_ref().map(SecretUseProposal::sink))
+                .flatten(),
+            provider: None,
+            authorized_by: (!storage_backed).then(|| self.broker_principal.clone()),
+            decision_id: decision_id.clone(),
+            policy_revision: (!storage_backed).then(|| self.policy_revision.clone()),
+            policy_ids: if storage_backed {
+                Vec::new()
+            } else {
+                policy_ids
+            },
+            policy_digest: (!storage_backed).then(|| self.policy_digest.clone()),
+            allowed: false,
+            reason: Some(reason.to_owned()),
+            decision_digest: digest.clone(),
+            storage_scope_commitment: None,
+            storage: None,
+        })
+        .await
+        .map_err(|source| {
+            report_audit_failure("decision", &request.id, &source);
+            BrokerError::DecisionAudit { source }
+        })?;
         Ok(InvocationResult {
             invocation: request.id.clone(),
             decision,
@@ -4043,7 +4077,7 @@ where
         let execution = tracing::Span::current();
         execution.record("outcome", "failed");
         execution.record("error", reason);
-        self.audit.append(event).await.map_err(|source| {
+        self.record_audit(event).await.map_err(|source| {
             execution.record("outcome", "authorized-failure-unaudited");
             execution.record("error", source.category());
             report_audit_failure("authorized-failure", invocation, &source);
@@ -4169,66 +4203,65 @@ where
             uri: None,
         };
 
-        self.audit
-            .append(AuditEvent::Decision {
-                invocation: invocation_id.clone(),
-                trace,
-                principal: storage_scope_commitment
-                    .is_none()
-                    .then(|| context.principal().clone()),
-                actor: storage_scope_commitment
-                    .is_none()
-                    .then(|| context.actor().clone()),
-                via: storage_scope_commitment
-                    .is_none()
-                    .then(|| context.via().cloned())
-                    .flatten(),
-                attested_subject: storage_scope_commitment
-                    .is_none()
-                    .then(|| context.attested_subject().cloned())
-                    .flatten(),
-                capability: capability.clone(),
-                secret: authorized
-                    .proposal()
-                    .secret_use
-                    .as_ref()
-                    .map(|secret| secret.secret().clone()),
-                secret_sink: authorized
-                    .proposal()
-                    .secret_use
-                    .as_ref()
-                    .map(SecretUseProposal::sink),
-                provider: storage_scope_commitment
-                    .is_none()
-                    .then(|| set.provider.clone()),
-                authorized_by: storage_scope_commitment
-                    .is_none()
-                    .then(|| self.broker_principal.clone()),
-                decision_id: decision_id.clone(),
-                policy_revision: storage_scope_commitment
-                    .is_none()
-                    .then(|| self.policy_revision.clone()),
-                policy_ids: if storage_scope_commitment.is_some() {
-                    Vec::new()
-                } else {
-                    policy_ids.clone()
-                },
-                policy_digest: storage_scope_commitment
-                    .is_none()
-                    .then(|| self.policy_digest.clone()),
-                allowed: true,
-                reason: None,
-                decision_digest,
-                storage_scope_commitment: storage_scope_commitment.clone(),
-                storage: None,
-            })
-            .await
-            .map_err(|source| {
-                tracing::Span::current().record("outcome", "decision-unaudited");
-                tracing::Span::current().record("error", source.category());
-                report_audit_failure("decision", &invocation_id, &source);
-                BrokerError::DecisionAudit { source }
-            })?;
+        self.record_audit(AuditEvent::Decision {
+            invocation: invocation_id.clone(),
+            trace,
+            principal: storage_scope_commitment
+                .is_none()
+                .then(|| context.principal().clone()),
+            actor: storage_scope_commitment
+                .is_none()
+                .then(|| context.actor().clone()),
+            via: storage_scope_commitment
+                .is_none()
+                .then(|| context.via().cloned())
+                .flatten(),
+            attested_subject: storage_scope_commitment
+                .is_none()
+                .then(|| context.attested_subject().cloned())
+                .flatten(),
+            capability: capability.clone(),
+            secret: authorized
+                .proposal()
+                .secret_use
+                .as_ref()
+                .map(|secret| secret.secret().clone()),
+            secret_sink: authorized
+                .proposal()
+                .secret_use
+                .as_ref()
+                .map(SecretUseProposal::sink),
+            provider: storage_scope_commitment
+                .is_none()
+                .then(|| set.provider.clone()),
+            authorized_by: storage_scope_commitment
+                .is_none()
+                .then(|| self.broker_principal.clone()),
+            decision_id: decision_id.clone(),
+            policy_revision: storage_scope_commitment
+                .is_none()
+                .then(|| self.policy_revision.clone()),
+            policy_ids: if storage_scope_commitment.is_some() {
+                Vec::new()
+            } else {
+                policy_ids.clone()
+            },
+            policy_digest: storage_scope_commitment
+                .is_none()
+                .then(|| self.policy_digest.clone()),
+            allowed: true,
+            reason: None,
+            decision_digest,
+            storage_scope_commitment: storage_scope_commitment.clone(),
+            storage: None,
+        })
+        .await
+        .map_err(|source| {
+            tracing::Span::current().record("outcome", "decision-unaudited");
+            tracing::Span::current().record("error", source.category());
+            report_audit_failure("decision", &invocation_id, &source);
+            BrokerError::DecisionAudit { source }
+        })?;
 
         let storage_grant = match storage_preparation.take() {
             None => None,
@@ -4536,7 +4569,7 @@ where
             execution.record("error", error);
         }
 
-        self.audit.append(audit_event).await.map_err(|source| {
+        self.record_audit(audit_event).await.map_err(|source| {
             execution.record("outcome", "outcome-unaudited");
             execution.record("error", source.category());
             report_audit_failure("outcome", &invocation_id, &source);
@@ -4546,6 +4579,18 @@ where
             }
         })?;
         Ok(result)
+    }
+
+    /// Records one decision in the trace, then offers it to whatever durable sink is configured.
+    ///
+    /// The log event is the audit record, so it happens exactly once per decision whether or not a
+    /// deployment also asked for a file. The sink still fails closed — a deployment that asked for
+    /// a durable copy and did not get one refuses the invocation — but by then the decision has
+    /// already been recorded, which is the ordering the constitution's "losing the exporter loses
+    /// audit" wants rather than "losing the disk loses audit".
+    async fn record_audit(&self, event: AuditEvent) -> Result<AuditRecord, AuditError> {
+        emit_audit_event(&event);
+        self.audit.append(event).await
     }
 
     fn decision_reference(&self, decision_id: &str) -> DecisionReference {
@@ -4913,6 +4958,171 @@ fn report_inspection_refusal(
         agent = %agent,
         via = %peer.principal(),
     );
+}
+
+/// Emits one metadata-only audit record as a structured log event inside the current span.
+///
+/// This event *is* the audit record ([goal 2](../../../docs/design.md#constitution)). It is
+/// emitted from inside `broker.authorize` or `broker.execute`, which descend from the
+/// `broker.invocation` span that adopted the client's `traceparent`, so the console JSON
+/// formatter and the OTLP log bridge stamp the live W3C trace and span ids on it without this
+/// crate linking any telemetry SDK. A durable file sink is a second copy, not the record.
+///
+/// Field names follow the record's own names rather than the surrounding span's, because an
+/// operator reading this back is reading what the JSONL sink writes. Absent is not null: a
+/// storage-routed decision names no principal, actor, provider, or policy at all, and every
+/// `Option` field simply disappears, so a present field always means the broker knew it. Nothing
+/// here can carry secret bytes — `secret` and `credential` are the symbolic names owner
+/// configuration already holds, and the HTTP evidence is the same sanitized set the span carries:
+/// method, authority, status, accounted bytes, and whether a credential was injected.
+fn emit_audit_event(event: &AuditEvent) {
+    match event {
+        AuditEvent::Decision {
+            invocation,
+            principal,
+            actor,
+            via,
+            attested_subject,
+            capability,
+            secret,
+            secret_sink,
+            provider,
+            authorized_by,
+            decision_id,
+            policy_revision,
+            policy_ids,
+            policy_digest,
+            allowed,
+            reason,
+            storage_scope_commitment,
+            storage,
+            // The digest binds the file's own history rather than the decision an operator reads,
+            // and the trace id below is the correlation identifier the Dekopon one is being
+            // replaced by.
+            decision_digest: _,
+            trace: _,
+        } => tracing::info!(
+            target: "dekopon_broker::audit",
+            {
+                audit.event = "broker.decision",
+                invocation.id = %invocation,
+                capability.id = %capability,
+                decision.id = decision_id.as_str(),
+                decision.allowed = allowed,
+                decision.reason = reason.as_deref(),
+                principal = principal.as_ref().map(ToString::to_string),
+                actor.kind = actor.as_ref().map(actor_kind),
+                actor.id = actor.as_ref().map(actor_id),
+                via = via.as_ref().map(ToString::to_string),
+                subject = attested_subject.as_ref().map(ToString::to_string),
+                provider = provider.as_ref().map(ToString::to_string),
+                authorized.by = authorized_by.as_ref().map(ToString::to_string),
+                policy.revision = policy_revision.as_deref(),
+                policy.ids = joined(policy_ids),
+                policy.digest = policy_digest.as_deref(),
+                secret = secret.as_ref().map(ToString::to_string),
+                secret.sink = secret_sink.as_ref().map(ToString::to_string),
+                storage.scope_commitment = storage_scope_commitment
+                    .as_ref()
+                    .map(StorageScopeCommitment::as_str),
+                storage.evidence = storage.as_ref().and_then(rendered),
+            },
+            "broker decision"
+        ),
+        AuditEvent::Execution {
+            invocation,
+            principal,
+            actor,
+            via,
+            attested_subject,
+            capability,
+            secret,
+            secret_sink,
+            provider,
+            authorized_by,
+            decision_id,
+            policy_revision,
+            policy_ids,
+            policy_digest,
+            effect,
+            risk,
+            idempotency,
+            credential,
+            outcome,
+            duration_ms,
+            error,
+            output_digest,
+            http_calls,
+            storage_scope_commitment,
+            storage,
+            trace: _,
+        } => tracing::info!(
+            target: "dekopon_broker::audit",
+            {
+                audit.event = "broker.execution",
+                invocation.id = %invocation,
+                capability.id = %capability,
+                decision.id = decision_id.as_str(),
+                principal = principal.as_ref().map(ToString::to_string),
+                actor.kind = actor.as_ref().map(actor_kind),
+                actor.id = actor.as_ref().map(actor_id),
+                via = via.as_ref().map(ToString::to_string),
+                subject = attested_subject.as_ref().map(ToString::to_string),
+                provider = provider.as_ref().map(ToString::to_string),
+                authorized.by = authorized_by.as_ref().map(ToString::to_string),
+                policy.revision = policy_revision.as_deref(),
+                policy.ids = joined(policy_ids),
+                policy.digest = policy_digest.as_deref(),
+                secret = secret.as_ref().map(ToString::to_string),
+                secret.sink = secret_sink.as_ref().map(ToString::to_string),
+                effect = ?effect,
+                risk = ?risk,
+                idempotency = ?idempotency,
+                credential = credential.as_deref(),
+                outcome = ?outcome,
+                duration_ms = duration_ms,
+                error = error.as_deref(),
+                output.digest = output_digest.as_deref(),
+                http.calls = rendered(http_calls),
+                storage.scope_commitment = storage_scope_commitment
+                    .as_ref()
+                    .map(StorageScopeCommitment::as_str),
+                storage.evidence = storage.as_ref().and_then(rendered),
+            },
+            "broker execution"
+        ),
+    }
+}
+
+/// Which of the three trusted actor kinds a record names, as one low-cardinality token.
+const fn actor_kind(actor: &Actor) -> &'static str {
+    match actor {
+        Actor::Human { .. } => "human",
+        Actor::Agent { .. } => "agent",
+        Actor::Service { .. } => "service",
+    }
+}
+
+/// The identity inside the actor, which is the principal for two kinds and the agent for the third.
+fn actor_id(actor: &Actor) -> String {
+    match actor {
+        Actor::Human { principal } | Actor::Service { principal } => principal.to_string(),
+        Actor::Agent { agent } => agent.to_string(),
+    }
+}
+
+/// Renders a bounded structured field as JSON, or nothing when it is empty or unrenderable.
+///
+/// An audit record must never fail to be emitted because one of its evidence fields would not
+/// serialize, so a failure drops that field rather than the record.
+fn rendered<T: Serialize>(value: &T) -> Option<String> {
+    let json = serde_json::to_string(value).ok()?;
+    (json != "[]" && json != "null").then_some(json)
+}
+
+/// Joins policy identifiers into one comma-separated field, or nothing when no policy matched.
+fn joined(ids: &[String]) -> Option<String> {
+    (!ids.is_empty()).then(|| ids.join(","))
 }
 
 /// Reports why the broker could not durably account for a decision or an outcome.

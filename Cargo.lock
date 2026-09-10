@@ -899,6 +899,8 @@ dependencies = [
  "hmac",
  "http-auth",
  "libc",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "reqwest",
  "rustix",
  "semver",
