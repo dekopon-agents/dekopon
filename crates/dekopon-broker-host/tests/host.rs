@@ -1741,3 +1741,156 @@ fn snapshot_storage_tree(root: &Path) -> Vec<(PathBuf, u32, u64, Vec<u8>)> {
         .map(|entry| (entry.relative, entry.mode, entry.len, entry.contents))
         .collect()
 }
+
+// Keep the adversarial core cleanup separate from a real Rust guest's allocator. Each export
+// returns a valid string before post-return traps or spins; a successful lift is not success.
+fn post_return_component(command_export: &str, cleanup: &str) -> tempfile::NamedTempFile {
+    use std::io::Write as _;
+
+    let manifest = serde_json::to_string(&json!({
+        "apiVersion": dekopon_provider_sdk::ProviderApiVersion::V1Alpha1,
+        "id": "cleanup-probe",
+        "description": "Post-return failure probe",
+        "commandWords": ["cleanup"],
+        "capabilities": [{
+            "id": "cleanup-probe.echo",
+            "description": "Echo probe",
+            "effect": dekopon_capability::EffectKind::ReadOnly,
+            "risk": dekopon_core::RiskLevel::Low,
+            "inputSchema": {"type": "object"}
+        }]
+    }))
+    .expect("serialize manifest");
+    let response = r#"{"outcome":"succeeded","output":{}}"#;
+    let bytes = |data: &[u8]| {
+        data.iter()
+            .map(|byte| format!("\\{byte:02x}"))
+            .collect::<String>()
+    };
+    let descriptor = |offset: u32, length: usize| {
+        bytes(
+            &[
+                offset.to_le_bytes(),
+                u32::try_from(length).expect("small string").to_le_bytes(),
+            ]
+            .concat(),
+        )
+    };
+    let (command_params, core_params) = match command_export {
+        "run-command" => (
+            "(param \"argv\" (list string)) (param \"stdin\" (option string))",
+            "i32 i32 i32 i32 i32",
+        ),
+        "resolve-command" => ("(param \"argv\" (list string))", "i32 i32"),
+        _ => panic!("unknown test export"),
+    };
+    let wat = format!(
+        r#"(component
+            (core module $m
+                (memory (export "memory") 1)
+                (data (i32.const 0) "{manifest_descriptor}")
+                (data (i32.const 8) "{response_descriptor}")
+                (data (i32.const 64) "{manifest}")
+                (data (i32.const 2048) "{response}")
+                (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 4096)
+                (func (export "describe") (result i32) i32.const 0)
+                (func (export "invoke") (param i32 i32 i32 i32) (result i32) i32.const 8)
+                (func (export "command") (param {core_params}) (result i32) i32.const 8)
+                (func (export "cleanup") (param i32) {cleanup})
+            )
+            (core instance $i (instantiate $m))
+            (func (export "describe") (result string)
+                (canon lift (core func $i "describe") (memory (core memory $i "memory"))))
+            (func (export "invoke") (param "capability" string) (param "input" string) (result string)
+                (canon lift (core func $i "invoke") (memory (core memory $i "memory"))
+                    (realloc (core func $i "realloc")) (post-return (core func $i "cleanup"))))
+            (func (export "{command_export}") {command_params} (result string)
+                (canon lift (core func $i "command") (memory (core memory $i "memory"))
+                    (realloc (core func $i "realloc")) (post-return (core func $i "cleanup"))))
+        )"#,
+        manifest_descriptor = descriptor(64, manifest.len()),
+        response_descriptor = descriptor(2048, response.len()),
+        manifest = bytes(manifest.as_bytes()),
+        response = bytes(response.as_bytes()),
+    );
+    let mut file = tempfile::NamedTempFile::new().expect("temporary component");
+    file.write_all(wat.as_bytes())
+        .expect("write component text");
+    file
+}
+
+#[tokio::test]
+async fn automatic_post_return_traps_remain_command_and_invocation_failures() {
+    for export in ["run-command", "resolve-command"] {
+        let component = post_return_component(export, "unreachable");
+        let registry =
+            BrokerProviderRegistry::load([component.path()], BrokerHostLimits::default())
+                .await
+                .expect("valid manifest loads without cleanup trap");
+        let error = registry
+            .run_command("cleanup", &[], None)
+            .await
+            .expect_err("cleanup trap must not become an output parsing failure");
+        let BrokerHostError::RunCommand { source, .. } = error else {
+            panic!("expected command failure, got {error:?}");
+        };
+        assert_eq!(
+            source.downcast_ref::<wasmtime::Trap>(),
+            Some(&wasmtime::Trap::UnreachableCodeReached)
+        );
+        let error = registry
+            .invoke(
+                authorized(
+                    "cleanup-probe.echo".parse().expect("capability"),
+                    json!({}),
+                    ExecutionConstraints {
+                        timeout_ms: 5_000,
+                        max_output_bytes: 1024,
+                        ..ExecutionConstraints::default()
+                    },
+                ),
+                None,
+            )
+            .await
+            .expect_err("cleanup trap must not return the lifted success response");
+        let BrokerHostError::Invoke { source, .. } = *error.error else {
+            panic!("expected invocation failure, got {error:?}");
+        };
+        assert_eq!(
+            source.downcast_ref::<wasmtime::Trap>(),
+            Some(&wasmtime::Trap::UnreachableCodeReached)
+        );
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn automatic_post_return_yields_to_the_deadline_and_releases_the_store() {
+    let component = post_return_component("run-command", "(loop $spin br $spin)");
+    let limits = BrokerHostLimits {
+        fuel: u64::MAX,
+        max_timeout: Duration::from_millis(50),
+        ..BrokerHostLimits::default()
+    };
+    let options = BrokerHostOptions {
+        max_total_memory_bytes: Some(limits.max_memory_bytes),
+        ..BrokerHostOptions::default()
+    };
+    let registry =
+        BrokerProviderRegistry::load_with_options([component.path()], limits, None, &options)
+            .await
+            .expect("valid manifest loads");
+    let error = registry
+        .run_command("cleanup", &[], None)
+        .await
+        .expect_err("looping cleanup times out");
+    assert!(
+        matches!(error, BrokerHostError::Timeout { timeout_ms: 50, .. }),
+        "{error:?}"
+    );
+    // The aggregate ceiling admits exactly one store, so a second run that reaches the same
+    // deadline rather than memory exhaustion proves the first store was released.
+    assert!(matches!(
+        registry.run_command("cleanup", &[], None).await,
+        Err(BrokerHostError::Timeout { .. })
+    ));
+}
