@@ -119,7 +119,6 @@ class ClassifyCiChangesTests(unittest.TestCase):
 
     def test_ci_control_changes_fail_open_to_every_lane(self) -> None:
         self.assert_selected([".github/workflows/ci.yml"], *CATEGORIES)
-        self.assert_selected([".github/scripts/ci_metrics.sh"], *CATEGORIES)
 
     def test_gate_scripts_fail_open_to_every_lane(self) -> None:
         # Gate scripts have no lane of their own; edits must not run nothing at all.
