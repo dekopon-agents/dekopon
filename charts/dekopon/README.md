@@ -574,13 +574,14 @@ init container is needed. See [`../../docs/secrets.md`](../../docs/secrets.md).
 The chart refuses to render, with a message, when: `runAsUser` is changed while the stock image is
 selected; a required file has no source; both sources are set for one file; an inline `broker.yaml`
 names `policiesPath`, `credentialsPath`, `secretMapPath`, or `constraintSets` with no corresponding value supplied;
-`paths.catalogDir` is inside `paths.configDir`; or `terminationGracePeriodSeconds` is shorter than
-the two drains it has to cover in sequence. When provider storage is enabled, its root and
-key directory must also be absolute, disjoint from one another, and pairwise non-overlapping with
-every chart-owned mount (`config`, runtime, audit state, catalog, `/tmp`, and both projected
-configuration/key sources); a nested mount would otherwise shadow or destructively replace those
-files. Every one of
-those is a mistake whose only other symptom is a pod that starts and never becomes ready.
+an inline `broker.yaml`'s `identities` never map the broker's own UID, which the startup and
+readiness probes connect as; `paths.catalogDir` is inside `paths.configDir`; or
+`terminationGracePeriodSeconds` is shorter than the two drains it has to cover in sequence. When
+provider storage is enabled, its root and key directory must also be absolute, disjoint from one
+another, and pairwise non-overlapping with every chart-owned mount (`config`, runtime, audit state,
+catalog, `/tmp`, and both projected configuration/key sources); a nested mount would otherwise
+shadow or destructively replace those files. Every one of those is a mistake whose only other
+symptom is a pod that starts and never becomes ready.
 
 The chart's default `broker.config.inline` is the echo example from the broker's own README, moved
 onto these paths: a real deny-by-default configuration that starts, loads the baked

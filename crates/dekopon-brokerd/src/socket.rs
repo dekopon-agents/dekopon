@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use dekopon_broker_protocol::{ipc_socket_mode, secure_socket, secure_socket_parent};
 use thiserror::Error;
 use tokio::{
     net::{UnixListener, UnixStream},
@@ -40,7 +41,8 @@ pub fn validate_private_parent(path: &Path, expected_uid: u32) -> Result<(), Soc
     Ok(())
 }
 
-// The directory is the operator-owned IPC group setting. No credential path uses this rule.
+// The rule itself lives in `dekopon-broker-protocol`, where the clients that must agree with this
+// server read it. What stays here is the path handling and the error an operator acts on.
 pub fn validate_socket_parent(path: &Path, expected_uid: u32) -> Result<fs::Metadata, SocketError> {
     let parent = path.parent().ok_or_else(|| SocketError::MissingParent {
         path: path.to_path_buf(),
@@ -49,12 +51,7 @@ pub fn validate_socket_parent(path: &Path, expected_uid: u32) -> Result<fs::Meta
         path: parent.to_path_buf(),
         source,
     })?;
-    let mode = metadata.permissions().mode();
-    if !metadata.file_type().is_dir()
-        || metadata.uid() != expected_uid
-        || mode & 0o027 != 0
-        || !matches!(mode & 0o070, 0 | 0o010 | 0o050)
-    {
+    if !secure_socket_parent(&metadata, expected_uid) {
         return Err(SocketError::InsecureParent {
             path: parent.to_path_buf(),
         });
@@ -65,17 +62,6 @@ pub fn validate_socket_parent(path: &Path, expected_uid: u32) -> Result<fs::Meta
     })?;
     validate_ancestors(&canonical)?;
     Ok(metadata)
-}
-
-fn socket_is_secure(metadata: &fs::Metadata, expected_uid: u32, parent: &fs::Metadata) -> bool {
-    let mode = metadata.permissions().mode() & 0o7777;
-    metadata.file_type().is_socket()
-        && metadata.uid() == expected_uid
-        && metadata.nlink() == 1
-        && (mode == 0o600
-            || (mode == 0o660
-                && parent.permissions().mode() & 0o010 != 0
-                && metadata.gid() == parent.gid()))
 }
 
 pub fn validate_owned_file(path: &Path, expected_uid: u32) -> Result<(), SocketError> {
@@ -146,11 +132,7 @@ pub async fn bind(
     })?;
     // Group traversal opts into shared IPC. Set its exact group before granting access;
     // an unprivileged broker must itself belong to this group. Private parents stay 0600.
-    let mode = if parent.permissions().mode() & 0o010 != 0 {
-        0o660
-    } else {
-        0o600
-    };
+    let mode = ipc_socket_mode(&parent);
     if mode == 0o660
         && let Err(source) = std::os::unix::fs::chown(path, None, Some(parent.gid()))
     {
@@ -178,7 +160,7 @@ pub async fn bind(
             });
         }
     };
-    if !socket_is_secure(&metadata, expected_uid, &parent) {
+    if !secure_socket(&metadata, expected_uid, &parent) {
         let _ = fs::remove_file(path);
         return Err(SocketError::InsecureSocket {
             path: path.to_path_buf(),
@@ -209,7 +191,7 @@ async fn remove_stale(
             });
         }
     };
-    if !socket_is_secure(&metadata, expected_uid, parent) {
+    if !secure_socket(&metadata, expected_uid, parent) {
         return Err(SocketError::InsecureSocket {
             path: path.to_path_buf(),
         });

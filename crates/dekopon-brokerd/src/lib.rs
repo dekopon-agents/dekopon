@@ -84,7 +84,25 @@ where
             .is_some_and(|telemetry| telemetry.telemetry_payloads),
     );
     let frame_limits = config.server_limits.frame_limits()?;
-    socket::validate_socket_parent(&config.socket_path, uid)?;
+    let socket_parent = socket::validate_socket_parent(&config.socket_path, uid)?;
+    // A private parent gets an owner-only socket, so any other configured UID could never open it:
+    // the broker would start, report healthy through its own probe, and leave its peers looping on
+    // EACCES. Every unreachable peer is named at once, because fixing one at a time is the same
+    // failed start over again.
+    if dekopon_broker_protocol::ipc_socket_mode(&socket_parent) == 0o600 {
+        let configured = config
+            .identities
+            .iter()
+            .map(|identity| identity.uid)
+            .filter(|peer| *peer != uid)
+            .collect::<Vec<_>>();
+        if !configured.is_empty() {
+            return Err(BrokerdError::UnreachablePeerUids {
+                configured,
+                server: uid,
+            });
+        }
+    }
     socket::validate_private_parent(&config.audit_path, uid)?;
     for provider in &config.providers {
         socket::validate_owned_file(provider, uid)?;
@@ -452,6 +470,17 @@ pub enum BrokerdError {
     /// A configured transport identity could not be bound.
     #[error("broker peer identity is invalid")]
     Context(#[source] dekopon_broker::ContextError),
+    /// Configured peer UIDs that the socket this deployment will bind cannot admit.
+    #[error(
+        "broker socket parent grants no group traversal, so the socket is owner-only for server UID {server}; configured peer UID(s) {} can never connect",
+        .configured.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")
+    )]
+    UnreachablePeerUids {
+        /// Every configured peer UID other than the server's, in configuration order.
+        configured: Vec<u32>,
+        /// The UID the broker runs as, and the only one an owner-only socket admits.
+        server: u32,
+    },
     /// Listener serving or bounded shutdown failed.
     #[error("broker server failed")]
     Server(#[from] ServerError),

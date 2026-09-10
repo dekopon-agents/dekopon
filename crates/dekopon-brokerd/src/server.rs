@@ -338,6 +338,11 @@ where
         .map_err(|source| ConnectionError::PeerCredentials { source })?;
     let uid = credentials.uid();
     let Some(peer) = identities.get(&uid) else {
+        // The wire answer is deliberately opaque, so this is the only place the reason exists. It
+        // is also the usual reason a deployed broker never becomes ready: its own readiness probe
+        // connects as the broker's UID, and a configuration that does not map that UID refuses it
+        // exactly like any other stranger.
+        tracing::warn!(event = "broker_peer_unmapped", peer.uid = uid);
         write_frame(
             &mut stream,
             &ResponseEnvelope::error(ERROR_UNAUTHENTICATED, "peer is not mapped by broker policy"),

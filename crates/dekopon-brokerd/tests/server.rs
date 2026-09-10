@@ -140,6 +140,19 @@ fn write_owner_only(path: &Path, contents: &[u8]) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("secure fixture");
 }
 
+/// A fixture directory the broker binds under and its clients connect through.
+///
+/// `tempfile::tempdir` applies the process umask, which normally leaves the directory
+/// world-traversable. That is a parent `socket::bind` refuses, and — now that both sides read one
+/// socket rule — a parent `BrokerClient` refuses too: whoever can write the directory can replace
+/// the listener under a socket whose own mode still looks private.
+fn private_directory() -> tempfile::TempDir {
+    let directory = tempfile::tempdir().expect("create fixture directory");
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        .expect("private fixture directory");
+    directory
+}
+
 fn bind_fixture(path: &Path) -> UnixListener {
     let listener = UnixListener::bind(path).expect("bind server fixture");
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("secure server fixture");
@@ -356,7 +369,7 @@ async fn cli_probe_broker() -> (Arc<Broker<InMemoryAuditLog>>, Arc<InMemoryAudit
 #[tokio::test(flavor = "multi_thread")]
 async fn run_command_over_the_socket_renders_help_then_proposes() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create server fixture");
+    let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
     let (broker, audit) = cli_probe_broker().await;
@@ -454,7 +467,7 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_legacy_resolve_command_frame_is_still_answered() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create server fixture");
+    let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
     let (broker, audit) = cli_probe_broker().await;
@@ -531,7 +544,7 @@ async fn a_legacy_resolve_command_frame_is_still_answered() {
 #[tokio::test(flavor = "multi_thread")]
 async fn authenticated_unix_peer_can_inspect_and_invoke_under_policy() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create server fixture");
+    let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
     let (broker, audit) = broker().await;
@@ -569,10 +582,20 @@ async fn authenticated_unix_peer_can_inspect_and_invoke_under_policy() {
         .expect("server shuts down");
 }
 
+/// The refusal an operator most often meets: the broker's own readiness probe connects as the
+/// broker's UID, so a configuration whose `identities` omit it is answered with the same opaque
+/// nothing a stranger gets. What the answer withholds is pinned here; the `broker_peer_unmapped`
+/// line that carries the peer UID is pinned in `failure_logging.rs`, whose global subscriber is
+/// the only one a spawned connection task reports to.
+///
+/// The frame is read straight off the socket because this is the one refusal the broker writes
+/// before reading a request and closes the socket with: macOS refuses to report a peer's
+/// credentials once that close has landed, so a `BrokerClient` here would report losing the
+/// server rather than the answer this test is about. The refusal itself survives the close —
+/// it is already in this peer's receive buffer.
 #[tokio::test(flavor = "multi_thread")]
 async fn unmapped_peer_receives_no_capability_information() {
-    let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create server fixture");
+    let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
     let (broker, _audit) = broker().await;
@@ -580,8 +603,18 @@ async fn unmapped_peer_receives_no_capability_information() {
     let server = BrokerServer::new(broker, BTreeMap::new(), limits).expect("server starts");
     let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
     let task = tokio::spawn(server.serve(listener, shutdown_on(shutdown_receive)));
-    let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
-    assert!(client.capabilities().await.is_err());
+    let mut peer = UnixStream::connect(&socket_path)
+        .await
+        .expect("connect as an unmapped peer");
+    let refusal = read_frame::<_, ResponseEnvelope>(&mut peer, limits.frame)
+        .await
+        .expect("an unmapped peer is answered before it asks for anything");
+    let BrokerResponse::Error { code, message } = refusal.response else {
+        panic!("an unmapped peer must be refused rather than served");
+    };
+    assert_eq!(code, ERROR_UNAUTHENTICATED);
+    // Not even the provider it would have been allowed to call, had it been mapped.
+    assert!(!message.contains("echo"), "{message}");
     shutdown_send.send(()).expect("signal clean shutdown");
     task.await
         .expect("server task exits")
@@ -591,9 +624,7 @@ async fn unmapped_peer_receives_no_capability_information() {
 #[tokio::test(flavor = "multi_thread")]
 async fn full_service_appends_after_restart_without_replay_restoration() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create service fixture");
-    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
-        .expect("secure service directory");
+    let directory = private_directory();
     let config_path = directory.path().join("broker.json");
     let socket_path = directory.path().join("broker.sock");
     let audit_path = directory.path().join("audit.jsonl");
@@ -707,9 +738,7 @@ async fn full_service_appends_after_restart_without_replay_restoration() {
 #[tokio::test(flavor = "multi_thread")]
 async fn full_service_resolves_a_private_map_only_after_dual_drn_authorization() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("service fixture");
-    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
-        .expect("secure fixture directory");
+    let directory = private_directory();
     let config_path = directory.path().join("broker.json");
     let socket_path = directory.path().join("broker.sock");
     let audit_path = directory.path().join("audit.jsonl");
@@ -920,7 +949,7 @@ async fn wait_for_socket(
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_never_ran() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create server fixture");
+    let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
     // One audit slot: the first allowed invocation spends it on its Decision, so its terminal
@@ -990,7 +1019,7 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
 #[tokio::test(flavor = "multi_thread")]
 async fn an_exhausted_replay_ledger_is_not_reported_as_a_transient_outage() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create server fixture");
+    let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
     let broker = broker_with_replay_bound(1).await;
@@ -1054,7 +1083,7 @@ async fn an_exhausted_replay_ledger_is_not_reported_as_a_transient_outage() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attested_invoke_over_the_socket_succeeds_for_an_attestor_peer() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create server fixture");
+    let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
     let (broker, audit) = attested_broker().await;
@@ -1104,7 +1133,7 @@ async fn an_attested_invoke_over_the_socket_succeeds_for_an_attestor_peer() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attested_invoke_from_a_peer_without_a_grant_is_denied_not_erred() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create server fixture");
+    let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
     let (broker, audit) = attested_broker().await;
@@ -1154,7 +1183,7 @@ async fn an_attested_invoke_from_a_peer_without_a_grant_is_denied_not_erred() {
 #[tokio::test(flavor = "multi_thread")]
 async fn mismatched_attestation_binding_is_a_protocol_error() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create server fixture");
+    let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
     let (broker, audit) = attested_broker().await;
@@ -1214,7 +1243,7 @@ async fn mismatched_attestation_binding_is_a_protocol_error() {
 #[tokio::test(flavor = "multi_thread")]
 async fn attested_capabilities_over_the_socket() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create server fixture");
+    let directory = private_directory();
     let limits = server_limits();
 
     let granted_path = directory.path().join("granted.sock");
@@ -1298,9 +1327,7 @@ async fn attested_capabilities_over_the_socket() {
 #[tokio::test(flavor = "multi_thread")]
 async fn strict_startup_refuses_every_policy_that_names_something_absent() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create service fixture");
-    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
-        .expect("secure service directory");
+    let directory = private_directory();
     let config_path = directory.path().join("broker.json");
     let policies_path = directory.path().join("policies.cedar");
     let document = json!({
@@ -1373,9 +1400,7 @@ async fn strict_startup_refuses_every_policy_that_names_something_absent() {
 #[tokio::test(flavor = "multi_thread")]
 async fn default_startup_tolerates_names_no_loaded_provider_declares() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create service fixture");
-    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
-        .expect("secure service directory");
+    let directory = private_directory();
     let config_path = directory.path().join("broker.json");
     let policies_path = directory.path().join("policies.cedar");
     let document = json!({

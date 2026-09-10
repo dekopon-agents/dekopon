@@ -13,9 +13,12 @@ dekopon-brokerd probe --socket /run/dekopon/broker.sock
 ```
 
 Run as the broker owner UID, mapped separately from the gateway in `identities`.
-The existing protocol client verifies socket safety and the live server UID against
-its own effective UID, then requests capabilities with a two-second complete-exchange
-deadline and the default frame ceiling. An empty authorized listing is healthy.
+That mapping is what makes the probe answerable: it is an ordinary authenticated client, so a
+configuration whose `identities` omit the broker's own UID refuses its own health check and logs
+`broker_peer_unmapped` with that UID.
+The existing protocol client verifies socket safety — the socket and its parent directory — and the
+live server UID against its own effective UID, then requests capabilities with a two-second
+complete-exchange deadline and the default frame ceiling. An empty authorized listing is healthy.
 Success exits 0 without output; absent, refused, unmapped, wrong-server, malformed or
 stalled endpoints exit 1 with a diagnostic. Missing arguments exit 2. The probe rejects
 `--config`, loads no components or credentials, invokes nothing and
@@ -435,7 +438,9 @@ rejects duplicate mapping subjects and malformed namespaces.
 
 ### IPC directory and distinct peer UIDs
 
-A broker-owned `0700` socket parent retains a `0600` socket for owner-only clients.
+A broker-owned `0700` socket parent retains a `0600` socket for owner-only clients. Configuring any
+peer UID other than the broker's own under such a parent is refused at startup, naming every
+unreachable UID at once: the socket it would bind admits none of them.
 For a distinct gateway UID, give the broker-owned parent the shared IPC group and mode
 `0710` (or `0750`). Group traversal selects a `0660` socket in that exact parent group;
 there is no extra configuration key. The broker must itself belong to that group to set
@@ -444,9 +449,10 @@ the IPC parent. A symlink parent, unsafe ancestors, wrong owner, socket symlink,
 link, wrong group, unsafe mode, or live listener replacement is refused.
 
 Give the gateway membership in that IPC group, map its actual UID in `identities`, and
-set its existing `broker.serverUid` to the broker UID. The protocol client checks socket
-ownership and the live server peer UID before writing a request. Unmapped peers receive
-no capabilities even if their group lets them connect. Owner-only clients remain valid.
+set its existing `broker.serverUid` to the broker UID. The protocol client checks socket and parent
+ownership and mode — the same rule this server binds under — and the live server peer UID before
+writing a request. Unmapped peers receive no capabilities even if their group lets them connect.
+Owner-only clients remain valid.
 
 Keep broker config, credentials, provider files, audit/cache and storage in their separate
 broker-owned protected paths; the IPC directory is not a credential or data directory.

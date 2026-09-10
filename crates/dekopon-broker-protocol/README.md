@@ -9,8 +9,12 @@ The authority-bearing half of the wire carries only capability inspection reques
 `RunCommand` (`runCommand`) is the one authority-bearing operation deliberately **not** gated on the caller's grants. It runs one provider-declared shell command word, its arguments, and the optional value the script piped into it (`stdin`) through the declaring component's pure, import-free, fuel- and timeout-bounded `run-command` export (or the legacy `resolve-command`, when that is all it exports, which receives no piped value), and answers with the guest's own `CommandRunOutcome`: a proposal to submit, text the guest rendered together with the exit status it chose, or a decline carrying the guest's stable code and message. A proposal is authorized on exactly the path every other proposal takes, so a caller who runs a word they may not use receives a denial one step later having learned nothing they could not learn by naming the capability directly; rendered text authorizes nothing. The piped value is bounded twice: by the frame ceiling on the client, where an oversized value fails in the request phase before a byte is written, and by the broker host's input bound before a store exists. A guest failure is the stable `provider-error` code with a deliberately opaque message. `ResolveCommand` (`resolveCommand`) is the legacy form of the same operation, kept for one release so an older client keeps working against a newer broker: a server answers it as a run with no piped value and reports rendered text as a decline carrying that text; this client no longer sends it, and a newer client's `runCommand` reaching an older broker is refused as `invalid-request`.
 
 Unix clients accept server-owned, single-link `0600` sockets and shared IPC `0660`
-sockets. A shared socket must match the GID of its server-owned, non-symlink parent,
-which permits group traversal but no group writes or access for others. Filesystem
+sockets, and inspect the parent directory in both cases: it must be a server-owned,
+non-symlink directory, private or group-traversable, with no group writes and no access
+for others. A shared socket must additionally carry that parent's GID and its group-traversal
+bit. `secure_socket_parent`, `secure_socket`, and `ipc_socket_mode` are the one definition of
+those rules; `dekopon-brokerd` calls them before binding, so a client trusts exactly the sockets
+the broker would bind. Filesystem
 metadata is not server authentication: the connected peer UID must also match the
 configured server UID before any request bytes are sent. Group access never supplies
 caller identity; the broker still maps the actual peer UID. See the broker's
@@ -88,7 +92,7 @@ A failure response carries a stable code and a bounded message. The code is the 
 | `unauthenticated` | The connected peer UID is not mapped by broker policy. | Not until the peer is mapped. |
 | `invalid-request` | The request frame could not be decoded, or an attestation was malformed or mismatched to its operation or proposal. | Yes, once corrected. |
 | `broker-unavailable` | The broker could not complete the request and **no provider work began**. | Yes, under a fresh invocation identifier. |
-| `capacity-exhausted` | A bounded broker resource — the replay ledger or the audit log — is full. No provider work began. | Safe, and futile: it fails identically until an operator raises the bound. **Do not retry.** |
+| `capacity-exhausted` | A bounded broker resource — the process-local replay ledger, or an embedding's in-memory audit log — is full and does not evict. The append-only file audit has no record cap, so a full disk arrives as `broker-unavailable` or `outcome-unaudited` instead. No provider work began. | Safe, and futile: it fails identically until an operator raises the bound. **Do not retry.** |
 | `provider-error` | A `runCommand` or `resolveCommand` run did not produce an answer: no loaded provider declares the word, the argv plus piped value exceeded the host's input bound, the guest failed, or its answer would not decode. **No invocation existed and nothing executed.** | Not without changing the word, its arguments, or the piped value; an identical retry fails identically. |
 | `outcome-unaudited` | Provider work may already have completed and the broker did not record its outcome. | **No.** The external effect may have taken place. |
 | `storage-quota`, `storage-busy`, `storage-timeout`, `storage-corrupt`, `storage-io` | Broker-owned namespace/grant setup failed before provider execution. | Yes under a fresh identifier after correcting or reconciling the storage condition. |

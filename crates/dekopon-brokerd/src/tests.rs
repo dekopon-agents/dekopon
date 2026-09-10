@@ -57,9 +57,9 @@ fn write_config(path: &Path, document: &serde_json::Value) {
 /// grant, a mapping inside that grant, a policy file, and the constraint set the policy's
 /// capability needs.
 ///
-/// The gateway takes its own UID because that is the only shape in which `via` is real isolation.
-/// `run` separately refuses any configured UID other than the server's, so this remains
-/// configuration-level validation of a deployment the socket cannot yet express.
+/// The two peers under other UIDs are what `via` is for, and reaching them needs a group-traversable
+/// socket parent: under a private one `run` refuses both at startup, so a caller that runs this
+/// configuration chooses the parent's mode deliberately.
 fn attested_document(uid: u32) -> serde_json::Value {
     json!({
         "apiVersion": config::CONFIG_API_VERSION,
@@ -80,6 +80,11 @@ fn attested_document(uid: u32) -> serde_json::Value {
                 "principal": "gateway",
                 "actor": {"type": "service", "principal": "gateway"},
                 "attestor": {"namespaces": ["slack.t0123abc"]}
+            },
+            {
+                "uid": uid + 2,
+                "principal": "console",
+                "actor": {"type": "service", "principal": "console"}
             }
         ],
         "identityMappings": [
@@ -228,6 +233,8 @@ async fn managed_provider_configuration_is_strict_and_network_free() {
     );
     assert_eq!(resolved.locked_providers.as_ref().map(Vec::len), Some(1));
 
+    // This fixture directory is private, so the server's own UID is the only peer a socket bound
+    // under it could admit; `run` refuses the other two.
     let mut runnable = document.clone();
     runnable["identities"] = json!([document["identities"][0].clone()]);
     write_config(&path, &runnable);
@@ -250,6 +257,63 @@ async fn managed_provider_configuration_is_strict_and_network_free() {
         .await
         .expect_err("a locked blob with another link is not trusted startup input");
     assert!(matches!(error, config::ConfigError::ProviderLock { .. }));
+}
+
+/// A peer that could never open the socket is the misconfiguration this refusal exists for: a
+/// private parent yields an owner-only socket, so a gateway under another UID loops on EACCES while
+/// the broker's own probe still reports healthy. Every offender is named at once, because an
+/// operator who corrects one at a time only reaches the next failed start.
+#[tokio::test]
+async fn every_peer_uid_a_private_socket_parent_excludes_is_named_at_startup() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create configuration fixture");
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        .expect("private fixture directory");
+    let path = directory.path().join("broker.yaml");
+    write_owner_only(
+        &directory.path().join("policies.cedar"),
+        POLICIES.as_bytes(),
+    );
+    let component = fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("examples/providers/echo-provider.wasm"),
+    )
+    .expect("checked echo component");
+    write_owner_only(&directory.path().join("echo.wasm"), &component);
+    // The socket keeps its own parent: the audit log's parent must stay private whatever the
+    // socket's does, so one directory cannot express both deployments.
+    let socket_parent = directory.path().join("run");
+    fs::create_dir(&socket_parent).expect("create socket parent");
+    fs::set_permissions(&socket_parent, fs::Permissions::from_mode(0o700))
+        .expect("private socket parent");
+
+    let mut document = attested_document(uid);
+    document["socketPath"] = json!("run/broker.sock");
+    write_config(&path, &document);
+    let error = super::run(&path, async {})
+        .await
+        .expect_err("an owner-only socket cannot admit the gateway or the console peer");
+    let super::BrokerdError::UnreachablePeerUids { configured, server } = &error else {
+        panic!("the refusal must name the peers it is about: {error}");
+    };
+    assert_eq!(*configured, vec![uid + 1, uid + 2]);
+    assert_eq!(*server, uid);
+    let message = error.to_string();
+    for named in [uid + 1, uid + 2, uid] {
+        assert!(
+            message.contains(&named.to_string()),
+            "UID {named} is missing from the refusal: {message}"
+        );
+    }
+
+    // Group traversal on that parent is the deployment those peers need, and it is the only thing
+    // that changes here.
+    fs::set_permissions(&socket_parent, fs::Permissions::from_mode(0o710))
+        .expect("IPC socket parent");
+    super::run(&path, async {})
+        .await
+        .expect("a group-traversable socket parent admits every configured peer");
 }
 
 /// Grants and mappings are owner-controlled identity machinery, so both fail closed on the shapes
@@ -1383,6 +1447,38 @@ async fn ipc_group_socket_keeps_private_paths_private_and_replaces_only_safe_sta
             client.capabilities().await,
             Err(ClientError::UnsafeSocket)
         ));
+    }
+
+    // Parent modes are half of the same rule, so both sides are pinned against the same directory.
+    // A shared-IPC socket belongs to the `0700` refusals as well: the broker binds under a private
+    // parent, but never this socket, and a client that trusted it would be trusting one the broker
+    // would refuse to reopen.
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).unwrap();
+    let limits = FrameLimits {
+        max_frame_bytes: 64 * 1024,
+        io_timeout: std::time::Duration::from_millis(200),
+    };
+    for mode in [0o770, 0o730, 0o740, 0o711, 0o751, 0o777, 0o1770, 0o700] {
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(mode)).unwrap();
+        assert!(
+            socket::bind(&path, uid).await.is_err(),
+            "the broker bound under parent {mode:o}"
+        );
+        let client = BrokerClient::new(&path, uid, limits).unwrap();
+        assert!(
+            matches!(client.capabilities().await, Err(ClientError::UnsafeSocket)),
+            "the client trusted parent {mode:o}"
+        );
+    }
+    // The parents the broker does bind a shared socket under are the parents its clients reach it
+    // through: nothing here answers, so the exchange fails on the read deadline instead.
+    for mode in [0o710, 0o750, 0o2710] {
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(mode)).unwrap();
+        let client = BrokerClient::new(&path, uid, limits).unwrap();
+        assert!(
+            !matches!(client.capabilities().await, Err(ClientError::UnsafeSocket)),
+            "the client refused parent {mode:o} the broker binds under"
+        );
     }
     drop(listener);
     fs::remove_file(path).unwrap();

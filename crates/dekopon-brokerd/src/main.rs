@@ -109,83 +109,7 @@ async fn main() -> ExitCode {
         }
         return ExitCode::from(2);
     }
-    // Health checks do not discover credentials or initialize telemetry/provider machinery.
-    if let Some(Command::Probe { socket }) = &cli.command {
-        return match probe(socket).await {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("dekopon-brokerd: probe failed: {}", error_chain(&error));
-                ExitCode::FAILURE
-            }
-        };
-    }
-    let provider_mode = cli.command.is_some();
-
-    // Provider management never reads daemon configuration and never installs telemetry. It is an
-    // offline operator mode with command output on stdout and diagnostics on stderr.
-    let settings = match (&cli.command, &cli.config) {
-        (None, Some(config)) => {
-            dekopon_brokerd::telemetry_settings(config, dekopon_brokerd::current_uid())
-                .await
-                .ok()
-                .flatten()
-        }
-        _ => None,
-    };
-
-    // Telemetry must never keep the broker from starting. Authorization and audit are the
-    // service's contract; observability is not, and failing closed here would trade a working
-    // authority boundary for a missing dashboard.
-    let tracer_provider = dekopon_telemetry::optional_tracer_provider(
-        settings.as_ref().map(|telemetry| &telemetry.settings),
-        "dekopon-brokerd",
-    );
-
-    let console = if provider_mode {
-        Console {
-            format: ConsoleFormat::Text {
-                ansi: None,
-                target: true,
-                timestamps: true,
-            },
-            writer: ConsoleWriter::Stderr,
-            filter: ConsoleFilter::Environment("warn".to_owned()),
-        }
-    } else {
-        // Structured JSON on stdout is the daemon log contract; a collector or shipper can pick it
-        // up without the broker holding a second credential.
-        Console {
-            format: ConsoleFormat::Json,
-            writer: ConsoleWriter::Stdout,
-            filter: ConsoleFilter::Environment("info".to_owned()),
-        }
-    };
-    let mut install = Install::new(console);
-    if let Some(provider) = tracer_provider {
-        install = install.with_traces(provider, "dekopon-brokerd", OTEL_TRACE_FILTER);
-    }
-    let telemetry = match install.install() {
-        Ok(guard) => guard,
-        Err(error) => {
-            eprintln!("dekopon-brokerd: could not install tracing subscriber: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let code = match execute(cli).await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            tracing::error!(event = "broker_exit", error = %error_chain(&error));
-            ExitCode::FAILURE
-        }
-    };
-
-    // Flush failures are reported but do not change the exit code: the broker's durable audit,
-    // not its telemetry, is the record of what happened.
-    if let Err(error) = telemetry.shutdown() {
-        tracing::error!(event = "broker_telemetry_shutdown_failed", error = %error);
-    }
-    code
+    execute(cli).await
 }
 
 #[cfg(unix)]
@@ -214,19 +138,88 @@ fn validate_cli(cli: &Cli) -> Result<(), clap::Error> {
     }
 }
 
+/// The one dispatch over the parsed command line.
+///
+/// Each arm brings the process state its mode needs, which is why the setup lives here rather than
+/// ahead of the match: a health check must discover no credentials and initialize no telemetry or
+/// provider machinery, and provider management must read no daemon configuration.
 #[cfg(unix)]
-async fn execute(cli: Cli) -> Result<(), AppError> {
+async fn execute(cli: Cli) -> ExitCode {
     match cli.command {
-        Some(Command::Probe { socket }) => probe(&socket).await,
-        Some(Command::Provider(provider)) => execute_provider(provider).await,
+        Some(Command::Probe { socket }) => match probe(&socket).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("dekopon-brokerd: probe failed: {}", error_chain(&error));
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::Provider(provider)) => {
+            // An offline operator mode with command output on stdout and diagnostics on stderr.
+            let install = Install::new(Console {
+                format: ConsoleFormat::Text {
+                    ansi: None,
+                    target: true,
+                    timestamps: true,
+                },
+                writer: ConsoleWriter::Stderr,
+                filter: ConsoleFilter::Environment("warn".to_owned()),
+            });
+            observed(install, execute_provider(provider)).await
+        }
         None => {
-            execute_server(
-                cli.config
-                    .expect("validate_cli requires daemon configuration"),
-            )
-            .await
+            let config = cli
+                .config
+                .expect("validate_cli requires daemon configuration");
+            let settings =
+                dekopon_brokerd::telemetry_settings(&config, dekopon_brokerd::current_uid())
+                    .await
+                    .ok()
+                    .flatten();
+            // Telemetry must never keep the broker from starting. Authorization and audit are the
+            // service's contract; observability is not, and failing closed here would trade a
+            // working authority boundary for a missing dashboard.
+            let tracer_provider = dekopon_telemetry::optional_tracer_provider(
+                settings.as_ref().map(|telemetry| &telemetry.settings),
+                "dekopon-brokerd",
+            );
+            // Structured JSON on stdout is the daemon log contract; a collector or shipper can
+            // pick it up without the broker holding a second credential.
+            let mut install = Install::new(Console {
+                format: ConsoleFormat::Json,
+                writer: ConsoleWriter::Stdout,
+                filter: ConsoleFilter::Environment("info".to_owned()),
+            });
+            if let Some(provider) = tracer_provider {
+                install = install.with_traces(provider, "dekopon-brokerd", OTEL_TRACE_FILTER);
+            }
+            observed(install, execute_server(config)).await
         }
     }
+}
+
+/// Installs one mode's subscriber, runs it to completion, and flushes what it recorded.
+#[cfg(unix)]
+async fn observed(install: Install, work: impl Future<Output = Result<(), AppError>>) -> ExitCode {
+    let telemetry = match install.install() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("dekopon-brokerd: could not install tracing subscriber: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let code = match work.await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            tracing::error!(event = "broker_exit", error = %error_chain(&error));
+            ExitCode::FAILURE
+        }
+    };
+    // Flush failures are reported but do not change the exit code: the broker's durable audit,
+    // not its telemetry, is the record of what happened.
+    if let Err(error) = telemetry.shutdown() {
+        tracing::error!(event = "broker_telemetry_shutdown_failed", error = %error);
+    }
+    code
 }
 
 #[cfg(unix)]

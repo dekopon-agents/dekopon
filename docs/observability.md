@@ -437,6 +437,7 @@ only place the cause exists. These events carry it:
 | `broker_capacity_exhausted` | error | `dekopon-brokerd` | `category`, and the chain naming which bound was reached |
 | `broker_accept_retried` | warn | `dekopon-brokerd` | `error.kind` (`process-descriptor-limit`, `system-descriptor-limit`, `kernel-memory`, `connection-aborted`, `connection-reset`, `interrupted`), `backoff_ms`, and the errno's chain |
 | `broker_socket_cleanup_failed` | warn | `dekopon-brokerd` | the socket error's chain |
+| `broker_peer_unmapped` | warn | `dekopon-brokerd` | `peer.uid`, the UID the refused connection authenticated as |
 
 `broker_capabilities_refused` exists because an attested `capabilities` and an attested
 `runCommand` (or legacy `resolveCommand`) answer a refused caller with the same opaque nothing whatever went wrong — a
@@ -461,9 +462,12 @@ whole chain as one `a: b: c` line. Frame contents never join it: a decode failur
 the bytes that failed to decode.
 
 `broker_capacity_exhausted` and `broker_accept_retried` are the two events that report a condition
-outside any one request. The first says a bounded broker resource — the replay ledger or the audit
-log — is full; every caller now receives `capacity-exhausted`, no retry can clear it, and a restart
-does not either, because the ledger is restored from durable history. The second says the daemon
+outside any one request. The first says a bounded broker resource — the process-local replay ledger,
+or an embedding's in-memory audit log — is full and does not evict; every caller now receives
+`capacity-exhausted` and no retry can clear it within that process lifetime. The durable file audit
+is not one of those bounds: it bounds each record, not their number, so a full audit filesystem
+arrives as `broker_audit_append_failed` with `category=io` — and, once execution has begun, as
+`broker_outcome_unaudited` — rather than here. The second says the daemon
 survived an `accept` failure it used to exit on. A steady stream of it at
 `error.kind=process-descriptor-limit` is the descriptor leak the exit used to hide, and it is worth
 alerting on precisely because the service is no longer failing loudly.
@@ -472,6 +476,12 @@ alerting on precisely because the service is no longer failing loudly.
 path is a smaller problem than the failure that ended service, so the serve error
 and `broker_stopped` come first and the cleanup error surfaces only when nothing
 more significant failed.
+
+`broker_peer_unmapped` names the UID behind an `unauthenticated` refusal, which the wire answer
+deliberately withholds. It is the event to look for when a deployed broker never becomes ready:
+`dekopon-brokerd probe` is an ordinary client authenticating as the broker's own UID, so a
+configuration whose `identities` omit that UID refuses its own health check. The Helm chart refuses
+that combination at render time; this event is what names it everywhere else.
 
 ## Storage telemetry and audit privacy
 

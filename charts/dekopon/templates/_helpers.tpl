@@ -257,6 +257,18 @@ that starts and then refuses to serve, which is much harder to read than a templ
 {{- if and (regexMatch "(?m)^[[:space:]]*constraintSets:" .Values.broker.config.inline) (not (include "dekopon.hasPolicies" .)) -}}
 {{- fail "broker.config.inline declares constraintSets but no policy set was supplied; dekopon-brokerd refuses to start with executable capabilities and no policy" -}}
 {{- end -}}
+{{/* The probe is an ordinary authenticated client, so an unmapped broker UID is a pod that starts,
+answers every probe `unauthenticated`, and never becomes ready. */}}
+{{- $config := .Values.broker.config.inline | fromYaml -}}
+{{- $probeMapped := false -}}
+{{- range (dig "identities" (list) $config) -}}
+{{- if eq ((dig "uid" -1 .) | int) $uid -}}
+{{- $probeMapped = true -}}
+{{- end -}}
+{{- end -}}
+{{- if not $probeMapped -}}
+{{- fail (printf "broker.config.inline identities must map the broker's own UID %d: the startup and readiness probes run dekopon-brokerd probe as that UID" $uid) -}}
+{{- end -}}
 {{- end -}}
 
 {{- if .Values.gateway.enabled -}}

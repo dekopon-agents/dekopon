@@ -74,6 +74,10 @@ pub const ERROR_STORAGE_IO: &str = "storage-io";
 /// Distinct from [`ERROR_BROKER_UNAVAILABLE`]: the process-local replay ledger or an embedding's
 /// bounded in-memory audit log is full and does not evict. A new identifier cannot fix capacity
 /// within that lifetime. Nothing executed, but clients must not retry automatically.
+///
+/// The broker's durable file audit is not one of those resources — it bounds each record, never the
+/// number of them — so a full audit filesystem arrives as [`ERROR_BROKER_UNAVAILABLE`] before
+/// execution and [`ERROR_OUTCOME_UNAUDITED`] after it, and never here.
 pub const ERROR_CAPACITY_EXHAUSTED: &str = "capacity-exhausted";
 
 /// Exact protocol version carried by every envelope.
@@ -1531,35 +1535,29 @@ impl BrokerClient {
     }
 }
 
+/// Applies the shared socket rules before every exchange, parent included.
+///
+/// The parent is inspected whatever the socket's mode, so this client trusts exactly the sockets
+/// `dekopon-brokerd` would bind and no others.
 #[cfg(unix)]
 async fn validate_socket_path(path: &Path, expected_uid: u32) -> Result<(), ClientError> {
     let metadata = tokio::fs::symlink_metadata(path)
         .await
         .map_err(|source| ClientError::SocketMetadata { source })?;
-    let mode = metadata.permissions().mode() & 0o7777;
-    if !metadata.file_type().is_socket()
-        || metadata.uid() != expected_uid
-        || metadata.nlink() != 1
-        || !matches!(mode, 0o600 | 0o660)
+    // A bare relative name has an empty parent, which is the current directory.
+    let parent = path.parent().ok_or(ClientError::UnsafeSocket)?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let parent = tokio::fs::symlink_metadata(parent)
+        .await
+        .map_err(|source| ClientError::SocketMetadata { source })?;
+    if !secure_socket_parent(&parent, expected_uid)
+        || !secure_socket(&metadata, expected_uid, &parent)
     {
         return Err(ClientError::UnsafeSocket);
-    }
-    // Preserve owner-only clients. Group access additionally needs the broker-controlled
-    // IPC parent: a client in that group may connect, but cannot replace the listener.
-    if mode == 0o660 {
-        let parent = path.parent().ok_or(ClientError::UnsafeSocket)?;
-        let parent = tokio::fs::symlink_metadata(parent)
-            .await
-            .map_err(|source| ClientError::SocketMetadata { source })?;
-        let parent_mode = parent.permissions().mode();
-        if !parent.file_type().is_dir()
-            || parent.uid() != expected_uid
-            || parent_mode & 0o027 != 0
-            || !matches!(parent_mode & 0o070, 0o010 | 0o050)
-            || metadata.gid() != parent.gid()
-        {
-            return Err(ClientError::UnsafeSocket);
-        }
     }
     Ok(())
 }
@@ -1761,6 +1759,60 @@ impl ResolvedBrokerSocket {
     #[must_use]
     pub const fn tier(&self) -> BrokerSocketTier {
         self.tier
+    }
+}
+
+/// Whether a directory may hold a broker socket.
+///
+/// This and [`secure_socket`] are the one definition of that rule: `dekopon-brokerd` consults them
+/// before binding, and every client consults them before connecting, so the two sides cannot drift
+/// into a mirror that accepts what the authority refuses. The directory is the operator-owned IPC
+/// group setting: server-owned, never group-writable or reachable by others, and either private or
+/// group-traversable. No credential path uses this rule.
+#[cfg(unix)]
+#[must_use]
+pub fn secure_socket_parent(parent: &std::fs::Metadata, expected_uid: u32) -> bool {
+    let mode = parent.permissions().mode();
+    parent.file_type().is_dir()
+        && parent.uid() == expected_uid
+        && mode & 0o027 == 0
+        && matches!(mode & 0o070, 0 | 0o010 | 0o050)
+}
+
+/// Whether a socket is one its server can own, inside a parent [`secure_socket_parent`] accepts.
+///
+/// A `0600` socket is owner-only. A `0660` socket is shared IPC, which is trustworthy only inside a
+/// group-traversable parent whose group it carries: a client in that group may connect, but cannot
+/// replace the listener.
+#[cfg(unix)]
+#[must_use]
+pub fn secure_socket(
+    socket: &std::fs::Metadata,
+    expected_uid: u32,
+    parent: &std::fs::Metadata,
+) -> bool {
+    let mode = socket.permissions().mode() & 0o7777;
+    socket.file_type().is_socket()
+        && socket.uid() == expected_uid
+        && socket.nlink() == 1
+        && (mode == 0o600
+            || (mode == 0o660
+                && parent.permissions().mode() & 0o010 != 0
+                && socket.gid() == parent.gid()))
+}
+
+/// The mode a broker binds its socket with under this parent.
+///
+/// Group traversal is how an operator opts into shared IPC. A private parent keeps the socket
+/// owner-only, which is also why a broker under one refuses to configure any peer UID but its own:
+/// no other UID could open what it is about to bind.
+#[cfg(unix)]
+#[must_use]
+pub fn ipc_socket_mode(parent: &std::fs::Metadata) -> u32 {
+    if parent.permissions().mode() & 0o010 == 0 {
+        0o600
+    } else {
+        0o660
     }
 }
 

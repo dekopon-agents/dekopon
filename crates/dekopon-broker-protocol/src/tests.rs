@@ -30,6 +30,22 @@ fn scope() -> ChatScopeClaim {
     }
 }
 
+/// A socket parent both sides of the socket rule accept.
+///
+/// `tempfile::tempdir` applies the process umask, which normally leaves the directory
+/// world-traversable — a parent the broker refuses to bind under, and one this client refuses to
+/// connect through however private the socket's own mode looks. Fixtures that expect an exchange
+/// to happen start from a directory the broker could really have bound in.
+#[cfg(unix)]
+fn private_socket_directory() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = tempfile::tempdir().expect("create socket fixture directory");
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("private socket fixture directory");
+    directory
+}
+
 fn invocation() -> InvocationRequest {
     InvocationRequest {
         id: "invoke-test"
@@ -399,7 +415,7 @@ async fn unix_client_authenticates_private_socket_and_response_variant() {
 
     use super::BrokerClient;
 
-    let directory = tempfile::tempdir().expect("create socket fixture directory");
+    let directory = private_socket_directory();
     let socket = directory.path().join("broker.sock");
     let listener = UnixListener::bind(&socket).expect("bind broker fixture");
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
@@ -458,7 +474,7 @@ async fn framing_failures_keep_the_executed_or_not_distinction() {
         BrokerClient, ClientError, ERROR_BROKER_UNAVAILABLE, ERROR_OUTCOME_UNAUDITED, ExchangePhase,
     };
 
-    let directory = tempfile::tempdir().expect("create socket fixture directory");
+    let directory = private_socket_directory();
     let socket = directory.path().join("broker.sock");
     let listener = UnixListener::bind(&socket).expect("bind broker fixture");
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
@@ -1195,7 +1211,7 @@ async fn a_run_command_exchange_decodes_a_rendered_answer() {
 
     use super::BrokerClient;
 
-    let directory = tempfile::tempdir().expect("create socket fixture directory");
+    let directory = private_socket_directory();
     let socket = directory.path().join("broker.sock");
     let listener = UnixListener::bind(&socket).expect("bind broker fixture");
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
@@ -1250,7 +1266,7 @@ async fn an_oversized_piped_value_is_refused_before_it_leaves_the_client() {
 
     use super::{BrokerClient, ClientError, ExchangePhase};
 
-    let directory = tempfile::tempdir().expect("create socket fixture directory");
+    let directory = private_socket_directory();
     let socket = directory.path().join("unread.sock");
     let listener = UnixListener::bind(&socket).expect("bind broker fixture");
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
@@ -1301,7 +1317,7 @@ async fn a_refused_attested_surface_is_a_stable_failure_rather_than_an_empty_ans
 
     use super::{BrokerClient, ClientError, ERROR_UNAUTHENTICATED};
 
-    let directory = tempfile::tempdir().expect("create socket fixture directory");
+    let directory = private_socket_directory();
     let socket = directory.path().join("broker.sock");
     let listener = UnixListener::bind(&socket).expect("bind broker fixture");
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
