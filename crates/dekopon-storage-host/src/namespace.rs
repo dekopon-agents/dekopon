@@ -13,7 +13,7 @@ use crate::{
         DOMAIN_AUDIT_SCOPE, DOMAIN_AUTHORITY, DOMAIN_GENERATION, DOMAIN_NAMESPACE_PATH, StorageKey,
         random_bytes,
     },
-    layout::{Directory, ENTRY_CHARGE, EntryKind, Usage, scan_usage},
+    layout::{Directory, ENTRY_CHARGE, EntryKind, Usage, scan_usage, usage_with_directory_entry},
 };
 
 const POINTER_VERSION: &str = "dekopon.dev/storage-authority-pointer/v1alpha1";
@@ -88,15 +88,7 @@ impl NamespacePlan {
                 if !namespaces_root.retains_child(&base_token, &base)? {
                     return Err(StorageHostError::Busy);
                 }
-                let mut usage = scan_usage(&base, maximum_entries)?;
-                usage.entries = usage
-                    .entries
-                    .checked_add(1)
-                    .ok_or(StorageHostError::Arithmetic)?;
-                usage.bytes = usage
-                    .bytes
-                    .checked_add(ENTRY_CHARGE)
-                    .ok_or(StorageHostError::Arithmetic)?;
+                let usage = usage_with_directory_entry(scan_usage(&base, maximum_entries)?)?;
                 (Some(base), Some(lease), usage)
             } else {
                 (None, None, Usage::default())
@@ -329,18 +321,6 @@ impl Simulation {
         }
         Ok(())
     }
-}
-
-fn usage_with_directory_entry(mut usage: Usage) -> Result<Usage, StorageHostError> {
-    usage.entries = usage
-        .entries
-        .checked_add(1)
-        .ok_or(StorageHostError::Arithmetic)?;
-    usage.bytes = usage
-        .bytes
-        .checked_add(ENTRY_CHARGE)
-        .ok_or(StorageHostError::Arithmetic)?;
-    Ok(usage)
 }
 
 fn open_optional_directory(

@@ -2,7 +2,7 @@
 use crate::{
     StorageEvidence, StorageGrant, StorageHostError,
     key::{DOMAIN_LOGICAL_PATH, DOMAIN_OPERATION_EVIDENCE, DOMAIN_OUTPUT_EVIDENCE, StorageKey},
-    layout::{ENTRY_CHARGE, EntryKind, scan_usage},
+    layout::{ENTRY_CHARGE, EntryKind, Usage, scan_usage, usage_with_directory_entry},
     metrics::byte_bucket,
     namespace::{Namespace, is_token, lock_exclusive},
     quota::{QuotaLedger, Reservation},
@@ -53,6 +53,24 @@ pub(crate) struct HandleState {
     pub(crate) lock: LockLevel,
 }
 
+/// One logical file's length before a reserved mutation and the length that mutation writes.
+#[derive(Debug)]
+struct PlannedChange {
+    token: String,
+    before: Option<u64>,
+    after: Option<u64>,
+}
+
+/// Every logical file one mutation rewrites, measured while its growth was reserved.
+///
+/// Reserving already stats each file it is about to change, so the resulting sizes are the
+/// mutation's exact accounting delta. Carrying them to the accounting call is what keeps
+/// `scan_usage` an open-time function instead of a per-write tree walk.
+#[derive(Debug)]
+pub(crate) struct PlannedMutation {
+    changes: Vec<PlannedChange>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OperationEvidence {
     pub(crate) operations: u64,
@@ -71,6 +89,8 @@ pub struct StorageHandle {
     pub(crate) key: Arc<StorageKey>,
     pub(crate) ledger: Arc<QuotaLedger>,
     pub(crate) entries: BTreeMap<String, FileEntry>,
+    /// What the namespace tree holds, carried forward by every mutation this invocation applies.
+    usage: Usage,
     pub(crate) baseline_files: BTreeSet<String>,
     pub(crate) handles: BTreeMap<u64, HandleState>,
     pub(crate) pending_delete: BTreeSet<String>,
@@ -107,16 +127,12 @@ impl StorageHandle {
             .open_private("lease.lock", false)?;
         lock_exclusive(&lease, grant.limits.lock_timeout_ms)?;
 
-        let mut namespace_usage =
-            scan_usage(&grant.namespace.directory, grant.limits.startup_max_entries)?;
-        namespace_usage.entries = namespace_usage
-            .entries
-            .checked_add(1)
-            .ok_or(StorageHostError::Arithmetic)?;
-        namespace_usage.bytes = namespace_usage
-            .bytes
-            .checked_add(ENTRY_CHARGE)
-            .ok_or(StorageHostError::Arithmetic)?;
+        // The one tree walk of this invocation. Every mutation below carries its own delta
+        // forward instead of asking the tree again.
+        let usage = usage_with_directory_entry(scan_usage(
+            &grant.namespace.directory,
+            grant.limits.startup_max_entries,
+        )?)?;
         let mut baseline_files = BTreeSet::new();
         for token in grant
             .namespace
@@ -147,7 +163,7 @@ impl StorageHandle {
         if baseline_files.len() as u64 > grant.limits.max_files_per_namespace {
             return Err(StorageHostError::QuotaExceeded);
         }
-        if namespace_usage.bytes > grant.limits.max_namespace_bytes {
+        if usage.bytes > grant.limits.max_namespace_bytes {
             return Err(StorageHostError::QuotaExceeded);
         }
         let reservation = ledger.begin(
@@ -155,7 +171,7 @@ impl StorageHandle {
                 "{}/{}",
                 grant.namespace.base_token, grant.namespace.generation_token
             ),
-            namespace_usage,
+            usage,
         )?;
         Ok(Self {
             interface: grant.interface,
@@ -165,6 +181,7 @@ impl StorageHandle {
             key: grant.key,
             ledger,
             entries: BTreeMap::new(),
+            usage,
             baseline_files,
             handles: BTreeMap::new(),
             pending_delete: BTreeSet::new(),
@@ -388,30 +405,45 @@ impl StorageHandle {
     pub(crate) fn reserve_candidate(
         &mut self,
         changes: &[(&str, Option<&[u8]>)],
-    ) -> Result<(), StorageHostError> {
+    ) -> Result<PlannedMutation, StorageHostError> {
         let mut files = self.baseline_files.clone();
         let mut growth = 0u64;
         let mut entries = 0u64;
+        let mut planned = Vec::with_capacity(changes.len());
         for (token, data) in changes {
-            let old = self.namespace.data_directory.metadata(token)?;
-            if let Some(data) = data {
-                if data.len() as u64 > self.limits.max_file_bytes {
-                    return Err(StorageHostError::QuotaExceeded);
-                }
-                files.insert((*token).to_owned());
-                let added = (data.len() as u64).saturating_sub(old.as_ref().map_or(0, |m| m.len));
-                growth = growth
-                    .checked_add(added)
-                    .ok_or(StorageHostError::Arithmetic)?;
-                if old.is_none() {
-                    entries += 1;
+            let before = self
+                .namespace
+                .data_directory
+                .metadata(token)?
+                .map(|metadata| metadata.len);
+            let after = match data {
+                Some(data) => {
+                    if data.len() as u64 > self.limits.max_file_bytes {
+                        return Err(StorageHostError::QuotaExceeded);
+                    }
+                    files.insert((*token).to_owned());
+                    let added = (data.len() as u64).saturating_sub(before.unwrap_or(0));
                     growth = growth
-                        .checked_add(ENTRY_CHARGE)
+                        .checked_add(added)
                         .ok_or(StorageHostError::Arithmetic)?;
+                    if before.is_none() {
+                        entries += 1;
+                        growth = growth
+                            .checked_add(ENTRY_CHARGE)
+                            .ok_or(StorageHostError::Arithmetic)?;
+                    }
+                    Some(data.len() as u64)
                 }
-            } else {
-                files.remove(*token);
-            }
+                None => {
+                    files.remove(*token);
+                    None
+                }
+            };
+            planned.push(PlannedChange {
+                token: (*token).to_owned(),
+                before,
+                after,
+            });
         }
         if files.len() as u64 > self.limits.max_files_per_namespace {
             return Err(StorageHostError::QuotaExceeded);
@@ -424,13 +456,15 @@ impl StorageHandle {
         if matches!(result, Err(StorageHostError::QuotaExceeded)) {
             self.note_quota_denial();
         }
-        result
+        result?;
+        Ok(PlannedMutation { changes: planned })
     }
 
     pub(crate) fn write_direct(
         &mut self,
         token: &str,
         bytes: Option<&[u8]>,
+        planned: PlannedMutation,
     ) -> Result<(), StorageHostError> {
         let directory = &self.namespace.data_directory;
         let result = match bytes {
@@ -443,7 +477,7 @@ impl StorageHandle {
             })(),
             None => directory.remove_file(token),
         };
-        self.after_mutation(result)
+        self.after_mutation(result, planned)
     }
 
     pub(crate) fn write_range(
@@ -451,6 +485,7 @@ impl StorageHandle {
         token: &str,
         offset: u64,
         bytes: &[u8],
+        planned: PlannedMutation,
     ) -> Result<(), StorageHostError> {
         use std::os::unix::fs::FileExt as _;
         let directory = &self.namespace.data_directory;
@@ -459,13 +494,14 @@ impl StorageHandle {
             file.write_all_at(bytes, offset)
                 .map_err(|source| directory.io_error(source))
         })();
-        self.after_mutation(result)
+        self.after_mutation(result, planned)
     }
 
     pub(crate) fn truncate_direct(
         &mut self,
         token: &str,
         size: u64,
+        planned: PlannedMutation,
     ) -> Result<(), StorageHostError> {
         let directory = &self.namespace.data_directory;
         let result = (|| {
@@ -474,15 +510,20 @@ impl StorageHandle {
                 .set_len(size)
                 .map_err(|source| directory.io_error(source))
         })();
-        self.after_mutation(result)
+        self.after_mutation(result, planned)
     }
 
     pub(crate) fn after_mutation(
         &mut self,
         result: Result<(), StorageHostError>,
+        planned: PlannedMutation,
     ) -> Result<(), StorageHostError> {
         // Account actual usage even after a partial syscall; no rollback or deferred write.
-        let accounting = self.account_direct();
+        let accounting = if result.is_ok() {
+            self.account_planned(&planned)
+        } else {
+            self.account_observed(&planned)
+        };
         if accounting.is_err()
             && let Some(reservation) = self.reservation.take()
         {
@@ -495,27 +536,96 @@ impl StorageHandle {
         result
     }
 
-    pub(crate) fn account_direct(&mut self) -> Result<(), StorageHostError> {
-        let mut usage = scan_usage(&self.namespace.directory, self.limits.startup_max_entries)?;
-        usage.bytes = usage
-            .bytes
-            .checked_add(ENTRY_CHARGE)
-            .ok_or(StorageHostError::Arithmetic)?;
-        usage.entries = usage
-            .entries
-            .checked_add(1)
-            .ok_or(StorageHostError::Arithmetic)?;
+    /// Charges the sizes the reservation planned, which every syscall of the mutation produced.
+    fn account_planned(&mut self, planned: &PlannedMutation) -> Result<(), StorageHostError> {
+        let final_sizes = planned
+            .changes
+            .iter()
+            .map(|change| change.after)
+            .collect::<Vec<_>>();
+        self.account_final_sizes(planned, &final_sizes)
+    }
+
+    /// Charges what a failed mutation actually left behind, at one `statat` per file it touched.
+    ///
+    /// A short `write_all_at` or a refused `set_len` leaves a length neither the plan nor the
+    /// previous state predicts. Re-stating those files is the complete correction; the namespace
+    /// tree is never walked here. A stat that fails leaves the length unknown, and the caller
+    /// then retains the reservation rather than releasing bytes that may still be occupied.
+    fn account_observed(&mut self, planned: &PlannedMutation) -> Result<(), StorageHostError> {
+        let mut final_sizes = Vec::with_capacity(planned.changes.len());
+        for change in &planned.changes {
+            final_sizes.push(
+                self.namespace
+                    .data_directory
+                    .metadata(&change.token)?
+                    .map(|metadata| metadata.len),
+            );
+        }
+        self.account_final_sizes(planned, &final_sizes)
+    }
+
+    /// Moves the cached usage by each file's own delta and reports the new total to the ledger.
+    fn account_final_sizes(
+        &mut self,
+        planned: &PlannedMutation,
+        final_sizes: &[Option<u64>],
+    ) -> Result<(), StorageHostError> {
+        let mut usage = self.usage;
+        for (change, after) in planned.changes.iter().zip(final_sizes) {
+            match (change.before, *after) {
+                (None, None) => {}
+                (None, Some(length)) => {
+                    usage.entries = usage
+                        .entries
+                        .checked_add(1)
+                        .ok_or(StorageHostError::Arithmetic)?;
+                    usage.files = usage
+                        .files
+                        .checked_add(1)
+                        .ok_or(StorageHostError::Arithmetic)?;
+                    usage.bytes = usage
+                        .bytes
+                        .checked_add(ENTRY_CHARGE)
+                        .and_then(|bytes| bytes.checked_add(length))
+                        .ok_or(StorageHostError::Arithmetic)?;
+                }
+                (Some(length), None) => {
+                    usage.entries = usage
+                        .entries
+                        .checked_sub(1)
+                        .ok_or(StorageHostError::Arithmetic)?;
+                    usage.files = usage
+                        .files
+                        .checked_sub(1)
+                        .ok_or(StorageHostError::Arithmetic)?;
+                    usage.bytes = usage
+                        .bytes
+                        .checked_sub(ENTRY_CHARGE)
+                        .and_then(|bytes| bytes.checked_sub(length))
+                        .ok_or(StorageHostError::Arithmetic)?;
+                }
+                (Some(previous), Some(length)) => {
+                    usage.bytes = usage
+                        .bytes
+                        .checked_sub(previous)
+                        .and_then(|bytes| bytes.checked_add(length))
+                        .ok_or(StorageHostError::Arithmetic)?;
+                }
+            }
+        }
+        self.usage = usage;
+        for (change, after) in planned.changes.iter().zip(final_sizes) {
+            if after.is_some() {
+                self.baseline_files.insert(change.token.clone());
+            } else {
+                self.baseline_files.remove(&change.token);
+            }
+        }
         self.reservation
             .as_mut()
             .ok_or(StorageHostError::Io)?
-            .observe_direct(usage)?;
-        self.baseline_files = self
-            .namespace
-            .data_directory
-            .entries_bounded(self.limits.max_files_per_namespace)?
-            .into_iter()
-            .collect();
-        Ok(())
+            .observe_direct(usage)
     }
 
     /// Releases resources, retaining every write already applied by this invocation.
@@ -631,8 +741,9 @@ pub(crate) fn wall_ms() -> Result<u64, StorageHostError> {
 #[cfg(test)]
 mod tests {
     use crate::{
-        ContinuityPolicy, OpenOptions, StorageGrantRequest, StorageHandle, StorageHost,
+        ContinuityPolicy, Durability, OpenOptions, StorageGrantRequest, StorageHandle, StorageHost,
         StorageLimits,
+        layout::{scan_usage, usage_with_directory_entry},
     };
     use dekopon_capability::{StorageAccess, StorageInterface, StorageNamespace};
     use std::{fs, os::unix::fs::PermissionsExt as _};
@@ -714,6 +825,89 @@ mod tests {
         assert_eq!(next.vfs_read_at(handle, 0, 64).expect("read"), b"visible");
         next.vfs_close(handle).expect("close");
         next.finish_read().expect("finish");
+    }
+
+    #[test]
+    fn a_mutation_reads_no_directory_and_leaves_the_cached_usage_exact() {
+        /// Directory reads a mutation may perform, whatever the namespace holds and however many
+        /// mutations came before it: none. Accounting carries each change's own delta forward, so
+        /// the tree walk `begin` performs is the only one an invocation makes.
+        const SCANS_ALLOWED: u64 = 0;
+        const FILES: u64 = 8;
+        const FRAMES: u64 = 64;
+        const FRAME: u64 = 512;
+
+        let (_temporary, host) = probe_host(StorageLimits::default());
+        let mut transaction = vfs_transaction(&host, "incremental-accounting");
+        let opened = crate::layout::directory_scans();
+        assert!(opened > 0, "directory-scan instrumentation is dead");
+        let mut handles = Vec::new();
+        for index in 0..FILES {
+            handles.push(
+                transaction
+                    .vfs_open(
+                        &format!("shard{index}.db"),
+                        OpenOptions {
+                            read: true,
+                            write: true,
+                            create: true,
+                            ..OpenOptions::default()
+                        },
+                    )
+                    .expect("open"),
+            );
+        }
+        let created = crate::layout::directory_scans();
+        assert_eq!(
+            created - opened,
+            SCANS_ALLOWED,
+            "creating {FILES} files read the namespace"
+        );
+
+        for handle in handles.drain(1..) {
+            transaction.vfs_close(handle).expect("close");
+        }
+        let frame = vec![0x5a_u8; usize::try_from(FRAME).expect("bounded frame")];
+        for index in 0..FRAMES {
+            transaction
+                .vfs_write_at(handles[0], index * FRAME, &frame)
+                .expect("append");
+        }
+        let appended = crate::layout::directory_scans();
+        assert_eq!(
+            appended - created,
+            SCANS_ALLOWED,
+            "{FRAMES} appends read the namespace: accounting is rescanning the tree per write"
+        );
+
+        transaction
+            .vfs_rename_atomic("shard1.db", "shard1.moved.db", true, Durability::Full)
+            .expect("rename");
+        transaction
+            .vfs_remove("shard2.db", Durability::Full)
+            .expect("remove");
+        assert_eq!(
+            crate::layout::directory_scans() - appended,
+            SCANS_ALLOWED,
+            "a rename and a removal read the namespace"
+        );
+
+        let walked = usage_with_directory_entry(
+            scan_usage(
+                &transaction.namespace.directory,
+                transaction.limits.startup_max_entries,
+            )
+            .expect("ground truth"),
+        )
+        .expect("ground truth");
+        assert_eq!(
+            transaction.usage, walked,
+            "the usage carried across {FILES} creations, {FRAMES} appends, a rename, and a \
+             removal disagrees with the tree it describes"
+        );
+
+        transaction.vfs_close(handles[0]).expect("close");
+        transaction.commit().expect("finish");
     }
 
     #[test]

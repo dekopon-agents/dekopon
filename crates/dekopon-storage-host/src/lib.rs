@@ -69,7 +69,7 @@ use key::{
     DOMAIN_AUDIT_SCOPE, DOMAIN_CONTENT, DOMAIN_DECISION_EVIDENCE, DOMAIN_NAMESPACE_PATH,
     DOMAIN_RECORD_ID, StorageKey, random_bytes,
 };
-use layout::{ENTRY_CHARGE, Layout, scan_root_usage, scan_usage};
+use layout::{Layout, scan_root_usage, scan_usage, usage_with_directory_entry};
 use namespace::{Namespace, NamespacePlan};
 use quota::QuotaLedger;
 
@@ -586,36 +586,28 @@ impl StorageHost {
                 return Err(error);
             }
         };
-        let mut after_namespace =
-            match scan_usage(&base_directory, self.inner.limits.startup_max_entries) {
-                Ok(usage) => usage,
-                Err(error) => {
-                    namespace_reservation
-                        .take()
-                        .expect("namespace reservation")
-                        .commit();
-                    housekeeping_reservation.retain();
-                    return Err(error);
-                }
-            };
-        let Some(entries) = after_namespace.entries.checked_add(1) else {
-            namespace_reservation
-                .take()
-                .expect("namespace reservation")
-                .commit();
-            housekeeping_reservation.retain();
-            return Err(StorageHostError::Arithmetic);
+        let scanned = match scan_usage(&base_directory, self.inner.limits.startup_max_entries) {
+            Ok(usage) => usage,
+            Err(error) => {
+                namespace_reservation
+                    .take()
+                    .expect("namespace reservation")
+                    .commit();
+                housekeeping_reservation.retain();
+                return Err(error);
+            }
         };
-        let Some(bytes) = after_namespace.bytes.checked_add(ENTRY_CHARGE) else {
-            namespace_reservation
-                .take()
-                .expect("namespace reservation")
-                .commit();
-            housekeeping_reservation.retain();
-            return Err(StorageHostError::Arithmetic);
+        let after_namespace = match usage_with_directory_entry(scanned) {
+            Ok(usage) => usage,
+            Err(error) => {
+                namespace_reservation
+                    .take()
+                    .expect("namespace reservation")
+                    .commit();
+                housekeeping_reservation.retain();
+                return Err(error);
+            }
         };
-        after_namespace.entries = entries;
-        after_namespace.bytes = bytes;
         if let Err(error) = housekeeping_reservation.commit(before_namespace, after_namespace) {
             namespace_reservation
                 .take()

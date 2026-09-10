@@ -73,6 +73,19 @@ pub(crate) struct Usage {
     pub(crate) files: u64,
 }
 
+/// Charges the scanned directory's own entry in its parent, which a scan of it never sees.
+pub(crate) fn usage_with_directory_entry(mut usage: Usage) -> Result<Usage, StorageHostError> {
+    usage.entries = usage
+        .entries
+        .checked_add(1)
+        .ok_or(StorageHostError::Arithmetic)?;
+    usage.bytes = usage
+        .bytes
+        .checked_add(ENTRY_CHARGE)
+        .ok_or(StorageHostError::Arithmetic)?;
+    Ok(usage)
+}
+
 impl Layout {
     pub(crate) fn minimum_usage(key: &StorageKey) -> Result<Usage, StorageHostError> {
         let document = LayoutDocument {
@@ -423,6 +436,8 @@ impl Directory {
         maximum: u64,
         fail_on_excess: bool,
     ) -> Result<Vec<String>, StorageHostError> {
+        #[cfg(test)]
+        note_directory_scan();
         let mut directory = rustix::fs::Dir::read_from(self.file.as_ref())
             .map_err(|source| self.io_error(std::io::Error::from(source)))?;
         let mut entries = Vec::new();
@@ -726,10 +741,34 @@ fn validate_ancestors(path: &Path) -> Result<(), StorageHostError> {
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Directory reads performed on this thread.
+    ///
+    /// Test-only instrumentation. Accounting a mutation from the tree it just changed is a cost
+    /// this crate has to hold to — a write reads no directory — so directory reads are counted
+    /// rather than assumed. A tree walk bumps this once for the walk and once per directory it
+    /// reads, so a scan on a path that must not scan cannot register as one read.
+    static DIRECTORY_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_directory_scan() {
+    DIRECTORY_SCANS.with(|cell| cell.set(cell.get().saturating_add(1)));
+}
+
+/// Directory reads performed on this thread so far.
+#[cfg(test)]
+pub(crate) fn directory_scans() -> u64 {
+    DIRECTORY_SCANS.with(std::cell::Cell::get)
+}
+
 pub(crate) fn scan_usage(
     directory: &Directory,
     maximum_entries: u64,
 ) -> Result<Usage, StorageHostError> {
+    #[cfg(test)]
+    note_directory_scan();
     let mut usage = Usage::default();
     scan(directory, maximum_entries, &mut usage)?;
     Ok(usage)

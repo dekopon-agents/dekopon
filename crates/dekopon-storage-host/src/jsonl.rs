@@ -96,13 +96,17 @@ impl StorageHandle {
         replacement.reserve(record.len().saturating_add(1));
         replacement.extend_from_slice(record);
         replacement.push(b'\n');
-        if let Err(error) = self.reserve_candidate(&[(&token, Some(replacement.as_slice()))]) {
-            replacement.truncate(current_size);
-            self.entries.get_mut(&token).expect("loaded entry").data =
-                was_present.then_some(replacement);
-            return Err(error);
-        }
-        self.write_direct(&token, Some(&replacement))?;
+        let reserved = self.reserve_candidate(&[(&token, Some(replacement.as_slice()))]);
+        let planned = match reserved {
+            Ok(planned) => planned,
+            Err(error) => {
+                replacement.truncate(current_size);
+                self.entries.get_mut(&token).expect("loaded entry").data =
+                    was_present.then_some(replacement);
+                return Err(error);
+            }
+        };
+        self.write_direct(&token, Some(&replacement), planned)?;
         let entry = self.entries.get_mut(&token).expect("loaded entry");
         entry.data = Some(replacement);
         Ok(entry.data.as_ref().map_or(0, |bytes| bytes.len() as u64))
@@ -128,8 +132,8 @@ impl StorageHandle {
         if current_size != expected_size {
             return Err(StorageHostError::Busy);
         }
-        self.reserve_candidate(&[(&token, Some(contents))])?;
-        self.write_direct(&token, Some(contents))?;
+        let planned = self.reserve_candidate(&[(&token, Some(contents))])?;
+        self.write_direct(&token, Some(contents), planned)?;
         let entry = self.entries.get_mut(&token).expect("loaded entry");
         entry.data = Some(contents.to_vec());
         Ok(())
