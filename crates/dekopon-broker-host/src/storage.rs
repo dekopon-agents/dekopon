@@ -532,6 +532,7 @@ fn map_jsonl_error(error: StorageHostError) -> jsonl::StorageError {
         StorageHostError::Timeout => jsonl::StorageError::Timeout,
         StorageHostError::Unsupported => jsonl::StorageError::Unsupported,
         StorageHostError::Corrupt { .. }
+        | StorageHostError::CorruptNamespace { .. }
         | StorageHostError::CorruptLayout
         | StorageHostError::KeyMismatch => jsonl::StorageError::Corrupt,
         _ => jsonl::StorageError::Io,
@@ -553,6 +554,7 @@ fn map_durable_error(error: StorageHostError) -> durable::StorageError {
         StorageHostError::Timeout => durable::StorageError::Timeout,
         StorageHostError::Unsupported => durable::StorageError::Unsupported,
         StorageHostError::Corrupt { .. }
+        | StorageHostError::CorruptNamespace { .. }
         | StorageHostError::CorruptLayout
         | StorageHostError::KeyMismatch => durable::StorageError::Corrupt,
         _ => durable::StorageError::Io,

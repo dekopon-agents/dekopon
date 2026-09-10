@@ -110,10 +110,25 @@ The strict storage limits object accepts only live bounds. Configure the complet
 `StorageLimits` defaults/current fields; omit all GC scheduling/TTL and startup recovery-count
 settings. `maxPendingTransactions` remains the compatibility spelling for concurrent invocation
 handle admission. Keep the existing namespace key private and unchanged. Retained stores with
-unknown root or generation entries are refused or quarantined; there is no automatic migration,
+unknown root or generation entries are refused; there is no automatic migration,
 recursive cleanup or trusted import of legacy layout bytes. Preserve such data offline rather
 than deleting entries to bypass a refusal. A separately provisioned private storage root starts
 empty and does not restore previous data.
+
+## Namespace quarantine removal (unreleased)
+
+Before upgrading, move `quarantine/` out of the storage root. The root-entry allowlist is now
+`layout`, `namespaces` and `writer.lock`; a root that still holds a `quarantine/` directory fails
+startup as a corrupt layout, empty or not. Move the directory somewhere outside the root and keep
+it — the broker will not read, migrate, or delete those bytes.
+
+Delete `storage.maxQuarantinedNamespaces` from the broker configuration. The storage limits object
+is `deny_unknown_fields`, so a configuration that still names it is refused with that field name.
+
+A namespace that does not validate at startup is no longer moved aside. Startup ends with
+`storage namespace <base> is corrupt` plus the check that failed, and the broker does not serve —
+including the namespaces that are healthy. Move the named base out of `namespaces/` to start
+without it; the bytes are yours to keep or discard, and nothing recreates them.
 
 ## Two rules that apply to every upgrade
 

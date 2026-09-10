@@ -482,8 +482,8 @@ pub(crate) fn current_generation(
 
 /// Validates one complete isolated namespace without following or trusting any path entry.
 ///
-/// Root/layout corruption remains fatal, while callers may quarantine an error returned here and
-/// continue serving independently healthy namespace bases.
+/// An error returned here names one base as the thing that is wrong; the caller refuses the whole
+/// root rather than setting that base aside, so no unvalidated tree is ever retained or served.
 pub(crate) fn validate_namespace_base(
     base_directory: &Directory,
     key: &StorageKey,

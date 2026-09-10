@@ -479,6 +479,17 @@ All notable changes to Dekopon are documented here. The format is based on
   still reaches the caller as a `ScriptOutcome`; a syntax error is still the rendered
   `dekopon-shell: syntax error: ...` line on its output, which is the shape every consumer
   actually reads. The grammar is now free to change without a major version.
+- Removed namespace quarantine. A retained namespace that fails startup validation is no longer
+  renamed into a `quarantine/` directory, counted by a second quota scanner and skipped: startup
+  now ends with `storage namespace <base> is corrupt` and the check that failed, and the broker
+  does not serve until an operator moves that base out of `namespaces/`. `quarantine` left the
+  root-entry allowlist with it, so an existing root that still holds one is refused as a corrupt
+  layout; move it out of the storage root before upgrading. Delete
+  `storage.maxQuarantinedNamespaces` from broker configuration — the storage limits object is
+  `deny_unknown_fields` and refuses it by name. The removal is what makes the containment claim
+  true: the crate had to chmod a directory back to `0o700` to move and then walk something it had
+  just classified as untrusted, and both of those `chmodat` calls are gone. Hard-link, symlink,
+  ownership and mode refusals are unchanged; see [`docs/upgrading.md`](docs/upgrading.md).
 
 ### Fixed
 

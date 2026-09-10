@@ -10,10 +10,11 @@ Each invocation uses a direct namespace/VFS handle. Each authorized write affect
 at that host call; provider failure, trap, cancellation, or an invalid response does not undo
 completed writes. There is no invocation-wide atomicity, rollback, crash recovery, or automatic
 collection of inactive generations ([non-goal](../../docs/design.md#non-goals)). Unknown
-retained layout entries are refused/quarantined.
+retained layout entries and namespaces that do not validate are refused, naming the base and the
+check that failed; nothing is moved aside or repaired.
 
 Accounting is logical rather than a physical-disk claim: apparent bytes plus 4096 bytes for every
-file and directory, including quarantine and authority-pointer replacement temporaries. Namespace creation,
+file and directory, including authority-pointer replacement temporaries. Namespace creation,
 authority-pointer replacement, live-file growth and entry count are reserved before mutation.
 The process ledger is rebuilt once at startup and updated by host-owned mutations; unreadable
 usage after a partial syscall failure retains conservative headroom. Sparse gaps, growing truncate,

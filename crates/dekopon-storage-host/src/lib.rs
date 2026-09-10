@@ -389,16 +389,7 @@ impl StorageHost {
             return Err(StorageHostError::QuotaExceeded);
         }
         let layout = Layout::open(&root, &key)?;
-        quarantine_isolated_namespaces(&layout, &key, &limits)?;
-        let quarantined = layout
-            .quarantine()
-            .entries_prefix(limits.startup_max_entries.saturating_add(1))?
-            .len() as u64;
-        if quarantined > limits.max_quarantined_namespaces {
-            return Err(StorageHostError::Corrupt {
-                scope: "quarantine-capacity",
-            });
-        }
+        validate_namespaces(&layout, &key, &limits)?;
         let usage = scan_root_usage(&layout, limits.startup_max_entries)?;
         if usage.bytes > limits.max_root_bytes {
             return Err(StorageHostError::QuotaExceeded);
@@ -487,11 +478,6 @@ impl StorageHost {
         let _namespace = namespace_lock
             .lock()
             .expect("storage namespace housekeeping lock");
-        if self.inner.layout.quarantine().exists(&base)? {
-            return Err(StorageHostError::Corrupt {
-                scope: "quarantined-namespace",
-            });
-        }
         let mut namespace_reservation = Some({
             // The observation lock is dropped before any base lease wait, preserving concurrency between
             // distinct namespaces.
@@ -506,12 +492,6 @@ impl StorageHost {
                 .namespaces()
                 .entries_bounded(self.inner.limits.startup_max_entries)?
                 .into_iter()
-                .chain(
-                    self.inner
-                        .layout
-                        .quarantine()
-                        .entries_bounded(self.inner.limits.startup_max_entries)?,
-                )
                 .collect::<BTreeSet<_>>();
             self.inner
                 .ledger
@@ -548,14 +528,7 @@ impl StorageHost {
             self.inner
                 .layout
                 .namespaces()
-                .entries_bounded(self.inner.limits.startup_max_entries)?
-                .into_iter()
-                .chain(
-                    self.inner
-                        .layout
-                        .quarantine()
-                        .entries_bounded(self.inner.limits.startup_max_entries)?,
-                ),
+                .entries_bounded(self.inner.limits.startup_max_entries)?,
         );
         let namespace = match plan.apply(
             self.inner.layout.namespaces(),
@@ -745,15 +718,15 @@ fn resolve_parent_leaf(path: &Path, key: bool) -> Result<PathBuf, StorageHostErr
     Ok(traversed)
 }
 
-fn quarantine_isolated_namespaces(
+/// Refuses the whole root when any retained namespace does not validate.
+///
+/// A namespace this host cannot vouch for is never moved aside, repaired, or served: startup ends
+/// naming the base and the check that failed, and the operator decides what happens to the bytes.
+fn validate_namespaces(
     layout: &Layout,
     key: &StorageKey,
     limits: &StorageLimits,
 ) -> Result<(), StorageHostError> {
-    let mut quarantined = layout
-        .quarantine()
-        .entries_prefix(limits.startup_max_entries.saturating_add(1))?
-        .len() as u64;
     for base in layout
         .namespaces()
         .entries_bounded(limits.startup_max_entries)?
@@ -777,34 +750,11 @@ fn quarantine_isolated_namespaces(
         })();
         match validation {
             Ok(()) => {}
-            Err(error) if isolated_namespace_corruption(&error) => {
-                if quarantined >= limits.max_quarantined_namespaces {
-                    return Err(StorageHostError::Corrupt {
-                        scope: "quarantine-capacity",
-                    });
-                }
-                if layout.quarantine().exists(&base)? {
-                    return Err(StorageHostError::Corrupt {
-                        scope: "quarantine-collision",
-                    });
-                }
-                if matches!(error, StorageHostError::UnsafeRoot { .. })
-                    || matches!(
-                        error,
-                        StorageHostError::RootIo { ref source, .. }
-                            if source.kind() == std::io::ErrorKind::PermissionDenied
-                    )
-                {
-                    layout
-                        .namespaces()
-                        .make_owned_directory_traversable(&base)?;
-                }
-                layout
-                    .namespaces()
-                    .rename_to(&base, layout.quarantine(), &base)?;
-                layout.namespaces().sync()?;
-                layout.quarantine().sync()?;
-                quarantined = quarantined.saturating_add(1);
+            Err(error) if namespace_corruption(&error) => {
+                return Err(StorageHostError::CorruptNamespace {
+                    namespace: base,
+                    source: Box::new(error),
+                });
             }
             Err(error) => return Err(error),
         }
@@ -831,7 +781,11 @@ pub(crate) fn report_decode_failure(document: &'static str, error: &serde_json::
     );
 }
 
-fn isolated_namespace_corruption(error: &StorageHostError) -> bool {
+/// Whether this failure is the retained namespace's own shape rather than a root-wide condition.
+///
+/// A quota, entry-budget, or lock failure is about the root or the process and must be reported as
+/// itself; only these name one base as the thing that is wrong.
+fn namespace_corruption(error: &StorageHostError) -> bool {
     matches!(
         error,
         StorageHostError::Corrupt { .. } | StorageHostError::UnsafeRoot { .. }
@@ -912,8 +866,17 @@ pub enum StorageHostError {
     CorruptLayout,
     #[error("storage key does not match retained data")]
     KeyMismatch,
-    #[error("storage corruption detected")]
+    /// The scope is a compile-time literal naming the check that failed, never retained content.
+    #[error("storage corruption detected: {scope}")]
     Corrupt { scope: &'static str },
+    /// The base token is the on-disk directory name, not scope data: an operator needs it to find
+    /// the namespace this startup refused, and it commits to nothing a directory listing does not.
+    #[error("storage namespace {namespace} is corrupt")]
+    CorruptNamespace {
+        namespace: String,
+        #[source]
+        source: Box<StorageHostError>,
+    },
     #[error("storage quota exceeded")]
     QuotaExceeded,
     #[error("storage resource is busy")]
@@ -958,9 +921,10 @@ impl StorageHostError {
         match self {
             Self::QuotaExceeded | Self::Arithmetic => StorageFailureClass::Quota,
             Self::Timeout => StorageFailureClass::Timeout,
-            Self::Corrupt { .. } | Self::CorruptLayout | Self::KeyMismatch => {
-                StorageFailureClass::Corrupt
-            }
+            Self::Corrupt { .. }
+            | Self::CorruptNamespace { .. }
+            | Self::CorruptLayout
+            | Self::KeyMismatch => StorageFailureClass::Corrupt,
             Self::PermissionDenied | Self::GrantHostMismatch => StorageFailureClass::Denied,
             // An unaudited outcome is unknown rather than any one class, so it reports the
             // catch-all here and names what actually broke in its own `cause` instead.

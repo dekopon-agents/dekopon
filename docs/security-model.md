@@ -276,8 +276,9 @@ quota counts and powers-of-two byte buckets remain.
 The filesystem boundary retains directory descriptors and uses descriptor-relative no-follow
 opens, scans, creates, renames, and unlinks. It detects/refuses ordinary symlinks, hard links, wrong
 identities, unsafe modes, malformed namespace layouts, and a second conforming writer. Base then
-generation lease ordering serializes authority pointers, grants, and invocation access; isolated
-namespace corruption is quarantined while retaining quota. An actively malicious same-UID process
+generation lease ordering serializes authority pointers, grants, and invocation access; a namespace
+that does not validate refuses startup naming that base and the failed check, and the host never
+chmods or moves a directory it has classified as untrusted. An actively malicious same-UID process
 racing filesystem mutation is out of scope. Native filesystem operations can remain blocked after
 a timeout signal; the finalization budget prevents starting the next bounded finalization step after
 its deadline, while leases/reservations stay held until an already-started blocking operation

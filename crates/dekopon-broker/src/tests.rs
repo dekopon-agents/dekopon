@@ -442,9 +442,6 @@ fn every_authority_ceiling_is_canonical_and_semantic() {
             v.max_pending_transactions += 1
         }),
         ("startupMaxEntries", |v| v.startup_max_entries += 1),
-        ("maxQuarantinedNamespaces", |v| {
-            v.max_quarantined_namespaces += 1
-        }),
     ];
     assert_rotations(&storage, storage_mutations, encoded_storage);
 
