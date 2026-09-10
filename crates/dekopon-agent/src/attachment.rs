@@ -7,10 +7,10 @@
 //! broker still authorizes every invocation, and an owner still decides per route whether either
 //! convention is live.
 //!
-//! - **Out.** A successful capability result may carry a top-level `attachments` key
-//!   ([`dekopon_provider_sdk::ResultAttachment`]). The session's broker leg removes it, validates
-//!   each entry, puts the accepted bytes in [`ReplyAttachments`] — a request-local slot that is
-//!   never a model message — and leaves the model metadata only.
+//! - **Out.** A successful capability result may carry a top-level `attachments` key holding
+//!   `{mediaType, base64}` objects. The session's broker leg removes it, validates each entry, puts
+//!   the accepted bytes in [`ReplyAttachments`] — a request-local slot that is never a model
+//!   message — and leaves the model metadata only.
 //! - **In.** A capability input may carry the marker `chat-asset:<N>`, naming an attachment the
 //!   sender put on their message. For the capabilities a route lists, the leg expands each marker to
 //!   a `data:` URL through [`ChatAssetSource`] before the proposal is submitted.
@@ -18,6 +18,7 @@
 use std::{fmt, sync::Arc, sync::Mutex};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
+use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -41,6 +42,15 @@ pub const MAX_CHAT_ASSET_INPUTS: usize = 3;
 /// inside the byte bound a broker frame can carry.
 pub const MAX_CHAT_ASSET_INPUT_BYTES: usize = 8_912_896;
 
+/// Expansions one session may make across every invocation it proposes.
+///
+/// The per-invocation bound alone is not a session bound, and expansion happens **before** the
+/// broker authorizes anything: without this, a script could spend its whole capability budget
+/// proposing a listed capability and pull three attachments off the chat service with the bot token
+/// on every one of them, even if policy then denied every call. Twelve is four full invocations'
+/// worth — enough for a person iterating on a remix, far short of a download loop.
+pub const MAX_CHAT_ASSET_EXPANSIONS_PER_SESSION: usize = 12;
+
 /// The key a capability result carries attachments under, and which the gateway removes.
 const ATTACHMENTS_KEY: &str = "attachments";
 
@@ -49,6 +59,23 @@ const ATTACHED_KEY: &str = "attached";
 
 /// The key the gateway writes its own fixed refusal sentence under.
 const ATTACHMENT_NOTE_KEY: &str = "attachmentNote";
+
+/// One binary attachment a capability result offered, as it arrives on the wire.
+///
+/// Deliberately this crate's own type rather than one imported from the provider SDK. A provider
+/// ships from its own repository against its own pinned SDK version, so what the two sides actually
+/// share is the **JSON shape**, not a Rust type — and depending on the SDK here would compile its
+/// source into this tree's provider fixtures and pull `wit-bindgen` into the gateway's dependency
+/// graph for two string fields. `docs/development.md` and the SDK's README document the schema; this
+/// is the reader, and `deny_unknown_fields` is what keeps the two honest about it.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ResultAttachment {
+    /// IANA media type of the decoded bytes, such as `image/png`.
+    media_type: String,
+    /// Standard base64 encoding of the bytes themselves.
+    base64: String,
+}
 
 /// One bounded PNG, held only until the embedding chat transport accepts it.
 ///
@@ -263,7 +290,7 @@ pub fn strip_attachments(
     match slot {
         None => refusals.push(AttachmentRefusal::RouteDisabled),
         Some(slot) => {
-            match serde_json::from_value::<Vec<dekopon_provider_sdk::ResultAttachment>>(offered) {
+            match serde_json::from_value::<Vec<ResultAttachment>>(offered) {
                 // The shape is the provider's claim, not a host contract, so a result that used the
                 // reserved key for something else is one refusal rather than a failed invocation.
                 Err(_shape) => refusals.push(AttachmentRefusal::InvalidEncoding),
@@ -294,7 +321,7 @@ pub fn strip_attachments(
 /// Validates one offered attachment and stores it, answering with its delivered byte count.
 fn accept(
     slot: &ReplyAttachments,
-    attachment: &dekopon_provider_sdk::ResultAttachment,
+    attachment: &ResultAttachment,
 ) -> Result<usize, AttachmentRefusal> {
     if attachment.media_type != ATTACHMENT_MEDIA_TYPE {
         return Err(AttachmentRefusal::UnsupportedMedia);
@@ -330,6 +357,11 @@ pub enum ChatAssetRefusal {
     /// This invocation already expanded [`MAX_CHAT_ASSET_INPUTS`] markers.
     #[error("one invocation may expand at most {MAX_CHAT_ASSET_INPUTS} chat attachments")]
     PerInvocationLimit,
+    /// This session already expanded [`MAX_CHAT_ASSET_EXPANSIONS_PER_SESSION`] markers.
+    #[error(
+        "one session may expand at most {MAX_CHAT_ASSET_EXPANSIONS_PER_SESSION} chat attachments"
+    )]
+    SessionLimit,
     /// The expansions together would exceed [`MAX_CHAT_ASSET_INPUT_BYTES`].
     #[error("the expanded attachments exceeded the per-invocation byte budget")]
     ByteBudget,
@@ -346,27 +378,36 @@ impl ChatAssetRefusal {
             Self::UnknownAsset => "unknown-asset",
             Self::UnsupportedMedia => "unsupported-media",
             Self::PerInvocationLimit => "per-invocation-limit",
+            Self::SessionLimit => "session-limit",
             Self::ByteBudget => "byte-budget",
             Self::Unavailable => "unavailable",
         }
     }
 
-    /// The fixed gateway-authored sentence the model reads instead of a proposal.
+    /// The fixed gateway-authored clause the model reads instead of a proposal.
+    ///
+    /// Deliberately a clause rather than a whole sentence: the caller prefixes it with who refused,
+    /// so these do not repeat the attribution. A reader has to be able to tell this apart from a
+    /// broker policy denial, which the interpreter reports at the same exit status.
     #[must_use]
     pub const fn note(&self) -> &'static str {
         match self {
             Self::UnknownAsset => {
-                "the gateway found no chat attachment with that number; the reference lines in the \
-                 conversation name the ones there are"
+                "no chat attachment in this conversation carries that number, and the reference \
+                 lines above name the ones there are"
             }
-            Self::UnsupportedMedia => "the gateway passes only image attachments to a capability",
+            Self::UnsupportedMedia => "only image attachments may be passed to a capability",
             Self::PerInvocationLimit => {
-                "the gateway passes at most three chat attachments to one call; split the work"
+                "at most three chat attachments may be passed to one call, so split the work"
+            }
+            Self::SessionLimit => {
+                "this session has already passed its limit of twelve chat attachments to \
+                 capabilities, so answer with what you have"
             }
             Self::ByteBudget => {
                 "the chat attachments named in this call are together too large for one call"
             }
-            Self::Unavailable => "the gateway could not read that chat attachment's bytes",
+            Self::Unavailable => "that chat attachment's bytes could not be read",
         }
     }
 }
@@ -397,6 +438,12 @@ pub trait ChatAssetSource: Send + Sync {
 pub struct ChatAssetInputs {
     source: Arc<dyn ChatAssetSource>,
     capabilities: Vec<String>,
+    /// Expansions this session has already made, across every invocation.
+    ///
+    /// Lives here rather than in [`ExpansionBudget`] because the leg holding it is the session: one
+    /// `ChatAssetInputs` serves every script a session runs, so this counter is the only place a
+    /// bound on the whole session can be enforced.
+    spent: Mutex<usize>,
 }
 
 impl ChatAssetInputs {
@@ -411,6 +458,7 @@ impl ChatAssetInputs {
         Self {
             source,
             capabilities,
+            spent: Mutex::new(0),
         }
     }
 
@@ -418,6 +466,24 @@ impl ChatAssetInputs {
     #[must_use]
     pub fn covers(&self, capability: &str) -> bool {
         self.capabilities.iter().any(|listed| listed == capability)
+    }
+
+    /// Claims one of this session's expansions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatAssetRefusal::SessionLimit`] once the session has spent
+    /// [`MAX_CHAT_ASSET_EXPANSIONS_PER_SESSION`].
+    fn spend_session_allowance(&self) -> Result<(), ChatAssetRefusal> {
+        let mut spent = self
+            .spent
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *spent >= MAX_CHAT_ASSET_EXPANSIONS_PER_SESSION {
+            return Err(ChatAssetRefusal::SessionLimit);
+        }
+        *spent += 1;
+        Ok(())
     }
 
     /// Expands every marker in one invocation's input, under this invocation's own budget.
@@ -464,6 +530,9 @@ impl ChatAssetInputs {
         if budget.expanded >= MAX_CHAT_ASSET_INPUTS {
             return Err(ChatAssetRefusal::PerInvocationLimit);
         }
+        // Spent immediately before the download rather than after a successful expansion: the cost
+        // this bounds is the transport fetch, which a later media or byte refusal does not undo.
+        self.spend_session_allowance()?;
         let (mime, data) = self.source.fetch_for_capability(id)?;
         if !mime.starts_with("image/") {
             return Err(ChatAssetRefusal::UnsupportedMedia);
@@ -513,7 +582,8 @@ mod tests {
 
     use super::{
         AttachmentRefusal, ChatAssetInputs, ChatAssetRefusal, GeneratedImage, MAX_ATTACHMENT_BYTES,
-        MAX_CHAT_ASSET_INPUT_BYTES, ReplyAttachments, chat_asset_marker, strip_attachments,
+        MAX_CHAT_ASSET_EXPANSIONS_PER_SESSION, MAX_CHAT_ASSET_INPUT_BYTES, ReplyAttachments,
+        chat_asset_marker, strip_attachments,
     };
 
     fn png() -> Vec<u8> {
@@ -657,6 +727,69 @@ mod tests {
                 .expand(&mut two)
                 .expect_err("over the byte budget"),
             ChatAssetRefusal::ByteBudget
+        );
+    }
+
+    /// Expansion happens before the broker decides, so the per-invocation bound alone would let a
+    /// script pull three attachments per proposal for as many proposals as its capability budget
+    /// allows — even if policy denied every one of them.
+    #[test]
+    fn the_session_ceiling_holds_across_invocations() {
+        let inputs = ChatAssetInputs::new(
+            Arc::new(FixedAssets {
+                mime: "image/png",
+                bytes: 3,
+            }),
+            vec!["gpt-image.edit".to_owned()],
+        );
+
+        // Four full invocations spend the session's twelve.
+        for invocation in 0..4 {
+            let mut input = json!(["chat-asset:1", "chat-asset:2", "chat-asset:3"]);
+            assert_eq!(
+                inputs.expand(&mut input).expect("three expansions"),
+                3,
+                "invocation {invocation}"
+            );
+        }
+
+        let mut thirteenth = json!(["chat-asset:1"]);
+        assert_eq!(
+            inputs
+                .expand(&mut thirteenth)
+                .expect_err("the session allowance is spent"),
+            ChatAssetRefusal::SessionLimit
+        );
+        assert_eq!(
+            thirteenth[0], "chat-asset:1",
+            "a refused invocation leaves its input unexpanded"
+        );
+    }
+
+    /// The fetch is what the session bound exists to limit, so a download refused for its media type
+    /// still counts: the bytes already came off the chat service.
+    #[test]
+    fn a_refused_expansion_still_spends_the_session_allowance() {
+        let inputs = ChatAssetInputs::new(
+            Arc::new(FixedAssets {
+                mime: "application/pdf",
+                bytes: 3,
+            }),
+            vec!["gpt-image.edit".to_owned()],
+        );
+        for _ in 0..MAX_CHAT_ASSET_EXPANSIONS_PER_SESSION {
+            let mut input = json!(["chat-asset:1"]);
+            assert_eq!(
+                inputs.expand(&mut input).expect_err("not an image"),
+                ChatAssetRefusal::UnsupportedMedia
+            );
+        }
+        let mut input = json!(["chat-asset:1"]);
+        assert_eq!(
+            inputs
+                .expand(&mut input)
+                .expect_err("the allowance is spent"),
+            ChatAssetRefusal::SessionLimit
         );
     }
 

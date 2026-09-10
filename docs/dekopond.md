@@ -223,11 +223,15 @@ Each direction is an owner-authored route opt-in, because each is new reach.
 - **In: `chatAssetInputs: [<capability id>, …]`.** A capability input may name one of this
   conversation's own attachments as the exact string `chat-asset:<N>`, the number from its
   `Chat Asset #N` reference line. For a listed capability the leg replaces each marker with
-  `data:<mime>;base64,<bytes>` before the proposal is submitted, under a per-invocation budget of
-  three expansions and 8.5 MiB decoded; image media types only. That budget is separate from the
-  model's own four `fetch_chat_asset` calls, so a remix cannot exhaust the agent's ability to read
-  its own conversation. A capability *not* listed keeps the string verbatim and decides for itself.
-  Unknown identifiers in the list are a startup failure naming each one.
+  `data:<mime>;base64,<bytes>` before the proposal is submitted; image media types only. Three bounds
+  apply together: at most **three expansions per invocation**, at most **8.5 MiB decoded per
+  invocation**, and at most **twelve expansions per session** across every invocation it proposes.
+  The session bound exists because expansion happens *before* the broker authorizes anything — without
+  it a script could spend its whole capability budget proposing a listed capability and pull three
+  attachments off the chat service on each one, even if policy denied every call. All three are
+  separate from the model's own four `fetch_chat_asset` calls, so a remix cannot exhaust the agent's
+  ability to read its own conversation. A capability *not* listed keeps the string verbatim and
+  decides for itself. Unknown identifiers in the list are a startup failure naming each one.
 
 Neither direction can fail a script. A refused attachment leaves `attached: []` (or the entries that
 were accepted) plus one fixed gateway sentence the model reads, and the cause is audited once as

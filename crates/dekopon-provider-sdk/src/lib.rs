@@ -265,32 +265,6 @@ pub struct ComponentFailure {
     pub message: String,
 }
 
-/// One binary attachment a capability result may carry out of band.
-///
-/// Every value crossing the provider boundary is a JSON string, so bytes travel base64-encoded.
-/// Printing such a string into the sandboxed shell would clamp a multi-megabyte blob into the model
-/// transcript, which is why this is a *convention about where bytes go* rather than a field a
-/// provider fills in for the model to read:
-///
-/// A capability result object may carry a top-level `attachments` key holding a list of these. An
-/// embedding gateway that supports the convention **strips that key before the result reaches the
-/// shell**, validates each entry against its own byte and media bounds, delivers the accepted bytes
-/// out of band (a chat transport upload, for example), and replaces the key with metadata only. A
-/// host that does not support it leaves the result alone; a provider must therefore treat the
-/// attachment as a delivery request rather than as a guaranteed effect, and keep everything the
-/// model needs to reason about in the ordinary result fields beside it.
-///
-/// `attachments` is reserved for this shape on every capability: a result using the key for
-/// anything else is liable to be stripped.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct ResultAttachment {
-    /// IANA media type of the decoded bytes, such as `image/png`.
-    pub media_type: String,
-    /// Standard base64 encoding of the bytes themselves.
-    pub base64: String,
-}
-
 /// JSON result of a command-word rewrite, returned across the WIT boundary.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "outcome", rename_all = "camelCase", deny_unknown_fields)]

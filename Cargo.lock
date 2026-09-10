@@ -805,7 +805,6 @@ dependencies = [
  "dekopon-core",
  "dekopon-model",
  "dekopon-process",
- "dekopon-provider-sdk",
  "dekopon-shell",
  "dekopon-telemetry",
  "rustix",

@@ -132,19 +132,20 @@ All notable changes to Dekopon are documented here. The format is based on
 - Added two gateway conventions that carry bytes between a capability and a chat conversation
   without putting them in the model transcript, each an owner-authored route opt-in. `routes[].providerAttachments.maxPerReply`
   lets a session deliver the attachments an authorized capability produced: a successful result's
-  reserved top-level `attachments: [{mediaType, base64}]` (now `dekopon_provider_sdk::ResultAttachment`)
-  is stripped by the session's broker leg, each entry validated as a PNG of at most 8 MiB against
+  reserved top-level `attachments: [{mediaType, base64}]` is stripped by the session's broker leg, each entry validated as a PNG of at most 8 MiB against
   the per-reply ceiling, and the key replaced with `attached: [{mediaType, bytes}]` so the shell and
   the model see metadata only. `routes[].chatAssetInputs` lists the capabilities whose input may name
   one of the conversation's own attachments as `chat-asset:<N>`; the leg expands each marker to a
-  `data:<mime>;base64,…` URL before the proposal is submitted, under a per-invocation budget of three
-  expansions and 8.5 MiB decoded that is separate from the model's own `fetch_chat_asset` allowance.
-  Image media types only, both ways. A capability absent from `chatAssetInputs` keeps such a string
+  `data:<mime>;base64,…` URL before the proposal is submitted, under three bounds that are all
+  separate from the model's own `fetch_chat_asset` allowance: three expansions and 8.5 MiB decoded per
+  invocation, and twelve expansions per session, since expansion happens before the broker authorizes
+  anything. Image media types only, both ways. A capability absent from `chatAssetInputs` keeps such a string
   verbatim and decides for itself. Refusals never fail a script: the result carries `attached: []`
   plus one fixed gateway sentence, and the cause is audited as `agent.provider_attachment.refused`
   (`route-disabled`, `invalid-encoding`, `unsupported-media`, `too-large`, `per-reply-limit`) or
   `agent.chat_asset_input.refused` (`unknown-asset`, `unsupported-media`, `per-invocation-limit`,
-  `byte-budget`, `unavailable`). Attachment bytes never enter model messages, conversation history,
+  `session-limit`, `byte-budget`, `unavailable`); a refused marker submits no proposal and the model
+  reads that the *gateway* refused before the broker saw anything. Attachment bytes never enter model messages, conversation history,
   telemetry payloads, broker protocol, evidence, or audit.
 
 ### Changed
@@ -170,8 +171,9 @@ All notable changes to Dekopon are documented here. The format is based on
   `images` array carries them all. A text-only reply is byte-identical on every transport, and
   WhatsApp still refuses an attachment it has no media upload for. `GeneratedImage::filename` now
   takes the attachment's position in the reply, so two files in one reply do not arrive under one
-  name. `dekopon-agent` gains a `dekopon-provider-sdk` dependency (one definition of the
-  `attachments` result shape, already in its tree through `dekopon-broker-protocol`) and `base64`.
+  name. `dekopon-agent` reads the `attachments` result shape through a private type of its own — the
+  convention is a documented JSON schema rather than a shared Rust type, since a provider ships from
+  its own repository against its own pinned SDK version — and gains a `base64` dependency.
 
 - The broker protocol gains `runCommand` (`BrokerRequest::RunCommand`, with an optional `stdin`),
   answered by `BrokerResponse::CommandRun` carrying the guest's own `CommandRunOutcome` — a

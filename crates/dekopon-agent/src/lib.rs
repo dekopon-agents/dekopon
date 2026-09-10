@@ -733,9 +733,19 @@ impl CapabilityInvoker for BrokerLeg {
         // command word's `run-command` proposal arrives here after the interpreter checked the grant.
         let input = match self.expanded(capability, input) {
             Ok(input) => input,
+            // A refusal here is permanent and the call never happened, which is the interpreter's
+            // `Denied` — exit 126, its one non-retryable status — rather than a `Failed` the model
+            // would retry. The interpreter renders it as `<capability>: denied: <reason>`, the same
+            // shape a *policy* denial takes, so the reason says outright that the gateway refused
+            // before the broker saw anything. There is deliberately no broker audit record: no
+            // proposal was submitted, and the gateway's own `agent.chat_asset_input.refused` above
+            // is the record of it.
             Err(refusal) => {
                 return CapabilityCallResult::Denied {
-                    reason: format!("this call was not submitted: {}", refusal.note()),
+                    reason: format!(
+                        "the gateway refused this call before it reached the broker: {}",
+                        refusal.note()
+                    ),
                 };
             }
         };
@@ -1730,9 +1740,14 @@ mod tests {
             else {
                 panic!("an unknown attachment number is a refusal, not a failed call");
             };
-            assert!(reason.contains("was not submitted"), "{reason}");
+            // The interpreter prints this as `<capability>: denied: <reason>`, which a policy
+            // denial also takes, so the text has to say which side refused.
             assert!(
-                reason.contains("no chat attachment with that number"),
+                reason.contains("the gateway refused this call before it reached the broker"),
+                "{reason}"
+            );
+            assert!(
+                reason.contains("no chat attachment in this conversation carries that number"),
                 "{reason}"
             );
             assert!(

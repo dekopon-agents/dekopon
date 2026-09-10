@@ -23,8 +23,6 @@ dekopon-process.workspace = true
 dekopon-config.workspace = true
 dekopon-core.workspace = true
 dekopon-model.workspace = true
-# One definition of the `attachments` result convention, shared with the providers that write it.
-dekopon-provider-sdk.workspace = true
 dekopon-shell.workspace = true
 dekopon-telemetry.workspace = true
 serde.workspace = true
