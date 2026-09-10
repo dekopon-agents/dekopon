@@ -77,10 +77,10 @@ impl StorageHandle {
             if !exists {
                 self.charge_write(0)?;
                 let identity = self.allocate_file_identity()?;
-                let planned = self.reserve_candidate(&[(&token, Some(&[]))])?;
+                let planned = self.reserve_candidate(&[(&token, Some(0))])?;
                 self.write_direct(&token, Some(&[]), planned)?;
-                let entry = self.entries.get_mut(&token).expect("loaded entry");
-                entry.data = Some(Vec::new());
+                let entry = self.entries.get_mut(&token).expect("resolved entry");
+                entry.present(0);
                 entry.identity = identity;
             }
             self.handles.insert(
@@ -128,14 +128,12 @@ impl StorageHandle {
         {
             let planned = self.reserve_candidate(&[(&state.token, None)])?;
             self.write_direct(&state.token, None, planned)?;
-            let entry = self
-                .entries
+            self.entries
                 .get_mut(&state.token)
                 .ok_or(StorageHostError::Corrupt {
                     scope: "handle-entry",
-                })?;
-            entry.data = None;
-            entry.identity = 0;
+                })?
+                .absent();
             self.pending_delete.remove(&state.token);
         }
         Ok(())
@@ -202,56 +200,31 @@ impl StorageHandle {
         if !state.write {
             return Err(StorageHostError::PermissionDenied);
         }
-        self.load_token(&state.token)?;
+        // Stat-derived length: a positional write never reads, allocates, or rewrites the bytes it
+        // is not replacing, so the file's own size is the only thing this call needs to know.
         let current_length = self
             .entries
             .get(&state.token)
-            .and_then(|entry| entry.data.as_ref())
-            .map(Vec::len)
+            .and_then(crate::handle::FileEntry::size)
             .ok_or(StorageHostError::NotFound)?;
-        #[allow(
-            clippy::map_err_ignore,
-            reason = "TryFromIntError carries only out-of-range for a guest-supplied offset, which \
-                      InvalidArgument already states"
-        )]
-        let start = usize::try_from(offset).map_err(|_| StorageHostError::InvalidArgument)?;
-        let end = start
-            .checked_add(bytes.len())
+        let end = offset
+            .checked_add(bytes.len() as u64)
             .ok_or(StorageHostError::Arithmetic)?;
-        let logical_write = end.saturating_sub(current_length).max(bytes.len()) as u64;
+        // A sparse gap is logical growth the namespace pays for, and a rewrite in place still
+        // charges the bytes it supplied.
+        let logical_write = end.saturating_sub(current_length).max(bytes.len() as u64);
         self.charge_write(logical_write)?;
-        let mut replacement = self
-            .entries
-            .get_mut(&state.token)
-            .expect("open entry")
-            .data
-            .take()
-            .expect("loaded existing file");
-        let overlap_end = end.min(current_length);
-        let overwritten = (start < overlap_end).then(|| replacement[start..overlap_end].to_vec());
-        if replacement.len() < end {
-            replacement.resize(end, 0);
-        }
-        replacement[start..end].copy_from_slice(bytes);
-        let reserved = self.reserve_candidate(&[(&state.token, Some(replacement.as_slice()))]);
-        let planned = match reserved {
-            Ok(planned) => planned,
-            Err(error) => {
-                if let Some(overwritten) = overwritten {
-                    replacement[start..overlap_end].copy_from_slice(&overwritten);
-                }
-                replacement.truncate(current_length);
-                self.entries.get_mut(&state.token).expect("open entry").data = Some(replacement);
-                return Err(error);
-            }
-        };
+        let resulting_length = current_length.max(end);
+        let planned = self.reserve_candidate(&[(&state.token, Some(resulting_length))])?;
         if bytes.is_empty() && end > current_length {
-            self.truncate_direct(&state.token, end as u64, planned)?;
+            self.truncate_direct(&state.token, end, planned)?;
         } else {
             self.write_range(&state.token, offset, bytes, planned)?;
         }
-        let entry = self.entries.get_mut(&state.token).expect("open entry");
-        entry.data = Some(replacement);
+        self.entries
+            .get_mut(&state.token)
+            .expect("open entry")
+            .present(resulting_length);
         Ok(())
     }
 
@@ -279,49 +252,21 @@ impl StorageHandle {
         if !state.write {
             return Err(StorageHostError::PermissionDenied);
         }
-        #[allow(
-            clippy::map_err_ignore,
-            reason = "TryFromIntError carries only out-of-range, and a truncate target above usize \
-                      is above every configured ceiling, which QuotaExceeded already states"
-        )]
-        let target = usize::try_from(size).map_err(|_| StorageHostError::QuotaExceeded)?;
-        self.load_token(&state.token)?;
         let current_length = self
             .entries
             .get(&state.token)
-            .and_then(|entry| entry.data.as_ref())
-            .map(Vec::len)
+            .and_then(crate::handle::FileEntry::size)
             .ok_or(StorageHostError::NotFound)?;
-        let growth = target.saturating_sub(current_length) as u64;
+        // Growing truncate is logical growth; shrinking charges nothing but still reserves, so the
+        // released bytes reach the ledger.
+        let growth = size.saturating_sub(current_length);
         self.charge_write(growth)?;
-        let mut replacement = self
-            .entries
+        let planned = self.reserve_candidate(&[(&state.token, Some(size))])?;
+        self.truncate_direct(&state.token, size, planned)?;
+        self.entries
             .get_mut(&state.token)
             .expect("open entry")
-            .data
-            .take()
-            .expect("loaded existing file");
-        if target > current_length {
-            replacement.resize(target, 0);
-        }
-        let candidate = &replacement[..target.min(current_length)];
-        let result = if target > current_length {
-            self.reserve_candidate(&[(&state.token, Some(replacement.as_slice()))])
-        } else {
-            self.reserve_candidate(&[(&state.token, Some(candidate))])
-        };
-        let planned = match result {
-            Ok(planned) => planned,
-            Err(error) => {
-                replacement.truncate(current_length);
-                self.entries.get_mut(&state.token).expect("open entry").data = Some(replacement);
-                return Err(error);
-            }
-        };
-        replacement.resize(target, 0);
-        self.truncate_direct(&state.token, size, planned)?;
-        let entry = self.entries.get_mut(&state.token).expect("open entry");
-        entry.data = Some(replacement);
+            .present(size);
         Ok(())
     }
 
@@ -350,18 +295,19 @@ impl StorageHandle {
         self.require_vfs()?;
         self.note_call()?;
         self.charge_write(0)?;
-        let token = self.ensure_loaded(name)?;
+        let token = self.ensure_entry(name)?;
         if self.handles.values().any(|handle| handle.token == token) {
             return Err(StorageHostError::Busy);
         }
-        if self.entries[&token].data.is_none() {
+        if !self.entries[&token].exists() {
             return Err(StorageHostError::NotFound);
         }
         let planned = self.reserve_candidate(&[(&token, None)])?;
         self.write_direct(&token, None, planned)?;
-        let entry = self.entries.get_mut(&token).expect("loaded entry");
-        entry.data = None;
-        entry.identity = 0;
+        self.entries
+            .get_mut(&token)
+            .expect("resolved entry")
+            .absent();
         Ok(())
     }
 
@@ -375,8 +321,8 @@ impl StorageHandle {
         self.require_vfs()?;
         self.note_call()?;
         self.charge_write(0)?;
-        let from_token = self.ensure_loaded(from)?;
-        let to_token = self.ensure_loaded(to)?;
+        let from_token = self.ensure_entry(from)?;
+        let to_token = self.ensure_entry(to)?;
         if from_token == to_token {
             return Ok(());
         }
@@ -387,47 +333,29 @@ impl StorageHandle {
         {
             return Err(StorageHostError::Busy);
         }
-        if self.entries[&from_token].data.is_none() {
-            return Err(StorageHostError::NotFound);
-        }
-        if !replace && self.entries[&to_token].data.is_some() {
+        // The directory entry moves, not the bytes: the source's stat-derived length is exactly
+        // what the target ends up holding.
+        let length = self.entries[&from_token]
+            .size()
+            .ok_or(StorageHostError::NotFound)?;
+        if !replace && self.entries[&to_token].exists() {
             return Err(StorageHostError::AlreadyExists);
         }
         let identity = self.entries[&from_token].identity;
-        let source = self
-            .entries
-            .get_mut(&from_token)
-            .expect("loaded source")
-            .data
-            .take()
-            .expect("source existence checked");
-        let reserved =
-            self.reserve_candidate(&[(&from_token, None), (&to_token, Some(source.as_slice()))]);
-        let planned = match reserved {
-            Ok(planned) => planned,
-            Err(error) => {
-                self.entries
-                    .get_mut(&from_token)
-                    .expect("loaded source")
-                    .data = Some(source);
-                return Err(error);
-            }
-        };
+        let planned = self.reserve_candidate(&[(&from_token, None), (&to_token, Some(length))])?;
         let renamed = self.namespace.data_directory.rename_to(
             &from_token,
             &self.namespace.data_directory,
             &to_token,
         );
         self.after_mutation(renamed, planned)?;
-        {
-            let entry = self.entries.get_mut(&from_token).expect("loaded source");
-            entry.identity = 0;
-        }
-        {
-            let entry = self.entries.get_mut(&to_token).expect("loaded target");
-            entry.data = Some(source);
-            entry.identity = identity;
-        }
+        self.entries
+            .get_mut(&from_token)
+            .expect("renamed source")
+            .absent();
+        let target = self.entries.get_mut(&to_token).expect("renamed target");
+        target.present(length);
+        target.identity = identity;
         Ok(())
     }
 

@@ -174,6 +174,17 @@ All notable changes to Dekopon are documented here. The format is based on
 ### Changed
 
 - Provider storage applies writes per host call through a direct invocation handle, with namespace, key, quota and private-file isolation retained. Failed invocations can leave completed writes; there is no invocation rollback, crash recovery or automatic generation collection.
+- Durable files are sized by `statat` instead of a full-file in-memory mirror. A positional write,
+  truncate, remove, or rename no longer loads the file it changes, which redefines what
+  `maxReadBytesPerInvocation` bounds: the bytes an invocation pulls into memory — each positional
+  read or JSONL chunk charges the length it requests, and a JSONL append or replacement charges the
+  one working copy it loads — while durable-file mutations charge it nothing and stay bounded by the
+  write budgets, `maxFileBytes`, and `maxNamespaceBytes`. Before this, a durable-files invocation
+  that touched a 16 MiB SQLite database exhausted the default 16 MiB read budget on the first write,
+  before the guest read a byte; a database larger than that budget is now writable, truncatable,
+  renameable, and removable under it. Nothing needs lowering at upgrade: the ceiling on bytes
+  reaching a guest is unchanged and the host's own peak allocation per invocation falls, so this
+  release adds no `docs/upgrading.md` step.
 - OTLP smoke CI exercises a real broker/gateway local turn with a stub model and authorized provider. Daemon JSON stdout includes valid active native trace/span IDs; smoke-only shipping verifies independent remote correlation and redaction without a production log exporter.
 - `dekopon-brokerd probe --socket <path>` performs a bounded owner-authenticated health check; chart broker probes use it without loading credentials or telemetry.
 - The ChatGPT subscription client sends `user-agent: dekopon/<version>` on every model request;

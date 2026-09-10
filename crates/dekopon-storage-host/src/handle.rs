@@ -16,31 +16,54 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+/// One logical file's live presence and length for this invocation.
+///
+/// Presence and length are stat-derived when the file is first named and moved by each mutation
+/// this invocation applies; no path reads a file to learn how long it is. `data` is the JSONL
+/// append/replace working copy — that path builds the next contents from the previous ones — and
+/// is the only thing charged against the invocation load ceiling.
 #[derive(Clone, Debug)]
 pub(crate) struct FileEntry {
-    /// Bounded working bytes. `None` means absent only when `loaded` is true.
+    /// Bounded working bytes, authoritative only while `loaded` is true.
     pub(crate) data: Option<Vec<u8>>,
-    pub(crate) disk_exists: bool,
-    pub(crate) disk_size: u64,
     pub(crate) loaded: bool,
+    exists: bool,
+    size: u64,
     pub(crate) identity: u64,
 }
 
 impl FileEntry {
-    pub(crate) fn exists(&self) -> bool {
-        if self.loaded {
-            self.data.is_some()
-        } else {
-            self.disk_exists
-        }
+    pub(crate) const fn exists(&self) -> bool {
+        self.exists
     }
 
     pub(crate) fn size(&self) -> Option<u64> {
-        if self.loaded {
-            self.data.as_ref().map(|bytes| bytes.len() as u64)
-        } else {
-            self.disk_exists.then_some(self.disk_size)
-        }
+        self.exists.then_some(self.size)
+    }
+
+    /// Records the length a completed mutation left, which the working copy no longer mirrors.
+    pub(crate) fn present(&mut self, size: u64) {
+        self.exists = true;
+        self.size = size;
+        self.data = None;
+        self.loaded = false;
+    }
+
+    /// Records the contents a completed JSONL mutation wrote, retained as the working copy.
+    pub(crate) fn mirrored(&mut self, bytes: Vec<u8>) {
+        self.exists = true;
+        self.size = bytes.len() as u64;
+        self.data = Some(bytes);
+        self.loaded = true;
+    }
+
+    /// Records that a completed mutation removed the file, ending its identity.
+    pub(crate) fn absent(&mut self) {
+        self.exists = false;
+        self.size = 0;
+        self.identity = 0;
+        self.data = None;
+        self.loaded = true;
     }
 }
 
@@ -98,7 +121,7 @@ pub struct StorageHandle {
     pub(crate) next_file_identity: u64,
     pub(crate) host_calls: u64,
     pub(crate) read_bytes: u64,
-    // Successful original-file loads only; writes have their own budget. Never refunded.
+    // Successful JSONL working-copy loads only; writes have their own budget. Never refunded.
     native_loaded_bytes: u64,
     pub(crate) write_bytes: u64,
     pub(crate) entropy_bytes: u64,
@@ -315,12 +338,13 @@ impl StorageHandle {
         ))
     }
 
-    /// Loads only trusted metadata. Size/stat calls therefore cannot allocate the complete file.
+    /// Loads only trusted metadata. Size, stat, and every durable-file mutation therefore cannot
+    /// allocate the complete file.
     pub(crate) fn ensure_entry(&mut self, name: &str) -> Result<String, StorageHostError> {
         let token = self.logical_token(name)?;
         if !self.entries.contains_key(&token) {
             let metadata = self.namespace.data_directory.metadata(&token)?;
-            let (disk_exists, disk_size) = match metadata {
+            let (exists, size) = match metadata {
                 Some(metadata)
                     if metadata.kind == EntryKind::File
                         && metadata.nlink == 1
@@ -336,7 +360,7 @@ impl StorageHandle {
                 }
                 None => (false, 0),
             };
-            let identity = if disk_exists {
+            let identity = if exists {
                 self.allocate_file_identity()?
             } else {
                 0
@@ -345,9 +369,9 @@ impl StorageHandle {
                 token.clone(),
                 FileEntry {
                     data: None,
-                    disk_exists,
-                    disk_size,
-                    loaded: !disk_exists,
+                    loaded: !exists,
+                    exists,
+                    size,
                     identity,
                 },
             );
@@ -370,7 +394,7 @@ impl StorageHandle {
         }
         let loaded = self
             .native_loaded_bytes
-            .checked_add(entry.disk_size)
+            .checked_add(entry.size)
             .ok_or(StorageHostError::Arithmetic)?;
         if loaded > self.limits.max_read_bytes_per_invocation {
             self.note_quota_denial();
@@ -380,7 +404,7 @@ impl StorageHandle {
             .namespace
             .data_directory
             .read_bounded(token, self.limits.max_file_bytes)?;
-        if bytes.len() as u64 != entry.disk_size {
+        if bytes.len() as u64 != entry.size {
             return Err(StorageHostError::Corrupt {
                 scope: "logical-size-race",
             });
@@ -401,28 +425,30 @@ impl StorageHandle {
         Ok(identity)
     }
 
-    // Reserve growth before touching private data, including concurrent root users.
+    // Reserve growth before touching private data, including concurrent root users. Each change
+    // names the length its file ends at, never its contents: a positional write knows that length
+    // from the file's stat-derived size and never assembles the whole file to measure it.
     pub(crate) fn reserve_candidate(
         &mut self,
-        changes: &[(&str, Option<&[u8]>)],
+        changes: &[(&str, Option<u64>)],
     ) -> Result<PlannedMutation, StorageHostError> {
         let mut files = self.baseline_files.clone();
         let mut growth = 0u64;
         let mut entries = 0u64;
         let mut planned = Vec::with_capacity(changes.len());
-        for (token, data) in changes {
+        for (token, length) in changes {
             let before = self
                 .namespace
                 .data_directory
                 .metadata(token)?
                 .map(|metadata| metadata.len);
-            let after = match data {
-                Some(data) => {
-                    if data.len() as u64 > self.limits.max_file_bytes {
+            let after = match *length {
+                Some(length) => {
+                    if length > self.limits.max_file_bytes {
                         return Err(StorageHostError::QuotaExceeded);
                     }
                     files.insert((*token).to_owned());
-                    let added = (data.len() as u64).saturating_sub(before.unwrap_or(0));
+                    let added = length.saturating_sub(before.unwrap_or(0));
                     growth = growth
                         .checked_add(added)
                         .ok_or(StorageHostError::Arithmetic)?;
@@ -432,7 +458,7 @@ impl StorageHandle {
                             .checked_add(ENTRY_CHARGE)
                             .ok_or(StorageHostError::Arithmetic)?;
                     }
-                    Some(data.len() as u64)
+                    Some(length)
                 }
                 None => {
                     files.remove(*token);

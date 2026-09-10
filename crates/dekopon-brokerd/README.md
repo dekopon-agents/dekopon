@@ -662,6 +662,14 @@ context. `rootPath` is disjoint from every broker-owned file and provider path, 
 `namespaceKeyPath` is one no-follow, server-owned `0600`, single-link, ≤4 KiB document under safe
 ancestors. A deployment with retained data and a missing or changed key fails closed.
 
+`maxReadBytesPerInvocation` bounds what one invocation pulls into memory: each positional
+durable-file read or JSONL chunk charges the length it requests, and a JSONL append or replacement
+charges the one working copy it loads. Durable-file writes, truncates, removes, and renames charge
+it nothing — their lengths come from `statat` — and are bounded instead by `maxWriteBytesPerCall`,
+`maxWriteBytesPerInvocation`, `maxFileBytes`, and `maxNamespaceBytes`. Size a durable-files
+deployment's read ceiling for the largest result a provider reads back in one invocation, not for
+the largest database it keeps.
+
 ```yaml
 storage:
   rootPath: /var/lib/dekopon-provider-storage
