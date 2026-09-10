@@ -1,6 +1,6 @@
 # Contributing to Dekopon
 
-Dekopon is early-stage security infrastructure. Small, reviewable changes with explicit trust assumptions are preferred over speculative framework code.
+A change is judged by the three goals in the [constitution](docs/design.md#constitution); a subsystem that serves none of them is a deletion candidate. Small, reviewable changes with explicit trust assumptions beat speculative framework code.
 
 Read [`docs/design.md`](docs/design.md) before changing behavior or architecture. Then read [`docs/development.md`](docs/development.md) for the repository map, generated artifacts, separate provider workspace, validation matrix, and PR workflow. Area-specific contracts are indexed in [`docs/README.md`](docs/README.md).
 
@@ -20,7 +20,7 @@ cargo check -p dekopon-core -p dekopon-capability -p dekopon-protocol --locked
 cargo machete
 ```
 
-The fetch installs the ignored echo, JSONPlaceholder, and memory-chat fixtures that core tests read. The `cargo check` compiles the foundational crates with their opt-in `schemars` feature off, and `cargo machete` (0.9.2 is the version CI pins) detects unused dependencies. The complete gate list is in [Root workspace](docs/development.md#root-workspace).
+The fetch installs the ignored echo, JSONPlaceholder, and memory-chat fixtures that core tests read. The `cargo check` compiles the foundational crates with their opt-in `schemars` feature off. The complete gate list is in [Root workspace](docs/development.md#root-workspace).
 
 Install `cargo-deny` to run the dependency policy:
 
@@ -29,7 +29,7 @@ cargo install cargo-deny --locked
 cargo deny --all-features check
 ```
 
-For MSRV-sensitive changes run the two `cargo +1.89.0` commands in [Root workspace](docs/development.md#root-workspace) (`--no-run`, then `--doc`), which is what the required `test (Rust 1.89.0)` check runs. Run `cargo package --workspace --locked` from a clean tree when changing package metadata, crate dependencies, or include lists. Validate workflow and shell-script edits with `actionlint .github/workflows/*.yml` and `shellcheck <SCRIPT>`; CI runs shellcheck over the repository scripts (the exact file list is the `shellcheck` line in [Root workspace](docs/development.md#root-workspace)).
+For MSRV-sensitive changes run the two `cargo +1.89.0` commands in [Root workspace](docs/development.md#root-workspace) (`--no-run`, then `--doc`), which is what the required `test (Rust 1.89.0)` check runs. Run `cargo package --workspace --locked` from a clean tree when changing package metadata, crate dependencies, or include lists. Validate workflow and shell-script edits with `actionlint .github/workflows/*.yml` and `shellcheck <SCRIPT>`; the exact file list CI shellchecks is the `shellcheck` line in [Root workspace](docs/development.md#root-workspace).
 
 Documentation edits are gated too: run the duplicate-entry check below, and add every new `audit.event` name, backticked, to [`docs/observability.md`](docs/observability.md) in the same change ([details](docs/development.md#documentation-gates)).
 
@@ -65,4 +65,4 @@ The fixtures under `examples/providers/` are separate Cargo workspaces that root
 
 Pull requests require CI and human review. Automated agents must not approve their own changes. Follow the checklist in [Before opening a pull request](docs/development.md#before-opening-a-pull-request).
 
-Security vulnerabilities should follow [`SECURITY.md`](SECURITY.md), not the public issue tracker.
+Security vulnerabilities follow [`SECURITY.md`](SECURITY.md), not the public issue tracker.

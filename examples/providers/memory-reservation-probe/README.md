@@ -13,9 +13,8 @@ It is also the checked-in hand-rolled `run-command` guest, compiled against the
 argument parser: values are shifted out of argv by hand, which is the clap-free baseline the SDK's
 `Provider::run_command` contract promises. `recall --help` renders a short hand-written page on
 stdout at status 0; `recall`, alone or with any positional arguments, proposes `ordinary.escape`
-with an empty input, exactly as its legacy `resolve-command` rewrite did, so every broker
-reservation test keeps its behaviour; any other flag is declined with a `usage` error. The piped
-value is ignored. The `clap`-layer counterpart is [`cli-probe`](../cli-probe/README.md).
+with an empty input, which is what every broker reservation test drives; any other flag is
+declined with a `usage` error. The piped value is ignored. The `clap`-layer counterpart is [`cli-probe`](../cli-probe/README.md).
 
 This fixture is not packaged in the container image. Regenerate it only from source:
 

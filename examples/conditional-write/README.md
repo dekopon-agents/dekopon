@@ -55,8 +55,8 @@ $EDITOR broker-credentials.yaml          # replace the replace-me_XXXX… placeh
 
 `chmod 600` is not advice. The broker checks this file harder than its own configuration — it
 rejects group or world *readability*, not just writability — and refuses to start otherwise.
-`broker-credentials.yaml` is deliberately absent from the repository and is in `.gitignore`, so
-following this step cannot commit a secret.
+`broker-credentials.yaml` is absent from the repository and is in `.gitignore`, so following
+this step cannot commit a secret.
 
 ## 3. Adjust the placeholders
 
@@ -90,11 +90,9 @@ chmod 700 ~/.local/run/dekopon ~/.local/state/dekopon
 chmod 600 broker.yaml policies.cedar dekopond.yaml
 ```
 
-The catalog half is checkable before anything runs:
-
-The gateway loads and validates the complete typed catalog before starting transports.
-The example's cross-references and read/comment-without-approval boundary are also pinned by
-`cargo test -p dekopon-config --test examples --locked`.
+The catalog half is checked before anything runs: the gateway loads and validates the complete
+typed catalog before starting transports, and `cargo test -p dekopon-config --test examples
+--locked` pins this example's cross-references and its read/comment-without-approval boundary.
 
 ## 4. Run the broker
 
@@ -173,13 +171,12 @@ The session:
    the last place for; the operator reads the category from telemetry.
 4. **What the next message remembers.** The route is `mode: persistent` with
    `scope: privateConversation`, so this exchange is kept as one `(question, answer)` pair in the
-   gateway's memory and replayed ahead of the next message from *this sender in this conversation*
-   — which is what makes a follow-up like "and 4712?"
-   answerable. Only the question and the answer are kept: the `http-probe.fetch` output above is
-   dropped at write-back and never replayed. Nothing is written to disk, nothing reaches the broker, and
-   fifteen idle minutes or a narrowed grant drops it. Set the route to `mode: oneShot` — or leave
-   the `conversation:` block out, which means the same thing — and every message starts from an
-   empty prompt again.
+   gateway's memory and replayed ahead of the next message from *this sender in this conversation*,
+   which is what makes a follow-up like "and 4712?" answerable. Only the question and the answer
+   are kept: the `http-probe.fetch` output above is dropped at write-back and never replayed.
+   Nothing is written to disk, nothing reaches the broker, and fifteen idle minutes or a narrowed
+   grant drops it. Set the route to `mode: oneShot` — or leave the `conversation:` block out, which
+   means the same thing — and every message starts from an empty prompt again.
 
 ### The refusals worth knowing
 
@@ -193,12 +190,17 @@ component:
 | `http-failed` | the pre-read itself failed, so there is nothing to pin a write to |
 | `invalid-input` | no `uri`, which is refused without any host call at all |
 
-That is why the capability is classified `conditional` rather than `idempotent`, and why its
-constraint set allows two requests and two methods: one `GET`, then one `POST` carrying an etag
-that was true a moment ago. A retry against an unchanged record converges; a retry after someone
-else's edit refuses instead of overwriting work nobody read.
+The capability is classified `conditional` rather than `idempotent`, and its constraint set allows
+two requests and two methods: one `GET`, then one `POST` carrying an etag that was true a moment
+ago. A retry against an unchanged record converges; a retry after someone else's edit refuses
+instead of overwriting work nobody read.
+
+*Committed direction:* removed ([non-goals](../../docs/design.md#non-goals)).
 
 ## 7. What the audit log holds
+
+*Committed direction:* opt-in sink, off by default; audit is a log record in the trace
+([non-goals](../../docs/design.md#non-goals)).
 
 ```console
 tail -1 ~/.local/state/dekopon/audit.jsonl | jq .
@@ -250,7 +252,7 @@ What each part is doing:
   whole evaluated policy set, so two brokers reporting the same digest evaluated the same surface.
 - Two `http_calls` — the pre-read and the write, exactly the budget the constraint set allowed.
   `credentialInjected: true` says broker-held authority was presented; the value appears nowhere,
-  and `requestBytes` deliberately excludes the injected header so its length cannot leak either.
+  and `requestBytes` excludes the injected header so its length cannot leak either.
 - `credential: api-token` — *which* authority, by the symbolic name in `broker.yaml`. One example
   has one token, so it reads as redundant here; a deployment whose constraint set names a different
   credential per agent is one where the two organizations' writes would otherwise be identical
@@ -261,8 +263,11 @@ What each part is doing:
 Records 1 through 5 are the rest of the same session — among them a `decision` and an `execution`
 for the read, then the `decision` that allowed this write. Every identifier in the session shares
 the `trace`, and each invocation extends it with a counter, so `grep dekopond-session-9f1c4a7b0e35d268`
-recovers the whole conversation's effects. Each JSONL record contains its `sequence` ordinal
-and metadata-only `event`.
+recovers the whole conversation's effects. Each JSONL record carries its `sequence` ordinal and a
+metadata-only `event`.
+
+*Committed direction:* removed; the W3C trace id is the only correlation identifier
+([goal 2](../../docs/design.md#constitution)).
 
 ## 8. When it does not work
 
@@ -284,25 +289,21 @@ the gateway, the subject, and the reason. Both refuse; only one of them ever pro
 
 ## What this deployment does not buy yet
 
-`dekopond` and `dekopon-brokerd` run under one UID in this local walkthrough. Its attestor grant
-buys attribution and deny-by-default scoping, not OS isolation: any process running as you can
-act as the configured gateway peer. This is an example choice, not a peer-UID equality requirement.
-The chart uses broker UID 65532, gateway UID 65533 and IPC group 65534 with a broker-owned 0710
-parent and a 0660 group-reachable socket. Peer UID mapping supplies identity; group membership
-alone grants none. Owner-only local chat sockets remain 0600 and private stores remain owner-only.
-See the [current local process boundary](../../docs/security-model.md#current-local-process-boundary).
+`dekopond` and `dekopon-brokerd` run under one UID in this local walkthrough. The attestor grant
+buys attribution and deny-by-default scoping, not OS isolation: any process running as you can act
+as the configured gateway peer. That is an example choice — the chart splits the two UIDs and the
+IPC group; see the
+[current local process boundary](../../docs/security-model.md#current-local-process-boundary).
 
-This route is `mode: persistent` and explicitly pins `scope: privateConversation`, so the gateway
-replays a bounded window of earlier turns from the same authenticated sender into the next prompt.
-Nothing carries beyond that conversation: the agent has no memory that outlives it. The broader
-`sharedConversation` option is intentionally not enabled in this deployment walkthrough.
+The agent has no memory outliving the conversation's bounded window, and `sharedConversation` is
+not enabled here.
 
 ## Related
 
 - [`../slack/`](../slack/README.md) — the Slack app manifest, both tokens, and finding the `T…`/`U…` identifiers.
-- [`../providers/http-probe/`](../providers/http-probe/README.md) — the component this deployment executes, and the `http-probe.purge` it deliberately never grants.
+- [`../providers/http-probe/`](../providers/http-probe/README.md) — the component this deployment executes, and the `http-probe.purge` it never grants.
 - [`dekopon-provider-gh`](https://github.com/dekopon-agents/dekopon-provider-gh) — the same shape at nineteen capabilities, shipped from its own repository.
 - [`../../docs/dekopond.md`](../../docs/dekopond.md) — transports, routing, session bounds, and the authorization flow.
 - [`../../crates/dekopon-brokerd/README.md`](../../crates/dekopon-brokerd/README.md) — every configuration field, and the audit and shutdown contract.
-- [`../../crates/dekopon-policy/README.md`](../../crates/dekopon-policy/README.md) — what Cedar decides here and what it deliberately does not.
-- [`../catalog/dekopon.yaml`](../catalog/dekopon.yaml) — the catalog-only example, whose `reviewer` may comment and deliberately holds no approval capability.
+- [`../../crates/dekopon-policy/README.md`](../../crates/dekopon-policy/README.md) — what Cedar decides here and what it does not.
+- [`../catalog/dekopon.yaml`](../catalog/dekopon.yaml) — the catalog-only example, whose `reviewer` may comment and holds no approval capability.

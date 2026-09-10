@@ -55,10 +55,10 @@ credentials and model credentials only. Provider credentials and policy remain i
 
 Only ordinary inbound and outbound text is implemented. Media, templates, interactive messages,
 reactions, status processing, business-management APIs, embedded signup, webhook multiplexing, and
-TLS termination are out of scope. Free-form replies can still be rejected by Meta outside its
-customer-service window; Dekopon does not fall back to templates.
+TLS termination are out of scope. Meta rejects free-form replies outside its customer-service
+window; Dekopon does not fall back to templates.
 
 Webhook message-ID deduplication is bounded and process-local. A duplicate observed by one running
-process is acknowledged without a second session, but a restart forgets the set. Conversely, a
-crash after HTTP 200 and before the in-memory queue is drained can lose an accepted message. This is
-at-most-once within one process window, not durable exactly-once delivery.
+process is acknowledged without a second session; a restart forgets the set. A crash after HTTP 200
+and before the in-memory queue drains loses the accepted message. At-most-once within one process
+window, not durable exactly-once delivery.

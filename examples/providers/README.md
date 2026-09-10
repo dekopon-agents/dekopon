@@ -4,33 +4,30 @@ Dekopon core keeps only host-conformance fixtures in this directory. Providers w
 behavior, dependency graph, issues, and release cadence live in standalone repositories. Core does
 not track their source or generated Wasm.
 
-Fetch the exact v0.1.0 components needed by local workspace tests:
+Fetch the components local workspace tests need:
 
 ```console
 ci/fetch-external-provider-components.sh examples/providers
 ```
 
 The script downloads each release asset and sidecar, requires the checksum and byte length pinned
-in core, and writes ignored fixture files at the historical paths expected by tests. Set
+in core, and writes ignored fixture files at the paths tests expect. Set
 `DEKOPON_VERIFY_PROVIDER_ATTESTATIONS=1` to additionally require GitHub artifact attestations.
 These generated local files must never be committed.
 
-Standalone providers consumed at exact v0.1.0:
+Standalone providers this tree consumes at pinned releases:
 
 - [`dekopon-provider-echo`](https://github.com/dekopon-agents/dekopon-provider-echo) — import-free
-  echo and deterministic Unicode message transformations;
-  [release](https://github.com/dekopon-agents/dekopon-provider-echo/releases/tag/v0.1.0).
+  echo and deterministic Unicode message transformations.
 - [`dekopon-provider-jsonplaceholder`](https://github.com/dekopon-agents/dekopon-provider-jsonplaceholder)
-  — bounded broker HTTP read and synthetic external-write operations;
-  [release](https://github.com/dekopon-agents/dekopon-provider-jsonplaceholder/releases/tag/v0.1.0).
+  — bounded broker HTTP read and synthetic external-write operations.
 - [`dekopon-provider-memory-chat`](https://github.com/dekopon-agents/dekopon-provider-memory-chat)
-  — optional JSONL-only durable chat memory;
-  [release](https://github.com/dekopon-agents/dekopon-provider-memory-chat/releases/tag/v0.1.0).
+  — optional JSONL-only durable chat memory.
 - [`dekopon-provider-gh`](https://github.com/dekopon-agents/dekopon-provider-gh) — the
-  nineteen-capability GitHub provider fetched by image staging at its pinned release.
+  nineteen-capability GitHub provider fetched by image staging.
 - [`dekopon-provider-skylight-private`](https://github.com/dekopon-agents/dekopon-provider-skylight-private)
-  — public source for the opt-in unofficial private-API exploration; it remains unreleased,
-  unsupported, mock-only, and absent from default catalogs, images, policies, and deployments.
+  — public source for the opt-in unofficial private-API exploration: unreleased, unsupported,
+  mock-only, and absent from default catalogs, images, policies, and deployments.
 - [`dekopon-provider-turso-sql`](https://github.com/dekopon-agents/dekopon-provider-turso-sql) —
   SQLite-compatible SQL over `durable-files`, distributed outside core.
 
