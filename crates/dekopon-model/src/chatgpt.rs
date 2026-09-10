@@ -205,7 +205,7 @@ impl ChatGptCodexModel {
             .header("originator", "dekopon")
             .header(
                 "user-agent",
-                &format!("dekopon-run/{}", env!("CARGO_PKG_VERSION")),
+                &format!("dekopon/{}", env!("CARGO_PKG_VERSION")),
             )
             .header("openai-beta", "responses=experimental")
             .header("accept", "text/event-stream")
@@ -2818,6 +2818,7 @@ mod tests {
         assert!(request.contains("authorization: Bearer header."));
         assert!(request.contains("chatgpt-account-id: acct-test"));
         assert!(request.contains("originator: dekopon"));
+        assert!(request.contains(concat!("user-agent: dekopon/", env!("CARGO_PKG_VERSION"))));
     }
 
     fn export_fixture(path: &Path) {

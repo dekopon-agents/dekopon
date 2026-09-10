@@ -616,7 +616,7 @@ mod tests {
     }
 
     /// A rebuilt parent must stay byte-identical and remote, or broker spans silently start a new
-    /// trace instead of joining the runner's.
+    /// trace instead of joining the gateway's.
     #[test]
     fn remote_context_preserves_identifiers_and_marks_them_remote() {
         let parts = TraceContextParts {

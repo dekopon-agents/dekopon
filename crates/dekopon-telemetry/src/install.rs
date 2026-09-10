@@ -492,9 +492,9 @@ mod tests {
     fn an_otlp_layer_never_sees_the_exporters_own_records() {
         for directive in [
             // A caller that named only its own crates.
-            "dekopon_run=trace",
+            "dekopond=trace",
             // A caller that silenced the exporter itself; the guarantee is idempotent.
-            "dekopon_run=trace,opentelemetry=off",
+            "dekopond=trace,opentelemetry=off",
             // A caller that admitted everything. Without the appended directive this layer would
             // export every diagnostic the export itself produced.
             "trace",
@@ -506,20 +506,20 @@ mod tests {
                 tracing::error!(target: "opentelemetry", "api diagnostic");
                 tracing::error!(target: "opentelemetry-sdk", "sdk diagnostic");
                 tracing::error!(target: "opentelemetry-otlp", "exporter diagnostic");
-                tracing::info!(target: "dekopon_run", "runner event");
+                tracing::info!(target: "dekopond", "gateway event");
             });
 
             assert_eq!(
                 *recorded.0.lock().expect("target log"),
-                vec!["dekopon_run".to_owned()],
+                vec!["dekopond".to_owned()],
                 "{directive}"
             );
         }
     }
 
-    /// A process that configured no exporter still runs this on the way out — the runner without
-    /// an OTLP endpoint, the broker's offline provider mode — and must not report a failure for
-    /// having nothing to flush.
+    /// A process that configured no exporter still runs this on the way out — a daemon started
+    /// without an OTLP endpoint, the broker's offline provider mode — and must not report a failure
+    /// for having nothing to flush.
     #[test]
     fn a_guard_without_exporters_shuts_down_cleanly() {
         let guard = TelemetryGuard {

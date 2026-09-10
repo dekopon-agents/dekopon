@@ -472,7 +472,7 @@ let response = agent
     .header("authorization", "Bearer eyJ.fake-access-token.REDACTED")
     .header("chatgpt-account-id", "acct_example")
     .header("originator", "dekopon")
-    .header("user-agent", &format!("dekopon-run/{}", env!("CARGO_PKG_VERSION")))
+    .header("user-agent", &format!("dekopon/{}", env!("CARGO_PKG_VERSION")))
     .header("openai-beta", "responses=experimental")
     .header("accept", "text/event-stream")
     .send_json(&request_1)?;
