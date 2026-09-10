@@ -6,8 +6,6 @@
 - an OpenAI-compatible Chat Completions client;
 - native ChatGPT/Codex subscription device authentication, token refresh, and Responses streaming;
 - request-scoped prompt-cache routing hints plus normalized provider-reported cached-token usage;
-- a fixed-endpoint OpenAI Images client producing one signature-validated PNG under explicit prompt,
-  encoded-response, and 8 MiB decoded bounds; and
 - multimodal message content, where a message carries `ContentPart`s — text, images, documents —
   instead of a single string.
 
@@ -18,10 +16,6 @@ a summary instead, because those are what reach the prompt transcript in the aud
 writes `[image/png, 219136 bytes]` for an image and `[report.pdf (application/pdf), 219136 bytes]`
 for a file; `Debug` writes the same counts as a `bytes: 219136` field. The count is raw bytes, never
 a scaled unit.
-
-`GeneratedImage` renders only media type and byte count under `Debug`; its raw bytes are exposed
-only to the embedding delivery path. The Images client never reuses the undocumented ChatGPT/Codex
-subscription endpoint and never accepts a model-selected endpoint.
 
 The gateway executable owns account lifecycle through `dekopond auth`; execution clients such as
 external embeddings consume the resulting credentials. Model credentials are never passed to Wasm

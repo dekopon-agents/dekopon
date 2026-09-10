@@ -15,14 +15,16 @@ use std::{
 };
 
 use dekopon_agent::{
-    BrokerLeg, BrokerLegError, IdSequence, ShellRuntime, current_trace_parent,
+    BrokerLeg, BrokerLegError, IdSequence, ShellRuntime,
+    attachment::{ChatAssetInputs, ReplyAttachments},
+    current_trace_parent,
     meta::{
         AgentConfigView, ConversationConfigView, ConversationScopeView, SessionConfigView,
         SkillView,
     },
     prompt::{
-        CancellationProbe, GeneratedImageOutput, History, PromptError, ReplyDisposition,
-        SessionInputs, run_prompt_session,
+        CancellationProbe, History, PromptError, ReplyDisposition, SessionInputs,
+        run_prompt_session,
     },
 };
 use dekopon_broker_protocol::{
@@ -32,7 +34,6 @@ use dekopon_broker_protocol::{
 };
 use dekopon_model::{
     chatgpt::ChatGptCodexModel,
-    image::{ImageGenerationError, ImageGenerator, OpenAiImageGenerator},
     model::{ChatModel, CompletionOptions, ModelError, OpenAiChatModel},
 };
 use dekopon_process::{CancelHandle, CancelSignal};
@@ -45,8 +46,7 @@ use crate::{
     activity::{ActivityControl, ActivityLease},
     asset::{self, AssetAccess, AssetStore, SessionAssets},
     config::{
-        ConversationPolicy, ConversationScope, ConversationWindow, ImageGeneratorConfig,
-        ModelConfig, ResolvedBroker,
+        ConversationPolicy, ConversationScope, ConversationWindow, ModelConfig, ResolvedBroker,
     },
     conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
     routes::BoundRoute,
@@ -102,39 +102,6 @@ pub(crate) trait ModelFactory: Send + Sync {
 /// The real factory: whatever `models:` configured, constructed by the shared model library.
 pub(crate) struct ConfiguredModels;
 
-/// Builds the gateway's image generator once at startup, reading its credential only when a bound
-/// route actually opts in, and before any transport begins accepting messages.
-pub(crate) fn configured_image_generator(
-    configured: Option<&ImageGeneratorConfig>,
-    referenced: bool,
-) -> Result<Option<Arc<dyn ImageGenerator>>, ImageGeneratorStartupError> {
-    let Some(generator) = configured.filter(|_| referenced) else {
-        return Ok(None);
-    };
-    let variable = generator.api_key_env.as_str();
-    let credential = image_credential(variable, std::env::var_os(variable))?;
-    let client = OpenAiImageGenerator::new(
-        &generator.model,
-        credential,
-        std::time::Duration::from_millis(generator.timeout_ms),
-    )?;
-    Ok(Some(Arc::new(client) as Arc<dyn ImageGenerator>))
-}
-
-/// Resolves the image generator's credential, keeping which of the three problems it was.
-///
-/// Split from the environment read so the rule is reachable without a test mutating this process's
-/// environment: `set_var` is unsafe in this edition and this workspace forbids unsafe outright.
-pub(crate) fn image_credential(
-    variable: &str,
-    value: Option<std::ffi::OsString>,
-) -> Result<String, ImageGeneratorStartupError> {
-    credential_from(variable, value).map_err(|source| ImageGeneratorStartupError::Credential {
-        variable: variable.to_owned(),
-        source,
-    })
-}
-
 /// The bearer token a configured model's `apiKeyEnv` names, when it names one.
 ///
 /// Absent is not missing. A loopback llama.cpp needs no key and leaving the field out is how an
@@ -154,7 +121,8 @@ pub(crate) fn model_bearer_token(
     model_credential(model.name(), variable, std::env::var_os(variable)).map(Some)
 }
 
-/// Split from the environment read for the same reason [`image_credential`] is.
+/// Split from the environment read so the rule is reachable without a test mutating this process's
+/// environment: `set_var` is unsafe in this edition and this workspace forbids unsafe outright.
 pub(crate) fn model_credential(
     model: &str,
     variable: &str,
@@ -551,9 +519,6 @@ pub(crate) struct SessionRunner {
     pub assets: Arc<AssetStore>,
     /// How each transport turns one of those references back into bytes, by transport name.
     pub asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>>,
-    /// The gateway's model-credential image generator, built once at startup. A route reaches it
-    /// only when it explicitly opts in.
-    pub image_generator: Option<Arc<dyn ImageGenerator>>,
     /// Optional service-native in-flight activity, by transport name.
     pub activities: HashMap<String, Arc<dyn ChatActivity>>,
     /// Bounded transport-owned Slack Agent thread claims, by transport name.
@@ -780,18 +745,6 @@ async fn session(
 
     let memory_surface = leg.chat_memory_surface().cloned();
     let chat_claim = chat_claim(route, message).ok();
-    let image_generator = match (route.image_generator, runner.image_generator.as_ref()) {
-        (false, _) => None,
-        (true, Some(generator)) => Some(Arc::clone(generator)),
-        (true, None) => {
-            tracing::error!(
-                event = "gateway_session_failed",
-                category = "image-generator-unavailable"
-            );
-            answer(replier, message, FAILURE_REPLY).await;
-            return "failed";
-        }
-    };
     let model_config = Arc::clone(&route.model);
     let models = Arc::clone(&runner.models);
     let limits = route.limits;
@@ -826,14 +779,17 @@ async fn session(
         Some(ConversationScope::SharedConversation) => attributed_prompt(&message.subject, &text),
         Some(ConversationScope::PrivateConversation) | None => text,
     };
-    let assets = SessionAssets::new(
+    // Shared rather than owned by the prompt loop alone: the same reader serves the model's own
+    // attachment tool and, on a route that lists capabilities, the broker leg's marker expansion.
+    // Each spends its own budget; they share only the store, the generation fence, and the bounds.
+    let assets = Arc::new(SessionAssets::new(
         Arc::clone(&runner.assets),
         asset_access,
         runner.asset_fetchers.get(&message.transport).cloned(),
         tokio::runtime::Handle::current(),
         images_supported,
         registered.fetchable,
-    );
+    ));
     let shell = ShellLimits {
         max_capability_calls: limits.max_capability_calls,
         ..ShellLimits::default()
@@ -853,6 +809,22 @@ async fn session(
     // parked on, so the blocking loop reaches its next cancellation check instead of waiting out
     // a broker that is still working.
     let leg = leg.with_cancel_signal(cancellation.signal());
+    // Request-local and dropped with the session: an attachment the route cannot deliver never
+    // becomes bytes this process holds, and a cancelled or failed session drops the slot unread.
+    let attachments = Arc::new(ReplyAttachments::new(route.provider_attachments));
+    let leg = if route.provider_attachments > 0 {
+        leg.with_provider_attachments(Arc::clone(&attachments))
+    } else {
+        leg
+    };
+    let leg = if route.chat_asset_inputs.is_empty() {
+        leg
+    } else {
+        leg.with_chat_asset_inputs(ChatAssetInputs::new(
+            Arc::clone(&assets) as Arc<dyn dekopon_agent::attachment::ChatAssetSource>,
+            route.chat_asset_inputs.to_vec(),
+        ))
+    };
     let mut activity = ActivityLease::start(driver, message.activity.clone());
     let _active_registration = activity_enabled.then(|| {
         runner.active_sessions.register(
@@ -878,6 +850,7 @@ async fn session(
     // Shared with the route rather than cloned: the skill text is read once at startup.
     let skills = Arc::clone(&route.skills);
     let improvement_suggestions = route.improvement_suggestions;
+    let session_attachments = Arc::clone(&attachments);
     let result = tokio::task::spawn_blocking(move || {
         let _entered = blocking_span.enter();
         // Resolved before the accumulator exists, so a model client that cannot be constructed
@@ -885,7 +858,7 @@ async fn session(
         // first message to reach a given endpoint actually builds one.
         let model = match models.client(&model_config) {
             Ok(model) => model,
-            Err(error) => return (Err(error), None, None),
+            Err(error) => return (Err(error), None, Vec::new()),
         };
         let runtime = ShellRuntime {
             invoker: CancelAwareInvoker {
@@ -898,17 +871,13 @@ async fn session(
         // `history` is the accumulator rather than a return value, so this session's exchange is
         // recorded into it whichever way the loop ends.
         let mut history = seeded;
-        let generated_image = GeneratedImageOutput::default();
         let mut inputs = SessionInputs::new(&text, limits)
             .with_system(instructions.as_deref())
             .with_skills(&skills)
             .with_options(&options)
-            .with_assets(&assets)
+            .with_assets(assets.as_ref())
             .with_agent_config(&agent_config)
             .with_cancellation(&prompt_cancellation);
-        if let Some(generator) = image_generator.as_deref() {
-            inputs = inputs.with_image_generation(generator, &generated_image);
-        }
         if improvement_suggestions {
             inputs = inputs.with_improvement_suggestions();
         }
@@ -926,12 +895,18 @@ async fn session(
             Err(SessionError::Prompt(PromptError::ZeroSteps | PromptError::Cancelled)) => None,
             _ => history.turns().last().cloned(),
         };
-        let image = outcome.is_ok().then(|| generated_image.take()).flatten();
-        (outcome, turn, image)
+        // Taken only on success, for the reason the fixed failure line is never stored: a session
+        // that failed or was cancelled underneath its own work must not post what it produced.
+        let images = if outcome.is_ok() {
+            session_attachments.take()
+        } else {
+            Vec::new()
+        };
+        (outcome, turn, images)
     })
     .await;
 
-    let (outcome, turn, generated_image) = match result {
+    let (outcome, turn, attachments) = match result {
         Ok(session) => session,
         Err(_) => {
             if !cancellation.claim_completion() {
@@ -1004,9 +979,10 @@ async fn session(
         }
     };
     let delivered_answer = bound_outbound(&answer_text);
-    let reply = match generated_image {
-        Some(image) => OutboundReply::with_image(delivered_answer.clone(), image),
-        None => OutboundReply::text(delivered_answer.clone()),
+    let reply = if attachments.is_empty() {
+        OutboundReply::text(delivered_answer.clone())
+    } else {
+        OutboundReply::with_images(delivered_answer.clone(), attachments)
     };
     let delivery = deliver(replier, message, reply).await;
     activity.finish_in_background();
@@ -1337,21 +1313,6 @@ async fn deliver(
             None
         }
     }
-}
-
-/// Startup failure while resolving the configured image generator.
-#[derive(Debug, Error)]
-pub enum ImageGeneratorStartupError {
-    /// The named variable is unset, blank, or not UTF-8; the source says which.
-    #[error("image generator credential environment variable {variable} is unusable")]
-    Credential {
-        /// Owner-authored variable name, never its value.
-        variable: String,
-        #[source]
-        source: TransportError,
-    },
-    #[error("image generator client configuration is invalid")]
-    Client(#[from] ImageGenerationError),
 }
 
 /// The credential one configured model names could not be resolved.
