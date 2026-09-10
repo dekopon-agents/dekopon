@@ -1,7 +1,6 @@
 //! Broker-owned bounded asynchronous WebAssembly provider hosting.
 //!
-//! The current immediate host intentionally has an empty linker. This crate is the privileged
-//! counterpart intended only for a separately deployed broker: it accepts an
+//! This crate is the privileged host for the separately deployed broker: it accepts an
 //! [`AuthorizedInvocation`], links only the project-owned buffered HTTP and namespace-bound
 //! storage interfaces, and applies the invocation's exact host-call constraints in a fresh store.
 
@@ -332,7 +331,7 @@ pub struct BrokerInvocationFailure {
     pub error: Box<BrokerHostError>,
     /// Sanitized metadata for every HTTP call dispatched before the failure.
     pub http_calls: Vec<HttpCallEvidence>,
-    /// Content-free storage evidence when a storage transaction began.
+    /// Content-free storage evidence when a storage invocation began.
     pub storage: Option<StorageEvidence>,
 }
 
@@ -954,7 +953,7 @@ impl BrokerWasmProvider {
         input: &Value,
         constraints: &ExecutionConstraints,
         credential: Option<BoundCredential>,
-        storage_transaction: Option<dekopon_storage_host::StorageTransaction>,
+        storage_transaction: Option<dekopon_storage_host::StorageHandle>,
     ) -> Result<BrokerInvocationOutput, BrokerInvocationFailure> {
         validate_authorized_constraints(constraints, &self.runtime.limits)?;
         if !self
@@ -1806,7 +1805,7 @@ pub enum BrokerHostError {
     /// The single-use storage grant did not match the authorized invocation.
     #[error("storage grant does not match authorized invocation")]
     StorageGrantMismatch,
-    /// Native storage setup, transaction, or finalization failed.
+    /// Native storage setup, operation, or finalization failed.
     #[error("broker provider storage failed")]
     Storage {
         #[source]

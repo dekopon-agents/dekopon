@@ -75,8 +75,8 @@ The complete `${...}` value must be one canonical DRN. Literal passwords, prefix
 interpolation are rejected. Bare DRN characters elsewhere are ordinary public text and have no
 resolution semantics. The marker is removed
 before provider input is built. Immediate/direct invokers refuse secret use; only a broker-backed
-leg forwards the typed top-level proposal. Every broker-backed session reaches it — `dekopon-run
-prompt --broker` and a `dekopond` chat session — because invocation is one
+leg forwards the typed top-level proposal. Every broker-backed session reaches it, including a `dekopond`
+chat session, because invocation is one
 method, so a wrapper that records a call or stops one at a cancellation boundary cannot drop the
 proposal on the way through.
 
@@ -121,7 +121,7 @@ under the same hard 1 MiB read ceiling as other trusted inputs. `mapRevision` is
 authority metadata: bump it whenever a physical source, selector, projection, or binding meaning
 changes. Effective secret bindings plus that revision enter authority-bound durable-memory
 continuity, while values never do. Physical locators and bootstrap paths are sensitive deployment
-inventory and never appear in prompts, audit, evidence, provider metadata, or the web UI.
+inventory and never appear in prompts, audit, evidence, or provider metadata.
 Bootstrap credentials are never DRN-addressable, preventing resolver cycles and use of a source-store token as application material. The map file itself is likewise prohibited as a `secureFile` source. In the Helm chart,
 `broker.secretBootstrapFiles` copies operator-managed Secret keys into broker-only `0600` files;
 `broker.secretSourceVolumes` mounts AtomicWriter sources read-only into the broker only. Expiring AWS
@@ -383,7 +383,7 @@ intend to grant.
 ## Resolution and rotation
 
 Startup parses and validates the map, locators, scopes and bootstrap paths without contacting a
-remote source. After dual authorization and durable decision audit, the broker resolves exactly one
+remote source. After dual authorization and appending the decision audit record, the broker resolves exactly one
 snapshot. There is no cross-invocation cache and no stale fallback:
 
 - a floating alias or projected generation rotates on the next invocation;

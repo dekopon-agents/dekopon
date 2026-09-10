@@ -1,4 +1,4 @@
-//! Checked logical quota reservations shared across grants and namespace transactions.
+//! Checked logical quota reservations shared across grants and invocation handles.
 
 use std::{
     collections::BTreeMap,
@@ -142,7 +142,6 @@ impl QuotaLedger {
             namespace,
             reserved: 0,
             entries_reserved: 0,
-            reconciled: false,
             finalized: false,
         })
     }
@@ -162,36 +161,6 @@ impl QuotaLedger {
     pub(crate) fn release_handle(&self) {
         let mut state = self.state.lock().expect("storage quota ledger");
         state.open_handles = state.open_handles.saturating_sub(1);
-    }
-
-    pub(crate) fn release_generation(&self, base: &str, generation: &str) {
-        let namespace = format!("{base}/{generation}");
-        let mut state = self.state.lock().expect("storage quota ledger");
-        state.namespace_used.remove(&namespace);
-        state.namespace_entries.remove(&namespace);
-        state.namespace_reserved.remove(&namespace);
-    }
-
-    pub(crate) fn release_namespace_slot(&self, namespace: &str) {
-        let mut state = self.state.lock().expect("storage quota ledger");
-        state.namespace_slots.remove(namespace);
-        state.pending_namespace_slots.remove(namespace);
-        let prefix = format!("{namespace}/");
-        state
-            .namespace_used
-            .retain(|generation, _| !generation.starts_with(&prefix));
-        state
-            .namespace_entries
-            .retain(|generation, _| !generation.starts_with(&prefix));
-        state
-            .namespace_reserved
-            .retain(|generation, _| !generation.starts_with(&prefix));
-    }
-
-    pub(crate) fn release_root_usage(&self, usage: Usage) {
-        let mut state = self.state.lock().expect("storage quota ledger");
-        state.root_used = state.root_used.saturating_sub(usage.bytes);
-        state.root_entries = state.root_entries.saturating_sub(usage.entries);
     }
 }
 
@@ -300,12 +269,11 @@ pub(crate) struct Reservation {
     namespace: String,
     reserved: u64,
     entries_reserved: u64,
-    reconciled: bool,
     finalized: bool,
 }
 
 impl Reservation {
-    /// Raises the transaction's exact temporary headroom reservation atomically.
+    /// Raises the handle's exact temporary headroom reservation atomically.
     /// A denial changes no state.
     pub(crate) fn reserve_to(
         &mut self,
@@ -359,20 +327,7 @@ impl Reservation {
         Ok(())
     }
 
-    /// Reconciles a committed namespace from its pre-invocation to final logical usage.
-    ///
-    /// `retired_transaction` is an atomically unreachable trash entry. It remains charged until
-    /// immediate best-effort cleanup or a later bounded GC pass removes it.
-    pub(crate) fn commit(
-        &mut self,
-        final_usage: Usage,
-        retired_transaction: Usage,
-    ) -> Result<(), StorageHostError> {
-        if self.reconciled {
-            return Err(StorageHostError::Corrupt {
-                scope: "reservation-reconciled-twice",
-            });
-        }
+    pub(crate) fn observe_direct(&mut self, final_usage: Usage) -> Result<(), StorageHostError> {
         let mut state = self.ledger.state.lock().expect("storage quota ledger");
         let old = *state.namespace_used.get(&self.namespace).unwrap_or(&0);
         let old_entries = *state.namespace_entries.get(&self.namespace).unwrap_or(&0);
@@ -380,27 +335,19 @@ impl Reservation {
             state
                 .root_used
                 .checked_add(final_usage.bytes - old)
-                .and_then(|value| value.checked_add(retired_transaction.bytes))
                 .ok_or(StorageHostError::Arithmetic)?
         } else {
-            state
-                .root_used
-                .saturating_sub(old - final_usage.bytes)
-                .checked_add(retired_transaction.bytes)
-                .ok_or(StorageHostError::Arithmetic)?
+            state.root_used.saturating_sub(old - final_usage.bytes)
         };
         state.root_entries = if final_usage.entries >= old_entries {
             state
                 .root_entries
                 .checked_add(final_usage.entries - old_entries)
-                .and_then(|value| value.checked_add(retired_transaction.entries))
                 .ok_or(StorageHostError::Arithmetic)?
         } else {
             state
                 .root_entries
                 .saturating_sub(old_entries - final_usage.entries)
-                .checked_add(retired_transaction.entries)
-                .ok_or(StorageHostError::Arithmetic)?
         };
         state
             .namespace_used
@@ -408,22 +355,13 @@ impl Reservation {
         state
             .namespace_entries
             .insert(self.namespace.clone(), final_usage.entries);
-        // Keep the complete staging/failure reservation until the caller has durably published its
-        // final marker. If that publication fails, poison and any ambiguous marker entry remain
-        // covered without trying to reconstruct accounting on the error path.
-        self.reconciled = true;
+        release_root_locked(&mut state, self.reserved, self.entries_reserved);
+        if let Some(value) = state.namespace_reserved.get_mut(&self.namespace) {
+            *value = value.saturating_sub(self.reserved);
+        }
+        self.reserved = 0;
+        self.entries_reserved = 0;
         Ok(())
-    }
-
-    pub(crate) fn finish_commit(mut self) {
-        let mut state = self.ledger.state.lock().expect("storage quota ledger");
-        release_locked(
-            &mut state,
-            &self.namespace,
-            self.reserved,
-            self.entries_reserved,
-        );
-        self.finalized = true;
     }
 
     pub(crate) fn abort(mut self) {
@@ -437,11 +375,8 @@ impl Reservation {
         self.finalized = true;
     }
 
-    /// Keeps conservative root/namespace headroom after a durable outcome becomes unknown.
-    ///
-    /// The next process rebuilds exact accounting from disk. Releasing this reservation in the
-    /// current process would let an already-minted grant on another namespace spend bytes occupied
-    /// by the retained committed transaction before it performs a fresh root scan.
+    /// Keeps conservative headroom when actual usage cannot be read after a syscall failure.
+    /// Releasing it could let another namespace spend bytes still occupied on disk.
     pub(crate) fn retain_after_unknown(mut self) {
         self.finalized = true;
     }

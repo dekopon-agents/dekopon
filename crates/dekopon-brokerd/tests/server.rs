@@ -10,14 +10,13 @@ use dekopon_broker::{
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
-    AgentInventory, Attestation, BrokerClient, BrokerRequest, BrokerResponse, ClientError,
-    CommandRunOutcome, ERROR_BROKER_UNAVAILABLE, ERROR_CAPACITY_EXHAUSTED, ERROR_INVALID_REQUEST,
-    ERROR_UNAUTHENTICATED, FrameLimits, ModelUsageReport, ProtocolVersion, ReportedAgent,
-    ReportedAgentCapability, RequestEnvelope, ResponseEnvelope, read_frame, write_frame,
+    Attestation, BrokerClient, BrokerRequest, BrokerResponse, ClientError, CommandRunOutcome,
+    ERROR_BROKER_UNAVAILABLE, ERROR_CAPACITY_EXHAUSTED, ERROR_INVALID_REQUEST,
+    ERROR_UNAUTHENTICATED, FrameLimits, ProtocolVersion, RequestEnvelope, ResponseEnvelope,
+    read_frame, write_frame,
 };
 use dekopon_brokerd::{
-    AuditCheckpoint, BrokerServer, BrokerdError, CHECKPOINT_API_VERSION, CONFIG_API_VERSION,
-    CheckpointError, MappedPeer, ServerLimits, current_uid, run, run_with_http,
+    BrokerServer, BrokerdError, CONFIG_API_VERSION, MappedPeer, ServerLimits, current_uid, run,
 };
 use dekopon_capability::{
     EffectKind, ExecutionConstraints, HttpConstraints, Idempotency, InvocationOutcome,
@@ -27,11 +26,10 @@ use dekopon_core::{
     RiskLevel, SecretUseProposal, TraceId,
 };
 use dekopon_test_support::{provider_fixture, shutdown_on};
-use dekopon_webui::ServiceStatus;
 use serde_json::{Value, json};
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
-    net::{TcpStream, UnixListener, UnixStream},
+    net::{UnixListener, UnixStream},
     sync::oneshot,
 };
 
@@ -140,6 +138,19 @@ fn request(id: &str) -> InvocationRequest {
 fn write_owner_only(path: &Path, contents: &[u8]) {
     fs::write(path, contents).expect("write fixture");
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("secure fixture");
+}
+
+/// A fixture directory the broker binds under and its clients connect through.
+///
+/// `tempfile::tempdir` applies the process umask, which normally leaves the directory
+/// world-traversable. That is a parent `socket::bind` refuses, and — now that both sides read one
+/// socket rule — a parent `BrokerClient` refuses too: whoever can write the directory can replace
+/// the listener under a socket whose own mode still looks private.
+fn private_directory() -> tempfile::TempDir {
+    let directory = tempfile::tempdir().expect("create fixture directory");
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        .expect("private fixture directory");
+    directory
 }
 
 fn bind_fixture(path: &Path) -> UnixListener {
@@ -358,7 +369,7 @@ async fn cli_probe_broker() -> (Arc<Broker<InMemoryAuditLog>>, Arc<InMemoryAudit
 #[tokio::test(flavor = "multi_thread")]
 async fn run_command_over_the_socket_renders_help_then_proposes() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create server fixture");
+    let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
     let (broker, audit) = cli_probe_broker().await;
@@ -456,7 +467,7 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_legacy_resolve_command_frame_is_still_answered() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create server fixture");
+    let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
     let (broker, audit) = cli_probe_broker().await;
@@ -533,7 +544,7 @@ async fn a_legacy_resolve_command_frame_is_still_answered() {
 #[tokio::test(flavor = "multi_thread")]
 async fn authenticated_unix_peer_can_inspect_and_invoke_under_policy() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create server fixture");
+    let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
     let (broker, audit) = broker().await;
@@ -571,77 +582,20 @@ async fn authenticated_unix_peer_can_inspect_and_invoke_under_policy() {
         .expect("server shuts down");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn mapped_attestor_can_publish_informational_ui_state_without_touching_audit() {
-    let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create server fixture");
-    let socket_path = directory.path().join("broker.sock");
-    let listener = bind_fixture(&socket_path);
-    let (broker, audit) = attested_broker().await;
-    let mut identities = BTreeMap::new();
-    identities.insert(
-        uid,
-        MappedPeer {
-            context: context("caller"),
-            attestor: Some(attestor_grant()),
-        },
-    );
-    let status = ServiceStatus::default();
-    let limits = server_limits();
-    let server = BrokerServer::new_with_status(broker, identities, limits, status.clone())
-        .expect("server limits valid");
-    let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
-    let task = tokio::spawn(server.serve(listener, shutdown_on(shutdown_receive)));
-    let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
-    client
-        .publish_agent_inventory(AgentInventory {
-            agents: vec![ReportedAgent {
-                id: agent("chat-agent"),
-                description: "Answers chat".to_owned(),
-                enabled: true,
-                model_class: Some("reasoning".to_owned()),
-                providers: vec!["echo".parse().expect("valid provider")],
-                capabilities: vec![ReportedAgentCapability {
-                    id: "echo.echo".parse().expect("valid capability"),
-                    provider: "echo".parse().expect("valid provider"),
-                    permissions: Vec::new(),
-                }],
-            }],
-            truncated: false,
-        })
-        .await
-        .expect("attestor inventory is accepted");
-    client
-        .publish_model_usage(ModelUsageReport {
-            model_calls: 2,
-            input_tokens: 30,
-            output_tokens: 7,
-            input_unreported_calls: 1,
-            ..ModelUsageReport::default()
-        })
-        .await
-        .expect("attestor usage is accepted");
-
-    let (inventory, reports) = status.agents();
-    assert_eq!(reports, 1);
-    assert_eq!(inventory.agents[0].id.as_str(), "chat-agent");
-    assert_eq!(status.tokens().input_tokens, 30);
-    assert_eq!(status.tokens().output_tokens, 7);
-    assert!(
-        audit.records().await.is_empty(),
-        "informational UI reports are not authorization audit"
-    );
-
-    shutdown_send.send(()).expect("signal clean shutdown");
-    task.await
-        .expect("server task exits")
-        .expect("server shuts down");
-}
-
+/// The refusal an operator most often meets: the broker's own readiness probe connects as the
+/// broker's UID, so a configuration whose `identities` omit it is answered with the same opaque
+/// nothing a stranger gets. What the answer withholds is pinned here; the `broker_peer_unmapped`
+/// line that carries the peer UID is pinned in `failure_logging.rs`, whose global subscriber is
+/// the only one a spawned connection task reports to.
+///
+/// The frame is read straight off the socket because this is the one refusal the broker writes
+/// before reading a request and closes the socket with: macOS refuses to report a peer's
+/// credentials once that close has landed, so a `BrokerClient` here would report losing the
+/// server rather than the answer this test is about. The refusal itself survives the close —
+/// it is already in this peer's receive buffer.
 #[tokio::test(flavor = "multi_thread")]
 async fn unmapped_peer_receives_no_capability_information() {
-    let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create server fixture");
+    let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
     let (broker, _audit) = broker().await;
@@ -649,8 +603,18 @@ async fn unmapped_peer_receives_no_capability_information() {
     let server = BrokerServer::new(broker, BTreeMap::new(), limits).expect("server starts");
     let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
     let task = tokio::spawn(server.serve(listener, shutdown_on(shutdown_receive)));
-    let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
-    assert!(client.capabilities().await.is_err());
+    let mut peer = UnixStream::connect(&socket_path)
+        .await
+        .expect("connect as an unmapped peer");
+    let refusal = read_frame::<_, ResponseEnvelope>(&mut peer, limits.frame)
+        .await
+        .expect("an unmapped peer is answered before it asks for anything");
+    let BrokerResponse::Error { code, message } = refusal.response else {
+        panic!("an unmapped peer must be refused rather than served");
+    };
+    assert_eq!(code, ERROR_UNAUTHENTICATED);
+    // Not even the provider it would have been allowed to call, had it been mapped.
+    assert!(!message.contains("echo"), "{message}");
     shutdown_send.send(()).expect("signal clean shutdown");
     task.await
         .expect("server task exits")
@@ -658,11 +622,9 @@ async fn unmapped_peer_receives_no_capability_information() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn full_service_restores_replay_state_from_verified_audit() {
+async fn full_service_appends_after_restart_without_replay_restoration() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create service fixture");
-    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
-        .expect("secure service directory");
+    let directory = private_directory();
     let config_path = directory.path().join("broker.json");
     let socket_path = directory.path().join("broker.sock");
     let audit_path = directory.path().join("audit.jsonl");
@@ -673,8 +635,6 @@ async fn full_service_restores_replay_state_from_verified_audit() {
         "apiVersion": CONFIG_API_VERSION,
         "socketPath": &socket_path,
         "auditPath": &audit_path,
-        "checkpointPath": &checkpoint_path,
-        "checkpointLockPath": &checkpoint_lock_path,
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "policiesPath": &policies_path,
@@ -707,11 +667,24 @@ async fn full_service_restores_replay_state_from_verified_audit() {
         .expect("first invocation completes");
     assert_eq!(result.outcome, InvocationOutcome::Succeeded);
     stop.send(()).expect("stop first service");
-    let checkpoint = first
+    first
         .await
         .expect("first service task exits")
         .expect("first service stops cleanly");
-    assert_eq!(checkpoint.records, 2);
+    assert_eq!(
+        fs::read_to_string(&audit_path)
+            .expect("read audit")
+            .lines()
+            .inspect(|line| {
+                let _: dekopon_broker::AuditRecord =
+                    serde_json::from_str(line).expect("complete audit record");
+            })
+            .count(),
+        2
+    );
+    assert!(!checkpoint_path.exists());
+    assert!(!checkpoint_lock_path.exists());
+    let prior = fs::read(&audit_path).expect("read prior audit bytes");
 
     let (stop, stopped) = oneshot::channel::<()>();
     let second_config = config_path.clone();
@@ -722,42 +695,50 @@ async fn full_service_restores_replay_state_from_verified_audit() {
     let replay = client
         .invoke(None, request("invoke-durable-service"))
         .await
-        .expect("replay receives an accounted denial");
-    assert_eq!(replay.outcome, InvocationOutcome::Denied);
-    assert_eq!(replay.error.as_deref(), Some("replayed-invocation"));
+        .expect("restarted invocation receives an accounted result");
+    assert_eq!(replay.outcome, InvocationOutcome::Succeeded);
+    assert_eq!(replay.error, None);
     stop.send(()).expect("stop second service");
-    let checkpoint = second
+    second
         .await
         .expect("second service task exits")
         .expect("second service stops cleanly");
-    assert_eq!(checkpoint.records, 3);
-    let stored: Value =
-        serde_json::from_slice(&fs::read(&checkpoint_path).expect("read durable checkpoint"))
-            .expect("checkpoint JSON decodes");
-    assert_eq!(stored.as_object().expect("checkpoint object").len(), 3);
-    assert_eq!(stored["apiVersion"], CHECKPOINT_API_VERSION);
-    assert_eq!(stored["records"], 3);
-    assert!(stored["head"].as_str().is_some());
-
+    assert_eq!(
+        fs::read_to_string(&audit_path)
+            .expect("read audit")
+            .lines()
+            .inspect(|line| {
+                let _: dekopon_broker::AuditRecord =
+                    serde_json::from_str(line).expect("complete audit record");
+            })
+            .count(),
+        4
+    );
+    assert!(!checkpoint_path.exists());
+    assert!(!checkpoint_lock_path.exists());
     let audit = fs::read_to_string(&audit_path).expect("read audit before truncation");
+    assert!(audit.as_bytes().starts_with(&prior));
+    let ordinals = audit
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<dekopon_broker::AuditRecord>(line)
+                .expect("complete audit record")
+                .sequence
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(ordinals, [1, 2, 3, 4]);
     let first = audit.lines().next().expect("audit has a first record");
     fs::write(&audit_path, format!("{first}\n")).expect("write valid-prefix truncation");
-    let error = run(&config_path, async {})
+    run(&config_path, async {})
         .await
-        .expect_err("checkpoint must reject valid-prefix audit rollback");
-    assert!(matches!(
-        error,
-        BrokerdError::Checkpoint(CheckpointError::AuditMismatch)
-    ));
+        .expect("valid audit prefix starts without a sidecar");
     assert!(!socket_path.exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn full_service_resolves_a_private_map_only_after_dual_drn_authorization() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("service fixture");
-    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
-        .expect("secure fixture directory");
+    let directory = private_directory();
     let config_path = directory.path().join("broker.json");
     let socket_path = directory.path().join("broker.sock");
     let audit_path = directory.path().join("audit.jsonl");
@@ -846,8 +827,6 @@ when { context.capability == "http-probe.fetch"
         "apiVersion": CONFIG_API_VERSION,
         "socketPath": &socket_path,
         "auditPath": &audit_path,
-        "checkpointPath": directory.path().join("checkpoint.json"),
-        "checkpointLockPath": directory.path().join("checkpoint.lock"),
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "policiesPath": &policies_path,
@@ -920,129 +899,24 @@ when { context.capability == "http-probe.fetch"
     assert_eq!(denied.outcome, InvocationOutcome::Failed);
 
     stop.send(()).expect("stop service");
-    let checkpoint = service
-        .await
-        .expect("service task exits")
-        .expect("service stops");
-    assert_eq!(checkpoint.records, 4);
-    let audit = fs::read_to_string(audit_path).expect("read audit");
-    assert!(audit.contains("drn:com.xrl:secret:test:api/token"));
-    assert!(!audit.contains("brokerd-secret-value"));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn full_service_serves_the_explicit_read_only_http_listener() {
-    let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create web UI fixture");
-    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
-        .expect("secure fixture directory");
-    let config_path = directory.path().join("broker.json");
-    let socket_path = directory.path().join("broker.sock");
-    let policies_path = directory.path().join("policies.cedar");
-    let document = json!({
-        "apiVersion": CONFIG_API_VERSION,
-        "socketPath": &socket_path,
-        "auditPath": directory.path().join("audit.jsonl"),
-        "checkpointPath": directory.path().join("checkpoint.json"),
-        "checkpointLockPath": directory.path().join("checkpoint.lock"),
-        "brokerPrincipal": "broker-test",
-        "policyRevision": "policy-test",
-        "policiesPath": &policies_path,
-        "providers": [provider_fixture("echo-provider.wasm")],
-        "identities": [{
-            "uid": uid,
-            "principal": "caller",
-            "actor": {"type": "agent", "agent": "brokerd-test"}
-        }],
-        "constraintSets": {
-            "echo.echo": serde_json::to_value(echo_constraint_set())
-                .expect("constraint set serializes")
-        }
-    });
-    write_owner_only(&policies_path, DIRECT_POLICY.as_bytes());
-    write_owner_only(
-        &config_path,
-        &serde_json::to_vec(&document).expect("config serializes"),
-    );
-    let reservation =
-        std::net::TcpListener::bind("127.0.0.1:0").expect("reserve an ephemeral HTTP port");
-    let http_address = reservation.local_addr().expect("reserved address");
-    drop(reservation);
-
-    let (stop, stopped) = oneshot::channel::<()>();
-    let started_config = config_path.clone();
-    let mut service = tokio::spawn(async move {
-        run_with_http(started_config, Some(http_address), shutdown_on(stopped)).await
-    });
-    wait_for_socket(&socket_path, &mut service).await;
-    wait_for_http(http_address, &mut service).await;
-
-    let root = http_get(http_address, "/").await;
-    assert!(
-        root.starts_with("HTTP/1.1 308 Permanent Redirect"),
-        "{root}"
-    );
-    assert!(
-        root.to_ascii_lowercase().contains("location: /ui"),
-        "{root}"
-    );
-    let ui = http_get(http_address, "/ui").await;
-    assert!(ui.starts_with("HTTP/1.1 200 OK"), "{ui}");
-    for expected in ["Dekopon service", "Providers", "Wasmtime", "echo"] {
-        assert!(ui.contains(expected), "missing {expected:?} in {ui}");
-    }
-    let provider = http_get(http_address, "/ui/providers/echo").await;
-    assert!(provider.starts_with("HTTP/1.1 200 OK"), "{provider}");
-    for expected in [
-        "pub capability",
-        "echo.echo",
-        "Complete manifest",
-        "SHA-256",
-    ] {
-        assert!(
-            provider.contains(expected),
-            "missing {expected:?} in provider page"
-        );
-    }
-
-    stop.send(()).expect("stop service");
     service
         .await
         .expect("service task exits")
-        .expect("service stops cleanly");
-}
-
-async fn wait_for_http<T: std::fmt::Debug>(
-    address: std::net::SocketAddr,
-    task: &mut tokio::task::JoinHandle<T>,
-) {
-    for _ in 0..100 {
-        assert!(!task.is_finished(), "service exited before HTTP bind");
-        if TcpStream::connect(address).await.is_ok() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("HTTP listener at {address} did not become ready");
-}
-
-async fn http_get(address: std::net::SocketAddr, path: &str) -> String {
-    let mut stream = TcpStream::connect(address)
-        .await
-        .expect("connect to web UI");
-    stream
-        .write_all(
-            format!("GET {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\n\r\n")
-                .as_bytes(),
-        )
-        .await
-        .expect("write HTTP request");
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .await
-        .expect("read HTTP response");
-    String::from_utf8(response).expect("HTTP response is UTF-8")
+        .expect("service stops");
+    assert_eq!(
+        fs::read_to_string(&audit_path)
+            .expect("read audit")
+            .lines()
+            .inspect(|line| {
+                let _: dekopon_broker::AuditRecord =
+                    serde_json::from_str(line).expect("complete audit record");
+            })
+            .count(),
+        4
+    );
+    let audit = fs::read_to_string(audit_path).expect("read audit");
+    assert!(audit.contains("drn:com.xrl:secret:test:api/token"));
+    assert!(!audit.contains("brokerd-secret-value"));
 }
 
 /// Waits until the fixture's socket exists *and* is owner-only.
@@ -1055,7 +929,7 @@ async fn http_get(address: std::net::SocketAddr, path: &str) -> String {
 /// polling on `exists()` alone makes the suite flaky under parallel load.
 async fn wait_for_socket(
     path: &Path,
-    task: &mut tokio::task::JoinHandle<Result<AuditCheckpoint, BrokerdError>>,
+    task: &mut tokio::task::JoinHandle<Result<(), BrokerdError>>,
 ) {
     for _ in 0..3_000 {
         if std::fs::symlink_metadata(path)
@@ -1075,7 +949,7 @@ async fn wait_for_socket(
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_never_ran() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create server fixture");
+    let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
     // One audit slot: the first allowed invocation spends it on its Decision, so its terminal
@@ -1121,9 +995,8 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
     else {
         panic!("expected a remote broker failure, got {never_ran}");
     };
-    // Nothing executed, so this is safe to resubmit — and futile. The audit log does not rotate,
-    // so every fresh invocation identifier fails on the same append until an operator raises
-    // `auditMaxRecords` or moves the file, which is why it is not the retriable class.
+    // Nothing executed, so this is safe to resubmit — and futile in this bounded in-memory log.
+    // Every fresh identifier fails on the same append until the embedding addresses capacity.
     assert_eq!(unran_code, ERROR_CAPACITY_EXHAUSTED);
     assert!(
         unran_message.contains("operator action"),
@@ -1140,13 +1013,13 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
         .expect("server shuts down");
 }
 
-/// The other permanent exhaustion, and the one a restart cannot clear: the replay ledger restores
-/// every Decision identifier from durable history, so a bound reached once is reached again on the
-/// next boot. Reporting it as `broker-unavailable` invited a client to retry forever.
+/// The other process-lifetime exhaustion: the replay ledger retains
+/// every reserved identifier until restart. Reporting it as `broker-unavailable` would invite
+/// a client to retry forever against that same exhausted process.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_exhausted_replay_ledger_is_not_reported_as_a_transient_outage() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create server fixture");
+    let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
     let broker = broker_with_replay_bound(1).await;
@@ -1210,7 +1083,7 @@ async fn an_exhausted_replay_ledger_is_not_reported_as_a_transient_outage() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attested_invoke_over_the_socket_succeeds_for_an_attestor_peer() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create server fixture");
+    let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
     let (broker, audit) = attested_broker().await;
@@ -1260,7 +1133,7 @@ async fn an_attested_invoke_over_the_socket_succeeds_for_an_attestor_peer() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attested_invoke_from_a_peer_without_a_grant_is_denied_not_erred() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create server fixture");
+    let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
     let (broker, audit) = attested_broker().await;
@@ -1310,7 +1183,7 @@ async fn an_attested_invoke_from_a_peer_without_a_grant_is_denied_not_erred() {
 #[tokio::test(flavor = "multi_thread")]
 async fn mismatched_attestation_binding_is_a_protocol_error() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create server fixture");
+    let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
     let (broker, audit) = attested_broker().await;
@@ -1370,7 +1243,7 @@ async fn mismatched_attestation_binding_is_a_protocol_error() {
 #[tokio::test(flavor = "multi_thread")]
 async fn attested_capabilities_over_the_socket() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create server fixture");
+    let directory = private_directory();
     let limits = server_limits();
 
     let granted_path = directory.path().join("granted.sock");
@@ -1454,17 +1327,13 @@ async fn attested_capabilities_over_the_socket() {
 #[tokio::test(flavor = "multi_thread")]
 async fn strict_startup_refuses_every_policy_that_names_something_absent() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create service fixture");
-    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
-        .expect("secure service directory");
+    let directory = private_directory();
     let config_path = directory.path().join("broker.json");
     let policies_path = directory.path().join("policies.cedar");
     let document = json!({
         "apiVersion": CONFIG_API_VERSION,
         "socketPath": directory.path().join("broker.sock"),
         "auditPath": directory.path().join("audit.jsonl"),
-        "checkpointPath": directory.path().join("checkpoint.json"),
-        "checkpointLockPath": directory.path().join("checkpoint.lock"),
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "policiesPath": &policies_path,
@@ -1531,17 +1400,13 @@ async fn strict_startup_refuses_every_policy_that_names_something_absent() {
 #[tokio::test(flavor = "multi_thread")]
 async fn default_startup_tolerates_names_no_loaded_provider_declares() {
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create service fixture");
-    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
-        .expect("secure service directory");
+    let directory = private_directory();
     let config_path = directory.path().join("broker.json");
     let policies_path = directory.path().join("policies.cedar");
     let document = json!({
         "apiVersion": CONFIG_API_VERSION,
         "socketPath": directory.path().join("broker.sock"),
         "auditPath": directory.path().join("audit.jsonl"),
-        "checkpointPath": directory.path().join("checkpoint.json"),
-        "checkpointLockPath": directory.path().join("checkpoint.lock"),
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "policiesPath": &policies_path,

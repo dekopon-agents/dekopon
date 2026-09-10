@@ -205,9 +205,25 @@ Startup guards. Every one of these is a configuration mistake whose only other s
 that starts and then refuses to serve, which is much harder to read than a template error.
 */}}
 {{- define "dekopon.validate" -}}
+{{- if hasKey .Values.broker "httpBind" -}}
+{{- fail "broker.httpBind is not supported" -}}
+{{- end -}}
 {{- $uid := .Values.podSecurityContext.runAsUser | int -}}
 {{- if and (ne $uid 65532) (eq .Values.image.repository "ghcr.io/dekopon-agents/dekopon") -}}
-{{- fail (printf "podSecurityContext.runAsUser is %d, but %s bakes /opt/dekopon/providers/*.wasm owned by 65532 and dekopon-brokerd loads a provider only when its owner equals the broker's own euid. Every provider would fail to load. Use 65532, or supply an image that bakes providers under %d." $uid .Values.image.repository $uid) -}}
+{{- fail (printf "podSecurityContext.runAsUser is %d, but %s bakes /opt/dekopon/providers/*.wasm owned by 65532 and dekopon-brokerd loads a provider only when its owner equals the broker's own euid. Every provider would fail to load. Use 65532 for the broker; the gateway has a separate container identity." $uid .Values.image.repository) -}}
+{{- end -}}
+
+{{- if or (hasKey .Values.podSecurityContext "fsGroup") (ne $uid 65532) (ne (.Values.podSecurityContext.runAsGroup | int) 65532) -}}
+{{- fail "chart isolation requires broker UID/GID 65532:65532 and no fsGroup" -}}
+{{- end -}}
+{{- if ne (toJson .Values.podSecurityContext.supplementalGroups) "[65534]" -}}
+{{- fail "podSecurityContext.supplementalGroups must be [65534] for IPC only" -}}
+{{- end -}}
+{{- if and .Values.gateway.enabled .Values.gateway.config.inline -}}
+{{- $gateway := .Values.gateway.config.inline | fromYaml -}}
+{{- if ne (dig "broker" "serverUid" -1 $gateway | int) 65532 -}}
+{{- fail "gateway config must explicitly pin broker.serverUid: 65532" -}}
+{{- end -}}
 {{- end -}}
 
 {{- if and .Values.broker.config.inline .Values.broker.config.existingSecret -}}
@@ -240,6 +256,18 @@ that starts and then refuses to serve, which is much harder to read than a templ
 {{- end -}}
 {{- if and (regexMatch "(?m)^[[:space:]]*constraintSets:" .Values.broker.config.inline) (not (include "dekopon.hasPolicies" .)) -}}
 {{- fail "broker.config.inline declares constraintSets but no policy set was supplied; dekopon-brokerd refuses to start with executable capabilities and no policy" -}}
+{{- end -}}
+{{/* The probe is an ordinary authenticated client, so an unmapped broker UID is a pod that starts,
+answers every probe `unauthenticated`, and never becomes ready. */}}
+{{- $config := .Values.broker.config.inline | fromYaml -}}
+{{- $probeMapped := false -}}
+{{- range (dig "identities" (list) $config) -}}
+{{- if eq ((dig "uid" -1 .) | int) $uid -}}
+{{- $probeMapped = true -}}
+{{- end -}}
+{{- end -}}
+{{- if not $probeMapped -}}
+{{- fail (printf "broker.config.inline identities must map the broker's own UID %d: the startup and readiness probes run dekopon-brokerd probe as that UID" $uid) -}}
 {{- end -}}
 {{- end -}}
 
@@ -276,13 +304,13 @@ that starts and then refuses to serve, which is much harder to read than a templ
 {{- fail "gateway.chatgpt.inline and gateway.chatgpt.existingSecret are mutually exclusive" -}}
 {{- end -}}
 {{- if and (not .Values.gateway.chatgpt.inline) (not .Values.gateway.chatgpt.existingSecret) -}}
-{{- fail "gateway.chatgpt.enabled is true, so a credential is required: set gateway.chatgpt.inline or gateway.chatgpt.existingSecret. Produce one with `dekopon auth chatgpt export`." -}}
+{{- fail "gateway.chatgpt.enabled is true, so a credential is required: set gateway.chatgpt.inline or gateway.chatgpt.existingSecret. Produce one with `dekopond auth chatgpt export`." -}}
 {{- end -}}
 {{- if not (regexMatch "^[A-Za-z0-9._-]+$" .Values.gateway.chatgpt.subdir) -}}
 {{- fail (printf "gateway.chatgpt.subdir must be one path segment joined onto paths.stateDir, got %q; the credential has to live on the claim" .Values.gateway.chatgpt.subdir) -}}
 {{- end -}}
-{{- if or (eq .Values.gateway.chatgpt.subdir ".") (eq .Values.gateway.chatgpt.subdir "..") -}}
-{{- fail "gateway.chatgpt.subdir must not be . or .." -}}
+{{- if or (eq .Values.gateway.chatgpt.subdir "broker") (eq .Values.gateway.chatgpt.subdir ".") (eq .Values.gateway.chatgpt.subdir "..") -}}
+{{- fail "gateway.chatgpt.subdir must not be broker, . or .." -}}
 {{- end -}}
 {{- if not (regexMatch "^[A-Za-z0-9._-]+$" .Values.gateway.chatgpt.fileName) -}}
 {{- fail (printf "gateway.chatgpt.fileName must be one path segment, got %q" .Values.gateway.chatgpt.fileName) -}}
@@ -312,7 +340,7 @@ broker that lands mid-invocation and mid-audit-append. */}}
 {{- fail (printf "terminationGracePeriodSeconds is %d, but the containers stop in sequence: %s, and drainBudget.bufferSeconds adds %d s for SIGTERM delivery, telemetry flush, and the sidecar stop that only begins once the gateway's container is gone. That needs %d seconds. At %d the kubelet SIGKILLs whichever daemon is still draining, which for the broker is mid-invocation and mid-audit-append. Raise terminationGracePeriodSeconds to %d, or lower a shutdownGraceMs." $budgetSeconds $drains $bufferSeconds $requiredSeconds $budgetSeconds $requiredSeconds) -}}
 {{- end -}}
 
-{{- $chartPaths := dict "paths.configDir" .Values.paths.configDir "paths.runtimeDir" .Values.paths.runtimeDir "paths.stateDir" .Values.paths.stateDir "paths.catalogDir" .Values.paths.catalogDir -}}
+{{- $chartPaths := dict "paths.gatewayConfigDir" .Values.paths.gatewayConfigDir "paths.configDir" .Values.paths.configDir "paths.runtimeDir" .Values.paths.runtimeDir "paths.stateDir" .Values.paths.stateDir "paths.catalogDir" .Values.paths.catalogDir -}}
 {{- range $name, $path := $chartPaths -}}
 {{- if or (not (regexMatch "^/([A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$" $path)) (ne (clean $path) $path) -}}
 {{- fail (printf "%s must be a canonical absolute path of safe non-dot segments with no repeated or trailing slash, got %q" $name $path) -}}
@@ -348,7 +376,7 @@ broker that lands mid-invocation and mid-audit-append. */}}
 {{- $_ := set $bootstrapNames .file true -}}
 {{- end -}}
 
-{{- $secretSourceNames := dict "config-source" true "config" true "runtime" true "state" true "tmp" true "catalog" true "provider-storage" true "provider-storage-key" true "provider-storage-key-source" true -}}
+{{- $secretSourceNames := dict "gateway-config" true "gateway-tmp" true "config-source" true "config" true "runtime" true "state" true "tmp" true "catalog" true "provider-storage" true "provider-storage-key" true "provider-storage-key-source" true -}}
 {{- range .Values.broker.secretSourceVolumes -}}
 {{- $source := . -}}
 {{- if or (not .name) (not .mountPath) (not (kindIs "map" .volume)) -}}
@@ -413,7 +441,7 @@ broker that lands mid-invocation and mid-audit-append. */}}
 {{- end -}}
 {{- end -}}
 {{- $storageMounts := dict "providerStorage.rootPath" (clean .Values.providerStorage.rootPath) "providerStorage.keyDir" (clean .Values.providerStorage.keyDir) -}}
-{{- $ownedMounts := dict "paths.configDir" (clean .Values.paths.configDir) "paths.runtimeDir" (clean .Values.paths.runtimeDir) "paths.stateDir" (clean .Values.paths.stateDir) "paths.catalogDir" (clean .Values.paths.catalogDir) "temporary directory" "/tmp" "projected configuration source" "/dekopon-source" "projected storage-key source" "/dekopon-storage-key-source" "packaged default providers" "/opt/dekopon/providers" "packaged optional providers" "/opt/dekopon/optional-providers" "packaged executables" "/usr/local/bin" "packaged documentation" "/usr/share/doc/dekopon" -}}
+{{- $ownedMounts := dict "paths.gatewayConfigDir" (clean .Values.paths.gatewayConfigDir) "paths.configDir" (clean .Values.paths.configDir) "paths.runtimeDir" (clean .Values.paths.runtimeDir) "paths.stateDir" (clean .Values.paths.stateDir) "paths.catalogDir" (clean .Values.paths.catalogDir) "temporary directory" "/tmp" "projected configuration source" "/dekopon-source" "projected storage-key source" "/dekopon-storage-key-source" "packaged default providers" "/opt/dekopon/providers" "packaged optional providers" "/opt/dekopon/optional-providers" "packaged executables" "/usr/local/bin" "packaged documentation" "/usr/share/doc/dekopon" -}}
 {{- range $storageName, $storagePath := $storageMounts -}}
 {{- range $ownedName, $ownedPath := $ownedMounts -}}
 {{- if or (eq $storagePath $ownedPath) (hasPrefix (printf "%s/" $storagePath) $ownedPath) (hasPrefix (printf "%s/" $ownedPath) $storagePath) -}}
@@ -455,12 +483,9 @@ Arguments: dict "ctx" $ "sidecar" bool
   imagePullPolicy: {{ $.Values.image.pullPolicy }}
   # No ENTRYPOINT in the image: the command selects which of the four binaries runs.
   command: ["dekopon-brokerd"]
-  # broker.httpBind is empty by default, so the unauthenticated read-only web UI stays absent:
-  # without the flag dekopon-brokerd opens no TCP listener. The chart adds no Service or Ingress
-  # for it either; see values.yaml and docs/security-model.md.
-  args: ["--config", "{{ $.Values.paths.configDir }}/broker.yaml"{{ with $.Values.broker.httpBind }}, "--http-bind", "{{ . }}"{{ end }}]
+  args: ["--config", "{{ $.Values.paths.configDir }}/broker.yaml"]
   securityContext:
-    {{- toYaml $.Values.securityContext | nindent 4 }}
+    {{- toYaml (mergeOverwrite (deepCopy $.Values.securityContext) (dict "runAsUser" ($.Values.podSecurityContext.runAsUser | int) "runAsGroup" ($.Values.podSecurityContext.runAsGroup | int))) | nindent 4 }}
   env:
     {{- with $.Values.broker.env }}
     {{- toYaml . | nindent 4 }}
@@ -470,15 +495,14 @@ Arguments: dict "ctx" $ "sidecar" bool
     {{- toYaml . | nindent 4 }}
   {{- end }}
   # Both probes are a real broker client over the real socket. `capabilities` is evaluated from
-  # policy and the constraint catalog and appends no audit record, so probing does not consume the
-  # audit log's bounded record budget.
+  # policy and the constraint catalog and appends no audit record.
   startupProbe:
     exec:
-      command: ["dekopon-run", "broker", "capabilities", "--socket", "{{ $.Values.paths.runtimeDir }}/broker.sock"]
+      command: ["dekopon-brokerd", "probe", "--socket", "{{ $.Values.paths.runtimeDir }}/broker.sock"]
     {{- toYaml $.Values.broker.startupProbe | nindent 4 }}
   readinessProbe:
     exec:
-      command: ["dekopon-run", "broker", "capabilities", "--socket", "{{ $.Values.paths.runtimeDir }}/broker.sock"]
+      command: ["dekopon-brokerd", "probe", "--socket", "{{ $.Values.paths.runtimeDir }}/broker.sock"]
     {{- toYaml $.Values.broker.readinessProbe | nindent 4 }}
   resources:
     {{- toYaml $.Values.broker.resources | nindent 4 }}
@@ -490,6 +514,7 @@ Arguments: dict "ctx" $ "sidecar" bool
       mountPath: {{ $.Values.paths.runtimeDir }}
     - name: state
       mountPath: {{ $.Values.paths.stateDir }}
+      subPath: broker
 {{- range $.Values.broker.secretSourceVolumes }}
     - name: {{ .name }}
       mountPath: {{ .mountPath }}

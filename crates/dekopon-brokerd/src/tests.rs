@@ -57,16 +57,14 @@ fn write_config(path: &Path, document: &serde_json::Value) {
 /// grant, a mapping inside that grant, a policy file, and the constraint set the policy's
 /// capability needs.
 ///
-/// The gateway takes its own UID because that is the only shape in which `via` is real isolation.
-/// `run` separately refuses any configured UID other than the server's, so this remains
-/// configuration-level validation of a deployment the socket cannot yet express.
+/// The two peers under other UIDs are what `via` is for, and reaching them needs a group-traversable
+/// socket parent: under a private one `run` refuses both at startup, so a caller that runs this
+/// configuration chooses the parent's mode deliberately.
 fn attested_document(uid: u32) -> serde_json::Value {
     json!({
         "apiVersion": config::CONFIG_API_VERSION,
         "socketPath": "broker.sock",
         "auditPath": "audit.jsonl",
-        "checkpointPath": "checkpoint.json",
-        "checkpointLockPath": "checkpoint.lock",
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "policiesPath": "policies.cedar",
@@ -82,6 +80,11 @@ fn attested_document(uid: u32) -> serde_json::Value {
                 "principal": "gateway",
                 "actor": {"type": "service", "principal": "gateway"},
                 "attestor": {"namespaces": ["slack.t0123abc"]}
+            },
+            {
+                "uid": uid + 2,
+                "principal": "console",
+                "actor": {"type": "service", "principal": "console"}
             }
         ],
         "identityMappings": [
@@ -230,6 +233,8 @@ async fn managed_provider_configuration_is_strict_and_network_free() {
     );
     assert_eq!(resolved.locked_providers.as_ref().map(Vec::len), Some(1));
 
+    // This fixture directory is private, so the server's own UID is the only peer a socket bound
+    // under it could admit; `run` refuses the other two.
     let mut runnable = document.clone();
     runnable["identities"] = json!([document["identities"][0].clone()]);
     write_config(&path, &runnable);
@@ -252,6 +257,63 @@ async fn managed_provider_configuration_is_strict_and_network_free() {
         .await
         .expect_err("a locked blob with another link is not trusted startup input");
     assert!(matches!(error, config::ConfigError::ProviderLock { .. }));
+}
+
+/// A peer that could never open the socket is the misconfiguration this refusal exists for: a
+/// private parent yields an owner-only socket, so a gateway under another UID loops on EACCES while
+/// the broker's own probe still reports healthy. Every offender is named at once, because an
+/// operator who corrects one at a time only reaches the next failed start.
+#[tokio::test]
+async fn every_peer_uid_a_private_socket_parent_excludes_is_named_at_startup() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create configuration fixture");
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        .expect("private fixture directory");
+    let path = directory.path().join("broker.yaml");
+    write_owner_only(
+        &directory.path().join("policies.cedar"),
+        POLICIES.as_bytes(),
+    );
+    let component = fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("examples/providers/echo-provider.wasm"),
+    )
+    .expect("checked echo component");
+    write_owner_only(&directory.path().join("echo.wasm"), &component);
+    // The socket keeps its own parent: the audit log's parent must stay private whatever the
+    // socket's does, so one directory cannot express both deployments.
+    let socket_parent = directory.path().join("run");
+    fs::create_dir(&socket_parent).expect("create socket parent");
+    fs::set_permissions(&socket_parent, fs::Permissions::from_mode(0o700))
+        .expect("private socket parent");
+
+    let mut document = attested_document(uid);
+    document["socketPath"] = json!("run/broker.sock");
+    write_config(&path, &document);
+    let error = super::run(&path, async {})
+        .await
+        .expect_err("an owner-only socket cannot admit the gateway or the console peer");
+    let super::BrokerdError::UnreachablePeerUids { configured, server } = &error else {
+        panic!("the refusal must name the peers it is about: {error}");
+    };
+    assert_eq!(*configured, vec![uid + 1, uid + 2]);
+    assert_eq!(*server, uid);
+    let message = error.to_string();
+    for named in [uid + 1, uid + 2, uid] {
+        assert!(
+            message.contains(&named.to_string()),
+            "UID {named} is missing from the refusal: {message}"
+        );
+    }
+
+    // Group traversal on that parent is the deployment those peers need, and it is the only thing
+    // that changes here.
+    fs::set_permissions(&socket_parent, fs::Permissions::from_mode(0o710))
+        .expect("IPC socket parent");
+    super::run(&path, async {})
+        .await
+        .expect("a group-traversable socket parent admits every configured peer");
 }
 
 /// Grants and mappings are owner-controlled identity machinery, so both fail closed on the shapes
@@ -345,8 +407,6 @@ async fn strict_configuration_resolves_paths_and_rejects_unknown_fields() {
         "apiVersion": config::CONFIG_API_VERSION,
         "socketPath": "broker.sock",
         "auditPath": "audit.jsonl",
-        "checkpointPath": "checkpoint.json",
-        "checkpointLockPath": "checkpoint.lock",
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "providers": ["echo.wasm"],
@@ -373,24 +433,50 @@ async fn strict_configuration_resolves_paths_and_rejects_unknown_fields() {
         canonical_directory.join("broker.sock")
     );
     assert_eq!(resolved.audit_path, canonical_directory.join("audit.jsonl"));
-    assert_eq!(
-        resolved.checkpoint_path,
-        canonical_directory.join("checkpoint.json")
-    );
-    assert_eq!(
-        resolved.checkpoint_lock_path,
-        canonical_directory.join("checkpoint.lock")
-    );
     assert_eq!(resolved.providers, [canonical_directory.join("echo.wasm")]);
 
     let mut conflicting = document.clone();
-    conflicting["checkpointLockPath"] = json!("checkpoint.json.tmp");
+    conflicting["auditPath"] = json!("broker.sock");
     fs::write(
         &path,
         serde_json::to_vec(&conflicting).expect("conflict fixture serializes"),
     )
     .expect("replace config fixture");
-    assert!(config::load(&path, uid).await.is_err());
+    assert!(matches!(
+        config::load(&path, uid).await,
+        Err(config::ConfigError::ConflictingPaths)
+    ));
+
+    for key in ["checkpointPath", "checkpointLockPath"] {
+        let mut retired = document.clone();
+        retired[key] = json!("retired");
+        fs::write(
+            &path,
+            serde_json::to_vec(&retired).expect("fixture serializes"),
+        )
+        .expect("replace config fixture");
+        let error = config::load(&path, uid)
+            .await
+            .expect_err("retired key is unknown");
+        assert!(matches!(error, config::ConfigError::Decode { source }
+            if source.to_string().contains("unknown field") && source.to_string().contains(key)));
+    }
+
+    let mut retired = document.clone();
+    retired["serverLimits"] = json!({
+        "maxFrameBytes": dekopon_broker_protocol::DEFAULT_MAX_FRAME_BYTES,
+        "ioTimeoutMs": 30000,
+        "maxConnections": config::DEFAULT_MAX_CONNECTIONS,
+        "auditMaxLineBytes": dekopon_broker::DEFAULT_MAX_AUDIT_LINE_BYTES,
+        "shutdownGraceMs": 120000,
+        "auditMaxRecords": 200000
+    });
+    write_config(&path, &retired);
+    let error = config::load(&path, uid)
+        .await
+        .expect_err("retired server limit is unknown");
+    assert!(matches!(error, config::ConfigError::Decode { source }
+        if source.to_string().contains("unknown field") && source.to_string().contains("auditMaxRecords")));
 
     let mut invalid = document;
     invalid["principal"] = json!("payload-forgery");
@@ -412,8 +498,6 @@ async fn telemetry_section_is_optional_and_strict() {
         "apiVersion": config::CONFIG_API_VERSION,
         "socketPath": "broker.sock",
         "auditPath": "audit.jsonl",
-        "checkpointPath": "checkpoint.json",
-        "checkpointLockPath": "checkpoint.lock",
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "providers": ["echo.wasm"],
@@ -585,8 +669,6 @@ fn provider_config(uid: u32, providers: serde_json::Value) -> serde_json::Value 
         "apiVersion": config::CONFIG_API_VERSION,
         "socketPath": "broker.sock",
         "auditPath": "audit.jsonl",
-        "checkpointPath": "checkpoint.json",
-        "checkpointLockPath": "checkpoint.lock",
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "providers": providers,
@@ -1039,7 +1121,6 @@ async fn refused_storage_and_frame_bounds_keep_the_field_that_refused_them() {
         "maxFrameBytes": dekopon_broker_protocol::DEFAULT_MAX_FRAME_BYTES,
         "ioTimeoutMs": 0,
         "maxConnections": config::DEFAULT_MAX_CONNECTIONS,
-        "auditMaxRecords": dekopon_broker::DEFAULT_MAX_AUDIT_RECORDS,
         "auditMaxLineBytes": dekopon_broker::DEFAULT_MAX_AUDIT_LINE_BYTES,
         "shutdownGraceMs": 120_000
     });
@@ -1157,66 +1238,6 @@ fn storage_section_is_optional_all_or_nothing_and_strict() {
         serde_json::from_value::<config::BrokerdConfig>(document).is_err(),
         "presence requires every storage field"
     );
-}
-
-/// The shutdown budget is one grace, not one per listener. Both listeners have already stopped
-/// accepting when this runs, so a broker drain that spends the whole grace must not then hand the
-/// storage GC and the web UI a fresh full grace each — that is how a 120 s `shutdownGraceMs`
-/// became a 360 s exit against a 180 s `terminationGracePeriodSeconds`.
-#[tokio::test(start_paused = true)]
-async fn every_drain_shares_one_grace() {
-    let grace = std::time::Duration::from_secs(120);
-    let started = tokio::time::Instant::now();
-    let report = super::drain_services(
-        started + grace,
-        async {
-            tokio::time::sleep(grace).await;
-            Ok(())
-        },
-        tokio::time::sleep(grace * 3 / 4),
-        Some(async {
-            tokio::time::sleep(grace * 3 / 4).await;
-            Ok(())
-        }),
-    )
-    .await;
-
-    let elapsed = started.elapsed();
-    assert!(
-        elapsed < grace * 2,
-        "three drains that each fit one grace must not take three: {elapsed:?}"
-    );
-    assert!(report.broker.is_ok());
-    assert!(!report.storage_gc_timed_out);
-    assert!(!report.web_timed_out);
-    assert!(matches!(report.web, Some(Ok(()))));
-}
-
-/// And the deadline is shared rather than restarted, so a drain that outlives it is reported
-/// instead of being given the grace over again.
-#[tokio::test(start_paused = true)]
-async fn a_drain_past_the_shared_deadline_times_out() {
-    let grace = std::time::Duration::from_secs(120);
-    let started = tokio::time::Instant::now();
-    let report = super::drain_services(
-        started + grace,
-        async {
-            tokio::time::sleep(grace / 2).await;
-            Ok(())
-        },
-        tokio::time::sleep(grace * 4),
-        Some(async {
-            tokio::time::sleep(grace * 4).await;
-            Ok(())
-        }),
-    )
-    .await;
-
-    let elapsed = started.elapsed();
-    assert!(elapsed < grace * 2, "{elapsed:?}");
-    assert!(report.storage_gc_timed_out);
-    assert!(report.web_timed_out);
-    assert!(report.web.is_none());
 }
 
 /// The startup frame check exists so an oversized capability response fails here rather than on
@@ -1346,4 +1367,119 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
     );
     validate_capability_responses(&broker, &identities, ceiling_bytes)
         .expect("a frame that carries the widest answer starts");
+}
+
+#[tokio::test]
+async fn ipc_group_socket_keeps_private_paths_private_and_replaces_only_safe_stale_sockets() {
+    use dekopon_broker_protocol::{BrokerClient, ClientError, FrameLimits};
+    use std::os::unix::fs::MetadataExt as _;
+
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("IPC fixture");
+    let path = directory.path().join("broker.sock");
+    for mode in [0o700, 0o710, 0o750, 0o2710] {
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(mode)).unwrap();
+        let (listener, mut guard) = socket::bind(&path, uid).await.expect("safe IPC parent");
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        assert_eq!(metadata.uid(), uid);
+        assert_eq!(
+            metadata.permissions().mode() & 0o7777,
+            if mode == 0o700 { 0o600 } else { 0o660 }
+        );
+        if mode != 0o700 {
+            assert_eq!(
+                metadata.gid(),
+                fs::metadata(directory.path()).unwrap().gid()
+            );
+            assert!(
+                socket::validate_private_parent(&path, uid).is_err(),
+                "audit/cache parents stay private"
+            );
+        }
+        assert!(matches!(
+            socket::bind(&path, uid).await,
+            Err(super::SocketError::AlreadyRunning { .. })
+        ));
+        drop(listener);
+        // Keep the inode at the original path while relinquishing the first guard.
+        let parked = directory.path().join("parked.sock");
+        fs::rename(&path, &parked).unwrap();
+        guard.cleanup().unwrap();
+        fs::rename(&parked, &path).unwrap();
+        let (listener, mut replacement) = socket::bind(&path, uid)
+            .await
+            .expect("safe stale IPC socket");
+        drop(listener);
+        replacement.cleanup().unwrap();
+    }
+    for mode in [0o770, 0o730, 0o740, 0o711, 0o751, 0o777, 0o1770] {
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(mode)).unwrap();
+        assert!(
+            matches!(
+                socket::bind(&path, uid).await,
+                Err(super::SocketError::InsecureParent { .. })
+            ),
+            "unsafe parent {mode:o}"
+        );
+    }
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o710)).unwrap();
+    assert!(socket::bind(&path, uid.wrapping_add(1)).await.is_err());
+    let alias = directory.path().join("alias");
+    std::os::unix::fs::symlink(directory.path(), &alias).unwrap();
+    assert!(socket::bind(&alias.join("broker.sock"), uid).await.is_err());
+    fs::remove_file(&alias).unwrap();
+    fs::write(&path, "not a socket").unwrap();
+    assert!(socket::bind(&path, uid).await.is_err());
+    fs::remove_file(&path).unwrap();
+    std::os::unix::fs::symlink("missing", &path).unwrap();
+    assert!(socket::bind(&path, uid).await.is_err());
+    fs::remove_file(&path).unwrap();
+
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    for mode in [0o666, 0o661, 0o670, 0o760, 0o1660] {
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+        assert!(matches!(
+            socket::bind(&path, uid).await,
+            Err(super::SocketError::InsecureSocket { .. })
+        ));
+        let client = BrokerClient::new(&path, uid, FrameLimits::default()).unwrap();
+        assert!(matches!(
+            client.capabilities().await,
+            Err(ClientError::UnsafeSocket)
+        ));
+    }
+
+    // Parent modes are half of the same rule, so both sides are pinned against the same directory.
+    // A shared-IPC socket belongs to the `0700` refusals as well: the broker binds under a private
+    // parent, but never this socket, and a client that trusted it would be trusting one the broker
+    // would refuse to reopen.
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).unwrap();
+    let limits = FrameLimits {
+        max_frame_bytes: 64 * 1024,
+        io_timeout: std::time::Duration::from_millis(200),
+    };
+    for mode in [0o770, 0o730, 0o740, 0o711, 0o751, 0o777, 0o1770, 0o700] {
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(mode)).unwrap();
+        assert!(
+            socket::bind(&path, uid).await.is_err(),
+            "the broker bound under parent {mode:o}"
+        );
+        let client = BrokerClient::new(&path, uid, limits).unwrap();
+        assert!(
+            matches!(client.capabilities().await, Err(ClientError::UnsafeSocket)),
+            "the client trusted parent {mode:o}"
+        );
+    }
+    // The parents the broker does bind a shared socket under are the parents its clients reach it
+    // through: nothing here answers, so the exchange fails on the read deadline instead.
+    for mode in [0o710, 0o750, 0o2710] {
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(mode)).unwrap();
+        let client = BrokerClient::new(&path, uid, limits).unwrap();
+        assert!(
+            !matches!(client.capabilities().await, Err(ClientError::UnsafeSocket)),
+            "the client refused parent {mode:o} the broker binds under"
+        );
+    }
+    drop(listener);
+    fs::remove_file(path).unwrap();
 }

@@ -9,10 +9,8 @@
 //! Which capability that is, is the embedder's choice, not the script's: the target is fixed for
 //! the whole execution and a script cannot redirect it.
 //!
-//! Phase 1 wiring note: `dekopon-run shell` is direct mode, whose Wasmtime linker is empty by
-//! design and can never instantiate an HTTP-importing component. `curl` therefore cannot make a
-//! real network call there, and that is correct rather than a gap. Real broker-backed HTTP arrives
-//! with the broker-backed runner path in a later phase.
+//! A broker-backed embedder submits the proposal over the existing broker protocol. Only the
+//! separate broker may authorize HTTP or resolve a separately authorized secret-use proposal.
 
 use dekopon_core::{SecretDrn, SecretUseProposal};
 use serde_json::{Value, json};

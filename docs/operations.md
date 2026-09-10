@@ -6,29 +6,21 @@ broker is [`crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.
 gateway it is [`dekopond.md`](dekopond.md). This page exists so an operator can find them by the
 question they arrived with, rather than by guessing that a crate README is the operations manual.
 
-One instruction is restated here because it is the most consequential in the project and must not be
-reachable only by guessing.
+## Append-only audit and process-local replay
 
-## The audit chain and its checkpoint
+`dekopon-brokerd` appends metadata-only records to an owner-only JSONL file. Startup counts
+bounded newline-delimited records for the next ordinal without decoding or verifying history;
+unterminated tails are refused, not repaired. Appends are flushed, not fsynced. A failed or
+cancelled append can leave partial bytes and poisons the open handle.
 
-> **A non-empty audit log with no checkpoint fails closed and requires explicit operator recovery
-> from trusted copies. So does any checkpoint that is not an exact verified prefix of the audit
-> file. Do not delete one file to make the broker start.**
+Replay rejection is bounded to the current broker process. Restart creates an empty replay
+ledger: persisted audit records do not restore invocation IDs or establish whether retrying an
+external effect is safe. There is no tamper-detection, rollback protection, or crash-recovery
+promise. Preserve audit data when investigating an append failure; do not erase it to bypass a
+startup refusal.
 
-`dekopon-brokerd` keeps a hash-linked JSONL audit chain and, in a separately locked file, a
-checkpoint holding the retained record count and the SHA-256 chain head. At startup the checkpoint
-must identify an exact prefix of the fully verified chain; that is what detects replacement,
-truncation, and valid-prefix rollback. An audit exactly one record ahead of a valid checkpoint is the
-recoverable crash window and is advanced before the broker listens. A larger gap is not.
-
-Deleting the checkpoint does not repair the state — it destroys the evidence that would have told you
-what happened. Recovery means restoring both files from copies you trust.
-
-`dekopon-brokerd audit verify --audit-path <PATH>` runs that same chain check offline, against a
-live log or a retained copy, without starting the broker.
-
-Full mechanics, filesystem requirements, and the limits of local integrity evidence:
-[`crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.md#audit-checkpoint-and-recovery).
+Full append mechanics, bounds, and private-file requirements:
+[`crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.md#audit).
 
 ## By the question you arrived with
 
@@ -38,26 +30,25 @@ Full mechanics, filesystem requirements, and the limits of local integrity evide
 |---|---|
 | What files and directories must exist, and with what ownership and modes? | [`dekopon-brokerd` § Configuration](../crates/dekopon-brokerd/README.md#configuration) |
 | How do I resolve, materialize, list, or verify a managed provider set? | [`dekopon-brokerd` § Managed provider sets](../crates/dekopon-brokerd/README.md#managed-provider-sets) — normal startup, `list`, and `verify` are offline; successful lock changes apply after restart |
-| Is a retained audit log still intact? | [`dekopon-brokerd` § Verifying a chain offline](../crates/dekopon-brokerd/README.md#verifying-a-chain-offline) — `audit verify` reports the record count and head, or names the record that broke the chain |
 | Why did a managed provider refuse to load? | The same section distinguishes desired references, the generated manifest/component lock, installed blob hygiene, and complete host validation. A digest proves bytes, not publisher provenance. |
-| Why did the broker refuse to start? | [`dekopon-brokerd` § Configuration](../crates/dekopon-brokerd/README.md#configuration) for path and permission refusals; [`broker-http.md` § Startup validation](broker-http.md#startup-validation) for policy refusals |
+| Why did the broker refuse to start? | [`dekopon-brokerd` § Configuration](../crates/dekopon-brokerd/README.md#configuration) for path and permission refusals; [`dekopon-brokerd` contract § Startup validation](../crates/dekopon-brokerd/README.md#catalog-ownership-at-policy-startup) for policy refusals |
 | Why did the gateway refuse to start? | [`dekopond.md` § Startup fails closed](dekopond.md#startup-fails-closed) |
 | What does shutdown actually do, and how long may it take? | [`dekopon-brokerd` § Configuration](../crates/dekopon-brokerd/README.md#configuration) — signals, draining, and the grace that must cover one host deadline plus two frame deadlines |
 | Why does startup take so long, and can a restart skip recompiling every component? | [`dekopon-brokerd` § Compilation cache and the concurrent memory budget](../crates/dekopon-brokerd/README.md#compilation-cache-and-the-concurrent-memory-budget) — `compileCachePath` is optional; absent, Cranelift recompiles every component before the socket binds, which is what the chart's startup probe budget ([`charts/dekopon/README.md` § Probes](../charts/dekopon/README.md#probes)) is sized to cover |
 | In what order do I restart the two daemons? | [`upgrading.md`](upgrading.md#restart-the-broker-first-and-stop-it-last) |
 | This release changed configuration — what do I edit? | [`upgrading.md`](upgrading.md) |
-| Can I run a newer broker against an older gateway? | No. [`broker-http.md` § Version and compatibility](broker-http.md#version-and-compatibility) |
+| Can I run a newer broker against an older gateway? | No. [`dekopon-brokerd` contract § Version and compatibility](../crates/dekopon-broker-protocol/README.md#version-and-compatibility) |
 
 ### Authority, policy, and credentials
 
 | Question | Read |
 |---|---|
 | Who may drive which agent, and where is that written? | [`dekopon-brokerd` § Policy](../crates/dekopon-brokerd/README.md#policy) |
-| How narrowly does an authorized invocation actually run? | [`broker-http.md` § Broker HTTP enforcement](broker-http.md#broker-http-enforcement) |
-| Where do legacy provider credentials live, and how are they bound to a destination? | [`broker-http.md` § Broker HTTP enforcement](broker-http.md#broker-http-enforcement) and [`dekopon-brokerd` § One capability, one token per agent](../crates/dekopon-brokerd/README.md#one-capability-one-token-per-agent) |
+| How narrowly does an authorized invocation actually run? | [`dekopon-brokerd` contract § Broker HTTP enforcement](../crates/dekopon-http-host/README.md#request-and-credential-boundary) |
+| Where do legacy provider credentials live, and how are they bound to a destination? | [`dekopon-brokerd` contract § Broker HTTP enforcement](../crates/dekopon-http-host/README.md#request-and-credential-boundary) and [`dekopon-brokerd` § One capability, one token per agent](../crates/dekopon-brokerd/README.md#one-capability-one-token-per-agent) |
 | How may an agent name a secret without seeing it, and which stores can back it? | [`secrets.md`](secrets.md) — DRNs, dual policy, private bindings, source adapters, path scope, bootstrap, rotation and reflection limits |
 | Why did a DRN return `secret-denied`? | The same document: unknown, unbound, wrong-sink/username and policy-denied names intentionally share one result; inspect broker-side policy/map validation rather than probing names. |
-| A grant looks right and every session is denied. | Check the agent name. [`broker-http.md` § Startup validation](broker-http.md#startup-validation) — agent literals are the one class that is not proved at startup |
+| A grant looks right and every session is denied. | Check the agent name. [`dekopon-brokerd` contract § Startup validation](../crates/dekopon-brokerd/README.md#catalog-ownership-at-policy-startup) — agent literals are the one class that is not proved at startup |
 | What does an agent's catalog entry actually decide? | [`catalog.md`](catalog.md) |
 | How do I get a ChatGPT credential onto a host or into a pod? | [`chatgpt-credential.md`](chatgpt-credential.md), and [`1password-eso.md`](1password-eso.md) for the secret store |
 
@@ -66,10 +57,8 @@ Full mechanics, filesystem requirements, and the limits of local integrity evide
 | Question | Read |
 |---|---|
 | What do the traces, spans, and audit-safe logs contain? | [`observability.md`](observability.md) |
-| What did a session actually say and run, after the fact? | [`observability.md` § Reading sessions back](observability.md#reading-sessions-back) — `dekopon-run session list`, `show`, and `replay` query the OpenObserve receiver the runner and gateway export to; a session recorded with payload telemetry off still lists, but `show` and `replay` find its accounted turns and no transcript |
-| What is the dashboard, and what does exposing it disclose? | [`dekopon-brokerd` § Read-only web UI](../crates/dekopon-brokerd/README.md#read-only-web-ui) |
-| A client got a failure code — is it safe to resubmit? | [`broker-http.md` § Failure codes](broker-http.md#failure-codes) |
-| An invocation may have taken effect and was not recorded. | `outcome-unaudited`, in the same table. The durable audit is the only record; do not resubmit under any identifier |
+| A client got a failure code — is it safe to resubmit? | [`dekopon-brokerd` contract § Failure codes](../crates/dekopon-broker-protocol/README.md#failure-codes) |
+| An invocation may have taken effect and was not recorded. | `outcome-unaudited`, in the same table. The terminal audit record may be missing; the effect may have happened. Do not resubmit under any identifier |
 
 ### Deploying
 
@@ -86,14 +75,12 @@ These are invariants, not defaults, and no operational convenience overrides the
 is [`dekopon-brokerd` § Boundaries](../crates/dekopon-brokerd/README.md#boundaries); the two that
 most often come up while operating are:
 
-- **The owner-only socket is one UID trust domain.** Every process running under that UID can act as
-  its configured principal. An attestor grant buys attribution and deny-by-default scoping in that
-  shape, not process separation. A dedicated gateway UID is committed direction, not current
-  behavior.
-- **The checkpoint is local integrity evidence, not tamper-proof storage.** It detects truncation and
-  rollback relative to a retained checkpoint. Coordinated deletion of both files by whoever owns the
-  host is not detectable from local state; retain or export checkpoint generations elsewhere if that
-  is in your threat model.
+- **IPC group membership is not identity.** The [current local process boundary](security-model.md#current-local-process-boundary)
+  separates gateway and broker UIDs; the broker maps the real peer UID, not its group.
+  Each mapped UID remains its own trust domain, not independent process attestation.
+- **Audit is append-only evidence, not tamper-proof or crash-durable storage.** Private files and
+  redaction contain access and content; they do not establish historical integrity or recover replay
+  state. A restart is not permission to retry an effect.
 
 [`security-model.md`](security-model.md) is the full statement of what is trusted, what is not, and
 what is presently out of scope.

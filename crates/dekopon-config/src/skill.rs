@@ -113,7 +113,7 @@ impl Skill {
 
     /// The tools the author expected to be pre-approved.
     ///
-    /// Recorded and rendered only. Dekopon's session has one scripting tool whatever a skill
+    /// Recorded as metadata only. Dekopon's session has one scripting tool whatever a skill
     /// says, and authority comes from broker policy rather than from a file a model reads.
     #[must_use]
     pub fn allowed_tools(&self) -> Option<&str> {

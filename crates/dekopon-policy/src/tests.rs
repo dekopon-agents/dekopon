@@ -520,7 +520,8 @@ fn world_construction_rejects_duplicates_and_reserved_names() {
     .expect_err("one capability must not route to two providers");
     assert!(matches!(
         duplicate,
-        PolicyBuildError::DuplicateCapability { .. }
+        PolicyBuildError::WorldConflicts { reserved, duplicates }
+            if reserved.is_empty() && duplicates == vec!["echo.echo".parse().expect("valid id")]
     ));
 
     for action in [AGENT_PROMPT_ACTION, SECRET_USE_ACTION] {
@@ -534,7 +535,10 @@ fn world_construction_rejects_duplicates_and_reserved_names() {
             )],
         )
         .expect_err("a capability must not shadow a fixed action");
-        assert!(matches!(reserved, PolicyBuildError::ReservedAction { .. }));
+        assert!(matches!(reserved,
+            PolicyBuildError::WorldConflicts { reserved, duplicates }
+                if duplicates.is_empty() && reserved == vec![action.parse().expect("valid id")]
+        ));
     }
 }
 
@@ -854,4 +858,45 @@ fn secret_use_is_a_separate_exact_resource_decision() {
     )
     .expect_err("unknown DRN refuses startup");
     assert!(matches!(unknown, PolicyBuildError::UnknownSecret { .. }));
+}
+
+#[test]
+fn world_refusal_names_all_reserved_and_duplicate_capabilities() {
+    let error = PolicyWorld::new(
+        [],
+        [
+            "secret.use",
+            "echo.two",
+            "agent.prompt",
+            "echo.one",
+            "echo.two",
+            "echo.one",
+        ]
+        .map(|name| {
+            (
+                name.parse().expect("valid id"),
+                "echo".parse().expect("valid provider"),
+            )
+        }),
+    )
+    .expect_err("all conflicts refuse the world");
+    let rendered = error.to_string();
+    for name in ["agent.prompt", "secret.use", "echo.one", "echo.two"] {
+        assert!(rendered.contains(name), "missing {name}: {rendered}");
+    }
+    let PolicyBuildError::WorldConflicts {
+        reserved,
+        duplicates,
+    } = error
+    else {
+        panic!("expected world conflicts");
+    };
+    assert_eq!(
+        reserved,
+        ["agent.prompt", "secret.use"].map(|id| id.parse().expect("valid id"))
+    );
+    assert_eq!(
+        duplicates,
+        ["echo.one", "echo.two"].map(|id| id.parse().expect("valid id"))
+    );
 }

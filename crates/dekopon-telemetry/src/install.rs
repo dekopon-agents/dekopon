@@ -93,6 +93,12 @@ impl Console {
                 .json()
                 .flatten_event(true)
                 .with_current_span(true)
+                .event_format(CorrelatedJson(
+                    fmt::format()
+                        .json()
+                        .flatten_event(true)
+                        .with_current_span(true),
+                ))
                 .with_writer(writer)
                 .with_filter(filter)
                 .boxed(),
@@ -113,6 +119,43 @@ impl Console {
                 }
             }
         }
+    }
+}
+
+/// Delegate all existing JSON fields to tracing-subscriber; only native context adds IDs.
+struct CorrelatedJson(fmt::format::Format<fmt::format::Json>);
+
+impl<S, N> fmt::FormatEvent<S, N> for CorrelatedJson
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    N: for<'a> fmt::FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        context: &fmt::FmtContext<'_, S, N>,
+        mut writer: fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        use opentelemetry::trace::TraceContextExt as _;
+        // Subscriber callbacks cannot re-enter the tracing dispatcher. The OTel layer
+        // activates this same native context on span entry, independently of callbacks.
+        let native = opentelemetry::Context::current();
+        let span = native.span();
+        let ids = span.span_context();
+        if !ids.is_valid() {
+            return self.0.format_event(context, writer, event);
+        }
+        let mut json = String::new();
+        self.0
+            .format_event(context, fmt::format::Writer::new(&mut json), event)?;
+        // The delegated formatter always emits one JSON object and a newline.
+        let object = json.strip_suffix("}\n").ok_or(std::fmt::Error)?;
+        writeln!(
+            writer,
+            "{object},\"trace_id\":\"{}\",\"span_id\":\"{}\"}}",
+            ids.trace_id(),
+            ids.span_id(),
+        )
     }
 }
 
@@ -358,6 +401,74 @@ mod tests {
 
     use super::{TelemetryGuard, otlp_filter};
 
+    #[derive(Clone, Default)]
+    struct Output(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Output {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("output").extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn json_ids_match_native_context_and_are_absent_without_it() {
+        use opentelemetry::trace::TracerProvider as _;
+        use tracing_subscriber::fmt;
+
+        for enabled in [false, true] {
+            let output = Output::default();
+            let writer = output.clone();
+            let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+            let console = fmt::layer()
+                .json()
+                .flatten_event(true)
+                .event_format(super::CorrelatedJson(
+                    fmt::format().json().flatten_event(true),
+                ))
+                .with_writer(move || writer.clone());
+            let subscriber = registry().with(console).with(
+                enabled
+                    .then(|| tracing_opentelemetry::layer().with_tracer(provider.tracer("test"))),
+            );
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(retained = 7, "outside");
+                let span = tracing::info_span!("native", retained_span = 8);
+                let _entered = span.enter();
+                let native = crate::current_trace_context();
+                tracing::info!(retained = 9, "inside");
+                let text = String::from_utf8(output.0.lock().expect("output").clone())
+                    .expect("UTF-8 JSON");
+                let lines: Vec<_> = text.lines().collect();
+                assert_eq!(lines.len(), 2);
+                assert!(!lines[0].contains("trace_id"));
+                assert!(!lines[0].contains("span_id"));
+                assert!(lines[0].contains("\"retained\":7"));
+                assert!(lines[1].contains("\"retained\":9"));
+                assert!(lines[1].contains("\"retained_span\":8"));
+                if let Some(parts) = native {
+                    assert!(enabled);
+                    assert!(lines[1].contains(&format!(
+                        "\"trace_id\":\"{}\"",
+                        opentelemetry::trace::TraceId::from_bytes(parts.trace_id)
+                    )));
+                    assert!(lines[1].contains(&format!(
+                        "\"span_id\":\"{}\"",
+                        opentelemetry::trace::SpanId::from_bytes(parts.span_id)
+                    )));
+                } else {
+                    assert!(!enabled);
+                    assert!(!lines[1].contains("trace_id"));
+                    assert!(!lines[1].contains("span_id"));
+                }
+            });
+            provider.shutdown().expect("shutdown");
+        }
+    }
+
     /// Records the target of every event a layer is actually asked to handle.
     #[derive(Clone, Default)]
     struct RecordTargets(Arc<Mutex<Vec<String>>>);
@@ -381,9 +492,9 @@ mod tests {
     fn an_otlp_layer_never_sees_the_exporters_own_records() {
         for directive in [
             // A caller that named only its own crates.
-            "dekopon_run=trace",
+            "dekopond=trace",
             // A caller that silenced the exporter itself; the guarantee is idempotent.
-            "dekopon_run=trace,opentelemetry=off",
+            "dekopond=trace,opentelemetry=off",
             // A caller that admitted everything. Without the appended directive this layer would
             // export every diagnostic the export itself produced.
             "trace",
@@ -395,20 +506,20 @@ mod tests {
                 tracing::error!(target: "opentelemetry", "api diagnostic");
                 tracing::error!(target: "opentelemetry-sdk", "sdk diagnostic");
                 tracing::error!(target: "opentelemetry-otlp", "exporter diagnostic");
-                tracing::info!(target: "dekopon_run", "runner event");
+                tracing::info!(target: "dekopond", "gateway event");
             });
 
             assert_eq!(
                 *recorded.0.lock().expect("target log"),
-                vec!["dekopon_run".to_owned()],
+                vec!["dekopond".to_owned()],
                 "{directive}"
             );
         }
     }
 
-    /// A process that configured no exporter still runs this on the way out — the runner without
-    /// an OTLP endpoint, the broker's offline provider mode — and must not report a failure for
-    /// having nothing to flush.
+    /// A process that configured no exporter still runs this on the way out — a daemon started
+    /// without an OTLP endpoint, the broker's offline provider mode — and must not report a failure
+    /// for having nothing to flush.
     #[test]
     fn a_guard_without_exporters_shuts_down_cleanly() {
         let guard = TelemetryGuard {

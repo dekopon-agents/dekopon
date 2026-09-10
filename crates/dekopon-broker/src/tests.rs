@@ -1,4 +1,4 @@
-use std::{fs, sync::Arc};
+use std::fs;
 
 #[cfg(unix)]
 use std::os::unix::fs::{PermissionsExt as _, symlink};
@@ -13,12 +13,11 @@ use dekopon_core::{
 };
 
 use super::{
-    AttestorGrant, AuditConfigurationError, AuditError, AuditEvent, AuditIntegrityError, AuditLog,
-    AuditRecord, AuthenticatedContext, AuthorityEncoder, BrokerBuildError, CapabilityRoute,
-    ChatMemoryConfig, ChatScopeClaim, ChatScopeGrant, ChatTransportKind, ConstraintSet,
-    ContextError, FileAuditError, FileAuditLog, InMemoryAuditLog, canonical_chat_scope,
-    encode_execution_constraints, encode_host_limits, encode_memory_config, encode_storage_limits,
-    verify_audit_chain,
+    AttestorGrant, AuditConfigurationError, AuditError, AuditEvent, AuditLog, AuditRecord,
+    AuthenticatedContext, AuthorityEncoder, BrokerBuildError, CapabilityRoute, ChatMemoryConfig,
+    ChatScopeClaim, ChatScopeGrant, ChatTransportKind, ConstraintSet, ContextError, FileAuditError,
+    FileAuditLog, InMemoryAuditLog, canonical_chat_scope, encode_execution_constraints,
+    encode_host_limits, encode_memory_config, encode_storage_limits,
 };
 
 /// A terminal execution event, for the record shapes a decision-only fixture never reaches.
@@ -195,13 +194,17 @@ fn memory_composition_reserves_dedup_calls_and_pre_compaction_peak() {
         "two final partial chunks are charged at their requested 256 KiB bounds"
     );
 
-    // The old threshold + target estimate fit in 30 MiB; the real old+staged peak can hold two
-    // near-threshold turn files plus both permanent-dedup copies and transaction metadata.
+    // The direct live peak includes the post-append turn file, permanent dedup, and metadata.
     let too_small_namespace = dekopon_storage_host::StorageLimits {
-        max_namespace_bytes: 30 * 1024 * 1024,
+        max_namespace_bytes: 16 * 1024 * 1024,
         ..dekopon_storage_host::StorageLimits::default()
     };
     assert!(memory.validate(&too_small_namespace).is_err());
+    let formerly_staged_copy_rejection = dekopon_storage_host::StorageLimits {
+        max_namespace_bytes: 30 * 1024 * 1024,
+        ..dekopon_storage_host::StorageLimits::default()
+    };
+    assert!(memory.validate(&formerly_staged_copy_rejection).is_ok());
 
     let exact_write_call = dekopon_storage_host::StorageLimits {
         max_write_bytes_per_call: memory.compaction_target_bytes,
@@ -226,9 +229,9 @@ fn memory_composition_reserves_dedup_calls_and_pre_compaction_peak() {
     };
     assert!(memory.validate(&one_below_file_limit).is_err());
 
-    let exact_namespace = memory.compaction_threshold_bytes * 2
+    let exact_namespace = memory.compaction_threshold_bytes
         + memory.max_turn_bytes
-        + memory.max_dedup_bytes * 2
+        + memory.max_dedup_bytes
         + 32 * 4_096;
     let exact_namespace_limit = dekopon_storage_host::StorageLimits {
         max_namespace_bytes: exact_namespace,
@@ -439,26 +442,9 @@ fn every_authority_ceiling_is_canonical_and_semantic() {
             v.max_pending_transactions += 1
         }),
         ("startupMaxEntries", |v| v.startup_max_entries += 1),
-        ("startupMaxTransactions", |v| {
-            v.startup_max_transactions += 1
-        }),
         ("maxQuarantinedNamespaces", |v| {
             v.max_quarantined_namespaces += 1
         }),
-        ("retiredGenerationGraceMs", |v| {
-            v.retired_generation_grace_ms += 1
-        }),
-        ("retiredGenerationTtlMs", |v| {
-            v.retired_generation_ttl_ms += 1
-        }),
-        ("inactiveNamespaceTtlMs", |v| {
-            v.inactive_namespace_ttl_ms += 1
-        }),
-        ("gcIntervalMs", |v| v.gc_interval_ms += 1),
-        ("gcMaxNamespacesPerPass", |v| {
-            v.gc_max_namespaces_per_pass += 1
-        }),
-        ("gcMaxBytesPerPass", |v| v.gc_max_bytes_per_pass += 1),
     ];
     assert_rotations(&storage, storage_mutations, encoded_storage);
 
@@ -609,7 +595,7 @@ fn pre_execution_storage_failures_keep_their_public_category() {
 }
 
 /// A permanent exhaustion is not a momentary outage. The replay ledger never evicts and is
-/// restored from durable history at startup, and the audit log does not rotate, so a client told
+/// process-local; the bounded in-memory audit does not evict either, so a client told
 /// to resubmit under a fresh identifier would loop against a broker that is capped forever.
 #[test]
 fn exhausted_bounds_are_terminal_rather_than_retriable() {
@@ -669,48 +655,6 @@ async fn a_panicking_storage_materialization_keeps_its_panic_and_its_public_cate
             .to_string()
             .contains("namespace generation pointer is missing"),
         "the panic message was discarded: {cause}"
-    );
-}
-
-/// `storage-outcome-unaudited` used to be the one broker failure with no cause anywhere.
-///
-/// The wire code says the effect may already have happened; the fieldless `OutcomeUnaudited`
-/// behind it said nothing about what made the outcome unknown, and the variant carried no
-/// `#[source]`, so the chain stopped at "storage outcome is unaudited". An operator holding a
-/// poisoned namespace could not tell a full filesystem from an exhausted quota.
-#[test]
-fn an_unaudited_storage_outcome_carries_the_cause_that_ended_finalization() {
-    let invocation = "invoke-unaudited"
-        .parse::<InvocationId>()
-        .expect("valid invocation fixture");
-    let mut rendered = Vec::new();
-    for cause in [
-        dekopon_storage_host::StorageFailureClass::Quota,
-        dekopon_storage_host::StorageFailureClass::Io,
-    ] {
-        let error = super::BrokerError::StorageOutcome {
-            invocation: invocation.clone(),
-            source: dekopon_storage_host::StorageHostError::OutcomeUnaudited { cause },
-        };
-        assert_eq!(
-            error.unaudited_outcome(),
-            Some(&invocation),
-            "naming the cause must not change what the client is told about resubmission"
-        );
-        assert!(
-            std::error::Error::source(&error).is_some(),
-            "the storage failure is not reachable as a source"
-        );
-        let chain = dekopon_core::error_chain(&error);
-        assert!(
-            chain.contains(cause.label()),
-            "{chain} does not name its cause"
-        );
-        rendered.push(chain);
-    }
-    assert_ne!(
-        rendered[0], rendered[1],
-        "a quota failure and an I/O failure must not render identically"
     );
 }
 
@@ -863,33 +807,29 @@ fn authenticated_human_identity_must_match_transport_principal() {
 }
 
 #[tokio::test]
-async fn audit_chain_detects_content_and_link_mutation() {
-    let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
-    audit
-        .append(decision("invoke-one", true))
-        .await
-        .expect("first append succeeds");
-    audit
-        .append(decision("invoke-two", false))
-        .await
-        .expect("second append succeeds");
-    let records = audit.records().await;
-    verify_audit_chain(&records).expect("fresh chain verifies");
-
-    let mut mutated = records.clone();
-    if let AuditEvent::Decision { allowed, .. } = &mut mutated[0].event {
-        *allowed = false;
+async fn audit_record_shape_is_sequence_and_metadata_event() {
+    let audit = InMemoryAuditLog::new(2).expect("bounded log");
+    for (sequence, event) in [
+        (1, decision("invoke-one", true)),
+        (2, execution("invoke-one")),
+    ] {
+        let record = audit.append(event.clone()).await.expect("append");
+        assert_eq!(record.sequence, sequence);
+        assert_eq!(record.event, event);
+        assert_eq!(
+            serde_json::to_value(&record).expect("serialize"),
+            serde_json::json!({"sequence": sequence, "event": event})
+        );
     }
-    assert_eq!(
-        verify_audit_chain(&mutated),
-        Err(AuditIntegrityError::RecordHash { index: 0 })
-    );
-
-    let mut reordered = records;
-    reordered.swap(0, 1);
-    assert_eq!(
-        verify_audit_chain(&reordered),
-        Err(AuditIntegrityError::Sequence { index: 0 })
+    let records = audit.records().await;
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].event, decision("invoke-one", true));
+    assert_eq!(records[1].event, execution("invoke-one"));
+    let mut unknown = serde_json::to_value(&records[0]).expect("serialize");
+    unknown["recordHash"] = serde_json::json!("retired");
+    assert!(
+        serde_json::from_value::<AuditRecord>(unknown).is_err(),
+        "record decoding stays strict"
     );
 }
 
@@ -912,81 +852,47 @@ async fn in_memory_audit_fails_closed_at_its_bound() {
 }
 
 #[tokio::test]
-async fn durable_audit_reopens_verifies_and_continues_the_chain() {
+async fn file_audit_reopens_and_continues_jsonl_ordinals() {
     let directory = tempfile::tempdir().expect("create audit fixture directory");
     let path = directory.path().join("audit.jsonl");
-    let audit = FileAuditLog::open(&path, 4, 16 * 1024)
+    let audit = FileAuditLog::open(&path, 16 * 1024)
         .await
-        .expect("create durable audit");
-    audit
-        .append(decision("invoke-one", true))
+        .expect("create audit");
+    assert_eq!(audit.path(), path);
+    let events = [
+        decision("invoke-one", true),
+        decision("invoke-two", false),
+        decision("invoke-three", true),
+    ];
+    for event in &events[..2] {
+        audit.append(event.clone()).await.expect("append succeeds");
+    }
+    let prior = fs::read(&path).expect("read flushed audit");
+    let error = FileAuditLog::open(&path, 16 * 1024)
         .await
-        .expect("first durable append succeeds");
-    audit
-        .append(decision("invoke-two", false))
-        .await
-        .expect("second durable append succeeds");
-    let checkpoint = audit.checkpoint().await;
-    assert_eq!(checkpoint.0, 2);
-    assert!(checkpoint.1.is_some());
-    assert!(audit.contains_checkpoint(0, None).await);
-    assert!(audit.contains_checkpoint(2, checkpoint.1.as_deref()).await);
-    let first = serde_json::from_str::<AuditRecord>(
-        fs::read_to_string(&path)
-            .expect("read synchronized audit")
-            .lines()
-            .next()
-            .expect("first record exists"),
-    )
-    .expect("first record decodes");
-    assert!(audit.contains_checkpoint(1, Some(&first.record_hash)).await);
-    assert!(!audit.contains_checkpoint(1, checkpoint.1.as_deref()).await);
-    assert!(!audit.contains_checkpoint(3, None).await);
-    let error = FileAuditLog::open(&path, 4, 16 * 1024)
-        .await
-        .expect_err("a second writer must not share the audit file");
+        .expect_err("second writer refused");
     assert!(matches!(error, FileAuditError::Lock { .. }));
     drop(audit);
-
-    let audit = FileAuditLog::open(&path, 4, 16 * 1024)
+    let audit = FileAuditLog::open(&path, 16 * 1024)
         .await
-        .expect("existing chain verifies");
-    assert_eq!(audit.checkpoint().await, checkpoint);
-    assert_eq!(
-        audit
-            .take_replay_ids()
-            .await
-            .iter()
-            .map(InvocationId::as_str)
-            .collect::<Vec<_>>(),
-        ["invoke-one", "invoke-two"]
-    );
-    audit
-        .append(decision("invoke-three", true))
+        .expect("reopen audit");
+    let third = audit
+        .append(events[2].clone())
         .await
-        .expect("append continues verified chain");
-    // Startup-only state: the broker's replay ledger owns these ids now, so nothing keeps
-    // accumulating a second copy of them here for the life of the process.
-    assert!(
-        audit.take_replay_ids().await.is_empty(),
-        "restored identifiers are handed over once, not retained and re-served"
-    );
-    // The reconcile window still answers for the current head and the record before it.
-    let (count, head) = audit.checkpoint().await;
-    assert_eq!(count, 3);
-    assert!(audit.contains_checkpoint(3, head.as_deref()).await);
-    assert!(audit.contains_checkpoint(2, checkpoint.1.as_deref()).await);
-    assert!(!audit.contains_checkpoint(2, head.as_deref()).await);
+        .expect("append after reopen");
+    assert_eq!(third.sequence, 3);
     drop(audit);
-
-    let records = fs::read_to_string(&path)
-        .expect("read durable fixture")
+    let raw = fs::read_to_string(&path).expect("read audit");
+    assert!(raw.as_bytes().starts_with(&prior));
+    let records = raw
         .lines()
-        .map(|line| serde_json::from_str::<AuditRecord>(line).expect("valid durable record"))
+        .map(|line| serde_json::from_str::<AuditRecord>(line).expect("complete record"))
         .collect::<Vec<_>>();
     assert_eq!(records.len(), 3);
-    verify_audit_chain(&records).expect("reopened chain remains valid");
-
+    for (index, record) in records.iter().enumerate() {
+        assert_eq!(record.sequence, (index + 1) as u64);
+        assert_eq!(record.event, events[index]);
+    }
     #[cfg(unix)]
     assert_eq!(
         fs::metadata(&path)
@@ -999,10 +905,10 @@ async fn durable_audit_reopens_verifies_and_continues_the_chain() {
 }
 
 #[tokio::test]
-async fn durable_audit_rejects_mutation_and_partial_records() {
+async fn file_audit_does_not_verify_mutation_but_refuses_partial_lines() {
     let directory = tempfile::tempdir().expect("create audit fixture directory");
     let path = directory.path().join("audit.jsonl");
-    let audit = FileAuditLog::open(&path, 4, 16 * 1024)
+    let audit = FileAuditLog::open(&path, 16 * 1024)
         .await
         .expect("create durable audit");
     audit
@@ -1015,19 +921,21 @@ async fn durable_audit_rejects_mutation_and_partial_records() {
     let mutated = original.replace("\"allowed\":true", "\"allowed\":false");
     assert_ne!(mutated, original);
     fs::write(&path, mutated).expect("tamper with durable fixture");
-    let error = FileAuditLog::open(&path, 4, 16 * 1024)
+    let audit = FileAuditLog::open(&path, 16 * 1024)
         .await
-        .expect_err("semantic mutation must fail verification");
-    assert!(matches!(
-        error,
-        FileAuditError::Integrity {
-            source: AuditIntegrityError::RecordHash { index: 0 },
-            ..
-        }
-    ));
+        .expect("no integrity verification");
+    assert_eq!(
+        audit
+            .append(decision("invoke-two", true))
+            .await
+            .expect("append")
+            .sequence,
+        2
+    );
+    drop(audit);
 
     fs::write(&path, format!("{original}{{\"partial\":")).expect("write partial durable fixture");
-    let error = FileAuditLog::open(&path, 4, 16 * 1024)
+    let error = FileAuditLog::open(&path, 16 * 1024)
         .await
         .expect_err("partial final record must fail closed");
     assert!(matches!(
@@ -1044,7 +952,7 @@ async fn durable_audit_rejects_non_private_permissions() {
     fs::write(&path, []).expect("create audit fixture");
     fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
         .expect("set insecure fixture permissions");
-    let error = FileAuditLog::open(&path, 4, 16 * 1024)
+    let error = FileAuditLog::open(&path, 16 * 1024)
         .await
         .expect_err("group/world-readable audit must fail");
     assert!(matches!(error, FileAuditError::InsecureFile));
@@ -1053,7 +961,7 @@ async fn durable_audit_rejects_non_private_permissions() {
         .expect("restore private fixture permissions");
     let hard_link = directory.path().join("audit-hard-link.jsonl");
     fs::hard_link(&path, &hard_link).expect("create hard-link fixture");
-    let error = FileAuditLog::open(&path, 4, 16 * 1024)
+    let error = FileAuditLog::open(&path, 16 * 1024)
         .await
         .expect_err("multiply linked audit must fail");
     assert!(matches!(error, FileAuditError::InsecureFile));
@@ -1061,7 +969,7 @@ async fn durable_audit_rejects_non_private_permissions() {
     fs::remove_file(&hard_link).expect("remove hard-link fixture");
     let symlink_path = directory.path().join("audit-symlink.jsonl");
     symlink(&path, &symlink_path).expect("create symlink fixture");
-    let error = FileAuditLog::open(&symlink_path, 4, 16 * 1024)
+    let error = FileAuditLog::open(&symlink_path, 16 * 1024)
         .await
         .expect_err("audit symlink must not be followed");
     assert!(matches!(error, FileAuditError::Io { .. }));
@@ -1214,7 +1122,7 @@ fn per_agent_credentials_decode_validate_their_keys_and_select_by_actor() {
         set.credential_for(&agent("dekoponville-github")),
         Some("github-pat")
     );
-    // No agent, no override: the shape a direct `dekopon-run` peer arrives in.
+    // No agent, no override: the shape a direct service peer arrives in.
     assert_eq!(
         set.credential_for(&Actor::Service {
             principal: "local-user"
@@ -1246,11 +1154,7 @@ fn per_agent_credentials_decode_validate_their_keys_and_select_by_actor() {
     );
 }
 
-/// Two records written by an earlier build, hashes and all.
-///
-/// The durable chain is the one thing in this crate that outlives the process that wrote it. If a
-/// change to how a record is serialized, hashed, or laid out reaches disk, an operator's existing
-/// audit file stops verifying — so this fixture is a literal, not something the test regenerates.
+// Historical input, not an active chain format. Opening counts lines without decoding it.
 const CHAIN_FIXTURE: &str = concat!(
     r#"{"sequence":1,"event":{"type":"decision","invocation":"invoke-one","trace":"trace-test","principal":"caller","actor":{"type":"agent","agent":"reviewer"},"capability":"echo.echo","authorized_by":"broker","decision_id":"decision-invoke-one","policy_revision":"policy-test","allowed":true,"decision_digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},"recordHash":"sha256:ec62d84c407aa237e3ac373a2669bd19f418dbcac609d7a433a709e23f9788ce"}"#,
     "\n",
@@ -1259,48 +1163,43 @@ const CHAIN_FIXTURE: &str = concat!(
 );
 
 #[tokio::test]
-async fn an_existing_chain_still_verifies_and_appends_the_same_bytes() {
-    let directory = tempfile::tempdir().expect("create audit fixture directory");
+async fn existing_bytes_are_preserved_without_integrity_or_migration() {
+    let directory = tempfile::tempdir().expect("audit fixture");
     let path = directory.path().join("audit.jsonl");
-    fs::write(&path, CHAIN_FIXTURE).expect("write retained chain");
-    #[cfg(unix)]
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("owner-only fixture");
-
-    // Opening re-derives every record hash from the retained bytes, so a changed hash material,
-    // domain, or field order fails right here.
-    let audit = FileAuditLog::open(&path, 4, 16 * 1024)
-        .await
-        .expect("a chain written by an earlier build still verifies");
-    let (count, head) = audit.checkpoint().await;
-    assert_eq!(count, 2);
-    assert_eq!(
-        head.as_deref(),
-        Some("sha256:1d916e895127e01a65efa63147ae2b010564b6d8c401dd718241313138615dcf")
-    );
-
-    // And a record appended now continues that same chain in the same encoding.
-    let appended = audit
-        .append(decision("invoke-three", true))
-        .await
-        .expect("append continues the retained chain");
-    drop(audit);
-    let raw = fs::read_to_string(&path).expect("read continued chain");
-    assert!(raw.starts_with(CHAIN_FIXTURE), "{raw}");
-    let records = raw
-        .lines()
-        .map(|line| serde_json::from_str::<AuditRecord>(line).expect("valid durable record"))
-        .collect::<Vec<_>>();
-    verify_audit_chain(&records).expect("the continued chain verifies end to end");
-    assert_eq!(records[2], appended);
+    // Even malformed JSON and unrelated sequence fields are not interpreted as history.
+    for prior in [CHAIN_FIXTURE, "not-json\n{\"sequence\":99}\n"] {
+        fs::write(&path, prior).expect("write existing bytes");
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("private fixture");
+        let audit = FileAuditLog::open(&path, 16 * 1024)
+            .await
+            .expect("count only");
+        let record = audit
+            .append(decision("invoke-three", true))
+            .await
+            .expect("append");
+        assert_eq!(record.sequence, 3);
+        drop(audit);
+        let raw = fs::read_to_string(&path).expect("read continued file");
+        assert!(raw.starts_with(prior), "{raw}");
+        assert_eq!(
+            &raw[prior.len()..],
+            format!("{}\n", serde_json::to_string(&record).expect("serialize"))
+        );
+        assert_eq!(
+            serde_json::from_str::<AuditRecord>(raw.lines().nth(2).expect("third line"))
+                .expect("record"),
+            record
+        );
+    }
 }
 
-/// The durable line is spliced around one serialization of the event rather than serializing the
-/// record; this is what proves the splice and the derived encoding are the same bytes.
+/// Every appended event is written exactly as its complete record serializes.
 #[tokio::test]
 async fn durable_lines_match_the_record_encoding() {
     let directory = tempfile::tempdir().expect("create audit fixture directory");
     let path = directory.path().join("audit.jsonl");
-    let audit = FileAuditLog::open(&path, 8, 16 * 1024)
+    let audit = FileAuditLog::open(&path, 16 * 1024)
         .await
         .expect("create durable audit");
     let mut appended = Vec::new();
@@ -1312,11 +1211,9 @@ async fn durable_lines_match_the_record_encoding() {
         appended.push(audit.append(event).await.expect("append succeeds"));
     }
     drop(audit);
-    for (line, record) in fs::read_to_string(&path)
-        .expect("read durable chain")
-        .lines()
-        .zip(&appended)
-    {
+    let raw = fs::read_to_string(&path).expect("read audit file");
+    assert_eq!(raw.lines().count(), appended.len());
+    for (line, record) in raw.lines().zip(&appended) {
         assert_eq!(
             line.as_bytes(),
             serde_json::to_vec(record)
@@ -1326,4 +1223,84 @@ async fn durable_lines_match_the_record_encoding() {
             record.sequence
         );
     }
+}
+
+#[tokio::test]
+async fn file_audit_enforces_line_bytes_and_ordinal_overflow_without_writes() {
+    let directory = tempfile::tempdir().expect("audit fixture");
+    let path = directory.path().join("audit.jsonl");
+    assert!(matches!(
+        FileAuditLog::open(&path, 0).await,
+        Err(FileAuditError::ZeroMaximumLineBytes)
+    ));
+    let event = decision("invoke-one", true);
+    let length = serde_json::to_vec(&AuditRecord {
+        sequence: 1,
+        event: event.clone(),
+    })
+    .expect("serialize")
+    .len();
+    let audit = FileAuditLog::open(&path, length - 1).await.expect("open");
+    assert!(
+        matches!(audit.append(event.clone()).await, Err(AuditError::RecordTooLarge { length: actual, maximum }) if actual == length && maximum == length - 1)
+    );
+    assert_eq!(fs::read(&path).expect("read"), b"");
+    drop(audit);
+    let audit = FileAuditLog::open(&path, length).await.expect("open");
+    audit.append(event.clone()).await.expect("exact limit");
+    let prior = fs::read(&path).expect("read");
+    assert_eq!(prior.len(), length + 1);
+    audit.state.lock().await.count = u64::MAX;
+    assert!(matches!(
+        audit.append(event).await,
+        Err(AuditError::SequenceOverflow)
+    ));
+    assert_eq!(fs::read(&path).expect("read"), prior);
+    drop(audit);
+    assert!(
+        matches!(FileAuditLog::open(&path, length - 1).await, Err(FileAuditError::RecordTooLarge { line: 1, maximum }) if maximum == length - 1)
+    );
+    assert_eq!(fs::read(&path).expect("read"), prior);
+    // A line spanning multiple BufReader chunks is counted without allocating its full contents.
+    fs::write(&path, format!("{}\n", "x".repeat(20_000))).expect("long fixture");
+    let audit = FileAuditLog::open(&path, 20_000)
+        .await
+        .expect("exact existing line limit");
+    assert_eq!(
+        audit
+            .append(decision("invoke-two", true))
+            .await
+            .expect("append")
+            .sequence,
+        2
+    );
+}
+
+#[tokio::test]
+async fn file_audit_reports_io_cause_and_poison_without_fabricating_success() {
+    let directory = tempfile::tempdir().expect("audit fixture");
+    let path = directory.path().join("audit.jsonl");
+    let audit = FileAuditLog::open(&path, 16 * 1024).await.expect("open");
+    audit
+        .append(decision("invoke-one", true))
+        .await
+        .expect("first append");
+    let prior = fs::read(&path).expect("read");
+    audit.state.lock().await.file = tokio::fs::File::open(&path)
+        .await
+        .expect("read-only failure fixture");
+    let error = audit
+        .append(decision("invoke-two", true))
+        .await
+        .expect_err("write must fail");
+    let AuditError::Io { source } = error else {
+        panic!("I/O cause required: {error}")
+    };
+    assert!(source.raw_os_error().is_some(), "{source}");
+    assert!(matches!(
+        audit.append(decision("invoke-three", true)).await,
+        Err(AuditError::Poisoned)
+    ));
+    assert_eq!(audit.state.lock().await.count, 1);
+    assert_eq!(fs::read(&path).expect("read"), prior);
 }

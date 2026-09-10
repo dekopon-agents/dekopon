@@ -24,9 +24,8 @@ pub(crate) const DOMAIN_CONTENT: &str = "content-dedup-commitment-v1";
 pub(crate) const DOMAIN_DECISION_EVIDENCE: &str = "storage-decision-evidence-v1";
 pub(crate) const DOMAIN_OUTPUT_EVIDENCE: &str = "storage-output-evidence-v1";
 pub(crate) const DOMAIN_OPERATION_EVIDENCE: &str = "storage-operation-evidence-v1";
-pub(crate) const DOMAIN_LIFECYCLE: &str = "storage-lifecycle-marker-v1";
+// Authority pointers retain this domain spelling to preserve their authentication boundary.
 pub(crate) const DOMAIN_MANIFEST: &str = "transaction-manifest-v1";
-pub(crate) const DOMAIN_TRANSACTION: &str = "transaction-path-v1";
 
 const MAX_KEY_FILE_BYTES: u64 = 4 * 1024;
 
@@ -175,51 +174,6 @@ impl StorageKey {
     pub(crate) fn commitment(&self, domain: &str, fields: &[&[u8]]) -> String {
         format!("hmac-sha256:{}", self.token(domain, fields))
     }
-
-    /// Computes one final length-prefixed field from a bounded reader without retaining it.
-    pub(crate) fn commitment_reader(
-        &self,
-        domain: &str,
-        prefix_fields: &[&[u8]],
-        final_length: u64,
-        mut reader: impl std::io::Read,
-    ) -> Result<String, std::io::Error> {
-        let domain_key = hmac_sha256(
-            &self.0,
-            &encoded_fields(&[b"dekopon-storage-domain-v1".as_slice(), domain.as_bytes()]),
-        );
-        let mut hmac = HmacSha256::new(&domain_key);
-        for field in prefix_fields {
-            hmac.update(&(field.len() as u64).to_be_bytes());
-            hmac.update(field);
-        }
-        hmac.update(&final_length.to_be_bytes());
-        let mut remaining = final_length;
-        let mut buffer = [0_u8; 64 * 1024];
-        while remaining != 0 {
-            let maximum = usize::try_from(remaining.min(buffer.len() as u64))
-                .expect("a buffer-bounded length always fits usize");
-            let read = reader.read(&mut buffer[..maximum])?;
-            if read == 0 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::UnexpectedEof,
-                    "bounded commitment input ended early",
-                ));
-            }
-            hmac.update(&buffer[..read]);
-            remaining -= read as u64;
-        }
-        #[cfg(test)]
-        note_hashed(final_length);
-        let mut extra = [0_u8; 1];
-        if reader.read(&mut extra)? != 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "bounded commitment input grew while reading",
-            ));
-        }
-        Ok(format!("hmac-sha256:{}", hex(&hmac.finalize())))
-    }
 }
 
 fn validate_key_ancestors(parent: &Path, key: &Path) -> Result<(), StorageHostError> {
@@ -338,13 +292,12 @@ pub(crate) fn random_bytes(length: usize) -> Result<Vec<u8>, StorageHostError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::BTreeSet, io::Cursor};
+    use std::collections::BTreeSet;
 
     use super::{
         DOMAIN_AUDIT_SCOPE, DOMAIN_CONTENT, DOMAIN_DECISION_EVIDENCE, DOMAIN_GENERATION,
-        DOMAIN_LIFECYCLE, DOMAIN_LOGICAL_PATH, DOMAIN_MANIFEST, DOMAIN_NAMESPACE_PATH,
-        DOMAIN_OPERATION_EVIDENCE, DOMAIN_OUTPUT_EVIDENCE, DOMAIN_RECORD_ID, DOMAIN_TRANSACTION,
-        StorageKey,
+        DOMAIN_LOGICAL_PATH, DOMAIN_MANIFEST, DOMAIN_NAMESPACE_PATH, DOMAIN_OPERATION_EVIDENCE,
+        DOMAIN_OUTPUT_EVIDENCE, DOMAIN_RECORD_ID, StorageKey,
     };
 
     #[test]
@@ -362,30 +315,12 @@ mod tests {
             DOMAIN_DECISION_EVIDENCE,
             DOMAIN_OUTPUT_EVIDENCE,
             DOMAIN_OPERATION_EVIDENCE,
-            DOMAIN_LIFECYCLE,
             DOMAIN_MANIFEST,
-            DOMAIN_TRANSACTION,
         ]
         .map(|domain| key.token(domain, &fields));
         assert_eq!(
             commitments.iter().collect::<BTreeSet<_>>().len(),
             commitments.len()
         );
-    }
-
-    #[test]
-    fn streaming_commitments_match_the_canonical_in_memory_encoding() {
-        let key = StorageKey([9; 32]);
-        let bytes = vec![0x5a; 256 * 1024 + 17];
-        let expected = key.commitment(DOMAIN_CONTENT, &[b"file", &bytes]);
-        let streamed = key
-            .commitment_reader(
-                DOMAIN_CONTENT,
-                &[b"file"],
-                bytes.len() as u64,
-                Cursor::new(&bytes),
-            )
-            .expect("streamed commitment");
-        assert_eq!(streamed, expected);
     }
 }

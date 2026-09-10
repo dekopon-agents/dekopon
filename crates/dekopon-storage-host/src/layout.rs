@@ -30,46 +30,6 @@ pub(crate) struct Directory {
     diagnostic_path: Arc<PathBuf>,
 }
 
-pub(crate) struct EntryStream {
-    directory: Directory,
-    inner: rustix::fs::Dir,
-}
-
-impl std::fmt::Debug for EntryStream {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("EntryStream([RETAINED])")
-    }
-}
-
-impl EntryStream {
-    pub(crate) fn next_name(&mut self) -> Result<Option<String>, StorageHostError> {
-        loop {
-            let Some(entry) = self.inner.read() else {
-                return Ok(None);
-            };
-            let entry =
-                entry.map_err(|source| self.directory.io_error(std::io::Error::from(source)))?;
-            #[allow(
-                clippy::map_err_ignore,
-                reason = "Utf8Error reports only the offending byte offset inside a physical name \
-                          this crate never exports; the `non-utf8-entry` scope is the complete \
-                          diagnosis"
-            )]
-            let name = entry
-                .file_name()
-                .to_str()
-                .map_err(|_| StorageHostError::Corrupt {
-                    scope: "non-utf8-entry",
-                })?;
-            if name == "." || name == ".." {
-                continue;
-            }
-            validate_component(name)?;
-            return Ok(Some(name.to_owned()));
-        }
-    }
-}
-
 impl std::fmt::Debug for Directory {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("Directory([RETAINED])")
@@ -95,9 +55,7 @@ pub(crate) struct EntryMetadata {
 pub(crate) struct Layout {
     pub(crate) root: Directory,
     namespaces: Directory,
-    transactions: Directory,
     quarantine: Directory,
-    trash: Directory,
     _writer_lock: File,
 }
 
@@ -113,6 +71,19 @@ pub(crate) struct Usage {
     pub(crate) bytes: u64,
     pub(crate) entries: u64,
     pub(crate) files: u64,
+}
+
+/// Charges the scanned directory's own entry in its parent, which a scan of it never sees.
+pub(crate) fn usage_with_directory_entry(mut usage: Usage) -> Result<Usage, StorageHostError> {
+    usage.entries = usage
+        .entries
+        .checked_add(1)
+        .ok_or(StorageHostError::Arithmetic)?;
+    usage.bytes = usage
+        .bytes
+        .checked_add(ENTRY_CHARGE)
+        .ok_or(StorageHostError::Arithmetic)?;
+    Ok(usage)
 }
 
 impl Layout {
@@ -135,11 +106,11 @@ impl Layout {
         .checked_add(1)
         .ok_or(StorageHostError::Arithmetic)?;
         Ok(Usage {
-            bytes: 6_u64
+            bytes: 4_u64
                 .checked_mul(ENTRY_CHARGE)
                 .and_then(|bytes| bytes.checked_add(encoded))
                 .ok_or(StorageHostError::Arithmetic)?,
-            entries: 6,
+            entries: 4,
             files: 2,
         })
     }
@@ -148,8 +119,8 @@ impl Layout {
         validate_ancestors(root)?;
         ensure_root_directory(root)?;
         let root = Directory::open_path(root, true)?;
-        let initial_entries = root.entries_prefix(7)?;
-        if initial_entries.len() > 6 {
+        let initial_entries = root.entries_prefix(5)?;
+        if initial_entries.len() > 4 {
             return Err(StorageHostError::CorruptLayout);
         }
         let has_layout = initial_entries.iter().any(|name| name == "layout");
@@ -183,7 +154,7 @@ impl Layout {
             .map_err(|source| writer_lock_failure(&root, source))?;
 
         let key_commitment = key.commitment(DOMAIN_AUTHORITY, &[b"layout-key-v1"]);
-        let (namespaces, transactions, quarantine, trash) = if has_layout {
+        let (namespaces, quarantine) = if has_layout {
             let encoded = root.read_bounded("layout", 4_096)?;
             let document: LayoutDocument = serde_json::from_slice(&encoded).map_err(|error| {
                 crate::report_decode_failure("layout", &error);
@@ -192,14 +163,7 @@ impl Layout {
             if document.api_version != LAYOUT_VERSION || document.key_commitment != key_commitment {
                 return Err(StorageHostError::KeyMismatch);
             }
-            let expected = [
-                "layout",
-                "namespaces",
-                "quarantine",
-                "transactions",
-                "trash",
-                "writer.lock",
-            ];
+            let expected = ["layout", "namespaces", "quarantine", "writer.lock"];
             let retained = root.entries_prefix(expected.len() as u64 + 1)?;
             if retained.len() != expected.len() || retained.iter().map(String::as_str).ne(expected)
             {
@@ -207,15 +171,11 @@ impl Layout {
             }
             (
                 root.open_directory("namespaces")?,
-                root.open_directory("transactions")?,
                 root.open_directory("quarantine")?,
-                root.open_directory("trash")?,
             )
         } else {
             let namespaces = root.ensure_directory("namespaces")?;
-            let transactions = root.ensure_directory("transactions")?;
             let quarantine = root.ensure_directory("quarantine")?;
-            let trash = root.ensure_directory("trash")?;
             let document = LayoutDocument {
                 api_version: LAYOUT_VERSION.to_owned(),
                 key_commitment,
@@ -232,15 +192,13 @@ impl Layout {
                 .and_then(|()| file.sync_all())
                 .map_err(|source| root.io_error(source))?;
             root.sync()?;
-            (namespaces, transactions, quarantine, trash)
+            (namespaces, quarantine)
         };
 
         Ok(Self {
             root,
             namespaces,
-            transactions,
             quarantine,
-            trash,
             _writer_lock: writer,
         })
     }
@@ -249,16 +207,8 @@ impl Layout {
         &self.namespaces
     }
 
-    pub(crate) const fn transactions(&self) -> &Directory {
-        &self.transactions
-    }
-
     pub(crate) const fn quarantine(&self) -> &Directory {
         &self.quarantine
-    }
-
-    pub(crate) const fn trash(&self) -> &Directory {
-        &self.trash
     }
 }
 
@@ -351,19 +301,6 @@ impl Directory {
         self.open_directory(name)
     }
 
-    /// Creates one directory without accepting an existing entry under the same token.
-    ///
-    /// Callers synchronize this directory's parent explicitly so a finalization deadline can be
-    /// checked before that separate filesystem step begins.
-    pub(crate) fn create_directory(&self, name: &str) -> Result<Self, StorageHostError> {
-        validate_component(name)?;
-        match rustix::fs::mkdirat(self.file.as_ref(), name, Mode::from_raw_mode(0o700)) {
-            Ok(()) => self.open_directory(name),
-            Err(rustix::io::Errno::EXIST) => Err(StorageHostError::AlreadyExists),
-            Err(source) => Err(self.io_error(std::io::Error::from(source))),
-        }
-    }
-
     pub(crate) fn open_directory(&self, name: &str) -> Result<Self, StorageHostError> {
         self.open_directory_impl(name, true)
     }
@@ -437,8 +374,8 @@ impl Directory {
 
     /// Revalidates that a retained child descriptor is still the entry named by this parent.
     ///
-    /// This check runs after an advisory-lease wait. Without it, GC could rename an already-open
-    /// base directory to trash while a waiter later acquired the lock on the now-unlinked inode.
+    /// After an advisory-lease wait, refuse a base whose name no longer identifies the
+    /// descriptor on which the waiter acquired its lock.
     pub(crate) fn retains_child(&self, name: &str, child: &Self) -> Result<bool, StorageHostError> {
         validate_component(name)?;
         let stat = match rustix::fs::statat(self.file.as_ref(), name, AtFlags::SYMLINK_NOFOLLOW) {
@@ -484,14 +421,6 @@ impl Directory {
         self.read_entries(HARD_MAX_DIRECTORY_ENTRIES, true)
     }
 
-    pub(crate) fn entry_stream(&self) -> Result<EntryStream, StorageHostError> {
-        Ok(EntryStream {
-            directory: self.clone(),
-            inner: rustix::fs::Dir::read_from(self.file.as_ref())
-                .map_err(|source| self.io_error(std::io::Error::from(source)))?,
-        })
-    }
-
     /// Reads at most one bounded prefix without first materializing the complete directory.
     pub(crate) fn entries_prefix(&self, maximum: u64) -> Result<Vec<String>, StorageHostError> {
         self.read_entries(maximum.min(HARD_MAX_DIRECTORY_ENTRIES), false)
@@ -507,6 +436,8 @@ impl Directory {
         maximum: u64,
         fail_on_excess: bool,
     ) -> Result<Vec<String>, StorageHostError> {
+        #[cfg(test)]
+        note_directory_scan();
         let mut directory = rustix::fs::Dir::read_from(self.file.as_ref())
             .map_err(|source| self.io_error(std::io::Error::from(source)))?;
         let mut entries = Vec::new();
@@ -732,28 +663,6 @@ impl Directory {
         }
     }
 
-    pub(crate) fn remove_tree(&self, name: &str) -> Result<(), StorageHostError> {
-        validate_component(name)?;
-        let Some(metadata) = self.metadata(name)? else {
-            return Ok(());
-        };
-        match metadata.kind {
-            EntryKind::Directory => {
-                let child = self.open_directory(name)?;
-                for entry in child.entries()? {
-                    child.remove_tree(&entry)?;
-                }
-                drop(child);
-                rustix::fs::unlinkat(self.file.as_ref(), name, AtFlags::REMOVEDIR)
-                    .map_err(|source| self.io_error(std::io::Error::from(source)))
-            }
-            EntryKind::File => self.remove_file(name),
-            EntryKind::Symlink | EntryKind::Other => Err(StorageHostError::Corrupt {
-                scope: "remove-tree-type",
-            }),
-        }
-    }
-
     pub(crate) fn sync(&self) -> Result<(), StorageHostError> {
         self.file.sync_all().map_err(|source| self.io_error(source))
     }
@@ -832,108 +741,36 @@ fn validate_ancestors(path: &Path) -> Result<(), StorageHostError> {
     Ok(())
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Directory reads performed on this thread.
+    ///
+    /// Test-only instrumentation. Accounting a mutation from the tree it just changed is a cost
+    /// this crate has to hold to — a write reads no directory — so directory reads are counted
+    /// rather than assumed. A tree walk bumps this once for the walk and once per directory it
+    /// reads, so a scan on a path that must not scan cannot register as one read.
+    static DIRECTORY_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_directory_scan() {
+    DIRECTORY_SCANS.with(|cell| cell.set(cell.get().saturating_add(1)));
+}
+
+/// Directory reads performed on this thread so far.
+#[cfg(test)]
+pub(crate) fn directory_scans() -> u64 {
+    DIRECTORY_SCANS.with(std::cell::Cell::get)
+}
+
 pub(crate) fn scan_usage(
     directory: &Directory,
     maximum_entries: u64,
 ) -> Result<Usage, StorageHostError> {
-    scan_usage_checked(directory, maximum_entries, || Ok(()))
-}
-
-/// Scans no more than the configured entry/byte budget.
-///
-/// `None` means the subtree cannot fit this GC pass. Traversal stops as soon as that is known,
-/// rather than walking a large trash tree before applying the byte limit.
-pub(crate) fn scan_usage_capped(
-    directory: &Directory,
-    maximum_entries: u64,
-    maximum_bytes: u64,
-) -> Result<Option<Usage>, StorageHostError> {
+    #[cfg(test)]
+    note_directory_scan();
     let mut usage = Usage::default();
-    if scan_capped(directory, maximum_entries, maximum_bytes, &mut usage)? {
-        Ok(Some(usage))
-    } else {
-        Ok(None)
-    }
-}
-
-fn scan_capped(
-    directory: &Directory,
-    maximum_entries: u64,
-    maximum_bytes: u64,
-    usage: &mut Usage,
-) -> Result<bool, StorageHostError> {
-    let remaining = maximum_entries.saturating_sub(usage.entries);
-    let byte_slots = maximum_bytes
-        .saturating_sub(usage.bytes)
-        .checked_div(ENTRY_CHARGE)
-        .unwrap_or(0);
-    let bounded = remaining.min(byte_slots);
-    let entries = directory.entries_prefix(bounded.saturating_add(1))?;
-    if entries.len() as u64 > bounded {
-        return Ok(false);
-    }
-    for name in entries {
-        let metadata = directory
-            .metadata(&name)?
-            .ok_or(StorageHostError::Corrupt {
-                scope: "vanished-entry",
-            })?;
-        usage.entries = usage
-            .entries
-            .checked_add(1)
-            .ok_or(StorageHostError::Arithmetic)?;
-        usage.bytes = usage
-            .bytes
-            .checked_add(ENTRY_CHARGE)
-            .ok_or(StorageHostError::Arithmetic)?;
-        if usage.bytes > maximum_bytes {
-            return Ok(false);
-        }
-        match metadata.kind {
-            EntryKind::File => {
-                let next = usage
-                    .bytes
-                    .checked_add(metadata.len)
-                    .ok_or(StorageHostError::Arithmetic)?;
-                if next > maximum_bytes {
-                    return Ok(false);
-                }
-                let file = directory.open_private(&name, false)?;
-                directory.validate_private_file(&name, &file)?;
-                usage.bytes = next;
-                usage.files = usage
-                    .files
-                    .checked_add(1)
-                    .ok_or(StorageHostError::Arithmetic)?;
-            }
-            EntryKind::Directory => {
-                let child = directory.open_directory(&name)?;
-                if !scan_capped(&child, maximum_entries, maximum_bytes, usage)? {
-                    return Ok(false);
-                }
-            }
-            EntryKind::Symlink => {
-                return Err(StorageHostError::Corrupt { scope: "symlink" });
-            }
-            EntryKind::Other => {
-                return Err(StorageHostError::Corrupt { scope: "file-type" });
-            }
-        }
-    }
-    Ok(true)
-}
-
-/// Scans exact logical usage while checking a caller-owned deadline before each filesystem step.
-///
-/// One native operation may still block past the deadline. The callback prevents beginning the
-/// next entry/open after that operation drains.
-pub(crate) fn scan_usage_checked(
-    directory: &Directory,
-    maximum_entries: u64,
-    mut check: impl FnMut() -> Result<(), StorageHostError>,
-) -> Result<Usage, StorageHostError> {
-    let mut usage = Usage::default();
-    scan(directory, maximum_entries, &mut usage, &mut check)?;
+    scan(directory, maximum_entries, &mut usage)?;
     Ok(usage)
 }
 
@@ -941,9 +778,7 @@ fn scan(
     directory: &Directory,
     maximum_entries: u64,
     usage: &mut Usage,
-    check: &mut impl FnMut() -> Result<(), StorageHostError>,
 ) -> Result<(), StorageHostError> {
-    check()?;
     let remaining = maximum_entries.saturating_sub(usage.entries);
     let entries = directory.entries_prefix(remaining.saturating_add(1))?;
     if entries.len() as u64 > remaining {
@@ -953,7 +788,6 @@ fn scan(
         });
     }
     for name in entries {
-        check()?;
         let metadata = directory
             .metadata(&name)?
             .ok_or(StorageHostError::Corrupt {
@@ -975,7 +809,6 @@ fn scan(
             .ok_or(StorageHostError::Arithmetic)?;
         match metadata.kind {
             EntryKind::File => {
-                check()?;
                 let file = directory.open_private(&name, false)?;
                 directory.validate_private_file(&name, &file)?;
                 usage.files = usage
@@ -988,9 +821,8 @@ fn scan(
                     .ok_or(StorageHostError::Arithmetic)?;
             }
             EntryKind::Directory => {
-                check()?;
                 let child = directory.open_directory(&name)?;
-                scan(&child, maximum_entries, usage, check)?;
+                scan(&child, maximum_entries, usage)?;
             }
             EntryKind::Symlink => {
                 return Err(StorageHostError::Corrupt { scope: "symlink" });

@@ -1,11 +1,11 @@
-//! Engine-neutral durable-file overlay and rollback-journal lock state.
+//! Engine-neutral private-file access and rollback-journal lock state.
 
 use dekopon_capability::StorageInterface;
 
 use crate::{
-    StorageHostError, StorageTransaction,
+    StorageHandle, StorageHostError,
+    handle::{monotonic_ns, wall_ms},
     key::random_bytes,
-    transaction::{monotonic_ns, wall_ms},
 };
 
 /// Guest open intent.
@@ -44,7 +44,7 @@ pub struct FileStat {
     pub identity: u64,
 }
 
-impl StorageTransaction {
+impl StorageHandle {
     pub fn vfs_open(&mut self, name: &str, options: OpenOptions) -> Result<u64, StorageHostError> {
         self.require_vfs()?;
         self.note_call()?;
@@ -77,15 +77,15 @@ impl StorageTransaction {
             if !exists {
                 self.charge_write(0)?;
                 let identity = self.allocate_file_identity()?;
-                self.reserve_candidate(&[(&token, Some(&[]))])?;
+                let planned = self.reserve_candidate(&[(&token, Some(&[]))])?;
+                self.write_direct(&token, Some(&[]), planned)?;
                 let entry = self.entries.get_mut(&token).expect("loaded entry");
                 entry.data = Some(Vec::new());
                 entry.identity = identity;
-                entry.dirty = true;
             }
             self.handles.insert(
                 handle,
-                crate::transaction::HandleState {
+                crate::handle::HandleState {
                     token,
                     read: options.read,
                     write: options.write,
@@ -126,7 +126,8 @@ impl StorageTransaction {
                 .values()
                 .any(|candidate| candidate.token == state.token)
         {
-            self.reserve_candidate(&[(&state.token, None)])?;
+            let planned = self.reserve_candidate(&[(&state.token, None)])?;
+            self.write_direct(&state.token, None, planned)?;
             let entry = self
                 .entries
                 .get_mut(&state.token)
@@ -135,7 +136,6 @@ impl StorageTransaction {
                 })?;
             entry.data = None;
             entry.identity = 0;
-            entry.dirty = true;
             self.pending_delete.remove(&state.token);
         }
         Ok(())
@@ -181,20 +181,9 @@ impl StorageTransaction {
         )]
         let length = usize::try_from(u64::from(maximum).min(size - offset))
             .map_err(|_| StorageHostError::Arithmetic)?;
-        if entry.loaded {
-            let bytes = entry.data.as_ref().ok_or(StorageHostError::NotFound)?;
-            #[allow(
-                clippy::map_err_ignore,
-                reason = "TryFromIntError carries only out-of-range for a guest-supplied offset, \
-                          which InvalidArgument already states"
-            )]
-            let start = usize::try_from(offset).map_err(|_| StorageHostError::InvalidArgument)?;
-            Ok(bytes[start..start + length].to_vec())
-        } else {
-            self.namespace
-                .data_directory
-                .read_at(&state.token, offset, length)
-        }
+        self.namespace
+            .data_directory
+            .read_at(&state.token, offset, length)
     }
 
     pub fn vfs_write_at(
@@ -244,18 +233,25 @@ impl StorageTransaction {
             replacement.resize(end, 0);
         }
         replacement[start..end].copy_from_slice(bytes);
-        if let Err(error) = self.reserve_candidate(&[(&state.token, Some(replacement.as_slice()))])
-        {
-            if let Some(overwritten) = overwritten {
-                replacement[start..overlap_end].copy_from_slice(&overwritten);
+        let reserved = self.reserve_candidate(&[(&state.token, Some(replacement.as_slice()))]);
+        let planned = match reserved {
+            Ok(planned) => planned,
+            Err(error) => {
+                if let Some(overwritten) = overwritten {
+                    replacement[start..overlap_end].copy_from_slice(&overwritten);
+                }
+                replacement.truncate(current_length);
+                self.entries.get_mut(&state.token).expect("open entry").data = Some(replacement);
+                return Err(error);
             }
-            replacement.truncate(current_length);
-            self.entries.get_mut(&state.token).expect("open entry").data = Some(replacement);
-            return Err(error);
+        };
+        if bytes.is_empty() && end > current_length {
+            self.truncate_direct(&state.token, end as u64, planned)?;
+        } else {
+            self.write_range(&state.token, offset, bytes, planned)?;
         }
         let entry = self.entries.get_mut(&state.token).expect("open entry");
         entry.data = Some(replacement);
-        entry.dirty = true;
         Ok(())
     }
 
@@ -268,7 +264,7 @@ impl StorageTransaction {
             .ok_or(StorageHostError::InvalidArgument)?;
         self.entries
             .get(&state.token)
-            .and_then(crate::transaction::FileEntry::size)
+            .and_then(crate::handle::FileEntry::size)
             .ok_or(StorageHostError::NotFound)
     }
 
@@ -314,15 +310,18 @@ impl StorageTransaction {
         } else {
             self.reserve_candidate(&[(&state.token, Some(candidate))])
         };
-        if let Err(error) = result {
-            replacement.truncate(current_length);
-            self.entries.get_mut(&state.token).expect("open entry").data = Some(replacement);
-            return Err(error);
-        }
+        let planned = match result {
+            Ok(planned) => planned,
+            Err(error) => {
+                replacement.truncate(current_length);
+                self.entries.get_mut(&state.token).expect("open entry").data = Some(replacement);
+                return Err(error);
+            }
+        };
         replacement.resize(target, 0);
+        self.truncate_direct(&state.token, size, planned)?;
         let entry = self.entries.get_mut(&state.token).expect("open entry");
         entry.data = Some(replacement);
-        entry.dirty = true;
         Ok(())
     }
 
@@ -332,8 +331,13 @@ impl StorageTransaction {
         if !self.handles.contains_key(&handle) {
             return Err(StorageHostError::InvalidArgument);
         }
-        // Overlay bytes are synchronized at commit. This records the guest's durability barrier;
-        // commit uses the strongest primitive for every staged file and parent directory.
+        let token = &self.handles[&handle].token;
+        let directory = &self.namespace.data_directory;
+        directory
+            .open_private(token, false)?
+            .sync_all()
+            .map_err(|source| directory.io_error(source))?;
+        directory.sync()?;
         self.evidence.syncs = self
             .evidence
             .syncs
@@ -353,11 +357,11 @@ impl StorageTransaction {
         if self.entries[&token].data.is_none() {
             return Err(StorageHostError::NotFound);
         }
-        self.reserve_candidate(&[(&token, None)])?;
+        let planned = self.reserve_candidate(&[(&token, None)])?;
+        self.write_direct(&token, None, planned)?;
         let entry = self.entries.get_mut(&token).expect("loaded entry");
         entry.data = None;
         entry.identity = 0;
-        entry.dirty = true;
         Ok(())
     }
 
@@ -397,25 +401,32 @@ impl StorageTransaction {
             .data
             .take()
             .expect("source existence checked");
-        if let Err(error) =
-            self.reserve_candidate(&[(&from_token, None), (&to_token, Some(source.as_slice()))])
-        {
-            self.entries
-                .get_mut(&from_token)
-                .expect("loaded source")
-                .data = Some(source);
-            return Err(error);
-        }
+        let reserved =
+            self.reserve_candidate(&[(&from_token, None), (&to_token, Some(source.as_slice()))]);
+        let planned = match reserved {
+            Ok(planned) => planned,
+            Err(error) => {
+                self.entries
+                    .get_mut(&from_token)
+                    .expect("loaded source")
+                    .data = Some(source);
+                return Err(error);
+            }
+        };
+        let renamed = self.namespace.data_directory.rename_to(
+            &from_token,
+            &self.namespace.data_directory,
+            &to_token,
+        );
+        self.after_mutation(renamed, planned)?;
         {
             let entry = self.entries.get_mut(&from_token).expect("loaded source");
             entry.identity = 0;
-            entry.dirty = true;
         }
         {
             let entry = self.entries.get_mut(&to_token).expect("loaded target");
             entry.data = Some(source);
             entry.identity = identity;
-            entry.dirty = true;
         }
         Ok(())
     }

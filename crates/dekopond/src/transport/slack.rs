@@ -562,18 +562,42 @@ impl ChatReplier for SlackReplier {
                 reason = "serializing a serde_json::Value cannot fail: it holds no non-string map \
                           keys and serde_json::Number rejects non-finite floats"
             )]
-            let response = self
-                .http
-                .post(format!("{}/api/chat.postMessage", self.endpoint))
-                .header(
-                    "authorization",
-                    format!("Bearer {}", self.bot_token.expose()),
-                )
-                .header("content-type", "application/json; charset=utf-8")
-                .body(serde_json::to_vec(&body).map_err(|_| TransportError::Response)?)
-                .send()
+            let encoded = serde_json::to_vec(&body).map_err(|_| TransportError::Response)?;
+            let post = || {
+                self.http
+                    .post(format!("{}/api/chat.postMessage", self.endpoint))
+                    .header(
+                        "authorization",
+                        format!("Bearer {}", self.bot_token.expose()),
+                    )
+                    .header("content-type", "application/json; charset=utf-8")
+                    .body(encoded.clone())
+                    .send()
+            };
+            let mut response = post()
                 .await
                 .map_err(|source| TransportError::Request(Box::new(source)))?;
+            if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                let backoff = response
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(5)
+                    .min(60);
+                tracing::warn!(
+                    event = "gateway_reply_rate_limited",
+                    transport = "slack",
+                    retry_after_seconds = backoff
+                );
+                drop(response);
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+                // Only an explicit 429 is retried, once; every other result uses the
+                // existing response validation and failure path.
+                response = post()
+                    .await
+                    .map_err(|source| TransportError::Request(Box::new(source)))?;
+            }
             let body = check_ok(response).await?;
             let response_channel = body["channel"].as_str().ok_or(TransportError::Response)?;
             let timestamp = body["ts"].as_str().ok_or(TransportError::Response)?;

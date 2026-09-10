@@ -29,14 +29,8 @@ pub const SKILL_TOOL_NAME: &str = "read_skill";
 const SKILL_ALREADY_SHOWN: &str = "That skill text is already in this conversation, in an earlier read_skill result; read it \
      there again.";
 
-/// The first line of every skills listing, so a recording can tell the listing from instructions.
+/// The first line of every skills listing.
 const PROMPT_BLOCK_PREFIX: &str = "Skills mounted for this agent";
-
-/// Whether one system message is a skills listing this module rendered.
-#[must_use]
-pub(crate) fn is_prompt_block(message: &str) -> bool {
-    message.starts_with(PROMPT_BLOCK_PREFIX)
-}
 
 /// Renders the standing skills listing for the system prompt, or `None` when nothing is mounted.
 ///

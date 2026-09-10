@@ -3,7 +3,7 @@
 //! The whole store is a bounded map in the daemon's memory. It is never written to disk, never sent
 //! to the broker, and lost on restart — a person who asks a follow-up across a restart gets a
 //! first-message answer. That placement is the point rather than a shortcut: the broker holds
-//! provider credentials and a deliberately metadata-only audit chain, and conversation text there
+//! provider credentials and a deliberately metadata-only audit log, and conversation text there
 //! would put the most sensitive content in the system inside the most privileged process. The
 //! gateway already read the message and wrote the answer, so keeping the history here adds no new
 //! reader.

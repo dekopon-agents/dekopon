@@ -14,20 +14,18 @@ any published tag works.
 
 ## What it is
 
-One image, `ghcr.io/dekopon-agents/dekopon`, carrying all four binaries for `linux/amd64` and
+One image, `ghcr.io/dekopon-agents/dekopon`, carrying both daemon binaries for `linux/amd64` and
 `linux/arm64`. It is a separate GHCR package from the published WIT interface packages
 `dekopon/provider`, `dekopon/http`, and `dekopon/storage`, which are OCI artifacts rather than images.
 
-One image rather than four is a deployment fact, not a convenience. `dekopon-brokerd` binds a
-`0600` Unix socket and authenticates its peer with `SO_PEERCRED`; there is no TCP transport. A
+One image rather than two is a deployment fact, not a convenience. `dekopon-brokerd` binds a
+protected Unix socket and authenticates its peer with `SO_PEERCRED`; there is no TCP transport. A
 gateway can therefore only reach a broker through a shared filesystem namespace — in Kubernetes, a
 shared pod. Two containers in one pod running two images that must be version-locked buys nothing
 that one image with two `command`s does not.
 
 | Path | Contents |
 |---|---|
-| `/usr/local/bin/dekopon` | Operator CLI |
-| `/usr/local/bin/dekopon-run` | Direct runner and broker client |
 | `/usr/local/bin/dekopon-brokerd` | Authenticated local capability broker |
 | `/usr/local/bin/dekopond` | Unprivileged chat gateway |
 | `/opt/dekopon/providers/*.wasm` | One in-tree conformance fixture plus exact pinned standalone Echo, JSONPlaceholder, and GitHub releases |
@@ -53,13 +51,13 @@ means the image and the tarball are the same bytes, and `sha256sum` proves it.
 
 [`../ci/stage-image-context.sh`](../ci/stage-image-context.sh) verifies before it trusts: it
 downloads each Linux archive, checks it against its published `.sha256`, runs `gh attestation
-verify --repo dekopon-agents/dekopon` on it, and only then extracts the four executables into the
+verify --repo dekopon-agents/dekopon` on it, and only then extracts the two executables into the
 build context. The workflow runs that script and so does a human building locally — two
 implementations of a verification path would drift, and the local one is the one nobody would
 run. The `Dockerfile` performs no network access at all.
 
 After building, and before anything is pushed, the workflow extracts each binary back out of both
-platform images and compares its SHA-256 against the archive it came from. Eight comparisons, all
+platform images and compares its SHA-256 against the archive it came from. Six comparisons, all
 of which must match.
 
 The runtime base is Debian 13 (glibc 2.41) while the release archives are built on `ubuntu-24.04`.
@@ -74,7 +72,7 @@ naming a version node the runtime lacks — which is what forced the move.
 
 The image needs three things: the release executables, exact checksum- and provenance-verified
 provider components, and the two licences. The staging script copies exactly those into a scratch directory alongside the
-`Dockerfile`, asserts that the result is precisely that sixteen-file set, and builds from there.
+`Dockerfile`, asserts that the result is precisely that twelve-file set, and builds from there.
 
 The alternative — keeping the whole repository as the context and excluding the rest with a
 `.dockerignore` — is correct only for as long as every file added later stays matched by it. That
@@ -108,8 +106,9 @@ The `COPY` that places them uses `--chown` and deliberately no `--chmod`, becaus
 components therefore keep the mode they carry in the staged context, which the staging script
 normalises to `0644`.
 
-Only the fetched `echo-provider.wasm` loads on the direct runner. The other default components import
-HTTP, and fetched optional `memory-chat` imports JSONL; the immediate linker is empty and rejects all of them.
+The fetched `echo-provider.wasm` is import-free. The other default components import HTTP,
+and fetched optional `memory-chat` imports JSONL. All are loaded only through the broker,
+whose exact grants and independent ceilings constrain every invocation.
 Memory lives outside `/opt/dekopon/providers`, so a default directory scan cannot silently enable
 retention. An operator must name the exact optional file or explicitly scan its directory. The
 `storage-probe` and malicious `memory-reservation-probe` fixtures are not packaged anywhere in
@@ -128,13 +127,18 @@ mount will not, because those are symlink farms.
 ## Run a binary
 
 ```console
-docker run --rm ghcr.io/dekopon-agents/dekopon:<VERSION> dekopon version
-docker run --rm ghcr.io/dekopon-agents/dekopon:<VERSION> dekopon-run --version
-docker run --rm ghcr.io/dekopon-agents/dekopon:<VERSION> dekopon-run invoke \
-  --provider /opt/dekopon/providers/echo-provider.wasm echo.echo --input '{}'
-docker run --rm -v /path/to/catalog:/etc/dekopon:ro \
-  ghcr.io/dekopon-agents/dekopon:<VERSION> dekopon --config /etc/dekopon/dekopon.yaml validate
+docker run --rm ghcr.io/dekopon-agents/dekopon:<VERSION> dekopond --help
+docker run --rm ghcr.io/dekopon-agents/dekopon:<VERSION> dekopon-brokerd --version
+ci/verify-image-broker.sh ghcr.io/dekopon-agents/dekopon:<VERSION>
 ```
+
+The Linux verifier requires Docker, Python 3 and sudo to create broker-owned private files.
+It starts the real broker with the baked echo component and waits under a deadline for the
+socket, which is bound only after compilation and description succeed. New releases also run
+the existing `probe` command; the verifier supplies version-appropriate configuration for
+immutable releases without that command, which prove component-load/startup only. Owned containers and private files
+are removed on exit. This proves the selected release's bytes, not a build of source HEAD.
+There is no replacement general invocation CLI.
 
 In Kubernetes the same selection is `command: ["dekopon-brokerd"]` or `command: ["dekopond"]` with
 `args` carrying `--config`.
@@ -146,27 +150,17 @@ In Kubernetes the same selection is `command: ["dekopon-brokerd"]` or `command: 
 - No credentials. `dekopon-brokerd` reads an optional legacy credentials file, an optional private
   secret map, and any source bootstrap files the deployment provides; `dekopond` reads environment
   variables the deployment sets. None is baked.
-- No socket, audit log, or checkpoint. Those are runtime state on a writable volume.
+- No socket or audit log. Those are runtime state on a writable volume.
 - No system CA store dependency. `reqwest` and `ureq` use rustls with compiled-in webpki roots, so
   outbound TLS does not consult `/etc/ssl`.
 
 ## Deployment notes
 
-`dekopon-brokerd` validates its runtime directories at startup and refuses to serve if they are
-wrong. The socket, audit, and checkpoint parents must be directories **owned by UID 65532 with mode
-`0700`** — group or world access of any kind is refused, read included.
-
-A bare `emptyDir` does not satisfy that: it is created root-owned and world-writable, and
-`fsGroup` only changes the group and adds group access, which the check rejects for the opposite
-reason. An init container running as root that creates the directory, `chown`s it to `65532:65532`,
-and `chmod`s it to `0700` is the shape that works. [`../charts/dekopon/`](../charts/dekopon/README.md)
-is that shape worked out in full — one pod, two containers, one UID — and is the intended consumer
-of this image.
-
-Configured peer UIDs must equal the broker's own UID — `65532` in this image — so a gateway sharing
-the pod's UID is the configuration the broker accepts today. That single-UID trust domain is a
-current limitation, recorded in [`security-model.md`](security-model.md), not something the image
-changes.
+The chart enforces the [current local process boundary](security-model.md#current-local-process-boundary).
+The image's default UID remains the broker/provider owner; the gateway container overrides it.
+Private credentials and state do not acquire group permissions. The init container creates
+separate private mounts and the broker-owned IPC directory; a bare `emptyDir` is insufficient.
+See the [chart layout and upgrade instructions](../charts/dekopon/README.md#paths-the-chart-owns).
 
 ## Publication
 
@@ -207,16 +201,15 @@ provider ownership, and the byte-identity check.
 
 ## Build and check it locally
 
-The image is assembled from a release, so stage one first. Any published release works; the
-`Dockerfile` never cares which. This is the same script the workflow runs, with the same arguments.
+The image is assembled from a release, so stage one first. A release must contain both daemon archives and supported provider inputs; the
+`Dockerfile` copies their bytes without compiling them. This is the same script the workflow runs, with the same arguments.
 
 ```console
 work=$(mktemp -d)
 ci/stage-image-context.sh v0.3.0 "$work"
 docker buildx build --platform linux/arm64 --load -t dekopon:local "$work/context"
-docker run --rm dekopon:local dekopon version
-docker run --rm dekopon:local dekopon-run invoke \
-  --provider /opt/dekopon/providers/echo-provider.wasm echo.echo --input '{}'
+docker run --rm dekopon:local dekopond --help
+ci/verify-image-broker.sh dekopon:local
 ```
 
 The script prints what it staged and the digest of each executable, so the allowlist is visible
@@ -229,7 +222,7 @@ rather than asserted in prose:
           5057  Dockerfile
          10847  LICENSE-APACHE
           1064  LICENSE-MIT
-       4764024  dist/amd64/dekopon
+       4764024  dist/amd64/dekopond
        ...
         585394  providers/gh-provider.wasm
 ```
@@ -246,9 +239,9 @@ mode, and content are read from outside it — which is also how the byte-identi
 ```console
 docker export "$(docker create dekopon:local unused)" > rootfs.tar
 tar -tvf rootfs.tar opt/dekopon/providers
-tar -xOf rootfs.tar usr/local/bin/dekopon | sha256sum
-sha256sum "$work/context/dist/arm64/dekopon"
+tar -xOf rootfs.tar usr/local/bin/dekopond | sha256sum
+sha256sum "$work/context/dist/arm64/dekopond"
 ```
 
 The last two must print the same digest. That is the assertion the whole design rests on, and
-`$work/binaries.sha256` records all eight so the workflow can make it after the build.
+`$work/binaries.sha256` records all four so the workflow can make it after the build.

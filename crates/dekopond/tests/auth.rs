@@ -1,22 +1,12 @@
+#![cfg(unix)]
+
 use std::{
     path::PathBuf,
     process::{Command, Output},
 };
 
 fn binary() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_dekopon"))
-}
-
-fn example_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("examples/local/dekopon.yaml")
-}
-
-fn run_example(arguments: &[&str]) -> Output {
-    let mut command = binary();
-    command.arg("--config").arg(example_path()).args(arguments);
-    command.output().expect("CLI process starts")
+    Command::new(env!("CARGO_BIN_EXE_dekopond"))
 }
 
 fn stdout(output: &Output) -> String {
@@ -25,203 +15,6 @@ fn stdout(output: &Output) -> String {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("stderr is UTF-8")
-}
-
-#[test]
-fn required_example_commands_are_operational() {
-    let cases = [
-        (vec!["get", "agents"], "reviewer"),
-        (vec!["get", "agents", "-o", "wide"], "PROVIDERS"),
-        (
-            vec!["get", "agent", "reviewer", "-o", "yaml"],
-            "kind: Agent",
-        ),
-        (vec!["get", "capabilities"], "github.pull-request.comment"),
-        (vec!["get", "providers"], "github"),
-        (vec!["describe", "agent", "reviewer"], "Capabilities:"),
-        (vec!["validate"], "configuration valid"),
-        (vec!["config", "view", "-o", "json"], "\"agents\""),
-    ];
-
-    for (arguments, expected) in cases {
-        let output = run_example(&arguments);
-        assert_eq!(
-            output.status.code(),
-            Some(0),
-            "{arguments:?} failed: {}",
-            stderr(&output)
-        );
-        assert!(
-            stdout(&output).contains(expected),
-            "{arguments:?} did not contain {expected:?}: {}",
-            stdout(&output)
-        );
-    }
-}
-
-#[test]
-fn lists_agents_in_every_output_format() {
-    let table = run_example(&["get", "agents", "-o", "table"]);
-    assert_eq!(table.status.code(), Some(0));
-    assert!(stdout(&table).starts_with("NAME"));
-    assert!(stdout(&table).contains("Disabled"));
-
-    let wide = run_example(&["get", "agents", "-o", "wide"]);
-    assert!(stdout(&wide).contains("MODEL"));
-    assert!(stdout(&wide).contains("POLICY"));
-
-    let json = run_example(&["get", "agents", "-o", "json"]);
-    let value: serde_json::Value =
-        serde_json::from_slice(&json.stdout).expect("JSON output parses");
-    assert_eq!(value["kind"], "AgentList");
-    assert_eq!(value["items"].as_array().map(Vec::len), Some(2));
-
-    let yaml = run_example(&["get", "agents", "-o", "yaml"]);
-    assert!(stdout(&yaml).contains("kind: AgentList"));
-
-    let names = run_example(&["get", "agents", "-o", "name"]);
-    assert_eq!(stdout(&names), "agent/reviewer\nagent/snooper\n");
-}
-
-#[test]
-fn gets_each_singular_resource_shape() {
-    let agent = run_example(&["get", "agent", "reviewer", "-o", "json"]);
-    let agent_value: serde_json::Value =
-        serde_json::from_slice(&agent.stdout).expect("agent JSON parses");
-    assert_eq!(agent_value["kind"], "Agent");
-
-    let capability = run_example(&[
-        "get",
-        "capability",
-        "github.pull-request.comment",
-        "-o",
-        "yaml",
-    ]);
-    assert_eq!(capability.status.code(), Some(0));
-    assert!(stdout(&capability).contains("effect: external-write"));
-
-    let provider = run_example(&["get", "provider", "github", "-o", "name"]);
-    assert_eq!(stdout(&provider), "provider/github\n");
-}
-
-#[test]
-fn example_encodes_the_review_authority_boundary() {
-    let description = run_example(&["describe", "agent", "reviewer"]);
-    let rendered = stdout(&description);
-
-    assert!(rendered.contains("github.pull-request.read"));
-    assert!(rendered.contains("github.pull-request.comment [external-write"));
-    assert!(!rendered.contains("github.pull-request.approve"));
-}
-
-/// A mounted skill is described by name, file count, and summary; its text stays in the file.
-#[test]
-fn example_describes_the_reviewer_skill_without_its_body() {
-    let description = run_example(&["describe", "agent", "reviewer"]);
-    let rendered = stdout(&description);
-
-    assert!(rendered.contains("Skills:"), "{rendered}");
-    assert!(
-        rendered.contains("pull-request-review [1 resource file(s)]"),
-        "{rendered}"
-    );
-    assert!(!rendered.contains("## "), "{rendered}");
-}
-
-#[test]
-fn config_view_is_canonical_and_machine_readable() {
-    let output = run_example(&["config", "view", "--output", "json"]);
-    let value: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("config JSON parses");
-
-    assert_eq!(value["apiVersion"], "dekopon.dev/v1alpha1");
-    assert_eq!(value["agents"].as_array().map(Vec::len), Some(2));
-    assert_eq!(value["capabilities"].as_array().map(Vec::len), Some(3));
-    assert_eq!(value["providers"].as_array().map(Vec::len), Some(1));
-}
-
-#[test]
-fn missing_resource_exits_with_three() {
-    let output = run_example(&["get", "agent", "absent"]);
-
-    assert_eq!(output.status.code(), Some(3));
-    assert!(stderr(&output).contains("agent \"absent\" not found"));
-}
-
-#[test]
-fn invalid_configuration_exits_with_one() {
-    let file = tempfile::NamedTempFile::new().expect("temporary config");
-    std::fs::write(
-        file.path(),
-        r#"
-apiVersion: dekopon.dev/v1alpha1
-kind: Agent
-metadata:
-  name: reviewer
-spec:
-  description: Invalid fixture
-  capabilities:
-    - github.missing
-"#,
-    )
-    .expect("write fixture");
-    let output = binary()
-        .arg("--config")
-        .arg(file.path())
-        .arg("validate")
-        .output()
-        .expect("CLI process starts");
-
-    assert_eq!(output.status.code(), Some(1));
-    assert!(stderr(&output).contains("references missing capability"));
-}
-
-#[test]
-fn usage_errors_exit_with_two() {
-    let output = binary()
-        .args(["get", "agent", "not valid"])
-        .output()
-        .expect("CLI process starts");
-
-    assert_eq!(output.status.code(), Some(2));
-    assert!(stderr(&output).contains("invalid character"));
-}
-
-#[test]
-fn a_bare_invocation_is_a_usage_error() {
-    // The subcommand is optional in the grammar only so this crate can name what was missing in
-    // its own words. It is still required, and a script that pipes a bare `dekopon` gets the
-    // documented usage exit rather than something it has to interpret.
-    let output = binary().output().expect("CLI process starts");
-
-    assert_eq!(
-        output.status.code(),
-        Some(2),
-        "exit 2 is the documented usage code"
-    );
-    assert!(
-        stderr(&output).contains("subcommand is required"),
-        "the refusal must say what was missing: {}",
-        stderr(&output)
-    );
-}
-
-#[test]
-fn top_level_and_nested_help_are_generated() {
-    let top = binary().arg("--help").output().expect("CLI process starts");
-    assert_eq!(top.status.code(), Some(0));
-    // `[COMMAND]` rather than `<COMMAND>`: the subcommand is optional in the grammar so that a bare
-    // `dekopon` reaches this crate's own refusal instead of Clap's, and the usage line says so.
-    assert!(stdout(&top).contains("Usage: dekopon [OPTIONS] [COMMAND]"));
-    assert!(stdout(&top).contains("--no-color"));
-
-    let nested = binary()
-        .args(["get", "--help"])
-        .output()
-        .expect("CLI process starts");
-    assert_eq!(nested.status.code(), Some(0));
-    assert!(stdout(&nested).contains("agents"));
-    assert!(stdout(&nested).contains("capabilities"));
 }
 
 #[test]
@@ -287,7 +80,7 @@ fn chatgpt_export_emits_an_exact_secret_manifest() {
     assert_eq!(
         stdout(&output),
         format!(
-            "# Exported by `dekopon auth chatgpt export`. This manifest carries a live ChatGPT access token and\n\
+            "# Exported by `dekopond auth chatgpt export`. This manifest carries a live ChatGPT access token and\n\
              # a rotating refresh token; base64 here is Kubernetes' encoding for `data`, not encryption.\n\
              #\n\
              # The refresh token rotates: whichever process refreshes next invalidates this copy. Seed it once\n\
@@ -470,33 +263,212 @@ fn chatgpt_export_help_states_that_it_prints_a_credential() {
     );
     assert!(help.contains("--expose-credential"), "{help}");
 }
-
 #[test]
-fn version_does_not_require_configuration() {
+fn auth_isolated_from_gateway_config_transport_and_telemetry_discovery() {
     let directory = tempfile::tempdir().expect("temporary directory");
+    let auth_file = directory.path().join("missing-auth.json");
     let output = binary()
+        .env_clear()
+        .env(
+            "DEKOPON_CONFIG",
+            directory.path().join("absent-catalog.yaml"),
+        )
+        .env("OTEL_EXPORTER_OTLP_ENDPOINT", "not an endpoint")
         .current_dir(directory.path())
-        .arg("version")
+        .arg("--config")
+        .arg(directory.path()) // A directory is not a usable gateway configuration.
+        .args(["auth", "chatgpt", "status", "--auth-file"])
+        .arg(&auth_file)
+        .args(["-o", "json"])
         .output()
-        .expect("CLI process starts");
-
-    assert_eq!(output.status.code(), Some(0));
-    assert_eq!(
-        stdout(&output),
-        format!("dekopon {}\n", env!("CARGO_PKG_VERSION"))
-    );
+        .expect("gateway auth starts without any transport credential environment");
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert!(stderr(&output).is_empty(), "{}", stderr(&output));
+    let status: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("only status JSON");
+    assert_eq!(status["signedIn"], false);
+    assert_eq!(status["expired"], false);
+    assert!(!auth_file.exists());
 }
 
 #[test]
-fn verbose_diagnostics_still_reach_a_redirected_stderr() {
-    // `-vv` has to reach a redirected stderr, which is where a script collects it. Nothing in this
-    // binary writes to a terminal on its own, so there is no suppression path to get this wrong.
-    let output = run_example(&["-vv", "get", "agents"]);
+fn status_formats_and_logout_never_disclose_credentials() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let auth_file = credential_fixture(directory.path(), CREDENTIAL_FIXTURE);
+    for format in ["table", "wide", "name", "json", "yaml"] {
+        let output = binary()
+            .env_clear()
+            .args(["auth", "chatgpt", "status", "--auth-file"])
+            .arg(&auth_file)
+            .args(["-o", format])
+            .output()
+            .expect("status starts");
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        for token in [
+            "access-token-fixture",
+            "refresh-token-fixture",
+            "acct-fixture",
+        ] {
+            assert!(!stdout(&output).contains(token));
+            assert!(!stderr(&output).contains(token));
+        }
+        match format {
+            "json" => {
+                let status: serde_json::Value =
+                    serde_json::from_slice(&output.stdout).expect("JSON");
+                assert_eq!(status["signedIn"], true);
+                assert_eq!(status["expired"], true);
+            }
+            "yaml" => {
+                let status: serde_yaml::Value =
+                    serde_yaml::from_slice(&output.stdout).expect("YAML");
+                assert_eq!(status["signedIn"].as_bool(), Some(true));
+                assert_eq!(status["expired"].as_bool(), Some(true));
+            }
+            "name" => assert_eq!(stdout(&output), "auth/chatgpt\n"),
+            _ => assert!(stdout(&output).contains("signed in; refresh required")),
+        }
+    }
+    let other = directory.path().join("other-client.json");
+    std::fs::write(&other, "synthetic unrelated client").expect("other client fixture");
+    for _ in 0..2 {
+        let output = binary()
+            .env_clear()
+            .args(["auth", "chatgpt", "logout", "--auth-file"])
+            .arg(&auth_file)
+            .args(["-o", "json"])
+            .output()
+            .expect("logout starts");
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        let status: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+        assert_eq!(status["signedIn"], false);
+        assert_eq!(status["expired"], false);
+        assert!(!auth_file.exists());
+        assert_eq!(
+            std::fs::read_to_string(&other).expect("other client remains"),
+            "synthetic unrelated client"
+        );
+        assert!(!stdout(&output).contains("token-fixture"));
+        assert!(!stderr(&output).contains("token-fixture"));
+    }
+}
 
-    assert_eq!(output.status.code(), Some(0));
-    assert!(
-        stderr(&output).contains("loaded validated catalog"),
-        "debug diagnostics vanished: {}",
-        stderr(&output)
-    );
+#[test]
+fn serving_requires_config_and_auth_flags_do_not_change_daemon_logging() {
+    for arguments in [
+        vec![],
+        vec!["--quiet"],
+        vec!["--output", "json"],
+        vec!["get", "agents"],
+    ] {
+        let output = binary()
+            .env_clear()
+            .args(arguments)
+            .output()
+            .expect("usage starts");
+        assert_eq!(output.status.code(), Some(2));
+        assert!(stdout(&output).is_empty());
+    }
+    for operation in ["login", "status", "logout", "export"] {
+        let output = binary()
+            .env_clear()
+            .args(["auth", "chatgpt", operation, "--help"])
+            .output()
+            .expect("help never starts device login");
+        assert_eq!(output.status.code(), Some(0));
+        assert!(stdout(&output).contains("--auth-file"));
+        assert!(stderr(&output).is_empty());
+    }
+}
+
+#[test]
+fn malformed_credential_diagnostics_never_reflect_values() {
+    use std::os::unix::fs::PermissionsExt;
+    for field in ["version", "expiresAt"] {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let marker = format!("synthetic-malformed-{field}-only");
+        let mut document: serde_json::Value =
+            serde_json::from_str(CREDENTIAL_FIXTURE).expect("fixture JSON");
+        document[field] = marker.clone().into();
+        let bytes = serde_json::to_vec(&document).expect("encode synthetic document");
+        let path = directory.path().join("malformed.json");
+        std::fs::write(&path, &bytes).expect("write synthetic credential");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("private fixture");
+        for command in ["status", "export"] {
+            for verbosity in [None, Some("-v"), Some("-vv")] {
+                let mut cli = binary();
+                cli.env_clear()
+                    .args(["auth", "chatgpt", command, "--no-color", "--auth-file"])
+                    .arg(&path);
+                if command == "export" {
+                    cli.arg("--expose-credential");
+                }
+                if let Some(flag) = verbosity {
+                    cli.arg(flag);
+                }
+                let output = cli.output().expect("CLI starts");
+                let diagnostic = stderr(&output);
+                assert_eq!(output.status.code(), Some(1));
+                assert!(output.stdout.is_empty());
+                for value in [
+                    &marker,
+                    "access-token-fixture",
+                    "refresh-token-fixture",
+                    "acct-fixture",
+                ] {
+                    assert!(!stdout(&output).contains(value));
+                    assert!(!diagnostic.contains(value));
+                }
+                assert!(diagnostic.contains("could not parse ChatGPT credentials"));
+                assert!(diagnostic.contains(path.to_str().expect("UTF-8 path")));
+                if verbosity.is_some() {
+                    assert!(diagnostic.contains("credential JSON Data at line 1 column "));
+                }
+                if verbosity == Some("-vv") {
+                    assert!(diagnostic.contains("debug: ChatGpt::ParseAuth"));
+                }
+                assert_eq!(std::fs::read(&path).expect("read fixture"), bytes);
+            }
+        }
+    }
+}
+
+#[test]
+fn non_parse_credential_io_failure_keeps_cause_and_debug_context() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let path = directory.path().join("loop.json");
+    std::os::unix::fs::symlink(&path, &path).expect("self-referential symlink");
+    let cause = std::fs::File::open(&path).expect_err("ELOOP").to_string();
+    for command in ["status", "export"] {
+        for verbosity in ["-v", "-vv"] {
+            let mut cli = binary();
+            cli.env_clear()
+                .args([
+                    "auth",
+                    "chatgpt",
+                    command,
+                    verbosity,
+                    "--no-color",
+                    "--auth-file",
+                ])
+                .arg(&path);
+            if command == "export" {
+                cli.arg("--expose-credential");
+            }
+            let output = cli.output().expect("CLI starts");
+            let diagnostic = stderr(&output);
+            assert_eq!(output.status.code(), Some(1));
+            assert!(output.stdout.is_empty());
+            assert!(diagnostic.contains("could not read ChatGPT credentials"));
+            assert!(diagnostic.contains(path.to_str().expect("UTF-8 path")));
+            assert!(diagnostic.contains(&format!("caused by: {cause}")));
+            if verbosity == "-vv" {
+                assert!(diagnostic.contains("debug:"));
+                assert!(diagnostic.contains("ReadAuth"));
+                assert!(diagnostic.contains("Os {"));
+            }
+            assert_eq!(std::fs::read_link(&path).expect("symlink survives"), path);
+        }
+    }
 }

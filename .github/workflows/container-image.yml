@@ -1,8 +1,8 @@
-# Publishes ghcr.io/dekopon-agents/dekopon: one image, all four binaries, linux/amd64 and
+# Publishes ghcr.io/dekopon-agents/dekopon: one image, both daemon binaries, linux/amd64 and
 # linux/arm64.
 #
 # The image is assembled from the release archives, not compiled here. `release.yml` already
-# builds, checksums, and provenance-attests the four executables for both Linux targets, so this
+# builds, checksums, and provenance-attests the two executables for both Linux targets, so this
 # workflow verifies those archives and copies their contents into an image. Recompiling would
 # produce a second set of binaries nobody has verified, from a toolchain that can drift, and would
 # cost a native build matrix to arrive somewhere less trustworthy than the artifacts users already
@@ -57,6 +57,7 @@ on:
       - ".github/workflows/container-image.yml"
       - "Dockerfile"
       - "ci/stage-image-context.sh"
+      - "ci/verify-image-broker.sh"
       - "ci/fetch-external-provider-components.sh"
       - "LICENSE-*"
       - "examples/providers/*.wasm"
@@ -125,11 +126,24 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "::notice::packaging $tag (push=$push)"
 
+      # Keep verification tooling from the workflow revision, not the requested release.
+      # The release checkout below still owns every staged image input and its attribution.
+      - name: Check out verification tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Preserve the broker image verifier
+        run: cp ci/verify-image-broker.sh "$RUNNER_TEMP/verify-image-broker.sh"
+
       - name: Check out the source to package
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.plan.outputs.checkout_ref }}
           persist-credentials: false
+
+      - name: Check image scripts
+        run: shellcheck ci/stage-image-context.sh "$RUNNER_TEMP/verify-image-broker.sh"
 
       - name: Stage the build context
         id: stage
@@ -187,7 +201,7 @@ jobs:
 
             # The claim this whole design rests on: the executable in the image is the executable
             # the release published, byte for byte.
-            for binary in dekopon dekopon-run dekopon-brokerd dekopond; do
+            for binary in dekopon-brokerd dekopond; do
               in_image=$(tar -xOf "$rootfs" "usr/local/bin/$binary" | sha256sum | cut -d' ' -f1)
               in_release=$(sha256sum "$CONTEXT/dist/$arch/$binary" | cut -d' ' -f1)
               if [ "$in_image" != "$in_release" ]; then
@@ -225,26 +239,20 @@ jobs:
           done
 
           # The runner is amd64, so that image runs here for real.
-          docker run --rm dekopon-proof:amd64 dekopon version
-          docker run --rm dekopon-proof:amd64 dekopon-run --version
+          docker run --rm dekopon-proof:amd64 dekopond --help
           docker run --rm dekopon-proof:amd64 dekopon-brokerd --version
           docker run --rm dekopon-proof:amd64 dekopond --version
-          # Components compile lazily through Cranelift, so only an actual component load proves
-          # Wasmtime works under the runtime image's constraints. `echo` is the one baked component
-          # the direct runner can load: other default components import HTTP and optional memory
-          # imports JSONL; the immediate linker is empty by design.
-          docker run --rm dekopon-proof:amd64 dekopon-run inspect \
-            --provider /opt/dekopon/providers/echo-provider.wasm > /dev/null
-          docker run --rm dekopon-proof:amd64 dekopon-run invoke \
-            --provider /opt/dekopon/providers/echo-provider.wasm echo.echo --input '{}' > /dev/null
+          # Exercise real broker loading/startup of the baked echo component. This proves
+          # released image bytes, not a native build of the PR's source HEAD.
+          "$RUNNER_TEMP/verify-image-broker.sh" dekopon-proof:amd64
           bytes=$(docker image inspect dekopon-proof:amd64 --format '{{.Size}}')
           human=$(awk -v b="$bytes" 'BEGIN { printf "%.1f MiB", b/1048576 }')
           {
             echo "| checked | result |"
             echo "|---|---|"
-            echo "| binaries byte-identical to the archives | amd64 4/4, arm64 4/4 |"
+            echo "| binaries byte-identical to the archives | amd64 2/2, arm64 2/2 |"
             echo "| provider components 65532-owned, not group/world writable | both |"
-            echo "| binaries executed (amd64) | 4/4 plus a component load |"
+            echo "| binaries executed (amd64) | 2/2 plus broker component load/startup |"
             echo "| unpacked size | $human |"
           } >> "$GITHUB_STEP_SUMMARY"
 

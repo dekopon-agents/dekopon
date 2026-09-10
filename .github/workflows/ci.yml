@@ -97,31 +97,13 @@ jobs:
       # Path installation uses the debug profile so it can reuse the smoke-test build. Keep a
       # release-profile compile gate here; tag workflows still perform the final linked builds.
       - name: Check release CLIs
-        run: cargo check --release --locked -p dekopon -p dekopon-run -p dekopon-brokerd -p dekopond
+        run: cargo check --release --locked -p dekopon-brokerd -p dekopond
       # Every other gate builds --all-features, so nothing else compiles the foundational crates
       # with their opt-in `schemars` feature off — the state a crates.io consumer gets by default.
       - name: Check foundational crates without the schemars feature
         run: cargo check -p dekopon-core -p dekopon-capability -p dekopon-protocol --locked
       - name: Detect unused dependencies
         run: cargo machete
-      - name: Verify runner excludes privileged broker machinery
-        shell: bash
-        run: |
-          set -euo pipefail
-          tree=$(cargo tree --locked -p dekopon-run --edges normal --prefix none)
-          if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host|storage-host|policy) v' <<<"$tree"; then
-            printf '%s\n' "$tree" >&2
-            exit 1
-          fi
-      - name: Verify the operator CLI excludes privileged broker machinery
-        shell: bash
-        run: |
-          set -euo pipefail
-          tree=$(cargo tree --locked -p dekopon --edges normal --prefix none)
-          if grep -Eq '^dekopon-(broker|broker-host|brokerd|http-host|storage-host|policy) v' <<<"$tree"; then
-            printf '%s\n' "$tree" >&2
-            exit 1
-          fi
       - name: Verify gateway excludes privileged broker machinery
         shell: bash
         run: |
@@ -131,6 +113,17 @@ jobs:
             printf '%s\n' "$tree" >&2
             exit 1
           fi
+      - name: Verify broker excludes unprivileged orchestration
+        shell: bash
+        run: |
+          set -euo pipefail
+          tree=$(cargo tree --locked -p dekopon-brokerd --edges normal --prefix none)
+          if grep -Eq '^dekopon-(agent|shell|model|process|config) v' <<<"$tree"; then
+            printf '%s\n' "$tree" >&2
+            exit 1
+          fi
+      - name: Test daemon dependency boundary gates
+        run: python3 .github/scripts/test_daemon_dependency_gates.py
       - name: Format, lint, and test Rust provider examples
         env:
           CARGO_TARGET_DIR: target/provider-example-native
@@ -368,7 +361,9 @@ jobs:
         run: |
           printf '%s' '${{ secrets.GITHUB_TOKEN }}' \
             | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
-      - name: Export runner traces to OpenObserve
+      - name: Check smoke failure controls
+        run: python3 examples/otel-traces/test-smoke.py
+      - name: Export daemon traces to OpenObserve
         env:
           OPENOBSERVE_PORT: "15080"
           OPENOBSERVE_IMAGE: ghcr.io/${{ github.repository_owner }}/openobserve:v0.92.0@sha256:a40c420d5d25f013243dbd7e025db1e39980385dcb9e5de924ce5a6a80957527
@@ -479,6 +474,8 @@ jobs:
         run: python3 .github/scripts/test_verify_changelog.py
       - name: Test release metadata validation
         run: python3 .github/scripts/test_verify_release_metadata.py
+      - name: Test Homebrew formula rendering
+        run: python3 .github/scripts/test_render_homebrew_formula.py
       - name: Check package shell scripts
         if: ${{ needs.changes.outputs.run_package != 'false' }}
         run: shellcheck .github/scripts/prepare-package-cache.sh
@@ -564,44 +561,22 @@ jobs:
           restore-keys: |
             cargo-registry-v1-${{ runner.os }}-
       - name: Build CLIs
-        run: cargo build --locked -p dekopon -p dekopon-run -p dekopon-brokerd -p dekopond
+        run: cargo build --locked -p dekopon-brokerd -p dekopond
       - name: Fetch exact standalone echo fixture
         run: ci/fetch-external-provider-components.sh examples/providers echo
       - name: Exercise generated help and example commands
         shell: bash
         run: |
           set -euo pipefail
-          bin=target/debug/dekopon
-          runner=target/debug/dekopon-run
           broker=target/debug/dekopon-brokerd
           gateway=target/debug/dekopond
-          config=examples/local/dekopon.yaml
-          provider=examples/providers/echo-provider.wasm
-          "$bin" --help >/dev/null
-          "$bin" get --help >/dev/null
-          "$bin" --config "$config" get agents >/dev/null
-          "$bin" --config "$config" get agents -o wide >/dev/null
-          "$bin" --config "$config" get agent reviewer -o yaml >/dev/null
-          "$bin" --config "$config" get capabilities -o name >/dev/null
-          "$bin" --config "$config" get providers >/dev/null
-          "$bin" --config "$config" describe agent reviewer >/dev/null
-          "$bin" --config "$config" validate >/dev/null
-          "$bin" --config "$config" config view -o json >/dev/null
-          "$runner" --help >/dev/null
-          "$runner" broker --help >/dev/null
-          "$runner" broker invoke --help >/dev/null
-          "$runner" chat --help >/dev/null
           "$broker" --help >/dev/null
           "$broker" --version >/dev/null
           "$gateway" --help >/dev/null
           "$gateway" --version >/dev/null
-          "$bin" auth chatgpt export --help >/dev/null
+          "$gateway" auth chatgpt export --help >/dev/null
           DEKOPON_CHATGPT_AUTH_FILE="$RUNNER_TEMP/dekopon-chatgpt-test-auth.json" \
-            "$bin" auth chatgpt status >/dev/null
-          "$runner" inspect --provider "$provider" >/dev/null
-          "$runner" invoke --provider "$provider" echo.echo --input '{}' >/dev/null
-          "$runner" invoke --provider "$provider" echo.ransom-case \
-            --input '{"message":"Hello, World!"}' >/dev/null
+            "$gateway" auth chatgpt status >/dev/null
       - name: Verify credential export emits an applicable Secret
         shell: bash
         run: |
@@ -610,7 +585,7 @@ jobs:
           cat >"$auth" <<'JSON'
           {"version":1,"access":"access-token-fixture","refresh":"refresh-token-fixture","expiresAt":1700000000,"accountId":"acct-fixture"}
           JSON
-          target/debug/dekopon auth chatgpt export --auth-file "$auth" \
+          target/debug/dekopond auth chatgpt export --auth-file "$auth" \
             --expose-credential --namespace dekopon >"$RUNNER_TEMP/chatgpt-secret.yaml"
           grep -q '^apiVersion: v1$' "$RUNNER_TEMP/chatgpt-secret.yaml"
           grep -q '^kind: Secret$' "$RUNNER_TEMP/chatgpt-secret.yaml"
@@ -620,45 +595,22 @@ jobs:
             | base64 -d | diff - "$auth"
           # An export with no credential must fail rather than emit a half-formed secret.
           set +e
-          target/debug/dekopon auth chatgpt export --auth-file "$RUNNER_TEMP/absent-auth.json" \
+          target/debug/dekopond auth chatgpt export --auth-file "$RUNNER_TEMP/absent-auth.json" \
             --expose-credential >/dev/null 2>&1
-          status=$?
-          set -e
-          test "$status" -eq 1
-      - name: Verify invalid configuration exit behavior
-        shell: bash
-        run: |
-          set -euo pipefail
-          invalid="$RUNNER_TEMP/invalid-dekopon.yaml"
-          cat >"$invalid" <<'YAML'
-          apiVersion: dekopon.dev/v1alpha1
-          kind: Agent
-          metadata:
-            name: invalid
-          spec:
-            description: Missing declared capability
-            capabilities: [github.missing]
-          YAML
-          set +e
-          target/debug/dekopon --config "$invalid" validate >/dev/null 2>&1
           status=$?
           set -e
           test "$status" -eq 1
       - name: Verify path installation
         if: ${{ needs.changes.outputs.run_cli_install != 'false' }}
         shell: bash
-        # Reuse the debug workspace build rather than creating four independent release targets.
+        # Reuse the debug workspace build rather than creating two independent release targets.
         # The quality lane checks release-profile compilation in one unified dependency graph.
         env:
           CARGO_TARGET_DIR: target
         run: |
           set -euo pipefail
-          cargo install --debug --locked --path crates/dekopon --root "$RUNNER_TEMP/dekopon-install"
-          cargo install --debug --locked --path crates/dekopon-run --root "$RUNNER_TEMP/dekopon-install"
           cargo install --debug --locked --path crates/dekopon-brokerd --root "$RUNNER_TEMP/dekopon-install"
           cargo install --debug --locked --path crates/dekopond --root "$RUNNER_TEMP/dekopon-install"
-          "$RUNNER_TEMP/dekopon-install/bin/dekopon" version
-          "$RUNNER_TEMP/dekopon-install/bin/dekopon-run" --version
           "$RUNNER_TEMP/dekopon-install/bin/dekopon-brokerd" --version
           "$RUNNER_TEMP/dekopon-install/bin/dekopond" --version
       - name: Finish CI metrics
@@ -726,18 +678,47 @@ jobs:
           helm template dekopon charts/dekopon \
             -f charts/dekopon/values-pr-summarizer-linter.yaml \
             --set gateway.service.enabled=true > "$RUNNER_TEMP/gateway-service.yaml"
-          # broker.httpBind is the only optional value that reaches the broker container's argv,
-          # so rendering is the only thing that can prove the flag is still passed. Default values
-          # otherwise: no Service and no Ingress exist for this listener.
-          helm template dekopon charts/dekopon \
-            --set broker.httpBind=127.0.0.1:8080 > "$RUNNER_TEMP/http-bind.yaml"
-          grep -q -- '"--http-bind", "127.0.0.1:8080"' "$RUNNER_TEMP/http-bind.yaml"
-          # ... and that the default render, which is the one everybody installs, still passes no
-          # such flag, so the listener stays absent unless an operator asks for it.
-          if grep -q -- '--http-bind' "$RUNNER_TEMP/default.yaml"; then
-            echo "default values must not enable the web UI listener" >&2
+          # Retired broker UI configuration must fail, never silently disappear.
+          if helm template dekopon charts/dekopon --set broker.httpBind=127.0.0.1:8080 > "$RUNNER_TEMP/http-bind.yaml" 2> "$RUNNER_TEMP/http-bind.err"; then
+            echo "retired broker listener configuration was accepted" >&2
             exit 1
           fi
+          grep -q 'broker.httpBind is not supported' "$RUNNER_TEMP/http-bind.err"
+          # The pod's probe authenticates as its own UID, so a broker config that maps only
+          # the gateway's 65533 renders a broker that starts, binds, and never becomes ready.
+          # Refuse it at template time, not at rollout.
+          cat > "$RUNNER_TEMP/foreign-uid-broker.yaml" <<'YAML'
+          apiVersion: dekopon.dev/brokerd/v1alpha1
+          socketPath: /run/dekopon/broker.sock
+          auditPath: /var/lib/dekopon/audit.jsonl
+          brokerPrincipal: local-broker
+          policyRevision: chart-default
+          policiesPath: /etc/dekopon/policies.cedar
+          providers:
+            - /opt/dekopon/providers/echo-provider.wasm
+          identities:
+            - uid: 65533
+              principal: dekopon-pod
+              actor:
+                type: service
+                principal: dekopon-pod
+          constraintSets:
+            echo.echo:
+              provider: echo
+              effect: read-only
+              risk: Low
+              idempotency: idempotent
+              constraints:
+                timeoutMs: 30000
+                maxOutputBytes: 1048576
+          YAML
+          if helm template dekopon charts/dekopon \
+            --set-file broker.config.inline="$RUNNER_TEMP/foreign-uid-broker.yaml" \
+            > "$RUNNER_TEMP/foreign-uid.yaml" 2> "$RUNNER_TEMP/foreign-uid.err"; then
+            echo "broker identities that omit the pod's own UID were accepted" >&2
+            exit 1
+          fi
+          grep -q "identities must map the broker's own UID 65532" "$RUNNER_TEMP/foreign-uid.err"
       # The drains run in sequence, so the pod's grace has to cover their sum. A guard that never
       # fires is not a guard: render the two shapes that must be refused and prove the message
       # names the number, not just that something went wrong.
@@ -791,10 +772,6 @@ jobs:
             ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e \
             -strict -summary -kubernetes-version 1.33.0 \
             < "$RUNNER_TEMP/gateway-service.yaml"
-          docker run --rm -i \
-            ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e \
-            -strict -summary -kubernetes-version 1.33.0 \
-            < "$RUNNER_TEMP/http-bind.yaml"
       # chart-publish.yml ships a tarball, not the working tree, and .helmignore decides what
       # goes in it. Package the chart and prove the archive renders byte-identically to the
       # source directory, so a file dropped from the package is a CI failure rather than a

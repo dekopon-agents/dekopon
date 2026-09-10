@@ -1,6 +1,6 @@
 [package]
 name = "dekopon-storage-host"
-description = "Broker-owned namespace-bound quota and transaction engine for Dekopon providers"
+description = "Broker-owned namespace-bound quota and direct-write engine for Dekopon providers"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

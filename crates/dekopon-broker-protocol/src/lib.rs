@@ -6,7 +6,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::{collections::BTreeSet, fmt, io, time::Duration};
+use std::{fmt, io, time::Duration};
 
 #[cfg(unix)]
 use std::{
@@ -15,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-pub use dekopon_capability::{InvocationOutcome, InvocationResult, Permission};
+pub use dekopon_capability::{InvocationOutcome, InvocationResult};
 use dekopon_core::{
     AgentId, CapabilityId, ExternalSubject, InvocationId, ProviderId, SecretUseProposal, TraceId,
     TransportId,
@@ -41,21 +41,6 @@ pub const DEFAULT_MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const HARD_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 /// Default connection/read/write deadline.
 pub const DEFAULT_IO_TIMEOUT: Duration = Duration::from_secs(30);
-/// Maximum agents accepted in one informational gateway inventory.
-pub const MAX_REPORTED_AGENTS: usize = 1_024;
-/// Maximum capabilities accepted for one reported agent.
-pub const MAX_REPORTED_AGENT_CAPABILITIES: usize = 1_024;
-/// Maximum providers accepted for one reported agent.
-pub const MAX_REPORTED_AGENT_PROVIDERS: usize = 256;
-/// Maximum provider permissions accepted for one reported capability.
-pub const MAX_REPORTED_PERMISSIONS: usize = 256;
-/// Maximum bytes retained from one operator-authored informational string.
-pub const MAX_REPORTED_TEXT_BYTES: usize = 4 * 1024;
-/// Defensive ceiling on model calls represented by one accounting delta.
-pub const MAX_REPORTED_MODEL_CALLS: u64 = 1_000_000;
-/// Defensive ceiling on any one token-accounting delta.
-pub const MAX_REPORTED_TOKENS: u64 = 1_000_000_000_000_000;
-
 /// Stable failure code: the connected peer is not mapped by broker policy.
 pub const ERROR_UNAUTHENTICATED: &str = "unauthenticated";
 /// Stable failure code: the request frame could not be decoded.
@@ -86,12 +71,13 @@ pub const ERROR_STORAGE_IO: &str = "storage-io";
 
 /// Stable failure code: a bounded broker resource is exhausted and nothing executed.
 ///
-/// Distinct from [`ERROR_BROKER_UNAVAILABLE`] because the exhaustion is permanent rather than
-/// momentary: the replay ledger never evicts and is restored from durable history on restart, and
-/// the audit log does not rotate. Resubmission under a fresh invocation identifier is *safe* — no
-/// provider work began — and it is also futile, because it fails identically until an operator
-/// raises `maxReplayIds` / `auditMaxRecords` or moves the audit file aside. A client must not
-/// retry this.
+/// Distinct from [`ERROR_BROKER_UNAVAILABLE`]: the process-local replay ledger or an embedding's
+/// bounded in-memory audit log is full and does not evict. A new identifier cannot fix capacity
+/// within that lifetime. Nothing executed, but clients must not retry automatically.
+///
+/// The broker's durable file audit is not one of those resources — it bounds each record, never the
+/// number of them — so a full audit filesystem arrives as [`ERROR_BROKER_UNAVAILABLE`] before
+/// execution and [`ERROR_OUTCOME_UNAUDITED`] after it, and never here.
 pub const ERROR_CAPACITY_EXHAUSTED: &str = "capacity-exhausted";
 
 /// Exact protocol version carried by every envelope.
@@ -111,7 +97,7 @@ pub enum ProtocolVersion {
 /// W3C `traceparent`, carrying the client's OpenTelemetry span as a remote parent.
 ///
 /// This is distinct from [`TraceId`] and does not replace it. `TraceId` identifies a Dekopon
-/// session for the audit chain and replay accounting; `TraceParent` exists only so broker spans
+/// session for the audit log and replay accounting; `TraceParent` exists only so broker spans
 /// join the client's trace instead of starting an unrelated one. Two identifiers, two jobs.
 ///
 /// Like every other request field this is untrusted: it influences telemetry correlation and
@@ -810,380 +796,6 @@ pub struct AvailableCapability {
     pub capability: ProviderCapability,
 }
 
-/// Informational catalog capability reported by an unprivileged gateway.
-///
-/// This value is never policy input. It exists only so the broker-hosted read-only web UI can show
-/// what the gateway loaded from its catalog without moving catalog ownership into the broker.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct ReportedAgentCapability {
-    /// Catalog capability identifier.
-    pub id: CapabilityId,
-    /// Catalog provider declaration for this capability.
-    pub provider: ProviderId,
-    /// Catalog-declared least-privilege provider permissions.
-    pub permissions: Vec<Permission>,
-}
-
-/// One informational catalog agent reported by an unprivileged gateway.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct ReportedAgent {
-    /// Catalog agent identifier.
-    pub id: AgentId,
-    /// Operator-authored purpose, never standing instructions.
-    pub description: String,
-    /// Whether the catalog permits the gateway to route to this agent.
-    pub enabled: bool,
-    /// Optional model class, not a model credential or endpoint.
-    pub model_class: Option<String>,
-    /// Providers the agent's declared capabilities refer to.
-    pub providers: Vec<ProviderId>,
-    /// Capabilities the agent may propose; this inventory grants none of them.
-    pub capabilities: Vec<ReportedAgentCapability>,
-}
-
-/// Complete informational agent inventory loaded by one gateway.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct AgentInventory {
-    /// Agents in deterministic identifier order.
-    pub agents: Vec<ReportedAgent>,
-    /// Whether defensive report bounds omitted or shortened any catalog metadata.
-    #[serde(default)]
-    pub truncated: bool,
-}
-
-impl AgentInventory {
-    /// Checks defensive cardinality, text, and duplicate bounds before retaining a report.
-    #[must_use]
-    pub fn is_valid(&self) -> bool {
-        self.validate().is_ok()
-    }
-
-    /// Checks the same bounds as [`AgentInventory::is_valid`], naming the first one violated.
-    ///
-    /// A server keeps the wire message generic and logs this locally, so an operator whose web UI
-    /// inventory went stale can learn which agent and which bound was at fault instead of reading
-    /// one fixed string on both ends.
-    ///
-    /// # Errors
-    ///
-    /// Returns the [`InventoryError`] describing the first violated bound. The error names
-    /// validated identifiers and byte counts only; no operator-authored text reaches it.
-    pub fn validate(&self) -> Result<(), InventoryError> {
-        if self.agents.len() > MAX_REPORTED_AGENTS {
-            return Err(InventoryError::TooManyAgents {
-                count: self.agents.len(),
-                maximum: MAX_REPORTED_AGENTS,
-            });
-        }
-        let mut reported = BTreeSet::new();
-        for agent in &self.agents {
-            if !reported.insert(agent.id.clone()) {
-                return Err(InventoryError::DuplicateAgent {
-                    agent: agent.id.clone(),
-                });
-            }
-            agent.validate()?;
-        }
-        Ok(())
-    }
-}
-
-impl ReportedAgent {
-    fn validate(&self) -> Result<(), InventoryError> {
-        self.check_text("description", self.description.len())?;
-        if let Some(model_class) = &self.model_class {
-            self.check_text("model class", model_class.len())?;
-        }
-        self.check_count(
-            "providers",
-            self.providers.len(),
-            MAX_REPORTED_AGENT_PROVIDERS,
-        )?;
-        self.check_count(
-            "capabilities",
-            self.capabilities.len(),
-            MAX_REPORTED_AGENT_CAPABILITIES,
-        )?;
-        if let Some(provider) = duplicate(self.providers.iter()) {
-            return Err(InventoryError::DuplicateProvider {
-                agent: self.id.clone(),
-                provider: provider.clone(),
-            });
-        }
-        if let Some(capability) = duplicate(self.capabilities.iter().map(|entry| &entry.id)) {
-            return Err(InventoryError::DuplicateCapability {
-                agent: self.id.clone(),
-                capability: capability.clone(),
-            });
-        }
-        for capability in &self.capabilities {
-            if !self.providers.contains(&capability.provider) {
-                return Err(InventoryError::UndeclaredProvider {
-                    agent: self.id.clone(),
-                    capability: capability.id.clone(),
-                    provider: capability.provider.clone(),
-                });
-            }
-            if capability.permissions.len() > MAX_REPORTED_PERMISSIONS {
-                return Err(InventoryError::TooManyPermissions {
-                    agent: self.id.clone(),
-                    capability: capability.id.clone(),
-                    count: capability.permissions.len(),
-                    maximum: MAX_REPORTED_PERMISSIONS,
-                });
-            }
-            for permission in &capability.permissions {
-                self.check_text("permission operation", permission.operation.len())?;
-                if let Some(resource) = &permission.resource {
-                    self.check_text("permission resource", resource.len())?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn check_text(&self, field: &'static str, bytes: usize) -> Result<(), InventoryError> {
-        if bytes > MAX_REPORTED_TEXT_BYTES {
-            return Err(InventoryError::TextTooLong {
-                agent: self.id.clone(),
-                field,
-                bytes,
-                maximum: MAX_REPORTED_TEXT_BYTES,
-            });
-        }
-        Ok(())
-    }
-
-    fn check_count(
-        &self,
-        collection: &'static str,
-        count: usize,
-        maximum: usize,
-    ) -> Result<(), InventoryError> {
-        if count > maximum {
-            return Err(InventoryError::TooMany {
-                agent: self.id.clone(),
-                collection,
-                count,
-                maximum,
-            });
-        }
-        Ok(())
-    }
-}
-
-fn duplicate<'a, T: 'a + Ord>(values: impl IntoIterator<Item = &'a T>) -> Option<&'a T> {
-    let mut seen = BTreeSet::new();
-    values.into_iter().find(|value| !seen.insert(*value))
-}
-
-/// The first defensive bound one informational agent inventory violated.
-///
-/// Every field is a validated identifier or a byte count, never operator-authored text, so a
-/// server may log this without moving catalog prose or prompt content into its logs.
-#[derive(Clone, Debug, Error, Eq, PartialEq)]
-pub enum InventoryError {
-    /// More agents than [`MAX_REPORTED_AGENTS`].
-    #[error("inventory reports {count} agents; maximum is {maximum}")]
-    TooManyAgents {
-        /// Reported agents.
-        count: usize,
-        /// Accepted maximum.
-        maximum: usize,
-    },
-    /// One agent identifier appeared more than once.
-    #[error("inventory reports agent `{agent}` more than once")]
-    DuplicateAgent {
-        /// Repeated agent.
-        agent: AgentId,
-    },
-    /// One operator-authored string exceeded [`MAX_REPORTED_TEXT_BYTES`].
-    #[error("agent `{agent}` {field} is {bytes} bytes; maximum is {maximum}")]
-    TextTooLong {
-        /// Offending agent.
-        agent: AgentId,
-        /// Which string exceeded the bound.
-        field: &'static str,
-        /// Reported byte length.
-        bytes: usize,
-        /// Accepted maximum.
-        maximum: usize,
-    },
-    /// One agent collection exceeded its cardinality bound.
-    #[error("agent `{agent}` reports {count} {collection}; maximum is {maximum}")]
-    TooMany {
-        /// Offending agent.
-        agent: AgentId,
-        /// Which collection exceeded its bound.
-        collection: &'static str,
-        /// Reported entries.
-        count: usize,
-        /// Accepted maximum.
-        maximum: usize,
-    },
-    /// One agent listed the same provider twice.
-    #[error("agent `{agent}` reports provider `{provider}` more than once")]
-    DuplicateProvider {
-        /// Offending agent.
-        agent: AgentId,
-        /// Repeated provider.
-        provider: ProviderId,
-    },
-    /// One agent listed the same capability twice.
-    #[error("agent `{agent}` reports capability `{capability}` more than once")]
-    DuplicateCapability {
-        /// Offending agent.
-        agent: AgentId,
-        /// Repeated capability.
-        capability: CapabilityId,
-    },
-    /// One capability named a provider its agent does not declare.
-    #[error("agent `{agent}` capability `{capability}` names undeclared provider `{provider}`")]
-    UndeclaredProvider {
-        /// Offending agent.
-        agent: AgentId,
-        /// Offending capability.
-        capability: CapabilityId,
-        /// Provider missing from the agent's own list.
-        provider: ProviderId,
-    },
-    /// One capability exceeded [`MAX_REPORTED_PERMISSIONS`].
-    #[error(
-        "agent `{agent}` capability `{capability}` reports {count} permissions; maximum is {maximum}"
-    )]
-    TooManyPermissions {
-        /// Offending agent.
-        agent: AgentId,
-        /// Offending capability.
-        capability: CapabilityId,
-        /// Reported permissions.
-        count: usize,
-        /// Accepted maximum.
-        maximum: usize,
-    },
-}
-
-/// Provider-reported token accounting accumulated by an unprivileged model process.
-///
-/// Counts are informational and process-local. They never enter policy, authorization, execution,
-/// evidence, or durable broker audit. Missing counts stay explicit rather than becoming zero.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct ModelUsageReport {
-    /// Model calls represented by this delta.
-    pub model_calls: u64,
-    /// Provider-reported input tokens.
-    pub input_tokens: u64,
-    /// Calls whose provider omitted input-token accounting.
-    pub input_unreported_calls: u64,
-    /// Provider-reported cached input tokens.
-    pub cached_input_tokens: u64,
-    /// Calls whose provider omitted cached-input accounting.
-    pub cached_input_unreported_calls: u64,
-    /// Provider-reported output tokens.
-    pub output_tokens: u64,
-    /// Calls whose provider omitted output-token accounting.
-    pub output_unreported_calls: u64,
-    /// Provider-reported reasoning output tokens.
-    pub reasoning_output_tokens: u64,
-    /// Calls whose provider omitted reasoning-token accounting.
-    pub reasoning_unreported_calls: u64,
-    /// Provider-reported total tokens.
-    pub total_tokens: u64,
-    /// Calls whose provider omitted total-token accounting.
-    pub total_unreported_calls: u64,
-}
-
-impl ModelUsageReport {
-    /// Validates one bounded accounting delta before it reaches a live counter.
-    #[must_use]
-    pub fn is_valid(self) -> bool {
-        self.validate().is_ok()
-    }
-
-    /// Checks the same bounds as [`ModelUsageReport::is_valid`], naming the first one violated.
-    ///
-    /// # Errors
-    ///
-    /// Returns the [`UsageReportError`] describing the first violated bound. Every field is a
-    /// count, so a server may log it without moving any model or prompt content into its logs.
-    pub fn validate(self) -> Result<(), UsageReportError> {
-        if self.model_calls == 0 || self.model_calls > MAX_REPORTED_MODEL_CALLS {
-            return Err(UsageReportError::ModelCalls {
-                count: self.model_calls,
-                maximum: MAX_REPORTED_MODEL_CALLS,
-            });
-        }
-        for (field, count) in [
-            ("input", self.input_unreported_calls),
-            ("cached input", self.cached_input_unreported_calls),
-            ("output", self.output_unreported_calls),
-            ("reasoning", self.reasoning_unreported_calls),
-            ("total", self.total_unreported_calls),
-        ] {
-            if count > self.model_calls {
-                return Err(UsageReportError::UnreportedCalls {
-                    field,
-                    count,
-                    calls: self.model_calls,
-                });
-            }
-        }
-        for (field, count) in [
-            ("input", self.input_tokens),
-            ("cached input", self.cached_input_tokens),
-            ("output", self.output_tokens),
-            ("reasoning output", self.reasoning_output_tokens),
-            ("total", self.total_tokens),
-        ] {
-            if count > MAX_REPORTED_TOKENS {
-                return Err(UsageReportError::Tokens {
-                    field,
-                    count,
-                    maximum: MAX_REPORTED_TOKENS,
-                });
-            }
-        }
-        Ok(())
-    }
-}
-
-/// The first defensive bound one model-usage accounting delta violated.
-#[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
-pub enum UsageReportError {
-    /// The delta represented no calls, or more than [`MAX_REPORTED_MODEL_CALLS`].
-    #[error("report covers {count} model calls; expected 1 to {maximum}")]
-    ModelCalls {
-        /// Reported calls.
-        count: u64,
-        /// Accepted maximum.
-        maximum: u64,
-    },
-    /// More calls omitted one accounting field than the delta has calls.
-    #[error("report omits {field} accounting for {count} of its {calls} model calls")]
-    UnreportedCalls {
-        /// Which accounting field.
-        field: &'static str,
-        /// Calls reported as missing that field.
-        count: u64,
-        /// Calls the delta represents.
-        calls: u64,
-    },
-    /// One token count exceeded [`MAX_REPORTED_TOKENS`].
-    #[error("report counts {count} {field} tokens; maximum is {maximum}")]
-    Tokens {
-        /// Which token field.
-        field: &'static str,
-        /// Reported tokens.
-        count: u64,
-        /// Accepted maximum.
-        maximum: u64,
-    },
-}
-
 /// One strict untrusted client request.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -1244,24 +856,6 @@ impl RequestEnvelope {
         Self {
             api_version: ProtocolVersion::V1Alpha2,
             request: BrokerRequest::RecordDeliveredTurn { attestation, turn },
-        }
-    }
-
-    /// Creates an informational gateway catalog report.
-    #[must_use]
-    pub const fn publish_agent_inventory(inventory: AgentInventory) -> Self {
-        Self {
-            api_version: ProtocolVersion::V1Alpha2,
-            request: BrokerRequest::PublishAgentInventory { inventory },
-        }
-    }
-
-    /// Creates an informational model-token accounting report.
-    #[must_use]
-    pub const fn publish_model_usage(usage: ModelUsageReport) -> Self {
-        Self {
-            api_version: ProtocolVersion::V1Alpha2,
-            request: BrokerRequest::PublishModelUsage { usage },
         }
     }
 }
@@ -1358,19 +952,6 @@ pub enum BrokerRequest {
         /// Typed post-acceptance fields the broker turns into the proposal itself.
         turn: DeliveredTurnRequest,
     },
-    /// Replaces the broker's in-memory informational view of the gateway catalog.
-    ///
-    /// The server accepts this only from a mapped attestor peer. It grants nothing and is never
-    /// consulted by authorization or provider execution.
-    PublishAgentInventory {
-        /// Bounded catalog metadata with no instructions, prompts, or credentials.
-        inventory: AgentInventory,
-    },
-    /// Adds one provider-reported model-token delta to process-local informational counters.
-    PublishModelUsage {
-        /// Bounded usage delta with explicit unreported-call counts.
-        usage: ModelUsageReport,
-    },
 }
 
 /// One strict public broker response.
@@ -1461,15 +1042,6 @@ impl ResponseEnvelope {
         }
     }
 
-    /// Acknowledges an informational report that was retained in memory.
-    #[must_use]
-    pub const fn acknowledged() -> Self {
-        Self {
-            api_version: ProtocolVersion::V1Alpha2,
-            response: BrokerResponse::Acknowledged,
-        }
-    }
-
     /// Creates a stable protocol/server failure response without internal details.
     #[must_use]
     pub fn error(code: impl Into<String>, message: impl Into<String>) -> Self {
@@ -1533,8 +1105,6 @@ pub enum BrokerResponse {
         /// What the provider answered.
         result: CommandRunOutcome,
     },
-    /// An informational status report was retained in process memory.
-    Acknowledged,
     /// Protocol or broker infrastructure failure.
     Error {
         /// Stable public machine code.
@@ -1845,8 +1415,7 @@ impl BrokerClient {
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             BrokerResponse::CommandResolution { .. }
             | BrokerResponse::CommandRun { .. }
-            | BrokerResponse::Invocation { .. }
-            | BrokerResponse::Acknowledged => Err(ClientError::UnexpectedResponse),
+            | BrokerResponse::Invocation { .. } => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -1883,8 +1452,7 @@ impl BrokerClient {
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             BrokerResponse::Capabilities { .. }
             | BrokerResponse::CommandResolution { .. }
-            | BrokerResponse::Invocation { .. }
-            | BrokerResponse::Acknowledged => Err(ClientError::UnexpectedResponse),
+            | BrokerResponse::Invocation { .. } => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -1906,8 +1474,7 @@ impl BrokerClient {
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             BrokerResponse::Capabilities { .. }
             | BrokerResponse::CommandResolution { .. }
-            | BrokerResponse::CommandRun { .. }
-            | BrokerResponse::Acknowledged => Err(ClientError::UnexpectedResponse),
+            | BrokerResponse::CommandRun { .. } => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -1926,44 +1493,7 @@ impl BrokerClient {
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             BrokerResponse::Capabilities { .. }
             | BrokerResponse::CommandResolution { .. }
-            | BrokerResponse::CommandRun { .. }
-            | BrokerResponse::Acknowledged => Err(ClientError::UnexpectedResponse),
-        }
-    }
-
-    /// Publishes a bounded, informational gateway catalog inventory.
-    ///
-    /// A broker accepts this only from a mapped attestor peer. The inventory is never an
-    /// authorization input and a reporting failure must not be treated as loss of authority.
-    pub async fn publish_agent_inventory(
-        &self,
-        inventory: AgentInventory,
-    ) -> Result<(), ClientError> {
-        match self
-            .exchange(RequestEnvelope::publish_agent_inventory(inventory))
-            .await?
-        {
-            BrokerResponse::Acknowledged => Ok(()),
-            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::Capabilities { .. }
-            | BrokerResponse::CommandResolution { .. }
-            | BrokerResponse::CommandRun { .. }
-            | BrokerResponse::Invocation { .. } => Err(ClientError::UnexpectedResponse),
-        }
-    }
-
-    /// Publishes one bounded, informational model-token accounting delta.
-    pub async fn publish_model_usage(&self, usage: ModelUsageReport) -> Result<(), ClientError> {
-        match self
-            .exchange(RequestEnvelope::publish_model_usage(usage))
-            .await?
-        {
-            BrokerResponse::Acknowledged => Ok(()),
-            BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::Capabilities { .. }
-            | BrokerResponse::CommandResolution { .. }
-            | BrokerResponse::CommandRun { .. }
-            | BrokerResponse::Invocation { .. } => Err(ClientError::UnexpectedResponse),
+            | BrokerResponse::CommandRun { .. } => Err(ClientError::UnexpectedResponse),
         }
     }
 
@@ -2005,15 +1535,27 @@ impl BrokerClient {
     }
 }
 
+/// Applies the shared socket rules before every exchange, parent included.
+///
+/// The parent is inspected whatever the socket's mode, so this client trusts exactly the sockets
+/// `dekopon-brokerd` would bind and no others.
 #[cfg(unix)]
 async fn validate_socket_path(path: &Path, expected_uid: u32) -> Result<(), ClientError> {
     let metadata = tokio::fs::symlink_metadata(path)
         .await
         .map_err(|source| ClientError::SocketMetadata { source })?;
-    if !metadata.file_type().is_socket()
-        || metadata.uid() != expected_uid
-        || metadata.permissions().mode() & 0o077 != 0
-        || metadata.nlink() != 1
+    // A bare relative name has an empty parent, which is the current directory.
+    let parent = path.parent().ok_or(ClientError::UnsafeSocket)?;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let parent = tokio::fs::symlink_metadata(parent)
+        .await
+        .map_err(|source| ClientError::SocketMetadata { source })?;
+    if !secure_socket_parent(&parent, expected_uid)
+        || !secure_socket(&metadata, expected_uid, &parent)
     {
         return Err(ClientError::UnsafeSocket);
     }
@@ -2031,8 +1573,8 @@ pub enum ClientError {
         #[source]
         source: io::Error,
     },
-    /// Socket was not a private, single-link socket owned by the expected UID.
-    #[error("broker socket is not private or owned by the expected server UID")]
+    /// Socket or parent violated the server-owned private/shared IPC boundary.
+    #[error("broker socket or parent has unsafe permissions or ownership")]
     UnsafeSocket,
     /// Connecting exceeded the configured deadline.
     #[error("broker connection timed out")]
@@ -2220,11 +1762,65 @@ impl ResolvedBrokerSocket {
     }
 }
 
+/// Whether a directory may hold a broker socket.
+///
+/// This and [`secure_socket`] are the one definition of that rule: `dekopon-brokerd` consults them
+/// before binding, and every client consults them before connecting, so the two sides cannot drift
+/// into a mirror that accepts what the authority refuses. The directory is the operator-owned IPC
+/// group setting: server-owned, never group-writable or reachable by others, and either private or
+/// group-traversable. No credential path uses this rule.
+#[cfg(unix)]
+#[must_use]
+pub fn secure_socket_parent(parent: &std::fs::Metadata, expected_uid: u32) -> bool {
+    let mode = parent.permissions().mode();
+    parent.file_type().is_dir()
+        && parent.uid() == expected_uid
+        && mode & 0o027 == 0
+        && matches!(mode & 0o070, 0 | 0o010 | 0o050)
+}
+
+/// Whether a socket is one its server can own, inside a parent [`secure_socket_parent`] accepts.
+///
+/// A `0600` socket is owner-only. A `0660` socket is shared IPC, which is trustworthy only inside a
+/// group-traversable parent whose group it carries: a client in that group may connect, but cannot
+/// replace the listener.
+#[cfg(unix)]
+#[must_use]
+pub fn secure_socket(
+    socket: &std::fs::Metadata,
+    expected_uid: u32,
+    parent: &std::fs::Metadata,
+) -> bool {
+    let mode = socket.permissions().mode() & 0o7777;
+    socket.file_type().is_socket()
+        && socket.uid() == expected_uid
+        && socket.nlink() == 1
+        && (mode == 0o600
+            || (mode == 0o660
+                && parent.permissions().mode() & 0o010 != 0
+                && socket.gid() == parent.gid()))
+}
+
+/// The mode a broker binds its socket with under this parent.
+///
+/// Group traversal is how an operator opts into shared IPC. A private parent keeps the socket
+/// owner-only, which is also why a broker under one refuses to configure any peer UID but its own:
+/// no other UID could open what it is about to bind.
+#[cfg(unix)]
+#[must_use]
+pub fn ipc_socket_mode(parent: &std::fs::Metadata) -> u32 {
+    if parent.permissions().mode() & 0o010 == 0 {
+        0o600
+    } else {
+        0o660
+    }
+}
+
 /// Inputs used to resolve the broker socket precedence.
 ///
-/// This is the one definition of that precedence. `dekopon-run`, `dekopond`, and the operator
-/// console all consult it, so a socket a client finds here is the socket the documentation
-/// describes, and a change lands in one place rather than three that must be kept in step.
+/// This is the one definition of that precedence. `dekopond` and the operator
+/// console consult it, so a socket a client finds here is the socket the documentation
+/// describes, and a change lands in one place rather than multiple copies that must be kept in step.
 ///
 /// Unlike configuration discovery, no candidate is probed for existence: a broker socket is absent
 /// whenever the daemon is not running, so the tightest resolved tier is always trusted and

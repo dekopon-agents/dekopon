@@ -6,7 +6,6 @@ on:
     paths:
       - ".github/workflows/wit-package.yml"
       - "ci/fetch-external-provider-components.sh"
-      - "crates/dekopon-provider-host/wit/**"
       - "crates/dekopon-provider-http/src/**"
       - "crates/dekopon-provider-http/wit/**"
       - "crates/dekopon-provider-sdk/src/**"
@@ -33,7 +32,6 @@ on:
     paths:
       - ".github/workflows/wit-package.yml"
       - "ci/fetch-external-provider-components.sh"
-      - "crates/dekopon-provider-host/wit/**"
       - "crates/dekopon-provider-http/src/**"
       - "crates/dekopon-provider-http/wit/**"
       - "crates/dekopon-provider-sdk/src/**"
@@ -189,9 +187,6 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p target/wit-package "$RUNNER_TEMP/wkg-build-cache"
-          cmp \
-            crates/dekopon-provider-sdk/wit/provider.wit \
-            crates/dekopon-provider-host/wit/provider.wit
           for mirror in \
             crates/dekopon-broker-host/wit/deps/provider.wit \
             examples/providers/cli-probe/wit/deps/provider.wit \

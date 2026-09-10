@@ -1,22 +1,38 @@
 # dekopon-brokerd
 
-`dekopon-brokerd` is the separately deployed privileged Unix service for Dekopon provider components. It derives caller identity from Unix peer credentials, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, restores replay identifiers from a verified owner-only audit chain, maintains a separate atomic audit checkpoint, executes only statically linked Dekopon host interfaces, and can explicitly bind the unauthenticated `GET`/`HEAD`-only `dekopon-webui` operational view.
+`dekopon-brokerd` is the separately deployed privileged Unix service for Dekopon provider components. It derives caller identity from Unix peer credentials, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, appends owner-only JSONL audit records, and executes only statically linked Dekopon host interfaces.
 
 Authorization and execution constraints are two separate files on purpose. `policiesPath` decides *who may do what*; `constraintSets` decides *how narrowly the broker then does it*. A policy edit can never widen a timeout, reach a new host, or bind a credential that was not already bound.
 
-The owner-only socket intentionally supports one Unix UID trust domain. Every process running under that UID can act as its configured principal/actor; use a dedicated service/client UID when process-level separation matters. Request payloads cannot provide or override identity, policy, constraints, credentials, or authorization.
+The broker accepts configured Unix peer UIDs, including a dedicated gateway UID. Every process running under a mapped UID can act as its configured principal/actor; group membership permits a connection, not an identity grant. Request payloads cannot provide or override identity, policy, constraints, credentials, or authorization.
+
+## Health probe
+
+```console
+dekopon-brokerd probe --socket /run/dekopon/broker.sock
+```
+
+Run as the broker owner UID, mapped separately from the gateway in `identities`.
+That mapping is what makes the probe answerable: it is an ordinary authenticated client, so a
+configuration whose `identities` omit the broker's own UID refuses its own health check and logs
+`broker_peer_unmapped` with that UID.
+The existing protocol client verifies socket safety — the socket and its parent directory — and the
+live server UID against its own effective UID, then requests capabilities with a two-second
+complete-exchange deadline and the default frame ceiling. An empty authorized listing is healthy.
+Success exits 0 without output; absent, refused, unmapped, wrong-server, malformed or
+stalled endpoints exit 1 with a diagnostic. Missing arguments exit 2. The probe rejects
+`--config`, loads no components or credentials, invokes nothing and
+initializes no telemetry.
 
 ## Configuration
 
-The configuration must be a regular single-link file owned by the server UID and must not be group/world writable. Socket, audit, checkpoint, and checkpoint-lock parent directories must be owner-only. Provider components must be regular single-link files owned by the server UID and must not be group/world writable; their canonical parent directories must also be server-owned and not group/world writable. Writable non-sticky path ancestors are rejected.
+The configuration must be a regular single-link file owned by the server UID and must not be group/world writable. Audit parent directories must be owner-only. The socket has the separate IPC directory contract below. Provider components must be regular single-link files owned by the server UID and must not be group/world writable; their canonical parent directories must also be server-owned and not group/world writable. Writable non-sticky path ancestors are rejected.
 
 ```yaml
 # broker.yaml
 apiVersion: dekopon.dev/brokerd/v1alpha1
 socketPath: /home/dekopon/.local/run/dekopon/broker.sock
 auditPath: /home/dekopon/.local/state/dekopon/audit.jsonl
-checkpointPath: /home/dekopon/.local/state/dekopon/audit-checkpoint.json
-checkpointLockPath: /home/dekopon/.local/state/dekopon/audit-checkpoint.lock
 brokerPrincipal: local-broker
 policyRevision: policy-2026-01
 policiesPath: /home/dekopon/.config/dekopon/policies.cedar
@@ -145,9 +161,8 @@ dekopon-brokerd provider verify \
 `--output json` gives deterministic machine-readable command results. Successful lock changes say
 that they apply on the next broker restart; there is no hot reload.
 
-Operator commands never take `--config` or `--http-bind`; combining them is a usage error.
-`provider` requires `--lock-file` and `--store`, `sync` also `--provider-set`, and `audit verify`
-requires `--audit-path`. Usage errors exit 2; a failed command exits 1. Operator modes print
+Operator commands never take `--config`; combining them is a usage error.
+`provider` requires `--lock-file` and `--store`; `sync` also requires `--provider-set`. Usage errors exit 2; a failed command exits 1. Operator modes print
 results on stdout and text diagnostics on stderr at `warn` (override with `RUST_LOG`); the daemon
 logs JSON on stdout at `info`.
 
@@ -332,7 +347,7 @@ The key is the agent, because a route already binds a transport and a match to a
 workspace or one channel selects the agent that answers, and the agent selects the token. The name
 comes from the attested context the broker derived from this file's own `attestor` grant and
 `identityMappings`, so it is trusted configuration selecting on trusted identity — a request
-payload cannot ask for a different token. A caller with no agent, such as a direct `dekopon-run`
+payload cannot ask for a different token. A caller with no agent, such as a direct service
 peer, matches no override and takes the default.
 
 `credential:` may be omitted while `credentialByAgent:` is present, and then an agent with no entry
@@ -421,11 +436,36 @@ outside its namespaces), `unmapped-subject` (granted, but no mapping names that 
 `agent-denied` (attested and mapped, but no policy lets that principal drive that agent). Startup
 rejects duplicate mapping subjects and malformed namespaces.
 
-The example uses the server's own UID because that is what the owner-only socket currently permits:
-every configured peer UID must equal the server's. In that single-UID deployment a grant buys
-attribution and deny-by-default scoping, not separation — any process under that UID can already
-act as the configured peer. Running the gateway under its own UID, where `via` and namespace
-scoping become real isolation, is committed direction rather than current behavior.
+### IPC directory and distinct peer UIDs
+
+A broker-owned `0700` socket parent retains a `0600` socket for owner-only clients. Configuring any
+peer UID other than the broker's own under such a parent is refused at startup, naming every
+unreachable UID at once: the socket it would bind admits none of them.
+For a distinct gateway UID, give the broker-owned parent the shared IPC group and mode
+`0710` (or `0750`). Group traversal selects a `0660` socket in that exact parent group;
+there is no extra configuration key. The broker must itself belong to that group to set
+the socket GID. Neither group writes nor any permissions for others are permitted on
+the IPC parent. A symlink parent, unsafe ancestors, wrong owner, socket symlink, hard
+link, wrong group, unsafe mode, or live listener replacement is refused.
+
+Give the gateway membership in that IPC group, map its actual UID in `identities`, and
+set its existing `broker.serverUid` to the broker UID. The protocol client checks socket and parent
+ownership and mode — the same rule this server binds under — and the live server peer UID before
+writing a request. Unmapped peers receive no capabilities even if their group lets them connect.
+Owner-only clients remain valid.
+
+Keep broker config, credentials, provider files, audit/cache and storage in their separate
+broker-owned protected paths; the IPC directory is not a credential or data directory.
+The gateway's local development **chat** socket stays `0600` under its own private parent.
+The chart's distinct container identities and init layout are documented in the chart.
+
+The package's `tests/ipc_process.rs` runs real broker/client subprocesses. Unprivileged
+runs exercise owner-UID access, not cross-UID isolation. In a disposable Linux root
+container, require the full UID-switch, unmapped-peer, wrong-server and private-file proof:
+
+```console
+DEKOPON_REQUIRE_CROSS_UID=1 cargo test -p dekopon-brokerd --test ipc_process --locked -- --nocapture
+```
 
 An optional `telemetry` section enables OTLP export of broker spans:
 
@@ -440,7 +480,7 @@ telemetry:
 
 `telemetryPayloads: true` adds provider input and HTTP URLs to spans, declaring the telemetry sink in
 scope for the data this broker handles. It never exposes a credential: `Redacted` values render
-their marker in either mode, and durable audit records are unaffected either way.
+their marker in either mode, and append-only audit records are unaffected either way.
 
 It has no credential field by design. Ingest authentication is read from the standard
 `OTEL_EXPORTER_OTLP_HEADERS` environment variable by the OpenTelemetry SDK, so a token never enters
@@ -451,9 +491,12 @@ rejects exports without it, so include `organization=<org>` alongside the token 
 telemetry and log the reason rather than preventing startup. Broker logs are structured JSON on
 stdout, filtered by `RUST_LOG`.
 
-Host, broker, and server limits have conservative defaults (including a 2 MiB frame ceiling) when their entire sections are omitted. `hostLimits` and `brokerLimits` also default field by field, so a partial section keeps the absent-section value for everything it does not name — which is what lets a deployment set `maxTotalMemoryBytes` or `maxReplayIds` alone. `serverLimits` stays all-or-nothing: when it is present every field is required. Unknown fields and unknown API versions are rejected. Startup also requires aggregate provider metadata, every mapped peer's capability response, and the *widest* response any session could receive to fit the frame ceiling. That last bound is the one that matters in a gateway deployment: the connecting peer is typically granted nothing itself, while the principals its `identityMappings` name hold the capability sets that actually reach the wire through an attested `capabilities`. The agent catalog belongs to the gateway, so those contexts cannot be enumerated here and are bounded instead. Shutdown grace must cover one configured host deadline plus two complete frame deadlines, and it is one grace for the whole process: the Unix drain, the provider-storage GC drain, and the web-UI drain share a single deadline rather than taking one each.
+Host, broker, and server limits have conservative defaults (including a 2 MiB frame ceiling) when their entire sections are omitted. `hostLimits` and `brokerLimits` also default field by field, so a partial section keeps the absent-section value for everything it does not name — which is what lets a deployment set `maxTotalMemoryBytes` or `maxReplayIds` alone. `serverLimits` stays all-or-nothing: when it is present every field is required. Unknown fields and unknown API versions are rejected. Startup also requires aggregate provider metadata, every mapped peer's capability response, and the *widest* response any session could receive to fit the frame ceiling. That last bound is the one that matters in a gateway deployment: the connecting peer is typically granted nothing itself, while the principals its `identityMappings` name hold the capability sets that actually reach the wire through an attested `capabilities`. The agent catalog belongs to the gateway, so those contexts cannot be enumerated here and are bounded instead. Shutdown grace must cover one configured host deadline plus two complete frame deadlines, and it is one grace for the whole process: all Unix connections drain under that one deadline rather than each taking a fresh grace period.
 
-`maxReplayIds` should be at least `auditMaxRecords`; the Helm chart's default configuration sets both to 200 000. The built-in default does not satisfy this: `brokerLimits.maxReplayIds` defaults to 100 000 while `serverLimits.auditMaxRecords` defaults to 200 000, so a configuration that omits `brokerLimits` refuses every invocation with `capacity-exhausted` at half its audit budget; set `brokerLimits: { maxReplayIds: 200000 }` explicitly. Both bounds are permanent when reached — the ledger never evicts, is restored from durable history on restart, and the audit log does not rotate — and a denial spends one audit record but a full ledger slot, so an undersized ledger refuses every invocation with `capacity-exhausted` long before the audit bound it was meant to outlast.
+`brokerLimits.maxReplayIds` bounds the process-local invocation-ID ledger (default 100 000;
+chart default 200 000). The ledger never evicts during a process lifetime; exhaustion returns
+`capacity-exhausted`, not a retryable outage. Restart starts an empty ledger. Audit file growth
+is independent of this memory bound and requires operator disk monitoring.
 
 ### Compilation cache and the concurrent memory budget
 
@@ -468,7 +511,7 @@ hostLimits:
 socket binds only after that work finishes — the cost a startup probe has to cover. Present, the
 broker keeps Wasmtime's content-addressed cache there and a restart reads compiled code back
 instead. The directory holds code this privileged process executes, so its parent must be
-owner-only under the same rule as the socket and audit paths; the broker creates the directory
+owner-only under the same rule as the audit paths; the broker creates the directory
 itself. Components already compile concurrently rather than one at a time either way.
 
 `hostLimits.maxMemoryBytes` bounds one invocation. Nothing bounds all of them at once, so the worst
@@ -484,55 +527,25 @@ rotate stored authority.
 chmod 0700 /home/dekopon/.local/run/dekopon /home/dekopon/.local/state/dekopon
 chmod 0600 /path/to/broker.yaml
 dekopon-brokerd --config /path/to/broker.yaml
-# Explicitly expose the unauthenticated informational UI on every interface:
-dekopon-brokerd --config /path/to/broker.yaml --http-bind=0.0.0.0:8080
 ```
 
-SIGINT and SIGTERM stop Unix and HTTP acceptance together, drain bounded in-flight connections concurrently under one shutdown grace, synchronize audit/checkpoint appends, log the verified chain head, and remove only the Unix socket inode created by this process.
+SIGINT and SIGTERM stop Unix acceptance, drain bounded in-flight connections under one shutdown grace, finish audit appends, log `broker_stopped`, and remove only the Unix socket inode created by this process.
 
-## Read-only web UI
+## Audit
 
-`--http-bind <ADDRESS>` enables a second, TCP listener; without the flag the broker opens no HTTP port. `/` returns a permanent redirect to `/ui`. The HTTP router accepts only `GET`/`HEAD`, has no login and no mutation endpoint, sends `no-store`, `nosniff`, `no-referrer`, and a closed content-security policy, and escapes every authored or component-provided string.
+The broker appends metadata-only JSONL records with `sequence` (one-based file line ordinal) and
+`event`. Open counts bounded newline-delimited lines in fixed memory without decoding events,
+verifying integrity, or restoring invocation IDs. Old bytes remain untouched; existing sequence
+fields are not trusted as ordinals. A private readable nonempty file can start on its own.
+`run` returns `Result<(), BrokerdError>` after clean shutdown.
 
-The overview includes:
-
-- the latest bounded catalog-agent inventory reported by `dekopond`, including declared providers, capabilities, and least-privilege provider permissions;
-- provider-reported input/output token totals and explicit counts of model calls that omitted each usage field;
-- a table of provider components loaded into this broker;
-- host-observed Wasmtime compilation, store, instantiation, invocation, fuel, memory/table limiter, HTTP count/byte statistics, plus every configured host ceiling; and
-- credential-free OTLP endpoint, transport, service name, timeout, and payload mode. Header and resource-attribute **values** are never retained or rendered.
-
-A provider page is intentionally rustdoc-like: local artifact path, source byte count and SHA-256, Wasmtime-visible imports/exports and nested interface functions, command words, every capability's description/effect/risk/idempotency/input schema, and the complete validated manifest. The host executes local WebAssembly component bytes and reports the digest of its exact compile buffer. A managed lock separately retains the OCI source and manifest digest, but the UI is not yet given that lock context and says so rather than presenting the component digest as publisher provenance.
-
-Agent and token state still belongs to the unprivileged gateway. A mapped attestor may publish a content-free normalized inventory and bounded usage deltas over the authenticated Unix protocol. Reports omit instructions, prompts, answers, subjects, principals, credentials, policy, constraints, and authorization; are held only in process memory; reset on broker restart; and are never consulted by Cedar, routing, execution, evidence, replay, or durable audit. Reporting is best effort, so the live totals are not billing reconciliation—use the displayed OTLP configuration and `accounting.model.turn` for retained accounting.
-
-“No login” makes the surrounding network the access boundary. Agent names, provider schemas, artifact paths/digests, OTLP endpoints, and runtime limits/activity are deployment information. `--http-bind=0.0.0.0:8080` deliberately exposes it on every interface; choose that address only when everyone who can reach it may read those facts.
-
-## Audit checkpoint and recovery
-
-The checkpoint is one strict, hard-4-KiB-bounded, newline-terminated JSON object with API version `dekopon.dev/audit-checkpoint/v1alpha1`, the retained record count, and the SHA-256 chain head. A dedicated owner-only lock permits one broker writer. Every audit append is synchronized before the checkpoint is written to a new owner-only file, synchronized, atomically renamed, and followed by a parent-directory synchronization.
-
-At startup, the checkpoint must identify an exact prefix of the fully verified audit chain. This detects replacement, truncation, and valid-prefix rollback relative to the retained checkpoint. An audit that is exactly one record ahead of a valid checkpoint is the recoverable crash window and advances the checkpoint; a larger gap fails closed. A non-empty audit without a checkpoint, or any checkpoint that is not a retained prefix, fails closed and requires explicit operator recovery from trusted copies. Do not delete only one file to bypass recovery.
-
-The backing filesystem must honor Unix no-follow opens, advisory exclusive locks, same-directory atomic rename, and file/directory synchronization. Retain or export checkpoint generations in an independently protected system if rollback by the host owner or storage administrator is in scope. Deleting or rolling back both local files together cannot be detected by local state alone.
-
-### Verifying a chain offline
-
-`audit verify` runs the same sequence, previous-hash, and record-hash check the daemon runs at
-startup, without binding a socket, reading daemon configuration, or taking the daemon's exclusive
-lock — so it also answers for a retained copy the broker is no longer serving:
-
-```console
-dekopon-brokerd audit verify \
-  --audit-path /home/dekopon/.local/state/dekopon/audit.jsonl
-```
-
-It prints the record count and the chain head, takes the same `--output json` and the same usage
-and exit rules as the provider commands above, and exits non-zero with the reason on any failure.
-A broken chain is reported separately from a file that could not be read: an interrupted append
-leaves an unterminated final record, which is not the same finding as a record that was edited.
-The whole chain is held in memory while it is checked, so a log past the default
-`auditMaxRecords` is refused rather than read.
+The file must be regular, single-link, owner-only and exclusively writer-locked, without symlink
+following; its owner and private parent are checked before listening. `auditMaxLineBytes` bounds
+both existing lines and new serialized records (excluding the newline). Unterminated tails are
+refused without truncation or repair. Appends write and flush, not fsync; a failed or cancelled
+append can leave partial bytes and poisons the open handle. There is no rollback, crash-recovery,
+file rotation, or total file-size bound. Monitor disk space; I/O failure remains explicit and a
+failed terminal append still reports that provider work may already have completed.
 
 ## Boundaries
 
@@ -545,9 +558,9 @@ The whole chain is held in memory while it is checked, so a log past the default
 - Audit records carry the determining `policy_ids`, the `policy_digest` of the evaluated set, and
   the symbolic name of the `credential` the invocation selected.
 - Generic WASI and ambient I/O imports remain unavailable.
-- The durable JSONL chain is mutation-evident and replay-restoring. The separate atomic checkpoint makes the retained head externally inspectable, but is not signed, remote, append-only, or a transparency service by itself.
+- Audit appends contain metadata only; replay rejection is bounded process-local state.
 - Credential resolution is destination-bound, capability-scoped, and optionally agent-scoped. Providers receive only explicitly linked Dekopon host interfaces and policy constraints; an injected credential exists solely inside the native HTTP engine and is never observable by guest code.
-- Direct `dekopon-run` subcommands retain their import-free host. Only explicit `dekopon-run broker` subcommands connect as unprivileged identity-free clients.
+- Unprivileged clients submit proposals over the authenticated protocol; only the broker executes providers.
 
 ## Optional provider storage and chat memory
 
@@ -578,14 +591,7 @@ storage:
   finalizationBudgetMs: 5000
   maxPendingTransactions: 64
   startupMaxEntries: 100000
-  startupMaxTransactions: 1024
   maxQuarantinedNamespaces: 128
-  retiredGenerationGraceMs: 86400000
-  retiredGenerationTtlMs: 604800000
-  inactiveNamespaceTtlMs: 31536000000
-  gcIntervalMs: 3600000
-  gcMaxNamespacesPerPass: 64
-  gcMaxBytesPerPass: 67108864
 
 chatMemory:
   continuityPolicy: authority-bound # safe default; stable must be explicit
@@ -654,8 +660,9 @@ Each recent/search constraint set's `maxOutputBytes` must leave 1024 bytes beyon
 `chatMemory.maxResultBytes` for the SDK response envelope; record must leave the same fixed envelope
 headroom. Enabling `chatMemory` also requires the routed provider to declare exactly those three
 capabilities and no fourth. Memory/storage composition also rounds each 256 KiB JSONL read request when checking the
-invocation and host-call budgets, requires both logical files, and reserves the post-append old file,
-staged replacement, permanent dedup copies, and transaction metadata. Startup accounts the
+invocation and host-call budgets, requires both logical files, and reserves the direct peak: the
+post-append turn file, live permanent dedup file, and conservative namespace entry metadata
+(including authority-pointer/manifest temporaries), without staged JSONL file copies. Startup accounts the
 worst-case JSON escaping of a bounded search query and additionally proves that raw/decoded files
 plus canonical-ABI compaction copies and fixed allocator headroom fit the independent Wasm
 linear-memory ceiling.
@@ -685,3 +692,12 @@ identities:
           channel: c0123abc
           conversation: c0123abc:1712345678.000100
 ```
+
+## Catalog ownership at policy startup
+
+The agent catalog belongs to the gateway. Cedar declares `Dekopon::Agent` but does not enumerate
+agent instances: a misspelled agent literal can validate and then deny every session. The gateway
+rejects a route naming an absent catalog agent; operators must cross-check policy agent literals
+against that catalog. Principal literals are always checked; undeclared providers/capabilities
+are fatal with `strict: true`, otherwise reported as schema-only phantoms. Policy cannot widen
+owner-authored execution constraints or bind another credential.

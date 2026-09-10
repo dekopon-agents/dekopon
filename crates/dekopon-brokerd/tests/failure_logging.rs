@@ -29,7 +29,7 @@ use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency};
 use dekopon_core::{
     Actor, AgentId, CapabilityId, InvocationId, PrincipalId, ProviderId, RiskLevel, TraceId,
 };
-use dekopon_test_support::{CaptureLayer, provider_fixture};
+use dekopon_test_support::{CaptureLayer, provider_fixture, shutdown_on};
 use serde_json::json;
 use tokio::{
     io::AsyncWriteExt as _,
@@ -69,6 +69,18 @@ fn context() -> AuthenticatedContext {
         },
     )
     .expect("trusted context binds")
+}
+
+/// A fixture directory the broker binds under and its client connects through.
+///
+/// `tempfile::tempdir` applies the process umask, which normally leaves the directory
+/// world-traversable — a parent both sides of the socket rule refuse, so a client under one never
+/// reaches the audit failure this file is about.
+fn private_directory() -> tempfile::TempDir {
+    let directory = tempfile::tempdir().expect("create fixture directory");
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
+        .expect("private fixture directory");
+    directory
 }
 
 fn bind_fixture(path: &Path) -> UnixListener {
@@ -149,27 +161,13 @@ fn identities(uid: u32) -> BTreeMap<u32, MappedPeer> {
 
 /// Writes one raw length-prefixed frame, bypassing the client that would refuse to build it, and
 /// returns the wire code the server answers with.
-///
-/// `whole` replaces the prefix and body with one buffer written in a single call, for a frame
-/// whose refusal must not race its own body.
-async fn write_raw(
-    socket: &Path,
-    prefix: u32,
-    body: &[u8],
-    limits: FrameLimits,
-    whole: Option<&[u8]>,
-) -> String {
+async fn write_raw(socket: &Path, prefix: u32, body: &[u8], limits: FrameLimits) -> String {
     let mut stream = UnixStream::connect(socket).await.expect("connect fixture");
-    match whole {
-        Some(frame) => stream.write_all(frame).await.expect("write whole frame"),
-        None => {
-            stream
-                .write_all(&prefix.to_be_bytes())
-                .await
-                .expect("write frame prefix");
-            stream.write_all(body).await.expect("write frame body");
-        }
-    }
+    stream
+        .write_all(&prefix.to_be_bytes())
+        .await
+        .expect("write frame prefix");
+    stream.write_all(body).await.expect("write frame body");
     stream.flush().await.expect("flush fixture frame");
     let response = read_frame::<_, ResponseEnvelope>(&mut stream, limits)
         .await
@@ -182,26 +180,21 @@ async fn write_raw(
 
 /// A timeout, an oversized frame, and unreadable JSON all answer `invalid-request`. The kind is
 /// what separates "a client is misbehaving" from "the frame ceiling is too small for this input".
+/// An unmapped peer answers `unauthenticated` and is named nowhere else at all.
 #[tokio::test(flavor = "multi_thread")]
-async fn framing_and_audit_failures_name_their_cause() {
+async fn framing_audit_and_unmapped_peer_failures_name_their_cause() {
     let captured = CaptureLayer::workspace();
     tracing_subscriber::registry().with(captured.clone()).init();
 
     let uid = current_uid();
-    let directory = tempfile::tempdir().expect("create server fixture");
+    let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
-    let server =
-        BrokerServer::new(broker(1).await, identities(uid), limits()).expect("server limits valid");
+    let shared = broker(1).await;
+    let server = BrokerServer::new(Arc::clone(&shared), identities(uid), limits())
+        .expect("server limits valid");
     let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
-    let task = tokio::spawn(server.serve(listener, async move {
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "this future's only job is to resolve; a signal and a dropped sender both \
-                      mean stop, and serve treats them identically"
-        )]
-        let _ = shutdown_receive.await;
-    }));
+    let task = tokio::spawn(server.serve(listener, shutdown_on(shutdown_receive)));
 
     let malformed = b"{ this is not protocol json";
     let code = write_raw(
@@ -209,7 +202,6 @@ async fn framing_and_audit_failures_name_their_cause() {
         u32::try_from(malformed.len()).expect("fixture frame fits"),
         malformed,
         limits().frame,
-        None,
     )
     .await;
     assert_eq!(code, ERROR_INVALID_REQUEST);
@@ -221,7 +213,7 @@ async fn framing_and_audit_failures_name_their_cause() {
         "{unreadable}"
     );
 
-    let oversized_code = write_raw(&socket_path, 128 * 1024, b"", limits().frame, None).await;
+    let oversized_code = write_raw(&socket_path, 128 * 1024, b"", limits().frame).await;
     assert_eq!(oversized_code, ERROR_INVALID_REQUEST);
     let oversized = take_after(&captured, "broker_request_frame_invalid").await;
     assert!(oversized.contains("frame-too-large"), "{oversized}");
@@ -229,8 +221,10 @@ async fn framing_and_audit_failures_name_their_cause() {
     assert!(oversized.contains("65536"), "{oversized}");
 
     // A piped value rides a `runCommand` frame under the same ceiling: a real frame carrying a
-    // value twice the bound is refused from its length prefix before a byte of it is read. The
-    // whole frame goes out in one write so the refusal cannot race the body.
+    // value twice the bound is refused from its length prefix before a byte of it is read.
+    // Send only that real frame's length: write_all may perform partial stream writes, so
+    // sending the body would race the server's refusal and close. Withholding it also proves
+    // that rejection does not wait for (or drain) an oversized body.
     let oversized_run = serde_json::to_vec(&RequestEnvelope::run_command(
         None,
         "probe".to_owned(),
@@ -238,12 +232,14 @@ async fn framing_and_audit_failures_name_their_cause() {
         Some("x".repeat(128 * 1024)),
     ))
     .expect("the oversized run frame serializes");
-    let mut frame = u32::try_from(oversized_run.len())
-        .expect("fixture frame fits")
-        .to_be_bytes()
-        .to_vec();
-    frame.extend_from_slice(&oversized_run);
-    let stdin_code = write_raw(&socket_path, 0, &[], limits().frame, Some(&frame)).await;
+    assert!(oversized_run.len() > limits().frame.max_frame_bytes);
+    let stdin_code = write_raw(
+        &socket_path,
+        u32::try_from(oversized_run.len()).expect("fixture frame fits"),
+        b"",
+        limits().frame,
+    )
+    .await;
     assert_eq!(stdin_code, ERROR_INVALID_REQUEST);
     let oversized_stdin = take_after(&captured, "broker_request_frame_invalid").await;
     assert!(
@@ -286,6 +282,34 @@ async fn framing_and_audit_failures_name_their_cause() {
         unaudited.contains("audit log reached its 1-record bound"),
         "{unaudited}"
     );
+
+    // The refusal that names its peer nowhere on the wire. A broker whose `identities` omit its
+    // own UID refuses its own readiness probe exactly like a stranger, so a pod that starts and
+    // never becomes ready has this line and nothing else to explain itself.
+    //
+    // A bare connection rather than a `BrokerClient`: this is the one refusal the broker writes
+    // before reading anything, and it closes the socket with it. A client reads its peer's
+    // credentials just after connecting, and macOS reports none for a socket already
+    // disconnected, so which failure a client surfaces here is a matter of timing. This event is
+    // not. What the peer is told is `server.rs`'s half; the connection stays open so the
+    // broker's write of it has somewhere to land.
+    let unmapped_path = directory.path().join("unmapped.sock");
+    let unmapped_listener = bind_fixture(&unmapped_path);
+    let unmapped_server =
+        BrokerServer::new(shared, BTreeMap::new(), limits()).expect("server limits valid");
+    let (stop_unmapped, unmapped_stopped) = oneshot::channel::<()>();
+    let unmapped_task =
+        tokio::spawn(unmapped_server.serve(unmapped_listener, shutdown_on(unmapped_stopped)));
+    let _unmapped_peer = UnixStream::connect(&unmapped_path)
+        .await
+        .expect("connect as an unmapped peer");
+    let unmapped = take_after(&captured, "broker_peer_unmapped").await;
+    assert!(unmapped.contains(&format!("peer.uid={uid}")), "{unmapped}");
+    stop_unmapped.send(()).expect("signal clean shutdown");
+    unmapped_task
+        .await
+        .expect("unmapped server task exits")
+        .expect("unmapped server shuts down");
 
     shutdown_send.send(()).expect("signal clean shutdown");
     #[allow(

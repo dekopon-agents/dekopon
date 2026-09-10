@@ -2,7 +2,7 @@
 # Stage a minimal build context for the Dekopon container image, from a published release.
 #
 # The image needs exactly three things: the executables a release already published, the
-# exact provider release components, and the two licences. Everything else here — twenty-one crates,
+# exact provider release components, and the two licences. Everything else here — workspace crates,
 # a Cargo target directory that reaches tens of gigabytes, documentation, examples — is not a
 # build input. Excluding all of it with a `.dockerignore` would be correct only for as long as
 # every file added to the repository afterwards stays matched by it, which is a standing
@@ -25,7 +25,7 @@
 #   <work>/archives/        the release archives and their published .sha256 sidecars
 #   <work>/context/         the build context: Dockerfile, dist/<arch>/<binary>, providers/,
 #                           optional-providers/, LICENSE-APACHE, LICENSE-MIT — and nothing else
-#   <work>/binaries.sha256  the eight staged executables, for the byte-identity check after the
+#   <work>/binaries.sha256  the four staged executables, for the byte-identity check after the
 #                           image is built
 set -euo pipefail
 
@@ -47,7 +47,7 @@ context="$work/context"
 # a build can bake in a binary that cannot start.
 max_glibc="2.41"
 
-binaries="dekopon dekopon-run dekopon-brokerd dekopond"
+binaries="dekopon-brokerd dekopond"
 providers="http-probe"
 standalone_default_providers="echo jsonplaceholder"
 # Other out-of-tree providers, as <owner>/<repo>@<tag>. These ship in the image so it is useful

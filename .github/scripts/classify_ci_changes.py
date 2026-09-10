@@ -29,9 +29,11 @@ FULL_CI_INPUTS = {
     ".github/workflows/cache-warm.yml",
     ".github/scripts/classify_ci_changes.py",
     ".github/scripts/test_classify_ci_changes.py",
+    ".github/scripts/test_daemon_dependency_gates.py",
     ".github/scripts/ci_metrics.sh",
     ".github/scripts/check_docs_duplicates.py",
     ".github/scripts/render-homebrew-formula.py",
+    ".github/scripts/test_render_homebrew_formula.py",
 }
 
 RUST_ROOT_INPUTS = {
@@ -42,7 +44,6 @@ RUST_ROOT_INPUTS = {
     "clippy.toml",
     "rust-toolchain.toml",
     "rustfmt.toml",
-    "examples/local/dekopon.yaml",
     "ci/fetch-external-provider-components.sh",
     "wit/http/http.wit",
     "wit/storage/storage.wit",
@@ -98,7 +99,7 @@ def classify_path(path: str) -> dict[str, bool]:
             run_dependencies=True,
         )
 
-    if path in RUST_ROOT_INPUTS:
+    if path in RUST_ROOT_INPUTS or path.startswith("examples/catalog/"):
         flags["run_rust"] = True
 
     crate = CRATE_INPUT.fullmatch(path)
@@ -156,7 +157,7 @@ def classify_path(path: str) -> dict[str, bool]:
         flags["run_docs"] = True
 
     # Preserve the existing OTLP and release-profile install coverage for every
-    # Rust-affecting change. Both exercise normal dependencies outside the four
+    # Rust-affecting change. Both exercise normal dependencies outside the three
     # binary crates, so path-only direct-crate gating would silently lose coverage.
     if flags["run_rust"]:
         flags["run_otel"] = True

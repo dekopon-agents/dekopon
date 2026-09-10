@@ -13,9 +13,9 @@ use dekopon_http_host::{BufferedHttpClient, ErrorCode, Header, HttpHostCeilings,
 use dekopon_test_support::{CaptureLayer, LoopbackServer};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
-/// Telemetry is a second egress path for the same call the audit chain records, and it has none of
-/// the audit chain's guarantees. A URL path, a query, a header, or a body reaching a span field
-/// would undo the redaction `HttpCallEvidence` exists to enforce, so this drives a real request
+/// Telemetry is a second egress path for the same call the audit log records. A URL path,
+/// a query, a header, or a body reaching a span field would undo the redaction
+/// `HttpCallEvidence` exists to enforce, so this drives a real request
 /// whose every such component is a distinct sentinel and reads back what the span layer captured.
 #[tokio::test]
 async fn http_span_carries_evidence_fields_and_no_payload() {

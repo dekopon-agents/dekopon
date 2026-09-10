@@ -795,25 +795,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dekopon"
-version = "0.12.0"
-dependencies = [
- "base64 0.23.1",
- "clap",
- "dekopon-config",
- "dekopon-core",
- "dekopon-model",
- "dekopon-protocol",
- "serde",
- "serde_json",
- "serde_yaml_ng",
- "tempfile",
- "thiserror 2.0.20",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "dekopon-agent"
 version = "0.12.0"
 dependencies = [
@@ -910,7 +891,6 @@ dependencies = [
  "dekopon-storage-host",
  "dekopon-telemetry",
  "dekopon-test-support",
- "dekopon-webui",
  "futures-util",
  "hmac",
  "http-auth",
@@ -1036,21 +1016,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dekopon-provider-host"
-version = "0.12.0"
-dependencies = [
- "dekopon-capability",
- "dekopon-core",
- "dekopon-provider-sdk",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "tracing",
- "wasmtime",
-]
-
-[[package]]
 name = "dekopon-provider-http"
 version = "0.12.0"
 dependencies = [
@@ -1091,39 +1056,6 @@ name = "dekopon-provider-storage"
 version = "0.12.0"
 dependencies = [
  "wit-bindgen",
-]
-
-[[package]]
-name = "dekopon-run"
-version = "0.12.0"
-dependencies = [
- "clap",
- "dekopon-agent",
- "dekopon-broker",
- "dekopon-broker-host",
- "dekopon-broker-protocol",
- "dekopon-brokerd",
- "dekopon-capability",
- "dekopon-config",
- "dekopon-core",
- "dekopon-model",
- "dekopon-process",
- "dekopon-provider-host",
- "dekopon-provider-sdk",
- "dekopon-shell",
- "dekopon-telemetry",
- "dekopon-test-support",
- "rustix",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "time",
- "tokio",
- "tracing",
- "tracing-chrome",
- "tracing-subscriber",
- "ureq",
 ]
 
 [[package]]
@@ -1187,24 +1119,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dekopon-webui"
-version = "0.12.0"
-dependencies = [
- "axum",
- "dekopon-broker-host",
- "dekopon-broker-protocol",
- "dekopon-core",
- "dekopon-test-support",
- "libc",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
- "tower",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "dekopond"
 version = "0.12.0"
 dependencies = [
@@ -1221,6 +1135,7 @@ dependencies = [
  "dekopon-shell",
  "dekopon-storage-host",
  "dekopon-telemetry",
+ "dekopon-test-support",
  "futures-util",
  "getrandom 0.4.3",
  "hmac",
@@ -1238,6 +1153,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3905,17 +3821,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "tracing-chrome"
-version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf0a738ed5d6450a9fb96e86a23ad808de2b727fd1394585da5cdd6788ffe724"
-dependencies = [
- "serde_json",
- "tracing-core",
- "tracing-subscriber",
 ]
 
 [[package]]

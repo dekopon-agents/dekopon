@@ -6,7 +6,7 @@ use dekopon_broker::{
     BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet, CredentialStore, FileAuditLog,
     IdentityDirectory, InMemoryAuditLog, InvocationRequest, Leniency, PolicyEngine, PolicyWorld,
     SecretCatalog, SecretMaterial, SecretResolutionError, SecretResolver, SecretUseBinding,
-    StartupWarning, verify_audit_chain,
+    StartupWarning,
 };
 use dekopon_broker_host::BoundCredential;
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry, CommandRunOutcome};
@@ -250,7 +250,7 @@ fn direct_http_policy(name: &str, agent_name: &str, capability: &str) -> String 
 }
 
 /// The same HTTP grant for a directly connected peer that is no agent at all — the shape
-/// `dekopon-run` arrives in, carrying `Actor::Service` and therefore no `context.agent`.
+/// a direct service peer arrives in, carrying `Actor::Service` and therefore no `context.agent`.
 const DIRECT_PEER_HTTP_POLICY: &str = r#"permit(principal == Dekopon::Principal::"direct-peer",
        action == Dekopon::Action::"http-probe.fetch",
        resource == Dekopon::Provider::"http-probe")
@@ -434,7 +434,6 @@ async fn policy_authorizes_once_and_audits_no_payloads() {
 
     let records = audit.records().await;
     assert_eq!(records.len(), 3);
-    verify_audit_chain(&records).expect("audit chain verifies");
     assert!(matches!(
         records[0].event,
         AuditEvent::Decision { allowed: true, .. }
@@ -445,11 +444,11 @@ async fn policy_authorizes_once_and_audits_no_payloads() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn durable_audit_restores_replay_rejection_after_restart() {
+async fn file_audit_continues_but_replay_ledger_is_process_local() {
     let directory = tempfile::tempdir().expect("create durable broker fixture");
     let path = directory.path().join("audit.jsonl");
     let audit = Arc::new(
-        FileAuditLog::open(&path, 8, 64 * 1024)
+        FileAuditLog::open(&path, 64 * 1024)
             .await
             .expect("create durable audit"),
     );
@@ -485,12 +484,11 @@ async fn durable_audit_restores_replay_rejection_after_restart() {
     drop(audit);
 
     let audit = Arc::new(
-        FileAuditLog::open(&path, 8, 64 * 1024)
+        FileAuditLog::open(&path, 64 * 1024)
             .await
-            .expect("verified audit reopens"),
+            .expect("audit reopens"),
     );
-    let replay_ids = audit.take_replay_ids().await;
-    let broker = Broker::new_with_replay_ids(
+    let broker = Broker::new(
         echo_registry(BrokerHostLimits::default()).await,
         "broker-test"
             .parse::<PrincipalId>()
@@ -502,9 +500,8 @@ async fn durable_audit_restores_replay_rejection_after_restart() {
         IdentityDirectory::empty(),
         Arc::clone(&audit),
         BrokerLimits::default(),
-        replay_ids,
     )
-    .expect("broker restores verified replay state");
+    .expect("broker starts with process-local replay state");
     let replay = broker
         .invoke(
             &context("caller"),
@@ -513,12 +510,26 @@ async fn durable_audit_restores_replay_rejection_after_restart() {
             request("invoke-durable", "echo.echo", json!({"message": "again"})),
         )
         .await
-        .expect("replay denial is durably audited");
+        .expect("restart does not restore replay state");
     assert_eq!(
         replay.outcome,
-        dekopon_capability::InvocationOutcome::Denied
+        dekopon_capability::InvocationOutcome::Succeeded
     );
-    assert_eq!(replay.error.as_deref(), Some("replayed-invocation"));
+    assert_eq!(replay.error, None);
+    let raw = std::fs::read_to_string(&path).expect("read appended records");
+    let records = raw
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<dekopon_broker::AuditRecord>(line).expect("record decodes")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| record.sequence)
+            .collect::<Vec<_>>(),
+        [1, 2, 3, 4]
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -742,7 +753,6 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
 
     let records = audit.records().await;
     assert_eq!(records.len(), 2);
-    verify_audit_chain(&records).expect("audit chain verifies");
     let serialized = serde_json::to_string(&records).expect("audit serializes");
     assert!(serialized.contains(&authority));
     assert!(serialized.contains("POST"));
@@ -902,7 +912,6 @@ async fn jsonplaceholder_write_requires_external_write_policy_and_redacts_conten
 
     let records = audit.records().await;
     assert_eq!(records.len(), 3);
-    verify_audit_chain(&records).expect("audit chain verifies");
     let serialized = serde_json::to_string(&records).expect("audit serializes");
     assert!(serialized.contains(&authority));
     assert!(serialized.contains("external-write"));
@@ -1011,7 +1020,6 @@ async fn failed_execution_audits_the_external_write_that_already_landed() {
 
     let records = audit.records().await;
     assert_eq!(records.len(), 2);
-    verify_audit_chain(&records).expect("audit chain verifies");
     let AuditEvent::Execution {
         outcome,
         http_calls,
@@ -1115,7 +1123,6 @@ async fn credentialed_constraint_sets_inject_bound_secrets_and_never_audit_them(
 
     // Presence is recorded; the value is not — not in audit, not in the public result.
     let records = audit.records().await;
-    verify_audit_chain(&records).expect("audit chain verifies");
     let serialized = serde_json::to_string(&records).expect("audit serializes");
     assert!(
         serialized.contains("\"credentialInjected\":true"),
@@ -1382,7 +1389,7 @@ async fn authorized_source_failure_is_a_terminal_audited_failure_not_an_ambiguou
 ///
 /// Selection keys on the agent in the trusted context, so all three shapes a caller can arrive in
 /// are here — an agent the set names, an agent it does not, and a direct peer that is no agent at
-/// all. The wire is the only place a secret may appear; the audit chain gets the symbolic name,
+/// all. The wire is the only place a secret may appear; the audit log gets the symbolic name,
 /// which is what keeps the two writes from being indistinguishable after the fact.
 #[tokio::test(flavor = "multi_thread")]
 async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
@@ -1487,7 +1494,7 @@ async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
         agent_context("caller", "dekoponville-github"),
     )
     .await;
-    // A direct peer such as `dekopon-run` is an `Actor::Service`: no agent, no override, default.
+    // A direct peer is an `Actor::Service`: no agent, no override, default.
     fetch("invoke-direct", service_context("direct-peer")).await;
 
     let wire = || server.request_text();
@@ -1513,7 +1520,6 @@ async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
 
     // Which authority a write used is exactly what an auditor needs; the value still is not.
     let records = audit.records().await;
-    verify_audit_chain(&records).expect("audit chain verifies");
     let encoded = serde_json::to_value(&records).expect("audit serializes");
     let selected = encoded
         .as_array()
@@ -1619,7 +1625,6 @@ async fn an_agent_with_no_override_and_no_default_transacts_unauthenticated() {
     server.join();
 
     let records = audit.records().await;
-    verify_audit_chain(&records).expect("audit chain verifies");
     let encoded = serde_json::to_value(&records).expect("audit serializes");
     let selected = encoded
         .as_array()
@@ -1911,7 +1916,6 @@ async fn via_isolation_holds_in_both_directions() {
     );
 
     let records = audit.records().await;
-    verify_audit_chain(&records).expect("audit chain verifies");
     assert_eq!(records.len(), 4, "one allow plus execution, two denials");
 }
 
@@ -1970,7 +1974,6 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
 
     let records = audit.records().await;
     assert_eq!(records.len(), 2);
-    verify_audit_chain(&records).expect("audit chain verifies");
     for record in &records {
         let AuditEvent::Decision {
             principal,
@@ -2118,11 +2121,9 @@ async fn attested_success_audits_via_and_subject() {
 
     let records = audit.records().await;
     assert_eq!(records.len(), 2);
-    verify_audit_chain(&records).expect("audit chain verifies");
     let encoded = serde_json::to_value(&records).expect("audit serializes");
     // Event field names are the enum's own snake_case, unlike the camelCase record envelope
-    // around them. Asserting the literal wire keys keeps that difference from drifting silently:
-    // the record hash is computed over exactly this encoding.
+    // around them. Asserting the literal wire keys keeps that difference from drifting silently.
     for (index, kind) in [(0, "decision"), (1, "execution")] {
         let event = &encoded[index]["event"];
         assert_eq!(event["type"], kind);
@@ -2262,12 +2263,11 @@ fn identity_directory_rejects_duplicates_and_resolves_exactly() {
     ));
 }
 
-/// `via` and `attested_subject` are serde defaults that stay absent when empty, so a durable
-/// chain written before attestation existed still decodes *and* re-serializes byte for byte. That
-/// second half is the load-bearing one: the record hash is a digest of this exact encoding, so a
-/// field that appeared as `null` would invalidate every retained record.
+/// `via` and `attested_subject` are serde defaults that stay absent when empty, so an audit
+/// event written before attestation existed still decodes and re-serializes byte for byte.
+/// An absent field must remain absent rather than appearing as `null`.
 #[test]
-fn audit_events_written_before_attestation_decode_and_hash_unchanged() {
+fn audit_events_written_before_attestation_serialize_unchanged() {
     let legacy = concat!(
         r#"{"type":"decision","invocation":"invoke-legacy","trace":"trace-legacy","#,
         r#""principal":"caller","actor":{"type":"agent","agent":"provider-test"},"#,
@@ -2290,18 +2290,18 @@ fn audit_events_written_before_attestation_decode_and_hash_unchanged() {
     assert_eq!(
         serde_json::to_string(&event).expect("serializes"),
         legacy,
-        "an absent attestation must not change the bytes a retained record hashes over"
+        "an absent attestation must not change the serialized event bytes"
     );
 }
 
 /// The same requirement for the terminal record's `credential`, which per-agent selection added.
 ///
-/// A durable chain written before it existed has to keep hashing to the same value, so the field
+/// An event written before it existed retains its serialization shape, so the field
 /// has to be a skipped-when-absent option rather than a `null`. The name is recorded for the same
 /// reason `policy_ids` is: an auditor needs to know which authority a write used, and once one
 /// capability can present two, an unnamed one makes two organizations' writes identical.
 #[test]
-fn execution_records_written_before_per_agent_credentials_decode_and_hash_unchanged() {
+fn execution_records_written_before_per_agent_credentials_serialize_unchanged() {
     let legacy = concat!(
         r#"{"type":"execution","invocation":"invoke-legacy","trace":"trace-legacy","#,
         r#""principal":"caller","actor":{"type":"agent","agent":"provider-test"},"#,
@@ -2319,7 +2319,7 @@ fn execution_records_written_before_per_agent_credentials_decode_and_hash_unchan
     assert_eq!(
         serde_json::to_string(&event).expect("serializes"),
         legacy,
-        "an absent credential must not change the bytes a retained record hashes over"
+        "an absent credential must not change the serialized event bytes"
     );
 }
 
@@ -2439,7 +2439,6 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
         .expect("the denial is accounted");
 
     let records = audit.records().await;
-    verify_audit_chain(&records).expect("audit chain verifies");
     let encoded = serde_json::to_value(&records).expect("audit serializes");
     // Event fields keep the enum's own snake_case, unlike the camelCase record envelope.
     for index in [0, 1] {
@@ -2479,7 +2478,6 @@ async fn tolerating_an_unconstrained_capability_warns_but_still_denies_it() {
         Arc::clone(&audit),
         BrokerLimits::default(),
         Leniency::Tolerant,
-        std::iter::empty(),
     )
     .expect("tolerating an unexecutable grant starts");
 
@@ -2561,7 +2559,6 @@ async fn tolerating_a_constraint_set_that_routes_nowhere_drops_it() {
         Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound")),
         BrokerLimits::default(),
         Leniency::Tolerant,
-        std::iter::empty(),
     )
     .expect("tolerating an unrouted constraint set starts");
 
@@ -2610,7 +2607,6 @@ async fn command_words_are_filtered_by_what_policy_allows() {
         Arc::clone(&audit),
         BrokerLimits::default(),
         Leniency::Strict,
-        std::iter::empty(),
     )
     .expect("broker starts");
 
@@ -2654,7 +2650,6 @@ async fn an_unknown_command_word_is_refused_without_running_anything() {
         Arc::clone(&audit),
         BrokerLimits::default(),
         Leniency::Strict,
-        std::iter::empty(),
     )
     .expect("broker starts");
 
@@ -2701,7 +2696,6 @@ async fn a_command_word_renders_help_and_reads_the_piped_value_through_the_broke
         Arc::clone(&audit),
         BrokerLimits::default(),
         Leniency::Strict,
-        std::iter::empty(),
     )
     .expect("broker starts");
     let caller = context("caller");

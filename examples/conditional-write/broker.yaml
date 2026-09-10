@@ -1,6 +1,6 @@
 # dekopon-brokerd — the only process in this example that holds any authority.
 #
-# It owns the socket, the policy, the constraint sets, the the upstream API credential, and the audit chain.
+# It owns the socket, the policy, the constraint sets, the the upstream API credential, and the audit log.
 # The gateway holds none of those; it holds a Slack token and a model endpoint.
 #
 # Hygiene, all checked at startup and all fatal:
@@ -14,8 +14,6 @@ apiVersion: dekopon.dev/brokerd/v1alpha1
 
 socketPath: /home/xavier/.local/run/dekopon/broker.sock
 auditPath: /home/xavier/.local/state/dekopon/audit.jsonl
-checkpointPath: /home/xavier/.local/state/dekopon/audit-checkpoint.json
-checkpointLockPath: /home/xavier/.local/state/dekopon/audit-checkpoint.lock
 
 brokerPrincipal: local-broker
 policyRevision: conditional-write-2026-01
@@ -38,11 +36,13 @@ providers:
   - ../providers/http-probe-provider.wasm
 
 identities:
-  # 501 is the server's own UID, which is what the owner-only socket currently permits: every
-  # configured peer UID must equal the broker's. Change it to your own (`id -u`). In this
-  # single-UID deployment the attestor grant buys attribution and deny-by-default scoping, not
-  # separation — any process under this UID can already act as this peer. A dedicated gateway UID
-  # is where `via` becomes real isolation, and that deployment is committed direction.
+  # 501 is the server's own UID; change it to your own (`id -u`). A peer under any other UID needs
+  # a group-traversable socket parent (mode 0710 or 0750, owned by a group both processes are in),
+  # which is what makes the broker bind a 0660 socket. Under a private 0700 parent the broker
+  # refuses to start rather than bind a socket that peer could never open. In this single-UID
+  # deployment the attestor grant buys attribution and deny-by-default scoping, not separation —
+  # any process under this UID can already act as this peer. A dedicated gateway UID is where
+  # `via` becomes real isolation.
   - uid: 501
     principal: dekopond-gateway
     actor:

@@ -53,6 +53,10 @@ capability and nothing else, and can never authorize an execution: it routes to 
 broker refuses any constraint set naming an unrouted capability, and an invocation naming one is
 denied `unconstrained-capability` before Cedar is consulted.
 
+`PolicyWorld::new` refuses all reserved-action collisions and duplicate capability names together
+as `PolicyBuildError::WorldConflicts`, with sorted, unique `reserved` and `duplicates` lists.
+At least one list is nonempty; no conflicting world is returned.
+
 ## Context
 
 Capability actions carry `{ via?, subject?, agent?, effect, risk, idempotency }`. `agent.prompt`

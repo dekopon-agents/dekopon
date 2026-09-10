@@ -1,7 +1,7 @@
 //! Rust guest interface for Dekopon provider components.
 //!
 //! Provider authors implement [`Provider`] using ordinary domain types. [`export_provider!`]
-//! supplies the JSON-over-WIT adapter required by `dekopon-provider-host`. A provider that
+//! supplies the JSON-over-WIT adapter consumed by component hosts. A provider that
 //! contributes command words to the sandboxed shell implements [`Provider::run_command`] and
 //! exports through [`export_provider_with_cli!`], so `gh --help` renders a page and `gh pr view 7`
 //! proposes a capability.

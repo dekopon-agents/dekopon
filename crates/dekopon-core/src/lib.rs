@@ -41,9 +41,8 @@ pub const MAX_SECRET_USERNAME_LENGTH: usize = 256;
 
 /// File extension a Dekopon provider component is recognized by.
 ///
-/// Shared so the privileged broker and the direct runner cannot disagree about which files in a
-/// provider directory are components. Each does its own directory read — one under owner-only
-/// rules, one unprivileged — but both select by this.
+/// The privileged broker uses this to select components when reading a provider directory
+/// under its owner-only file rules.
 pub const PROVIDER_COMPONENT_EXTENSION: &str = "wasm";
 
 /// Words a provider may not claim as a command word.

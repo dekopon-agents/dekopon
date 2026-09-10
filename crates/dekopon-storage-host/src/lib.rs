@@ -33,7 +33,7 @@
 //! ```
 //!
 //! Rust visibility is defense in depth. Host ownership, trusted broker derivation, exact binding,
-//! filesystem isolation, and invocation-transactional commit are the authority boundary.
+//! and filesystem isolation are the authority boundary.
 
 #![forbid(unsafe_code)]
 
@@ -51,27 +51,25 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 mod config;
-mod gc;
+mod handle;
 mod jsonl;
 mod key;
 mod layout;
 mod metrics;
 mod namespace;
 mod quota;
-mod transaction;
 mod vfs;
 
 pub use config::{StorageConfigError, StorageLimits};
-pub use gc::GcReport;
+pub use handle::StorageHandle;
 pub use jsonl::JsonlChunk;
-pub use transaction::StorageTransaction;
 pub use vfs::{Durability, FileStat, LockLevel, OpenOptions};
 
 use key::{
     DOMAIN_AUDIT_SCOPE, DOMAIN_CONTENT, DOMAIN_DECISION_EVIDENCE, DOMAIN_NAMESPACE_PATH,
     DOMAIN_RECORD_ID, StorageKey, random_bytes,
 };
-use layout::{ENTRY_CHARGE, Layout, scan_root_usage, scan_usage};
+use layout::{Layout, scan_root_usage, scan_usage, usage_with_directory_entry};
 use namespace::{Namespace, NamespacePlan};
 use quota::QuotaLedger;
 
@@ -354,11 +352,8 @@ struct HostInner {
     ledger: Arc<QuotaLedger>,
     limits: StorageLimits,
     namespace_locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
-    /// In-process poison is authoritative even when a failing filesystem cannot persist the marker.
-    poisoned_bases: Arc<Mutex<BTreeSet<String>>>,
     /// Serializes physical namespace-slot observations with base removal, but never lease waits.
     namespace_observation_lock: Mutex<()>,
-    gc_lock: Mutex<gc::GcState>,
 }
 
 /// Wasmtime-independent secure native storage engine.
@@ -374,7 +369,7 @@ impl fmt::Debug for StorageHost {
 }
 
 impl StorageHost {
-    /// Opens, locks, validates, recovers, and accounts one broker-owned root.
+    /// Opens, locks, validates, and accounts one broker-owned root.
     pub fn open(
         root: impl AsRef<Path>,
         namespace_key_path: impl AsRef<Path>,
@@ -395,14 +390,10 @@ impl StorageHost {
         }
         let layout = Layout::open(&root, &key)?;
         quarantine_isolated_namespaces(&layout, &key, &limits)?;
-        transaction::recover_transactions(&layout, &key, &limits)?;
-        transaction::recover_retired_transactions(&layout, &key, &limits)?;
         let quarantined = layout
             .quarantine()
             .entries_prefix(limits.startup_max_entries.saturating_add(1))?
-            .into_iter()
-            .filter(|name| !name.starts_with("transaction-"))
-            .count() as u64;
+            .len() as u64;
         if quarantined > limits.max_quarantined_namespaces {
             return Err(StorageHostError::Corrupt {
                 scope: "quarantine-capacity",
@@ -429,9 +420,7 @@ impl StorageHost {
                 ledger,
                 limits,
                 namespace_locks: Mutex::new(BTreeMap::new()),
-                poisoned_bases: Arc::new(Mutex::new(BTreeSet::new())),
                 namespace_observation_lock: Mutex::new(()),
-                gc_lock: Mutex::new(gc::GcState::default()),
             }),
         })
     }
@@ -498,25 +487,13 @@ impl StorageHost {
         let _namespace = namespace_lock
             .lock()
             .expect("storage namespace housekeeping lock");
-        if self
-            .inner
-            .poisoned_bases
-            .lock()
-            .expect("storage poison registry")
-            .contains(&base)
-        {
-            return Err(StorageHostError::Corrupt {
-                scope: "poisoned-namespace",
-            });
-        }
         if self.inner.layout.quarantine().exists(&base)? {
             return Err(StorageHostError::Corrupt {
                 scope: "quarantined-namespace",
             });
         }
         let mut namespace_reservation = Some({
-            // A GC base removal takes the same short lock around rename + slot release. The lock
-            // is deliberately dropped before any base lease wait, preserving concurrency between
+            // The observation lock is dropped before any base lease wait, preserving concurrency between
             // distinct namespaces.
             let _observation = self
                 .inner
@@ -533,18 +510,7 @@ impl StorageHost {
                     self.inner
                         .layout
                         .quarantine()
-                        .entries_bounded(self.inner.limits.startup_max_entries)?
-                        .into_iter()
-                        .filter(|name| !name.starts_with("transaction-")),
-                )
-                .chain(
-                    self.inner
-                        .layout
-                        .trash()
-                        .entries_bounded(self.inner.limits.startup_max_entries)?
-                        .into_iter()
-                        .filter_map(|name| name.strip_prefix("base-").map(str::to_owned))
-                        .filter(|name| namespace::is_token(name)),
+                        .entries_bounded(self.inner.limits.startup_max_entries)?,
                 )
                 .collect::<BTreeSet<_>>();
             self.inner
@@ -588,18 +554,7 @@ impl StorageHost {
                     self.inner
                         .layout
                         .quarantine()
-                        .entries_bounded(self.inner.limits.startup_max_entries)?
-                        .into_iter()
-                        .filter(|name| !name.starts_with("transaction-")),
-                )
-                .chain(
-                    self.inner
-                        .layout
-                        .trash()
-                        .entries_bounded(self.inner.limits.startup_max_entries)?
-                        .into_iter()
-                        .filter_map(|name| name.strip_prefix("base-").map(str::to_owned))
-                        .filter(|name| namespace::is_token(name)),
+                        .entries_bounded(self.inner.limits.startup_max_entries)?,
                 ),
         );
         let namespace = match plan.apply(
@@ -609,7 +564,7 @@ impl StorageHost {
             Ok(namespace) => namespace,
             Err(error) => {
                 // `apply` may have completed mkdir/rename before a later open or sync failed. A
-                // physically present base owns the slot permanently until GC removes its trash.
+                // physically present base continues to own its slot.
                 if self.inner.layout.namespaces().exists(&base).unwrap_or(true) {
                     namespace_reservation
                         .take()
@@ -631,36 +586,28 @@ impl StorageHost {
                 return Err(error);
             }
         };
-        let mut after_namespace =
-            match scan_usage(&base_directory, self.inner.limits.startup_max_entries) {
-                Ok(usage) => usage,
-                Err(error) => {
-                    namespace_reservation
-                        .take()
-                        .expect("namespace reservation")
-                        .commit();
-                    housekeeping_reservation.retain();
-                    return Err(error);
-                }
-            };
-        let Some(entries) = after_namespace.entries.checked_add(1) else {
-            namespace_reservation
-                .take()
-                .expect("namespace reservation")
-                .commit();
-            housekeeping_reservation.retain();
-            return Err(StorageHostError::Arithmetic);
+        let scanned = match scan_usage(&base_directory, self.inner.limits.startup_max_entries) {
+            Ok(usage) => usage,
+            Err(error) => {
+                namespace_reservation
+                    .take()
+                    .expect("namespace reservation")
+                    .commit();
+                housekeeping_reservation.retain();
+                return Err(error);
+            }
         };
-        let Some(bytes) = after_namespace.bytes.checked_add(ENTRY_CHARGE) else {
-            namespace_reservation
-                .take()
-                .expect("namespace reservation")
-                .commit();
-            housekeeping_reservation.retain();
-            return Err(StorageHostError::Arithmetic);
+        let after_namespace = match usage_with_directory_entry(scanned) {
+            Ok(usage) => usage,
+            Err(error) => {
+                namespace_reservation
+                    .take()
+                    .expect("namespace reservation")
+                    .commit();
+                housekeeping_reservation.retain();
+                return Err(error);
+            }
         };
-        after_namespace.entries = entries;
-        after_namespace.bytes = bytes;
         if let Err(error) = housekeeping_reservation.commit(before_namespace, after_namespace) {
             namespace_reservation
                 .take()
@@ -686,33 +633,12 @@ impl StorageHost {
         })
     }
 
-    /// Consumes and validates one grant, acquiring its namespace lease for the transaction lifetime.
-    pub fn begin(&self, grant: StorageGrant) -> Result<StorageTransaction, StorageHostError> {
+    /// Consumes and validates one grant, acquiring its namespace lease for the invocation lifetime.
+    pub fn begin(&self, grant: StorageGrant) -> Result<StorageHandle, StorageHostError> {
         if grant.host_id != self.inner.id {
             return Err(StorageHostError::GrantHostMismatch);
         }
-        StorageTransaction::begin(
-            grant,
-            Arc::clone(&self.inner.ledger),
-            self.inner.layout.namespaces().clone(),
-            self.inner.layout.transactions().clone(),
-            self.inner.layout.trash().clone(),
-            Arc::clone(&self.inner.poisoned_bases),
-        )
-    }
-
-    /// Runs one bounded lifecycle pass. Active namespace leases are skipped.
-    pub fn gc_once(&self) -> Result<GcReport, StorageHostError> {
-        let mut gc = self.inner.gc_lock.lock().expect("storage GC lock");
-        gc::run(
-            &self.inner.layout,
-            &self.inner.key,
-            &self.inner.limits,
-            &self.inner.namespace_locks,
-            &self.inner.namespace_observation_lock,
-            &self.inner.ledger,
-            &mut gc,
-        )
+        StorageHandle::begin(grant, Arc::clone(&self.inner.ledger))
     }
 
     #[must_use]
@@ -827,9 +753,7 @@ fn quarantine_isolated_namespaces(
     let mut quarantined = layout
         .quarantine()
         .entries_prefix(limits.startup_max_entries.saturating_add(1))?
-        .into_iter()
-        .filter(|name| !name.starts_with("transaction-"))
-        .count() as u64;
+        .len() as u64;
     for base in layout
         .namespaces()
         .entries_bounded(limits.startup_max_entries)?
@@ -923,9 +847,7 @@ fn isolated_namespace_corruption(error: &StorageHostError) -> bool {
 
 /// The coarse class a storage failure is reported under.
 ///
-/// One definition serves two readers that must agree: the content-free public reason a rejected
-/// transaction records for a guest, and the cause an [`StorageHostError::OutcomeUnaudited`] carries
-/// so an operator facing a poisoned namespace can tell "free disk" from "raise the quota".
+/// Content-free classification for guest-visible refusal reasons and operator diagnostics.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum StorageFailureClass {
     /// A quota or an accounting overflow refused the write.
@@ -1025,18 +947,8 @@ pub enum StorageHostError {
     Clock,
     #[error("storage startup scan saw {count} entries, above {maximum}")]
     StartupEntryLimit { count: u64, maximum: u64 },
-    #[error("storage startup scan saw too many transactions")]
-    StartupTransactionLimit,
     #[error("storage grant belongs to another host instance")]
     GrantHostMismatch,
-    #[error("storage committed durably but finalization or audit evidence failed (cause: {cause})")]
-    OutcomeUnaudited {
-        /// Coarse class of the failure that ended finalization.
-        ///
-        /// The outcome itself stays unknown; this says which kind of thing broke on the way to
-        /// it, which is the difference between freeing disk and raising a quota.
-        cause: StorageFailureClass,
-    },
 }
 
 impl StorageHostError {

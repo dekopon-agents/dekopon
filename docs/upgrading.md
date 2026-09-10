@@ -8,31 +8,60 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Broker dashboard retirement (unreleased)
+
+Remove the broker listener flag and chart value when upgrading. The UI and its reporting feed
+are retired; see the [lockstep and refusal contract](../crates/dekopon-broker-protocol/README.md#version-and-compatibility).
+Provider HTTP, gateway webhooks, model accounting and daemon tracing remain.
+
+## Broker audit configuration (unreleased)
+
+Use only the current [broker configuration fields](../crates/dekopon-brokerd/README.md#configuration);
+obsolete audit settings are rejected as unknown fields. Keep the private audit file and its
+line-size bound. Startup counts bounded newline-delimited records without decoding history and
+refuses unterminated tails. Appends are flushed, not fsynced; there is no automatic repair,
+historical integrity check, or crash-durability guarantee. Replay rejection is process-local and
+starts empty after restart. Library callers of `run` receive unit on clean shutdown.
+
+## Provider storage direct-write contract
+
+Provider storage applies each write immediately; provider traps, invalid responses and cancellation
+can leave completed writes. Applications must not assume invocation-wide rollback, atomic
+cross-file commit, or crash recovery. Inactive generations remain charged to the root quota.
+
+The strict storage limits object accepts only live bounds. Configure the complete object using
+`StorageLimits` defaults/current fields; omit all GC scheduling/TTL and startup recovery-count
+settings. `maxPendingTransactions` remains the compatibility spelling for concurrent invocation
+handle admission. Keep the existing namespace key private and unchanged. Retained stores with
+unknown root or generation entries are refused or quarantined; there is no automatic migration,
+recursive cleanup or trusted import of legacy layout bytes. Preserve such data offline rather
+than deleting entries to bypass a refusal. A separately provisioned private storage root starts
+empty and does not restore previous data.
+
 ## Two rules that apply to every upgrade
 
-### Upgrade all four executables together
+### Upgrade both daemon executables together
 
-`dekopon`, `dekopon-run`, `dekopon-brokerd`, and `dekopond` are separately installable — Homebrew,
+`dekopon-brokerd` and `dekopond` are separately installable — Homebrew,
 crates.io, release archives, the container image, and the Helm chart with its own `image.tag` — so a
 mixed set is easy to end up with by accident. Do not. The local broker protocol has one version
 constant and both envelopes are strict-decoded; a newer broker adding a field to a response an older
 client already understands makes that response undecodable, which is the failure a partial upgrade
-most reliably produces. [`broker-http.md`](broker-http.md#version-and-compatibility) has the exact
-mechanics. The container image and the chart ship all four from one release for this reason.
+most reliably produces. [`dekopon-brokerd` contract](../crates/dekopon-broker-protocol/README.md#version-and-compatibility) has the exact
+mechanics. The container image and the chart ship both daemon executables from one release for this reason.
 
 ### Restart the broker first and stop it last
 
 `dekopond` asks the broker for capabilities once at startup and **exits non-zero** if the broker does
 not answer, so a gateway started against a stopped broker crash-loops rather than waiting. Shutdown
 runs the other way: the gateway drains first so no session is mid-invocation when the broker begins
-synchronizing its audit chain.
+finishing its audit appends.
 
 Dekopon ships no service units, so the order is yours to enforce whatever supervises the processes:
 
 1. Stop `dekopond`.
 2. Signal `dekopon-brokerd` with `SIGINT` or `SIGTERM` and let it finish. It stops accepting, drains
-   bounded in-flight connections, synchronizes the audit and checkpoint appends, logs the verified
-   chain head, and removes only the socket inode it created.
+   bounded in-flight connections, finishes audit appends, logs `broker_stopped`, and removes only the socket inode it created.
 3. Replace the binaries and make any configuration edits the release notes below call for.
 4. Start `dekopon-brokerd` and wait for it to be answering on its socket.
 5. Start `dekopond`.
@@ -41,9 +70,9 @@ Under the Helm chart this ordering is structural rather than procedural: the bro
 sidecar with a startup probe, so Kubernetes will not start `dekopond` until the broker answers a real
 request, and terminates them in the reverse order.
 
-**Never move the audit chain or its checkpoint as part of an upgrade.** Startup requires the
-checkpoint to be an exact verified prefix of the audit file, and a mismatch fails closed and needs
-explicit operator recovery. See [`operations.md`](operations.md#the-audit-chain-and-its-checkpoint).
+Keep audit data when upgrading or investigating a refusal. A fresh process does not recover replay
+state from that file, and restarting does not make an uncertain external effect safe to retry.
+See [`operations.md`](operations.md#append-only-audit-and-process-local-replay).
 
 ## Release-by-release
 
@@ -55,17 +84,17 @@ swap in the order above.
 Not yet released; the version that carries it is named when it is cut. Nothing here needs a
 configuration edit.
 
-- **Upgrade the broker before its clients, and all four executables together.** The local protocol
-  stays `dekopon.dev/broker/v1alpha2`, but `dekopon-run --broker` and `dekopond` now send a provider
-  command word as `runCommand` — the word, its argv, and the optional piped value — and read back
+- **Upgrade the broker before its clients, and both daemons together.** The local protocol
+  stays `dekopon.dev/broker/v1alpha2`, but `dekopond` now sends a provider
+  command word as `runCommand` — the word, its argv, and the optional piped value — and reads back
   the guest's own outcome. A newer broker still answers the legacy `resolveCommand`, with a
   rendered page degraded to a decline carrying its stdout then stderr, so an older client keeps
   working for one release. The reverse does not hold: an older broker refuses `runCommand` as
   `invalid-request` at the `operation` tag, indistinguishable from a corrupt frame, so a newer
   client against an older broker reports every command word as a failed run until the broker moves.
-- **Upgrade the hosts before a provider adopts `run-command`.** A component built against
-  `dekopon:provider@0.3.0`'s `provider-cli` world exports `run-command`, which only a broker or
-  runner at this version looks up; an older host finds no `resolve-command` behind the manifest's
+- **Upgrade the broker host before a provider adopts `run-command`.** A component built against
+  `dekopon:provider@0.3.0`'s `provider-cli` world exports `run-command`, which the broker host
+  at this version looks up; an older host finds no `resolve-command` behind the manifest's
   `commandWords` and refuses the component at load. Components built against `0.1.0` or `0.2.0`
   keep loading unchanged and never receive a piped value.
 - **Embedders: `BrokerClient::resolve_command`, `RequestEnvelope::resolve_command`, and
@@ -98,7 +127,7 @@ bootstrap limitations.
   value quietly ignored. Delete every `dev.*` `identityMappings` subject and attestor namespace with
   it: `dev` is no longer a subject service, so those lines no longer parse either. The field was off
   by default and no chart release could set it, so a deployment that never opted in has nothing to
-  edit — and no persisted audit chain can carry a `dev.*` subject.
+  edit — and no persisted audit log can carry a `dev.*` subject.
 - **Declare `route:` on every chat-memory constraint set before upgrading the broker.** Durable chat
   memory used to be recognized by name: any capability spelled `memory.chat.*` and any provider
   called `memory-chat` was reserved, and renaming the shipped provider silently dropped that
@@ -114,8 +143,7 @@ bootstrap limitations.
   omits it means exactly what it meant before. The wire protocol and audit record shapes are
   unchanged.
 - **The local broker protocol moved to `dekopon.dev/broker/v1alpha2`; upgrade all four executables
-  in one step.** The eleven request operations collapsed into six — `capabilities`,
-  `resolveCommand`, `invoke`, `recordDeliveredTurn`, `publishAgentInventory`, `publishModelUsage` —
+  in one step.** The request operations collapsed to one per verb,
   because whether a caller speaks as its own peer, on behalf of a subject, or inside a chat scope is
   now an optional `attestation` field rather than a separate operation per shape. The retired tags
   (`capabilitiesFor`, `capabilitiesForChat`, `invokeFor`, `invokeForChat`, `resolveCommandForChat`,
@@ -162,7 +190,7 @@ bootstrap limitations.
   and follows no redirect, so an exported proxy variable no longer carries a bearer token, the
   device-code exchange, or a prompt through a host nobody named to Dekopon. That is the stance
   `dekopon-http-host` already took for provider HTTP. It reaches `dekopond`, `dekopon-run`, and
-  `dekopon auth chatgpt login`; nothing in a configuration file changes, and there is no field or
+  `dekopond auth chatgpt login`; nothing in a configuration file changes, and there is no field or
   flag to opt back in, so a model endpoint that was only reachable through that proxy is
   unreachable after the upgrade.
 
@@ -271,7 +299,7 @@ Mechanical steps:
 
 Startup validates the result against a schema generated from the deployment's own world, so a typo
 in a principal or capability name is refused rather than becoming dead policy — with one exception,
-agent names, described in [`broker-http.md`](broker-http.md#startup-validation).
+agent names, described in [`dekopon-brokerd` contract](../crates/dekopon-brokerd/README.md#catalog-ownership-at-policy-startup).
 
 0.3 also introduced `dekopond`. Adding it is not part of this migration; the broker upgrade stands
 alone.
@@ -301,12 +329,6 @@ If `telemetry.endpoint` contains userinfo (`http://user:pass@collector`), the br
 start. Move the credential to `OTEL_EXPORTER_OTLP_HEADERS`, where it never enters the configuration
 file, the process command line, or a span attribute. See
 [`observability.md`](observability.md).
-
-0.6 also added the `dekopon-webui` dashboard. It is **off unless `--http-bind` is supplied** and
-opens no port otherwise, so upgrading changes no network surface by itself. If you do enable it,
-read the access-boundary note in
-[`crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.md#read-only-web-ui) first: it
-is unauthenticated and read-only, and the address you bind is the whole access control.
 
 ### 0.6 → 0.7 — standing instructions became readable
 
@@ -355,13 +377,22 @@ defaults to, so a chart release and an application release are two separate upgr
 application under an existing chart, set `image.tag` (or better, `image.digest`) rather than waiting
 for a chart release. [`charts/dekopon/README.md`](../charts/dekopon/README.md#two-version-numbers)
 has the full account, including the retained-claim behavior that makes `helm uninstall` leave the
-audit chain in place.
+audit log in place.
 
 ## Related documents
 
 - [`CHANGELOG.md`](../CHANGELOG.md) — the authoritative record of what each release contains.
-- [`operations.md`](operations.md) — the running-system runbook, including audit recovery.
-- [`broker-http.md`](broker-http.md#version-and-compatibility) — what a version mismatch actually
+- [`operations.md`](operations.md) — the running-system runbook, including audit append failures.
+- [`dekopon-brokerd` contract](../crates/dekopon-broker-protocol/README.md#version-and-compatibility) — what a version mismatch actually
   does on the wire.
 - [`catalog.md`](catalog.md) — the catalog schema an upgrade may need you to re-read.
 - [`container-image.md`](container-image.md) — how the image is assembled and what it pins.
+
+## Unreleased: standalone catalog CLI retirement
+
+The standalone `dekopon` package/executable and its get/describe/validate/config commands are
+removed. Install the matching `dekopond` from this source revision and use
+`dekopond auth chatgpt {login,status,logout,export}` instead. Auth flags belong after `auth`;
+serving still requires `dekopond --config PATH`. Existing isolated credential files, export
+Secret labels/keys/default names, and refresh behavior are unchanged. Published 0.12.0 archives
+remain historical artifacts; they do not provide the new gateway auth command.

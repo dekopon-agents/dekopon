@@ -974,7 +974,7 @@ fn check_cancelled(cancellation: Option<&dyn CancellationProbe>) -> Result<(), P
 
 /// Renders one script outcome the way a terminal would: output, then an exit-code trailer.
 ///
-/// `dekopon-run shell` prints this exact shape to a human and the prompt loop hands this exact
+/// Embedders can print this exact shape to a human, and the prompt loop hands this exact
 /// shape to a model, so a script a model wrote behaves identically when an operator reruns it.
 #[must_use]
 pub fn format_script_outcome(outcome: &ScriptOutcome) -> String {
@@ -3873,13 +3873,6 @@ mod tests {
             vec!["http.get --url https://example.test".to_owned()]
         );
     }
-
-    // The companion assertion — that the interpreter's own spans nest under `prompt.script` across
-    // this same bridge — lives in `dekopon-run/tests/prompt_tracing.rs` rather than here.
-    // `tracing` caches callsite interest globally and once, so a `prompt.script` first reached by
-    // one of the tests above (which install no subscriber) stays disabled for any later
-    // thread-local one; that made the assertion depend on test ordering. Its own binary removes
-    // the race.
 
     #[test]
     fn rejects_a_zero_step_session_before_contacting_the_model() {

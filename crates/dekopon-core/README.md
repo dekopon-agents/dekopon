@@ -10,7 +10,7 @@ retry classification with its backoff bounds, `error_chain`, which renders a fai
 as one line, `read_trusted_file`, the one definition of what makes a local file trusted input —
 opened without following a symlink, regular, single-link, owned by this process, within a byte
 ceiling, and at one of two named permission tiers — `PROVIDER_COMPONENT_EXTENSION`, the file
-extension both the broker and the direct runner select components by, and `RESERVED_COMMAND_WORDS`
+extension the broker selects components by, and `RESERVED_COMMAND_WORDS`
 with `command_word_conflicts`, the shell-owned word list and the check that reports every reserved,
 capability-shaped, duplicated, or repeated provider command word at once, so the broker can refuse
 a conflicting manifest at startup without linking the interpreter.

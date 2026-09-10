@@ -1,7 +1,7 @@
 //! Which spans a suspended authorization leaves entered on its worker thread.
 //!
-//! `broker.authorize` covers work that awaits: the replay ledger, and on every denial a durable
-//! audit append that flushes and fsyncs. A span guard held across those awaits stays entered in the
+//! `broker.authorize` covers work that awaits: the replay ledger, and on every denial an asynchronous
+//! audit append. A span guard held across those awaits stays entered in the
 //! thread's context while the task is suspended, so whatever the runtime polls next on that thread
 //! — another connection, another session — is recorded as a child of this request's authorization.
 //! With OTLP export on, that is cross-request misattribution in production traces rather than a
@@ -33,8 +33,8 @@ permit(principal == Dekopon::Principal::"caller",
 
 /// An audit log that parks inside `append` until the test lets it finish.
 ///
-/// Real durable appends write, flush, and fsync through `tokio::fs`, so the task always yields
-/// there. This reproduces that yield deterministically on a single-threaded runtime.
+/// An asynchronous audit append can suspend. This gate holds the append pending until released,
+/// so the test deterministically exercises that interleaving on a single-threaded runtime.
 struct GatedAudit {
     inner: InMemoryAuditLog,
     entered: mpsc::UnboundedSender<()>,
@@ -156,8 +156,8 @@ async fn a_suspended_authorization_does_not_parent_another_task_s_events() {
         }
     });
 
-    // The authorizing task is now parked inside the audit append, exactly where a real fsync parks
-    // it. Anything else this thread polls belongs to itself, not to that request.
+    // The authorizing task is now parked inside the gated audit append. Anything else this thread
+    // polls belongs to itself, not to that request.
     entered_rx
         .recv()
         .await

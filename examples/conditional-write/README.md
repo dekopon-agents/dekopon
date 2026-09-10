@@ -7,14 +7,14 @@ the record moved between the read and the write, and nobody's edit gets silently
 The gateway authenticates the message and vouches for the sender; it decides nothing. The broker
 maps that Slack identity to the principal `cpetersen`, checks a Cedar policy, resolves the two
 capabilities that policy permits, injects an API token bound to `api.example.com`, executes the
-`http-probe` WebAssembly component, and hash-links the result into an audit chain naming the person
+`http-probe` WebAssembly component, and appends metadata-only audit records naming the person
 who asked. The token is never visible to the model, the shell session, the agent, or the component
 that uses it — the broker's native HTTP engine adds the header after the guest's own headers have
 been validated, and audit records `credentialInjected: true` and never a value.
 
 | File | What it is | Who reads it |
 |---|---|---|
-| [`dekopon.yaml`](dekopon.yaml) | The catalog: one agent, two capabilities, one provider | `dekopond`, `dekopon` |
+| [`dekopon.yaml`](dekopon.yaml) | The catalog: one agent, two capabilities, one provider | `dekopond` |
 | [`broker.yaml`](broker.yaml) | Broker configuration: identities, mappings, constraint sets | `dekopon-brokerd` |
 | [`policies.cedar`](policies.cedar) | Who may do what, and through which gateway | `dekopon-brokerd` |
 | [`broker-credentials.yaml.example`](broker-credentials.yaml.example) | The API token, after you copy it | `dekopon-brokerd` |
@@ -64,7 +64,7 @@ Exactly these, and nothing else:
 
 | Placeholder | File | Replace with |
 |---|---|---|
-| `/home/xavier/.local/{run,state}/dekopon/…` | `broker.yaml` | your own paths — four entries: socket, audit, checkpoint, checkpoint lock |
+| `/home/xavier/.local/{run,state}/dekopon/…` | `broker.yaml` | your own paths — two entries: socket and audit |
 | `/home/xavier/.local/run/dekopon/broker.sock` | `dekopond.yaml` | the same socket path as `broker.yaml` |
 | `uid: 501` | `broker.yaml` | your UID (`id -u`) |
 | `serverUid: 501` | `dekopond.yaml` | the same UID |
@@ -92,15 +92,9 @@ chmod 600 broker.yaml policies.cedar dekopond.yaml
 
 The catalog half is checkable before anything runs:
 
-```console
-$ dekopon --config dekopon.yaml validate
-configuration valid: 1 agent(s), 2 capability(ies), 1 provider(s)
-
-$ dekopon --config dekopon.yaml describe agent xaviers-conditional-writer
-```
-
-That validates cross-references and capability metadata, and nothing else — the `dekopon` CLI reads
-the catalog and never contacts the broker. What the agent may actually do is decided two files away.
+The gateway loads and validates the complete typed catalog before starting transports.
+The example's cross-references and read/comment-without-approval boundary are also pinned by
+`cargo test -p dekopon-config --test examples --locked`.
 
 ## 4. Run the broker
 
@@ -109,12 +103,8 @@ dekopon-brokerd --config broker.yaml
 ```
 
 ```json
-{"timestamp":"2026-01-14T09:12:03.114Z","level":"INFO","event":"broker_started","audit_records":0,"audit_head":"none","target":"dekopon_brokerd"}
+{"timestamp":"2026-01-14T09:12:03.114Z","level":"INFO","event":"broker_started","target":"dekopon_brokerd"}
 ```
-
-`audit_records: 0` and `audit_head: "none"` are a fresh chain. On the next start they are the
-retained count and the verified head — and if the audit file and its checkpoint disagree by more
-than the one-record crash window, the broker refuses to start rather than continuing over a gap.
 
 Everything the broker will ever permit was decided by the time this line printed: the policy is
 compiled and strictly validated, every capability it can permit has a constraint set, and the
@@ -208,7 +198,7 @@ constraint set allows two requests and two methods: one `GET`, then one `POST` c
 that was true a moment ago. A retry against an unchanged record converges; a retry after someone
 else's edit refuses instead of overwriting work nobody read.
 
-## 7. What the audit chain now holds
+## 7. What the audit log holds
 
 ```console
 tail -1 ~/.local/state/dekopon/audit.jsonl | jq .
@@ -217,7 +207,6 @@ tail -1 ~/.local/state/dekopon/audit.jsonl | jq .
 ```json
 {
   "sequence": 6,
-  "previousHash": "sha256:1d0a…",
   "event": {
     "type": "execution",
     "invocation": "dekopond-session-9f1c4a7b0e35d268-3",
@@ -246,8 +235,7 @@ tail -1 ~/.local/state/dekopon/audit.jsonl | jq .
       { "method": "POST", "authority": "api.example.com", "status": 200,
         "requestBytes": 486, "responseBytes": 1204, "credentialInjected": true }
     ]
-  },
-  "recordHash": "sha256:c7e2…"
+  }
 }
 ```
 
@@ -268,13 +256,13 @@ What each part is doing:
   credential per agent is one where the two organizations' writes would otherwise be identical
   records.
 - No record body, no request payload, no written text, no Slack message, no URL path or query. The
-  chain records that something happened and to what; provider output is a digest.
+  log records that something happened and to what; provider output is a digest.
 
 Records 1 through 5 are the rest of the same session — among them a `decision` and an `execution`
 for the read, then the `decision` that allowed this write. Every identifier in the session shares
 the `trace`, and each invocation extends it with a counter, so `grep dekopond-session-9f1c4a7b0e35d268`
-recovers the whole conversation's effects. Each record carries `previousHash` and `recordHash`, and
-the broker verifies the entire chain on every start.
+recovers the whole conversation's effects. Each JSONL record contains its `sequence` ordinal
+and metadata-only `event`.
 
 ## 8. When it does not work
 
@@ -291,17 +279,18 @@ the broker verifies the entire chain on every start.
 | Gateway exits: broker unreachable | the broker is not running, or the two socket paths disagree | the `gateway_broker_ready` probe never logs |
 
 The split matters when you are debugging: a session refused *before* it starts leaves a gateway log
-line and an empty audit chain, while anything refused *during* one leaves an audited denial naming
+line without a broker audit record for that request, while anything refused *during* one leaves an audited denial naming
 the gateway, the subject, and the reason. Both refuse; only one of them ever proposed anything.
 
 ## What this deployment does not buy yet
 
-`dekopond` and `dekopon-brokerd` run under one UID here, because the broker's owner-only socket
-currently requires every configured peer UID to equal the server's. Under one UID an attestor grant
-buys attribution and deny-by-default scoping, not isolation — any process running as you can
-already act as the configured gateway peer. `via` and namespace scoping become real separation only
-when the gateway has its own UID, and that deployment is committed direction rather than current
-behavior. [`../../docs/security-model.md`](../../docs/security-model.md) states this in full.
+`dekopond` and `dekopon-brokerd` run under one UID in this local walkthrough. Its attestor grant
+buys attribution and deny-by-default scoping, not OS isolation: any process running as you can
+act as the configured gateway peer. This is an example choice, not a peer-UID equality requirement.
+The chart uses broker UID 65532, gateway UID 65533 and IPC group 65534 with a broker-owned 0710
+parent and a 0660 group-reachable socket. Peer UID mapping supplies identity; group membership
+alone grants none. Owner-only local chat sockets remain 0600 and private stores remain owner-only.
+See the [current local process boundary](../../docs/security-model.md#current-local-process-boundary).
 
 This route is `mode: persistent` and explicitly pins `scope: privateConversation`, so the gateway
 replays a bounded window of earlier turns from the same authenticated sender into the next prompt.
@@ -314,6 +303,6 @@ Nothing carries beyond that conversation: the agent has no memory that outlives 
 - [`../providers/http-probe/`](../providers/http-probe/README.md) — the component this deployment executes, and the `http-probe.purge` it deliberately never grants.
 - [`dekopon-provider-gh`](https://github.com/dekopon-agents/dekopon-provider-gh) — the same shape at nineteen capabilities, shipped from its own repository.
 - [`../../docs/dekopond.md`](../../docs/dekopond.md) — transports, routing, session bounds, and the authorization flow.
-- [`../../crates/dekopon-brokerd/README.md`](../../crates/dekopon-brokerd/README.md) — every configuration field, and the checkpoint/recovery contract.
+- [`../../crates/dekopon-brokerd/README.md`](../../crates/dekopon-brokerd/README.md) — every configuration field, and the audit and shutdown contract.
 - [`../../crates/dekopon-policy/README.md`](../../crates/dekopon-policy/README.md) — what Cedar decides here and what it deliberately does not.
-- [`../local/dekopon.yaml`](../local/dekopon.yaml) — the catalog-only example, whose `reviewer` may comment and deliberately holds no approval capability.
+- [`../catalog/dekopon.yaml`](../catalog/dekopon.yaml) — the catalog-only example, whose `reviewer` may comment and deliberately holds no approval capability.

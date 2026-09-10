@@ -5,12 +5,10 @@ use serde_json::json;
 use tokio::io::{AsyncWriteExt as _, duplex};
 
 use super::{
-    AgentInventory, Attestation, BrokerRequest, ChatScopeClaim, ChatTransportKind,
-    CommandRunOutcome, ComponentFailure, DeliveredTurnRequest, DeliveryIdentity, FrameLimits,
-    InventoryError, InvocationRequest, MAX_REPORTED_AGENT_PROVIDERS, MAX_REPORTED_MODEL_CALLS,
-    MAX_REPORTED_TEXT_BYTES, MAX_REPORTED_TOKENS, ModelUsageReport, PROTOCOL_VERSION, Permission,
-    ProtocolError, ProtocolVersion, ReportedAgent, ReportedAgentCapability, RequestEnvelope,
-    ResponseEnvelope, TraceParent, TraceParentError, UsageReportError, read_frame, write_frame,
+    Attestation, BrokerRequest, ChatScopeClaim, ChatTransportKind, CommandRunOutcome,
+    ComponentFailure, DeliveredTurnRequest, DeliveryIdentity, FrameLimits, InvocationRequest,
+    PROTOCOL_VERSION, ProtocolError, ProtocolVersion, RequestEnvelope, ResponseEnvelope,
+    TraceParent, TraceParentError, read_frame, write_frame,
 };
 
 fn subject() -> dekopon_core::ExternalSubject {
@@ -30,6 +28,22 @@ fn scope() -> ChatScopeClaim {
         channel: "c0123abc".to_owned(),
         conversation: "c0123abc:1712345678.000100".to_owned(),
     }
+}
+
+/// A socket parent both sides of the socket rule accept.
+///
+/// `tempfile::tempdir` applies the process umask, which normally leaves the directory
+/// world-traversable — a parent the broker refuses to bind under, and one this client refuses to
+/// connect through however private the socket's own mode looks. Fixtures that expect an exchange
+/// to happen start from a directory the broker could really have bound in.
+#[cfg(unix)]
+fn private_socket_directory() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = tempfile::tempdir().expect("create socket fixture directory");
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+        .expect("private socket fixture directory");
+    directory
 }
 
 fn invocation() -> InvocationRequest {
@@ -392,88 +406,6 @@ fn public_drn_is_typed_optional_proposal_data_and_never_provider_input() {
     );
 }
 
-#[test]
-fn informational_reports_are_bounded_and_carry_no_authority_or_prompt_content() {
-    let inventory = AgentInventory {
-        agents: vec![ReportedAgent {
-            id: "reviewer".parse().expect("valid agent"),
-            description: "Reviews pull requests".to_owned(),
-            enabled: true,
-            model_class: Some("reasoning".to_owned()),
-            providers: vec!["gh".parse().expect("valid provider")],
-            capabilities: vec![ReportedAgentCapability {
-                id: "gh.pull-request.read".parse().expect("valid capability"),
-                provider: "gh".parse().expect("valid provider"),
-                permissions: vec![Permission {
-                    operation: "pull_requests:read".to_owned(),
-                    resource: Some("dekopon-agents/*".to_owned()),
-                }],
-            }],
-        }],
-        truncated: false,
-    };
-    assert!(inventory.is_valid());
-    let encoded =
-        serde_json::to_string(&RequestEnvelope::publish_agent_inventory(inventory.clone()))
-            .expect("inventory serializes");
-    for prohibited in [
-        "instructions",
-        "prompt",
-        "credential",
-        "principal",
-        "policy",
-    ] {
-        assert!(
-            !encoded.contains(prohibited),
-            "inventory leaked {prohibited}"
-        );
-    }
-
-    let mut duplicated = inventory.clone();
-    duplicated.agents.push(inventory.agents[0].clone());
-    assert!(!duplicated.is_valid());
-    let mut oversized = inventory;
-    oversized.agents[0].description = "x".repeat(MAX_REPORTED_TEXT_BYTES + 1);
-    assert!(!oversized.is_valid());
-
-    let usage = ModelUsageReport {
-        model_calls: 2,
-        input_tokens: 100,
-        input_unreported_calls: 1,
-        output_tokens: 12,
-        ..ModelUsageReport::default()
-    };
-    assert!(usage.is_valid());
-    assert!(matches!(
-        RequestEnvelope::publish_model_usage(usage).request,
-        BrokerRequest::PublishModelUsage { .. }
-    ));
-    assert!(!ModelUsageReport::default().is_valid());
-    assert!(
-        !ModelUsageReport {
-            model_calls: MAX_REPORTED_MODEL_CALLS + 1,
-            ..ModelUsageReport::default()
-        }
-        .is_valid()
-    );
-    assert!(
-        !ModelUsageReport {
-            model_calls: 1,
-            input_tokens: MAX_REPORTED_TOKENS + 1,
-            ..ModelUsageReport::default()
-        }
-        .is_valid()
-    );
-    assert!(
-        !ModelUsageReport {
-            model_calls: 1,
-            output_unreported_calls: 2,
-            ..ModelUsageReport::default()
-        }
-        .is_valid()
-    );
-}
-
 #[cfg(unix)]
 #[tokio::test]
 async fn unix_client_authenticates_private_socket_and_response_variant() {
@@ -483,7 +415,7 @@ async fn unix_client_authenticates_private_socket_and_response_variant() {
 
     use super::BrokerClient;
 
-    let directory = tempfile::tempdir().expect("create socket fixture directory");
+    let directory = private_socket_directory();
     let socket = directory.path().join("broker.sock");
     let listener = UnixListener::bind(&socket).expect("bind broker fixture");
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
@@ -542,7 +474,7 @@ async fn framing_failures_keep_the_executed_or_not_distinction() {
         BrokerClient, ClientError, ERROR_BROKER_UNAVAILABLE, ERROR_OUTCOME_UNAUDITED, ExchangePhase,
     };
 
-    let directory = tempfile::tempdir().expect("create socket fixture directory");
+    let directory = private_socket_directory();
     let socket = directory.path().join("broker.sock");
     let listener = UnixListener::bind(&socket).expect("bind broker fixture");
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
@@ -627,130 +559,6 @@ async fn framing_failures_keep_the_executed_or_not_distinction() {
         .may_have_executed()
     );
     assert!(!ClientError::ConnectTimeout.may_have_executed());
-}
-
-/// A rejected inventory must name the agent and the bound, not just fail.
-#[test]
-fn inventory_and_usage_validation_name_the_offending_agent_and_bound() {
-    let inventory = AgentInventory {
-        agents: vec![ReportedAgent {
-            id: "reviewer".parse().expect("valid agent"),
-            description: "Reviews pull requests".to_owned(),
-            enabled: true,
-            model_class: None,
-            providers: vec!["gh".parse().expect("valid provider")],
-            capabilities: vec![ReportedAgentCapability {
-                id: "gh.pull-request.read".parse().expect("valid capability"),
-                provider: "gh".parse().expect("valid provider"),
-                permissions: Vec::new(),
-            }],
-        }],
-        truncated: false,
-    };
-    assert_eq!(inventory.validate(), Ok(()));
-
-    let mut oversized = inventory.clone();
-    oversized.agents[0].description = "x".repeat(MAX_REPORTED_TEXT_BYTES + 1);
-    let error = oversized
-        .validate()
-        .expect_err("an oversized description is rejected");
-    assert_eq!(
-        error,
-        InventoryError::TextTooLong {
-            agent: "reviewer".parse().expect("valid agent"),
-            field: "description",
-            bytes: MAX_REPORTED_TEXT_BYTES + 1,
-            maximum: MAX_REPORTED_TEXT_BYTES,
-        }
-    );
-    let rendered = error.to_string();
-    assert!(rendered.contains("reviewer"), "rendered {rendered}");
-    assert!(
-        rendered.contains(&MAX_REPORTED_TEXT_BYTES.to_string()),
-        "rendered {rendered}"
-    );
-    // The bound is named, the operator-authored text that broke it is not.
-    assert!(!rendered.contains("xxxx"), "rendered {rendered}");
-
-    let mut undeclared = inventory.clone();
-    undeclared.agents[0].capabilities[0].provider = "slack".parse().expect("valid provider");
-    assert_eq!(
-        undeclared
-            .validate()
-            .expect_err("a capability may not name an undeclared provider"),
-        InventoryError::UndeclaredProvider {
-            agent: "reviewer".parse().expect("valid agent"),
-            capability: "gh.pull-request.read".parse().expect("valid capability"),
-            provider: "slack".parse().expect("valid provider"),
-        }
-    );
-
-    let mut duplicated = inventory.clone();
-    duplicated.agents.push(inventory.agents[0].clone());
-    assert_eq!(
-        duplicated.validate().expect_err("duplicate agents fail"),
-        InventoryError::DuplicateAgent {
-            agent: "reviewer".parse().expect("valid agent"),
-        }
-    );
-
-    let mut providers = inventory;
-    providers.agents[0].providers = (0..=MAX_REPORTED_AGENT_PROVIDERS)
-        .map(|index| {
-            format!("gh{index}")
-                .parse()
-                .expect("generated provider identifier")
-        })
-        .collect();
-    assert_eq!(
-        providers
-            .validate()
-            .expect_err("a provider list past its bound fails"),
-        InventoryError::TooMany {
-            agent: "reviewer".parse().expect("valid agent"),
-            collection: "providers",
-            count: MAX_REPORTED_AGENT_PROVIDERS + 1,
-            maximum: MAX_REPORTED_AGENT_PROVIDERS,
-        }
-    );
-
-    assert_eq!(
-        ModelUsageReport::default()
-            .validate()
-            .expect_err("an empty delta fails"),
-        UsageReportError::ModelCalls {
-            count: 0,
-            maximum: MAX_REPORTED_MODEL_CALLS,
-        }
-    );
-    assert_eq!(
-        ModelUsageReport {
-            model_calls: 1,
-            output_unreported_calls: 2,
-            ..ModelUsageReport::default()
-        }
-        .validate()
-        .expect_err("more missing calls than calls fails"),
-        UsageReportError::UnreportedCalls {
-            field: "output",
-            count: 2,
-            calls: 1,
-        }
-    );
-    assert_eq!(
-        ModelUsageReport {
-            model_calls: 1,
-            input_tokens: MAX_REPORTED_TOKENS + 1,
-            ..ModelUsageReport::default()
-        }
-        .validate()
-        .expect_err("an oversized token count fails"),
-        UsageReportError::Tokens {
-            field: "input",
-            count: MAX_REPORTED_TOKENS + 1,
-            maximum: MAX_REPORTED_TOKENS,
-        }
-    );
 }
 
 /// One version identifier, three renderings, nothing keeping them equal but this.
@@ -1190,13 +998,6 @@ fn every_verb_is_one_operation_whatever_attestation_accompanies_it() {
             "recordDeliveredTurn",
             RequestEnvelope::record_delivered_turn(chat.bound_to(turn.id.clone()), turn),
         ),
-        (
-            "publishModelUsage",
-            RequestEnvelope::publish_model_usage(ModelUsageReport {
-                model_calls: 1,
-                ..ModelUsageReport::default()
-            }),
-        ),
     ] {
         let encoded = serde_json::to_value(&envelope).expect("envelope serializes");
         assert_eq!(
@@ -1227,7 +1028,7 @@ fn the_previous_protocol_version_and_its_retired_operation_tags_both_fail_to_dec
     assert!(
         serde_json::from_value::<ResponseEnvelope>(json!({
             "apiVersion": "dekopon.dev/broker/v1alpha1",
-            "response": {"type": "acknowledged"}
+            "response": {"type": "capabilities", "capabilities": [], "commandWords": []}
         }))
         .is_err()
     );
@@ -1410,7 +1211,7 @@ async fn a_run_command_exchange_decodes_a_rendered_answer() {
 
     use super::BrokerClient;
 
-    let directory = tempfile::tempdir().expect("create socket fixture directory");
+    let directory = private_socket_directory();
     let socket = directory.path().join("broker.sock");
     let listener = UnixListener::bind(&socket).expect("bind broker fixture");
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
@@ -1465,7 +1266,7 @@ async fn an_oversized_piped_value_is_refused_before_it_leaves_the_client() {
 
     use super::{BrokerClient, ClientError, ExchangePhase};
 
-    let directory = tempfile::tempdir().expect("create socket fixture directory");
+    let directory = private_socket_directory();
     let socket = directory.path().join("unread.sock");
     let listener = UnixListener::bind(&socket).expect("bind broker fixture");
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
@@ -1516,7 +1317,7 @@ async fn a_refused_attested_surface_is_a_stable_failure_rather_than_an_empty_ans
 
     use super::{BrokerClient, ClientError, ERROR_UNAUTHENTICATED};
 
-    let directory = tempfile::tempdir().expect("create socket fixture directory");
+    let directory = private_socket_directory();
     let socket = directory.path().join("broker.sock");
     let listener = UnixListener::bind(&socket).expect("bind broker fixture");
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))
@@ -1558,4 +1359,89 @@ async fn a_refused_attested_surface_is_a_stable_failure_rather_than_an_empty_ans
         panic!("expected a stable remote refusal, got {refused}");
     };
     assert_eq!(code, ERROR_UNAUTHENTICATED);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shared_socket_requires_protected_matching_parent_and_preserves_server_pinning() {
+    use super::{BrokerClient, ClientError, validate_socket_path};
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("broker.sock");
+    let listener = tokio::net::UnixListener::bind(&path).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660)).unwrap();
+    let uid = std::fs::metadata(&path).unwrap().uid();
+    for mode in [0o710, 0o750, 0o2710] {
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        validate_socket_path(&path, uid)
+            .await
+            .expect("protected shared socket");
+    }
+    for mode in [0o700, 0o740, 0o770, 0o711, 0o751, 0o1770] {
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(mode)).unwrap();
+        assert!(
+            matches!(
+                validate_socket_path(&path, uid).await,
+                Err(ClientError::UnsafeSocket)
+            ),
+            "parent {mode:o}"
+        );
+    }
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o710)).unwrap();
+    assert!(matches!(
+        validate_socket_path(&path, uid.wrapping_add(1)).await,
+        Err(ClientError::UnsafeSocket)
+    ));
+    let alias = directory.path().join("alias.sock");
+    std::os::unix::fs::symlink(&path, &alias).unwrap();
+    assert!(matches!(
+        validate_socket_path(&alias, uid).await,
+        Err(ClientError::UnsafeSocket)
+    ));
+    let parent_alias = directory.path().join("parent-alias");
+    std::os::unix::fs::symlink(directory.path(), &parent_alias).unwrap();
+    assert!(matches!(
+        validate_socket_path(&parent_alias.join("broker.sock"), uid).await,
+        Err(ClientError::UnsafeSocket)
+    ));
+
+    let limits = FrameLimits {
+        max_frame_bytes: 4096,
+        io_timeout: Duration::from_secs(1),
+    };
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = read_frame::<_, RequestEnvelope>(&mut stream, limits)
+            .await
+            .unwrap();
+        assert!(matches!(
+            request.request,
+            BrokerRequest::Capabilities { attestation: None }
+        ));
+        write_frame(
+            &mut stream,
+            &ResponseEnvelope::capabilities(Vec::new(), Vec::new()),
+            limits,
+        )
+        .await
+        .unwrap();
+    });
+    let client = BrokerClient::new(&path, uid, limits).unwrap();
+    assert!(
+        client
+            .capabilities()
+            .await
+            .expect("owner still connects to group socket")
+            .is_empty()
+    );
+    server.await.unwrap();
+}
+
+#[test]
+fn retired_reporting_operations_are_refused() {
+    for operation in ["publishAgentInventory", "publishModelUsage"] {
+        let value = json!({"apiVersion": PROTOCOL_VERSION, "request": {"operation": operation}});
+        assert!(serde_json::from_value::<RequestEnvelope>(value).is_err());
+    }
 }

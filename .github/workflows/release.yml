@@ -116,7 +116,7 @@ jobs:
           cache-workspace-crates: true
           cache-bin: false
       - name: Build CLIs
-        run: cargo build --release --locked -p dekopon -p dekopon-run -p dekopon-brokerd -p dekopond --target ${{ matrix.target }}
+        run: cargo build --release --locked -p dekopon-brokerd -p dekopond --target ${{ matrix.target }}
       - name: Fetch exact attested JSONPlaceholder provider release
         env:
           DEKOPON_VERIFY_PROVIDER_ATTESTATIONS: "1"
@@ -131,8 +131,6 @@ jobs:
           version="${RELEASE_TAG#v}"
           archive="dekopon-${version}-${{ matrix.target }}"
           mkdir -p "staging/$archive/providers"
-          cp "target/${{ matrix.target }}/release/dekopon" "staging/$archive/"
-          cp "target/${{ matrix.target }}/release/dekopon-run" "staging/$archive/"
           cp "target/${{ matrix.target }}/release/dekopon-brokerd" "staging/$archive/"
           cp "target/${{ matrix.target }}/release/dekopond" "staging/$archive/"
           cp README.md LICENSE-APACHE LICENSE-MIT "staging/$archive/"
@@ -289,7 +287,7 @@ jobs:
         run: |
           set -euo pipefail
           version=$(cargo metadata --no-deps --format-version 1 \
-            | jq -r '.packages[] | select(.name == "dekopon") | .version')
+            | jq -r '.packages[] | select(.name == "dekopond") | .version')
           publish() {
             crate="$1"
             status=$(curl --silent --show-error --retry 3 \

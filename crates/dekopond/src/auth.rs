@@ -17,8 +17,8 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::{
+    auth_result::{CommandResult, ModelAuthStatus},
     cli::{AuthCommand, ChatGptAuthCommand, ExportFormat},
-    command::{CommandResult, ModelAuthStatus},
 };
 
 /// Key the exported credential is stored under.
@@ -29,7 +29,7 @@ const SECRET_KEY: &str = "chatgpt-auth.json";
 
 /// Header carried by the Secret manifest, because the manifest outlives the terminal that warned.
 const MANIFEST_HEADER: &str = "\
-# Exported by `dekopon auth chatgpt export`. This manifest carries a live ChatGPT access token and
+# Exported by `dekopond auth chatgpt export`. This manifest carries a live ChatGPT access token and
 # a rotating refresh token; base64 here is Kubernetes' encoding for `data`, not encryption.
 #
 # The refresh token rotates: whichever process refreshes next invalidates this copy. Seed it once
@@ -45,8 +45,7 @@ pub enum AuthError {
     ChatGpt(#[from] ChatGptError),
     /// The caller did not acknowledge that the command prints credential material.
     ///
-    /// Clap makes this unreachable from a command line, but [`crate::run`] is a public entry point
-    /// that accepts a constructed [`crate::cli::Cli`], so the gate belongs in the code path too.
+    /// Clap enforces this on the command line; constructed commands must pass the same gate.
     #[error("refusing to print ChatGPT credentials without --expose-credential")]
     ExposeNotAcknowledged,
     /// Standard output is a terminal, which keeps the credential after the command exits.
@@ -227,5 +226,21 @@ mod tests {
     #[test]
     fn a_terminal_destination_is_allowed_explicitly() {
         assert!(guard_destination(true, true).is_ok());
+    }
+    #[test]
+    fn constructed_export_requires_acknowledgement_before_reading() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let missing = directory.path().join("missing.json");
+        let error = super::export(
+            Some(&missing),
+            crate::cli::ExportFormat::Raw,
+            "dekopon-chatgpt-auth",
+            None,
+            false,
+            true,
+        )
+        .expect_err("acknowledgement required");
+        assert!(matches!(error, AuthError::ExposeNotAcknowledged));
+        assert!(!missing.exists());
     }
 }

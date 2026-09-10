@@ -7,8 +7,9 @@ use dekopon_provider_sdk_testkit::{
     BrokerHostError, BrokerHostLimits, CommandRunOutcome, ContinuityPolicy, FakeBroker,
     FakeBrokerError, StorageAccess, StorageInterface, StorageLimits,
 };
-use dekopon_test_support::{provider_fixture, snapshot_tree};
+use dekopon_test_support::provider_fixture;
 use serde_json::{Value, json};
+use std::{fs, io, path::Path};
 
 fn record(id: &str, user: &str, assistant: &str) -> Value {
     json!({
@@ -54,7 +55,7 @@ async fn runs_a_storage_backed_component_against_a_real_storage_host() {
     assert_eq!(output.output["clocksCalled"], true);
     assert_eq!(output.output["entropyBytes"], 32);
     assert_eq!(output.output["identityNonzero"], true);
-    // Storage evidence exists because a transaction actually ran, which is the part a hand-written
+    // Storage evidence exists because real host calls ran, which is the part a hand-written
     // fake would have had to invent.
     let evidence = output
         .storage
@@ -67,7 +68,7 @@ async fn runs_a_storage_backed_component_against_a_real_storage_host() {
 ///
 /// Each invocation gets a fresh id and a freshly minted, separately consumed grant; only the scope
 /// material around them is held constant. That constancy is what makes the third call able to read
-/// what the first two committed, and it is the part a caller would otherwise have to know to
+/// what the first two wrote through completed host calls, and it is the part a caller would otherwise have to know to
 /// reproduce by hand.
 #[tokio::test(flavor = "multi_thread")]
 async fn successive_invocations_reach_one_durable_namespace() {
@@ -294,7 +295,11 @@ async fn a_builder_missing_its_component_or_provider_says_which() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_compile_cache_directory_is_written_and_reused() {
     let cache = tempfile::tempdir().expect("compile cache directory");
-    assert_eq!(files(cache.path()), 0, "the cache starts empty");
+    assert_eq!(
+        cache_files(cache.path()).expect("observe empty cache"),
+        0,
+        "the cache starts empty"
+    );
 
     for attempt in ["first", "second"] {
         let broker = FakeBroker::builder()
@@ -312,7 +317,7 @@ async fn a_compile_cache_directory_is_written_and_reused() {
     }
 
     assert!(
-        files(cache.path()) > 0,
+        cache_files(cache.path()).expect("observe populated cache") > 0,
         "loading the same component twice left the compile cache empty"
     );
 }
@@ -445,12 +450,145 @@ async fn a_narrowed_fuel_ceiling_stops_the_guest() {
     );
 }
 
-/// Counts every regular file under a directory, recursively.
-fn files(root: &std::path::Path) -> usize {
-    snapshot_tree(root)
-        .into_iter()
-        .filter(|entry| !entry.is_dir)
-        .count()
+/// Observe regular files, not a content snapshot: Wasmtime's detached cache worker
+/// atomically renames temporary stats files while the cache is being enumerated.
+/// Only an entry missing at metadata lookup is skipped; it contributes no file.
+/// Directory/enumeration errors (including a missing root) remain errors. Symlinks
+/// are not followed. This private fixture is not a containment snapshot.
+fn cache_files(root: &Path) -> io::Result<usize> {
+    cache_files_with_metadata(root, &mut |path| fs::symlink_metadata(path))
+}
+
+fn cache_files_with_metadata(
+    root: &Path,
+    metadata: &mut impl FnMut(&Path) -> io::Result<fs::Metadata>,
+) -> io::Result<usize> {
+    if !fs::symlink_metadata(root)?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "cache root is not a directory",
+        ));
+    }
+    let mut files = 0;
+    for entry in fs::read_dir(root)? {
+        let path = entry?.path();
+        let kind = match metadata(&path) {
+            Ok(metadata) => metadata.file_type(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if kind.is_file() {
+            files += 1;
+        } else if kind.is_dir() {
+            files += cache_files_with_metadata(&path, metadata)?;
+        }
+    }
+    Ok(files)
+}
+
+#[test]
+fn cache_observation_does_not_count_an_entry_renamed_after_enumeration() {
+    let cache = tempfile::tempdir().expect("cache");
+    let destination = tempfile::tempdir().expect("rename destination");
+    let temporary = cache.path().join("module.wip-atomic-write-stats");
+    fs::write(&temporary, b"stats").expect("temporary stats");
+    let mut observed = 0;
+    let count = cache_files_with_metadata(cache.path(), &mut |path| {
+        assert_eq!(path, temporary);
+        observed += 1;
+        fs::rename(path, destination.path().join("module.stats")).expect("atomic rename");
+        let result = fs::symlink_metadata(path);
+        // This is the precise syscall the old snapshot unconditionally expected
+        // to succeed. No claim is made about the original failure's filename.
+        assert_eq!(
+            result.as_ref().expect_err("old lookup fails").kind(),
+            io::ErrorKind::NotFound
+        );
+        result
+    })
+    .expect("a vanished entry is not a file");
+    assert_eq!(observed, 1, "the interleaving actually ran");
+    assert_eq!(count, 0, "no manufactured cache file");
+    assert_eq!(cache_files(destination.path()).expect("renamed file"), 1);
+}
+
+#[test]
+fn cache_observation_counts_only_regular_files_recursively() {
+    let cache = tempfile::tempdir().expect("cache");
+    assert_eq!(cache_files(cache.path()).expect("empty cache"), 0);
+    let nested = cache.path().join("nested");
+    fs::create_dir(&nested).expect("directory");
+    assert_eq!(cache_files(cache.path()).expect("directories only"), 0);
+    fs::write(nested.join("module"), b"compiled").expect("file");
+    assert_eq!(cache_files(cache.path()).expect("nested regular file"), 1);
+}
+
+#[test]
+fn cache_observation_propagates_missing_roots_and_metadata_errors() {
+    let cache = tempfile::tempdir().expect("cache");
+    assert_eq!(
+        cache_files(&cache.path().join("missing"))
+            .expect_err("missing root")
+            .kind(),
+        io::ErrorKind::NotFound
+    );
+    let file = cache.path().join("module");
+    fs::write(&file, b"compiled").expect("file");
+    assert_eq!(
+        cache_files(&file).expect_err("file root").kind(),
+        io::ErrorKind::InvalidInput
+    );
+    for kind in [io::ErrorKind::PermissionDenied, io::ErrorKind::Other] {
+        let error = cache_files_with_metadata(cache.path(), &mut |_| {
+            Err(io::Error::new(kind, "metadata control"))
+        })
+        .expect_err("unexpected errors must not become success");
+        assert_eq!(error.kind(), kind);
+        assert_eq!(error.to_string(), "metadata control");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_observation_neither_counts_nor_follows_symlinks() {
+    use std::os::unix::fs::symlink;
+    let cache = tempfile::tempdir().expect("cache");
+    let outside = tempfile::tempdir().expect("outside");
+    fs::write(outside.path().join("module"), b"compiled").expect("outside file");
+    symlink(outside.path(), cache.path().join("directory-link")).expect("directory symlink");
+    symlink(
+        outside.path().join("module"),
+        cache.path().join("file-link"),
+    )
+    .expect("file symlink");
+    symlink(
+        outside.path().join("missing"),
+        cache.path().join("dangling-link"),
+    )
+    .expect("dangling symlink");
+    assert_eq!(cache_files(cache.path()).expect("symlinks only"), 0);
+    assert_eq!(
+        cache_files(&cache.path().join("directory-link"))
+            .expect_err("symlink root")
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cache_observation_propagates_directory_permission_errors() {
+    use std::os::unix::fs::PermissionsExt;
+    let cache = tempfile::tempdir().expect("cache");
+    let nested = cache.path().join("unreadable");
+    fs::create_dir(&nested).expect("directory");
+    fs::set_permissions(&nested, fs::Permissions::from_mode(0o000)).expect("deny access");
+    let result = cache_files(cache.path());
+    fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).expect("restore access");
+    assert_eq!(
+        result.expect_err("unreadable directory").kind(),
+        io::ErrorKind::PermissionDenied
+    );
 }
 
 /// Counts namespace generations on disk: `<root>/namespaces/<namespace>/<generation>/`.

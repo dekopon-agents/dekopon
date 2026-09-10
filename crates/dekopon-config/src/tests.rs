@@ -176,7 +176,7 @@ fn rejects_unknown_fields() {
     assert!(error.to_string().contains("unknown field"));
 }
 
-/// The requirement the whole report shape exists for: one `dekopon validate` run, one fix pass.
+/// The requirement the whole report shape exists for: one catalog load, one fix pass.
 #[test]
 fn every_problem_in_a_catalog_is_reported_at_once() {
     let input = r#"apiVersion: dekopon.dev/v1alpha1

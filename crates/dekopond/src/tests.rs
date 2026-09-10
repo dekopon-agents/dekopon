@@ -36,7 +36,6 @@ use serde_json::{Value, json};
 use tokio::{net::UnixListener, sync::mpsc};
 
 use crate::{
-    agent_inventory,
     asset::{self, AssetAccess, AssetSourceRef, AssetStore, PendingAsset, SessionAssets},
     cache_key,
     config::{
@@ -1375,6 +1374,171 @@ async fn every_missing_transport_credential_is_named_before_anything_connects() 
 }
 
 #[tokio::test]
+async fn every_failing_transport_connection_is_named_in_one_refusal() {
+    let directory = temporary();
+    fs::write(
+        directory.path().join("dekopon.yaml"),
+        catalog_text(true, Some("reasoning")),
+    )
+    .expect("write catalog");
+    let (broker, mut observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let mut document = document(directory.path());
+    document["broker"]["serverUid"] = json!(broker.server_uid);
+    let paths = [
+        directory.path().join("first.sock"),
+        directory.path().join("second.sock"),
+    ];
+    for path in &paths {
+        fs::write(path, "not a socket").expect("write protected non-socket fixture");
+    }
+    document["transports"] = json!([
+        { "name": "first", "kind": "local", "socketPath": paths[0] },
+        { "name": "second", "kind": "local", "socketPath": paths[1] }
+    ]);
+    document["routes"][0]["transport"] = json!("first");
+    let path = write_config(directory.path(), &document);
+    let error = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::run(&path, std::future::pending()),
+    )
+    .await
+    .expect("startup is bounded")
+    .expect_err("both non-socket paths refuse transport startup");
+    let crate::DekopondError::TransportConnect { problems } = &error else {
+        panic!("expected aggregate connect refusal: {error:?}");
+    };
+    assert_eq!(problems.len(), 2);
+    let rendered = error.to_string();
+    for ((problem, name), path) in problems.iter().zip(["first", "second"]).zip(&paths) {
+        assert_eq!(problem.transport, name);
+        assert!(
+            matches!(&problem.source, TransportError::InsecureSocket { path: refused }
+            if refused == &path.display().to_string())
+        );
+        assert!(rendered.contains(&format!("chat transport {name} could not connect")));
+        assert!(
+            rendered.contains(&problem.source.to_string()),
+            "cause is rendered: {rendered}"
+        );
+        assert_eq!(
+            fs::read_to_string(path).expect("fixture survives"),
+            "not a socket"
+        );
+    }
+    assert!(observed.try_recv().is_ok(), "startup broker probe ran");
+    assert!(
+        observed.try_recv().is_err(),
+        "startup sends no retired report"
+    );
+}
+
+#[tokio::test]
+async fn aggregate_telegram_connect_failures_never_render_bot_tokens() {
+    use std::error::Error as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    // Both sentinels are synthetic. One peer closes before headers; the other truncates the body.
+    let tokens = [
+        "synthetic-telegram-token-first",
+        "synthetic-telegram-token-second",
+    ];
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback peer");
+    let endpoint = format!("http://{}", listener.local_addr().expect("bound address"));
+    let peer = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for token in tokens {
+                let (mut stream, _) = listener.accept().await.expect("accept getMe");
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert!(request.len() < 8192, "bounded request headers");
+                    request.push(stream.read_u8().await.expect("read request byte"));
+                }
+                assert!(
+                    String::from_utf8(request)
+                        .expect("ASCII headers")
+                        .starts_with(&format!("GET /bot{token}/getMe "))
+                );
+                if token == tokens[1] {
+                    stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{",
+                        )
+                        .await
+                        .expect("send truncated body");
+                }
+            }
+        })
+        .await
+        .expect("peer lifetime is bounded");
+    });
+    let mut problems = Vec::new();
+    for (name, token) in ["first-telegram", "second-telegram"]
+        .into_iter()
+        .zip(tokens)
+    {
+        let mut transport = crate::transport::telegram::TelegramTransport::new(
+            name.to_owned(),
+            endpoint.clone(),
+            token.to_owned(),
+            ActivityMode::Off,
+        )
+        .expect("build token-owning transport");
+        let source = tokio::time::timeout(Duration::from_secs(5), transport.connect())
+            .await
+            .expect("connect is bounded")
+            .expect_err("broken peer refuses startup");
+        let TransportError::Request(cause) = &source else {
+            panic!("expected typed request failure");
+        };
+        let request = cause
+            .downcast_ref::<reqwest::Error>()
+            .expect("reqwest cause preserved");
+        assert!(request.is_request() || request.is_body() || request.is_decode());
+        assert!(request.url().is_none(), "credential-bearing URL is removed");
+        assert!(
+            request.source().is_some(),
+            "underlying failure remains inspectable"
+        );
+        problems.push(crate::TransportConnectProblem {
+            transport: name.to_owned(),
+            source,
+        });
+    }
+    peer.await.expect("peer completed");
+    let error = crate::DekopondError::TransportConnect { problems };
+    for rendered in [
+        error.to_string(),
+        format!("{error:?}"),
+        dekopon_core::error_chain(&error).to_string(),
+    ] {
+        for token in tokens {
+            assert!(
+                !rendered.contains(token),
+                "bot token must never be rendered"
+            );
+        }
+        for name in ["first-telegram", "second-telegram"] {
+            assert!(
+                rendered.contains(name),
+                "both failing transports remain named"
+            );
+        }
+    }
+    let display = error.to_string();
+    assert_eq!(display.matches("chat service request failed").count(), 2);
+    assert!(
+        display.contains("error sending request"),
+        "send cause remains useful"
+    );
+    assert!(
+        display.contains("error decoding response body"),
+        "body cause remains useful"
+    );
+}
+
+#[tokio::test]
 async fn a_discord_transport_resolves_its_pinned_rest_endpoint() {
     let directory = temporary();
     let mut document = document(directory.path());
@@ -1500,84 +1664,6 @@ fn catalog(enabled: bool, model_class: Option<&str>) -> LocalCatalog {
         &catalog_text(enabled, model_class),
     )
     .expect("catalog fixture parses")
-}
-
-#[test]
-fn informational_inventory_omits_agent_instructions() {
-    let inventory = agent_inventory(&catalog(true, Some("reasoning")));
-
-    assert!(!inventory.truncated);
-    assert_eq!(inventory.agents.len(), 1);
-    assert_eq!(inventory.agents[0].id.as_str(), "reviewer");
-    assert_eq!(inventory.agents[0].description, "Reviews things");
-    assert_eq!(
-        inventory.agents[0].model_class.as_deref(),
-        Some("reasoning")
-    );
-    let encoded = serde_json::to_string(&inventory).expect("inventory serializes");
-    assert!(!encoded.contains("Answer briefly"), "{encoded}");
-    assert!(!encoded.contains("instructions"), "{encoded}");
-}
-
-#[tokio::test]
-async fn a_failed_report_names_a_category_and_names_a_timeout_apart_from_one() {
-    // Reporting is informational and never retried, so this line is the whole record of it. Without
-    // a category, "the web UI shows stale inventory" cannot be told apart from "the broker socket is
-    // gone", which is exactly the triage the report exists for.
-    use dekopon_broker_protocol::ClientError;
-
-    assert_eq!(crate::report_failure(Ok(Ok(()))), None);
-    assert_eq!(
-        crate::report_failure(Ok(Err(ClientError::UnsafeSocket))),
-        Some("unsafe-socket")
-    );
-    assert_eq!(
-        crate::report_failure(Ok(Err(ClientError::ServerIdentity {
-            expected: 501,
-            actual: 0
-        }))),
-        Some("server-identity")
-    );
-    let elapsed = tokio::time::timeout(Duration::ZERO, std::future::pending::<()>())
-        .await
-        .expect_err("a zero deadline elapses");
-    assert_eq!(
-        crate::report_failure(Err(elapsed)),
-        Some("timeout"),
-        "a broker that answered too slowly is not a broker that refused"
-    );
-}
-
-#[test]
-fn every_broker_client_failure_has_its_own_category() {
-    // A category is only triage if two different failures are two different values.
-    use dekopon_broker_protocol::ClientError;
-    use std::{collections::BTreeSet, io};
-
-    let categories = [
-        ClientError::SocketMetadata {
-            source: io::Error::from(io::ErrorKind::NotFound),
-        },
-        ClientError::UnsafeSocket,
-        ClientError::ConnectTimeout,
-        ClientError::Connect {
-            source: io::Error::from(io::ErrorKind::ConnectionRefused),
-        },
-        ClientError::PeerCredentials {
-            source: io::Error::from(io::ErrorKind::PermissionDenied),
-        },
-        ClientError::ServerIdentity {
-            expected: 501,
-            actual: 0,
-        },
-        ClientError::UnexpectedResponse,
-    ]
-    .iter()
-    .map(crate::client_error_category)
-    .collect::<BTreeSet<_>>();
-
-    assert_eq!(categories.len(), 7);
-    assert!(!categories.contains("timeout"), "{categories:?}");
 }
 
 async fn resolved(directory: &Path, document: &Value) -> crate::ResolvedConfig {
@@ -2736,7 +2822,6 @@ fn runner_tracking(
         activities: HashMap::new(),
         thread_ownership: HashMap::new(),
         active_sessions: Default::default(),
-        usage_reports: None,
     })
 }
 
@@ -2987,7 +3072,10 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
     let directory = temporary();
     let (broker, mut observed) = stub_broker(
         directory.path(),
-        vec![memory_surface_response(), ResponseEnvelope::acknowledged()],
+        vec![
+            memory_surface_response(),
+            ResponseEnvelope::invocation(record_result(InvocationOutcome::Succeeded, None)),
+        ],
     )
     .await;
     let models = ModelScript::new([decline_reply()]);
@@ -3367,7 +3455,10 @@ async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_te
     let directory = temporary();
     let (broker, mut observed) = stub_broker(
         directory.path(),
-        vec![memory_surface_response(), ResponseEnvelope::acknowledged()],
+        vec![
+            memory_surface_response(),
+            ResponseEnvelope::invocation(record_result(InvocationOutcome::Succeeded, None)),
+        ],
     )
     .await;
     let models = ModelScript::scripted([None]);
@@ -3394,7 +3485,10 @@ async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_te
     let directory = temporary();
     let (broker, mut observed) = stub_broker(
         directory.path(),
-        vec![memory_surface_response(), ResponseEnvelope::acknowledged()],
+        vec![
+            memory_surface_response(),
+            ResponseEnvelope::invocation(record_result(InvocationOutcome::Succeeded, None)),
+        ],
     )
     .await;
     let models = ModelScript::new([answer("one chunk lands and another fails")]);
@@ -4014,7 +4108,7 @@ async fn shared_scope_is_visible_in_effective_configuration_without_identity() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_session_reports_unreported_model_usage_without_delaying_the_answer() {
+async fn a_session_delivers_the_model_answer() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(
         directory.path(),
@@ -4026,14 +4120,8 @@ async fn a_session_reports_unreported_model_usage_without_delaying_the_answer() 
     .await;
     let models = ModelScript::new([answer("Done.")]);
     let replier = Arc::new(RecordingReplier::default());
-    let (usage, mut reports) = mpsc::channel(1);
-    let mut session_runner = runner(broker, models, 1);
-    Arc::get_mut(&mut session_runner)
-        .expect("fixture has one runner owner")
-        .usage_reports = Some(usage);
-
     run_session(
-        session_runner,
+        runner(broker, models, 1),
         route(model_config()),
         message("do it"),
         Arc::clone(&replier) as Arc<dyn ChatReplier>,
@@ -4041,12 +4129,6 @@ async fn a_session_reports_unreported_model_usage_without_delaying_the_answer() 
     .await;
 
     assert_eq!(replier.replies(), ["Done."]);
-    let report = reports.recv().await.expect("session emits usage");
-    assert_eq!(report.model_calls, 1);
-    assert_eq!(report.input_tokens, 0);
-    assert_eq!(report.input_unreported_calls, 1);
-    assert_eq!(report.output_unreported_calls, 1);
-    assert_eq!(report.total_unreported_calls, 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -7388,6 +7470,89 @@ async fn a_slack_answer_is_posted_as_a_markdown_block() {
     // The fallback a push notification shows, which is the one place blocks do not render.
     assert_eq!(body["text"], answer_text);
     assert_eq!(body["channel"], "d0123abc");
+}
+
+#[tokio::test]
+async fn a_slack_429_delays_the_identical_answer_once_without_reply_failure() {
+    use dekopon_test_support::CaptureLayer;
+    use tokio::io::AsyncWriteExt as _;
+    use tracing::instrument::WithSubscriber as _;
+    use tracing_subscriber::prelude::*;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("loopback Slack stand-in");
+    let endpoint = format!("http://{}", listener.local_addr().expect("bound address"));
+    let server = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(10), async move {
+            let mut requests = Vec::new();
+            let mut deliveries = 0;
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().await.expect("post connects");
+                let (path, _, body) = read_http_request_parts(&mut stream)
+                    .await
+                    .expect("complete post");
+                assert_eq!(path, "/api/chat.postMessage");
+                requests.push((body, Instant::now()));
+                let (status, headers, body) = if attempt == 0 {
+                    ("429 Too Many Requests", "Retry-After: 1\r\n", json!({"ok": false}))
+                } else {
+                    deliveries += 1;
+                    ("200 OK", "", json!({"ok": true, "channel": "C1", "ts": "1700000000.000100"}))
+                };
+                let body = body.to_string();
+                let response = format!(
+                    "HTTP/1.1 {status}\r\n{headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).await.expect("response writes");
+            }
+            (requests, deliveries)
+        }).await.expect("stand-in finishes within ten seconds")
+    });
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("echo.echo")],
+            Vec::new(),
+        )],
+    )
+    .await;
+    let models = ModelScript::new([answer("answer-payload-sentinel")]);
+    let mut inbound = message("question-payload-sentinel");
+    inbound.reply = ReplyTarget::Slack {
+        channel: "C1".into(),
+        thread_ts: Some("1700000000.000001".into()),
+    };
+    let capture = CaptureLayer::workspace();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        run_session(
+            runner(broker, models, 4),
+            route(model_config()),
+            inbound,
+            slack(&endpoint).replier(),
+        )
+        .with_subscriber(tracing_subscriber::registry().with(capture.clone())),
+    )
+    .await
+    .expect("session finishes within ten seconds");
+    let (requests, deliveries) = server.await.expect("stand-in joins");
+    assert_eq!(deliveries, 1);
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        requests[0].0, requests[1].0,
+        "retry preserves the whole post"
+    );
+    assert!(requests[1].1.duration_since(requests[0].1) >= Duration::from_secs(1));
+    let recorded = capture.text();
+    assert!(recorded.contains("outcome=\"answered\""), "{recorded}");
+    assert!(!recorded.contains("reply-failed"), "{recorded}");
+    assert_eq!(recorded.matches("gateway_reply_rate_limited").count(), 1);
+    assert!(recorded.contains("retry_after_seconds=1"), "{recorded}");
+    assert!(!recorded.contains("payload-sentinel"), "{recorded}");
+    assert!(!recorded.contains("bot-token"), "{recorded}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

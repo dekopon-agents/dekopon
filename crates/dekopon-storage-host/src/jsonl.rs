@@ -1,8 +1,8 @@
-//! Curated JSONL operations over the invocation overlay.
+//! Curated JSONL operations over the invocation namespace.
 
 use dekopon_capability::StorageInterface;
 
-use crate::{StorageHostError, StorageTransaction};
+use crate::{StorageHandle, StorageHostError};
 
 /// One bounded JSONL read.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -12,7 +12,7 @@ pub struct JsonlChunk {
     pub eof: bool,
 }
 
-impl StorageTransaction {
+impl StorageHandle {
     pub fn jsonl_size(&mut self, name: &str) -> Result<u64, StorageHostError> {
         self.require_jsonl()?;
         self.note_call()?;
@@ -47,23 +47,10 @@ impl StorageTransaction {
         )]
         let maximum = usize::try_from(u64::from(max_bytes).min(size - offset))
             .map_err(|_| StorageHostError::Arithmetic)?;
-        let bytes = if self.entries[&token].loaded {
-            let data = self.entries[&token]
-                .data
-                .as_ref()
-                .ok_or(StorageHostError::NotFound)?;
-            #[allow(
-                clippy::map_err_ignore,
-                reason = "TryFromIntError carries only out-of-range for a guest-supplied offset, \
-                          which InvalidArgument already states"
-            )]
-            let start = usize::try_from(offset).map_err(|_| StorageHostError::InvalidArgument)?;
-            data[start..start + maximum].to_vec()
-        } else {
-            self.namespace
-                .data_directory
-                .read_at(&token, offset, maximum)?
-        };
+        let bytes = self
+            .namespace
+            .data_directory
+            .read_at(&token, offset, maximum)?;
         let next_offset = offset
             .checked_add(bytes.len() as u64)
             .ok_or(StorageHostError::Arithmetic)?;
@@ -109,15 +96,19 @@ impl StorageTransaction {
         replacement.reserve(record.len().saturating_add(1));
         replacement.extend_from_slice(record);
         replacement.push(b'\n');
-        if let Err(error) = self.reserve_candidate(&[(&token, Some(replacement.as_slice()))]) {
-            replacement.truncate(current_size);
-            self.entries.get_mut(&token).expect("loaded entry").data =
-                was_present.then_some(replacement);
-            return Err(error);
-        }
+        let reserved = self.reserve_candidate(&[(&token, Some(replacement.as_slice()))]);
+        let planned = match reserved {
+            Ok(planned) => planned,
+            Err(error) => {
+                replacement.truncate(current_size);
+                self.entries.get_mut(&token).expect("loaded entry").data =
+                    was_present.then_some(replacement);
+                return Err(error);
+            }
+        };
+        self.write_direct(&token, Some(&replacement), planned)?;
         let entry = self.entries.get_mut(&token).expect("loaded entry");
         entry.data = Some(replacement);
-        entry.dirty = true;
         Ok(entry.data.as_ref().map_or(0, |bytes| bytes.len() as u64))
     }
 
@@ -141,10 +132,10 @@ impl StorageTransaction {
         if current_size != expected_size {
             return Err(StorageHostError::Busy);
         }
-        self.reserve_candidate(&[(&token, Some(contents))])?;
+        let planned = self.reserve_candidate(&[(&token, Some(contents))])?;
+        self.write_direct(&token, Some(contents), planned)?;
         let entry = self.entries.get_mut(&token).expect("loaded entry");
         entry.data = Some(contents.to_vec());
-        entry.dirty = true;
         Ok(())
     }
 

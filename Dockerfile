@@ -1,8 +1,8 @@
-# Dekopon container image: one image, all four binaries, assembled from a published release.
+# Dekopon container image: one image, both daemon binaries, assembled from a published release.
 #
 # Nothing is compiled here. `release.yml` already builds, checksums, and provenance-attests
 # `dekopon-<version>-<target>.tar.gz` for `x86_64-unknown-linux-gnu` and
-# `aarch64-unknown-linux-gnu`, each carrying all four executables. The image ships exactly those
+# `aarch64-unknown-linux-gnu`, each carrying both daemon executables. The image ships exactly those
 # bytes — the ones users download and can verify — rather than a second, independently compiled
 # set that merely ought to match. `ci/stage-image-context.sh` verifies each archive against its
 # `.sha256` sidecar and its attestation before extracting the executables into the context, and
@@ -13,14 +13,15 @@
 # Every instruction is a COPY, so BuildKit assembles both platforms on one runner with no
 # emulation and no per-architecture build.
 #
-# `dekopon-brokerd` and `dekopond` are separate processes but not separate deployments: the broker
-# socket is `0600`, authenticates its peer with `SO_PEERCRED`, and has no TCP transport, so a
-# gateway can only reach it through a shared filesystem namespace — in Kubernetes, a shared pod.
-# One image whose `command` selects the binary is what that deployment needs.
+# The chart runs broker UID 65532 and gateway UID 65533 in a shared pod, with IPC group 65534.
+# Its broker-owned IPC parent is 0710 and the group-reachable socket is 0660; peer UID mapping
+# authenticates callers, not group membership. Owner-only local chat sockets remain 0600.
+# See docs/security-model.md#current-local-process-boundary; private stores stay owner-only.
+# One image whose `command` selects the binary supports both processes without changing identity.
 #
 # This file expects a staged context and is not buildable from the repository root. The context is
 # constructed by `ci/stage-image-context.sh` rather than filtered out of a checkout: it contains
-# the Dockerfile, `dist/<arch>/` with the four executables from each release archive, `providers/`
+# the Dockerfile, `dist/<arch>/` with the two executables from each release archive, `providers/`
 # plus `optional-providers/` with checked-in components, and the two licences — nothing else, because nothing else was
 # put there. A `.dockerignore` denylist would have to keep excluding the rest of the repository
 # correctly forever; an allowlist is true by construction.
@@ -47,8 +48,6 @@ FROM gcr.io/distroless/cc-debian13:nonroot@sha256:c31ff9abcb1910f3ab25c7957bdaf0
 ARG TARGETARCH
 
 COPY --chmod=0755 \
-     dist/${TARGETARCH}/dekopon \
-     dist/${TARGETARCH}/dekopon-run \
      dist/${TARGETARCH}/dekopon-brokerd \
      dist/${TARGETARCH}/dekopond \
      /usr/local/bin/
@@ -84,10 +83,10 @@ WORKDIR /home/nonroot
 
 # No ENTRYPOINT on purpose. The command selects the binary, so `docker run <image> dekopond
 # --config ...` and a Kubernetes `command: ["dekopon-brokerd"]` both work without `--entrypoint`.
-CMD ["dekopon", "--help"]
+CMD ["dekopond", "--help"]
 
 LABEL org.opencontainers.image.title="dekopon" \
-      org.opencontainers.image.description="Dekopon operator CLI, runner, capability broker, and chat gateway" \
+      org.opencontainers.image.description="Dekopon capability broker and chat gateway with isolated model auth" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0" \
       org.opencontainers.image.source="https://github.com/dekopon-agents/dekopon" \
       org.opencontainers.image.url="https://github.com/dekopon-agents/dekopon" \

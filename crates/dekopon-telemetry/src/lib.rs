@@ -1,9 +1,9 @@
 //! Shared OTLP exporter construction and W3C trace context for Dekopon processes.
 //!
-//! Every exporting Dekopon process — the unprivileged runner, the privileged broker, and the chat
+//! Both exporting Dekopon daemons — the privileged broker and the unprivileged chat
 //! gateway — exports its own spans, so exporter construction lives here rather than in any one
 //! binary. The crate deliberately depends on no Dekopon crate: it must remain linkable from the
-//! runner without dragging broker code into the runner's dependency tree, which CI rejects.
+//! gateway without dragging broker code into the gateway's dependency tree, which CI rejects.
 //!
 //! # Authority
 //!
@@ -132,7 +132,7 @@ impl ExporterSettings {
             )));
         }
         // Ingest credentials belong in OTEL_EXPORTER_OTLP_HEADERS. Userinfo would put one in a
-        // parsed configuration value, exporter diagnostics, and the informational web UI.
+        // parsed configuration value or exporter diagnostics.
         let endpoint_authority = endpoint
             .split_once("://")
             .map_or(endpoint, |(_, rest)| rest)
@@ -616,7 +616,7 @@ mod tests {
     }
 
     /// A rebuilt parent must stay byte-identical and remote, or broker spans silently start a new
-    /// trace instead of joining the runner's.
+    /// trace instead of joining the gateway's.
     #[test]
     fn remote_context_preserves_identifiers_and_marks_them_remote() {
         let parts = TraceContextParts {

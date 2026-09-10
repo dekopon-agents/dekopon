@@ -1,9 +1,7 @@
 # dekopon-agent
 
-The reusable agent session layer shared by Dekopon's embedding binaries. `dekopon-run`
-drives one prompt session from a CLI; the `dekopond` daemon drives many from chat
-transports. Both consume the same pieces from this crate, so there is exactly one
-authoritative copy of each:
+The reusable agent session layer consumed by `dekopond` and external embeddings such as
+`dekopon-console`. This crate owns one authoritative copy of each shared piece:
 
 - `prompt::run_prompt` — the bounded model tool loop that always offers one sandboxed
   scripting tool (`bash`) instead of one tool per capability; embedders may additionally
@@ -59,7 +57,7 @@ authoritative copy of each:
 - `command_run_from_outcome` and `report_unobserved_command_run` — the one mapping from
   a provider's `CommandRunOutcome` onto the shell's `CommandRun`, and the one
   `agent.command.unobserved` record for a run whose caller was dropped, shared by the
-  broker leg here and the direct leg in `dekopon-run`.
+  broker leg and external embeddings.
 - `IdSequence` — collision-free trace and invocation identifiers under a caller-chosen
   session prefix.
 
@@ -76,7 +74,7 @@ result also lists the mounted skills under `skills` as `{name, description, reso
 names and resource paths, never the text, which `read_skill` already discloses on demand.
 
 `skills` mounts operator-authored reference material and discloses it progressively. The text is a
-`dekopon_config::Skill`, loaded and bounded by `dekopon-config` at catalog or command-line load
+`dekopon_config::Skill`, loaded and bounded by `dekopon-config` at catalog or embedder load
 time, so nothing in this crate opens a file. When at least one skill is mounted, a second system
 message follows the standing instructions: it begins `Skills mounted for this agent` and lists each
 skill as `- name: description` with the instruction to call `read_skill` before starting work a
@@ -110,47 +108,15 @@ with `session-limit`, and the session continues either way. Malformed JSON or a 
 the session as it does for every tool, and an object that is not the six-string-field shape ends
 it with `PromptError::InvalidSuggestion` (telemetry kind `invalid-suggestion`). Accepted notes
 arrive in `PromptOutcome.suggestions` as `improvement::ImprovementSuggestion` values, already
-written to telemetry; the copy is for an embedder that shows them to the operator directly, as
-the one-shot runner prints them to stderr. A suggestion is advisory by construction: no
+written to telemetry; the copy is for an embedder that shows them to the operator directly, without requiring telemetry to be their only presentation. A suggestion is advisory by construction: no
 instruction, skill, limit, or grant moves because a model asked. It is recorded, and a person
 decides.
-
-`replay` puts a recorded session to a model again with the operator's change applied and answers
-each script from the recording, so no capability runs and no effect happens.
-`replay::RecordedSession::from_records(trace_id, &[Value])` rebuilds one session from flattened
-log records: `agent.model.prompt` (the first turn's `full` transcript plus each later turn's
-`delta`), `agent.model.answer`, and `accounting.model.turn`, reading every attribute under either
-its dotted or underscored spelling and ignoring records of other traces. The result carries the
-leading `system` messages, the `history` exchanges ahead of the prompt, the `prompt`, every turn
-with its tool calls, their results, usage, and duration, and the final `answer`; it is also the
-JSON shape `dekopon-run session show --json` prints and `session replay --from-file` reads back.
-`replay::RecordingError` says why a set of records is not a session: `NoRecords`, `NoTranscript`
-(accounted turns but no transcript, because the session ran with payload telemetry off), or
-`Malformed`. `replay::list_sessions` groups `accounting.model.turn` records by trace into
-`SessionListing`s (`trace_id`, `service`, `started_us`, `ended_us`, `model_turns`,
-`total_tokens`, `failed`, `answered`), newest first; accounting fires in either payload mode, so a
-listing shows sessions no transcript was exported for, and only `from_records` says whether one can
-be replayed. `replay::replay(model, &recorded, ReplayInputs { system, skills,
-improvement_suggestions, live, limits })` replays the recorded system messages joined into one
-(unless `system` replaces them; a recorded skills listing is dropped whenever `skills` mounts
-anything, so the replay lists exactly what it can read, while with nothing mounted a recorded
-listing replays as text with no `read_skill` behind it), the whole recorded history, and the
-prompt, and answers each script the model writes with the first unconsumed recorded outcome of
-that exact text, rebuilt from the `[exit code: N]` trailer and spending none of the capability
-budget. The first script the recording never ran is the *divergence*: with `live: None` the
-replay stops there (`DivergenceHandling::Stopped`, which is not a failure); with a live
-`ScriptRuntime` the script runs on it (`Live`) and every turn after it is a new session. The
-`ReplayReport` carries `trace_id`, `recorded` and `replayed` summaries (`model_turns`, `scripts`,
-`answer`, `usage`), the `divergence` (`turn`, `script`, `unused_recorded_scripts`, `handling`),
-the replayed model's `suggestions`, and an `error` for any session failure other than a
-divergence stop. What replay cannot do is invent tool output: turns before the divergence are a
-faithful comparison, and turns after a live one are not.
 
 Nothing in this crate holds authority. The broker leg submits identity-free proposals
 over an authenticated Unix socket and reports back whatever the broker decided; this
 crate never interprets policy, resolves credentials, or constructs authorization state.
 It depends only on the client half of the broker protocol, never on broker internals —
-the same dependency discipline CI enforces for `dekopon-run`.
+the dependency discipline CI enforces for `dekopond`.
 
 Telemetry follows `docs/observability.md`: spans (`prompt.session`, `prompt.model_turn`,
 `prompt.script`, and `prompt.asset_fetch` and `prompt.image_generation` when an embedder supplies
@@ -177,3 +143,16 @@ invocation-bound chat surface. Only that leg can receive the broker-derived dura
 note or reach the memory retrieval routes. It still owns no storage grant or recording authority;
 the gateway performs the dedicated post-acceptance record request on a fresh client outside the
 model's capability seam.
+
+## Prompt and host bounds
+
+The `bash` tool requires an object carrying a string `script`; malformed arguments end the
+session rather than being guessed at. Its result is combined script output followed by an
+`[exit code: N]` trailer. `cap --list` and `cap --describe` discover the granted surface;
+provider-specific argument validation remains provider-owned.
+
+Each model turn admits at most ten tool calls, and the model-step limit bounds the session.
+The capability-call ceiling is spent across the whole session, not refreshed per script.
+Other interpreter ceilings apply per script, including steps, recursion, output, deadline,
+and cumulative materialized-value bytes. Model or embedder configuration never seeds the
+script's environment. See the [shell contract](../dekopon-shell/README.md).

@@ -5,33 +5,23 @@ Wasmtime-independent broker-owned storage engine for namespace-bound provider im
 The host derives opaque paths with domain-separated HMAC-SHA-256, retains directory descriptors for
 the complete tree, and performs opens, scans, creation, rename, and unlink relative to those
 descriptors with no-follow and identity/link checks. It keeps an exclusive root writer lock and a
-defined base-then-generation lease order, rebuilds logical quota accounting on startup, and commits
-write-capable invocation overlays through a versioned MACed manifest. A synchronized `commit`
-marker is the durable point: strictly recognized pre-marker transactions roll back; recognized
-post-marker transactions roll forward with bounded old/new identity checks. Every live failure
-from marker creation onward—including marker synchronization, apply, accounting, evidence, and
-atomic retirement—retains either roll-forward state or fully applied recognized trash, poisons the
-whole base scope, conservatively retains quota headroom, and is `outcome-unaudited` carrying the
-coarse class of the failure that ended finalization (`quota`, `timeout`, `corrupt`, `denied`, or
-`io`) — the outcome stays unknown, but which kind of thing made it unknown does not have to be. A retired
-committed transaction becomes ordinary GC-eligible trash only after scan, evidence, accounting, and
-a synchronized `finalized` publication; committed retired state without `finalized` is unknown by
-default even when every additional marker write failed. Bounded GC retains rotating directory
-streams so one unknown entry cannot starve later trash.
+defined base-then-generation lease order, and rebuilds logical quota accounting on startup.
+Each invocation uses a direct namespace/VFS handle. Each authorized write affects the live files
+at that host call; provider failure, trap, cancellation, or an invalid response does not undo
+completed writes. There is no invocation-wide atomicity, rollback, crash recovery, or automatic
+collection of inactive generations. Unknown retained layout entries are refused/quarantined.
 
 Accounting is logical rather than a physical-disk claim: apparent bytes plus 4096 bytes for every
-file, directory, manifest, marker, staging, trash, and quarantine entry. Namespace creation,
-unique replacement temporaries, exact serialized manifests, staging, and entry count are reserved
-atomically before mutation. The process ledger is rebuilt once at startup and then reconciled only
-by host-owned mutations, so a stale concurrent scan cannot lower it; failed cleanup retains its
-reservation. Sparse gaps, growing truncate, JSONL's host-added LF, and old/new replacement headroom
-consume write/quota budgets. Reservations are sized rather than hashed: a commitment is one fixed
-width, so the pre-mutation manifest is measured with a fixed-width placeholder that the manifest
-validator rejects, and the real content HMAC is computed once on the commit path over the real
-bytes. A positional write therefore reserves in proportion to its change set, never to the file it
-is appending to. Metadata-only size/stat calls do not load a whole file; retained native
-file bytes are independently bounded by the invocation read ceiling, and recovery hashes valid
-large targets/stages through a fixed-size streaming buffer rather than retaining them whole.
+file and directory, including quarantine and authority-pointer replacement temporaries. Namespace creation,
+authority-pointer replacement, live-file growth and entry count are reserved before mutation.
+The process ledger is rebuilt once at startup and updated by host-owned mutations; unreadable
+usage after a partial syscall failure retains conservative headroom. Sparse gaps, growing truncate,
+and JSONL's host-added LF consume write/quota budgets. Authority-pointer replacement and entry
+operations retain temporary headroom; direct JSONL replacement and positional writes reserve
+live-file growth, not a staged copy of the existing file. Metadata-only size/stat calls
+do not load a whole file; native reads remain bounded by invocation ceilings.
+`maxPendingTransactions` is the compatibility spelling for the bound on concurrently active
+invocation handles, not a transaction queue.
 
 ## Durable-files contract
 
@@ -81,16 +71,15 @@ not read a coarser guest lock surface as a compatibility failure.
 
 There is no SHM operation and no multiprocess-database claim. There is no WAL *implementation*
 either, but a single-instance WAL engine needs neither: its log is an ordinary durable file and its
-index lives in guest memory. The host commits the database and its log together in one invocation
-transaction, so there is no torn-WAL divergence to recover from.
+index lives in guest memory. Database and log writes are independent host calls. The host provides no atomic database/log
+commit or torn-WAL recovery guarantee; a failed invocation can leave partial database changes.
 
 ### Durability
 
-`data` records a data barrier; `data-and-metadata` additionally requires parent metadata; `full`
-asks for the strongest platform primitive. The invocation transaction delays all physical mutation
-until commit and then synchronizes every staging file, manifest, transaction directory, commit
-marker, target directory, and applied state. On platforms without a stronger primitive, `full`
-uses the same strongest `sync_all` primitive available to Rust.
+All sync modes synchronize the live file with `sync_all` and its parent directory.
+They do not create an invocation commit
+point or make a sequence of calls atomic. Applications must not infer crash durability or
+cross-file consistency from a successful invocation or sync request.
 
 ## Native I/O threat and timing limits
 
@@ -104,7 +93,7 @@ still exceed it.
 
 Retained directory descriptors, descriptor-relative no-follow operations, broker-derived opaque
 components, mode/owner/link checks, and before/after identity checks refuse ordinary corruption and
-unsafe layout. Base leases serialize pointers, lifecycle markers, grants, and GC; unique create-new
+unsafe layout. Base leases serialize authority pointers, grants, and invocation access; unique create-new
 temporaries cannot unlink one another. These controls do **not** claim protection from an actively
 malicious same-UID process racing filesystem mutation. Run the broker under a dedicated UID and
 mount boundary when that actor is in scope, and use a supported local filesystem with advisory

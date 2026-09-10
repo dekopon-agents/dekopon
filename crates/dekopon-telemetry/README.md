@@ -2,9 +2,9 @@
 
 Shared OTLP exporter construction and W3C trace context for Dekopon processes.
 
-`dekopon-run`, `dekopon-brokerd`, and `dekopond` each export their own spans, so exporter
+`dekopon-brokerd` and `dekopond` each export their own spans, so exporter
 construction lives here rather than being duplicated in each binary. The crate depends on no other Dekopon crate: it
-must stay linkable from the runner without pulling broker code into the runner's dependency tree,
+must stay linkable from the gateway without pulling broker code into the gateway's dependency tree,
 which CI rejects.
 
 ## Subscriber installation
@@ -14,8 +14,7 @@ stderr, filtered by `RUST_LOG` or by a fixed directive — then any process-spec
 OTLP span layer, then the OTLP log bridge, in that order so an entered span has already activated
 a context the log SDK can correlate against. It returns a `TelemetryGuard` whose `shutdown` flushes
 and stops both providers, reporting every failure rather than the first. What a caller does with
-that failure stays the caller's policy: the short-lived runner fails the command, and the daemons
-log and carry on.
+that failure stays the caller's policy: the daemons log and carry on.
 
 ## Transports
 
@@ -40,8 +39,7 @@ This crate configures transport and never resolves credentials. Ingest authentic
 the OpenTelemetry SDK from the standard `OTEL_EXPORTER_OTLP_HEADERS` environment variable, so a
 token is never accepted as a command-line argument, never written to a configuration file this
 crate parses, and never attached to a span attribute or log field. Endpoint URL userinfo is
-rejected; ingest credentials must use the standard header variables and are never exposed by the
-broker web UI.
+rejected; ingest credentials must use the standard header variables..
 
 ## Trace context
 

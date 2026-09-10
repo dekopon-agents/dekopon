@@ -315,12 +315,12 @@ requires the chart's broker-only copy step.
 
 One credential does not fit the pattern at all. The `chatgptSubscription` model kind's credential file holds a refresh token that **rotates**: each refresh invalidates its predecessor and the replacement is written back through a same-directory temporary file and an atomic rename. That needs a writable *directory*, not a writable file, and it means a read-only projected Secret breaks at the first refresh and presents an already-invalidated token on the next restart.
 
-The lifecycle it needs instead is seed-once: export a working local credential, store it in the vault, project it, copy it into a writable directory on first start only, and let refreshes persist there while the vault copy drifts out of date. `dekopon auth chatgpt export` and [`chatgpt-credential.md`](chatgpt-credential.md) are current; the chart implements the seed-once copy and an explicit destructive re-seed gate. Treat that document as the authority on the rotating credential rather than reasoning about it from this provider-storage section.
+The lifecycle it needs instead is seed-once: export a working local credential, store it in the vault, project it, copy it into a writable directory on first start only, and let refreshes persist there while the vault copy drifts out of date. `dekopond auth chatgpt export` and [`chatgpt-credential.md`](chatgpt-credential.md) are current; the chart implements the seed-once copy and an explicit destructive re-seed gate. Treat that document as the authority on the rotating credential rather than reasoning about it from this provider-storage section.
 
 ## Related documents
 
-- [`security-model.md`](security-model.md) — the trust boundaries the file hygiene above enforces, and what a single-UID deployment does and does not separate.
+- [`security-model.md`](security-model.md) — the trust boundaries the file hygiene above enforces, and the current distinct-UID deployment boundary.
 - [`../crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.md) — the configuration, credentials, and policy file contracts in full, including the credentials file this guide's Secret would eventually become.
 - [`dekopond.md`](dekopond.md) — the gateway's configuration, which names environment variables rather than secrets and so consumes an ESO-provisioned Secret differently from the broker.
-- [`broker-http.md`](broker-http.md) — how a resolved credential is bound to a destination and injected, once it exists as a file.
+- [`dekopon-brokerd` contract](../crates/dekopon-brokerd/README.md#boundaries) — how a resolved credential is bound to a destination and injected, once it exists as a file.
 - [`observability.md`](observability.md) — the other half of this cluster's deployment story, including the OpenObserve endpoint the same host serves.

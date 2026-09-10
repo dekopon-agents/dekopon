@@ -1,6 +1,5 @@
 [workspace]
 members = [
-    "crates/dekopon",
     "crates/dekopon-agent",
     "crates/dekopon-broker",
     "crates/dekopon-broker-host",
@@ -12,19 +11,16 @@ members = [
     "crates/dekopon-model",
     "crates/dekopon-http-host",
     "crates/dekopon-policy",
-    "crates/dekopon-provider-host",
     "crates/dekopon-provider-http",
     "crates/dekopon-provider-sdk",
     "crates/dekopon-provider-sdk-testkit",
     "crates/dekopon-provider-storage",
     "crates/dekopon-process",
     "crates/dekopon-protocol",
-    "crates/dekopon-run",
     "crates/dekopon-shell",
     "crates/dekopon-storage-host",
     "crates/dekopon-telemetry",
     "crates/dekopon-test-support",
-    "crates/dekopon-webui",
     "crates/dekopond",
 ]
 resolver = "3"
@@ -103,7 +99,6 @@ dekopon-core = { version = "0.12.0", path = "crates/dekopon-core", default-featu
 dekopon-http-host = { version = "0.12.0", path = "crates/dekopon-http-host" }
 dekopon-model = { version = "0.12.0", path = "crates/dekopon-model" }
 dekopon-policy = { version = "0.12.0", path = "crates/dekopon-policy" }
-dekopon-provider-host = { version = "0.12.0", path = "crates/dekopon-provider-host" }
 dekopon-provider-http = { version = "0.12.0", path = "crates/dekopon-provider-http" }
 dekopon-provider-sdk = { version = "0.12.0", path = "crates/dekopon-provider-sdk" }
 dekopon-provider-sdk-testkit = { version = "0.12.0", path = "crates/dekopon-provider-sdk-testkit" }
@@ -113,7 +108,6 @@ dekopon-protocol = { version = "0.12.0", path = "crates/dekopon-protocol", defau
 dekopon-shell = { version = "0.12.0", path = "crates/dekopon-shell" }
 dekopon-storage-host = { version = "0.12.0", path = "crates/dekopon-storage-host" }
 dekopon-telemetry = { version = "0.12.0", path = "crates/dekopon-telemetry" }
-dekopon-webui = { version = "0.12.0", path = "crates/dekopon-webui" }
 dekopond = { version = "0.12.0", path = "crates/dekopond" }
 
 [workspace.lints.rust]

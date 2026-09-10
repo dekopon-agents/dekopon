@@ -1,6 +1,6 @@
 //! The reusable agent session layer shared by Dekopon's embedding binaries.
 //!
-//! `dekopon-run` drives one prompt session from a CLI; `dekopond` drives many from chat transports. Both need the same four pieces, and this crate is where they live so there is one
+//! `dekopond` drives sessions from chat transports; external clients embed these same pieces. This crate is where they live so there is one
 //! authoritative copy:
 //!
 //! - [`prompt::run_prompt`] — the bounded model tool loop offering one sandboxed scripting tool,
@@ -60,7 +60,6 @@ use crate::{meta::EffectiveCapabilityView, prompt::ScriptRuntime};
 pub mod improvement;
 pub mod meta;
 pub mod prompt;
-pub mod replay;
 pub mod skills;
 
 /// Runs each model-authored script on the interpreter under this session's dispatch.
@@ -388,7 +387,7 @@ impl BrokerLeg {
     /// startup failure instead of a capability that inexplicably reports "command not found"
     /// halfway through a script a model already committed to.
     ///
-    /// `trace_prefix` names the embedding surface (for example `dekopon-run-prompt`) and becomes
+    /// `trace_prefix` names the embedding surface (for example `console-prompt`) and becomes
     /// the leading component of the session's trace and invocation identifiers, so every call a
     /// session made is recoverable from the broker's audit log by prefix.
     ///
@@ -448,7 +447,7 @@ impl BrokerLeg {
     ///
     /// A run in flight when `signal` is requested is aborted at its next await and joined before
     /// the leg answers the script with `session-cancelled`; the gateway fires it from a native
-    /// Stop. Without it a run is cancellable in contract only, which is what `dekopon-run` gets.
+    /// Stop. Without it a run is cancellable in contract only, as in an embedder that supplies no signal.
     #[must_use]
     pub fn with_cancel_signal(mut self, signal: CancelSignal) -> Self {
         self.cancel = signal;
@@ -1066,6 +1065,18 @@ mod tests {
             rustix::process::geteuid().as_raw()
         }
 
+        /// A socket parent the broker would bind under, which is what the client now demands.
+        ///
+        /// `dekopon_broker_protocol::secure_socket_parent` is consulted for every socket rather
+        /// than only shared ones, and `tempfile::tempdir` honours the umask — a world-traversable
+        /// fixture parent describes a deployment the broker itself refuses.
+        fn private_broker_directory() -> tempfile::TempDir {
+            let directory = tempfile::tempdir().expect("temporary broker directory");
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .expect("private broker directory");
+            directory
+        }
+
         fn result(outcome: InvocationOutcome, error: Option<&str>) -> InvocationResult {
             InvocationResult {
                 invocation: "invoke-stub".parse().expect("valid invocation fixture"),
@@ -1189,7 +1200,7 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_rendered_run_reaches_the_script_with_its_status() {
-            let directory = tempfile::tempdir().expect("temporary broker directory");
+            let directory = private_broker_directory();
             let rendered = CommandRunOutcome::Rendered {
                 stdout: "Usage: probe <COMMAND>\n".to_owned(),
                 stderr: String::new(),
@@ -1225,7 +1236,7 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn the_piped_value_travels_in_the_run_frame() {
-            let directory = tempfile::tempdir().expect("temporary broker directory");
+            let directory = private_broker_directory();
             let proposed = CommandRunOutcome::Proposed {
                 capability: "cli-probe.upper".parse().expect("valid capability fixture"),
                 input: json!({"text": "hello"}),
@@ -1260,7 +1271,7 @@ mod tests {
             // The broker has the request and is not answering. A gateway Stop must not leave the
             // script parked on it: the node is aborted and joined, and the script reads the same
             // refusal the capability path gives a cancelled session.
-            let directory = tempfile::tempdir().expect("temporary broker directory");
+            let directory = private_broker_directory();
             let (mut leg, mut observed, release) = stub_leg_parked(directory.path()).await;
             leg.command_words.insert("probe".to_owned());
             let (handle, signal) = CancelSignal::pair();
@@ -1283,7 +1294,7 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_transport_failure_names_its_cause_and_never_the_socket() {
-            let directory = tempfile::tempdir().expect("temporary broker directory");
+            let directory = private_broker_directory();
             let socket = directory.path().join("dekopon-secret-broker.sock");
             let mut leg = leg_for(&socket);
             leg.command_words.insert("probe".to_owned());
@@ -1301,7 +1312,7 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_word_no_provider_owns_never_reaches_the_broker() {
-            let directory = tempfile::tempdir().expect("temporary broker directory");
+            let directory = private_broker_directory();
             let leg = leg_for(&directory.path().join("absent.sock"));
 
             assert_eq!(run_word(leg, &["--help"], None).await, None);
@@ -1371,7 +1382,7 @@ mod tests {
             // The interpreter maps `Denied` to 126 and `Failed` to 1. A model that reads "policy
             // refused this" as "the call errored" will retry something it must not retry, so this
             // distinction has to survive the whole trip back.
-            let directory = tempfile::tempdir().expect("temporary broker directory");
+            let directory = private_broker_directory();
             let leg = stub_leg(
                 directory.path(),
                 vec![ResponseEnvelope::invocation(result(
@@ -1393,7 +1404,7 @@ mod tests {
         async fn an_unmapped_peer_is_a_denial_rather_than_an_infrastructure_failure() {
             // This refusal never reaches a decision record, so it arrives as a transport-level
             // code instead of a `Denied` outcome. It is still policy saying no.
-            let directory = tempfile::tempdir().expect("temporary broker directory");
+            let directory = private_broker_directory();
             let leg = stub_leg(
                 directory.path(),
                 vec![ResponseEnvelope::error(
@@ -1411,7 +1422,7 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_failed_invocation_carries_the_broker_reason_without_becoming_a_denial() {
-            let directory = tempfile::tempdir().expect("temporary broker directory");
+            let directory = private_broker_directory();
             let leg = stub_leg(
                 directory.path(),
                 vec![ResponseEnvelope::invocation(result(
@@ -1431,7 +1442,7 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_successful_invocation_hands_provider_output_to_the_script() {
-            let directory = tempfile::tempdir().expect("temporary broker directory");
+            let directory = private_broker_directory();
             let leg = stub_leg(
                 directory.path(),
                 vec![ResponseEnvelope::invocation(result(
@@ -1452,7 +1463,7 @@ mod tests {
             // The whole difference between the two legs is the frame, so assert on the frame. An
             // `invoke` here would be a gateway silently proposing as *itself*, which the broker
             // would answer under the daemon's own peer identity rather than the sender's.
-            let directory = tempfile::tempdir().expect("temporary broker directory");
+            let directory = private_broker_directory();
             let (leg, mut observed) = stub_leg_observing(
                 directory.path(),
                 vec![ResponseEnvelope::invocation(result(
@@ -1489,7 +1500,7 @@ mod tests {
             // A gateway whose grant does not cover this subject's namespace gets the same
             // transport-level code an unmapped peer gets. It is policy saying no, and a model that
             // reads it as "the call errored" will retry something it must not retry.
-            let directory = tempfile::tempdir().expect("temporary broker directory");
+            let directory = private_broker_directory();
             let (leg, _observed) = stub_leg_observing(
                 directory.path(),
                 vec![ResponseEnvelope::error(
@@ -1510,7 +1521,7 @@ mod tests {
         async fn a_direct_leg_still_proposes_without_any_identity_claim() {
             // The original behavior has to stay byte-for-byte: adding an attested mode must not
             // start attaching claims to sessions that never asked for one.
-            let directory = tempfile::tempdir().expect("temporary broker directory");
+            let directory = private_broker_directory();
             let (leg, mut observed) = stub_leg_observing(
                 directory.path(),
                 vec![ResponseEnvelope::invocation(result(
@@ -1537,7 +1548,7 @@ mod tests {
         async fn capabilities_outside_the_session_never_reach_the_broker() {
             // No stub server at all: if this dispatched, the call would fail against a missing
             // socket instead of reporting the capability as absent.
-            let directory = tempfile::tempdir().expect("temporary broker directory");
+            let directory = private_broker_directory();
             let leg = leg_for(&directory.path().join("absent.sock"));
 
             assert_eq!(
@@ -1551,7 +1562,7 @@ mod tests {
             // The interpreter refuses to read the process environment precisely so a script cannot
             // learn about its host. This is the one path that could hand `DEKOPON_BROKER_SOCKET`
             // straight back to a model inside an error string.
-            let directory = tempfile::tempdir().expect("temporary broker directory");
+            let directory = private_broker_directory();
             let socket = directory.path().join("dekopon-secret-broker.sock");
             let leg = leg_for(&socket);
 

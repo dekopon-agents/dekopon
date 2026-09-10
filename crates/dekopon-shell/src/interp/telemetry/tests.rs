@@ -429,9 +429,8 @@ fn xargs_records_every_command_it_actually_drove() {
 #[test]
 fn command_spans_nest_under_the_callers_active_span() {
     let _serialized = serialized();
-    // `dekopon-run` enters `prompt.script` (or `runner.shell`) and calls straight into the
-    // interpreter on the same thread, so nesting should need no propagation code at all. This
-    // pins that; `crates/dekopon-run/src/prompt.rs` pins it again across a real `spawn_blocking`.
+    // An embedder enters its parent span and calls the interpreter on the same thread;
+    // nesting needs no propagation code. This pins that shared interpreter contract.
     let telemetry = capture_with("echo hi", Limits::default(), true);
 
     let span = telemetry

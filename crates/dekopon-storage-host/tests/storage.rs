@@ -530,12 +530,11 @@ fn root_initialization_quota_denial_creates_no_layout_entry() {
     let parent = root.parent().expect("root parent");
     let before = tree_snapshot(parent);
     let limits = StorageLimits {
-        max_root_bytes: 6 * 4_096,
+        max_root_bytes: 4 * 4_096,
         max_namespace_bytes: 16 * 1024,
         max_file_bytes: 1,
         max_files_per_namespace: 1,
         startup_max_entries: 9,
-        gc_max_bytes_per_pass: 6 * 4_096,
         ..StorageLimits::default()
     };
     assert!(matches!(
@@ -550,7 +549,8 @@ fn root_initialization_quota_denial_creates_no_layout_entry() {
 fn namespace_housekeeping_quota_denial_precedes_every_mutation() {
     let (_temporary, root, key) = fixture();
     let limits = StorageLimits {
-        max_namespace_bytes: 4 * 4_096,
+        // Generation directory, data directory and lease: one byte below their live peak.
+        max_namespace_bytes: 3 * 4_096 - 1,
         max_file_bytes: 1,
         ..StorageLimits::default()
     };
@@ -1133,7 +1133,6 @@ fn concurrent_namespace_cap_is_atomic_and_a_denial_mutates_nothing() {
     let (_temporary, root, key) = fixture();
     let limits = StorageLimits {
         max_namespaces: 1,
-        gc_max_namespaces_per_pass: 1,
         ..StorageLimits::default()
     };
     let host = Arc::new(StorageHost::open(&root, &key, limits).expect("host"));
@@ -1219,7 +1218,6 @@ fn concurrent_root_byte_and_entry_caps_are_exact_and_denials_are_byte_identical(
     let limits = StorageLimits {
         max_root_bytes: exact.0,
         startup_max_entries: exact.1,
-        gc_max_bytes_per_pass: exact.0,
         ..seed_limits
     };
     let host = Arc::new(StorageHost::open(&root, &key, limits).expect("exact-cap host"));
@@ -1274,173 +1272,9 @@ fn concurrent_root_byte_and_entry_caps_are_exact_and_denials_are_byte_identical(
 }
 
 #[test]
-fn gc_trash_cleanup_never_exceeds_its_per_pass_entry_bound() {
+fn stable_reactivation_survives_restart() {
     let (_temporary, root, key) = fixture();
     let limits = StorageLimits {
-        gc_max_namespaces_per_pass: 1,
-        ..StorageLimits::default()
-    };
-    let host = StorageHost::open(&root, &key, limits.clone()).expect("host");
-    drop(host);
-    for name in ["stale-a", "stale-b", "stale-c"] {
-        let path = root.join("trash").join(name);
-        fs::create_dir(&path).expect("trash directory");
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("trash mode");
-    }
-    let host = StorageHost::open(&root, &key, limits).expect("reopen with accounted trash");
-    let report = host.gc_once().expect("bounded GC");
-    assert_eq!(report.namespaces_removed, 1);
-    assert_eq!(
-        fs::read_dir(root.join("trash"))
-            .expect("remaining trash")
-            .count(),
-        2
-    );
-}
-
-#[test]
-fn gc_rotating_trash_cursor_cannot_be_starved_by_retained_unknown_state() {
-    let (_temporary, root, key) = fixture();
-    let limits = StorageLimits {
-        gc_max_namespaces_per_pass: 1,
-        ..StorageLimits::default()
-    };
-    let host = StorageHost::open(&root, &key, limits).expect("host");
-    let unknown = root
-        .join("trash")
-        .join(format!("transaction-{}", "a".repeat(64)));
-    fs::create_dir(&unknown).expect("unknown transaction");
-    fs::set_permissions(&unknown, fs::Permissions::from_mode(0o700)).expect("unknown mode");
-    let commit = unknown.join("commit");
-    fs::write(&commit, b"").expect("commit marker");
-    fs::set_permissions(&commit, fs::Permissions::from_mode(0o600)).expect("commit mode");
-    for name in ["stale-a", "stale-b"] {
-        let path = root.join("trash").join(name);
-        fs::create_dir(&path).expect("stale trash");
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("stale mode");
-    }
-
-    for _ in 0..4 {
-        let report = host.gc_once().expect("rotating bounded GC");
-        assert!(report.namespaces_removed <= 1);
-    }
-    assert!(unknown.exists(), "unknown outcome evidence was deleted");
-    assert!(!root.join("trash/stale-a").exists());
-    assert!(!root.join("trash/stale-b").exists());
-}
-
-#[test]
-fn later_generic_base_trash_cleanup_reclaims_the_namespace_slot() {
-    let (_temporary, root, key) = fixture();
-    let limits = StorageLimits {
-        max_namespaces: 1,
-        gc_max_namespaces_per_pass: 1,
-        ..StorageLimits::default()
-    };
-    let host = StorageHost::open(&root, &key, limits.clone()).expect("host");
-    drop(
-        host.grant(scoped_request(
-            b"authority",
-            ContinuityPolicy::Stable,
-            "trash-slot-first",
-            StorageAccess::ReadOnly,
-            "slack.t0123abc.uone",
-        ))
-        .expect("first namespace"),
-    );
-    let base = fs::read_dir(root.join("namespaces"))
-        .expect("namespaces")
-        .next()
-        .expect("base")
-        .expect("base entry");
-    let token = base.file_name().to_string_lossy().into_owned();
-    fs::rename(
-        base.path(),
-        root.join("trash").join(format!("base-{token}")),
-    )
-    .expect("simulate interrupted post-rename cleanup");
-    drop(host);
-    let host = StorageHost::open(&root, &key, limits).expect("restart with base trash");
-    assert!(matches!(
-        host.grant(scoped_request(
-            b"authority",
-            ContinuityPolicy::Stable,
-            "trash-slot-still-retained",
-            StorageAccess::ReadOnly,
-            "slack.t0123abc.utwo",
-        )),
-        Err(StorageHostError::QuotaExceeded)
-    ));
-    host.gc_once().expect("generic trash cleanup");
-    drop(
-        host.grant(scoped_request(
-            b"authority",
-            ContinuityPolicy::Stable,
-            "trash-slot-second",
-            StorageAccess::ReadOnly,
-            "slack.t0123abc.utwo",
-        ))
-        .expect("generic cleanup reclaimed slot"),
-    );
-}
-
-#[test]
-fn gc_removes_an_inactive_base_and_reclaims_its_namespace_slot() {
-    let (_temporary, root, key) = fixture();
-    let limits = StorageLimits {
-        max_namespaces: 1,
-        gc_max_namespaces_per_pass: 1,
-        retired_generation_grace_ms: 1,
-        retired_generation_ttl_ms: 1,
-        inactive_namespace_ttl_ms: 1,
-        ..StorageLimits::default()
-    };
-    let host = StorageHost::open(&root, &key, limits).expect("host");
-    let first = host
-        .grant(scoped_request(
-            b"authority",
-            ContinuityPolicy::AuthorityBound,
-            "gc-first",
-            StorageAccess::ReadOnly,
-            "slack.t0123abc.uone",
-        ))
-        .expect("first grant");
-    host.begin(first)
-        .expect("first transaction")
-        .finish_read()
-        .expect("finish");
-    thread::sleep(std::time::Duration::from_millis(5));
-    let report = host.gc_once().expect("gc");
-    assert_eq!(report.namespaces_removed, 1);
-    assert_eq!(
-        fs::read_dir(root.join("namespaces"))
-            .expect("namespaces")
-            .count(),
-        0
-    );
-    let second = host
-        .grant(scoped_request(
-            b"authority",
-            ContinuityPolicy::AuthorityBound,
-            "gc-second",
-            StorageAccess::ReadOnly,
-            "slack.t0123abc.utwo",
-        ))
-        .expect("slot was reclaimed");
-    host.begin(second)
-        .expect("second transaction")
-        .finish_read()
-        .expect("finish second");
-}
-
-#[test]
-fn stable_reactivation_clears_retirement_and_survives_gc_and_restart() {
-    let (_temporary, root, key) = fixture();
-    let limits = StorageLimits {
-        retired_generation_grace_ms: 1,
-        retired_generation_ttl_ms: 1,
-        inactive_namespace_ttl_ms: 60_000,
-        gc_max_namespaces_per_pass: 8,
         ..StorageLimits::default()
     };
     let host = StorageHost::open(&root, &key, limits.clone()).expect("host");
@@ -1481,7 +1315,6 @@ fn stable_reactivation_clears_retirement_and_survives_gc_and_restart() {
         .expect("reactivated read");
 
     thread::sleep(std::time::Duration::from_millis(5));
-    host.gc_once().expect("bounded GC");
     let reader = host
         .grant(request(
             b"authority-d",
@@ -1507,43 +1340,6 @@ fn stable_reactivation_clears_retirement_and_survives_gc_and_restart() {
     let mut reader = host.begin(reader).expect("restart reader");
     assert_eq!(reader.jsonl_size("turns.jsonl").expect("stable data"), 16);
     reader.finish_read().expect("finish restart reader");
-}
-
-#[test]
-fn gc_cannot_unlink_a_base_from_an_already_granted_transaction() {
-    let (_temporary, root, key) = fixture();
-    let limits = StorageLimits {
-        retired_generation_grace_ms: 1,
-        retired_generation_ttl_ms: 1,
-        inactive_namespace_ttl_ms: 1,
-        ..StorageLimits::default()
-    };
-    let host = StorageHost::open(&root, &key, limits).expect("host");
-    let held = host
-        .grant(scoped_request(
-            b"authority",
-            ContinuityPolicy::AuthorityBound,
-            "gc-held-grant",
-            StorageAccess::ReadOnly,
-            "slack.t0123abc.uone",
-        ))
-        .expect("held grant");
-    thread::sleep(std::time::Duration::from_millis(5));
-    assert_eq!(
-        host.gc_once().expect("active base is skipped"),
-        dekopon_storage_host::GcReport::default()
-    );
-    host.begin(held)
-        .expect("granted base remains linked")
-        .finish_read()
-        .expect("finish held transaction");
-    thread::sleep(std::time::Duration::from_millis(5));
-    assert_eq!(
-        host.gc_once()
-            .expect("inactive base collects")
-            .namespaces_removed,
-        1
-    );
 }
 
 #[test]
@@ -1818,7 +1614,6 @@ fn quarantined_wrong_mode_directories_retain_their_complete_quota_charge() {
         max_namespace_bytes: 32 * 1024,
         max_file_bytes: 1,
         max_files_per_namespace: 1,
-        gc_max_bytes_per_pass: bytes - 1,
         ..StorageLimits::default()
     };
     assert!(matches!(
@@ -1835,71 +1630,11 @@ fn quarantined_wrong_mode_directories_retain_their_complete_quota_charge() {
 }
 
 #[test]
-fn key_symlinks_and_unknown_transaction_states_fail_closed() {
+fn key_symlinks_fail_closed() {
     let (_temporary, root, key) = fixture();
     let key_link = key.with_file_name("key-link.yaml");
     symlink(&key, &key_link).expect("key symlink");
     assert!(StorageHost::open(&root, &key_link, StorageLimits::default()).is_err());
-
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
-    drop(host);
-    let transaction = root.join("transactions").join("a".repeat(64));
-    fs::create_dir(&transaction).expect("transaction directory");
-    fs::set_permissions(&transaction, fs::Permissions::from_mode(0o700)).expect("transaction mode");
-    let unknown = transaction.join("unknown");
-    fs::write(&unknown, b"unknown").expect("unknown state");
-    fs::set_permissions(&unknown, fs::Permissions::from_mode(0o600)).expect("unknown mode");
-    assert!(matches!(
-        StorageHost::open(&root, &key, StorageLimits::default()),
-        Err(StorageHostError::Corrupt { .. })
-    ));
-}
-
-#[test]
-fn recovery_markers_reject_symlink_and_hardlink_substitution() {
-    for kind in ["symlink", "hardlink"] {
-        let (temporary, root, key) = fixture();
-        let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
-        drop(host);
-        let transaction = root.join("transactions").join("d".repeat(64));
-        fs::create_dir(&transaction).expect("transaction directory");
-        fs::set_permissions(&transaction, fs::Permissions::from_mode(0o700))
-            .expect("transaction mode");
-        let external = temporary.path().join(format!("marker-{kind}"));
-        fs::write(&external, b"").expect("external marker");
-        fs::set_permissions(&external, fs::Permissions::from_mode(0o600)).expect("marker mode");
-        match kind {
-            "symlink" => symlink(&external, transaction.join("commit")).expect("marker symlink"),
-            "hardlink" => {
-                fs::hard_link(&external, transaction.join("commit")).expect("marker hardlink")
-            }
-            _ => unreachable!(),
-        }
-        assert!(matches!(
-            StorageHost::open(&root, &key, StorageLimits::default()),
-            Err(StorageHostError::Corrupt { .. })
-        ));
-    }
-}
-
-#[test]
-fn an_incomplete_pending_manifest_is_a_recognized_pre_marker_rollback() {
-    let (_temporary, root, key) = fixture();
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
-    drop(host);
-
-    let token = "b".repeat(64);
-    let transaction = root.join("transactions").join(&token);
-    fs::create_dir(&transaction).expect("transaction directory");
-    fs::set_permissions(&transaction, fs::Permissions::from_mode(0o700)).expect("transaction mode");
-    let pending = transaction.join("manifest.pending");
-    fs::write(&pending, b"{\"partial\":").expect("partial pending manifest");
-    fs::set_permissions(&pending, fs::Permissions::from_mode(0o600)).expect("pending mode");
-
-    let reopened = StorageHost::open(&root, &key, StorageLimits::default())
-        .expect("pre-marker recovery rolls back");
-    assert!(!root.join("transactions").join(token).exists());
-    drop(reopened);
 }
 
 #[test]
@@ -1908,7 +1643,7 @@ fn initialized_root_never_recreates_missing_layout_entries_or_accepts_unknown_on
     let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
     drop(host);
 
-    fs::remove_dir(root.join("transactions")).expect("remove required directory");
+    fs::remove_dir(root.join("namespaces")).expect("remove required directory");
     let before = tree_snapshot(&root);
     assert!(matches!(
         StorageHost::open(&root, &key, StorageLimits::default()),
@@ -1920,9 +1655,9 @@ fn initialized_root_never_recreates_missing_layout_entries_or_accepts_unknown_on
         "startup must not repair data loss"
     );
 
-    fs::create_dir(root.join("transactions")).expect("restore required directory");
-    fs::set_permissions(root.join("transactions"), fs::Permissions::from_mode(0o700))
-        .expect("transaction directory mode");
+    fs::create_dir(root.join("namespaces")).expect("restore required directory");
+    fs::set_permissions(root.join("namespaces"), fs::Permissions::from_mode(0o700))
+        .expect("namespace directory mode");
     let unknown = root.join("unknown-root-entry");
     fs::write(&unknown, b"unknown").expect("write unknown root entry");
     fs::set_permissions(&unknown, fs::Permissions::from_mode(0o600)).expect("unknown mode");
@@ -1953,4 +1688,305 @@ fn logical_tree_usage(root: &Path) -> (u64, u64) {
         .map(|entry| 4_096 + if entry.is_dir { 0 } else { entry.len })
         .sum();
     (bytes, entries.len() as u64)
+}
+
+#[test]
+fn empty_positional_growth_matches_live_reads_stat_and_reopen() {
+    let (_temporary, root, key) = fixture();
+    let limits = StorageLimits {
+        max_file_bytes: 8,
+        ..StorageLimits::default()
+    };
+    let host = StorageHost::open(&root, &key, limits).expect("host");
+    let mut writer = host
+        .begin(
+            host.grant(vfs_request("empty-growth", StorageAccess::ReadWrite))
+                .expect("grant"),
+        )
+        .expect("writer");
+    let handle = writer
+        .vfs_open(
+            "main.db",
+            OpenOptions {
+                read: true,
+                write: true,
+                create: true,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("open");
+    writer
+        .vfs_write_at(handle, 8, b"")
+        .expect("empty sparse growth");
+    assert_eq!(writer.vfs_size(handle).expect("size"), 8);
+    assert_eq!(
+        writer
+            .vfs_stat("main.db")
+            .expect("stat")
+            .expect("file")
+            .size,
+        8
+    );
+    assert_eq!(
+        writer.vfs_read_at(handle, 0, 8).expect("live zeros"),
+        vec![0; 8]
+    );
+    let before = tree_snapshot(&root);
+    assert!(matches!(
+        writer.vfs_write_at(handle, 9, b""),
+        Err(StorageHostError::QuotaExceeded)
+    ));
+    assert_eq!(tree_snapshot(&root), before);
+    writer.abort();
+    let mut reader = host
+        .begin(
+            host.grant(vfs_request("empty-reopen", StorageAccess::ReadOnly))
+                .expect("grant"),
+        )
+        .expect("reader");
+    let handle = reader
+        .vfs_open(
+            "main.db",
+            OpenOptions {
+                read: true,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("reopen");
+    assert_eq!(reader.vfs_size(handle).expect("reopened size"), 8);
+    assert_eq!(
+        reader
+            .vfs_stat("main.db")
+            .expect("stat")
+            .expect("file")
+            .size,
+        8
+    );
+    assert_eq!(
+        reader.vfs_read_at(handle, 0, 8).expect("reopened zeros"),
+        vec![0; 8]
+    );
+    reader.vfs_close(handle).expect("close reopened handle");
+    reader.finish_read().expect("finish");
+}
+
+#[test]
+fn retired_poison_markers_are_quarantined_with_data_and_quota_preserved() {
+    for generation_level in [false, true] {
+        let (_temporary, root, key) = fixture();
+        let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
+        let grant = |subject, invocation, access| {
+            scoped_request(
+                b"authority",
+                ContinuityPolicy::Stable,
+                invocation,
+                access,
+                subject,
+            )
+        };
+        let mut first = host
+            .begin(
+                host.grant(grant(
+                    "slack.t0123abc.uone",
+                    "poison-first",
+                    StorageAccess::ReadWrite,
+                ))
+                .expect("grant"),
+            )
+            .expect("first");
+        first.jsonl_append("turns.jsonl", 0, b"1").expect("data");
+        first.commit().expect("finish");
+        let base = fs::read_dir(root.join("namespaces"))
+            .expect("bases")
+            .next()
+            .expect("base")
+            .expect("entry")
+            .path();
+        let mut healthy = host
+            .begin(
+                host.grant(grant(
+                    "slack.t0123abc.utwo",
+                    "poison-neighbor",
+                    StorageAccess::ReadWrite,
+                ))
+                .expect("grant"),
+            )
+            .expect("neighbor");
+        healthy
+            .jsonl_append("turns.jsonl", 0, b"2")
+            .expect("healthy data");
+        healthy.commit().expect("finish");
+        drop(host);
+        let marker_parent = if generation_level {
+            fs::read_dir(&base)
+                .expect("base entries")
+                .map(|entry| entry.expect("entry").path())
+                .find(|path| path.is_dir())
+                .expect("generation")
+        } else {
+            base.clone()
+        };
+        let marker = marker_parent.join("poisoned");
+        fs::write(&marker, b"").expect("retired marker");
+        fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).expect("private marker");
+        let before = tree_snapshot(&base);
+        let usage = logical_tree_usage(&root);
+        let host =
+            StorageHost::open(&root, &key, StorageLimits::default()).expect("quarantine and open");
+        let quarantined = root
+            .join("quarantine")
+            .join(base.file_name().expect("token"));
+        assert!(!base.exists());
+        assert_eq!(tree_snapshot(&quarantined), before);
+        assert_eq!(logical_tree_usage(&root), usage);
+        assert!(matches!(
+            host.grant(grant(
+                "slack.t0123abc.uone",
+                "poison-refused",
+                StorageAccess::ReadOnly
+            )),
+            Err(StorageHostError::Corrupt { .. })
+        ));
+        let mut healthy = host
+            .begin(
+                host.grant(grant(
+                    "slack.t0123abc.utwo",
+                    "poison-healthy-read",
+                    StorageAccess::ReadOnly,
+                ))
+                .expect("healthy grant"),
+            )
+            .expect("healthy reader");
+        assert_eq!(
+            healthy
+                .jsonl_read_chunk("turns.jsonl", 0, 16)
+                .expect("healthy read")
+                .bytes,
+            b"2\n"
+        );
+        healthy.finish_read().expect("finish");
+        drop(host);
+        let limits = StorageLimits {
+            max_root_bytes: usage.0 - 1,
+            max_namespace_bytes: 3 * 4096,
+            max_file_bytes: 1,
+            max_files_per_namespace: 1,
+            ..StorageLimits::default()
+        };
+        assert!(matches!(
+            StorageHost::open(&root, &key, limits),
+            Err(StorageHostError::QuotaExceeded)
+        ));
+        assert_eq!(tree_snapshot(&quarantined), before);
+    }
+}
+
+#[test]
+fn b1_original_load_budget_and_write_growth_are_independent() {
+    let (_temporary, root, key) = fixture();
+    let storage = StorageHost::open(&root, &key, StorageLimits::default()).expect("seed host");
+    let grant = storage
+        .grant(request(
+            b"b1",
+            ContinuityPolicy::Stable,
+            "b1-seed",
+            StorageAccess::ReadWrite,
+        ))
+        .expect("grant");
+    let mut handle = storage.begin(grant).expect("handle");
+    for name in ["a.jsonl", "b.jsonl", "c.jsonl"] {
+        handle.jsonl_replace(name, 0, b"0\n").expect("seed");
+    }
+    handle.commit().expect("finish");
+    drop(storage);
+    let limits = StorageLimits {
+        max_read_bytes_per_call: 4,
+        max_read_bytes_per_invocation: 4,
+        max_write_bytes_per_call: 4,
+        max_write_bytes_per_invocation: 12,
+        ..StorageLimits::default()
+    };
+    let storage = StorageHost::open(&root, &key, limits).expect("bounded host");
+    let grant = storage
+        .grant(request(
+            b"b1",
+            ContinuityPolicy::Stable,
+            "b1-write",
+            StorageAccess::ReadWrite,
+        ))
+        .expect("grant");
+    let mut handle = storage.begin(grant).expect("handle");
+    assert_eq!(
+        handle
+            .jsonl_append("a.jsonl", 2, b"100")
+            .expect("write at call limit"),
+        6
+    );
+    assert_eq!(
+        handle
+            .jsonl_append("b.jsonl", 2, b"0")
+            .expect("original loads exactly at ceiling"),
+        4
+    );
+    assert_eq!(
+        handle
+            .jsonl_append("a.jsonl", 6, b"0")
+            .expect("load only once"),
+        8
+    );
+    let before = tree_snapshot(&root);
+    assert!(matches!(
+        handle.jsonl_append("c.jsonl", 2, b"0"),
+        Err(StorageHostError::QuotaExceeded)
+    ));
+    assert_eq!(
+        tree_snapshot(&root),
+        before,
+        "load ceiling refuses before mutation"
+    );
+    assert!(matches!(
+        handle.jsonl_append("a.jsonl", 8, b"1000"),
+        Err(StorageHostError::QuotaExceeded)
+    ));
+    assert_eq!(
+        tree_snapshot(&root),
+        before,
+        "per-call write ceiling refuses before mutation"
+    );
+    assert_eq!(
+        handle
+            .jsonl_append("a.jsonl", 8, b"0")
+            .expect("write exactly at invocation ceiling including denied load charge"),
+        10
+    );
+    let before = tree_snapshot(&root);
+    assert!(matches!(
+        handle.jsonl_append("a.jsonl", 10, b"0"),
+        Err(StorageHostError::QuotaExceeded)
+    ));
+    assert_eq!(
+        tree_snapshot(&root),
+        before,
+        "invocation write ceiling refuses before mutation"
+    );
+    assert_eq!(
+        handle
+            .jsonl_read_chunk("b.jsonl", 0, 4)
+            .expect("independent read request")
+            .bytes,
+        b"0\n0\n"
+    );
+    assert!(matches!(
+        handle.jsonl_read_chunk("c.jsonl", 0, 1),
+        Err(StorageHostError::QuotaExceeded)
+    ));
+    assert_eq!(
+        tree_snapshot(&root),
+        before,
+        "read ceiling preserves exact tree"
+    );
+    assert!(before.iter().any(|(_, bytes)| bytes == b"0\n100\n0\n0\n"));
+    assert!(before.iter().any(|(_, bytes)| bytes == b"0\n0\n"));
+    assert!(before.iter().any(|(_, bytes)| bytes == b"0\n"));
+    handle.commit().expect("finish");
 }

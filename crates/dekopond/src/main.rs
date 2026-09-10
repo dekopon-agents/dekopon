@@ -1,4 +1,15 @@
 #[cfg(unix)]
+use dekopond::cli;
+#[cfg(unix)]
+mod auth;
+#[cfg(unix)]
+mod auth_output;
+#[cfg(unix)]
+mod auth_render;
+#[cfg(unix)]
+mod auth_result;
+
+#[cfg(unix)]
 use std::{future::Future, io, process::ExitCode, time::Duration};
 
 #[cfg(unix)]
@@ -36,7 +47,19 @@ const BLOCKING_EXIT_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(unix)]
 fn main() -> ExitCode {
     let cli = Cli::parse();
-    match bounded_runtime(BLOCKING_EXIT_TIMEOUT, serve(cli)) {
+    if let Some(cli::Command::Auth(options)) = &cli.command {
+        return if auth_output::run(options) == 0 {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::FAILURE
+        };
+    }
+    let Some(config) = cli.config else {
+        // Clap requires this for serving; keep constructed state fail-closed too.
+        eprintln!("dekopond: --config is required for serving");
+        return ExitCode::from(2);
+    };
+    match bounded_runtime(BLOCKING_EXIT_TIMEOUT, serve(config)) {
         Ok(code) => code,
         Err(error) => {
             eprintln!("dekopond: could not start the async runtime: {error}");
@@ -64,11 +87,11 @@ fn bounded_runtime<T>(
 }
 
 #[cfg(unix)]
-async fn serve(cli: Cli) -> ExitCode {
+async fn serve(config: std::path::PathBuf) -> ExitCode {
     // Read the export settings before serving. A failure here is discarded rather than reported:
     // `run` parses the same file and surfaces every configuration error with full context, so
     // reporting it twice would only make the first message the confusing one.
-    let settings = dekopond::telemetry_settings(&cli.config, dekopond::current_uid())
+    let settings = dekopond::telemetry_settings(&config, dekopond::current_uid())
         .await
         .ok()
         .flatten();
@@ -98,7 +121,7 @@ async fn serve(cli: Cli) -> ExitCode {
         }
     };
 
-    let code = match execute(cli).await {
+    let code = match execute(config).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             // The whole source chain, not just the top Display: "gateway service failed"
@@ -118,7 +141,7 @@ async fn serve(cli: Cli) -> ExitCode {
 }
 
 #[cfg(unix)]
-async fn execute(cli: Cli) -> Result<(), AppError> {
+async fn execute(config: std::path::PathBuf) -> Result<(), AppError> {
     let mut terminate = signal(SignalKind::terminate()).map_err(AppError::Signal)?;
     let shutdown = async move {
         tokio::select! {
@@ -130,7 +153,7 @@ async fn execute(cli: Cli) -> Result<(), AppError> {
             _ = terminate.recv() => {}
         }
     };
-    dekopond::run(cli.config, shutdown)
+    dekopond::run(config, shutdown)
         .await
         .map_err(AppError::Gateway)?;
     Ok(())

@@ -11,3 +11,19 @@ The address bound is a ceiling on the pin set rather than an admission test on t
 Evidence contains only method, authority, status, and accounted byte counts—never paths, queries, headers, or bodies. An entry exists from the point a request is dispatchable, so a call the credential binding then refuses is still recorded, status-less. A call rejected earlier—unauthorized method, denied destination, invalid header, failed resolution—consumes a unit of the request budget but has no sanitized authority to name; its failure class reaches telemetry through the `http.request` span and the `accounting.http.request` record instead, which are emitted for every attempt.
 
 The crate deliberately knows nothing about WIT, Wasmtime stores, provider manifests, authenticated callers, policy evaluation, credentials, or audit persistence. Those boundaries remain in the broker layers.
+
+## Request and credential boundary
+
+The buffered interface carries an absolute URI, method token, ordered duplicate-preserving
+headers and byte body; responses carry status, ordered headers and bounded bytes. It exposes
+no guest sockets, DNS, filesystem, environment, raw credential imports or streams.
+Userinfo and URI fragments are refused. Header syntax/count/bytes, request body and complete
+encoded request size, remaining calls, exact authority/effective port and method are enforced.
+Authority-defining, hop-by-hop, proxy and broker-managed credential headers are not guest controlled.
+
+Legacy destination-bound credentials are injected only after guest-header validation; a guest
+`authorization` header is rejected, not overwritten. Binding refusal never falls back to an
+unauthenticated request. The injected header is outside guest byte grants and public evidence
+sizes; evidence records only `credentialInjected`. The broker owns selection and `Redacted`
+values, never the component. Public DRNs additionally require the separately authorized native
+sink/use binding described in [secrets](../../docs/secrets.md).

@@ -10,9 +10,9 @@ use crate::ProviderManifest;
 
 /// Maximum component type entries retained for one provider's informational view.
 ///
-/// Provider metadata is owner-supplied but still must not make an unauthenticated status page grow
-/// without bound. The manifest and the component itself remain authoritative when this summary is
-/// truncated. Each rendered signature is bounded by the SDK's shared signature limit.
+/// Provider metadata is owner-supplied, so retained interface summaries must remain bounded.
+/// The manifest and component themselves remain authoritative when this summary is truncated.
+/// Each rendered signature is bounded by the SDK's shared signature limit.
 const MAX_INTERFACE_ITEMS: usize = 1_024;
 const MAX_INTERFACE_DEPTH: usize = 8;
 

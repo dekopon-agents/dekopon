@@ -11,6 +11,15 @@ class ClassifyCiChangesTests(unittest.TestCase):
         expected = {category: category in selected for category in CATEGORIES}
         self.assertEqual(result, expected)
 
+    def test_catalog_fixture_family_selects_its_real_readers(self) -> None:
+        for path in (
+            "examples/catalog/dekopon.yaml",
+            "examples/catalog/skills/pull-request-review/SKILL.md",
+            "examples/catalog/skills/pull-request-review/references/risk-checklist.md",
+        ):
+            with self.subTest(path=path):
+                self.assert_selected([path], "run_rust", "run_otel", "run_cli_install", "run_docs")
+
     def test_prose_selects_only_the_documentation_lane(self) -> None:
         self.assert_selected(["docs/design.md", "README.md"], "run_docs")
 
@@ -35,7 +44,7 @@ class ClassifyCiChangesTests(unittest.TestCase):
 
     def test_direct_binary_source_keeps_path_installation_coverage(self) -> None:
         self.assert_selected(
-            ["crates/dekopon-run/src/main.rs"],
+            ["crates/dekopond/src/main.rs"],
             "run_rust",
             "run_otel",
             "run_cli_install",
@@ -113,10 +122,12 @@ class ClassifyCiChangesTests(unittest.TestCase):
         self.assert_selected([".github/scripts/ci_metrics.sh"], *CATEGORIES)
 
     def test_gate_scripts_fail_open_to_every_lane(self) -> None:
-        # Neither script has a lane of its own, so an edit to one used to run nothing at all.
+        # Gate scripts have no lane of their own; edits must not run nothing at all.
         for path in (
             ".github/scripts/check_docs_duplicates.py",
+            ".github/scripts/test_daemon_dependency_gates.py",
             ".github/scripts/render-homebrew-formula.py",
+            ".github/scripts/test_render_homebrew_formula.py",
         ):
             with self.subTest(path=path):
                 self.assert_selected([path], *CATEGORIES)

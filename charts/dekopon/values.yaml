@@ -1,4 +1,4 @@
-# Dekopon — one pod, two containers, one UID.
+# Dekopon — one pod, two private UIDs, one IPC group.
 #
 # Read charts/dekopon/README.md before changing anything here. Most of the values below are
 # constrained by what the daemons check at startup, not by taste: dekopon-brokerd validates the
@@ -35,13 +35,14 @@ fullnameOverride: ""
 # ---------------------------------------------------------------------------------------------
 # 65532 is not a preference. The image bakes /opt/dekopon/providers/*.wasm owned by 65532:65532,
 # and dekopon-brokerd compares a provider file's owner against its own euid before loading it. Any
-# other UID makes every provider fail to load and the broker refuse to start. Changing this is
-# only meaningful with a custom image that bakes providers under the same UID; the chart refuses
-# the combination of a changed UID and the stock image.
+# other broker UID makes every provider fail to load. The chart pins broker UID/GID even for a
+# custom image. The gateway container overrides these defaults with UID/GID 65533:65533;
+# supplementary group 65534 reaches only IPC, never private credential files.
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 65532
   runAsGroup: 65532
+  supplementalGroups: [65534]
   seccompProfile:
     # wasmtime JITs through Cranelift and needs mmap with PROT_EXEC, mprotect, memfd_create, and
     # SIGSEGV/SIGBUS handlers for guard-page traps. RuntimeDefault permits all of that. Do not
@@ -82,14 +83,13 @@ initSecurityContext:
 #   <configDir>/broker.yaml               0600 65532  (Tier B: mode & 0o022, uid, nlink, O_NOFOLLOW)
 #   <configDir>/policies.cedar            0600 65532  (Tier B)
 #   <configDir>/broker-credentials.yaml   0600 65532  (Tier A: mode & 0o077, uid, nlink)
-#   <configDir>/dekopond.yaml             0600 65532  (Tier B)
-#   <runtimeDir>/broker.sock              0700 dir, 65532-owned; broker binds the 0600 socket
+#   <configDir>/dekopond.yaml             0600 65533  (gateway-only volume)
+#   <runtimeDir>/broker.sock              0710 dir, 65532:65534; broker binds the 0660 socket
 #   <stateDir>/audit.jsonl                0700 dir, 65532-owned; broker creates the 0600 file
-#   <stateDir>/audit-checkpoint.json      same directory — the checkpoint stages to a sibling
-#   <stateDir>/audit-checkpoint.lock      .tmp and renames atomically, so it cannot be split
 #   <catalogDir>/<catalog key>            no checks at all; a plain ConfigMap mount
 paths:
   configDir: /etc/dekopon
+  gatewayConfigDir: /etc/dekopon-gateway
   runtimeDir: /run/dekopon
   stateDir: /var/lib/dekopon
   catalogDir: /etc/dekopon-catalog
@@ -112,16 +112,13 @@ broker:
       apiVersion: dekopon.dev/brokerd/v1alpha1
       socketPath: /run/dekopon/broker.sock
       auditPath: /var/lib/dekopon/audit.jsonl
-      checkpointPath: /var/lib/dekopon/audit-checkpoint.json
-      checkpointLockPath: /var/lib/dekopon/audit-checkpoint.lock
       brokerPrincipal: local-broker
       policyRevision: chart-default
       policiesPath: /etc/dekopon/policies.cedar
       providers:
         - /opt/dekopon/providers/echo-provider.wasm
       identities:
-        # Must equal podSecurityContext.runAsUser. dekopon-brokerd refuses to start if a
-        # configured peer UID is not its own euid; there is only one trust domain.
+        # Broker-owned probes use this identity; gateway deployments map UID 65533 separately.
         - uid: 65532
           principal: dekopon-pod
           actor:
@@ -138,20 +135,17 @@ broker:
             maxOutputBytes: 1048576
       serverLimits:
         # A present section requires every field. These are the daemon's own defaults except
-        # auditMaxLineBytes, which the chart lowers so the record cap binds before the volume
-        # does — see "Sizing the audit volume" in README.md.
+        # auditMaxLineBytes, which bounds each record, not lifetime file growth.
+        # Monitor disk space — see "Sizing the audit volume" in README.md.
         maxFrameBytes: 2097152
         ioTimeoutMs: 30000
         maxConnections: 64
-        auditMaxRecords: 200000
         auditMaxLineBytes: 8192
         shutdownGraceMs: 120000
       brokerLimits:
         # Unlike serverLimits, brokerLimits and hostLimits default field by field: everything
-        # omitted here keeps the daemon's own value. The replay ledger never evicts and is
-        # restored from durable history at startup, so the stock 100 000 would answer every
-        # invocation `capacity-exhausted` at half the auditMaxRecords budget above — see
-        # "Size maxReplayIds with it" in README.md.
+        # omitted here keeps the daemon's own value. Replay IDs are bounded process-local memory;
+        # restart starts an empty ledger. This limit does not bound audit file growth.
         maxReplayIds: 200000
       hostLimits:
         # maxMemoryBytes bounds one invocation (64 MiB by default); nothing bounds all of them at
@@ -213,19 +207,6 @@ broker:
   #   existingSecretKey: token
   secretBootstrapFiles: []
 
-  # Optional read-only web UI. Empty is the default and means no `--http-bind` argument reaches
-  # argv, so dekopon-brokerd opens no TCP listener at all. An address appends
-  # `--http-bind <address>` to the broker container's arguments.
-  #
-  # Read docs/security-model.md before setting it. The listener is unauthenticated and shares the
-  # privileged broker's address space and container memory limit. It discloses agent names and
-  # declared permissions, provider descriptions and input schemas, component paths and digests,
-  # Wasmtime limits and activity, and the credential-free OTLP endpoint. The network that can
-  # reach the bound address is the whole access control, so bind loopback (127.0.0.1:8080, which
-  # `kubectl port-forward` still reaches) or a cluster-internal address; 0.0.0.0 publishes that
-  # deployment metadata on every interface. The chart creates no Service and no Ingress for it.
-  httpBind: ""
-
   resources:
     requests:
       cpu: 100m
@@ -240,15 +221,13 @@ broker:
   # broker wants is RUST_LOG and, if broker.yaml has a telemetry section, OTEL_EXPORTER_OTLP_HEADERS
   # (the OpenTelemetry SDK reads ingest auth from there so a token never enters the config file).
   #
-  # Do not set OTEL_EXPORTER_OTLP_ENDPOINT on this container: the readiness probe runs dekopon-run,
-  # which reads that variable and would export a trace on every probe.
   env:
     - name: RUST_LOG
       value: info
   envFrom: []
 
   # There is no HTTP health endpoint and the image has no shell, so both probes run a real broker
-  # client: `dekopon-run broker capabilities` connects over the socket, passes SO_PEERCRED both
+  # client: `dekopon-brokerd probe` connects over the socket, passes SO_PEERCRED both
   # ways, and gets an authorized capability list back. It appends no audit record.
   #
   # The startup probe is also the ordering primitive: Kubernetes does not start dekopond until the
@@ -258,7 +237,7 @@ broker:
     timeoutSeconds: 10
     # 5 minutes. Component compilation on a Raspberry Pi 5 is seconds, not minutes; the margin is
     # there because a startup probe that gives up restarts the container, and a restart loop
-    # against durable audit state is the worst failure this chart can produce.
+    # can interrupt work and reset process-local replay protection.
     failureThreshold: 60
   readinessProbe:
     periodSeconds: 30
@@ -299,9 +278,9 @@ gateway:
 
   # Seed a ChatGPT subscription credential once, and never again.
   #
-  # `dekopon auth chatgpt login` is a device-authorization flow: it prints a URL and waits for a
+  # `dekopond auth chatgpt login` is a device-authorization flow: it prints a URL and waits for a
   # human with a browser. Nothing in a pod can do that, so a `kind: chatgptSubscription` model has
-  # to be handed a credential exported from a local login — `dekopon auth chatgpt export`, which
+  # to be handed a credential exported from a local login — `dekopond auth chatgpt export`, which
   # lands with the auth-export change.
   #
   # This is the one file the chart writes that the daemon then OWNS. The refresh token rotates on
@@ -315,7 +294,7 @@ gateway:
   # dies with the pod, which would quietly turn "seed once" into "seed on every reschedule".
   chatgpt:
     enabled: false
-    # Prefer existingSecret. `dekopon auth chatgpt export --expose-credential --namespace <ns>`
+    # Prefer existingSecret. `dekopond auth chatgpt export --expose-credential --namespace <ns>`
     # emits exactly this Secret, named dekopon-chatgpt-auth with the key chatgpt-auth.json; an
     # External Secrets Operator ExternalSecret against a 1Password item projects the same shape.
     # An inline value is stored in the release and returned by `helm get values`.
@@ -370,24 +349,22 @@ gateway:
 # ---------------------------------------------------------------------------------------------
 # Audit state
 # ---------------------------------------------------------------------------------------------
-# Audit, checkpoint, and checkpoint lock live in one directory on one volume, because the
-# checkpoint stages to a same-directory temporary file and renames it atomically. Splitting them
-# across volumes breaks the atomicity the recovery rules depend on.
+# Persistent audit and model-credential state is retained across releases.
 state:
   # local-path is the target cluster's only StorageClass. It is RWO and — this is the part that
   # matters — ALLOWVOLUMEEXPANSION is false. This claim CANNOT BE GROWN LATER. Replacing it means
-  # copying audit.jsonl and audit-checkpoint.json to the new volume together: deleting one to
-  # dodge recovery makes the broker fail closed, and deleting both is an undetectable rollback.
+  # deliberately moving the retained audit and live model credential to the new volume.
   storageClassName: local-path
   accessModes: [ReadWriteOnce]
-  # Arithmetic in README.md ("Sizing the audit volume"). Short version: a measured external-write
-  # record with two HTTP calls is 1,279 bytes, the record cap is 200,000, so a realistic full log
-  # is ~250 MiB; 2Gi leaves room for ~10.7 KiB per record before the disk, rather than the
-  # daemon's own bound, is what stops the broker.
+  # Audit appends have no total record cap: size for expected traffic and retention, and monitor
+  # disk usage before this fixed-size volume fills. The per-record byte bound is not a disk budget.
+  # maxReplayIds separately bounds process-local replay memory, not audit-file growth; size that
+  # memory independently. See README.md ("Sizing the audit volume").
   size: 2Gi
-  # Named annotation, not a comment: helm uninstall must not delete the audit chain.
+  # Named annotation, not a comment: helm uninstall must not delete the audit log.
   keepOnUninstall: true
-  # Bring your own claim instead. The chart still chowns its root to 65532 and chmods it 0700.
+  # Bring your own claim instead. Init keeps its root 0:0/0700; each daemon mounts only
+  # its own private subdirectory. See the offline layout migration in the chart README.
   existingClaim: ""
 
 # Optional provider storage is physically and lifecycle-separate from audit state. The generated

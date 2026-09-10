@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use dekopon_broker_protocol::{ipc_socket_mode, secure_socket, secure_socket_parent};
 use thiserror::Error;
 use tokio::{
     net::{UnixListener, UnixStream},
@@ -38,6 +39,29 @@ pub fn validate_private_parent(path: &Path, expected_uid: u32) -> Result<(), Soc
         return Err(SocketError::InsecureParent { path: parent });
     }
     Ok(())
+}
+
+// The rule itself lives in `dekopon-broker-protocol`, where the clients that must agree with this
+// server read it. What stays here is the path handling and the error an operator acts on.
+pub fn validate_socket_parent(path: &Path, expected_uid: u32) -> Result<fs::Metadata, SocketError> {
+    let parent = path.parent().ok_or_else(|| SocketError::MissingParent {
+        path: path.to_path_buf(),
+    })?;
+    let metadata = fs::symlink_metadata(parent).map_err(|source| SocketError::Metadata {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    if !secure_socket_parent(&metadata, expected_uid) {
+        return Err(SocketError::InsecureParent {
+            path: parent.to_path_buf(),
+        });
+    }
+    let canonical = fs::canonicalize(parent).map_err(|source| SocketError::Metadata {
+        path: parent.to_path_buf(),
+        source,
+    })?;
+    validate_ancestors(&canonical)?;
+    Ok(metadata)
 }
 
 pub fn validate_owned_file(path: &Path, expected_uid: u32) -> Result<(), SocketError> {
@@ -100,13 +124,25 @@ pub async fn bind(
     path: &Path,
     expected_uid: u32,
 ) -> Result<(UnixListener, SocketGuard), SocketError> {
-    validate_private_parent(path, expected_uid)?;
-    remove_stale(path, expected_uid).await?;
+    let parent = validate_socket_parent(path, expected_uid)?;
+    remove_stale(path, expected_uid, &parent).await?;
     let listener = UnixListener::bind(path).map_err(|source| SocketError::Bind {
         path: path.to_path_buf(),
         source,
     })?;
-    if let Err(source) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+    // Group traversal opts into shared IPC. Set its exact group before granting access;
+    // an unprivileged broker must itself belong to this group. Private parents stay 0600.
+    let mode = ipc_socket_mode(&parent);
+    if mode == 0o660
+        && let Err(source) = std::os::unix::fs::chown(path, None, Some(parent.gid()))
+    {
+        let _ = fs::remove_file(path);
+        return Err(SocketError::Permissions {
+            path: path.to_path_buf(),
+            source,
+        });
+    }
+    if let Err(source) = fs::set_permissions(path, fs::Permissions::from_mode(mode)) {
         let _ = fs::remove_file(path);
         return Err(SocketError::Permissions {
             path: path.to_path_buf(),
@@ -124,11 +160,7 @@ pub async fn bind(
             });
         }
     };
-    if !metadata.file_type().is_socket()
-        || metadata.uid() != expected_uid
-        || metadata.permissions().mode() & 0o077 != 0
-        || metadata.nlink() != 1
-    {
+    if !secure_socket(&metadata, expected_uid, &parent) {
         let _ = fs::remove_file(path);
         return Err(SocketError::InsecureSocket {
             path: path.to_path_buf(),
@@ -144,7 +176,11 @@ pub async fn bind(
     ))
 }
 
-async fn remove_stale(path: &Path, expected_uid: u32) -> Result<(), SocketError> {
+async fn remove_stale(
+    path: &Path,
+    expected_uid: u32,
+    parent: &fs::Metadata,
+) -> Result<(), SocketError> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -155,11 +191,7 @@ async fn remove_stale(path: &Path, expected_uid: u32) -> Result<(), SocketError>
             });
         }
     };
-    if !metadata.file_type().is_socket()
-        || metadata.uid() != expected_uid
-        || metadata.permissions().mode() & 0o077 != 0
-        || metadata.nlink() != 1
-    {
+    if !secure_socket(&metadata, expected_uid, parent) {
         return Err(SocketError::InsecureSocket {
             path: path.to_path_buf(),
         });
@@ -245,7 +277,7 @@ pub enum SocketError {
         source: io::Error,
     },
     #[error(
-        "parent directory must be a non-symlink owner-only directory owned by the server UID: {path}"
+        "parent directory must be server-owned, non-symlink, private or IPC-group traversable, without group writes or others access: {path}"
     )]
     InsecureParent { path: PathBuf },
     #[error("path ancestor must be a directory without unprotected group/world writes: {path}")]
@@ -256,7 +288,9 @@ pub enum SocketError {
         "file must be regular, single-link, owned by the server UID, and not group/world writable: {path}"
     )]
     InsecureFile { path: PathBuf },
-    #[error("socket path is not a private single-link socket owned by the server UID: {path}")]
+    #[error(
+        "socket must be server-owned and single-link, mode 0600 or 0660 in its parent IPC group: {path}"
+    )]
     InsecureSocket { path: PathBuf },
     #[error("a broker is already listening at {path}")]
     AlreadyRunning { path: PathBuf },

@@ -1,5 +1,5 @@
 #[cfg(unix)]
-use std::{io, net::SocketAddr, path::PathBuf, process::ExitCode};
+use std::{io, path::PathBuf, process::ExitCode};
 
 #[cfg(unix)]
 use clap::{Args, CommandFactory as _, Parser, Subcommand, ValueEnum, error::ErrorKind};
@@ -25,10 +25,7 @@ struct Cli {
     /// Strict owner-controlled broker YAML/JSON configuration.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
-    /// Bind the unauthenticated, read-only operational web UI.
-    #[arg(long, value_name = "ADDRESS")]
-    http_bind: Option<SocketAddr>,
-    /// Offline operator mode. Omit to serve the broker.
+    /// Maintenance or health-check mode. Omit to serve the broker.
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -36,10 +33,14 @@ struct Cli {
 #[cfg(unix)]
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Check the broker as its mapped owner UID without loading configuration.
+    Probe {
+        /// Broker-owned Unix socket; the server must have this process's UID.
+        #[arg(long, value_name = "PATH")]
+        socket: PathBuf,
+    },
     /// Resolve, materialize, and verify a startup-fixed provider set.
     Provider(ProviderArgs),
-    /// Inspect a durable audit log without starting the broker.
-    Audit(AuditArgs),
 }
 
 #[cfg(unix)]
@@ -92,26 +93,6 @@ enum ProviderCommand {
     Verify,
 }
 
-#[cfg(unix)]
-#[derive(Debug, Args)]
-struct AuditArgs {
-    /// Durable JSONL audit log to read.
-    #[arg(long, value_name = "PATH", global = true)]
-    audit_path: Option<PathBuf>,
-    /// Render command results as a table or JSON.
-    #[arg(long, value_enum, default_value_t, global = true)]
-    output: OutputFormat,
-    #[command(subcommand)]
-    command: AuditCommand,
-}
-
-#[cfg(unix)]
-#[derive(Debug, Subcommand)]
-enum AuditCommand {
-    /// Verify every retained record's sequence, previous-hash link, and record hash.
-    Verify,
-}
-
 /// Transport crates are silenced explicitly: an HTTP or gRPC stack logs every connection. The
 /// OTLP exporter's own diagnostics are silenced by `dekopon_telemetry`, which appends that
 /// directive to every OTLP layer it installs.
@@ -128,91 +109,21 @@ async fn main() -> ExitCode {
         }
         return ExitCode::from(2);
     }
-    let provider_mode = cli.command.is_some();
-
-    // Provider management never reads daemon configuration and never installs telemetry. It is an
-    // offline operator mode with command output on stdout and diagnostics on stderr.
-    let settings = match (&cli.command, &cli.config) {
-        (None, Some(config)) => {
-            dekopon_brokerd::telemetry_settings(config, dekopon_brokerd::current_uid())
-                .await
-                .ok()
-                .flatten()
-        }
-        _ => None,
-    };
-
-    // Telemetry must never keep the broker from starting. Authorization and audit are the
-    // service's contract; observability is not, and failing closed here would trade a working
-    // authority boundary for a missing dashboard.
-    let tracer_provider = dekopon_telemetry::optional_tracer_provider(
-        settings.as_ref().map(|telemetry| &telemetry.settings),
-        "dekopon-brokerd",
-    );
-
-    let console = if provider_mode {
-        Console {
-            format: ConsoleFormat::Text {
-                ansi: None,
-                target: true,
-                timestamps: true,
-            },
-            writer: ConsoleWriter::Stderr,
-            filter: ConsoleFilter::Environment("warn".to_owned()),
-        }
-    } else {
-        // Structured JSON on stdout is the daemon log contract; a collector or shipper can pick it
-        // up without the broker holding a second credential.
-        Console {
-            format: ConsoleFormat::Json,
-            writer: ConsoleWriter::Stdout,
-            filter: ConsoleFilter::Environment("info".to_owned()),
-        }
-    };
-    let mut install = Install::new(console);
-    if let Some(provider) = tracer_provider {
-        install = install.with_traces(provider, "dekopon-brokerd", OTEL_TRACE_FILTER);
-    }
-    let telemetry = match install.install() {
-        Ok(guard) => guard,
-        Err(error) => {
-            eprintln!("dekopon-brokerd: could not install tracing subscriber: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let code = match execute(cli).await {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            tracing::error!(event = "broker_exit", error = %error_chain(&error));
-            ExitCode::FAILURE
-        }
-    };
-
-    // Flush failures are reported but do not change the exit code: the broker's durable audit,
-    // not its telemetry, is the record of what happened.
-    if let Err(error) = telemetry.shutdown() {
-        tracing::error!(event = "broker_telemetry_shutdown_failed", error = %error);
-    }
-    code
+    execute(cli).await
 }
 
 #[cfg(unix)]
 fn validate_cli(cli: &Cli) -> Result<(), clap::Error> {
-    match (&cli.command, &cli.config, &cli.http_bind) {
-        (None, None, _) => Err(Cli::command().error(
+    match (&cli.command, &cli.config) {
+        (None, None) => Err(Cli::command().error(
             ErrorKind::MissingRequiredArgument,
             "--config <PATH> is required when serving the broker",
         )),
-        (Some(_), Some(_), _) => Err(Cli::command().error(
+        (Some(_), Some(_)) => Err(Cli::command().error(
             ErrorKind::ArgumentConflict,
             "--config cannot be used with an offline operator command",
         )),
-        (Some(_), _, Some(_)) => Err(Cli::command().error(
-            ErrorKind::ArgumentConflict,
-            "--http-bind cannot be used with an offline operator command",
-        )),
-        (Some(Command::Provider(provider)), _, _)
+        (Some(Command::Provider(provider)), _)
             if provider.lock_file.is_none()
                 || provider.store.is_none()
                 || (matches!(provider.command, ProviderCommand::Sync { .. })
@@ -223,33 +134,112 @@ fn validate_cli(cli: &Cli) -> Result<(), clap::Error> {
                 "provider mode requires --lock-file and --store; sync also requires --provider-set",
             ))
         }
-        (Some(Command::Audit(audit)), _, _) if audit.audit_path.is_none() => Err(Cli::command()
-            .error(
-                ErrorKind::MissingRequiredArgument,
-                "audit mode requires --audit-path",
-            )),
         _ => Ok(()),
     }
 }
 
+/// The one dispatch over the parsed command line.
+///
+/// Each arm brings the process state its mode needs, which is why the setup lives here rather than
+/// ahead of the match: a health check must discover no credentials and initialize no telemetry or
+/// provider machinery, and provider management must read no daemon configuration.
 #[cfg(unix)]
-async fn execute(cli: Cli) -> Result<(), AppError> {
+async fn execute(cli: Cli) -> ExitCode {
     match cli.command {
-        Some(Command::Provider(provider)) => execute_provider(provider).await,
-        Some(Command::Audit(audit)) => execute_audit(audit),
+        Some(Command::Probe { socket }) => match probe(&socket).await {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("dekopon-brokerd: probe failed: {}", error_chain(&error));
+                ExitCode::FAILURE
+            }
+        },
+        Some(Command::Provider(provider)) => {
+            // An offline operator mode with command output on stdout and diagnostics on stderr.
+            let install = Install::new(Console {
+                format: ConsoleFormat::Text {
+                    ansi: None,
+                    target: true,
+                    timestamps: true,
+                },
+                writer: ConsoleWriter::Stderr,
+                filter: ConsoleFilter::Environment("warn".to_owned()),
+            });
+            observed(install, execute_provider(provider)).await
+        }
         None => {
-            execute_server(
-                cli.config
-                    .expect("validate_cli requires daemon configuration"),
-                cli.http_bind,
-            )
-            .await
+            let config = cli
+                .config
+                .expect("validate_cli requires daemon configuration");
+            let settings =
+                dekopon_brokerd::telemetry_settings(&config, dekopon_brokerd::current_uid())
+                    .await
+                    .ok()
+                    .flatten();
+            // Telemetry must never keep the broker from starting. Authorization and audit are the
+            // service's contract; observability is not, and failing closed here would trade a
+            // working authority boundary for a missing dashboard.
+            let tracer_provider = dekopon_telemetry::optional_tracer_provider(
+                settings.as_ref().map(|telemetry| &telemetry.settings),
+                "dekopon-brokerd",
+            );
+            // Structured JSON on stdout is the daemon log contract; a collector or shipper can
+            // pick it up without the broker holding a second credential.
+            let mut install = Install::new(Console {
+                format: ConsoleFormat::Json,
+                writer: ConsoleWriter::Stdout,
+                filter: ConsoleFilter::Environment("info".to_owned()),
+            });
+            if let Some(provider) = tracer_provider {
+                install = install.with_traces(provider, "dekopon-brokerd", OTEL_TRACE_FILTER);
+            }
+            observed(install, execute_server(config)).await
         }
     }
 }
 
+/// Installs one mode's subscriber, runs it to completion, and flushes what it recorded.
 #[cfg(unix)]
-async fn execute_server(config: PathBuf, http_bind: Option<SocketAddr>) -> Result<(), AppError> {
+async fn observed(install: Install, work: impl Future<Output = Result<(), AppError>>) -> ExitCode {
+    let telemetry = match install.install() {
+        Ok(guard) => guard,
+        Err(error) => {
+            eprintln!("dekopon-brokerd: could not install tracing subscriber: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let code = match work.await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            tracing::error!(event = "broker_exit", error = %error_chain(&error));
+            ExitCode::FAILURE
+        }
+    };
+    // Flush failures are reported but do not change the exit code: the broker's durable audit,
+    // not its telemetry, is the record of what happened.
+    if let Err(error) = telemetry.shutdown() {
+        tracing::error!(event = "broker_telemetry_shutdown_failed", error = %error);
+    }
+    code
+}
+
+#[cfg(unix)]
+async fn probe(socket: &std::path::Path) -> Result<(), AppError> {
+    use dekopon_broker_protocol::{BrokerClient, FrameLimits};
+    let client = BrokerClient::new(
+        socket,
+        dekopon_brokerd::current_uid(),
+        FrameLimits::default(),
+    )
+    .map_err(AppError::Probe)?;
+    tokio::time::timeout(std::time::Duration::from_secs(2), client.capabilities())
+        .await
+        .map_err(AppError::ProbeTimeout)?
+        .map_err(AppError::Probe)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn execute_server(config: PathBuf) -> Result<(), AppError> {
     let mut terminate = signal(SignalKind::terminate()).map_err(AppError::Signal)?;
     let shutdown = async move {
         tokio::select! {
@@ -261,7 +251,7 @@ async fn execute_server(config: PathBuf, http_bind: Option<SocketAddr>) -> Resul
             _ = terminate.recv() => {}
         }
     };
-    dekopon_brokerd::run_with_http(config, http_bind, shutdown)
+    dekopon_brokerd::run(config, shutdown)
         .await
         .map_err(AppError::Broker)?;
     Ok(())
@@ -333,22 +323,6 @@ async fn execute_provider(provider: ProviderArgs) -> Result<(), AppError> {
 }
 
 #[cfg(unix)]
-fn execute_audit(audit: AuditArgs) -> Result<(), AppError> {
-    let AuditCommand::Verify = audit.command;
-    let path = audit
-        .audit_path
-        .expect("validate_cli requires --audit-path");
-    let verification = dekopon_brokerd::verify_audit_file(path).map_err(AppError::Audit)?;
-    render(audit.output, &verification, || {
-        format!(
-            "RECORDS\tHEAD\n{}\t{}",
-            verification.records,
-            verification.head.as_deref().unwrap_or("-")
-        )
-    })
-}
-
-#[cfg(unix)]
 fn render<T: Serialize>(
     output: OutputFormat,
     value: &T,
@@ -367,28 +341,47 @@ fn render<T: Serialize>(
 #[cfg(unix)]
 #[derive(Debug, Error)]
 enum AppError {
+    #[error("broker probe exceeded two-second deadline")]
+    ProbeTimeout(#[source] tokio::time::error::Elapsed),
+    #[error("broker probe failed")]
+    Probe(#[source] dekopon_broker_protocol::ClientError),
     #[error("could not install termination signal handler")]
     Signal(#[source] io::Error),
     #[error("broker service failed")]
     Broker(#[source] dekopon_brokerd::BrokerdError),
     #[error("provider manager failed")]
     Provider(#[source] dekopon_brokerd::ProviderManagerError),
-    #[error("audit verification failed")]
-    Audit(#[source] dekopon_brokerd::AuditVerificationError),
     #[error("could not render provider-manager output")]
     Output(#[source] serde_json::Error),
 }
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::{
-        net::{IpAddr, Ipv4Addr, SocketAddr},
-        path::Path,
-    };
+    use std::path::Path;
 
     use clap::{CommandFactory as _, Parser as _};
 
-    use super::{AuditCommand, Cli, Command, OutputFormat, ProviderCommand, validate_cli};
+    use super::{Cli, Command, OutputFormat, ProviderCommand, validate_cli};
+
+    #[test]
+    fn probe_requires_only_a_socket_and_rejects_authority_arguments() {
+        let cli = Cli::try_parse_from(["dekopon-brokerd", "probe", "--socket", "/run/broker.sock"])
+            .unwrap();
+        assert!(validate_cli(&cli).is_ok());
+        assert!(
+            matches!(cli.command, Some(Command::Probe { socket }) if socket == Path::new("/run/broker.sock"))
+        );
+        assert!(Cli::try_parse_from(["dekopon-brokerd", "probe"]).is_err());
+        for flag in ["--server-uid", "--principal", "--provider", "--credential"] {
+            assert!(
+                Cli::try_parse_from(["dekopon-brokerd", "probe", "--socket", "x", flag, "x"])
+                    .is_err()
+            );
+        }
+        let cli = Cli::try_parse_from(["dekopon-brokerd", "--config=x", "probe", "--socket", "x"])
+            .unwrap();
+        assert!(validate_cli(&cli).is_err());
+    }
 
     #[test]
     fn cli_definition_is_internally_consistent() {
@@ -396,21 +389,14 @@ mod tests {
     }
 
     #[test]
-    fn http_listener_is_explicit_and_accepts_the_documented_spelling() {
-        let disabled = Cli::try_parse_from(["dekopon-brokerd", "--config", "broker.yaml"])
-            .expect("HTTP is optional");
-        assert!(disabled.http_bind.is_none());
-        assert!(validate_cli(&disabled).is_ok());
-
-        let enabled = Cli::try_parse_from([
-            "dekopon-brokerd",
-            "--config=broker.yaml",
-            "--http-bind=0.0.0.0:8080",
-        ])
-        .expect("documented HTTP bind parses");
-        assert_eq!(
-            enabled.http_bind,
-            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 8080))
+    fn retired_http_listener_flag_is_refused() {
+        assert!(
+            Cli::try_parse_from([
+                "dekopon-brokerd",
+                "--config=broker.yaml",
+                "--http-bind=0.0.0.0:8080"
+            ])
+            .is_err()
         );
     }
 
@@ -460,41 +446,16 @@ mod tests {
         assert!(validate_cli(&list).is_ok());
     }
 
-    /// `audit verify` is the only operator path to the audit-chain integrity check, so it must
-    /// refuse to run against nothing rather than silently verify an empty default.
     #[test]
-    fn audit_mode_requires_a_log_and_rejects_daemon_arguments() {
-        let cli = Cli::try_parse_from([
+    fn retired_audit_command_is_rejected() {
+        let error = Cli::try_parse_from([
             "dekopon-brokerd",
-            "audit",
-            "verify",
-            "--audit-path",
-            "audit.jsonl",
-            "--output",
-            "json",
-        ])
-        .expect("audit command parses");
-        assert!(validate_cli(&cli).is_ok());
-        let Some(Command::Audit(audit)) = cli.command else {
-            panic!("audit command");
-        };
-        assert_eq!(audit.output, OutputFormat::Json);
-        assert_eq!(audit.audit_path.as_deref(), Some(Path::new("audit.jsonl")));
-        assert!(matches!(audit.command, AuditCommand::Verify));
-
-        let without_path = Cli::try_parse_from(["dekopon-brokerd", "audit", "verify"])
-            .expect("shape parses before validation");
-        assert!(validate_cli(&without_path).is_err());
-
-        let with_config = Cli::try_parse_from([
-            "dekopon-brokerd",
-            "--config=broker.yaml",
             "audit",
             "verify",
             "--audit-path=audit.jsonl",
         ])
-        .expect("shape parses before validation");
-        assert!(validate_cli(&with_config).is_err());
+        .expect_err("retired command is not executable");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
 }
 

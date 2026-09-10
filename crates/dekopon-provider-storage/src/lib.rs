@@ -28,7 +28,7 @@ mod durable_bindings {
 
 #[cfg(feature = "jsonl")]
 pub mod jsonl {
-    //! Curated JSONL operations. Mutations remain provisional for the provider invocation.
+    //! Curated JSONL operations. Writes take effect per host call without invocation-wide rollback.
 
     use std::{error::Error, fmt};
 

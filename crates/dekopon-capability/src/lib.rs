@@ -492,7 +492,7 @@ pub enum SecretUseGrantError {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StorageInterface {
-    /// Curated invocation-transactional JSONL operations.
+    /// Curated per-call JSONL operations.
     Jsonl,
     /// Engine-neutral positional durable-file operations.
     DurableFiles,
@@ -505,7 +505,7 @@ pub enum StorageInterface {
 pub enum StorageAccess {
     /// Reads only; every mutating host call is terminally denied.
     ReadOnly,
-    /// Reads and invocation-transactional writes.
+    /// Reads and direct per-call writes.
     ReadWrite,
 }
 
@@ -857,7 +857,7 @@ mod tests {
         )
     }
 
-    /// `Display` feeds the web UI and operator errors; serde feeds manifests and constraint-set
+    /// `Display` feeds operator errors; serde feeds manifests and constraint-set
     /// decoding. Both spellings are hand-written once each, so nothing but this test stops a new
     /// variant from rendering one string to an operator and a different one to the audit record.
     #[test]
