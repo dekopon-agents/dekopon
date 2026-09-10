@@ -133,7 +133,9 @@ if [[ "$normalize_metadata" == true && -n "$crate_name" && -n "${CARGO_PKG_NAME-
     "metadata=$metadata_domain-${CARGO_PKG_NAME}-${CARGO_PKG_VERSION}-$crate_name-$target"
   )
 fi
-exec "$actual_rustc" "${args[@]}"
+# Darwin SIP clears rustup's loader environment across this shell proxy. Re-enter rustup so
+# the pinned compiler's dynamically linked rust-lld can find its matching LLVM library.
+exec rustup run "${DEKOPON_BUILD_RUST_TOOLCHAIN:?}" "$actual_rustc" "${args[@]}"
 EOF
 chmod 0700 "$rustc_proxy"
 
@@ -148,6 +150,7 @@ printf -v encoded_rustflags '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s' \
 rustup target add --toolchain "$rust_toolchain" wasm32-unknown-unknown
 CARGO_ENCODED_RUSTFLAGS="$encoded_rustflags" \
   DEKOPON_BUILD_RUSTC="$rustc_path" \
+  DEKOPON_BUILD_RUST_TOOLCHAIN="$rust_toolchain" \
   DEKOPON_BUILD_SOURCE_ROOT="$root" \
   DEKOPON_BUILD_METADATA_DOMAIN="$metadata_domain" \
   RUSTC="$rustc_proxy" \
