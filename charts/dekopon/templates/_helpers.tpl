@@ -121,16 +121,62 @@ than configured: an emptyDir here would turn seed-once into seed-per-reschedule.
 {{- if and .Values.gateway.enabled .Values.gateway.chatgpt.enabled -}}true{{- end -}}
 {{- end -}}
 
+{{- define "dekopon.brokerChatgptSecretName" -}}
+{{- printf "%s-broker-chatgpt" (include "dekopon.fullname" .) -}}
+{{- end -}}
+
 {{/*
-The seed-once file, as a YAML list of zero or one {file, secret, key}. Kept apart from
-managedFiles because the handling is the opposite: managedFiles are overwritten on every start,
-this one must survive every start after the first.
+The broker's own ChatGPT credential directory. Composed for the same reason the gateway's is, and a
+separate directory on purpose: two holders of one credential file eventually present a retired
+refresh token and revoke the family for both.
+*/}}
+{{- define "dekopon.brokerChatgptDir" -}}
+{{- printf "%s/%s" .Values.paths.stateDir .Values.broker.chatgpt.subdir -}}
+{{- end -}}
+
+{{/*
+Unlike the gateway's, this does not depend on gateway.enabled: the consumer is dekopon-brokerd,
+which is always in the pod.
+*/}}
+{{- define "dekopon.brokerChatgptEnabled" -}}
+{{- if .Values.broker.chatgpt.enabled -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+The seed-once files, as a YAML list of
+{label, owner, file, source, dir, value, reseed, secret, key}. Kept
+apart from managedFiles because the handling is the opposite: managedFiles are overwritten on every
+start, these must survive every start after the first.
+
+`source` is the path inside the projected volume and `file` the destination leaf, because two
+credential families that both default to chatgpt-auth.json would otherwise collide on one projected
+path. `owner` selects which container identity the seeded file and its directory belong to — the
+gateway's 65533 or the broker's 65532 — because each daemon refuses a credential it does not own.
+The init container loops over this list, so a second seed needs no second copy of the seed-once
+logic.
 */}}
 {{- define "dekopon.seedFiles" -}}
 {{- if include "dekopon.chatgptEnabled" . }}
-- file: {{ .Values.gateway.chatgpt.fileName }}
+- label: gateway ChatGPT credential
+  owner: gateway
+  file: {{ .Values.gateway.chatgpt.fileName }}
+  source: {{ .Values.gateway.chatgpt.fileName }}
+  dir: {{ include "dekopon.chatgptDir" . }}
+  value: gateway.chatgpt.reseed
+  reseed: {{ .Values.gateway.chatgpt.reseed }}
   secret: {{ default (include "dekopon.chatgptSecretName" .) .Values.gateway.chatgpt.existingSecret }}
   key: {{ if .Values.gateway.chatgpt.existingSecret }}{{ .Values.gateway.chatgpt.existingSecretKey }}{{ else }}{{ .Values.gateway.chatgpt.fileName }}{{ end }}
+{{- end }}
+{{- if include "dekopon.brokerChatgptEnabled" . }}
+- label: broker ChatGPT credential
+  owner: broker
+  file: {{ .Values.broker.chatgpt.fileName }}
+  source: broker-{{ .Values.broker.chatgpt.fileName }}
+  dir: {{ include "dekopon.brokerChatgptDir" . }}
+  value: broker.chatgpt.reseed
+  reseed: {{ .Values.broker.chatgpt.reseed }}
+  secret: {{ default (include "dekopon.brokerChatgptSecretName" .) .Values.broker.chatgpt.existingSecret }}
+  key: {{ if .Values.broker.chatgpt.existingSecret }}{{ .Values.broker.chatgpt.existingSecretKey }}{{ else }}{{ .Values.broker.chatgpt.fileName }}{{ end }}
 {{- end }}
 {{- end -}}
 
@@ -320,6 +366,38 @@ answers every probe `unauthenticated`, and never becomes ready. */}}
 {{- fail "gateway.chatgpt.enabled has no effect without gateway.enabled: the credential is read by dekopond, not by the broker" -}}
 {{- end -}}
 
+{{/* The broker's own ChatGPT family. Every problem is collected and reported together, because an
+operator who fixes one only to be told about the next has to roll the release twice. */}}
+{{- if include "dekopon.brokerChatgptEnabled" . -}}
+{{- $problems := list -}}
+{{- if and .Values.broker.chatgpt.inline .Values.broker.chatgpt.existingSecret -}}
+{{- $problems = append $problems "broker.chatgpt.inline and broker.chatgpt.existingSecret are mutually exclusive" -}}
+{{- end -}}
+{{- if and (not .Values.broker.chatgpt.inline) (not .Values.broker.chatgpt.existingSecret) -}}
+{{- $problems = append $problems "broker.chatgpt.enabled is true, so a credential is required: set broker.chatgpt.inline or broker.chatgpt.existingSecret. Produce one with `dekopond auth chatgpt login --auth-file <path>` and then `dekopond auth chatgpt export --expose-credential --auth-file <path>`." -}}
+{{- end -}}
+{{- if not (regexMatch "^[A-Za-z0-9._-]+$" .Values.broker.chatgpt.subdir) -}}
+{{- $problems = append $problems (printf "broker.chatgpt.subdir must be one path segment joined onto paths.stateDir, got %q; the credential has to live on the claim" .Values.broker.chatgpt.subdir) -}}
+{{- end -}}
+{{- if or (eq .Values.broker.chatgpt.subdir "broker") (eq .Values.broker.chatgpt.subdir ".") (eq .Values.broker.chatgpt.subdir "..") -}}
+{{- $problems = append $problems "broker.chatgpt.subdir must not be broker, . or .." -}}
+{{- end -}}
+{{- if not (regexMatch "^[A-Za-z0-9._-]+$" .Values.broker.chatgpt.fileName) -}}
+{{- $problems = append $problems (printf "broker.chatgpt.fileName must be one path segment, got %q" .Values.broker.chatgpt.fileName) -}}
+{{- end -}}
+{{- if include "dekopon.chatgptEnabled" . -}}
+{{- if eq .Values.broker.chatgpt.subdir .Values.gateway.chatgpt.subdir -}}
+{{- $problems = append $problems (printf "broker.chatgpt.subdir and gateway.chatgpt.subdir are both %q. They are separate refresh-token families and must not share a directory: the refresh token rotates and the authorization server retires its predecessor, so two holders of one file eventually revoke the family for both." .Values.broker.chatgpt.subdir) -}}
+{{- end -}}
+{{- if eq (printf "broker-%s" .Values.broker.chatgpt.fileName) .Values.gateway.chatgpt.fileName -}}
+{{- $problems = append $problems (printf "gateway.chatgpt.fileName %q collides with the projected source path of broker.chatgpt.fileName %q; rename one" .Values.gateway.chatgpt.fileName .Values.broker.chatgpt.fileName) -}}
+{{- end -}}
+{{- end -}}
+{{- if $problems -}}
+{{- fail (printf "broker.chatgpt is misconfigured: %s" (join "; " $problems)) -}}
+{{- end -}}
+{{- end -}}
+
 {{/* The containers stop in SEQUENCE, so the pod's grace is the sum of both drains, not the larger
 of the two. Whichever daemon is still draining when the grace expires is SIGKILLed, and for the
 broker that lands mid-invocation and mid-audit-append. */}}
@@ -360,8 +438,8 @@ broker that lands mid-invocation and mid-audit-append. */}}
 {{- end -}}
 
 {{- $bootstrapNames := dict "broker.yaml" true "policies.cedar" true "broker-credentials.yaml" true "secret-map.yaml" true "dekopond.yaml" true -}}
-{{- if include "dekopon.chatgptEnabled" . -}}
-{{- $_ := set $bootstrapNames .Values.gateway.chatgpt.fileName true -}}
+{{- range (include "dekopon.seedFiles" . | fromYamlArray) -}}
+{{- $_ := set $bootstrapNames .source true -}}
 {{- end -}}
 {{- range .Values.broker.secretBootstrapFiles -}}
 {{- if or (not .file) (not .existingSecret) (not .existingSecretKey) -}}
@@ -515,6 +593,14 @@ Arguments: dict "ctx" $ "sidecar" bool
     - name: state
       mountPath: {{ $.Values.paths.stateDir }}
       subPath: broker
+{{- if include "dekopon.brokerChatgptEnabled" $ }}
+    # Only the broker-owned credential subdirectory, writable for token rotation, and a sibling of
+    # the broker state subPath rather than a child of it — the same shape the gateway gets for its
+    # own family. The gateway mounts neither this directory nor the claim as a whole.
+    - name: state
+      mountPath: {{ include "dekopon.brokerChatgptDir" $ }}
+      subPath: {{ $.Values.broker.chatgpt.subdir }}
+{{- end }}
 {{- range $.Values.broker.secretSourceVolumes }}
     - name: {{ .name }}
       mountPath: {{ .mountPath }}

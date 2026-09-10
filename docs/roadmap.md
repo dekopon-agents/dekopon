@@ -9,7 +9,7 @@ Roadmap items describe sequencing. They are intentions, not shipped behavior, no
 - `dekopon policy explain` and `auth can-i`: ask the broker for the determining policy identifiers without making an effect happen. This is also the first CLI-to-broker integration and inherits that whole boundary discussion.
 - Cedar context conditioned on arbitrary provider input. Untrusted open JSON has no settled schema; the public DRN is the narrow exception that proves the rule, since one strongly typed top-level resource goes through a separate `secret.use` action and can never widen its owner binding.
 - Actor kind, human versus service, in policy context. The broker knows it and policy cannot read it. Cheap to add and easy to add wrongly, since it invites rules that look like identity checks but are transport facts.
-- The principal axis of credential selection — approve as the person who asked. That costs one entry per human in a file that otherwise declares capabilities and agents, plus a per-person token to manage.
+- The principal axis of credential selection — approve as the person who asked. That requires per-person credentials and explicit authorization. The legacy `credential`/`credentialByAgent` bindings will be replaced by public DRNs, so this must build on that direction rather than add another legacy override ([migration requirements](design.md#legacy-credential-bindings)).
 
 ## Intended package namespace
 

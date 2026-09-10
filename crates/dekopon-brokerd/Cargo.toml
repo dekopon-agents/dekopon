@@ -20,6 +20,7 @@ clap.workspace = true
 dekopon-broker.workspace = true
 dekopon-broker-host.workspace = true
 dekopon-http-host.workspace = true
+dekopon-model.workspace = true
 dekopon-broker-protocol.workspace = true
 dekopon-capability.workspace = true
 dekopon-core.workspace = true

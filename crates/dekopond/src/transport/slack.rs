@@ -15,9 +15,9 @@ use std::{
     time::Duration,
 };
 
+use dekopon_agent::attachment::GeneratedImage;
 use dekopon_broker_protocol::ChatTransportKind;
 use dekopon_core::{ExternalSubject, Redacted};
-use dekopon_model::image::GeneratedImage;
 use futures_util::{SinkExt as _, StreamExt as _, future::BoxFuture};
 use serde_json::{Value, json};
 use tokio::{net::TcpStream, time::timeout};
@@ -534,10 +534,10 @@ impl ChatReplier for SlackReplier {
             let ReplyTarget::Slack { channel, thread_ts } = target else {
                 return Err(TransportError::Response);
             };
-            let OutboundReply { text, image } = reply;
-            if let Some(image) = image {
+            let OutboundReply { text, images } = reply;
+            if !images.is_empty() {
                 return self
-                    .upload_generated_image(channel, thread_ts, text, image)
+                    .upload_attachments(channel, thread_ts, text, images)
                     .await;
             }
             // A `markdown` block, so Slack translates the model's CommonMark instead of this
@@ -613,15 +613,51 @@ impl ChatReplier for SlackReplier {
 }
 
 impl SlackReplier {
-    /// Uses Slack's current external-upload flow. The service-selected upload URL receives only
-    /// image bytes; the bot token returns to the fixed Web API origin for completion.
-    async fn upload_generated_image(
+    /// Uses Slack's current external-upload flow, once per attachment.
+    ///
+    /// The service-selected upload URL receives only image bytes; the bot token returns to the fixed
+    /// Web API origin for completion. The answer text rides the first upload's `initial_comment`, so
+    /// a reply with several attachments still posts one comment rather than repeating itself.
+    async fn upload_attachments(
         &self,
         channel: String,
         thread_ts: Option<String>,
         text: String,
-        image: GeneratedImage,
+        images: Vec<GeneratedImage>,
     ) -> Result<DeliveryReceipt, TransportError> {
+        let mut accepted = 0_usize;
+        let mut last = None;
+        for (index, image) in images.into_iter().enumerate() {
+            let comment = (index == 0)
+                .then_some(text.as_str())
+                .filter(|text| !text.is_empty());
+            match self
+                .upload_attachment(&channel, thread_ts.as_deref(), comment, image, index)
+                .await
+            {
+                Ok(receipt) => {
+                    accepted += 1;
+                    last = Some(receipt);
+                }
+                // The first attachment is already in the conversation, so this is a reply that
+                // arrived in part rather than one that never arrived.
+                Err(_) if accepted > 0 => return Err(TransportError::PartialDelivery),
+                Err(error) => return Err(error),
+            }
+        }
+        last.ok_or(TransportError::Response)
+    }
+
+    /// Uploads exactly one attachment and completes it into the conversation.
+    async fn upload_attachment(
+        &self,
+        channel: &str,
+        thread_ts: Option<&str>,
+        initial_comment: Option<&str>,
+        image: GeneratedImage,
+        index: usize,
+    ) -> Result<DeliveryReceipt, TransportError> {
+        let filename = image.filename(index);
         let length = image.bytes().len().to_string();
         let described = check_ok(
             self.http
@@ -630,7 +666,7 @@ impl SlackReplier {
                     "authorization",
                     format!("Bearer {}", self.bot_token.expose()),
                 )
-                .form(&[("filename", image.filename()), ("length", length.as_str())])
+                .form(&[("filename", filename.as_str()), ("length", length.as_str())])
                 .send()
                 .await
                 .map_err(|source| TransportError::Request(Box::new(source)))?,
@@ -662,14 +698,14 @@ impl SlackReplier {
         }
 
         let mut body = json!({
-            "files": [{"id": file_id, "title": "Generated image"}],
+            "files": [{"id": file_id, "title": filename}],
             "channel_id": channel,
         });
-        if !text.is_empty() {
-            body["initial_comment"] = Value::String(text);
+        if let Some(initial_comment) = initial_comment {
+            body["initial_comment"] = Value::String(initial_comment.to_owned());
         }
         if let Some(thread_ts) = thread_ts {
-            body["thread_ts"] = Value::String(thread_ts);
+            body["thread_ts"] = Value::String(thread_ts.to_owned());
         }
         #[allow(
             clippy::map_err_ignore,

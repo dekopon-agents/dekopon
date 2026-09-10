@@ -28,7 +28,7 @@ no-op and the final reply is unchanged.
 | Credential | Prefix | Purpose | Environment variable |
 |---|---|---|---|
 | App-level token | `xapp-…` | Opens the outbound Socket Mode connection | `DEKOPOND_SLACK_APP_TOKEN` |
-| Bot User OAuth Token | `xoxb-…` | Identifies the bot, publishes activity/text or generated-image replies, and reads attachments | `DEKOPOND_SLACK_BOT_TOKEN` |
+| Bot User OAuth Token | `xoxb-…` | Identifies the bot, publishes activity/text or attachment replies, and reads attachments | `DEKOPOND_SLACK_BOT_TOKEN` |
 
 Neither token belongs in the app manifest or a Dekopon configuration file.
 
@@ -42,7 +42,7 @@ Neither token belongs in the app manifest or a Dekopon configuration file.
    Slack assigned to the app. Use that URL to return directly to these settings later.
 
 Both manifests enable Socket Mode and the App Home messages tab. Both include `files:write` for
-bounded generated-image replies; remove it only when no route names an image generator. The classic profile adds
+bounded provider-attachment replies; remove it only when no route sets `providerAttachments`. The classic profile adds
 `reactions:write` for the explicitly configured fallback; remove that scope and leave activity off
 if the classic deployment wants final replies only. The Agent profile additionally adds
 `agent_view`, `assistant:write`, and `agent_session_stopped`, plus the `app_home_opened` event Slack
@@ -80,15 +80,15 @@ commit. Use **Revoke** in the token details if it is exposed.
 If the app was already installed, open **OAuth & Permissions** directly to find the bot token. If
 bot scopes change later, select **Reinstall to Workspace** so the new scopes take effect.
 
-## Configure generated image replies
+## Configure attachment replies
 
 Slack's current file path is `files.getUploadURLExternal` → a tokenless upload to Slack's returned,
-origin-checked URL → `files.completeUploadExternal` with the authenticated channel/thread. The bot
-token is attached only to the two fixed Slack Web API calls and never to the upload URL. A route
-must explicitly name a configured image generator before the model sees `generate_image`; otherwise
-reply behavior stays text-only and `files:write` is unused. See
-[`../../docs/dekopond.md#generated-images`](../../docs/dekopond.md#generated-images) for configuration
-and bounds.
+origin-checked URL → `files.completeUploadExternal` with the authenticated channel/thread, once per
+attachment. The bot token is attached only to the two fixed Slack Web API calls and never to the
+upload URL. A route must set `providerAttachments` before a capability's files are delivered at all;
+otherwise reply behavior stays text-only and `files:write` is unused. See
+[`../../docs/dekopond.md#provider-attachments-and-chat-asset-inputs`](../../docs/dekopond.md#provider-attachments-and-chat-asset-inputs)
+for the conventions and their bounds.
 
 ## Configure in-flight activity
 

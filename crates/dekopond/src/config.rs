@@ -21,7 +21,7 @@ use dekopon_broker_protocol::{
     BrokerSocketDiscovery, DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, ProtocolError,
     ResolvedBrokerSocket,
 };
-use dekopon_core::{AgentId, FileHygieneError, FileTier, read_trusted_file};
+use dekopon_core::{AgentId, CapabilityId, FileHygieneError, FileTier, read_trusted_file};
 use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
 use serde::Deserialize;
 use thiserror::Error;
@@ -130,9 +130,6 @@ pub struct DekopondConfig {
     pub broker: BrokerConfig,
     pub transports: Vec<TransportConfig>,
     pub models: Vec<ModelConfig>,
-    /// The gateway's image-generation backend. Absent unless a route opts in.
-    #[serde(default)]
-    pub image_generator: Option<ImageGeneratorConfig>,
     pub routes: Vec<RouteConfig>,
     #[serde(default)]
     pub sessions: SessionsConfig,
@@ -344,21 +341,17 @@ impl ModelConfig {
     }
 }
 
-/// The gateway's one image-generation backend.
+/// What a route may deliver from the attachments an authorized capability produced.
 ///
-/// The endpoint is OpenAI's public Images API, fixed inside `dekopon-model`; authored configuration
-/// chooses only the model, credential variable, and deadline. This keeps model output from
-/// selecting where a credential or image prompt is sent. One gateway configures at most one image
-/// generator, and a route either opts into it or does not.
-#[derive(Clone, Debug, Deserialize)]
+/// Provider bytes reaching a chat conversation is new reach, so an owner grants it per route rather
+/// than a provider declaring it. Absence is the default and means a capability result's reserved
+/// `attachments` key is stripped and refused, which is what keeps a newly granted capability from
+/// silently starting to post files.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct ImageGeneratorConfig {
-    /// Configured image model identifier.
-    pub model: String,
-    /// Environment variable naming the model credential; never the credential itself.
-    pub api_key_env: String,
-    /// Whole-request deadline in milliseconds.
-    pub timeout_ms: u64,
+pub struct ProviderAttachmentsConfig {
+    /// Attachments one reply may carry, across every capability call the session makes.
+    pub max_per_reply: u8,
 }
 
 /// Which conversations on a transport a route claims.
@@ -507,9 +500,15 @@ pub struct RouteConfig {
     /// Overrides model-class selection for this route.
     #[serde(default)]
     pub model: Option<String>,
-    /// Explicitly enables the gateway's image generator for this route.
+    /// Lets this route deliver the attachments an authorized capability produced.
     #[serde(default)]
-    pub image_generator: bool,
+    pub provider_attachments: Option<ProviderAttachmentsConfig>,
+    /// Capabilities whose input may name a chat attachment as `chat-asset:<N>`.
+    ///
+    /// A capability absent from this list keeps such a string verbatim, and the provider decides
+    /// what to do with it. Listing one is what lets a sender's attachment bytes reach it.
+    #[serde(default)]
+    pub chat_asset_inputs: Vec<CapabilityId>,
     /// Offers the `suggest_improvement` tool on this route's sessions.
     ///
     /// Opt-in because the suggestion record carries model-authored text to the telemetry sink
@@ -567,8 +566,10 @@ pub struct ResolvedRoute {
     pub agent: AgentId,
     /// Overrides model-class selection for this route.
     pub model: Option<String>,
-    /// Whether this route may generate images, already proved against the configured generator.
-    pub image_generator: bool,
+    /// Attachments one reply on this route may carry; zero for a route that delivers none.
+    pub provider_attachments: u8,
+    /// Capabilities whose input may name a chat attachment as `chat-asset:<N>`.
+    pub chat_asset_inputs: Vec<CapabilityId>,
     /// Whether this route's sessions may record improvement suggestions.
     pub improvement_suggestions: bool,
     pub limits: RouteLimits,
@@ -655,7 +656,6 @@ pub struct ResolvedConfig {
     pub broker: ResolvedBroker,
     pub transports: Vec<TransportConfig>,
     pub models: Vec<ModelConfig>,
-    pub image_generator: Option<ImageGeneratorConfig>,
     pub routes: Vec<ResolvedRoute>,
     pub sessions: SessionsConfig,
     pub shutdown_grace: Duration,
@@ -754,7 +754,7 @@ pub(crate) fn resolve(
     // resolves, which is exactly why `dekopon-config` leaves duplicates out of `drops_resource`.
     let mut transports_incomplete = config.transports.is_empty();
     let mut transport_names = BTreeSet::new();
-    // Transports that cannot carry a generated image, recorded before validation so the route
+    // Transports that cannot carry an attachment at all, recorded before validation so the route
     // pairing check below does not pass merely because this transport had a problem of its own.
     let mut text_only_transports = BTreeSet::new();
     let mut transports = Vec::with_capacity(config.transports.len());
@@ -912,16 +912,6 @@ pub(crate) fn resolve(
         }
     }
 
-    if let Some(generator) = &config.image_generator {
-        if generator.model.trim().is_empty() {
-            problems.push(ConfigProblem::UnnamedImageModel);
-        }
-        if generator.timeout_ms == 0 {
-            problems.push(ConfigProblem::InvalidImageGeneratorTimeout);
-        }
-        check_env_name(&generator.api_key_env, &mut problems);
-    }
-
     let mut routes = Vec::with_capacity(config.routes.len());
     for route in config.routes {
         if !transports_incomplete && !transport_names.contains(&route.transport) {
@@ -937,15 +927,21 @@ pub(crate) fn resolve(
                 model: model.clone(),
             });
         }
-        if route.image_generator && config.image_generator.is_none() {
-            problems.push(ConfigProblem::UnconfiguredRouteImageGenerator {
+        // A bound of zero is a bound nobody meant to write: the way to deliver no attachments is
+        // to leave the block out, and writing one that can never accept anything would make a
+        // capability's files vanish with the route looking as though it carried them.
+        if route
+            .provider_attachments
+            .is_some_and(|attachments| attachments.max_per_reply == 0)
+        {
+            problems.push(ConfigProblem::InvalidProviderAttachments {
                 agent: route.agent.to_string(),
             });
         }
-        // A generated image on a text-only transport would be paid for, then dropped on the way
-        // out. Refusing the pair at startup is the only place that failure is legible.
-        if route.image_generator && text_only_transports.contains(&route.transport) {
-            problems.push(ConfigProblem::UnsupportedRouteImageGenerator {
+        // A provider attachment on a text-only transport would be authorized, paid for, and then
+        // dropped on the way out. Refusing the pair at startup is the only place that is legible.
+        if route.provider_attachments.is_some() && text_only_transports.contains(&route.transport) {
+            problems.push(ConfigProblem::UnsupportedRouteProviderAttachments {
                 transport: route.transport.clone(),
             });
         }
@@ -985,7 +981,10 @@ pub(crate) fn resolve(
             r#match: route.r#match,
             agent: route.agent,
             model: route.model,
-            image_generator: route.image_generator,
+            provider_attachments: route
+                .provider_attachments
+                .map_or(0, |attachments| attachments.max_per_reply),
+            chat_asset_inputs: route.chat_asset_inputs,
             improvement_suggestions: route.improvement_suggestions,
             limits: route.limits,
             conversation,
@@ -1070,7 +1069,6 @@ pub(crate) fn resolve(
                 },
                 transports,
                 models: config.models,
-                image_generator: config.image_generator,
                 routes,
                 sessions: config.sessions,
                 shutdown_grace,
@@ -1282,10 +1280,6 @@ pub enum ConfigProblem {
     DuplicateModel { name: String },
     #[error("model {name:?} must have a timeout greater than zero")]
     InvalidModelTimeout { name: String },
-    #[error("the image generator must name a model")]
-    UnnamedImageModel,
-    #[error("the image generator must have a timeout greater than zero")]
-    InvalidImageGeneratorTimeout,
     #[error(
         "Slack transport {name:?} has an activity fallback that cannot take effect; off requires fallback none, and classic native activity requires fallback reaction"
     )]
@@ -1303,11 +1297,11 @@ pub enum ConfigProblem {
     #[error("route names unknown model {model:?}")]
     UnknownRouteModel { model: String },
     #[error(
-        "route for agent {agent:?} enables image generation, but no imageGenerator is configured"
+        "route for agent {agent:?} declares providerAttachments with maxPerReply 0; omit the block to deliver none"
     )]
-    UnconfiguredRouteImageGenerator { agent: String },
-    #[error("transport {transport:?} is text-only and cannot deliver a generated image")]
-    UnsupportedRouteImageGenerator { transport: String },
+    InvalidProviderAttachments { agent: String },
+    #[error("transport {transport:?} is text-only and cannot deliver a provider attachment")]
+    UnsupportedRouteProviderAttachments { transport: String },
     #[error("route for agent {agent:?} must allow at least one step and one capability call")]
     InvalidRouteLimits { agent: String },
     #[error("session bounds must be greater than zero")]
@@ -1348,9 +1342,9 @@ pub enum ConfigProblem {
 /// Renders every problem in one refusal, each followed by its own cause chain.
 ///
 /// The chain is walked here rather than inlined into each problem's message because a problem's
-/// real reason can sit two links down — a credential variable that is unset, under the image
-/// generator that named it — and an aggregate printing only top lines would be a list of headlines
-/// with the reasons removed. Shared by the gateway's three aggregate refusals so they read alike.
+/// real reason can sit two links down — a credential variable that is unset, under the transport
+/// that named it — and an aggregate printing only top lines would be a list of headlines with the
+/// reasons removed. Shared by the gateway's three aggregate refusals so they read alike.
 pub(crate) fn render_problems<P: std::error::Error>(problems: &[P]) -> String {
     let mut rendered = format!(
         "{} validation problem{} found:",

@@ -36,6 +36,11 @@ member ID. Socket Mode means no public HTTP endpoint and no inbound firewall hol
 
 ## 2. Create the token and the credentials file
 
+This example uses the current `credential`/`credentialByAgent` binding path.
+*Committed direction:* it will be replaced by public DRNs
+([migration requirements](../../docs/design.md#legacy-credential-bindings)); keep the existing
+configuration until that migration ships.
+
 A bearer token for the upstream API, scoped as narrowly as that API allows:
 
 - **read** on the record — `http-probe.fetch`
@@ -114,7 +119,6 @@ surprise at 2 a.m.
 ```console
 export DEKOPOND_SLACK_APP_TOKEN=xapp-...
 export DEKOPOND_SLACK_BOT_TOKEN=xoxb-...
-export OPENAI_IMAGE_API_KEY=sk-...
 dekopond --config dekopond.yaml
 ```
 
@@ -253,7 +257,9 @@ What each part is doing:
 - Two `http_calls` — the pre-read and the write, exactly the budget the constraint set allowed.
   `credentialInjected: true` says broker-held authority was presented; the value appears nowhere,
   and `requestBytes` excludes the injected header so its length cannot leak either.
-- `credential: api-token` — *which* authority, by the symbolic name in `broker.yaml`. One example
+- `credential: api-token` — *which* authority, by the symbolic name in `broker.yaml`. This is the
+  current legacy binding, [planned to be replaced by public DRNs](../../docs/design.md#legacy-credential-bindings).
+  One example
   has one token, so it reads as redundant here; a deployment whose constraint set names a different
   credential per agent is one where the two organizations' writes would otherwise be identical
   records.
@@ -280,7 +286,7 @@ metadata-only `event`.
 | Broker exits: `constraint set for X names unknown credential "api-token"` | `broker-credentials.yaml` was never copied, or names the credential differently | startup |
 | Broker exits: `broker credentials must be single-link, owned by the server UID, and unreadable by group and world` | `chmod 600 broker-credentials.yaml` | startup |
 | Broker exits: `constraint set for X allows host "…" outside credential "api-token" destinations` | an `allowedHosts` entry the credential is not bound to | startup |
-| Gateway exits at startup naming a variable | `DEKOPOND_SLACK_APP_TOKEN`, `DEKOPOND_SLACK_BOT_TOKEN`, or `OPENAI_IMAGE_API_KEY` is unset — reported by name, never by value. Delete the `imageGenerator:` block and the route's `imageGenerator: true` if you do not want the third one | startup |
+| Gateway exits at startup naming a variable | `DEKOPOND_SLACK_APP_TOKEN` or `DEKOPOND_SLACK_BOT_TOKEN` is unset — reported by name, never by value | startup |
 | Gateway exits: broker unreachable | the broker is not running, or the two socket paths disagree | the `gateway_broker_ready` probe never logs |
 
 The split matters when you are debugging: a session refused *before* it starts leaves a gateway log

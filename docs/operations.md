@@ -44,6 +44,10 @@ Full append mechanics, bounds, and private-file requirements:
 
 ### Authority, policy, and credentials
 
+The current `credential`/`credentialByAgent` bindings discussed below will be replaced by public
+DRNs. This is committed direction, not an upgrade required today
+([migration requirements](design.md#legacy-credential-bindings)).
+
 | Question | Read |
 |---|---|
 | Who may drive which agent, and where is that written? | [`dekopon-brokerd` § Policy](../crates/dekopon-brokerd/README.md#policy) |

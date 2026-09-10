@@ -12,10 +12,12 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use dekopon_agent::prompt::{
-    AGENT_CONFIG_TOOL_NAME, AssetSource as _, ConversationTurn, DECLINE_REPLY_TOOL_NAME,
-    HistoryLimits, IMAGE_GENERATION_TOOL_NAME, IMPROVEMENT_TOOL_NAME, PromptLimits,
-    SKILL_TOOL_NAME,
+use dekopon_agent::{
+    attachment::{ChatAssetSource as _, GeneratedImage},
+    prompt::{
+        AGENT_CONFIG_TOOL_NAME, AssetSource as _, ConversationTurn, DECLINE_REPLY_TOOL_NAME,
+        HistoryLimits, IMPROVEMENT_TOOL_NAME, PromptLimits, SKILL_TOOL_NAME,
+    },
 };
 use dekopon_broker_protocol::{
     Attestation, AvailableCapability, BrokerRequest, BrokerSocketDiscovery, ChatMemorySurface,
@@ -24,12 +26,9 @@ use dekopon_broker_protocol::{
 };
 use dekopon_config::LocalCatalog;
 use dekopon_core::{ExternalSubject, SecretDrn, SecretUseProposal};
-use dekopon_model::{
-    image::{GeneratedImage, ImageGenerationError, ImageGenerator},
-    model::{
-        AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelFunctionCall, ModelMessage,
-        ModelTool, ModelToolCall,
-    },
+use dekopon_model::model::{
+    AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelFunctionCall, ModelMessage,
+    ModelTool, ModelToolCall,
 };
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
@@ -40,16 +39,16 @@ use crate::{
     cache_key,
     config::{
         self, ActivityMode, ConfigError, ConfigProblem, ConversationPolicy, ConversationScope,
-        ConversationWindow, ImageGeneratorConfig, ModelConfig, NativeActivityConfig,
-        ResolvedBroker, RouteMatch, SlackActivityConfig, SlackActivityFallback, SlackExperience,
+        ConversationWindow, ModelConfig, NativeActivityConfig, ResolvedBroker, RouteMatch,
+        SlackActivityConfig, SlackActivityFallback, SlackExperience,
     },
     conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
     routes::{RouteError, RouteProblem, RoutingTable},
     session::{
-        BUSY_REPLY, CancelAwareInvoker, FAILURE_REPLY, ImageGeneratorStartupError, ModelCache,
-        ModelFactory, SessionCancellation, SessionError, SessionGate, SessionRunner, SharedModel,
-        UNAUTHORIZED_REPLY, UNREPORTED_WORK_REPLY, configured_image_generator, image_credential,
-        memory_record_outcome_category, model_bearer_token, model_credential, run_session,
+        BUSY_REPLY, CancelAwareInvoker, FAILURE_REPLY, ModelCache, ModelFactory,
+        SessionCancellation, SessionError, SessionGate, SessionRunner, SharedModel,
+        UNAUTHORIZED_REPLY, UNREPORTED_WORK_REPLY, memory_record_outcome_category,
+        model_bearer_token, model_credential, run_session,
     },
     transport::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
@@ -79,6 +78,11 @@ fn generated_image() -> GeneratedImage {
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     png.extend_from_slice(b"kitty pixels");
     GeneratedImage::from_png(png).expect("generated PNG fixture")
+}
+
+/// One reply's worth of provider attachments.
+fn generated_images(count: usize) -> Vec<GeneratedImage> {
+    (0..count).map(|_| generated_image()).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -176,8 +180,8 @@ async fn a_complete_configuration_resolves_with_documented_defaults() {
 
     assert_eq!(resolved.transports.len(), 1);
     assert_eq!(resolved.routes.len(), 1);
-    assert!(resolved.image_generator.is_none());
-    assert!(!resolved.routes[0].image_generator);
+    assert_eq!(resolved.routes[0].provider_attachments, 0);
+    assert!(resolved.routes[0].chat_asset_inputs.is_empty());
     assert_eq!(resolved.sessions.max_concurrent, 4);
     assert!(resolved.sessions.reply_on_busy);
     assert_eq!(resolved.routes[0].limits.max_steps, 8);
@@ -226,78 +230,62 @@ async fn an_explicit_shared_scope_survives_resolution_and_route_binding() {
 }
 
 #[tokio::test]
-async fn image_generation_is_configured_once_and_route_opt_in() {
+async fn provider_attachments_and_chat_asset_inputs_are_per_route_opt_ins() {
     let directory = temporary();
     let mut document = document(directory.path());
-    document["imageGenerator"] = json!({
-        "model": "gpt-image-1",
-        "apiKeyEnv": "OPENAI_IMAGE_API_KEY",
-        "timeoutMs": 120_000
-    });
-    document["routes"][0]["imageGenerator"] = json!(true);
+    document["routes"][0]["providerAttachments"] = json!({"maxPerReply": 2});
+    document["routes"][0]["chatAssetInputs"] = json!(["echo.echo"]);
 
     let resolved = load(directory.path(), &document)
         .await
-        .expect("an explicitly enabled image generator resolves");
+        .expect("both opt-ins resolve");
 
-    let generator = resolved
-        .image_generator
-        .as_ref()
-        .expect("the gateway configures one generator");
-    assert_eq!(generator.model, "gpt-image-1");
-    assert_eq!(generator.api_key_env, "OPENAI_IMAGE_API_KEY");
-    assert!(resolved.routes[0].image_generator);
-    let routes = RoutingTable::bind(&resolved, &catalog(true, Some("reasoning")))
-        .expect("the route binds the configured generator");
-    assert!(
-        routes
-            .route("dev", &ConversationKind::DirectMessage)
-            .expect("route matches")
-            .image_generator
+    assert_eq!(resolved.routes[0].provider_attachments, 2);
+    assert_eq!(
+        resolved.routes[0]
+            .chat_asset_inputs
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        ["echo.echo".to_owned()]
     );
+    let routes = RoutingTable::bind(&resolved, &catalog_with_capability())
+        .expect("the route binds both opt-ins");
+    let bound = routes
+        .route("dev", &ConversationKind::DirectMessage)
+        .expect("route matches");
+    assert_eq!(bound.provider_attachments, 2);
+    assert_eq!(&*bound.chat_asset_inputs, ["echo.echo".to_owned()]);
 }
 
-#[test]
-fn a_missing_image_model_credential_fails_before_chat_starts() {
-    let variable = "DEKOPOND_TEST_MISSING_IMAGE_KEY_7C83E9";
-    assert!(
-        std::env::var_os(variable).is_none(),
-        "fixture must stay unset"
+/// A capability nothing in the catalog defines can never expand a marker, and a route naming one is
+/// an authoring mistake that would otherwise look exactly like a provider refusing its own input.
+#[tokio::test]
+async fn unknown_chat_asset_capabilities_are_all_reported_at_startup() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["routes"][0]["chatAssetInputs"] =
+        json!(["echo.echo", "gpt-image.edit", "gpt-image.generate"]);
+    let resolved = load(directory.path(), &document)
+        .await
+        .expect("the identifiers are well formed");
+
+    let error = RoutingTable::bind(&resolved, &catalog_with_capability())
+        .expect_err("two of the three are not in the catalog");
+
+    let named = error
+        .problems
+        .iter()
+        .filter_map(|problem| match problem {
+            RouteProblem::UnknownChatAssetCapability { capability } => Some(capability.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        named,
+        ["gpt-image.edit".to_owned(), "gpt-image.generate".to_owned()],
+        "every unknown identifier is named in one refusal: {error}"
     );
-    let configured = ImageGeneratorConfig {
-        model: "gpt-image-1".to_owned(),
-        api_key_env: variable.to_owned(),
-        timeout_ms: 120_000,
-    };
-    let error = match configured_image_generator(Some(&configured), true) {
-        Err(error) => error,
-        Ok(_) => panic!("a named credential is required at startup"),
-    };
-
-    assert!(matches!(
-        &error,
-        ImageGeneratorStartupError::Credential {
-            source: TransportError::MissingCredential { .. },
-            ..
-        }
-    ));
-    let diagnostic = error.to_string();
-    assert!(diagnostic.contains(variable));
-
-    // Exported but blank is the same refusal, not a generator that starts with a blank key.
-    let blank = image_credential(variable, Some(OsString::from("   ")))
-        .expect_err("a blank credential is the absence of one presented as presence");
-    assert!(matches!(
-        &blank,
-        ImageGeneratorStartupError::Credential {
-            source: TransportError::EmptyCredential { .. },
-            ..
-        }
-    ));
-
-    let unused = configured_image_generator(Some(&configured), false)
-        .expect("an unreferenced generator reads no credential");
-    assert!(unused.is_none());
 }
 
 /// The cancellation boundary must not narrow what a proposal may carry.
@@ -644,29 +632,29 @@ async fn whatsapp_configuration_is_explicit_strict_and_pinned() {
         );
     }
 
-    // The transport is text-only. A route that pairs it with an image generator would pay a model
-    // for a PNG this transport has no way to deliver, so the pair is refused at startup rather
-    // than dropped at reply time.
+    // The transport is text-only. A route that pairs it with provider attachments would authorize
+    // and pay for a PNG this transport has no way to deliver, so the pair is refused at startup
+    // rather than dropped at reply time.
     let mut with_images = document.clone();
-    with_images["imageGenerator"] = json!({
-        "model": "gpt-image-1",
-        "apiKeyEnv": "OPENAI_IMAGE_API_KEY",
-        "timeoutMs": 120_000
-    });
-    with_images["routes"][0]["imageGenerator"] = json!(true);
+    with_images["routes"][0]["providerAttachments"] = json!({"maxPerReply": 1});
     let error = load(directory.path(), &with_images)
         .await
-        .expect_err("a text-only transport cannot carry a generated image");
+        .expect_err("a text-only transport cannot carry a provider attachment");
     assert!(
         reports(&error, |problem| matches!(
             problem,
-            ConfigProblem::UnsupportedRouteImageGenerator { .. }
+            ConfigProblem::UnsupportedRouteProviderAttachments { .. }
         )),
         "the refusal must name the transport pairing: {error:?}"
     );
+    let rendered = error.to_string();
     assert!(
-        error.to_string().contains("text-only"),
-        "the refusal names why: {error}"
+        rendered.contains("text-only"),
+        "the refusal names why: {rendered}"
+    );
+    assert!(
+        rendered.contains("support-whatsapp"),
+        "the refusal names the transport: {rendered}"
     );
 }
 
@@ -764,75 +752,57 @@ async fn invalid_configurations_fail_closed_at_startup() {
             |error| matches!(error, ConfigError::Decode { .. }),
         ),
         (
-            "unknown field inside the image generator",
+            // The gateway block and the route flag are both gone. A configuration that still names
+            // either one is a startup refusal carrying the unknown field's name, not a gateway that
+            // quietly ignores an operator's intention to draw.
+            "a retired imageGenerator gateway block",
             mutate(|document| {
                 document["imageGenerator"] = json!({
                     "model": "gpt-image-1",
-                    "apiKeyEnv": "OPENAI_IMAGE_API_KEY",
-                    "timeoutMs": 120_000,
-                    "endpoint": "https://attacker.example"
-                });
-            }),
-            |error| matches!(error, ConfigError::Decode { .. }),
-        ),
-        (
-            "image generator with a blank model",
-            mutate(|document| {
-                document["imageGenerator"] = json!({
-                    "model": "  ",
                     "apiKeyEnv": "OPENAI_IMAGE_API_KEY",
                     "timeoutMs": 120_000
                 });
             }),
             |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::UnnamedImageModel)
-                })
+                matches!(error, ConfigError::Decode { source }
+                    if source.to_string().contains("imageGenerator"))
             },
         ),
         (
-            "invalid image credential environment name",
-            mutate(|document| {
-                document["imageGenerator"] = json!({
-                    "model": "gpt-image-1",
-                    "apiKeyEnv": "sk-live-secret-not-a-name",
-                    "timeoutMs": 120_000
-                });
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::InvalidEnvironmentName { .. })
-                })
-            },
-        ),
-        (
-            "zero image generator timeout",
-            mutate(|document| {
-                document["imageGenerator"] = json!({
-                    "model": "gpt-image-1",
-                    "apiKeyEnv": "OPENAI_IMAGE_API_KEY",
-                    "timeoutMs": 0
-                });
-            }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::InvalidImageGeneratorTimeout)
-                })
-            },
-        ),
-        (
-            "route enables image generation with none configured",
+            "a retired imageGenerator route flag",
             mutate(|document| {
                 document["routes"][0]["imageGenerator"] = json!(true);
             }),
             |error| {
+                matches!(error, ConfigError::Decode { source }
+                    if source.to_string().contains("imageGenerator"))
+            },
+        ),
+        (
+            "unknown field inside providerAttachments",
+            mutate(|document| {
+                document["routes"][0]["providerAttachments"] =
+                    json!({"maxPerReply": 1, "maxBytes": 8});
+            }),
+            |error| matches!(error, ConfigError::Decode { .. }),
+        ),
+        (
+            "providerAttachments that can never carry one",
+            mutate(|document| {
+                document["routes"][0]["providerAttachments"] = json!({"maxPerReply": 0});
+            }),
+            |error| {
                 reports(error, |problem| {
-                    matches!(
-                        problem,
-                        ConfigProblem::UnconfiguredRouteImageGenerator { .. }
-                    )
+                    matches!(problem, ConfigProblem::InvalidProviderAttachments { .. })
                 })
             },
+        ),
+        (
+            "a chat-asset input that is not a capability identifier",
+            mutate(|document| {
+                document["routes"][0]["chatAssetInputs"] = json!(["Not A Capability"]);
+            }),
+            |error| matches!(error, ConfigError::Decode { .. }),
         ),
         (
             "unknown route match kind",
@@ -1666,6 +1636,23 @@ fn catalog(enabled: bool, model_class: Option<&str>) -> LocalCatalog {
     .expect("catalog fixture parses")
 }
 
+/// The same catalog with one capability in it, for the route fields that name one.
+fn catalog_with_capability() -> LocalCatalog {
+    let text = format!(
+        "{}---\napiVersion: dekopon.dev/v1alpha1\n\
+         kind: Provider\nmetadata:\n  name: echo\n\
+         spec:\n  description: Echoes its input\n  type: http\n  credentialRef: echo-token\n\
+         status: Unknown\n\
+         ---\napiVersion: dekopon.dev/v1alpha1\n\
+         kind: Capability\nmetadata:\n  name: echo.echo\n\
+         spec:\n  description: Echoes its input\n  provider: echo\n  effect: read-only\n  \
+         risk: Low\n  idempotency: idempotent\nstatus: Unknown\n",
+        catalog_text(true, Some("reasoning"))
+    );
+    LocalCatalog::from_str(Path::new("dekopon.yaml"), &text)
+        .expect("catalog fixture with a capability parses")
+}
+
 async fn resolved(directory: &Path, document: &Value) -> crate::ResolvedConfig {
     load(directory, document)
         .await
@@ -2213,6 +2200,7 @@ fn answer(text: &str) -> AssistantTurn {
     }
 }
 
+/// The tool the gateway used to offer and no longer does.
 fn generate_image(prompt: &str) -> AssistantTurn {
     AssistantTurn {
         content: None,
@@ -2220,7 +2208,7 @@ fn generate_image(prompt: &str) -> AssistantTurn {
             id: "image-call".to_owned(),
             kind: "function".to_owned(),
             function: ModelFunctionCall {
-                name: IMAGE_GENERATION_TOOL_NAME.to_owned(),
+                name: "generate_image".to_owned(),
                 arguments: json!({"prompt": prompt}).to_string(),
             },
         }],
@@ -2350,7 +2338,7 @@ fn inspect_agent_config() -> AssistantTurn {
 #[derive(Default)]
 struct RecordingReplier {
     replies: Mutex<Vec<String>>,
-    image_bytes: Mutex<Vec<usize>>,
+    image_bytes: Mutex<Vec<Vec<usize>>>,
 }
 
 impl RecordingReplier {
@@ -2358,7 +2346,8 @@ impl RecordingReplier {
         self.replies.lock().expect("reply lock").clone()
     }
 
-    fn image_bytes(&self) -> Vec<usize> {
+    /// One entry per reply, each listing that reply's attachment byte counts in order.
+    fn image_bytes(&self) -> Vec<Vec<usize>> {
         self.image_bytes.lock().expect("image reply lock").clone()
     }
 }
@@ -2371,12 +2360,13 @@ impl ChatReplier for RecordingReplier {
     ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
         Box::pin(async move {
             self.replies.lock().expect("reply lock").push(reply.text);
-            if let Some(image) = reply.image {
-                self.image_bytes
-                    .lock()
-                    .expect("image reply lock")
-                    .push(image.bytes().len());
-            }
+            self.image_bytes.lock().expect("image reply lock").push(
+                reply
+                    .images
+                    .iter()
+                    .map(|image| image.bytes().len())
+                    .collect(),
+            );
             Ok(DeliveryReceipt::new("test-acceptance"))
         })
     }
@@ -2585,6 +2575,14 @@ fn record_result(outcome: InvocationOutcome, error: Option<&str>) -> InvocationR
     .expect("record result fixture decodes")
 }
 
+/// A successful result whose output is whatever a provider chose to return.
+fn record_output(output: Value) -> InvocationResult {
+    InvocationResult {
+        output: Some(output),
+        ..record_result(InvocationOutcome::Succeeded, None)
+    }
+}
+
 /// Serves a fixed script of broker responses over a private Unix socket.
 ///
 /// A real socket rather than an in-memory duplex, because the client authenticates the server by
@@ -2636,7 +2634,8 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         instructions: Some("Answer briefly.".to_owned()),
         skills: Arc::from(Vec::new()),
         model: Arc::new(model),
-        image_generator: false,
+        provider_attachments: 0,
+        chat_asset_inputs: Arc::from(Vec::new()),
         improvement_suggestions: false,
         limits: PromptLimits {
             max_steps: 4,
@@ -2818,7 +2817,6 @@ fn runner_tracking(
             Duration::from_secs(60 * 60),
         )),
         asset_fetchers: HashMap::new(),
-        image_generator: None,
         activities: HashMap::new(),
         thread_ownership: HashMap::new(),
         active_sessions: Default::default(),
@@ -2943,38 +2941,32 @@ async fn an_authorized_message_reaches_its_agent_and_answers_in_chat() {
     assert_eq!(claim.scope.expect("chat scope").transport.as_str(), "dev");
 }
 
-struct TestImageGenerator;
-
-impl ImageGenerator for TestImageGenerator {
-    fn generate(&self, _prompt: &str) -> Result<GeneratedImage, ImageGenerationError> {
-        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
-        png.extend_from_slice(b"kitty pixels");
-        GeneratedImage::from_png(png)
-    }
+/// One capability result offering one PNG the way a provider does.
+fn attachment_output() -> Value {
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.extend_from_slice(b"kitty pixels");
+    json!({
+        "attachments": [{"mediaType": "image/png", "base64": STANDARD.encode(&png)}],
+        "image": {"generationId": "gen-7"}
+    })
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_explicit_route_generator_yields_an_image_reply() {
+async fn a_provider_attachment_reaches_the_reply_without_entering_the_transcript() {
     let directory = temporary();
-    let (broker, _) = stub_broker(
+    let (broker, _observed) = stub_broker(
         directory.path(),
-        vec![ResponseEnvelope::capabilities(
-            vec![capability("echo.echo")],
-            Vec::new(),
-        )],
+        vec![
+            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
+            ResponseEnvelope::invocation(record_output(attachment_output())),
+        ],
     )
     .await;
-    let models = ModelScript::new([
-        generate_image("a cheerful watercolor kitten"),
-        answer("Here is your kitty."),
-    ]);
+    let models = ModelScript::new([script_call("echo.echo '{}'"), answer("Here is your kitty.")]);
     let replier = Arc::new(RecordingReplier::default());
-    let mut runner = runner(broker, Arc::clone(&models), 4);
-    Arc::get_mut(&mut runner)
-        .expect("runner is uniquely owned")
-        .image_generator = Some(Arc::new(TestImageGenerator));
+    let runner = runner(broker, Arc::clone(&models), 4);
     let mut route = route(model_config());
-    route.image_generator = true;
+    route.provider_attachments = 1;
 
     run_session(
         runner,
@@ -2985,12 +2977,156 @@ async fn an_explicit_route_generator_yields_an_image_reply() {
     .await;
 
     assert_eq!(replier.replies(), ["Here is your kitty."]);
-    assert_eq!(replier.image_bytes(), [20]);
-    assert_eq!(models.requests(), 2);
+    assert_eq!(replier.image_bytes(), [vec![20]]);
+    let tool = tool_message(&models, 1);
+    assert!(tool.contains("\"attached\""), "{tool}");
+    assert!(tool.contains("\"bytes\""), "{tool}");
+    assert!(
+        !tool.contains(&STANDARD.encode(b"kitty pixels")),
+        "attachment bytes reached the model: {tool}"
+    );
+    assert!(
+        tool.contains("gen-7"),
+        "the ordinary result fields survive: {tool}"
+    );
+}
+
+/// The longest run of base64-alphabet characters anywhere in the text.
+///
+/// A byte count would not say what is wanted here: what must never appear in a transcript is a
+/// *blob*, and a blob is exactly a long unbroken run of that alphabet.
+fn longest_base64_run(text: &str) -> usize {
+    let mut longest = 0_usize;
+    let mut run = 0_usize;
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'/' || byte == b'=' {
+            run += 1;
+            longest = longest.max(run);
+        } else {
+            run = 0;
+        }
+    }
+    longest
+}
+
+/// The point of the convention: the bytes reach chat and never the model.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_model_message_in_a_session_carries_an_attachment_blob() {
+    let directory = temporary();
+    // Well past the shell's own clamping, so a transcript that carried the blob would carry a
+    // recognisable run of it rather than something a 1 KiB threshold could miss.
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    png.extend(std::iter::repeat_n(b'Z', 64 * 1024));
+    let output = json!({
+        "attachments": [{"mediaType": "image/png", "base64": STANDARD.encode(&png)}]
+    });
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![
+            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
+            ResponseEnvelope::invocation(record_output(output)),
+        ],
+    )
+    .await;
+    let models = ModelScript::new([script_call("echo.echo '{}'"), answer("Posted.")]);
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let mut route = route(model_config());
+    route.provider_attachments = 1;
+
+    run_session(
+        runner,
+        route,
+        message("draw me a kitty cat"),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert_eq!(replier.image_bytes(), [vec![png.len()]]);
+    for request in 0..models.requests() {
+        let transcript = models
+            .prompt(request)
+            .into_iter()
+            .map(|(role, content)| format!("{role}:{content}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let longest = longest_base64_run(&transcript);
+        assert!(
+            longest <= 1024,
+            "request {request} carried a {longest}-character base64 run"
+        );
+    }
+}
+
+/// The key is stripped even where nothing can deliver it, and the model is told why in one sentence.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_without_the_opt_in_strips_the_attachment_and_says_so() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![
+            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
+            ResponseEnvelope::invocation(record_output(attachment_output())),
+        ],
+    )
+    .await;
+    let models = ModelScript::new([
+        script_call("echo.echo '{}'"),
+        answer("I cannot attach that."),
+    ]);
+    let replier = Arc::new(RecordingReplier::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+
+    run_session(
+        runner,
+        route(model_config()),
+        message("draw me a kitty cat"),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert_eq!(replier.image_bytes(), [Vec::<usize>::new()]);
+    let tool = tool_message(&models, 1);
+    assert!(tool.contains("\"attached\":[]"), "{tool}");
+    assert!(tool.contains("cannot carry attachments"), "{tool}");
+    assert!(
+        !tool.contains(&STANDARD.encode(b"kitty pixels")),
+        "attachment bytes reached the model: {tool}"
+    );
+}
+
+/// The meta tool is gone, so the name is simply not a tool this session offers.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_model_call_to_generate_image_is_now_an_unknown_tool() {
+    let directory = temporary();
+    let (broker, _) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("echo.echo")],
+            Vec::new(),
+        )],
+    )
+    .await;
+    let models = ModelScript::new([generate_image("a cheerful watercolor kitten")]);
+    let replier = Arc::new(RecordingReplier::default());
+
+    run_session(
+        runner(broker, Arc::clone(&models), 4),
+        route(model_config()),
+        message("draw me a kitty cat"),
+        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+    )
+    .await;
+
+    assert_eq!(replier.replies(), [FAILURE_REPLY]);
+    assert_eq!(replier.image_bytes(), [Vec::<usize>::new()]);
     assert!(
         models
             .tool_names(0)
-            .contains(&IMAGE_GENERATION_TOOL_NAME.to_owned())
+            .iter()
+            .all(|name| name != "generate_image"),
+        "no session offers the removed tool: {:?}",
+        models.tool_names(0)
     );
 }
 
@@ -7580,7 +7716,7 @@ async fn slack_uploads_one_generated_png_without_sending_the_token_to_the_upload
                 channel: "d0123abc".to_owned(),
                 thread_ts: Some("1712345678.000100".to_owned()),
             },
-            OutboundReply::with_image("Here is your kitty.", generated_image()),
+            OutboundReply::with_images("Here is your kitty.", generated_images(1)),
         )
         .await
         .expect("the complete file share is accepted");
@@ -7627,6 +7763,51 @@ fn slack_generated_upload_urls_are_origin_bounded() {
         "http://127.0.0.1:9001/upload",
         "http://127.0.0.1:9000"
     ));
+}
+
+/// Two attachments are two uploads, and the answer text is posted once.
+#[tokio::test(flavor = "multi_thread")]
+async fn slack_uploads_each_attachment_and_comments_only_on_the_first() {
+    let base = Arc::new(Mutex::new(String::new()));
+    let response_base = Arc::clone(&base);
+    let api = spawn_http_mock(move |path, _body| match path {
+        "/api/files.getUploadURLExternal" => json!({
+            "ok": true,
+            "upload_url": format!("{}/upload", response_base.lock().expect("base lock")),
+            "file_id": "f-generated"
+        }),
+        "/upload" => json!({"uploaded": true}),
+        "/api/files.completeUploadExternal" => {
+            json!({"ok": true, "files": [{"id": "f-generated"}]})
+        }
+        other => panic!("unexpected Slack image call: {other}"),
+    });
+    *base.lock().expect("base lock") = api.base.clone();
+    let replier = slack(&api.base).replier();
+
+    let receipt = replier
+        .reply(
+            ReplyTarget::Slack {
+                channel: "d0123abc".to_owned(),
+                thread_ts: None,
+            },
+            OutboundReply::with_images("Two kittens.", generated_images(2)),
+        )
+        .await
+        .expect("both file shares are accepted");
+    assert!(receipt.accepted());
+
+    let calls = api.calls();
+    assert_eq!(calls.len(), 6, "three calls per attachment");
+    assert!(calls[0].1.contains("filename=generated-image.png"));
+    assert!(calls[3].1.contains("filename=generated-image-2.png"));
+    let first: Value = serde_json::from_str(&calls[2].1).expect("first completion JSON");
+    let second: Value = serde_json::from_str(&calls[5].1).expect("second completion JSON");
+    assert_eq!(first["initial_comment"], "Two kittens.");
+    assert!(
+        second.get("initial_comment").is_none(),
+        "the answer is posted once, not once per attachment: {second}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -8465,6 +8646,111 @@ async fn a_session_stops_opening_attachments_once_its_budget_is_spent() {
     assert!(refusal.contains("already opened"), "{refusal}");
 }
 
+/// A capability input and a model's own reading are separate allowances on purpose.
+///
+/// The model's four-fetch budget is about how much of the conversation it may read; the capability
+/// allowance is about how much one invocation may carry. Spending one from the other would let a
+/// remix exhaust the agent's ability to look at its own attachments.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_capability_input_does_not_spend_the_model_attachment_budget() {
+    let store = Arc::new(asset_store());
+    let arriving = (0..8)
+        .map(|index| pending(&format!("shot{index}.png"), "image/png", 10))
+        .collect();
+    store.assets_for(
+        &private_conversation_key("dev", "c1", SUBJECT),
+        arriving,
+        true,
+        Instant::now(),
+    );
+    let assets = SessionAssets::new(
+        Arc::clone(&store),
+        AssetAccess::one_shot(private_conversation_key("dev", "c1", SUBJECT)),
+        None,
+        tokio::runtime::Handle::current(),
+        true,
+        true,
+    );
+
+    let refusals = tokio::task::spawn_blocking(move || {
+        // No fetcher is wired, so every read fails at the same late check; what is asserted is
+        // which budget each attempt spent.
+        let capability_side = (1..=6)
+            .map(|id| assets.fetch_for_capability(id).expect_err("no fetcher"))
+            .collect::<Vec<_>>();
+        (capability_side, assets.fetch(1).expect_err("no fetcher"))
+    })
+    .await
+    .expect("the blocking task completes");
+
+    let (capability_side, model_side) = refusals;
+    assert!(
+        capability_side
+            .iter()
+            .all(|refusal| *refusal == dekopon_agent::attachment::ChatAssetRefusal::Unavailable),
+        "{capability_side:?}"
+    );
+    assert!(
+        !model_side.contains("already opened"),
+        "six capability inputs must not exhaust the model's own allowance: {model_side}"
+    );
+}
+
+/// A marker only expands for a capability the route listed; everything else keeps the string.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_chat_asset_marker_expands_only_for_a_listed_capability() {
+    struct FixedFetcher(Vec<u8>);
+
+    impl AssetFetcher for FixedFetcher {
+        fn fetch(
+            &self,
+            _source: &AssetSourceRef,
+            _max_bytes: u64,
+        ) -> BoxFuture<'_, Result<Vec<u8>, TransportError>> {
+            let bytes = self.0.clone();
+            Box::pin(async move { Ok(bytes) })
+        }
+    }
+
+    let store = Arc::new(asset_store());
+    store.assets_for(
+        &private_conversation_key("dev", "c1", SUBJECT),
+        vec![pending("shot.png", "image/png", 10)],
+        true,
+        Instant::now(),
+    );
+    let assets = Arc::new(SessionAssets::new(
+        Arc::clone(&store),
+        AssetAccess::one_shot(private_conversation_key("dev", "c1", SUBJECT)),
+        Some(Arc::new(FixedFetcher(b"\x89PNG\r\n\x1a\nshot".to_vec())) as Arc<dyn AssetFetcher>),
+        tokio::runtime::Handle::current(),
+        true,
+        true,
+    ));
+    let inputs = dekopon_agent::attachment::ChatAssetInputs::new(
+        Arc::clone(&assets) as Arc<dyn dekopon_agent::attachment::ChatAssetSource>,
+        vec!["http-probe.conditional-write".to_owned()],
+    );
+
+    assert!(inputs.covers("http-probe.conditional-write"));
+    assert!(!inputs.covers("http-probe.fetch"));
+    let expanded = tokio::task::spawn_blocking(move || {
+        let mut input = json!({"images": ["chat-asset:1"]});
+        let count = inputs.expand(&mut input).expect("one expansion");
+        (count, input)
+    })
+    .await
+    .expect("the blocking task completes");
+    assert_eq!(expanded.0, 1);
+    assert_eq!(
+        expanded.1["images"][0],
+        format!(
+            "data:image/png;base64,{}",
+            STANDARD.encode(b"\x89PNG\r\n\x1a\nshot")
+        )
+    );
+}
+
 #[test]
 fn a_redirect_away_from_slack_is_not_followed() {
     // `client()` refuses redirects globally so a bearer token is never forwarded by policy. The
@@ -8806,7 +9092,7 @@ async fn discord_posts_generated_png_as_a_bounded_multipart_attachment() {
                 channel_id: DISCORD_CHANNEL.to_owned(),
                 reply_to: Some(DISCORD_MESSAGE.to_owned()),
             },
-            OutboundReply::with_image("x".repeat(3_000), generated_image()),
+            OutboundReply::with_images("x".repeat(3_000), generated_images(1)),
         )
         .await
         .expect_err("the second chunk fails after the image was accepted");
@@ -8821,6 +9107,43 @@ async fn discord_posts_generated_png_as_a_bounded_multipart_attachment() {
     assert!(multipart.contains("kitty pixels"));
     assert!(multipart.contains("\"attachments\""));
     assert!(multipart.contains(DISCORD_MESSAGE));
+}
+
+/// Both attachments ride the first post, which is the message a person actually reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn discord_posts_every_attachment_on_the_first_message() {
+    let http = spawn_http_mock(|path, _body| {
+        assert_eq!(path, "/api/v10/channels/222222222222222222/messages");
+        json!({
+            "id": "444444444444444444",
+            "channel_id": DISCORD_CHANNEL,
+            "attachments": [
+                {"id": "555555555555555555", "filename": "generated-image.png"},
+                {"id": "555555555555555556", "filename": "generated-image-2.png"}
+            ]
+        })
+    });
+    let transport = discord(&http.base);
+
+    transport
+        .replier()
+        .reply(
+            ReplyTarget::Discord {
+                channel_id: DISCORD_CHANNEL.to_owned(),
+                reply_to: None,
+            },
+            OutboundReply::with_images("Two kittens.", generated_images(2)),
+        )
+        .await
+        .expect("one multipart post carries both attachments");
+
+    let calls = http.calls();
+    assert_eq!(calls.len(), 1, "two attachments are still one message");
+    let multipart = &calls[0].1;
+    assert!(multipart.contains("name=\"files[0]\""), "{multipart}");
+    assert!(multipart.contains("name=\"files[1]\""), "{multipart}");
+    assert!(multipart.contains("filename=\"generated-image.png\""));
+    assert!(multipart.contains("filename=\"generated-image-2.png\""));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -9801,7 +10124,7 @@ async fn telegram_sends_a_generated_png_as_a_photo_in_the_authenticated_topic() 
                 reply_to: Some(3),
                 message_thread_id: Some(77),
             },
-            OutboundReply::with_image("Here is your kitty.", generated_image()),
+            OutboundReply::with_images("Here is your kitty.", generated_images(1)),
         )
         .await
         .expect("photo and caption are accepted together");
@@ -9818,6 +10141,47 @@ async fn telegram_sends_a_generated_png_as_a_photo_in_the_authenticated_topic() 
     assert!(multipart.contains("-1001"));
     assert!(multipart.contains("77"));
     assert!(multipart.contains("3"));
+}
+
+/// One `sendPhoto` per attachment, with the caption on the first only.
+#[tokio::test(flavor = "multi_thread")]
+async fn telegram_sends_one_photo_per_attachment_and_captions_the_first() {
+    let http = spawn_http_mock(|path, _body| {
+        assert!(path.contains("sendPhoto"));
+        json!({
+            "ok": true,
+            "result": {
+                "message_id": 12,
+                "chat": {"id": -1001},
+                "photo": [{"file_id": "photo-large"}]
+            }
+        })
+    });
+    let transport = telegram(&http.base);
+
+    transport
+        .replier()
+        .reply(
+            ReplyTarget::Telegram {
+                chat_id: -1001,
+                reply_to: None,
+                message_thread_id: None,
+            },
+            OutboundReply::with_images("Two kittens.", generated_images(2)),
+        )
+        .await
+        .expect("both photos are accepted");
+
+    let calls = http.calls();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[0].1.contains("filename=\"generated-image.png\""));
+    assert!(calls[0].1.contains("Two kittens."));
+    assert!(calls[1].1.contains("filename=\"generated-image-2.png\""));
+    assert!(
+        !calls[1].1.contains("Two kittens."),
+        "the caption is written once: {}",
+        calls[1].1
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -9855,7 +10219,7 @@ async fn telegram_splits_long_generated_image_text_without_losing_it() {
                 reply_to: Some(3),
                 message_thread_id: None,
             },
-            OutboundReply::with_image(text.clone(), generated_image()),
+            OutboundReply::with_images(text.clone(), generated_images(1)),
         )
         .await
         .expect("photo and every bounded text chunk are accepted");
@@ -9906,7 +10270,7 @@ async fn telegram_reports_partial_delivery_when_long_image_text_fails_after_the_
                 reply_to: None,
                 message_thread_id: None,
             },
-            OutboundReply::with_image("x".repeat(1_025), generated_image()),
+            OutboundReply::with_images("x".repeat(1_025), generated_images(1)),
         )
         .await
         .expect_err("the photo succeeded before the text failed");
@@ -10010,7 +10374,7 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
             replier
                 .reply(
                     target,
-                    OutboundReply::with_image("a local kitty", generated_image()),
+                    OutboundReply::with_images("two local kitties", generated_images(2)),
                 )
                 .await
         }
@@ -10021,8 +10385,17 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
         .await
         .expect("the generated image reaches the local caller");
     let response = serde_json::from_str::<Value>(&line).expect("image reply is JSON");
-    assert_eq!(response["reply"], "a local kitty");
+    assert_eq!(response["reply"], "two local kitties");
+    assert_eq!(
+        response["images"]
+            .as_array()
+            .expect("an images array")
+            .len(),
+        2,
+        "every attachment reaches the local caller"
+    );
     assert_eq!(response["images"][0]["filename"], "generated-image.png");
+    assert_eq!(response["images"][1]["filename"], "generated-image-2.png");
     assert_eq!(response["images"][0]["mediaType"], "image/png");
     assert_eq!(
         STANDARD

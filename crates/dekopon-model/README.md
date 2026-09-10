@@ -5,9 +5,10 @@
 - the generic `ChatModel` request/response contract;
 - an OpenAI-compatible Chat Completions client;
 - native ChatGPT/Codex subscription device authentication, token refresh, and Responses streaming;
+- `chatgpt::CredentialFile`, the one implementation of "use the credential at this path": the
+  cross-process advisory lock, the adoption of a newer record another process wrote, the refresh
+  60 s before expiry, and the atomic write-back;
 - request-scoped prompt-cache routing hints plus normalized provider-reported cached-token usage;
-- a fixed-endpoint OpenAI Images client producing one signature-validated PNG under explicit prompt,
-  encoded-response, and 8 MiB decoded bounds; and
 - multimodal message content, where a message carries `ContentPart`s — text, images, documents —
   instead of a single string.
 
@@ -20,9 +21,17 @@ transcript in the audit log. `Serialize` writes
 for a file; `Debug` writes the same counts as a `bytes: 219136` field. The count is raw bytes,
 never a scaled unit.
 
-`GeneratedImage` renders only media type and byte count under `Debug`; its raw bytes are exposed
-only to the embedding delivery path. The Images client never reuses the undocumented ChatGPT/Codex
-subscription endpoint and never accepts a model-selected endpoint.
+`CredentialFile` has two consumers and must not grow a third definition. `ChatGptCodexModel` is one;
+`dekopon-brokerd`'s `kind: chatgptSubscription` provider credential is the other, which is why this
+crate is in the privileged broker's dependency tree at all. The refresh token rotates and the
+authorization server retires its predecessor, so a second implementation of that sequence is a second
+way to revoke a token family. Two holders of one *file* are coordinated by the snapshot and the lock;
+two holders of one *account* want two files and two logins.
+
+*Committed direction:* the broker's `credential`/`credentialByAgent` bindings will be replaced by
+public DRNs without duplicating or removing this refresh implementation
+([migration requirements](../../docs/design.md#legacy-credential-bindings)). The gateway's model
+credential is not part of that provider-binding migration.
 
 The gateway executable owns account lifecycle through `dekopond auth`; execution clients such as
 external embeddings consume the resulting credentials. Model credentials are never passed to Wasm

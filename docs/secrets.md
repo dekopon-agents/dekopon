@@ -4,8 +4,9 @@
 separate Cedar decision, an owner-only map to physical stores, invocation-pinned resolution, and
 native HTTP Basic/Bearer sinks. Implicit `credential`/`credentialByAgent` bindings run beside it,
 under [`security-model.md`](security-model.md#per-agent-credentials-and-where-their-boundary-stops).
-*Committed direction:* removed in favor of public DRNs
-([decisions](design.md#accepted-implementation-decisions)).
+*Committed direction:* `credential`/`credentialByAgent` bindings will be replaced by public DRNs;
+current configurations remain supported until that migration ships
+([migration requirements](design.md#legacy-credential-bindings)).
 
 ## The guarantee
 
@@ -127,8 +128,12 @@ source-store token as application material; the map file itself is prohibited as
 source. In the Helm chart,
 `broker.secretBootstrapFiles` copies operator-managed Secret keys into broker-only `0600` files;
 `broker.secretSourceVolumes` mounts AtomicWriter sources read-only into the broker only. Expiring AWS
-sessions and GCP/Azure/Kubernetes access tokens must be refreshed out of band; a chart-copied file
-changes only after a pod rollout, and no ambient workload-identity refresh chain is claimed.
+sessions and GCP/Azure/Kubernetes access tokens must be refreshed out of band for *this* system: no
+adapter here renews anything, a chart-copied file changes only after a pod rollout, and no ambient
+workload-identity refresh chain is claimed. The one credential the broker does renew itself is the
+legacy `chatgptSubscription` kind below, which is a different mechanism entirely — a named credential
+file rather than a DRN, and no private-map source. That legacy binding
+[will be replaced by public DRNs](design.md#legacy-credential-bindings), preserving refresh support.
 
 ```yaml
 apiVersion: dekopon.dev/secret-map/v1alpha1
@@ -381,6 +386,75 @@ ambient service-account mounting are not current. The chart keeps
 `automountServiceAccountToken: false`; deployments must mount only the broker-specific token they
 intend to grant.
 
+## Legacy credentials the broker renews
+
+*Committed direction:* these entries are selected through `credential`/`credentialByAgent`, which
+will be replaced by public DRNs. The migration must retain the shared refresh sequence, destination
+binding, and companion header described here; it is not implemented by the current private map
+([migration requirements](design.md#legacy-credential-bindings)).
+
+The two legacy kinds in `broker-credentials.yaml` differ in *when the value exists*, not in how it is
+bound or audited. `bearerToken` carries a `secret` an operator rotates by hand. `chatgptSubscription`
+carries an absolute `authFile` instead, because a ChatGPT subscription access token expires hourly and
+its refresh token rotates on every renewal:
+
+```yaml
+apiVersion: dekopon.dev/broker-credentials/v1alpha1
+credentials:
+  - name: chatgpt-gpt-image
+    kind: chatgptSubscription
+    authFile: /var/lib/dekopon/broker-chatgpt/chatgpt-auth.json
+    destinations: [chatgpt.com]
+```
+
+`secret` and `scheme` are prohibited for this kind, `authFile` is prohibited for `bearerToken`, and
+the file is validated as a whole: every missing field, surplus field, malformed name and duplicate
+name is reported in one startup refusal.
+
+**Hygiene.** The `authFile` goes through the same Tier A check as the credentials file itself —
+regular, owned by the broker's UID, `mode & 0o077 == 0`, one hard link, opened `O_NOFOLLOW`, under a
+64 KiB ceiling — and its parent directory must be owner-only **and writable**, because a rotated
+record is persisted by creating a sibling temporary file and renaming it over the target. A relative
+path, a symlink, a group-readable file, a read-only parent, or a document that is not a supported
+Dekopon credential each refuse startup naming the cause.
+
+**Refresh and write-back.** Resolution happens once per authorized invocation, after the decision
+audit record is appended and before the component runs, through the one implementation of that protocol in
+`dekopon-model`: take an advisory lock on a sibling `.lock` file, adopt a newer record another process
+wrote, renew 60 s before expiry, and persist the rotated record atomically (same-directory temporary
+file, `fsync`, rename, directory `fsync`). A renewal that reached the authorization server but could
+not be written back logs `chatgpt_credential_save_failed` and continues on the in-memory token,
+because by then the record on disk is the retired predecessor and failing would strand the only token
+that still works. The renewal is the broker's own HTTPS call: it is not charged to the invocation's
+`maxRequests`, produces no HTTP evidence entry, and is invisible to the component. Audit is unchanged
+— `credentialInjected: true` and the symbolic name, never the token. `dekopon-broker` reaches the
+resolution through an `Arc<dyn RefreshingCredential>` the deploying process supplies, so the broker
+core still holds no token endpoint of its own.
+
+**Startup destination coverage is unchanged.** A refreshing entry answers its `destinations` without
+resolving anything, so the same startup check applies: a constraint set whose `allowedHosts` are not
+all covered by the credential's `destinations` refuses to start, rather than discovering the mismatch
+on the first invocation against an unreachable token endpoint.
+
+**Two headers.** This kind presents `authorization: Bearer <access>` plus the fixed companion
+`chatgpt-account-id: <accountId>`, because the route refuses the bearer token without the account
+identifier and that identifier is a claim inside the token the guest never sees. It is one credential
+with one destination binding, not a generic header sink (see
+[Current non-goals](#current-non-goals)): a guest that sets the companion name is refused rather than
+overwritten, its bytes stay outside accounted request size, and evidence gained no field for it.
+
+**One file per holder.** Give the broker its own `dekopond auth chatgpt login --auth-file <path>`.
+Pointing it at a `chatgptSubscription` *model*'s file would have two independent holders spending one
+rotating refresh token, and the authorization server retires a predecessor on every rotation, so the
+family is eventually revoked for both. See
+[`chatgpt-credential.md`](chatgpt-credential.md#a-second-family-for-the-broker).
+
+**Failure classification.** A retired family (`invalid_grant`, `refresh_token_reused`,
+`refresh_token_invalidated`, `refresh_token_expired`) fails the invocation as
+`credential-unavailable` and logs `broker_chatgpt_credential_reauth_required`: an operator must log in
+again. Everything else — transport, a 5xx, a malformed token response — fails as
+`credential-refresh-failed`. Either way the broker keeps serving every other capability.
+
 ## Resolution and rotation
 
 Startup parses and validates the map, locators, scopes and bootstrap paths without contacting a
@@ -406,7 +480,9 @@ category are available only in broker logs.
 
 The authorized proposal serialization commits to the public DRN and sink. The effective execution
 constraints commit to the binding ID, owner `mapRevision`, and exact narrowed scope. Optional decision/execution audit
-fields record the public DRN and sink; the legacy `credential` field stays legacy-only. Raw value,
+fields record the public DRN and sink; the legacy `credential` field currently reports only the
+`credential`/`credentialByAgent` path, which [will be replaced by public DRNs](design.md#legacy-credential-bindings).
+This describes today's audit schema, not an already-shipped field migration. Raw value,
 backend, locator, selector, source revision, path/query, headers and bodies are absent. A record
 without those optional fields retains its serialized bytes and chain hashes.
 
@@ -420,7 +496,11 @@ value it reads.
 The project-wide list is [`design.md`](design.md#non-goals). Local to this feature:
 
 - arbitrary secret interpolation, headers, URL/query/body placement, environment variables, files,
-  or a `resolve-secret -> bytes` interface;
+  or a `resolve-secret -> bytes` interface; the `chatgptSubscription` companion header is one fixed
+  name chosen by that credential kind, not an owner- or provider-authored header;
+- a generalized `oauth2RefreshToken { tokenEndpoint, clientId }` kind, or any provider-declared
+  refresh callback: only owner-authored broker configuration may name a token endpoint, and one
+  consumer does not justify the template machinery;
 - provider-visible secret references or a new HTTP/provider WIT package;
 - Vault dynamic leases and lifecycle;
 - 1Password direct service-account SDK mode or file fields;

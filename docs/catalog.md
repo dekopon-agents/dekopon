@@ -14,7 +14,7 @@ which is which.
 
 | Process | Reads the catalog? | What it does with it |
 |---|---|---|
-| `dekopond` | Yes, at startup | Binds each route to an agent, resolves that agent's model, hands its `instructions` to the model as a system prompt, mounts its `skills` on every session the route serves. |
+| `dekopond` | Yes, at startup | Binds each route to an agent, resolves that agent's model, hands its `instructions` to the model as a system prompt, mounts its `skills` on every session the route serves, and checks that every capability a route's `chatAssetInputs` names exists here. |
 | `dekopon-brokerd` | **No** | The broker does not link `dekopon-config` and never sees this file. It declares the `Dekopon::Agent` Cedar type and matches instances by name without enumerating them. |
 
 The consequence worth internalizing: **nothing an agent may actually do comes from this file.** The
@@ -207,6 +207,11 @@ status: Unknown
 | `permissions` | list of `{ operation, resource? }` | no | Stored typed catalog metadata; no authority is granted. |
 | `status` | `Available` \| `Unavailable` \| `Unknown` | no | Stored typed authored metadata, never observed or reported; omission stays `None`, with no presentation fallback. |
 
+A capability's *existence* here is load-bearing in one more place: `dekopond` refuses to start when a
+route's `chatAssetInputs` names a capability this file does not define, because a misspelled
+identifier would otherwise silently never expand a `chat-asset:<N>` marker and look exactly like a
+provider rejecting its own input. Presence is still not a grant — the broker decides the invocation.
+
 **The broker does not read any of this.** The trusted `effect`, `risk`, and `idempotency` a policy
 decision sees come from the capability's `constraintSets` entry in `broker.yaml`, validated against
 the loaded provider manifest — as does its `route`, the field that decides whether a capability is
@@ -249,7 +254,7 @@ reads like it selects a behavior, so each is listed here rather than left to be 
 | Field | Looks like | Actually |
 |---|---|---|
 | `spec.policyProfile` (Agent) | Selects a named policy for the agent | Not consumed by runtime authority. Broker authority comes from the owner-authored Cedar policy file and the per-capability `constraintSets` in `broker.yaml`; naming a profile here selects no policy and changes no decision. |
-| `spec.credentialRef` (Provider) | Names the credential the provider will present | Preserved in the typed catalog, read by no credential resolver. Credential binding is owned by `constraintSets` (`credential:` / `credentialByAgent:`) and the broker's `0600` credentials file; model-selected public DRNs are owned by the separate typed proposal/private-map/`secret.use` path. Neither consults this catalog field. A `credentialRef` that matches nothing is not an error, and one that names a real credential binds nothing. |
+| `spec.credentialRef` (Provider) | Names the credential the provider will present | Preserved in the typed catalog, read by no credential resolver. Credential binding is owned by `constraintSets` (`credential:` / `credentialByAgent:`) and the broker's `0600` credentials file; model-selected public DRNs are owned by the separate typed proposal/private-map/`secret.use` path. Neither consults this catalog field. *Committed direction:* `credential`/`credentialByAgent` bindings will be replaced by public DRNs ([migration requirements](design.md#legacy-credential-bindings)); this does not activate `credentialRef`. A `credentialRef` that matches nothing is not an error, and one that names a real credential binds nothing. |
 | `status` (all three kinds) | Observed availability | Authored. No probe, daemon, or reconciler ever writes it, so the catalog records the file, not the deployment. |
 | `metadata.labels` | Selection or grouping | Retained by protocol serde. Nothing filters, selects, or reports on them. |
 

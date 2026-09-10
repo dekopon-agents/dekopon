@@ -79,10 +79,36 @@ See [`operations.md`](operations.md#append-only-audit-and-process-local-replay).
 Only releases that need an operator action appear here. A release absent from this list is a binary
 swap in the order above.
 
-### 0.12.0 → next (unreleased) — command words run over `runCommand`
+### 0.12.0 → next (unreleased) — command words run over `runCommand`, and `imageGenerator:` is removed
 
-Not yet released; the version that carries it is named when it is cut. Nothing here needs a
-configuration edit.
+Not yet released; the version that carries it is named when it is cut. One item here — the removed
+`imageGenerator:` — **does** need a configuration edit; nothing else does.
+
+- **`chatgptSubscription` is a new broker credential kind; nothing existing has to change.** Every
+  `bearerToken` entry in `broker-credentials.yaml` keeps its exact meaning. The new kind takes an
+  absolute `authFile` instead of a `secret` and `scheme`, and the broker refuses to start when a
+  `bearerToken` entry sets `authFile` or a `chatgptSubscription` entry sets `secret` or `scheme` — a
+  stricter refusal than before, since per-kind fields were previously unvalidated because there was
+  one kind. Startup also now reports *every* problem in that file at once rather than the first;
+  embedders matching `CredentialsError::InvalidName` or `CredentialsError::InvalidCredential` should
+  match `CredentialsError::Invalid { problems }` instead.
+- **Adopting it needs its own ChatGPT login.** Run
+  `dekopond auth chatgpt login --auth-file <path>` a second time rather than pointing the broker at a
+  `chatgptSubscription` model's file: the refresh token rotates and the authorization server retires
+  its predecessor, so two holders of one document revoke the family for both. The `authFile` must be
+  an owner-only `0600` single-link regular file in an owner-only **writable** directory, because a
+  rotated record is persisted by renaming a sibling temporary file over the target. Under the Helm
+  chart, `broker.chatgpt.*` (new in chart `0.4.0`) seeds it once into
+  `<paths.stateDir>/broker-chatgpt/`. Full lifecycle in
+  [`chatgpt-credential.md`](chatgpt-credential.md#a-second-family-for-the-broker).
+- **Two new classified invocation failures exist.** A capability presenting a refreshing credential
+  can now fail as `credential-unavailable` (the refresh-token family is retired; an operator must log
+  in again, and `broker_chatgpt_credential_reauth_required` says so at error level) or
+  `credential-refresh-failed` (transport, a 5xx, a malformed token response; retrying is the whole
+  remedy). Every other capability keeps serving. Alerting on
+  `broker_chatgpt_credential_reauth_required` and on the `broker.credential.refresh` span's
+  `outcome = rotated-unsaved` is the operational change; see
+  [`observability.md`](observability.md#broker-failure-events).
 
 - **Upgrade the broker before its clients, and both daemons together.** The local protocol
   stays `dekopon.dev/broker/v1alpha2`, but `dekopond` now sends a provider
@@ -102,10 +128,60 @@ configuration edit.
   and match the `CommandRunOutcome` they return; `BrokerRequest::ResolveCommand` remains a request
   the broker answers, not one the client builds.
 
+#### `imageGenerator:` is removed; delivery is a route opt-in instead
+
+Image generation and its credential belong to the provider/broker path, not the gateway. The `imageGenerator:`
+gateway block, the `routes[].imageGenerator` flag, and the `generate_image` model tool are all gone,
+and because `dekopond.yaml` is strict-decoded a file still naming either one **refuses to start**
+with the unknown field's name rather than quietly ignoring it. Delete both, and delete the
+`apiKeyEnv` variable from the deployment's environment — it is read by nothing now.
+
+Generating an image is a provider effect now: a provider capability produces the bytes, Cedar decides
+each call, and the broker audits it. The gateway's job is delivery, and a route opts into that:
+
+```yaml
+# before
+imageGenerator:
+  model: gpt-image-1
+  apiKeyEnv: OPENAI_IMAGE_API_KEY
+  timeoutMs: 120000
+routes:
+  - transport: workspace-slack
+    match: { kind: directMessage }
+    agent: reviewer
+    imageGenerator: true
+
+# after — no gateway block at all
+routes:
+  - transport: workspace-slack
+    match: { kind: directMessage }
+    agent: reviewer
+    providerAttachments:
+      maxPerReply: 1
+    chatAssetInputs: [gpt-image.edit]
+```
+
+`providerAttachments.maxPerReply` is how many files one reply may carry; omitting the block means a
+capability's `attachments` key is stripped and refused, which is what every route does today.
+`chatAssetInputs` lists the capabilities whose input may name one of the conversation's own
+attachments as `chat-asset:<N>`, so a person's photo can reach a remix capability; every identifier in
+it must exist in the catalog, and a capability left out of the list receives such a string verbatim.
+`maxPerReply: 0` is refused — omit the block instead — and pairing `providerAttachments` with a
+`whatsappCloudApi` transport is still a startup refusal. A model that calls `generate_image` now takes
+the ordinary unknown-tool path and ends the session.
+
+There is no replacement that keeps the old shape. A deployment that wants images needs a provider
+offering an image capability, a constraint set and Cedar statement for it in the broker, and the route
+opt-in above. [`dekopond.md`](dekopond.md#provider-attachments-and-chat-asset-inputs) has the
+conventions and their bounds.
+
 ### 0.11.1 → 0.12.0 — optional public DRNs require a private map and second policy
 
-Existing `credentialsPath`, `credential`, and `credentialByAgent` deployments need no migration and
-retain byte-compatible legacy audit serialization. To opt into model-selected DRNs:
+Existing `credentialsPath`, `credential`, and `credentialByAgent` deployments need no migration for
+this release and retain byte-compatible legacy audit serialization. *Committed direction:* the
+`credential`/`credentialByAgent` bindings will be replaced by public DRNs in a future migration,
+preserving broker-owned refresh ([requirements](design.md#legacy-credential-bindings)).
+To opt into the currently implemented model-selected DRN path:
 
 1. Install an owner-only `0600` `dekopon.dev/secret-map/v1alpha1` file and set `secretMapPath`.
 2. Keep every binding narrower than the named capability constraint set.
@@ -185,8 +261,8 @@ bootstrap limitations.
   its variable left unread, and `dekopon-run` is unchanged — an unset or blank `--api-key-env`
   variable still means no bearer token. See [`dekopond.md`](dekopond.md#startup-fails-closed).
 - **Model clients follow no ambient `HTTPS_PROXY` or `ALL_PROXY`.** Every
-  `dekopon-model` transport — the OpenAI-compatible chat client, the ChatGPT subscription client
-  and its device-flow login, and the Images client — is built from one agent that sets no proxy
+  `dekopon-model` transport — the OpenAI-compatible chat client and the ChatGPT subscription client
+  with its device-flow login — is built from one agent that sets no proxy
   and follows no redirect, so an exported proxy variable carries no bearer token, the
   device-code exchange, or a prompt through a host nobody named to Dekopon. That is the stance
   `dekopon-http-host` already took for provider HTTP. It reaches `dekopond`, `dekopon-run`, and
@@ -359,7 +435,8 @@ update looks like a working deployment with no Working UI.
   accepted; the name `localhost` is not, because what it resolves to is the resolver's decision. A
   configuration using `localhost` for a test override is a startup failure.
 - **A route naming an image generator on the text-only WhatsApp transport is a startup failure**
-  rather than a paid-for PNG with no delivery path.
+  rather than a paid-for PNG with no delivery path. (The `imageGenerator:` block itself was removed
+  after 0.12.0; the equivalent refusal now covers `providerAttachments`.)
 - **Provider storage and durable chat memory are opt-in and all-or-nothing.** Adding the `storage`
   or `chatMemory` section to `broker.yaml` requires every field in it; omitting the section leaves
   the broker exactly as it was.

@@ -25,8 +25,9 @@ brokerd-owned `SecretResolver`, and passes only native credential material to th
 set may instead bind a symbolic `credential:` resolved from a caller-supplied `CredentialStore`;
 construction fails closed on unknown names, missing HTTP authority, or allowed hosts outside the
 credential's destination binding. See [`../../docs/secrets.md`](../../docs/secrets.md).
-*Committed direction:* removed in favor of public DRNs
-([decisions](../../docs/design.md#accepted-implementation-decisions)).
+*Committed direction:* `credential`/`credentialByAgent` bindings will be replaced by public DRNs,
+preserving per-agent isolation, destination binding, and broker-owned refresh
+([migration requirements](../../docs/design.md#legacy-credential-bindings)).
 
 ## Security boundary
 

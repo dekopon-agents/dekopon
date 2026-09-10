@@ -3,10 +3,10 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use dekopon_broker::{
     Attestation, AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerBuildError,
-    BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet, CredentialStore, FileAuditLog,
-    IdentityDirectory, InMemoryAuditLog, InvocationRequest, Leniency, PolicyEngine, PolicyWorld,
-    SecretCatalog, SecretMaterial, SecretResolutionError, SecretResolver, SecretUseBinding,
-    StartupWarning,
+    BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet, CredentialRefreshError,
+    CredentialStore, FileAuditLog, IdentityDirectory, InMemoryAuditLog, InvocationRequest,
+    Leniency, PolicyEngine, PolicyWorld, RefreshingCredential, SecretCatalog, SecretMaterial,
+    SecretResolutionError, SecretResolver, SecretUseBinding, StartupWarning,
 };
 use dekopon_broker_host::BoundCredential;
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry, CommandRunOutcome};
@@ -1132,6 +1132,292 @@ async fn credentialed_constraint_sets_inject_bound_secrets_and_never_audit_them(
     assert!(!serialized.contains("Bearer"), "audit leaked the scheme");
     let public = serde_json::to_string(&result).expect("result serializes");
     assert!(!public.contains(SECRET), "result leaked the secret");
+}
+
+/// A credential the broker must resolve per invocation, with a counter instead of a token endpoint.
+///
+/// The real resolver is `dekopon-brokerd`'s, which runs `dekopon-model`'s OAuth refresh on the
+/// blocking pool; what this file has to pin is the broker's half of the seam — that the resolution
+/// happens exactly once per invocation, before the component runs, and outside everything the guest
+/// is accounted for.
+#[derive(Debug)]
+struct ScriptedRefreshingCredential {
+    destinations: Vec<String>,
+    resolutions: Arc<std::sync::atomic::AtomicUsize>,
+    script: std::sync::Mutex<Vec<Result<&'static str, CredentialRefreshError>>>,
+}
+
+impl ScriptedRefreshingCredential {
+    fn new(
+        destinations: Vec<String>,
+        script: Vec<Result<&'static str, CredentialRefreshError>>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            destinations,
+            resolutions: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            script: std::sync::Mutex::new(script),
+        })
+    }
+}
+
+#[async_trait]
+impl RefreshingCredential for ScriptedRefreshingCredential {
+    fn destinations(&self) -> &[String] {
+        &self.destinations
+    }
+
+    async fn resolve(&self) -> Result<BoundCredential, CredentialRefreshError> {
+        self.resolutions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let next = {
+            let mut script = self.script.lock().expect("script lock");
+            assert!(
+                !script.is_empty(),
+                "the broker resolved more times than the script allows"
+            );
+            script.remove(0)
+        };
+        let access = next?;
+        BoundCredential::chatgpt_subscription(
+            Redacted::new(access.to_owned()),
+            "acct-fixture",
+            self.destinations.clone(),
+        )
+        .map_err(|source| {
+            panic!("the fixture access token must be presentable: {source}");
+        })
+    }
+}
+
+/// A refresh is the broker's own call, not the guest's.
+///
+/// The constraint set grants exactly one HTTP request, so if the renewal were charged to the guest's
+/// budget the component's single call would be refused. The guest also never learns a renewal
+/// happened: evidence carries one call, the audit record carries the symbolic name, and neither
+/// carries the token or the account identifier.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refreshing_credential_resolves_once_per_invocation_outside_the_guest_budget() {
+    const ACCESS: &str = "refreshed-access-token-audit-must-never-see";
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("HTTP provider fixture loads");
+    let server = LoopbackServer::once(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+    );
+    let authority = server.authority().to_owned();
+    let constraints = loopback_constraints(&authority);
+    assert_eq!(
+        constraints
+            .http
+            .as_ref()
+            .expect("the fixture grants HTTP")
+            .max_requests,
+        1,
+        "the whole point is one guest call and no headroom for a renewal"
+    );
+    let source = ScriptedRefreshingCredential::new(vec![authority.clone()], vec![Ok(ACCESS)]);
+    let resolutions = Arc::clone(&source.resolutions);
+    let credentials = CredentialStore::new([(
+        "chatgpt-fixture".to_owned(),
+        source as Arc<dyn RefreshingCredential>,
+    )])
+    .expect("credential store builds");
+    let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
+    let broker = Broker::new(
+        registry,
+        principal("broker-test"),
+        "policy-test".to_owned(),
+        http_probe_engine(&direct_http_policy(
+            "caller",
+            "provider-test",
+            "http-probe.fetch",
+        )),
+        catalog([(
+            "http-probe.fetch",
+            ConstraintSet {
+                route: CapabilityRoute::Generic,
+                credential: Some("chatgpt-fixture".to_owned()),
+                ..set("http-probe", constraints)
+            },
+        )]),
+        credentials,
+        IdentityDirectory::empty(),
+        Arc::clone(&audit),
+        BrokerLimits::default(),
+    )
+    .expect("a refreshing credential proves its destinations at startup");
+
+    let result = broker
+        .invoke(
+            &context("caller"),
+            None,
+            None,
+            request(
+                "invoke-refreshing",
+                "http-probe.fetch",
+                json!({ "uri": format!("http://{authority}/images/generations"), "method": "GET" }),
+            ),
+        )
+        .await
+        .expect("the renewed credential serves the invocation");
+
+    assert_eq!(
+        result.outcome,
+        dekopon_capability::InvocationOutcome::Succeeded
+    );
+    assert_eq!(
+        resolutions.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "one invocation must resolve the credential exactly once"
+    );
+
+    let wire = server.request_text();
+    assert!(
+        wire.contains(&format!("authorization: Bearer {ACCESS}")),
+        "{wire}"
+    );
+    assert!(wire.contains("chatgpt-account-id: acct-fixture"), "{wire}");
+    server.join();
+
+    let records = audit.records().await;
+    let AuditEvent::Execution {
+        credential,
+        http_calls,
+        ..
+    } = &records[1].event
+    else {
+        panic!("the terminal record is an execution event");
+    };
+    assert_eq!(credential.as_deref(), Some("chatgpt-fixture"));
+    assert_eq!(
+        http_calls.len(),
+        1,
+        "the renewal must not appear as a second call"
+    );
+    assert!(http_calls[0].credential_injected);
+    let serialized = serde_json::to_string(&records).expect("audit serializes");
+    assert!(
+        !serialized.contains(ACCESS),
+        "audit leaked the access token"
+    );
+    assert!(
+        !serialized.contains("acct-fixture"),
+        "audit leaked the account identifier"
+    );
+}
+
+/// A credential that cannot be renewed fails its own invocation and nothing else.
+///
+/// The two classes are separate reasons on purpose: a revoked refresh-token family needs an operator
+/// at a browser, while a token endpoint that is down needs nobody. Both leave the broker serving,
+/// which the second invocation here demonstrates.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unrenewable_credential_fails_its_invocation_and_classifies_why() {
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("HTTP provider fixture loads");
+    // Nothing listens here: a provider that ran at all would fail on connect instead, which is how
+    // this test proves the component was never reached.
+    let authority = "127.0.0.1:9".to_owned();
+    let source = ScriptedRefreshingCredential::new(
+        vec![authority.clone()],
+        vec![
+            Err(CredentialRefreshError::ReauthorizationRequired),
+            Err(CredentialRefreshError::Unavailable {
+                category: "transport",
+            }),
+        ],
+    );
+    let resolutions = Arc::clone(&source.resolutions);
+    let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
+    let broker = Broker::new(
+        registry,
+        principal("broker-test"),
+        "policy-test".to_owned(),
+        http_probe_engine(&direct_http_policy(
+            "caller",
+            "provider-test",
+            "http-probe.fetch",
+        )),
+        catalog([(
+            "http-probe.fetch",
+            ConstraintSet {
+                route: CapabilityRoute::Generic,
+                credential: Some("chatgpt-fixture".to_owned()),
+                ..set("http-probe", loopback_constraints(&authority))
+            },
+        )]),
+        CredentialStore::new([(
+            "chatgpt-fixture".to_owned(),
+            source as Arc<dyn RefreshingCredential>,
+        )])
+        .expect("credential store builds"),
+        IdentityDirectory::empty(),
+        Arc::clone(&audit),
+        BrokerLimits::default(),
+    )
+    .expect("the constraint set matches the credential's destinations");
+
+    let caller = context("caller");
+    let invoke = |id: &'static str| {
+        broker.invoke(
+            &caller,
+            None,
+            None,
+            request(
+                id,
+                "http-probe.fetch",
+                json!({ "uri": format!("http://{authority}/"), "method": "GET" }),
+            ),
+        )
+    };
+
+    let permanent = invoke("invoke-reauth")
+        .await
+        .expect("an unrenewable credential is a failed invocation, not a broker error");
+    assert_eq!(
+        permanent.outcome,
+        dekopon_capability::InvocationOutcome::Failed
+    );
+    assert_eq!(permanent.error.as_deref(), Some("credential-unavailable"));
+    assert!(
+        !permanent
+            .evidence
+            .iter()
+            .any(|evidence| evidence.kind == "http-calls"),
+        "the component must never have run"
+    );
+
+    let transient = invoke("invoke-transient")
+        .await
+        .expect("the broker keeps serving after an unusable credential");
+    assert_eq!(
+        transient.outcome,
+        dekopon_capability::InvocationOutcome::Failed
+    );
+    assert_eq!(
+        transient.error.as_deref(),
+        Some("credential-refresh-failed"),
+        "a transient renewal failure must not read as one an operator has to fix"
+    );
+    assert_eq!(resolutions.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    let records = audit.records().await;
+    for record in &records {
+        if let AuditEvent::Execution { credential, .. } = &record.event {
+            assert_eq!(
+                credential.as_deref(),
+                Some("chatgpt-fixture"),
+                "a failed invocation still records which credential it would have presented"
+            );
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

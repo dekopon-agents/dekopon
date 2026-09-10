@@ -14,6 +14,8 @@ categories = ["development-tools"]
 include = ["src/**", "README.md", "Cargo.toml"]
 
 [dependencies]
+# Provider attachment bytes travel base64-encoded inside a capability result's JSON.
+base64.workspace = true
 dekopon-broker-protocol.workspace = true
 # One cancellable process node per broker-leg command word, joined before the leg answers.
 dekopon-process.workspace = true

@@ -30,6 +30,11 @@ use tokio::time::{Instant, timeout};
 use tracing::Instrument as _;
 
 const DEFAULT_HTTPS_PORT: u16 = 443;
+/// Companion header the `chatgptSubscription` credential kind injects beside `authorization`.
+///
+/// The ChatGPT account identifier is a claim inside the access token the guest never sees, and the
+/// Codex image and responses routes refuse a request that carries the bearer token without it.
+const CHATGPT_ACCOUNT_HEADER: &str = "chatgpt-account-id";
 const MAX_ERROR_MESSAGE_BYTES: usize = 256;
 const MAX_RESOLVED_ADDRESSES: usize = 16;
 const REQUEST_ENCODING_OVERHEAD_BYTES: u64 = 128;
@@ -215,6 +220,7 @@ pub enum ConfigurationError {
 #[derive(Clone)]
 pub struct BoundCredential {
     header_value: Redacted<String>,
+    companion_header: Option<(HeaderName, Redacted<String>)>,
     destinations: Vec<String>,
     secret_binding: Option<SecretBindingIdentity>,
     reflection_needles: Vec<SecretBytes>,
@@ -230,6 +236,13 @@ impl fmt::Debug for BoundCredential {
         formatter
             .debug_struct("BoundCredential")
             .field("header_value", &self.header_value)
+            .field(
+                "companion_header",
+                &self
+                    .companion_header
+                    .as_ref()
+                    .map(|(name, value)| (name, value)),
+            )
             .field("destinations", &self.destinations)
             .field("secret_binding", &self.secret_binding.is_some())
             .field("reflection_needles", &self.reflection_needles)
@@ -277,10 +290,45 @@ impl BoundCredential {
         let header_value = Redacted::new(format!("{scheme} {}", secret.expose()));
         Ok(Self {
             header_value,
+            companion_header: None,
             destinations,
             secret_binding: None,
             reflection_needles: Vec::new(),
         })
+    }
+
+    /// Builds the two headers a ChatGPT subscription access token must be presented with.
+    ///
+    /// `authorization: Bearer <access>` plus the fixed companion `chatgpt-account-id: <account_id>`.
+    /// The account identifier is a claim inside the access token, so a provider component cannot
+    /// derive it and the broker has to send it; a guest that sets either name is refused rather than
+    /// overwritten, exactly as for every other credentialed context.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigurationError::InvalidCredential`] naming the invalid field — never any part
+    /// of the token — when the access token or the account identifier is empty, oversized, or
+    /// carries bytes no header value admits, or when the destinations are not bare authorities.
+    pub fn chatgpt_subscription(
+        access: Redacted<String>,
+        account_id: &str,
+        destinations: Vec<String>,
+    ) -> Result<Self, ConfigurationError> {
+        let invalid = |reason| ConfigurationError::InvalidCredential { reason };
+        if account_id.is_empty()
+            || account_id.len() > MAX_CREDENTIAL_BYTES
+            || !account_id.bytes().all(|byte| byte.is_ascii_graphic())
+        {
+            return Err(invalid(
+                "ChatGPT account identifier must be a printable ASCII token",
+            ));
+        }
+        let mut credential = Self::bearer("Bearer", access, destinations)?;
+        credential.companion_header = Some((
+            HeaderName::from_static(CHATGPT_ACCOUNT_HEADER),
+            Redacted::new(account_id.to_owned()),
+        ));
+        Ok(credential)
     }
 
     /// Builds a DRN-bound Bearer credential for one separately authorized use grant.
@@ -315,6 +363,7 @@ impl BoundCredential {
         let rendered = format!("Bearer {token}");
         Ok(Self {
             header_value: Redacted::new(rendered.clone()),
+            companion_header: None,
             destinations: grant.allowed_hosts.clone(),
             secret_binding: Some(SecretBindingIdentity {
                 grant: grant.clone(),
@@ -354,6 +403,7 @@ impl BoundCredential {
         let rendered = format!("Basic {encoded}");
         Ok(Self {
             header_value: Redacted::new(rendered.clone()),
+            companion_header: None,
             destinations: grant.allowed_hosts.clone(),
             secret_binding: Some(SecretBindingIdentity {
                 grant: grant.clone(),
@@ -375,10 +425,7 @@ impl BoundCredential {
     /// Whether one allowed-host scope is covered verbatim by this credential's destinations.
     #[must_use]
     pub fn covers(&self, allowed_host: &str) -> bool {
-        let allowed = allowed_host.trim().to_ascii_lowercase();
-        self.destinations
-            .iter()
-            .any(|destination| destination.trim().to_ascii_lowercase() == allowed)
+        destinations_cover(&self.destinations, allowed_host)
     }
 
     fn matches(&self, host: &str, port: u16, scheme: &str) -> bool {
@@ -424,6 +471,42 @@ impl BoundCredential {
         value.set_sensitive(true);
         Ok(value)
     }
+
+    /// The fixed companion header name a guest must not set, when this credential carries one.
+    fn companion_name(&self) -> Option<&HeaderName> {
+        self.companion_header.as_ref().map(|(name, _)| name)
+    }
+
+    /// Renders the companion header, marked sensitive for the same reason `authorization` is.
+    fn render_companion(&self) -> Option<Result<(HeaderName, HeaderValue), HttpError>> {
+        let (name, value) = self.companion_header.as_ref()?;
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "`InvalidHeaderValue` reports only that parsing failed, and the constructor \
+                      already restricted these bytes to ASCII graphic; nothing derived from a \
+                      credential value may be reported anyway"
+        )]
+        let rendered = HeaderValue::from_str(value.expose())
+            .map_err(|_| http_error(ErrorCode::Internal, "credential could not be rendered"));
+        Some(rendered.map(|mut rendered| {
+            rendered.set_sensitive(true);
+            (name.clone(), rendered)
+        }))
+    }
+}
+
+/// Whether one allowed-host scope is covered verbatim by a credential's destination list.
+///
+/// The policy layer's coverage check is what makes a runtime destination mismatch unreachable, so it
+/// has to agree with [`BoundCredential::covers`] exactly. A broker entry whose value only exists at
+/// resolution time has no `BoundCredential` to ask at startup and calls this instead; a second
+/// implementation of the comparison could accept a host the injector then refuses.
+#[must_use]
+pub fn destinations_cover(destinations: &[String], allowed_host: &str) -> bool {
+    let allowed = allowed_host.trim().to_ascii_lowercase();
+    destinations
+        .iter()
+        .any(|destination| destination.trim().to_ascii_lowercase() == allowed)
 }
 
 /// The `allowed_hosts` grammar, applied to credential destinations: a bare authority with no
@@ -836,6 +919,19 @@ impl BufferedHttpClient {
         });
         if let Some(header) = credential_header {
             prepared.headers.insert(AUTHORIZATION, header?);
+            // One credential, one decision: the companion is part of the same presented identity,
+            // so it is inserted under the binding check that admitted the bearer token and never
+            // on its own. Its bytes are outside `request_bytes` for the same reason the
+            // authorization header's are — both are inserted after accounting, and a guest's byte
+            // grant must not need padding for a header it cannot see.
+            if let Some(companion) = self
+                .credential
+                .as_ref()
+                .and_then(BoundCredential::render_companion)
+            {
+                let (name, value) = companion?;
+                prepared.headers.insert(name, value);
+            }
             self.evidence[evidence_index].credential_injected = true;
             if self.secret_grant.is_some() {
                 self.secret_injections = self.secret_injections.saturating_add(1);
@@ -963,6 +1059,14 @@ impl BufferedHttpClient {
                 "request has too many headers",
             ));
         }
+        // Cloned before the loop: a guest-set companion name must be *refused* rather than
+        // silently overwritten, exactly as `authorization` is, so the forbidden set depends on
+        // which credential this context carries.
+        let companion = self
+            .credential
+            .as_ref()
+            .and_then(BoundCredential::companion_name)
+            .cloned();
         let mut headers = HeaderMap::new();
         let mut header_bytes = 0_u64;
         for header in request.headers {
@@ -987,7 +1091,7 @@ impl BufferedHttpClient {
             let name = HeaderName::from_bytes(header.name.as_bytes()).map_err(|_| {
                 http_error(ErrorCode::InvalidHeader, "request header name is invalid")
             })?;
-            if is_forbidden_request_header(&name) {
+            if is_forbidden_request_header(&name, companion.as_ref()) {
                 return Err(http_error(
                     ErrorCode::InvalidHeader,
                     "request header is broker-owned or hop-by-hop",
@@ -1331,7 +1435,15 @@ fn authority_matches(allowed: &str, host: &str, port: u16, scheme: &str) -> bool
             && port == DEFAULT_HTTPS_PORT)
 }
 
-fn is_forbidden_request_header(name: &HeaderName) -> bool {
+/// Whether a guest may not set this request header.
+///
+/// `companion` is the fixed extra header the context's credential injects, when it has one. It
+/// belongs in the same set as `authorization` rather than in the fixed list below: a guest that
+/// names it must be refused, and a context with no such credential has no reason to refuse it.
+fn is_forbidden_request_header(name: &HeaderName, companion: Option<&HeaderName>) -> bool {
+    if companion == Some(name) {
+        return true;
+    }
     matches!(
         name.as_str(),
         "authorization"
@@ -2167,6 +2279,180 @@ mod tests {
         assert_eq!(evidence[0].authority, "127.0.0.1:9");
         assert_eq!(evidence[0].status, None);
         assert!(!evidence[0].credential_injected);
+    }
+
+    fn chatgpt_credential_for(authority: &str) -> BoundCredential {
+        BoundCredential::chatgpt_subscription(
+            Redacted::new("fixture-access-token".to_owned()),
+            "acct-fixture",
+            vec![authority.to_owned()],
+        )
+        .expect("valid fixture credential")
+    }
+
+    /// The subscription route refuses a bearer token presented without the account identifier, so
+    /// the two headers are one credential: both go on, under the same destination-binding decision,
+    /// and neither is accounted against the guest's byte grant.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_chatgpt_subscription_credential_injects_both_headers_outside_accounted_bytes() {
+        let response: &[u8] =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+        let plain_server = LoopbackServer::once(response);
+        let plain_authority = plain_server.authority().to_owned();
+        let server = LoopbackServer::once(response);
+        let authority = server.authority().to_owned();
+        let request_to = |authority: &str| Request {
+            method: "GET".to_owned(),
+            uri: format!("http://{authority}/images/generations"),
+            headers: vec![Header {
+                name: "x-probe".to_owned(),
+                value: b"one".to_vec(),
+            }],
+            body: Vec::new(),
+        };
+
+        let mut plain = BufferedHttpClient::authorized(
+            grant(plain_authority.clone(), "GET"),
+            HttpHostCeilings::default(),
+            Duration::from_secs(5),
+        )
+        .expect("valid fixture authorization");
+        plain
+            .send(request_to(&plain_authority))
+            .await
+            .expect("uncredentialed request succeeds");
+
+        let mut client = BufferedHttpClient::authorized_with_credential(
+            grant(authority.clone(), "GET"),
+            Some(chatgpt_credential_for(&authority)),
+            HttpHostCeilings::default(),
+            Duration::from_secs(5),
+        )
+        .expect("valid fixture authorization");
+        client
+            .send(request_to(&authority))
+            .await
+            .expect("credentialed request succeeds");
+
+        let request = String::from_utf8(server.request()).expect("fixture request is UTF-8");
+        assert!(
+            request.contains("authorization: Bearer fixture-access-token"),
+            "{request}"
+        );
+        assert!(
+            request.contains("chatgpt-account-id: acct-fixture"),
+            "{request}"
+        );
+
+        let plain_evidence = plain.into_evidence();
+        let evidence = client.into_evidence();
+        assert!(evidence[0].credential_injected);
+        // `HttpCallEvidence` grew no field for the companion, and the companion's bytes are outside
+        // the guest's accounting exactly as `authorization`'s are. The twin requests differ only by
+        // their fixture authorities, so normalize for that before comparing.
+        let authority_delta = authority.len() as i64 - plain_authority.len() as i64;
+        assert_eq!(
+            evidence[0].request_bytes as i64 - authority_delta,
+            plain_evidence[0].request_bytes as i64
+        );
+        let serialized = serde_json::to_string(&evidence).expect("evidence serializes");
+        assert!(!serialized.contains("acct-fixture"), "{serialized}");
+        assert!(!serialized.contains("fixture-access-token"), "{serialized}");
+        assert!(!serialized.contains("chatgpt"), "{serialized}");
+
+        plain_server.join();
+        server.join();
+    }
+
+    /// The companion name is forbidden for the same reason `authorization` is, and only while the
+    /// context carries a credential that injects it: silently replacing a guest-supplied value
+    /// would train providers to attempt one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_guest_set_companion_header_is_rejected_not_overwritten() {
+        let forged = || Request {
+            method: "GET".to_owned(),
+            uri: "http://127.0.0.1:9/".to_owned(),
+            headers: vec![Header {
+                name: "chatgpt-account-id".to_owned(),
+                value: b"acct-guest-forged".to_vec(),
+            }],
+            body: Vec::new(),
+        };
+
+        let mut client = BufferedHttpClient::authorized_with_credential(
+            grant("127.0.0.1:9".to_owned(), "GET"),
+            Some(chatgpt_credential_for("127.0.0.1:9")),
+            HttpHostCeilings::default(),
+            Duration::from_secs(1),
+        )
+        .expect("valid fixture authorization");
+        let error = client
+            .send(forged())
+            .await
+            .expect_err("a guest-set companion header must be rejected");
+        assert_eq!(error.code, ErrorCode::InvalidHeader);
+
+        // A plain bearer credential injects no companion, so the same name is an ordinary header
+        // and the request fails on the unreachable destination instead.
+        let mut uncompanioned = BufferedHttpClient::authorized_with_credential(
+            grant("127.0.0.1:9".to_owned(), "GET"),
+            Some(credential_for("127.0.0.1:9")),
+            HttpHostCeilings::default(),
+            Duration::from_secs(1),
+        )
+        .expect("valid fixture authorization");
+        let error = uncompanioned
+            .send(forged())
+            .await
+            .expect_err("nothing listens on port 9");
+        assert_ne!(error.code, ErrorCode::InvalidHeader);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_chatgpt_subscription_credential_refuses_destinations_outside_its_binding() {
+        let mut client = BufferedHttpClient::authorized_with_credential(
+            grant("127.0.0.1:9".to_owned(), "GET"),
+            Some(chatgpt_credential_for("other.example.test")),
+            HttpHostCeilings::default(),
+            Duration::from_secs(1),
+        )
+        .expect("valid fixture authorization");
+        let error = client
+            .send(Request {
+                method: "GET".to_owned(),
+                uri: "http://127.0.0.1:9/".to_owned(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+            .await
+            .expect_err("unbound destinations are refused, not sent unauthenticated");
+        assert_eq!(error.code, ErrorCode::Denied);
+        let evidence = client.into_evidence();
+        assert_eq!(evidence.len(), 1);
+        assert!(!evidence[0].credential_injected);
+    }
+
+    #[test]
+    fn a_chatgpt_subscription_credential_fails_closed_on_a_structural_account_id() {
+        for account in ["", "acct with space", "acct\u{7f}control"] {
+            let error = BoundCredential::chatgpt_subscription(
+                Redacted::new("fixture-access-token".to_owned()),
+                account,
+                vec!["chatgpt.com".to_owned()],
+            )
+            .expect_err("a structurally invalid account identifier is refused");
+            let rendered = error.to_string();
+            assert!(rendered.contains("account identifier"), "{rendered}");
+            assert!(!rendered.contains("fixture-access-token"), "{rendered}");
+        }
+        // The access token itself is still validated by the bearer constructor underneath.
+        let error = BoundCredential::chatgpt_subscription(
+            Redacted::new(String::new()),
+            "acct-fixture",
+            vec!["chatgpt.com".to_owned()],
+        )
+        .expect_err("an empty access token is refused");
+        assert!(error.to_string().contains("secret must not be empty"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

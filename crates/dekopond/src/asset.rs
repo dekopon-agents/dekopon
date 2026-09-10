@@ -27,7 +27,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use dekopon_agent::prompt::{AssetSource, FetchedAsset};
+use dekopon_agent::{
+    attachment::{ChatAssetRefusal, ChatAssetSource},
+    prompt::{AssetSource, FetchedAsset},
+};
 use tokio::runtime::Handle;
 
 use crate::{conversation::ConversationKey, transport::AssetFetcher};
@@ -663,46 +666,124 @@ impl AssetSource for SessionAssets {
             }
             *spent += 1;
         }
+        self.load(id, self.images_supported)
+            .map_err(|failure| failure.for_model(id))
+    }
+}
+
+/// Hands an authorized capability the bytes of an attachment a route let it name.
+///
+/// Deliberately a second entry point rather than a second caller of [`AssetSource::fetch`]. That
+/// budget is about how many files one *model* may look at; this one is about how much a single
+/// invocation may carry, which `dekopon-agent` counts per invocation. Spending one from the other
+/// would let a remix exhaust the model's ability to read its own conversation, or the reverse.
+///
+/// `images_supported` is deliberately not consulted: whether the route's chat model can be shown an
+/// image says nothing about whether a capability can be handed one, and the caller enforces the
+/// image-only rule itself.
+impl ChatAssetSource for SessionAssets {
+    fn fetch_for_capability(&self, id: u64) -> Result<(String, Vec<u8>), ChatAssetRefusal> {
+        let asset = self.load(id, true).map_err(AssetFailure::for_capability)?;
+        Ok((asset.mime, asset.data))
+    }
+}
+
+impl SessionAssets {
+    /// Reads one attachment's bytes, or which check refused it.
+    ///
+    /// The one definition both entry points share, so the model-facing wording and the
+    /// capability-facing refusal reason can never disagree about what is readable.
+    fn load(&self, id: u64, images_supported: bool) -> Result<FetchedAsset, AssetFailure> {
         let Some(asset) = self.store.get_access(&self.access, id, Instant::now()) else {
-            return Err(format!(
-                "There is no Chat Asset #{id} in this conversation. The reference lines in the messages above name the ones there are."
-            ));
+            return Err(AssetFailure::Unknown);
         };
-        if !asset.is_fetchable(self.images_supported) {
-            return Err(format!(
-                "Chat Asset #{id} cannot be opened: {}.",
-                asset.unreadable_reason(self.images_supported)
-            ));
+        if !asset.is_fetchable(images_supported) {
+            return Err(AssetFailure::Unreadable {
+                reason: asset.unreadable_reason(images_supported),
+                // A file the app cannot see at all and a file of the wrong type are one message to
+                // a model and two different answers to a capability, so the distinction is recorded
+                // here rather than re-derived from the prose above.
+                refusal: if asset.source.is_none() {
+                    ChatAssetRefusal::Unavailable
+                } else {
+                    ChatAssetRefusal::UnsupportedMedia
+                },
+            });
         }
         if asset.size > MAX_ASSET_BYTES {
-            return Err(format!(
-                "Chat Asset #{id} is {} which is over the {} the gateway will read.",
-                kibibytes(asset.size),
-                kibibytes(MAX_ASSET_BYTES)
-            ));
+            return Err(AssetFailure::TooLarge { size: asset.size });
         }
         let (Some(fetcher), Some(source)) = (self.fetcher.as_ref(), asset.source.as_ref()) else {
-            return Err(format!("Chat Asset #{id} cannot be opened."));
+            return Err(AssetFailure::Unavailable);
         };
         let data = self
             .runtime
             .block_on(fetcher.fetch(source, MAX_ASSET_BYTES))
-            .map_err(|error| {
+            .map_err(|error| AssetFailure::Transport {
                 // The transport's own category, never its message: a transport error can carry
                 // service text, and this string goes into a prompt.
-                format!("Chat Asset #{id} could not be read ({}).", error.category())
+                category: error.category(),
             })?;
         // A generation can be retired while a transport read is in flight. The read cannot always
         // be cancelled, but its bytes must not enter the model after the retirement became visible.
         if !self.access.is_active() {
-            return Err(format!(
-                "There is no Chat Asset #{id} in this conversation. The reference lines in the messages above name the ones there are."
-            ));
+            return Err(AssetFailure::Unknown);
         }
         Ok(FetchedAsset {
             name: asset.name,
             mime: asset.mime,
             data,
         })
+    }
+}
+
+/// Which check refused one attachment read, before it is rendered for its audience.
+enum AssetFailure {
+    /// No such number in this conversation, or its generation was retired underneath the read.
+    Unknown,
+    /// The gateway will not show this one: why, in words, and which refusal a capability reads.
+    Unreadable {
+        reason: &'static str,
+        refusal: ChatAssetRefusal,
+    },
+    /// Larger than the gateway reads.
+    TooLarge { size: u64 },
+    /// Nothing can resolve it back to bytes.
+    Unavailable,
+    /// The transport refused or failed the read.
+    Transport { category: &'static str },
+}
+
+impl AssetFailure {
+    /// Words a model can repeat to the sender.
+    fn for_model(self, id: u64) -> String {
+        match self {
+            Self::Unknown => format!(
+                "There is no Chat Asset #{id} in this conversation. The reference lines in the messages above name the ones there are."
+            ),
+            Self::Unreadable { reason, .. } => {
+                format!("Chat Asset #{id} cannot be opened: {reason}.")
+            }
+            Self::TooLarge { size } => format!(
+                "Chat Asset #{id} is {} which is over the {} the gateway will read.",
+                kibibytes(size),
+                kibibytes(MAX_ASSET_BYTES)
+            ),
+            Self::Unavailable => format!("Chat Asset #{id} cannot be opened."),
+            Self::Transport { category } => {
+                format!("Chat Asset #{id} could not be read ({category}).")
+            }
+        }
+    }
+
+    /// The stable reason `dekopon-agent` audits when a capability input cannot be expanded.
+    const fn for_capability(self) -> ChatAssetRefusal {
+        match self {
+            Self::Unknown => ChatAssetRefusal::UnknownAsset,
+            Self::Unreadable { refusal, .. } => refusal,
+            Self::TooLarge { .. } | Self::Transport { .. } | Self::Unavailable => {
+                ChatAssetRefusal::Unavailable
+            }
+        }
     }
 }

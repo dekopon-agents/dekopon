@@ -8,9 +8,9 @@
 
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
+use dekopon_agent::attachment::GeneratedImage;
 use dekopon_broker_protocol::ChatTransportKind;
 use dekopon_core::{ExternalSubject, Redacted};
-use dekopon_model::image::GeneratedImage;
 use futures_util::{SinkExt as _, StreamExt as _, future::BoxFuture};
 use serde_json::{Value, json};
 use tokio::{net::TcpStream, sync::Mutex, time::Instant};
@@ -656,7 +656,7 @@ impl ChatReplier for DiscordReplier {
             {
                 return Err(TransportError::Response);
             }
-            let OutboundReply { text, mut image } = reply;
+            let OutboundReply { text, mut images } = reply;
             let mut accepted = 0_usize;
             let mut last_id = None;
             // The REST lock is taken per request rather than per reply. One answer's chunks still
@@ -685,12 +685,13 @@ impl ChatReplier for DiscordReplier {
                         "fail_if_not_exists": false,
                     });
                 }
-                let result = match image.take() {
-                    Some(image) => {
-                        self.create_message_with_image(&channel_id, &body, image)
-                            .await
-                    }
-                    None => self.create_message(&channel_id, &body).await,
+                // Every attachment rides the first post, which is where a person reads the answer
+                // and where Discord shows them together as one message.
+                let result = if images.is_empty() {
+                    self.create_message(&channel_id, &body).await
+                } else {
+                    self.create_message_with_images(&channel_id, &body, std::mem::take(&mut images))
+                        .await
                 };
                 match result {
                     Ok(id) => {
@@ -833,25 +834,44 @@ impl DiscordReplier {
         }
     }
 
-    async fn create_message_with_image(
+    async fn create_message_with_images(
         &self,
         channel_id: &str,
         body: &Value,
-        image: GeneratedImage,
+        images: Vec<GeneratedImage>,
     ) -> Result<String, TransportError> {
         let url = format!(
             "{}/api/v{API_VERSION}/channels/{channel_id}/messages",
             self.endpoint
         );
-        let filename = image.filename().to_owned();
-        let media_type = image.media_type().to_owned();
-        let bytes = image.into_bytes();
+        let media_type = images
+            .first()
+            .ok_or(TransportError::Response)?
+            .media_type()
+            .to_owned();
+        let attachments = images
+            .iter()
+            .enumerate()
+            .map(|(index, image)| image.filename(index))
+            .collect::<Vec<_>>();
+        let bytes = images
+            .into_iter()
+            .map(GeneratedImage::into_bytes)
+            .collect::<Vec<_>>();
         let mut payload = body.clone();
-        payload["attachments"] = json!([{
-            "id": 0,
-            "filename": filename,
-            "description": "Generated image",
-        }]);
+        payload["attachments"] = Value::Array(
+            attachments
+                .iter()
+                .enumerate()
+                .map(|(index, filename)| {
+                    json!({
+                        "id": index,
+                        "filename": filename,
+                        "description": "Attachment",
+                    })
+                })
+                .collect(),
+        );
         #[allow(
             clippy::map_err_ignore,
             reason = "serializing a serde_json::Value cannot fail: it holds no non-string map keys \
@@ -860,21 +880,22 @@ impl DiscordReplier {
         let payload = serde_json::to_string(&payload).map_err(|_| TransportError::Response)?;
         let mut retried = false;
         loop {
-            #[allow(
-                clippy::map_err_ignore,
-                reason = "mime_str only rejects strings that are not a media type, and \
-                          GeneratedImage::media_type returns a fixed IANA type"
-            )]
-            let part = reqwest::multipart::Part::bytes(bytes.clone())
-                .file_name(filename.clone())
-                .mime_str(&media_type)
-                .map_err(|_| TransportError::Response)?;
-            let form = reqwest::multipart::Form::new()
-                .text("payload_json", payload.clone())
-                .part("files[0]", part);
-            // An attachment goes out through the same lock discipline as a text chunk: it is one
-            // more Create Message against the same route, and a reply that posts an image is
-            // exactly the reply most worth not holding a shared lock through.
+            let mut form = reqwest::multipart::Form::new().text("payload_json", payload.clone());
+            for (index, (filename, bytes)) in attachments.iter().zip(&bytes).enumerate() {
+                #[allow(
+                    clippy::map_err_ignore,
+                    reason = "mime_str only rejects strings that are not a media type, and \
+                              GeneratedImage::media_type returns a fixed IANA type"
+                )]
+                let part = reqwest::multipart::Part::bytes(bytes.clone())
+                    .file_name(filename.clone())
+                    .mime_str(&media_type)
+                    .map_err(|_| TransportError::Response)?;
+                form = form.part(format!("files[{index}]"), part);
+            }
+            // Attachments go out through the same lock discipline as a text chunk: one more Create
+            // Message against the same route, and a reply that posts files is exactly the reply most
+            // worth not holding a shared lock through.
             let response = self
                 .send_rest(
                     self.http
@@ -907,14 +928,14 @@ impl DiscordReplier {
             let response_channel = response["channel_id"]
                 .as_str()
                 .ok_or(TransportError::Response)?;
-            let accepted_image = response["attachments"]
-                .as_array()
-                .is_some_and(|attachments| {
-                    attachments.len() == 1
-                        && attachments[0]["id"].as_str().is_some_and(is_snowflake)
-                        && attachments[0]["filename"].as_str() == Some(filename.as_str())
-                });
-            if !is_snowflake(response_id) || response_channel != channel_id || !accepted_image {
+            let accepted_images = response["attachments"].as_array().is_some_and(|accepted| {
+                accepted.len() == attachments.len()
+                    && accepted.iter().zip(&attachments).all(|(value, filename)| {
+                        value["id"].as_str().is_some_and(is_snowflake)
+                            && value["filename"].as_str() == Some(filename.as_str())
+                    })
+            });
+            if !is_snowflake(response_id) || response_channel != channel_id || !accepted_images {
                 return Err(TransportError::Response);
             }
             return Ok(response_id.to_owned());

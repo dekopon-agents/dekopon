@@ -13,7 +13,7 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 Ordered by the goals it serves. Credentials stay inside the broker:
 
 - Public inert secret DRNs, decided by a separate Cedar `secret.use` grant against an owner-only source/use map, with invocation-pinned secure-file/Kubernetes/1Password/Vault/AWS/GCP/Azure adapters, canonical host/method/path/query bounds, native Basic/Bearer rendering, binding-swap refusal, and direct-reflection filtering. Providers see neither references nor values. See [`docs/secrets.md`](docs/secrets.md).
-- One capability presents a different credential per acting agent. *Committed direction:* removed in favor of public DRNs ([decisions](docs/design.md#accepted-implementation-decisions)).
+- One capability presents a different credential per acting agent through `credential`/`credentialByAgent`. *Committed direction:* these bindings will be replaced by public DRNs ([migration requirements](docs/design.md#legacy-credential-bindings)).
 - Credential-free self-inspection: an authorized session calls `inspect_agent_config` for its exact standing prompt, route limits, and the capabilities Cedar currently grants that sender. Raw policy, identity, endpoints, paths, and every credential name or value stay out.
 
 One complete trace per message:
@@ -40,7 +40,7 @@ The operator surface on top:
 - Attachments a person sends: an image or document becomes a numbered chat asset named in the prompt, which a model opens on demand rather than carrying on every turn, under media-type, byte, attempt, and per-conversation limits.
 - Opt-in native in-flight feedback after fresh authorization: Slack Agent Working/Stop sessions with a classic `:tangerine:` reaction fallback, Discord typing, and Telegram topic-aware chat actions. Activity failure never changes the answer, and Stop is cooperative rather than rollback.
 - Slack Agent channel threads owned per authenticated sender after fresh authorization: that sender continues without repeating the mention, and the optional `decline_chat_reply` decision lets the agent post nothing when a reply would only take the last word. Ambient channel history never reaches routing or inference.
-- Explicit route-scoped image generation: one fixed-endpoint OpenAI Images meta tool yields one bounded PNG delivered natively to Slack, Discord, Telegram, or the local socket, without entering conversation memory, telemetry, providers, or broker protocol.
+- Image generation is a broker-authorized provider effect, not a gateway model tool. Route-scoped `providerAttachments` delivers bounded provider-produced PNGs to Slack, Discord, Telegram, or the local socket; `chatAssetInputs` lets listed capabilities receive an inbound attachment by reference. Neither direction passes attachment bytes through the model.
 
 ## What does not work yet
 
