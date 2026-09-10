@@ -158,11 +158,6 @@ pub struct TelemetryConfig {
     pub service_name: String,
     /// Timeout for each OTLP export and the final shutdown flush.
     pub export_timeout_ms: u64,
-    /// Whether spans carry provider payloads and HTTP URLs.
-    ///
-    /// Enabling this declares the telemetry sink in scope for the data this broker handles. It
-    /// never exposes a credential: `Redacted` values render their marker in either mode.
-    pub telemetry_payloads: bool,
 }
 
 /// Broker telemetry after validation.
@@ -170,8 +165,6 @@ pub struct TelemetryConfig {
 pub struct ResolvedTelemetry {
     /// Exporter transport and endpoint.
     pub settings: ExporterSettings,
-    /// Whether spans carry provider payloads and HTTP URLs.
-    pub telemetry_payloads: bool,
 }
 
 impl TelemetryConfig {
@@ -832,7 +825,6 @@ async fn resolve(
         .map(|telemetry| {
             Ok::<_, ConfigError>(ResolvedTelemetry {
                 settings: telemetry.resolve()?,
-                telemetry_payloads: telemetry.telemetry_payloads,
             })
         })
         .transpose()?;

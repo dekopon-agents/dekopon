@@ -123,7 +123,6 @@ telemetry:                                    # optional, identical in shape to 
   transport: http
   serviceName: dekopond
   exportTimeoutMs: 10000
-  telemetryPayloads: false                    # committed direction: removed; payloads always on
 ```
 
 The `conversation:` block is tagged on `mode`, and both halves are strict: an unknown mode, an unknown or wrong-case `scope`, and any persistent-only field written next to `mode: oneShot` are decode failures. `scope` is strict camelCase, accepts only `privateConversation` and `sharedConversation`, and is valid only beside `mode: persistent`; omission defaults to `privateConversation`. A setting that can never take effect is far more likely a mode typo than an intention, and a decoder that ignored it would leave a configuration file claiming a memory or audience the daemon does not have.
@@ -240,8 +239,8 @@ refused *input* marker submits no proposal at all and comes back as the interpre
 refusal, because the marker will not become valid on a retry. Attachment bytes cross broker IPC
 in expanded invocation inputs and provider results. The gateway strips result attachments before
 returning them to the shell or model, and retains no attachment bytes in conversation history or
-durable memory. Broker input spans can include expanded attachment data when `telemetryPayloads`
-is enabled; the gateway's byte-free result convention is not a broker-telemetry filter. The reply
+durable memory. Broker input spans include expanded attachment data; the gateway's byte-free result
+convention is not a broker-telemetry filter. The reply
 slot is dropped unread when a session fails or is cancelled.
 
 Delivery uses each service's native upload path: one Slack three-step external file upload per
@@ -671,7 +670,7 @@ Spans follow [`observability.md`](observability.md):
 
 The prompt loop's own spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `shell.script`, `shell.command`) nest under `gateway.session`, and the broker's `broker.invocation` joins the same trace through the proposal's `traceParent` field (a W3C `traceparent` value); [`observability.md`](observability.md#gateway-spans) is the authoritative list.
 
-Chat text and canonical subject identifiers reach telemetry as the `gateway.message.received` log event under `telemetryPayloads: true`; the metadata-only default carries transport, agent, and outcome and nothing else. The prompt cache key rides its own log event behind the same gate, as `gateway.session.cache_key`, so a key and a canonical subject never appear on one line. A route with `improvementSuggestions: true` writes its `agent.improvement.suggested` records in either payload mode. None of this gates model input: the gateway-authored canonical participant label is sent to the selected model on every shared turn. *Committed direction:* the gate is removed; payloads always on ([goal 2](design.md#constitution)).
+Chat text and canonical subject identifiers reach telemetry as the `gateway.message.received` log event, on every message. The prompt cache key rides its own log event, `gateway.session.cache_key`, so a key and a canonical subject never appear on one line. A route with `improvementSuggestions: true` writes its `agent.improvement.suggested` records beside them. None of this decides model input: the gateway-authored canonical participant label is sent to the selected model on every shared turn regardless.
 
 `gateway.session` carries `conversation.turns` and `conversation.bytes` — how much history this message replayed, as a count and a byte total and never as text; both are zero on a `oneShot` route and on the first message of any conversation. `gateway_conversation_evicted` is in the lifecycle events below with a reason of `idle`, `capacity`, or `grant-changed`. On a seeded session `message.count` counts the replayed window plus this exchange rather than this exchange alone. [`observability.md`](observability.md#what-conversation-history-changes) has the dashboard consequences.
 

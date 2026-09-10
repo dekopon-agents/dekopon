@@ -114,7 +114,7 @@ test -f "$provider" || {
 auth_token="$({ printf '%s:%s' "$OPENOBSERVE_ROOT_EMAIL" "$OPENOBSERVE_ROOT_PASSWORD"; } | base64 | tr -d '\r\n')"
 printf 'Authorization: Basic %s\n' "$auth_token" >"$temporary/openobserve-auth-header"
 run_started_us=$(( $(date +%s) * 1000000 - 60000000 ))
-sentinel="DEKOPON_OTEL_SMOKE_INPUT_MUST_NOT_APPEAR"
+sentinel="DEKOPON_OTEL_SMOKE_INPUT_MUST_APPEAR"
 
 OTEL_EXPORTER_OTLP_HEADERS="Authorization=Basic%20${auth_token},organization=default,stream-name=${stream}"   python3 "$example_dir/drive-turn.py" "$root" "$temporary"     "http://127.0.0.1:$port/api/default" "$service_name" &
 driver_pid=$!
@@ -145,8 +145,7 @@ auth = (folder / "openobserve-auth-header").read_text().strip().split(": ", 1)[1
 for path in folder.glob("dekopon*.log"):
     assert path.stat().st_size <= 4 * 1024 * 1024, "diagnostic bound"
     text = path.read_text()
-    for secret in ("DEKOPON_OTEL_SMOKE_INPUT_MUST_NOT_APPEAR",
-                   "DEKOPON_OTEL_SMOKE_CREDENTIAL_MUST_NOT_APPEAR",
+    for secret in ("DEKOPON_OTEL_SMOKE_CREDENTIAL_MUST_NOT_APPEAR",
                    auth.removeprefix("Basic "), os.environ["OPENOBSERVE_ROOT_PASSWORD"]):
         assert secret not in text, "local telemetry redaction failed"
 request = urllib.request.Request(f"http://127.0.0.1:{port}/api/default/{stream}/_json",
@@ -203,8 +202,10 @@ for operation_name in gateway.message gateway.session broker.invocation provider
     }
 done
 
-if grep -Fq "$sentinel" "$temporary/search.json"; then
-  echo "provider input leaked into exported traces" >&2
+# Completeness, not redaction: the proposal the model made has to be readable in the trace an
+# operator reads back, not only in the process that made it.
+if ! grep -Fq "$sentinel" "$temporary/search.json"; then
+  echo "provider input missing from exported traces" >&2
   exit 1
 fi
 
@@ -280,13 +281,15 @@ for daemon in ("dekopond", "dekopon-brokerd"):
 print("Both daemon stdout native ID pairs independently correlated with remote spans")
 PYCORRELATE
 
-# Redaction has to hold on the log path too; the traces check above never reads this stream.
-if grep -Fq "$sentinel" "$temporary/log-search.json"; then
-  echo "provider input leaked into exported logs" >&2
+# The log path carries the transcript and the inbound message; the traces check above never reads
+# this stream.
+if ! grep -Fq "$sentinel" "$temporary/log-search.json"; then
+  echo "chat text and transcript missing from exported logs" >&2
   exit 1
 fi
 
-# Check payload and actual fixture credentials in both signals and local daemon diagnostics.
+# Check the actual fixture credentials in both signals and local daemon diagnostics. The input
+# sentinel is deliberately absent from this list: payloads are exported, credentials are not.
 python3 - "$temporary" <<'PYREDACT'
 import os, pathlib, sys
 folder = pathlib.Path(sys.argv[1])
@@ -296,10 +299,9 @@ paths.extend(folder.glob("dekopon*.log"))
 for path in paths:
     assert path.stat().st_size <= 8 * 1024 * 1024, "telemetry response bound"
     text = path.read_text()
-    for secret in ("DEKOPON_OTEL_SMOKE_INPUT_MUST_NOT_APPEAR",
-                   "DEKOPON_OTEL_SMOKE_CREDENTIAL_MUST_NOT_APPEAR",
+    for secret in ("DEKOPON_OTEL_SMOKE_CREDENTIAL_MUST_NOT_APPEAR",
                    auth, os.environ["OPENOBSERVE_ROOT_PASSWORD"]):
-        assert secret not in text, "sentinel or credential leaked into telemetry"
+        assert secret not in text, "credential leaked into telemetry"
 PYREDACT
 
 printf 'OpenObserve OTLP smoke test passed: %s spans and %s correlated log records in trace %s\n' \

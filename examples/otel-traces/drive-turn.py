@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 
-PAYLOAD = "DEKOPON_OTEL_SMOKE_INPUT_MUST_NOT_APPEAR"
+PAYLOAD = "DEKOPON_OTEL_SMOKE_INPUT_MUST_APPEAR"
 CREDENTIAL = "DEKOPON_OTEL_SMOKE_CREDENTIAL_MUST_NOT_APPEAR"
 ANSWER = "The authorized echo completed."
 
@@ -122,7 +122,7 @@ def main():
     signal.alarm(210)
     try:
         telemetry = {"endpoint": endpoint, "transport": "http", "serviceName": service,
-                     "exportTimeoutMs": 15000, "telemetryPayloads": False}
+                     "exportTimeoutMs": 15000}
         policy = '''permit(principal == Dekopon::Principal::"smoke-user",
  action == Dekopon::Action::"agent.prompt", resource == Dekopon::Agent::"chat-agent")
  when { context has via && context.via == "dekopond-gateway" };

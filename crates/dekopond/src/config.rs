@@ -629,15 +629,12 @@ pub struct TelemetryConfig {
     pub transport: Transport,
     pub service_name: String,
     pub export_timeout_ms: u64,
-    /// Whether spans and logs carry chat text and canonical subject identifiers.
-    pub telemetry_payloads: bool,
 }
 
 /// Gateway telemetry after validation.
 #[derive(Clone, Debug)]
 pub struct ResolvedTelemetry {
     pub settings: ExporterSettings,
-    pub telemetry_payloads: bool,
 }
 
 /// Where and how to reach the broker, after discovery defaults were applied.
@@ -1044,10 +1041,7 @@ pub(crate) fn resolve(
             env!("CARGO_PKG_VERSION"),
             Duration::from_millis(telemetry.export_timeout_ms),
         )
-        .map(|settings| ResolvedTelemetry {
-            settings,
-            telemetry_payloads: telemetry.telemetry_payloads,
-        })
+        .map(|settings| ResolvedTelemetry { settings })
     }) {
         None => Some(None),
         Some(Ok(telemetry)) => Some(Some(telemetry)),

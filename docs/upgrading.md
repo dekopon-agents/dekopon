@@ -8,6 +8,22 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Telemetry payloads (unreleased)
+
+Remove `telemetryPayloads` from the `telemetry:` block of both `broker.yaml` and the gateway
+configuration before upgrading. Both sections reject unknown fields, so a daemon started on a file
+that still carries the key refuses to start and names it. Nothing replaces it, and there is no
+metadata-only mode to fall back to.
+
+What you export widens. Spans and log records now always carry what the key used to gate: the
+provider input on `broker.authorize` and `provider.invoke`, the full request URL with its path and
+query on `http.request`, the verbatim model transcript, the inbound chat text with its sender's
+canonical subject, the prompt cache key, and every command word a script ran including the ones the
+model wrote. Size the store's retention for that, and treat access to it as access to every
+conversation the system has handled. The exclusions are unchanged and were never part of the gate:
+secret bytes and the gateway's own credentials never reach telemetry, and HTTP request and response
+headers and bodies stay out of spans.
+
 ## Broker dashboard retirement (unreleased)
 
 Remove the broker listener flag and chart value when upgrading. The UI and its reporting feed
