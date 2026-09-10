@@ -16,7 +16,7 @@ dekopond auth chatgpt export --expose-credential
 
 ## Auth flags
 
-- `-o, --output <FORMAT>`: `table` (default), `wide`, `json`, `yaml`, or `name`.
+- `-o, --output <FORMAT>`: `table` (default), `json`, `yaml`, or `name`.
 - `--no-color`: disable ANSI color in diagnostics.
 - `--quiet`: suppress successful output; errors print. Conflicts with `-v`.
 - `-v`: emit informational diagnostics and error causes.
@@ -61,7 +61,7 @@ The refresh token rotates, so an exported copy is invalidated by the next refres
 ## Output behavior
 
 Status emits `{account, credentialFile, signedIn, expired}` in JSON/YAML, `auth/chatgpt` in
-name format, or an account/status/credential-file table in table and wide formats. Table cells
+name format, or an account/status/credential-file table in table format. Table cells
 remove terminal controls. Login and logout render the resulting status. Export ignores `--output`
 and writes only the chosen document. Device instructions and export warnings go to stderr.
 BrokenPipe on stdout is successful termination.

@@ -295,7 +295,7 @@ fn auth_isolated_from_gateway_config_transport_and_telemetry_discovery() {
 fn status_formats_and_logout_never_disclose_credentials() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let auth_file = credential_fixture(directory.path(), CREDENTIAL_FIXTURE);
-    for format in ["table", "wide", "name", "json", "yaml"] {
+    for format in ["table", "name", "json", "yaml"] {
         let output = binary()
             .env_clear()
             .args(["auth", "chatgpt", "status", "--auth-file"])

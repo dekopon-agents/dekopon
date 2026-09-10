@@ -28,7 +28,7 @@ fn render_auth(status: &ModelAuthStatus, format: OutputFormat) -> Result<String,
         OutputFormat::Json => to_json(status),
         OutputFormat::Yaml => to_yaml(status),
         OutputFormat::Name => Ok(format!("auth/{}", status.account)),
-        OutputFormat::Table | OutputFormat::Wide => {
+        OutputFormat::Table => {
             let state = if !status.signed_in {
                 "not signed in"
             } else if status.expired {
@@ -129,6 +129,7 @@ mod tests {
 
     #[test]
     fn output_format_values_remain_distinct() {
-        assert_ne!(OutputFormat::Table, OutputFormat::Wide);
+        assert_ne!(OutputFormat::Table, OutputFormat::Name);
+        assert_ne!(OutputFormat::Json, OutputFormat::Yaml);
     }
 }
