@@ -13,11 +13,14 @@ bounded newline-delimited records for the next ordinal without decoding or verif
 unterminated tails are refused, not repaired. Appends are flushed, not fsynced. A failed or
 cancelled append can leave partial bytes and poisons the open handle.
 
+*Committed direction:* opt-in sink, off by default; audit is a log record in the trace
+([non-goals](design.md#non-goals)).
+
 Replay rejection is bounded to the current broker process. Restart creates an empty replay
 ledger: persisted audit records do not restore invocation IDs or establish whether retrying an
-external effect is safe. There is no tamper-detection, rollback protection, or crash-recovery
-promise. Preserve audit data when investigating an append failure; do not erase it to bypass a
-startup refusal.
+external effect is safe. Tamper-detection, rollback protection, and crash recovery are
+[non-goals](design.md#non-goals). Preserve audit data when investigating an append failure; do
+not erase it to bypass a startup refusal.
 
 Full append mechanics, bounds, and private-file requirements:
 [`crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.md#audit).
@@ -36,16 +39,20 @@ Full append mechanics, bounds, and private-file requirements:
 | What does shutdown actually do, and how long may it take? | [`dekopon-brokerd` § Configuration](../crates/dekopon-brokerd/README.md#configuration) — signals, draining, and the grace that must cover one host deadline plus two frame deadlines |
 | Why does startup take so long, and can a restart skip recompiling every component? | [`dekopon-brokerd` § Compilation cache and the concurrent memory budget](../crates/dekopon-brokerd/README.md#compilation-cache-and-the-concurrent-memory-budget) — `compileCachePath` is optional; absent, Cranelift recompiles every component before the socket binds, which is what the chart's startup probe budget ([`charts/dekopon/README.md` § Probes](../charts/dekopon/README.md#probes)) is sized to cover |
 | In what order do I restart the two daemons? | [`upgrading.md`](upgrading.md#restart-the-broker-first-and-stop-it-last) |
-| This release changed configuration — what do I edit? | [`upgrading.md`](upgrading.md) |
+| Configuration changed between versions — what do I edit? | [`upgrading.md`](upgrading.md) |
 | Can I run a newer broker against an older gateway? | No. [`dekopon-brokerd` contract § Version and compatibility](../crates/dekopon-broker-protocol/README.md#version-and-compatibility) |
 
 ### Authority, policy, and credentials
+
+The current `credential`/`credentialByAgent` bindings discussed below will be replaced by public
+DRNs. This is committed direction, not an upgrade required today
+([migration requirements](design.md#legacy-credential-bindings)).
 
 | Question | Read |
 |---|---|
 | Who may drive which agent, and where is that written? | [`dekopon-brokerd` § Policy](../crates/dekopon-brokerd/README.md#policy) |
 | How narrowly does an authorized invocation actually run? | [`dekopon-brokerd` contract § Broker HTTP enforcement](../crates/dekopon-http-host/README.md#request-and-credential-boundary) |
-| Where do legacy provider credentials live, and how are they bound to a destination? | [`dekopon-brokerd` contract § Broker HTTP enforcement](../crates/dekopon-http-host/README.md#request-and-credential-boundary) and [`dekopon-brokerd` § One capability, one token per agent](../crates/dekopon-brokerd/README.md#one-capability-one-token-per-agent) |
+| Where do provider credentials live, and how are they bound to a destination? | [`dekopon-brokerd` contract § Broker HTTP enforcement](../crates/dekopon-http-host/README.md#request-and-credential-boundary) and [`dekopon-brokerd` § One capability, one token per agent](../crates/dekopon-brokerd/README.md#one-capability-one-token-per-agent) |
 | How may an agent name a secret without seeing it, and which stores can back it? | [`secrets.md`](secrets.md) — DRNs, dual policy, private bindings, source adapters, path scope, bootstrap, rotation and reflection limits |
 | Why did a DRN return `secret-denied`? | The same document: unknown, unbound, wrong-sink/username and policy-denied names intentionally share one result; inspect broker-side policy/map validation rather than probing names. |
 | A grant looks right and every session is denied. | Check the agent name. [`dekopon-brokerd` contract § Startup validation](../crates/dekopon-brokerd/README.md#catalog-ownership-at-policy-startup) — agent literals are the one class that is not proved at startup |
@@ -78,9 +85,9 @@ most often come up while operating are:
 - **IPC group membership is not identity.** The [current local process boundary](security-model.md#current-local-process-boundary)
   separates gateway and broker UIDs; the broker maps the real peer UID, not its group.
   Each mapped UID remains its own trust domain, not independent process attestation.
-- **Audit is append-only evidence, not tamper-proof or crash-durable storage.** Private files and
-  redaction contain access and content; they do not establish historical integrity or recover replay
-  state. A restart is not permission to retry an effect.
+- **Audit is append-only evidence, not tamper-proof or crash-durable storage.** A restart is not
+  permission to retry an effect. See [Append-only audit and process-local
+  replay](#append-only-audit-and-process-local-replay).
 
 [`security-model.md`](security-model.md) is the full statement of what is trusted, what is not, and
 what is presently out of scope.

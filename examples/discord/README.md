@@ -104,23 +104,23 @@ identityMappings:
     principal: maintainer
 ```
 
-The subject is still routing metadata rather than authority. The broker alone resolves it through
+The subject is routing metadata, not authority. The broker alone resolves it through
 `identityMappings`, and Cedar must separately permit that principal to drive the routed agent.
 An unmapped Discord sender is refused before any model call.
 
-A persistent route remains `privateConversation` when `scope` is omitted. If an operator explicitly
-sets `scope: sharedConversation` on a guild-channel route, Discord's conversation identity is the
-**whole channel** (a native thread is its own channel), so every independently authorized
-participant there can receive prior turns and attachment references from that window. Shared turns
-also send each canonical Discord subject identifier to the model provider even when telemetry
-payloads are disabled. This example does not enable that audience expansion.
+A persistent route is `privateConversation` when `scope` is omitted. Under
+`scope: sharedConversation` on a guild-channel route, Discord's conversation identity is the
+**whole channel** (a native thread is its own channel): every independently authorized participant
+there receives prior turns and attachment references from that window, and each canonical Discord
+subject identifier reaches the model provider. This example does not enable that audience
+expansion.
 
 ## Photos and files
 
 A Discord attachment contributes its untrusted filename, media type, and reported size to the
-conversation inventory. The existing gateway bounds still apply: supported image/document media
-types only, 8 MiB streamed maximum per fetch, four fetches per session, and 32 retained references
-per conversation. A route's model needs `modalities: [image]` before photos are offered; documents
+conversation inventory. The gateway bounds apply: supported image/document media types
+only, 8 MiB streamed maximum per fetch, four fetches per session, and 32 retained
+references per conversation. A route's model needs `modalities: [image]` before photos are offered; documents
 do not require image support.
 
 Downloads accept only HTTPS Discord CDN/media hosts in production, never carry the bot token, do

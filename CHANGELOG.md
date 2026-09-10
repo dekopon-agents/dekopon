@@ -256,6 +256,13 @@ All notable changes to Dekopon are documented here. The format is based on
   client applies both predicates to owner-only `0600` sockets as well as shared `0660` ones. The
   client therefore refuses every socket whose parent the broker would refuse to bind; only the
   broker additionally walks that parent's ancestors.
+- Documentation states the constitution — three goals in priority order, the non-goals, and the
+  invariants — in `docs/design.md`, drops release narrative, and distinguishes live mechanisms from
+  their planned retirement. It preserves broker-owned image generation and ChatGPT refresh, and
+  marks `credential`/`credentialByAgent` bindings as planned replacements by public DRNs throughout
+  their documentation. The [migration requirements](docs/design.md#legacy-credential-bindings)
+  preserve per-agent isolation, destination binding, refresh, and native injection; no runtime or
+  configuration migration is implemented by this documentation change.
 
 ### Removed
 

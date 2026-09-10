@@ -1,9 +1,12 @@
 # Public secret references and the private secret map
 
-**Status: current (shipped in 0.12.0; see [`upgrading.md`](upgrading.md#0111--0120--optional-public-drns-require-a-private-map-and-second-policy)).** This document defines the broker-owned secret
-system: public inert DRNs, a separate Cedar decision, an owner-only map to physical stores,
-invocation-pinned resolution, and native HTTP Basic/Bearer sinks. Existing implicit
-`credential`/`credentialByAgent` bindings remain supported unchanged.
+**Status: current.** This document defines the broker-owned secret system: public inert DRNs, a
+separate Cedar decision, an owner-only map to physical stores, invocation-pinned resolution, and
+native HTTP Basic/Bearer sinks. Implicit `credential`/`credentialByAgent` bindings run beside it,
+under [`security-model.md`](security-model.md#per-agent-credentials-and-where-their-boundary-stops).
+*Committed direction:* `credential`/`credentialByAgent` bindings will be replaced by public DRNs;
+current configurations remain supported until that migration ships
+([migration requirements](design.md#legacy-credential-bindings)).
 
 ## The guarantee
 
@@ -20,18 +23,18 @@ model-authored script
   -> constrained HTTP request
 ```
 
-The typed DRN/secret-use field is never copied into provider JSON or either provider WIT interface.
-The Wasm component sees the same `{uri, method, headers, body}` input it saw before. A DRN is public
-text, so a model can still quote those characters as ordinary provider data; doing so has no secret
-semantics and grants no resolution. Resolved bytes are
-passed only from the broker resolver to `dekopon-http-host`, beside an authorization committing to
-the same DRN, sink, and binding identifier. `dekopon-broker-host` rejects a swapped credential.
+The typed DRN/secret-use field is never copied into provider JSON or either provider WIT interface;
+the Wasm component sees an ordinary `{uri, method, headers, body}` input. A DRN is public text, so a
+model may quote those characters as ordinary provider data; doing so has no secret semantics and
+grants no resolution. Resolved bytes pass only from the broker resolver to `dekopon-http-host`,
+beside an authorization committing to the same DRN, sink, and binding identifier.
+`dekopon-broker-host` rejects a swapped credential.
 
-This guarantees that Dekopon's model, gateway, protocol results, provider memory, evidence, audit,
-and normal telemetry do not receive secret bytes. The authorized remote endpoint necessarily does.
-The native host rejects a response containing the raw secret or complete rendered Authorization
-value, but an endpoint can transform or semantically encode it; destination trust and narrow
-upstream credentials remain part of the boundary.
+Dekopon's model, gateway, protocol results, provider memory, evidence, audit, and telemetry
+therefore never receive secret bytes. The authorized remote endpoint necessarily does. The native
+host rejects a response containing the raw secret or complete rendered Authorization value, but an
+endpoint can transform or semantically encode it; destination trust and narrow upstream credentials
+remain part of the boundary, and [`design.md`](design.md#non-goals) rules out defending that case.
 
 ## Public DRNs
 
@@ -52,7 +55,7 @@ selector, or version. Those are private-map data. A DRN is lowercase ASCII, at m
 one DNS-like naming authority, a validated realm, and slash-separated nonempty path segments. It
 has no percent encoding, whitespace, query, fragment, backslash, empty segment, `.` or `..`.
 
-Knowing a DRN grants nothing. It is safe to copy and remains inert after revocation. Names can still
+Knowing a DRN grants nothing. It is safe to copy and remains inert after revocation. A name can
 disclose logical purpose, so deployments that consider `prod/payroll` sensitive should choose a
 less descriptive logical path.
 
@@ -68,17 +71,15 @@ curl -u 'userA:${drn:com.xrl:secret:prod:api/password}' \
   https://api.example.com/v1/thing
 ```
 
-`-U` is accepted as an alias for the second form because it was part of the original Dekopon DRN
-proposal; `-u` and `--user` are the curl-compatible spellings.
+`-U` is an accepted alias for the second form; `-u` and `--user` are the curl-compatible spellings.
 
-The complete `${...}` value must be one canonical DRN. Literal passwords, prefixes/suffixes, `${drn:…}` markers in URLs, headers or bodies, and arbitrary
-interpolation are rejected. Bare DRN characters elsewhere are ordinary public text and have no
-resolution semantics. The marker is removed
-before provider input is built. Immediate/direct invokers refuse secret use; only a broker-backed
-leg forwards the typed top-level proposal. Every broker-backed session reaches it, including a `dekopond`
-chat session, because invocation is one
-method, so a wrapper that records a call or stops one at a cancellation boundary cannot drop the
-proposal on the way through.
+The complete `${...}` value must be one canonical DRN. Literal passwords, prefixes/suffixes,
+`${drn:…}` markers in URLs, headers or bodies, and arbitrary interpolation are rejected. Bare DRN
+characters elsewhere are ordinary public text with no resolution semantics, and the marker is
+removed before provider input is built. Immediate/direct invokers refuse secret use; only a
+broker-backed leg forwards the typed top-level proposal. Invocation is one method, so every
+broker-backed session reaches it, a `dekopond` chat session included, and a wrapper that records a
+call or stops one at a cancellation boundary cannot drop the proposal on the way through.
 
 ## Two independent policies
 
@@ -122,14 +123,17 @@ authority metadata: bump it whenever a physical source, selector, projection, or
 changes. Effective secret bindings plus that revision enter authority-bound durable-memory
 continuity, while values never do. Physical locators and bootstrap paths are sensitive deployment
 inventory and never appear in prompts, audit, evidence, or provider metadata.
-Bootstrap credentials are never DRN-addressable, preventing resolver cycles and use of a source-store token as application material. The map file itself is likewise prohibited as a `secureFile` source. In the Helm chart,
+Bootstrap credentials are never DRN-addressable, which prevents resolver cycles and use of a
+source-store token as application material; the map file itself is prohibited as a `secureFile`
+source. In the Helm chart,
 `broker.secretBootstrapFiles` copies operator-managed Secret keys into broker-only `0600` files;
 `broker.secretSourceVolumes` mounts AtomicWriter sources read-only into the broker only. Expiring AWS
 sessions and GCP/Azure/Kubernetes access tokens must be refreshed out of band for *this* system: no
 adapter here renews anything, a chart-copied file changes only after a pod rollout, and no ambient
 workload-identity refresh chain is claimed. The one credential the broker does renew itself is the
 legacy `chatgptSubscription` kind below, which is a different mechanism entirely — a named credential
-file rather than a DRN, and no private-map source.
+file rather than a DRN, and no private-map source. That legacy binding
+[will be replaced by public DRNs](design.md#legacy-credential-bindings), preserving refresh support.
 
 ```yaml
 apiVersion: dekopon.dev/secret-map/v1alpha1
@@ -180,7 +184,7 @@ allowedPaths:
     path: /api/v1/items
 ```
 
-The grammar deliberately excludes percent encoding, backslashes, controls, whitespace, repeated
+The grammar excludes percent encoding, backslashes, controls, whitespace, repeated
 slashes, query/fragment text, and literal `.`/`..` segments. Matching uses the canonical path from
 the same URL object dispatched by the native client. Segment prefix matches `/api/v1/items` and
 `/api/v1/items/7`, not `/api/v1/items-admin`. Trailing slash is significant. Query is denied unless
@@ -252,8 +256,7 @@ secret sources read-only. `subPath` should not be used because it does not recei
 The on-disk layout cannot prove whether kubelet sourced a Secret or ConfigMap, so every projection
 entry must explicitly state `declaredOrigin`. A ConfigMap declaration requires `acknowledgeNonSecretSource: true`; this is
 an explicit operator claim rather than filesystem attestation. Values receive Dekopon's downstream
-redaction but do not gain Kubernetes Secret storage/RBAC properties retroactively. The existing chart's init-copy path remains
-valid and can be consumed through `secureFile`.
+redaction but do not gain Kubernetes Secret storage/RBAC properties retroactively.
 
 ### 1Password Connect
 
@@ -385,6 +388,11 @@ intend to grant.
 
 ## Legacy credentials the broker renews
 
+*Committed direction:* these entries are selected through `credential`/`credentialByAgent`, which
+will be replaced by public DRNs. The migration must retain the shared refresh sequence, destination
+binding, and companion header described here; it is not implemented by the current private map
+([migration requirements](design.md#legacy-credential-bindings)).
+
 The two legacy kinds in `broker-credentials.yaml` differ in *when the value exists*, not in how it is
 bound or audited. `bearerToken` carries a `secret` an operator rotates by hand. `chatgptSubscription`
 carries an absolute `authFile` instead, because a ChatGPT subscription access token expires hourly and
@@ -472,15 +480,20 @@ category are available only in broker logs.
 
 The authorized proposal serialization commits to the public DRN and sink. The effective execution
 constraints commit to the binding ID, owner `mapRevision`, and exact narrowed scope. Optional decision/execution audit
-fields record the public DRN and sink; the legacy `credential` field remains legacy-only. Raw value,
-backend, locator, selector, source revision, path/query, headers and bodies remain absent. Legacy
-records omit the new optional fields and retain their serialized bytes and chain hashes.
+fields record the public DRN and sink; the legacy `credential` field currently reports only the
+`credential`/`credentialByAgent` path, which [will be replaced by public DRNs](design.md#legacy-credential-bindings).
+This describes today's audit schema, not an already-shipped field migration. Raw value,
+backend, locator, selector, source revision, path/query, headers and bodies are absent. A record
+without those optional fields retains its serialized bytes and chain hashes.
 
-Payload telemetry can expose model-authored scripts, and therefore public DRNs, when explicitly
-enabled. It still cannot expose resolved bytes through a secret resolver or provider input because
-those bytes never enter either value.
+Telemetry carries model-authored scripts and therefore public DRNs under `telemetryPayloads: true`.
+*Committed direction:* the gate is removed; payloads always on
+([goal 2](design.md#constitution)). Telemetry cannot carry resolved bytes, which never enter a
+value it reads.
 
 ## Current non-goals
+
+The project-wide list is [`design.md`](design.md#non-goals). Local to this feature:
 
 - arbitrary secret interpolation, headers, URL/query/body placement, environment variables, files,
   or a `resolve-secret -> bytes` interface; the `chatgptSubscription` companion header is one fixed

@@ -22,12 +22,11 @@ local chat socket, sends one request, receives one JSON response line, and verif
 model calls and the broker's successful authorized echo audit event. The model first
 proposes a bash tool call and then answers from its actual provider result.
 
-Both daemons export traces over OTLP/HTTP. Their production log delivery remains
-structured stdout, not a daemon OTLP log exporter. A smoke-only Python shipper submits
-all captured JSON stdout records to OpenObserve's JSON ingestion API and checks its
-per-record success/failure counts. Native `trace_id` and `span_id` come from the active
-valid OpenTelemetry context in the shared formatter; records outside valid context
-have neither ID. The fixture enables only `wasmtime::runtime::code_memory` debug
+Both daemons export traces over OTLP/HTTP and deliver logs as structured stdout. A
+smoke-only Python shipper submits all captured JSON stdout records to OpenObserve's
+JSON ingestion API and checks its per-record success/failure counts. Native
+`trace_id` and `span_id` come from the active valid OpenTelemetry context in the
+shared formatter; records outside valid context have neither ID. The fixture enables only `wasmtime::runtime::code_memory` debug
 logging to obtain existing broker compilation records without compiler debug noise.
 
 The bounded queries require `gateway.message`, `gateway.session`, `broker.invocation`,
@@ -35,7 +34,7 @@ The bounded queries require `gateway.message`, `gateway.session`, `broker.invoca
 share a trace; startup compilation legitimately has its own. Each daemon's independently
 retrieved native log pair must match an actual exported span, not a query-manufactured
 ID. Queries fail on partial or saturated results, and remote log counts must equal
-shipped counts. Payload and fake credential sentinels are rejected across local stdout,
+shipped counts. Payload and fake-credential sentinels are rejected across local stdout,
 stderr, shipped records, and both complete remote signal responses. Failure controls
 exercise missing/wrong correlation, ingestion rejection, missing IDs, query truncation,
 connection failure, and redaction failures using the actual smoke assertion blocks.

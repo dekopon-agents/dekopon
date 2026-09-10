@@ -1,16 +1,19 @@
 # dekopon-policy
 
-The only place [Cedar](https://cedarpolicy.com) appears in Dekopon. It wraps `cedar-policy` behind
-a bounded, deterministic API that `dekopon-broker` and `dekopon-brokerd` consume; nothing else in
-the workspace depends on it.
+The only place [Cedar](https://cedarpolicy.com) appears in Dekopon. It wraps `cedar-policy` behind a
+bounded, deterministic API that `dekopon-broker` and `dekopon-brokerd` consume; nothing else in the
+workspace depends on it.
 
-## What it decides, and what it deliberately does not
+## What it decides, and what it does not
 
 Cedar answers one question: **may this principal take this action on this resource in this
 context?** It does not decide how narrowly the broker then executes the result. Timeouts, output
 ceilings, allowed HTTP destinations and methods, call budgets, and credential binding live in
 owner-authored *constraint sets* inside `dekopon-broker`, validated at startup against loaded
 provider manifests, the component host's independent ceilings, and the credential store.
+*Committed direction:* the legacy `credential`/`credentialByAgent` bindings will be replaced by
+public DRNs, retaining the broker's execution ceilings and separate `secret.use` authorization
+([migration requirements](../../docs/design.md#legacy-credential-bindings)).
 
 Keeping them apart is the point. A policy edit can broaden *who may act*; it can never widen a
 timeout, reach a new host, or bind a credential that was not already bound. The two failure modes
@@ -29,8 +32,8 @@ Everything lives in the `Dekopon` namespace.
 | `Dekopon::Secret` | public DRNs from the owner-only private map | resource of `secret.use` |
 
 Actions are one `Dekopon::Action::"<capability-id>"` per loaded capability, plus the fixed
-`agent.prompt` and `secret.use` actions. None of the entities carry attributes: a policy matches them
-with `==` and `in`, and there is no entity data for an expression to read.
+`agent.prompt` and `secret.use` actions. None of the entities carry attributes: a policy matches
+them with `==` and `in`, and there is no entity data for an expression to read.
 
 Agents are the one type whose instances are not declared, because the agent catalog belongs to the
 gateway rather than the broker. Everything else is enumerated, and that is what turns a typo into a
@@ -53,15 +56,15 @@ capability and nothing else, and can never authorize an execution: it routes to 
 broker refuses any constraint set naming an unrouted capability, and an invocation naming one is
 denied `unconstrained-capability` before Cedar is consulted.
 
-`PolicyWorld::new` refuses all reserved-action collisions and duplicate capability names together
-as `PolicyBuildError::WorldConflicts`, with sorted, unique `reserved` and `duplicates` lists.
-At least one list is nonempty; no conflicting world is returned.
+`PolicyWorld::new` refuses all reserved-action collisions and duplicate capability names together as
+`PolicyBuildError::WorldConflicts`, with sorted, unique `reserved` and `duplicates` lists. At least
+one list is nonempty; no conflicting world is returned.
 
 ## Context
 
 Capability actions carry `{ via?, subject?, agent?, effect, risk, idempotency }`. `agent.prompt`
 carries `{ via?, subject?, agent? }`. `secret.use` carries those routing fields plus the exact
-capability, provider and native sink the public DRN was proposed for. Strict validation prevents a
+capability, provider, and native sink the public DRN was proposed for. Strict validation prevents a
 field from being read on an action that never carries it.
 
 Every value is rendered by the broker from authenticated transport state or owner-controlled
@@ -72,12 +75,13 @@ configuration:
 - `subject` — the canonical external subject an attested context stands for.
 - `agent` — the agent identity of an agent actor; absent for human and service actors.
 - `effect` / `risk` / `idempotency` — the trusted classification the broker will execute under,
-  matched byte for byte against the loaded manifest at startup.
+  matched byte for byte against the loaded manifest at startup. *Committed direction:* removed
+  ([non-goals](../../docs/design.md#non-goals)).
 
-Message content and arbitrary provider input are deliberately **not** context. A public DRN is the
-one narrow caller-supplied exception: it is a strongly validated resource on a separate action and
-remains inert without an independently validated owner binding. Open JSON still has no policy
-schema and cannot influence a decision.
+Message content and arbitrary provider input are **not** context. A public DRN is the one narrow
+caller-supplied exception: it is a strongly validated resource on a separate action and remains
+inert without an independently validated owner binding. Open JSON has no policy schema and cannot
+influence a decision.
 
 ## Determinism and bounds
 
@@ -99,7 +103,7 @@ Everything is startup-fixed. There is no per-request parsing, compilation, or en
 `PolicyDecision::determining_policy_ids` carries the identifiers of the policies that decided the
 answer, sorted, and the broker writes them into every audit record as `policy_ids`. Cedar names
 text-parsed policies positionally (`policy0`, `policy1`, …); an optional `@id("…")` annotation
-replaces that with a stable name, which is what an audit trail actually wants:
+replaces that with a stable name, which is what an audit trail wants:
 
 ```cedar
 @id("chat-agent-echo")
@@ -117,6 +121,6 @@ sorted entity and action identifiers, domain-separated with `dekopon-policy-v1\0
 reporting the same digest evaluated the same authorization surface. It is recorded alongside
 `policy_ids` as `policy_digest`, and it is a correlation aid rather than a wire-format contract.
 
-Part of the [Dekopon](https://github.com/dekopon-agents/dekopon) workspace; see
-`docs/design.md` for the authority model and `docs/security-model.md` for the trust
-boundaries this adapter informs but never enforces.
+Part of the [Dekopon](https://github.com/dekopon-agents/dekopon) workspace; see `docs/design.md` for
+the authority model and `docs/security-model.md` for the trust boundaries this adapter informs but
+never enforces.

@@ -1,13 +1,8 @@
 # dekopond
 
-**Status: current.** Chat-transport wakeups, attested routing, opt-in native in-flight activity,
-cooperatively cancellable bounded sessions, persistent conversations, catalog-mounted skills, and
-opt-in improvement suggestions are implemented and tested.
-
-The unprivileged Dekopon chat gateway and agent daemon. It connects to chat services,
-waits for a wakeup, routes each authenticated message to a named agent from the catalog,
-runs one bounded model session with the sandboxed shell plus safe on-demand meta tools,
-and replies with the answer.
+The unprivileged Dekopon chat gateway and agent daemon. It connects to chat services, waits for a
+wakeup, routes each authenticated message to a named agent from the catalog, runs one bounded model
+session with the sandboxed shell plus safe on-demand meta tools, and replies with the answer.
 
 - **Transports** — Slack Socket Mode and Discord Gateway over outbound WebSockets, Telegram long
   polling, a raw-body-HMAC-authenticated text-only WhatsApp Cloud API webhook with pinned Graph
@@ -41,8 +36,8 @@ and replies with the answer.
 - **Conversations** — one independent session per message unless a route sets
   `mode: persistent`, whose `privateConversation` default keeps per-subject history and whose
   explicit `sharedConversation` scope shares one exact agent/transport/conversation window.
-  Shared turns carry gateway-authored canonical participant labels; those identifiers reach the
-  model provider even when telemetry payloads are disabled. History is compacted and bounded;
+  Shared turns carry gateway-authored canonical participant labels, and those identifiers reach
+  the model provider. History is compacted and bounded;
   transcript commits, attachment inventory/publication/fetch, and opaque cache-lane lifetime share
   one generation that is retired on idle/LRU/grant change or empty-grant removal. It caches no
   authorization.
@@ -57,9 +52,9 @@ and replies with the answer.
 - **Improvement suggestions** — a route with `improvementSuggestions: true` (default `false`)
   also offers `suggest_improvement`, a bounded channel for the model to tell the operator what
   to fix, at most three notes per session. Each note is written to telemetry as
-  `agent.improvement.suggested` whether or not `telemetryPayloads` is on, which is why the flag
-  is off by default: the record carries model-authored text, and setting the flag is that
-  consent. A suggestion is advisory by construction — no instruction, skill, limit, or grant
+  `agent.improvement.suggested` independent of the `telemetryPayloads` gate, which is why the
+  route flag is off by default: the record carries model-authored text, and setting the flag is
+  that consent. A suggestion is advisory by construction — no instruction, skill, limit, or grant
   moves because a model asked — and the gateway never relays it to chat.
 - **Self-inspection** — every authorized session offers `inspect_agent_config`, returning its
   standing prompt, mounted skills by name, description, and resource file paths (never their
@@ -68,6 +63,7 @@ and replies with the answer.
   skill directories, and all credential names and values. Calls are repeatable under the prompt
   loop's shared bounds, with no inspection-specific counter; a repeat points at the copy already
   in the conversation instead of appending a second one.
+
 ## Authority
 
 `dekopond` has none. It holds chat bot credentials and model credentials — the things it
@@ -82,7 +78,10 @@ tests link `dekopon-brokerd` and `dekopon-storage-host`, as dev-dependencies.
 Producing an attachment is provider authority; delivering one is not. The gateway holds no image
 credential: a capability the broker authorized returns the bytes, and owner configuration plus the
 authenticated envelope fix whether and where they go. The model chooses neither — it reads only
-`attached` metadata — and attachment bytes stay out of broker protocol, telemetry, and memory.
+`attached` metadata. Attachment bytes cross broker IPC in expanded inputs and provider results,
+but the gateway keeps them out of the shell, model transcript, and conversation history. Broker
+input spans may include expanded data under `telemetryPayloads: true`; the byte-free gateway result
+is not a broker-telemetry filter.
 
 Message text is untrusted end to end, and so are the agent's own standing orders and mounted
 skills from the catalog: none of them can assert identity, name a principal, or widen a grant. An
@@ -91,10 +90,10 @@ read any mounted skill in full through `read_skill`, so neither is confidential.
 Standing orders, chat content, subjects, and credentials remain excluded from informational status
 reports.
 
-The development transport is the one deliberate exception to "identity comes from
+The development transport is the one exception to "identity comes from
 authenticated transport": it trusts its local caller to declare a subject. It grants
-nothing by doing so — the broker's attestor grant and identity mapping still gate
-everything — but it is a development tool, not a production transport.
+nothing by doing so — the broker's attestor grant and identity mapping gate everything — but it
+is a development tool, not a production transport.
 
 Configuration, transport semantics, session bounds, telemetry, the conversation contract,
 and the distinct-UID deployment boundary are documented in
@@ -122,4 +121,4 @@ record failure cannot change an already delivered answer. Receipts do not prove 
 
 `dekopond auth chatgpt {login,status,logout,export}` runs before gateway configuration,
 telemetry, transports, or runtime creation. It uses only Dekopon's isolated model credential;
-ordinary serving still requires `--config PATH`. See [`docs/cli.md`](../../docs/cli.md) for auth-only flags, output, exit codes and both export guards.
+ordinary serving requires `--config PATH`. See [`docs/cli.md`](../../docs/cli.md) for auth-only flags, output, exit codes and both export guards.

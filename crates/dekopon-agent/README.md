@@ -34,9 +34,8 @@ The reusable agent session layer consumed by `dekopond` and external embeddings 
 - `prompt::SessionInputs` — the builder those entry points fill in and
   `prompt::run_prompt_session` runs. Two of its opt-ins are described below:
   `with_skills(&[Skill])` mounts operator-authored skills, and an empty slice adds no listing and
-  offers no tool, so a session without skills is byte-identical to one built before skills
-  existed; `with_improvement_suggestions()` offers `suggest_improvement`, which is never offered
-  unless the embedder called it.
+  offers no tool; `with_improvement_suggestions()` offers `suggest_improvement`, which is never
+  offered unless the embedder called it.
 - `ShellRuntime` — runs each model-authored script on a fresh `dekopon-shell`
   interpreter while spending one session-wide capability budget.
 - `SessionInvoker` — capability dispatch that prefers a local read-only leg and falls
@@ -46,8 +45,9 @@ The reusable agent session layer consumed by `dekopond` and external embeddings 
   takes an optional `Attestation`: `None` speaks as the connected peer, and a claim
   proposes on behalf of a transport-authenticated external subject, which the broker
   honors only under an owner-configured attestor grant. Its fresh capability
-  snapshot also supplies trusted effect/risk/idempotency metadata for self-inspection,
-  never policy source, identity, constraints, or credentials. Each provider command word
+  snapshot also supplies trusted effect, risk, and idempotency metadata for self-inspection,
+  never policy source, identity, constraints, or credentials. *Committed direction:* removed
+  ([non-goals](../../docs/design.md#non-goals)). Each provider command word
   it runs is one cancellable `broker-command` process node around the `runCommand` round
   trip; `BrokerLeg::with_cancel_signal` ties those runs to an embedder's cancellation (the
   gateway's Stop), and without it they are cancellable in contract only. A transport
@@ -57,10 +57,13 @@ The reusable agent session layer consumed by `dekopond` and external embeddings 
   a provider's `CommandRunOutcome` onto the shell's `CommandRun`, and the one
   `agent.command.unobserved` record for a run whose caller was dropped, shared by the
   broker leg and external embeddings.
-- `IdSequence` — collision-free trace and invocation identifiers under a caller-chosen
-  session prefix.
+- `IdSequence` — collision-free Dekopon `TraceId` and invocation identifiers under a
+  caller-chosen session prefix, the second correlation identifier described in
+  [`docs/observability.md`](../../docs/observability.md#trace-context-across-the-socket).
+  *Committed direction:* removed; the W3C trace id is the only correlation identifier
+  ([goal 2](../../docs/design.md#constitution)).
 
-`meta::AgentConfigView` is the deliberately narrow introspection shape: exact standing
+`meta::AgentConfigView` is the narrow introspection shape: exact standing
 instructions, session limits, and effective capability classifications. Its type has no
 field for policy source, policy IDs, identity, endpoints, paths, or credentials, and each
 serialized result is hard-bounded. Inspection is repeatable under the prompt loop's shared
@@ -122,8 +125,8 @@ Telemetry follows `docs/observability.md`: spans (`prompt.session`, `prompt.mode
 `dekopon_agent::audit` accounting events carry counts,
 durations, and stable categories; prompts, model answers, and script text ride the log stream only
 when the embedding binary opts into payload telemetry, and then the transcript is emitted whole
-once per session and extended by the messages each later turn appended. The skill and suggestion
-records fire in either payload mode. `agent.skill.read` carries `skill.name` (the
+once per session and extended by the messages each later turn appended. The skill and
+suggestion records fire in either payload mode. `agent.skill.read` carries `skill.name` (the
 operator-authored name the request matched, never the one the model typed), `skill.resource`
 (empty for the instructions), `skill.bytes`, and `skill.repeated`; `agent.skill.refused` carries a
 `reason` of `unknown-skill` or `unknown-resource`. `agent.improvement.suggested` carries
@@ -135,11 +138,11 @@ turn's `agent.model.prompt` delta, with payloads on; neither `agent.tool.script`
 `agent.tool.output` fires for it.
 
 Part of the [Dekopon](https://github.com/dekopon-agents/dekopon) workspace; see
-`docs/design.md` for the authority model this crate deliberately sits outside of.
+`docs/design.md` for the authority model this crate sits outside of.
 
 A gateway passes a chat-scoped `Attestation` to `BrokerLeg::connect` to snapshot an
 invocation-bound chat surface. Only that leg can receive the broker-derived durable-memory prompt
-note or reach the memory retrieval routes. It still owns no storage grant or recording authority;
+note or reach the memory retrieval routes. It owns no storage grant or recording authority;
 the gateway performs the dedicated post-acceptance record request on a fresh client outside the
 model's capability seam.
 

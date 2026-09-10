@@ -1,28 +1,16 @@
 # Model inference, prompt caching, and memory
 
-This document follows a Slack message from `dekopond` into the ChatGPT subscription transport. It explains what Dekopon caches, what it remembers, and what reaches the wire.
+This document follows a Slack message from `dekopond` into the ChatGPT subscription transport: what Dekopon caches, what it remembers, and what reaches the wire.
 
-**Status: Current, except where marked Exploration.** Dekopon sends cache-affinity hints,
-preserves append-only model turns, reports provider-declared cache usage, can keep a bounded
-conversation in gateway memory, can deliver bounded attachments an authorized capability produced, and
-optionally stores/retrieves namespace-isolated durable chat turns through a generated JSONL provider.
-It does not cache completed answers, request extended provider retention, use provider-managed
-conversation objects, generate images itself, retain attachment bytes, or automatically replay durable
-memory.
+**Status: Current, except where marked Exploration.** Dekopon sends cache-affinity hints, preserves
+append-only model turns, reports provider-declared cache usage, keeps a bounded conversation in
+gateway memory, delivers bounded provider-produced attachments on opted-in routes, and optionally
+stores and retrieves namespace-isolated durable chat turns through a JSONL provider. It does not
+cache completed answers, request extended provider retention, use provider-managed conversation
+objects, generate images itself, retain attachment bytes, or automatically replay durable memory.
 
-The ChatGPT subscription transport uses a fixed, undocumented ChatGPT/Codex backend rather than the public OpenAI Platform API. Public OpenAI documentation is useful context, but it is not a contract for that endpoint. This distinction is load-bearing throughout this document.
-
-## Answers at a glance
-
-| Question | Current answer |
-|---|---|
-| Is Dekopon's ChatGPT path optimized for caching? | **Yes, deliberately, but only as a best-effort optimization.** Requests carry `prompt_cache_key`; tool-loop turns grow by appending stable replay items; system instructions and tool definitions stay stable; and tests pin that shape. Only provider-reported `cached_input_tokens` proves a hit. |
-| How do we cache calls? | Dekopon relies on the provider's prompt-prefix cache. It sends the complete request every time. It does not memoize model answers or tool effects locally. |
-| How long is the cache fresh on a ChatGPT subscription? | **OpenAI does not publish a retention contract for the subscription endpoint Dekopon calls.** Public API policies range from short in-memory retention to model-specific extended retention, but those values cannot be promised here. |
-| Can a long-lived agent keep the cache alive? | Keeping a Rust object, process, HTTP connection, response ID, or conversation entry alive does not documentably pin a provider cache. Only provider-side reuse policy and actual matching requests matter. `dekopond` already shares one client per configured model, which reuses connections and coordinates credential refresh; that is a transport optimization, not a cache lease. |
-| How does an image reach a chat reply? | **Not through model inference.** A provider capability produces it and the broker authorizes that like any other external write; the gateway is the courier. On a route with `providerAttachments`, bounded PNGs a capability returned are carried outside the transcript to the authenticated Slack/Discord/Telegram/local reply target. Neither Chat Completions nor the private ChatGPT subscription contract is claimed to generate images. |
-| How does chat memory work? | `oneShot` routes remember nothing. `persistent` routes keep compacted question/final-answer pairs in `dekopond` memory, private per authenticated subject by default or explicitly shared inside one agent/transport/conversation, bounded by idle time, turns, bytes, and total conversation count. Every participant and message is authorized afresh. |
-| Does Dekopon have a memory framework? | **No general framework.** It has a focused conversation window plus optional durable on-demand recent/literal-search chat turns—not task, semantic, vector, editable-fact, or automatically replayed memory. |
+The ChatGPT subscription transport uses a fixed, undocumented ChatGPT/Codex backend rather than the
+public OpenAI Platform API. Public OpenAI documentation is context, not a contract for that endpoint.
 
 ## Three different mechanisms
 
@@ -34,7 +22,7 @@ The ChatGPT subscription transport uses a fixed, undocumented ChatGPT/Codex back
 | Conversation history | `dekopond` | Let a person—or an explicitly configured exact-conversation audience—ask a follow-up | Optional bounded `(question, final answer)` window in process memory, private per subject by default |
 | Durable chat-turn memory | `dekopon-brokerd` provider storage | On-demand recent/literal search across restarts inside one attested scope | Optional JSONL turns + permanent finite dedup; no automatic replay, deletion/export, semantic index, or encryption-at-rest claim |
 
-A cache hit never substitutes an old answer. The provider still evaluates the complete current request and produces a new response. “Fresh” therefore refers to whether prefix computation can be reused, not whether the answer or its underlying data is fresh.
+A cache hit never substitutes an old answer. The provider evaluates the complete request and produces a new response, so “fresh” refers to whether prefix computation can be reused, not to the answer or its underlying data.
 
 ## The inference path
 
@@ -63,7 +51,7 @@ The broker authorization leg is new for every Slack message. Neither remembered 
 
 ## What is optimized today
 
-The current implementation has five intentional cache-friendly properties:
+Five intentional cache-friendly properties:
 
 1. **One opaque key per useful reuse lane.** A persistent conversation gets one minted key. A one-shot route gets one key shared by that route's requests, where only the common agent prefix can match.
 2. **Append-only turns inside one model session.** If the model calls a tool, the next request retains the earlier `input` items byte-for-byte and appends the reasoning replay, function call, and function result.
@@ -88,20 +76,19 @@ The source contracts are in:
 - The gateway does not estimate tokens before a request. Its history bound is bytes plus whole turns because provider token counts arrive only after a billed call.
 - Cross-message compaction preserves conversational meaning, not the full prior wire transcript. A follow-up can reuse a leading prefix, but it is not necessarily an append-only extension of the last tool-loop request.
 
-That last distinction matters. Within one session, the second request is deliberately the first request plus more items. Between Slack messages, `History` reconstructs only the previous question and final answer; tool calls, tool outputs, and encrypted reasoning are gone. This keeps memory bounded and portable across model backends, but it can shorten the matching provider-cache prefix.
+Within one session, the second request is the first request plus more items. Between Slack messages, `History` reconstructs only the previous question and final answer; tool calls, tool outputs, and encrypted reasoning are gone. That keeps memory bounded and portable across model backends, and it can shorten the matching provider-cache prefix.
 
 ## Prompt cache key lifecycle
 
-A key is a routing hint, not a cache handle. Dekopon cannot use it to read another response, enumerate cache contents, or delete provider state.
+A key is a routing hint, not a cache handle. Dekopon cannot use it to read another response,
+enumerate cache contents, or delete provider state, and it is minted from entropy rather than from a
+subject, channel, phone number, or account ID. [`dekopond.md`](dekopond.md#the-prompt-cache-key) owns
+its scope, minting, and rotation.
 
-| Route mode | Key scope | Rotation |
-|---|---|---|
-| `persistent` | One scoped conversation: private `(agent, transport, conversation identity, subject)` or shared `(agent, transport, conversation identity)` | Idle, capacity, changed/empty capability grant, or process restart |
-| `oneShot` | One bound route, shared by its senders | Process restart |
-
-The key is minted from entropy. It is not a subject, channel, phone number, account ID, or hash of one. Sharing a one-shot route key does not share answers: requests can reuse only their identical prefix, and sender-specific text diverges where it differs.
-
-Rotation serves privacy and correctness. Once history is discarded, the replacement prompt no longer shares the old conversation's prefix, so retaining the old routing key would create linkability without a useful cache hit.
+Sharing a one-shot route's key does not share answers: two requests reuse only their identical
+prefix, and sender-specific text diverges where it differs. Once history is discarded the replacement
+prompt shares no prefix with the one it replaced, which is why the key rotates with the conversation
+it names.
 
 ### Getting the reuse available today
 
@@ -110,17 +97,17 @@ There is no cache-population call to make. The first eligible request warms what
 - keep the model, agent instructions, the mounted-skills listing (skill names and descriptions, hoisted into `instructions` with the agent instructions), tool descriptions, schemas, and ordering stable;
 - put changing information in the new user turn rather than in standing instructions;
 - use `persistent` only when the product should remember the conversation, not merely to chase a discount;
-- set a conversation window large enough that it does not rewrite the front on every follow-up;
+- set a conversation window large enough that it does not rewrite the front on every follow-up — when `maxTurns` or `maxBytes` drops the oldest exchange, the front of the request is rewritten and the cached prefix ends at the first changed token, so a generous window that trims rarely beats a tight one that trims constantly;
 - avoid sending an attachment again when only its compact reference is needed; and
 - measure reported cached input on real second and later turns.
 
-A short, stable prefix may still be below the provider's eligibility threshold. A long, identical prefix may still be evicted or routed elsewhere. Dekopon's responsibility is to preserve reuse opportunities and report outcomes, not to turn a provider optimization into a correctness dependency.
+A short, stable prefix can sit below the provider's eligibility threshold, and a long, identical one can be evicted or routed elsewhere. Dekopon preserves reuse opportunities and reports outcomes; it does not turn a provider optimization into a correctness dependency.
 
 ### Why completed responses are not cached
 
 A local response cache would be a separate feature with different safety rules. A correct key would need at least the backend, exact model, instructions, tools, full messages, attachments, and generation settings. A tool-enabled answer can also depend on fresh broker authorization and external data, and a prior turn may have caused an effect. Returning an old final answer could hide a revocation, report stale provider state, or make a caller believe an effect just ran when no proposal was submitted.
 
-Dekopon therefore makes the model call and reauthorizes effects. Any future response cache should begin with a narrowly defined, effect-free inference class plus explicit freshness, invalidation, privacy, and accounting semantics; it must not be inferred from `prompt_cache_key`.
+Dekopon makes the model call and reauthorizes the effects every time. Nothing about a response cache may be inferred from `prompt_cache_key`.
 
 ## Provider retention: what can be said
 
@@ -132,9 +119,7 @@ Dekopon posts subscription inference to:
 https://chatgpt.com/backend-api/codex/responses
 ```
 
-OpenAI's public documentation does not name that endpoint or publish its cache eligibility, retention, eviction, pricing, routing, or parameter-support contract. It may currently behave like the public Responses API in some respects; a successful request or observed cache count is evidence for that request, not a promise for the next one.
-
-Therefore the honest operational answer is:
+OpenAI's public documentation does not name that endpoint or publish its cache eligibility, retention, eviction, pricing, routing, or parameter-support contract. It may behave like the public Responses API in some respects; a successful request or observed cache count is evidence for that request, not a promise for the next one.
 
 > The ChatGPT subscription cache lifetime is undocumented. Treat every request as able to miss, and use `usage.cached_input_tokens` to measure observed reuse.
 
@@ -145,13 +130,13 @@ A missing cached-token field means **unreported**, not zero. A reported zero mea
 The following is context from OpenAI's public [Prompt Caching guide](https://developers.openai.com/api/docs/guides/prompt-caching), read on **2026-08-20**. It applies only to the documented public API and supported models.
 
 - Caching is automatic for eligible prompts and depends on an exact matching prefix.
-- Eligibility starts at a model-dependent minimum. The current guide says 1,024 tokens for GPT-5.6 and later, and 1,024–2,048 for earlier models. Earlier-model cache hits are reported in 128-token increments.
+- Eligibility starts at a model-dependent minimum: 1,024 tokens for GPT-5.6 and later, and 1,024–2,048 for earlier models. Earlier-model cache hits are reported in 128-token increments.
 - Public in-memory retention for supported earlier models is generally 5–10 minutes of inactivity, with a maximum of one hour.
 - Supported earlier models may offer extended retention up to 24 hours through `prompt_cache_retention`; 24 hours is a maximum, not a guaranteed hit.
-- GPT-5.6 and later use cache breakpoints and currently document a 30-minute TTL that refreshes on reuse through `prompt_cache_options.ttl`.
+- GPT-5.6 and later use cache breakpoints and document a 30-minute TTL that refreshes on reuse through `prompt_cache_options.ttl`.
 - Model support, defaults, write pricing, retention controls, and zero-data-retention interactions are version-sensitive.
 
-Dekopon currently sends none of those retention or breakpoint controls. Even if its configured model has the same name as a public API model, the ChatGPT subscription endpoint and account policy are different surfaces. Do not copy a public API TTL into an availability or cost forecast for the subscription.
+Dekopon sends none of those retention or breakpoint controls. Even if its configured model has the same name as a public API model, the ChatGPT subscription endpoint and account policy are different surfaces. Do not copy a public API TTL into an availability or cost forecast for the subscription.
 
 ## Can a long-lived agent keep a cache warm?
 
@@ -166,59 +151,47 @@ A local object has no lease on provider memory. The official public API model is
 - a response ID or provider conversation object; or
 - a Dekopon conversation entry that receives no model calls.
 
-Sending synthetic keep-alive prompts would consume quota, create more retained input, and still provide no subscription-endpoint guarantee. Dekopon should not do that.
+Synthetic keep-alive prompts would consume quota, create more retained input, and buy no subscription-endpoint guarantee. Dekopon does not send them.
 
-One long-lived optimization is already in place: `dekopond` shares one model client per configured model across gateway messages, reusing connections and the loaded credential, with refreshes coordinated through the client's credential mutex and the cross-process advisory lock beside the auth file. `CompletionOptions` stays request-scoped so a shared client cannot apply one conversation's key to another.
-
-The remaining candidate is an explicitly documented retention mode on a public API backend. It would require a modeled configuration field, supported-model validation, data-retention review, wire tests, and accounting, and it would not establish support on the ChatGPT subscription backend. That one is a future implementation choice, not current behavior.
+One long-lived optimization is in place: `dekopond` shares one model client per configured model across gateway messages, reusing connections and the loaded credential, with refreshes coordinated through the client's credential mutex and the cross-process advisory lock beside the auth file. `CompletionOptions` stays request-scoped so a shared client cannot apply one conversation's key to another.
 
 ## How scoped conversation memory works
 
-A route opts into memory explicitly and can pin the safer persistent default:
+A route opts in with a `conversation:` block, and [`dekopond.md`](dekopond.md#conversations) owns its
+keys, bounds, and eviction. What matters at the wire is what enters the prompt.
 
-```yaml
-conversation:
-  mode: persistent
-  scope: privateConversation
-  idleTimeoutMs: 900000
-  maxTurns: 12
-  maxBytes: 65536
-```
+`oneShot` is the route default and sends no history at all. A persistent route seeds the prompt with
+compacted `(question, final answer)` pairs ahead of the new message, oldest dropped first until both
+the turn and byte bounds hold. A shared turn is prefixed with
+`[gateway: authenticated participant: <canonical-subject>]` before it is sent and retained, so that
+canonical ID is model input whatever the telemetry gate says; private and one-shot prompt bytes carry
+no prefix and go out unchanged.
 
-`oneShot` remains the route default. Within persistent mode, omitting `scope` means `privateConversation`; the only other strict camelCase value is the explicit `sharedConversation` audience.
+Every message opens a fresh attested broker leg before inference. An empty grant stops before the
+model call and removes remembered state for that key; a broker or attestation failure stops before
+inference with no fresh grant vector to replace state with. A capability set that differs from the one
+stored beside the conversation drops the entry and closes its attachment generation, and on a shared
+route participants with different grant vectors reset the window between them. The new exchange is
+appended only if its generation remains current.
 
-Private state is keyed by agent, configured transport, transport-derived conversation identity, and canonical authenticated sender. Shared state drops only the sender component. It does not cross agents, transports, conversations, restarts, or eviction, and it is not global/team memory or the broker's durable memory namespace. On Slack the derived shared identity is normally the opening message plus its root thread. On Discord a guild channel itself is the identity, so enabling shared scope there may expose prior turns across the whole channel; a native thread channel is separate.
-
-A shared user turn is prefixed with `[gateway: authenticated participant: <canonical-subject>]` before it is sent and retained. That canonical ID is model input even when telemetry payloads are disabled. Private and one-shot prompt bytes receive no prefix and remain unchanged. On every message:
-
-1. the gateway opens a fresh attested broker leg;
-2. an empty grant stops before inference and removes remembered state for that key; a broker/attestation failure also stops before inference but has no fresh grant vector with which to replace state;
-3. the store compares the newly granted capability identifiers with those stored beside the conversation; on a shared route, participants with different grant vectors conservatively reset the window;
-4. an idle or grant-changed entry is dropped, invalidating its in-flight generation leases and closing the same generation's attachment-access fence;
-5. surviving `(question, final answer)` pairs and attachment inventory are available only inside that live generation;
-6. the new exchange is appended only if its generation is still current, and the oldest whole turns are trimmed until both bounds hold. An
-   inherited Slack Agent follow-up may explicitly decline its optional reply before capability work;
-   that stores the user message alone and performs no Slack delivery or durable recording.
-
-The store is bounded by `sessions.maxConversations` across the process. Capacity evicts least-recently-used entries. Idle eviction is lazy: stale text may remain resident until lookup, capacity pressure, or process exit, but it is never replayed after its timeout.
-
-### What history deliberately drops
+### What history drops
 
 - model reasoning, including encrypted replay items;
 - function/tool calls;
 - scripts and capability outputs;
 - system instructions, which are supplied fresh from the catalog;
 - the gateway's fixed failure sentence; and
-- any synthetic assistant text for a deliberate no-reply decision—there is none, so only the user
-  message remains in the in-process turn.
+- any synthetic assistant text for a no-reply decision — there is none, so a declined turn keeps the
+  user message alone.
 
-This is conversation continuity, not evidence continuity. The broker audit is where authorized effects remain verifiable.
+This is conversation continuity, not evidence continuity. The broker audit is where authorized
+effects remain verifiable.
 
 ### Memory never becomes authority
 
-History is untrusted prompt text. It is not sent to the broker as policy input. The prompt cache key also stays out of authorization. Every capability invocation still becomes a fresh proposal that only the broker may authorize.
+History is untrusted prompt text. It is not sent to the broker as policy input. The prompt cache key also stays out of authorization. Every capability invocation becomes a fresh proposal that only the broker may authorize.
 
-Grant-set invalidation has one known limit: it compares capability identifiers. Tightening a capability's execution constraints or changing its credential while retaining the same identifier does not currently invalidate history. [`security-model.md`](security-model.md#conversation-memory-as-a-trust-surface) records that live limitation.
+Grant-set invalidation has one known limit: it compares capability identifiers. Tightening a capability's execution constraints or changing its credential while retaining the same identifier does not invalidate history. [`security-model.md`](security-model.md#conversation-memory-as-a-trust-surface) records that live limitation.
 
 ## Outbound attachments are not inference
 
@@ -251,13 +224,13 @@ discuss the caption but cannot edit prior pixels without a new invocation.
 
 ## Optional durable chat-turn retrieval
 
-The independently released `memory-chat` component imports JSONL only and stores versioned `turns.jsonl` and
-`dedup.jsonl` inside an opaque broker-derived namespace. Scope always includes provider, agent,
-canonical sender, configured transport, channel, and conversation. `authority-bound` (default)
-rotates a persisted random epoch when effective capability metadata, constraints, selected symbolic
-credential, provider artifact bytes, host/storage ceilings, backend, or memory limits change;
+The independently released `memory-chat` component imports JSONL only and stores versioned
+`turns.jsonl` and `dedup.jsonl` inside an opaque broker-derived namespace. Scope always includes
+provider, agent, canonical sender, configured transport, channel, and conversation. `authority-bound`
+(default) rotates a persisted random epoch when effective capability metadata, constraints, selected
+symbolic credential, provider artifact bytes, host/storage ceilings, backend, or memory limits change;
 A→B→A never reopens A. Explicit `stable` preserves continuity across those changes while every read
-and write is still freshly authorized.
+and write is freshly authorized.
 
 The model sees only:
 
@@ -272,68 +245,23 @@ lower target and higher threshold for hysteresis; dedup records are never compac
 content succeeds without mutation, a changed commitment is `dedup-conflict`, malformed complete
 records are `memory-corrupt`, and finite dedup exhaustion is `dedup-capacity` while reads continue.
 
-Recording occurs only after fresh authorization, model success, and complete service/kernel
-transport acceptance. It is gateway-attested—not broker proof of delivery and not proof a person
-read it. A deliberately declined owned-thread continuation makes no reply call and therefore has
-no receipt and no durable record; configured native activity still receives its cosmetic cleanup.
-There is exactly one record request after an accepted answer
-and no automatic retry after any uncertain outcome. Durable text remains untrusted model context
-after explicit retrieval and never enters identity or Cedar as content.
+Parsing, search, and compaction run inside provider Wasm; the broker owns only opaque namespace-bound
+files, quotas, and commit. Conversation content therefore lives under the privileged broker's storage
+root and never in its audit, spans, metrics, public errors, or provider metadata.
+[`dekopond.md`](dekopond.md#durable-memory-after-transport-acceptance) owns when a turn is recorded.
+Retrieval is explicit: a durable turn never enters a later prompt on its own, and what comes back is
+untrusted model context.
 
-## What other projects do
+## Beyond the chat-turn window
 
-These projects illustrate common patterns; Dekopon does not depend on or endorse one of them. The links were checked on **2026-08-20** and their APIs remain version-sensitive.
-
-| Project | Short-term context | Longer-lived memory |
-|---|---|---|
-| [OpenAI Agents SDK Sessions](https://openai.github.io/openai-agents-python/sessions/) | A session loads stored conversation items before a run and writes new messages/tool items after it. Built-in stores include local and database-backed options. | OpenAI Conversations-backed sessions and compaction are available, but SDK session memory is distinct from `previous_response_id`/provider continuation and from prompt caching. |
-| [OpenAI Responses conversation state](https://developers.openai.com/api/docs/guides/conversation-state) | Applications can resend history or chain a response with `previous_response_id`. | A Conversations object can persist items across sessions, devices, or jobs. This is provider-managed state, not a prompt-cache lease. |
-| [LangGraph memory](https://docs.langchain.com/oss/python/langgraph/add-memory) | Thread-level state is checkpointed; production checkpointers can use databases. It provides trimming, deletion, and summarization patterns. | A separate store holds user- or application-level data across threads and can support semantic search. |
-| [Mem0](https://docs.mem0.ai/open-source/overview) | Extracts and retrieves selected conversational memories instead of replaying an unlimited transcript. | Positions a memory layer across sessions with vector/graph storage options and managed memory operations. |
-| [Letta stateful agents](https://docs.letta.com/v1-sdk/concepts/stateful-agents) | Messages and in-context memory blocks form the current context; compaction manages the window. | Editable memory blocks can remain attached to an agent or be shared, while older messages remain retrievable. |
-| [Zep concepts](https://help.getzep.com/concepts) | Builds context from chat and other sources rather than treating the raw transcript as the only memory. | A temporal knowledge graph tracks changing facts and relationships for retrieval. |
-
-Across these systems, the recurring split is:
-
-- **thread state** for immediate continuity;
-- **compaction/summarization** to fit a context window;
-- **durable stores** for cross-session facts or tasks; and
-- **retrieval** to select a small relevant subset for the next prompt.
-
-Prompt caching can make any repeated prefix cheaper. It does not implement any of those memory policies.
-
-## What a broader memory framework could buy
-
-**Status: Exploration.** The current accepted design is deliberately only durable on-demand chat
-turns. Dekopon has no accepted general design for editable facts, tasks, semantic/vector retrieval,
-cross-agent sharing, deletion/export UX, or automatic prompt insertion.
-
-A framework could provide:
-
-- durable continuity across daemon restarts, chat threads, transports, or devices;
-- typed user preferences, task state, facts, summaries, and episodes instead of one undifferentiated transcript;
-- provenance, timestamps, confidence, supersession, conflict handling, and explicit deletion;
-- retrieval under a token budget rather than replaying every stored item;
-- compaction and summarization policies with evaluations for information loss;
-- storage adapters, encryption, retention controls, backups, and tenant isolation;
-- observability for what was stored, retrieved, ignored, or forgotten; and
-- a provider-neutral memory layer rather than coupling history to one API's response IDs.
-
-It would also create a new high-risk data system. Before adopting a framework, Dekopon would need decisions on:
-
-- who owns the memory and authenticates reads and writes;
-- whether memory is scoped to a sender, agent, organization, task, or some combination;
-- consent, retention, export, deletion, and incident-response behavior;
-- prompt-injection persistence, poisoned memories, stale facts, and cross-sender retrieval;
-- capability-revocation invalidation beyond today's identifier comparison;
-- whether a model may propose a memory write and what trusted component validates it; and
-- how to prove retrieved memory never becomes trusted identity or authorization input.
-
-The current narrow implementation keeps parsing/search/compaction in provider Wasm while the
-broker owns only opaque namespace-bound files, quotas, and commit. Conversation content therefore
-lives under the privileged broker's storage root, but never in its audit, spans, metrics, public
-errors, or provider metadata. Any retrieved memory remains untrusted prompt context and every
-effect remains freshly authorized. A broader framework must preserve those properties.
+**Status: Exploration.** Durable on-demand chat turns are the accepted design. Editable facts, tasks,
+semantic or vector retrieval, cross-agent sharing, deletion and export UX, automatic prompt insertion,
+and an explicitly documented retention mode on a public API backend are none of them designed or
+committed. A proposal answers first: who owns the memory and authenticates each read and write; what
+it is scoped to; retention, export, deletion, and incident response; prompt-injection persistence and
+cross-sender retrieval; invalidation beyond the capability-identifier comparison described above;
+whether a model may propose a write and what trusted component validates it; and how retrieved memory
+is proven never to become identity or authorization input.
 
 ## Literal Rust walkthrough
 
@@ -363,7 +291,7 @@ let mut messages = vec![
         "You review pull requests. Be concise and cite the evidence you inspect.",
     ),
     ModelMessage::user(
-        "Summarize dekopon-agents/dekopon PR #110 and tell me whether it is merged.",
+        "Summarize example-org/example PR #7 and tell me whether it is merged.",
     ),
 ];
 
@@ -422,7 +350,7 @@ let request_1 = json!({
         "role": "user",
         "content": [{
             "type": "input_text",
-            "text": "Summarize dekopon-agents/dekopon PR #110 and tell me whether it is merged."
+            "text": "Summarize example-org/example PR #7 and tell me whether it is merged."
         }]
     }],
     "tools": [
@@ -496,7 +424,7 @@ let first_turn = AssistantTurn {
         function: ModelFunctionCall {
             name: "bash".to_owned(),
             arguments: json!({
-                "script": "gh pr view 110 -R dekopon-agents/dekopon"
+                "script": "gh pr view 7 -R example-org/example"
             })
             .to_string(),
         },
@@ -519,7 +447,7 @@ let first_turn = AssistantTurn {
             "id": "fc_01",
             "call_id": "call_01",
             "name": "bash",
-            "arguments": "{\"script\":\"gh pr view 110 -R dekopon-agents/dekopon\"}"
+            "arguments": "{\"script\":\"gh pr view 7 -R example-org/example\"}"
         }),
     ],
 };
@@ -536,8 +464,8 @@ messages.push(dekopon_model::model::assistant_message(&first_turn));
 messages.push(ModelMessage::tool(
     "call_01",
     concat!(
-        "{\"number\":110,\"state\":\"MERGED\",",
-        "\"title\":\"fix(gateway): make agent config inspection repeatable\"}\n",
+        "{\"number\":7,\"state\":\"MERGED\",",
+        "\"title\":\"fix(api): reject unbounded page size\"}\n",
         "[exit code: 0]"
     ),
 ));
@@ -554,7 +482,7 @@ let request_2_input = json!([
         "role": "user",
         "content": [{
             "type": "input_text",
-            "text": "Summarize dekopon-agents/dekopon PR #110 and tell me whether it is merged."
+            "text": "Summarize example-org/example PR #7 and tell me whether it is merged."
         }]
     },
     {
@@ -567,14 +495,14 @@ let request_2_input = json!([
         "id": "fc_01",
         "call_id": "call_01",
         "name": "bash",
-        "arguments": "{\"script\":\"gh pr view 110 -R dekopon-agents/dekopon\"}"
+        "arguments": "{\"script\":\"gh pr view 7 -R example-org/example\"}"
     },
     {
         "type": "function_call_output",
         "call_id": "call_01",
         "output": concat!(
-            "{\"number\":110,\"state\":\"MERGED\",",
-            "\"title\":\"fix(gateway): make agent config inspection repeatable\"}\n",
+            "{\"number\":7,\"state\":\"MERGED\",",
+            "\"title\":\"fix(api): reject unbounded page size\"}\n",
             "[exit code: 0]"
         )
     }
@@ -586,8 +514,8 @@ This is the strongest cache opportunity: request 2 keeps request 1's instruction
 Assume the final SSE turn says:
 
 ```text
-PR #110, “fix(gateway): make agent config inspection repeatable,” removes the
-one-call limit from agent configuration inspection. It is merged.
+PR #7, “fix(api): reject unbounded page size,” caps the list endpoint's
+page size at 100. It is merged.
 ```
 
 The provider may report some of request 2's input as cached. Dekopon records the reported count; it does not infer one from the identical Rust values.
@@ -598,9 +526,9 @@ At the end of the first Slack message, the persistent history stores only:
 
 ```rust
 let remembered = dekopon_agent::prompt::ConversationTurn::completed(
-    "Summarize dekopon-agents/dekopon PR #110 and tell me whether it is merged.",
-    "PR #110, “fix(gateway): make agent config inspection repeatable,” removes the \
-     one-call limit from agent configuration inspection. It is merged.",
+    "Summarize example-org/example PR #7 and tell me whether it is merged.",
+    "PR #7, “fix(api): reject unbounded page size,” caps the list endpoint's \
+     page size at 100. It is merged.",
 );
 ```
 
@@ -613,7 +541,7 @@ let request_3_input = json!([
         "role": "user",
         "content": [{
             "type": "input_text",
-            "text": "Summarize dekopon-agents/dekopon PR #110 and tell me whether it is merged."
+            "text": "Summarize example-org/example PR #7 and tell me whether it is merged."
         }]
     },
     {
@@ -622,8 +550,8 @@ let request_3_input = json!([
         "content": [{
             "type": "output_text",
             "text": concat!(
-                "PR #110, “fix(gateway): make agent config inspection repeatable,” removes ",
-                "the one-call limit from agent configuration inspection. It is merged."
+                "PR #7, “fix(api): reject unbounded page size,” ",
+                "caps the list endpoint's page size at 100. It is merged."
             ),
             "annotations": []
         }]
@@ -649,7 +577,7 @@ The earlier encrypted reasoning, function call, and tool result are absent. This
 4. Compare the ratio only across calls whose provider reported both values.
 5. Check whether instructions, tools, model, attachment parts, or the front of history changed.
 6. Check whether a history trim, idle eviction, capacity eviction, grant change, or process restart rotated or rewrote the lane.
-7. Remember the public API eligibility minimum: a short common prefix may be perfectly stable and still too small to cache. The subscription endpoint's threshold remains undocumented.
+7. Remember the public API eligibility minimum: a short common prefix can be perfectly stable and too small to cache. The subscription endpoint's threshold is undocumented.
 
 The useful metric is observed reuse, not the existence of a key:
 
@@ -661,10 +589,11 @@ Compute it only over calls where both fields were reported. A key proves Dekopon
 
 ## Related documents
 
-- [`dekopond.md`](dekopond.md) — routing, persistent-conversation bounds, cache-key privacy, and telemetry.
+- [`dekopond.md`](dekopond.md) — routing, persistent-conversation bounds, cache-key scope and rotation, generated images, durable recording, and telemetry.
 - [`security-model.md`](security-model.md#conversation-memory-as-a-trust-surface) — retained text and prompt-injection dwell time.
 - [`cli.md`](cli.md) — isolated model-account login.
 - [`chatgpt-credential.md`](chatgpt-credential.md) — rotating subscription credential lifecycle.
 - [`observability.md`](observability.md) — model usage fields and payload gating.
+- [`design.md`](design.md#non-goals) — the project's non-goals, which reject a memory feature argued on durability grounds.
 - [OpenAI Prompt Caching](https://developers.openai.com/api/docs/guides/prompt-caching) — public API behavior, not a subscription-endpoint guarantee.
-- [OpenAI conversation state](https://developers.openai.com/api/docs/guides/conversation-state) — public Responses state patterns, not current Dekopon behavior.
+- [OpenAI conversation state](https://developers.openai.com/api/docs/guides/conversation-state) — public Responses state patterns Dekopon does not use.

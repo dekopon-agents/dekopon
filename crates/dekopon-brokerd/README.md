@@ -1,10 +1,18 @@
 # dekopon-brokerd
 
-`dekopon-brokerd` is the separately deployed privileged Unix service for Dekopon provider components. It derives caller identity from Unix peer credentials, evaluates a deny-by-default Cedar policy set against owner-authored execution constraints, appends owner-only JSONL audit records, and executes only statically linked Dekopon host interfaces.
+`dekopon-brokerd` is the separately deployed privileged Unix service for Dekopon provider
+components. It derives caller identity from Unix peer credentials, evaluates a deny-by-default Cedar
+policy set against owner-authored execution constraints, appends owner-only JSONL audit records at
+the required `auditPath`, and executes only statically linked Dekopon host interfaces.
 
-Authorization and execution constraints are two separate files on purpose. `policiesPath` decides *who may do what*; `constraintSets` decides *how narrowly the broker then does it*. A policy edit can never widen a timeout, reach a new host, or bind a credential that was not already bound.
+Authorization and execution constraints are two separate files on purpose. `policiesPath` decides
+*who may do what*; `constraintSets` decides *how narrowly the broker then does it*. A policy edit
+can never widen a timeout, reach a new host, or bind a credential that was not already bound.
 
-The broker accepts configured Unix peer UIDs, including a dedicated gateway UID. Every process running under a mapped UID can act as its configured principal/actor; group membership permits a connection, not an identity grant. Request payloads cannot provide or override identity, policy, constraints, credentials, or authorization.
+The broker accepts configured Unix peer UIDs, including a dedicated gateway UID. Every process
+running under a mapped UID can act as its configured principal and actor; group membership permits a
+connection, not an identity grant. Request payloads cannot provide or override identity, policy,
+constraints, credentials, or authorization.
 
 ## Health probe
 
@@ -12,21 +20,23 @@ The broker accepts configured Unix peer UIDs, including a dedicated gateway UID.
 dekopon-brokerd probe --socket /run/dekopon/broker.sock
 ```
 
-Run as the broker owner UID, mapped separately from the gateway in `identities`.
-That mapping is what makes the probe answerable: it is an ordinary authenticated client, so a
-configuration whose `identities` omit the broker's own UID refuses its own health check and logs
-`broker_peer_unmapped` with that UID.
-The existing protocol client verifies socket safety — the socket and its parent directory — and the
-live server UID against its own effective UID, then requests capabilities with a two-second
-complete-exchange deadline and the default frame ceiling. An empty authorized listing is healthy.
-Success exits 0 without output; absent, refused, unmapped, wrong-server, malformed or
-stalled endpoints exit 1 with a diagnostic. Missing arguments exit 2. The probe rejects
-`--config`, loads no components or credentials, invokes nothing and
-initializes no telemetry.
+Run as the broker owner UID, mapped separately from the gateway in `identities`. The probe is an
+ordinary authenticated client, so a configuration whose `identities` omit the broker's own UID
+refuses its own health check and logs `broker_peer_unmapped` with that UID. The protocol client
+verifies socket safety — the socket and its parent directory — and the live server UID against its
+own effective UID, then requests capabilities with a two-second complete-exchange deadline and the
+default frame ceiling. An empty authorized listing is healthy.
+Success exits 0 without output; absent, refused, unmapped, wrong-server, malformed, or stalled
+endpoints exit 1 with a diagnostic. Missing arguments exit 2. The probe rejects `--config`, loads no
+components or credentials, invokes nothing, and initializes no telemetry.
 
 ## Configuration
 
-The configuration must be a regular single-link file owned by the server UID and must not be group/world writable. Audit parent directories must be owner-only. The socket has the separate IPC directory contract below. Provider components must be regular single-link files owned by the server UID and must not be group/world writable; their canonical parent directories must also be server-owned and not group/world writable. Writable non-sticky path ancestors are rejected.
+The configuration must be a regular single-link file owned by the server UID and must not be
+group/world writable. Audit parent directories must be owner-only. The socket has the separate IPC
+directory contract below. Provider components must be regular single-link files owned by the server
+UID and must not be group/world writable; their canonical parent directories must also be
+server-owned and not group/world writable. Writable non-sticky path ancestors are rejected.
 
 ```yaml
 # broker.yaml
@@ -65,202 +75,68 @@ permit(principal == Dekopon::Principal::"local-user",
 unless { context has via };
 ```
 
+`effect`, `risk`, and `idempotency` reach a decision as `dekopon-policy`'s
+[context](../dekopon-policy/README.md#context).
+
 `policiesPath` is read under the configuration's own rules: the path is canonicalized, then opened
 without following symlinks and required to be a regular server-owned single-link file that is not
-group/world writable, at most 1 MiB, and valid UTF-8. It is
-required once any `constraintSets` entry exists — a broker that declares executable capabilities
-and no policy would refuse every request while looking configured. An absent path means an empty
-policy set, which permits nothing.
+group/world writable, at most 1 MiB, and valid UTF-8. It is required once any `constraintSets` entry
+exists — a broker that declares executable capabilities and no policy would refuse every request
+while looking configured. An absent path means an empty policy set, which permits nothing.
 
-## Policy
+Each `providers` entry is a component file or a directory of them. A directory loads every `*.wasm`
+directly inside it — not recursively — in **filename order**, because the registry builds its
+capability route table in load order and readdir order would let two runs over one directory
+disagree about which provider claimed a duplicate capability. The directory must be owned by this
+UID and not group- or world-writable: anyone who can write it can add a provider the broker will
+compile and run. Every file the scan yields is checked on its own exactly as a directly named one
+is. An empty directory is an error, not a silent zero providers.
 
-Policies are [Cedar](https://cedarpolicy.com), validated at startup against a schema generated from
-this configuration. Everything a policy may name has to exist: principals come from `identities`
-and `identityMappings`, providers and capability actions come from the loaded provider manifests,
-and `agent.prompt` is fixed. A policy naming anything else refuses startup rather than becoming
-policy that can never match.
+There is no implicit provider search path: every directory the broker loads code from is named in
+this owner-only file and nowhere else.
 
-| Cedar name | Comes from |
-| --- | --- |
-| `Dekopon::Principal::"…"` | an `identities` entry or an `identityMappings` principal |
-| `Dekopon::Provider::"…"` | a loaded provider manifest |
-| `Dekopon::Action::"…"` | a loaded capability, or the fixed `agent.prompt` |
-| `Dekopon::Agent::"…"` | any agent name; the catalog belongs to the gateway, not the broker |
-| `Dekopon::Secret::"drn:…"` | a public DRN declared by the owner-only secret map |
-| `Dekopon::Action::"secret.use"` | fixed separate permission to consume one exact DRN |
+Host, broker, and server limits have conservative defaults, including a 2 MiB frame ceiling, when
+their entire sections are omitted. `hostLimits` and `brokerLimits` also default field by field, so a
+partial section keeps the absent-section value for everything it does not name — which is what lets
+a deployment set `maxTotalMemoryBytes` or `maxReplayIds` alone. `serverLimits` is all-or-nothing:
+when it is present every field is required. Unknown fields and unknown API versions are rejected.
 
-Capability actions carry a context of `{ via?, subject?, agent?, effect, risk, idempotency }`;
-`agent.prompt` carries `{ via?, subject?, agent? }`. Every value is derived by the broker from
-authenticated transport state or this configuration — never from a request payload, and never from
-message content or provider input.
+Startup also requires aggregate provider metadata, every mapped peer's capability response, and the
+*widest* response any session could receive to fit the frame ceiling. That last bound is what
+matters in a gateway deployment: the connecting peer is typically granted nothing itself, while the
+principals its `identityMappings` name hold the capability sets that reach the wire through an
+attested `capabilities`.
 
-An optional `@id("…")` annotation names a policy. That name is what audit records carry as
-`policy_ids`, so it is worth writing; without it Cedar names policies positionally (`policy0`,
-`policy1`, …) and inserting a policy renumbers the ones below it. Names must be unique.
-
-Each `providers` entry is a component file or a directory of them. A directory loads every
-`*.wasm` directly inside it — not recursively — in **filename order**, which matters because the
-registry builds its capability route table in load order: readdir order would let two runs over one
-directory disagree about which provider claimed a duplicate capability. A directory must be owned
-by this UID and not group- or world-writable, because anyone who can write it can add a provider
-the broker will compile and run. Every file the scan yields is then checked on its own exactly as a
-directly-named one is. An empty directory is an error rather than a silent zero providers; it
-almost always means a mount that did not happen or a build that did not run.
-
-There is no implicit provider search path. The broker loads code, so every directory it loads from
-is named in this owner-only file and nowhere else — pointing at a shipped directory is one line,
-and that line is the record of the decision.
-
-## Managed provider sets
-
-**Status: current, exact-reference foundation.** `dekopon-brokerd` also contains its provider
-manager, so resolving an OCI reference, fetching its component, validating it, and serving the
-locked bytes need no `wkg`, ORAS, Docker CLI, shell, or package manager beside the broker binary.
-Provider management is a separate operator mode. It exits after changing local state; normal daemon
-startup remains network-free, deterministic, and startup-fixed.
-
-The operator authors exact references:
-
-```yaml
-# providers.yaml
-apiVersion: dekopon.dev/provider-set/v1alpha1
-providers:
-  - source: ghcr.io/dekopon-agents/provider-gh:0.1.0
-  - source: ghcr.io/dekopon-agents/provider-curl@sha256:0123...cdef
-```
-
-A source must carry a fully qualified registry and either an explicit tag or a canonical lowercase
-SHA-256 **manifest** digest. A tag that looks like `1.2.3` is still one exact OCI tag; it is never
-silently interpreted as a SemVer range. An unchanged tag keeps the manifest digest already in the
-lock. To request another resolution, change the authored reference. Explicit SemVer requirements,
-networked outdated checks, and `update` are not in this first format.
-
-Resolve and materialize the set:
+`brokerLimits.maxReplayIds` bounds the process-local invocation-ID ledger (default 100 000; chart
+default 200 000). The ledger never evicts during a process lifetime; exhaustion returns
+`capacity-exhausted`, not a retryable outage. Restart starts an empty ledger. Audit file growth is
+independent of this memory bound and requires operator disk monitoring.
 
 ```console
-dekopon-brokerd provider sync \
-  --provider-set /etc/dekopon/providers.yaml \
-  --lock-file /etc/dekopon/providers.lock.yaml \
-  --store /var/lib/dekopon/provider-store
-
-# Recreate missing local bytes from the existing immutable lock, without resolving a tag:
-dekopon-brokerd provider sync --locked \
-  --provider-set /etc/dekopon/providers.yaml \
-  --lock-file /etc/dekopon/providers.lock.yaml \
-  --store /var/lib/dekopon/provider-store
-
-# Both are offline; list reports byte state/reason, verify also runs complete host validation:
-dekopon-brokerd provider list \
-  --lock-file /etc/dekopon/providers.lock.yaml \
-  --store /var/lib/dekopon/provider-store
-dekopon-brokerd provider verify \
-  --lock-file /etc/dekopon/providers.lock.yaml \
-  --store /var/lib/dekopon/provider-store
+chmod 0700 /home/dekopon/.local/run/dekopon /home/dekopon/.local/state/dekopon
+chmod 0600 /path/to/broker.yaml
+dekopon-brokerd --config /path/to/broker.yaml
 ```
 
-`--output json` gives deterministic machine-readable command results. Successful lock changes say
-that they apply on the next broker restart; there is no hot reload.
+SIGINT and SIGTERM stop Unix acceptance, drain bounded in-flight connections under one shutdown
+grace, finish audit appends, log `broker_stopped`, and remove only the Unix socket inode created by
+this process. Shutdown grace must cover one configured host deadline plus two complete frame
+deadlines, and it is one grace for the whole process: all Unix connections drain under that one
+deadline rather than each taking a fresh grace period.
 
-Operator commands never take `--config`; combining them is a usage error.
-`provider` requires `--lock-file` and `--store`; `sync` also requires `--provider-set`. Usage errors exit 2; a failed command exits 1. Operator modes print
-results on stdout and text diagnostics on stderr at `warn` (override with `RUST_LOG`); the daemon
-logs JSON on stdout at `info`.
-
-Resolution accepts one OCI image manifest with schema 2, exact artifact type
-`application/vnd.dekopon.provider.v1+wasm`, the standard empty OCI config, and exactly one positive,
-bounded `application/wasm` layer. Manifest, token, error, and component streams have independent
-byte ceilings and deadlines. Public registries use anonymous OCI Bearer challenge flow. Private
-registry credentials and custom certificate roots are deliberately not accepted yet; TLS
-verification cannot be disabled, ambient proxy environment variables are ignored, redirects may
-never downgrade to unapproved plaintext, and plain HTTP is available only to an exact literal
-loopback authority named with `--plaintext-loopback-registry <HOST[:PORT]>` (repeatable, `provider`
-subcommands only), for development and tests.
-
-Fetched bytes land at:
-
-```text
-<store>/blobs/sha256/<component-digest>.wasm
-```
-
-The manager serializes competing store and activation writers with owner-only advisory locks, writes a temporary blob
-on the destination filesystem, bounds and hashes the stream, synchronizes it, publishes without
-clobbering an existing content address, and synchronizes the parent. It validates the **complete**
-proposed set with the broker host before atomically replacing the generated lock. A failed
-multi-provider validation can leave an unreachable blob, but never a partially activated lock.
-The blob directory has a hard lifetime ceiling of 4 GiB and 1,024 files (stale temporaries count),
-checked under the store lock before another download, so repeated failed or changed resolutions
-cannot grow it without bound. There is no `prune` command yet; reaching that ceiling requires
-operator-reviewed cleanup until orphan deletion has its own safe lifecycle contract.
-
-The generated lock is strict, byte-capped, source-sorted, timestamp-free, and records both identities:
-
-```yaml
-apiVersion: dekopon.dev/provider-lock/v1alpha1
-providers:
-  - source: ghcr.io/dekopon-agents/provider-gh:0.1.0
-    resolvedVersion: 0.1.0
-    manifestDigest: sha256:...
-    componentDigest: sha256:...
-    componentBytes: 585394
-    providerId: gh
-```
-
-Activate it in daemon configuration instead of `providers`:
-
-```yaml
-providerSet:
-  lockPath: /etc/dekopon/providers.lock.yaml
-  storePath: /var/lib/dekopon/provider-store
-```
-
-`providerSet` and legacy `providers` are mutually exclusive. The lock, store, blob directories, and
-blob files are trusted broker input: they must be owned by the broker UID, have protected parents,
-be regular/single-link where applicable, and not be group/world writable. The daemon derives every
-blob path from the locked component digest and performs no registry request. Most importantly, the
-broker host compares the locked component length and SHA-256 against the **same single read buffer**
-it passes to Wasmtime, then compares the bounded `describe` provider ID with the lock. A preflight
-hash of a different read would not provide that guarantee.
-
-The implementation uses the lower-level OCI reference and bounded HTTP machinery that a package
-tool such as `wkg` is built from, not `wasm-pkg-client` itself. That client models standard
-`namespace:package@version` WIT packages and the standard OCI-Wasm config/layer layout; Dekopon's
-custom provider artifact type and `application/wasm` layer are intentionally different. Embedding
-that higher-level client would accept the wrong package contract while adding another binary solved
-nothing.
-
-A digest proves byte identity, not publisher identity. This manager does **not** yet verify GitHub
-release provenance or OCI attestations. It therefore does not replace the provenance checks in
-`ci/stage-image-context.sh`, and the Dockerfile remains network-free. Container staging still
-fetches each component at a pinned release, checks its SHA-256, and verifies its provenance with
-`gh attestation verify`; it does not use `provider sync --locked`, and a switch would have to keep
-verifying provenance for each downloaded component, because this manager checks byte identity only.
-
-At decision time a capability with no constraint set is denied `unconstrained-capability` before
-Cedar is consulted at all. That refusal is unconditional and is what actually enforces anything.
-
-`strict` (default `false`) decides whether startup *also* complains. Left alone, a policy naming a
-capability no loaded provider offers, and a constraint set naming one, are both warnings: the
-deployment starts, and each is logged as an `audit.event` so the mismatch is visible in traces.
-This is what lets you ship policy for a provider you have not dropped in yet. Set `strict: true`
-for a deployment whose provider set is fixed, where a mismatch means someone made a mistake — then
-every one of those warnings is the startup refusal it used to be.
-
-One thing stays fatal in both modes: a policy naming a principal that no `identities` or
-`identityMappings` entry declares. Principals come from this file rather than from a loaded
-component, so an undeclared one is always a typo.
-
-Bounds are startup-fixed: 1 MiB of source, 1024 policies, no templates, Cedar strict validation.
-Evaluation errors deny.
+### Provider credentials
 
 An optional `credentialsPath` names a second, stricter owner-only file (`0600`, single-link,
-byte-capped) holding legacy implicitly selected provider credentials. The secret values live only there — never in this
-configuration — and a constraint set binds one by symbolic name with `credential:`. Startup fails
-closed if a named credential is missing, the constraint set grants no HTTP authority, or any
-`allowedHosts` entry is absent from the credential's `destinations`; at execution the native
-engine injects `authorization: <scheme> <secret>` only after guest headers were validated and
-only for destinations inside the binding. Evidence and audit record `credentialInjected: true`,
-never the value. The terminal audit record also names which credential the invocation selected —
-the symbolic name from this file, never the secret.
+byte-capped) holding implicitly selected provider credentials. The secret values live only there —
+never in this configuration — and a constraint set binds one by symbolic name with `credential:`.
+Startup fails closed if a named credential is missing, the constraint set grants no HTTP authority,
+or any `allowedHosts` entry is absent from the credential's `destinations`; at execution the native
+engine injects `authorization: <scheme> <secret>` only after guest headers were validated and only
+for destinations inside the binding. Evidence and audit record `credentialInjected: true`, never the
+value. The terminal audit record also names which credential the invocation selected — the symbolic
+name from this file, never the secret. *Committed direction:* `credential`/`credentialByAgent`
+bindings will be replaced by public DRNs; these examples remain current until that migration ships
+([migration requirements](../../docs/design.md#legacy-credential-bindings)).
 
 ```yaml
 # broker.yaml
@@ -311,6 +187,10 @@ following start.
 
 ### `chatgptSubscription`: a credential the broker renews itself
 
+*Committed direction:* its legacy `credential`/`credentialByAgent` selection will be replaced by
+public DRNs, retaining the refresh and injection behavior below
+([migration requirements](../../docs/design.md#legacy-credential-bindings)).
+
 A `bearerToken` is a value an operator rotates by hand. A ChatGPT subscription token is not: the
 access token expires hourly and the refresh token rotates on every renewal, so the value to present
 exists only at the moment of use. `authFile` names the credential document
@@ -351,20 +231,25 @@ disk is the retired one.
 propose one public logical DRN through the sandboxed curl Basic/Bearer forms, but possession grants
 nothing: the broker requires ordinary capability policy, a separate `secret.use` Cedar statement,
 and an exact private binding before one source snapshot is fetched. Providers receive neither DRN
-nor bytes. Current adapters cover secure files, Kubernetes projections/API objects, 1Password
-Connect, Vault KV v1/v2, AWS Secrets Manager/SSM, GCP Secret Manager, and Azure Key Vault.
+nor bytes. Adapters cover secure files, Kubernetes projections and API objects, 1Password Connect,
+Vault KV v1/v2, AWS Secrets Manager and SSM, GCP Secret Manager, and Azure Key Vault.
 
 ```yaml
 secretMapPath: /etc/dekopon/secret-map.yaml
 ```
 
 Map descriptors are validated without network at startup. Resolution is per authorized invocation,
-with no stale fallback. Basic/Bearer rendering, path/query scope, injection limits and direct
-reflection checks live in the native HTTP host. See [`../../docs/secrets.md`](../../docs/secrets.md)
-for the strict map schema, source fields, bootstrap-file hygiene, policies, examples and current
-non-goals. `credentialsPath` and `secretMapPath` may coexist.
+with no stale fallback. Basic/Bearer rendering, path and query scope, injection limits, and direct
+reflection checks live in the native HTTP host. See
+[`../../docs/secrets.md`](../../docs/secrets.md) for the strict map schema, source fields,
+bootstrap-file hygiene, policies, and examples. `credentialsPath` and `secretMapPath` may coexist
+today; the legacy selection bindings [will be replaced by public DRNs](../../docs/design.md#legacy-credential-bindings).
 
 ### One capability, one token per agent
+
+*Committed direction:* `credential`/`credentialByAgent` will be replaced by public DRNs while
+preserving per-agent isolation ([migration requirements](../../docs/design.md#legacy-credential-bindings)).
+The following describes the current syntax and validation.
 
 `credential:` is the default for every caller. `credentialByAgent:` overrides it per acting agent,
 which is what lets one capability reach two organizations without being duplicated under a second
@@ -393,15 +278,14 @@ constraintSets:
         allowPlaintextLoopback: false
 ```
 
-The key is the agent, because a route already binds a transport and a match to an agent: one Slack
-workspace or one channel selects the agent that answers, and the agent selects the token. The name
-comes from the attested context the broker derived from this file's own `attestor` grant and
-`identityMappings`, so it is trusted configuration selecting on trusted identity — a request
-payload cannot ask for a different token. A caller with no agent, such as a direct service
-peer, matches no override and takes the default.
+The key is the agent because a route already binds a transport and a match to an agent: one Slack
+workspace or channel selects the agent that answers, and the agent selects the token. The name comes
+from the attested context the broker derived from this file's own `attestor` grant and
+`identityMappings`, so a request payload cannot ask for a different token. A caller with no agent,
+such as a direct service peer, matches no override and takes the default.
 
 `credential:` may be omitted while `credentialByAgent:` is present, and then an agent with no entry
-transacts unauthenticated exactly as a set with no credential at all always has.
+transacts unauthenticated, exactly as a set with no credential at all does.
 
 Every credential the set can select is validated at startup, not just the default: an override
 naming a credential the store does not hold, or one whose `destinations` do not cover every
@@ -409,9 +293,13 @@ naming a credential the store does not hold, or one whose `destinations` do not 
 override naming an agent no policy can reach is not an error — the broker holds no agent catalog,
 and the name is inert until a route and a policy exist for it.
 
+### Attested identity
+
 A peer identity may carry an optional `attestor` grant, which lets it propose on behalf of an
 authenticated external chat identity. `identityMappings` is the other half: it is the only place a
-canonical subject becomes a principal.
+canonical subject becomes a principal. The example's `credential` binding is current syntax that
+[will be replaced by public DRNs](../../docs/design.md#legacy-credential-bindings); identity attestation
+remains separate from credential selection.
 
 ```yaml
 # broker.yaml
@@ -451,11 +339,9 @@ constraintSets:
 ```
 
 ```cedar
-// policies.cedar — the canonical attested workflow.
-//
-// Two statements, because they answer two questions. The first is the session gate: may this
-// person drive this agent at all, and through which gateway. The second is what that session may
-// then reach. Neither implies the other.
+// policies.cedar — the canonical attested workflow. The session gate (may this person drive this
+// agent, through which gateway) and the surface that session reaches are two statements, and
+// neither implies the other.
 
 @id("boss-may-prompt-conditional-writer")
 permit(principal == Dekopon::Principal::"cpetersen",
@@ -490,32 +376,33 @@ rejects duplicate mapping subjects and malformed namespaces.
 
 A broker-owned `0700` socket parent retains a `0600` socket for owner-only clients. Configuring any
 peer UID other than the broker's own under such a parent is refused at startup, naming every
-unreachable UID at once: the socket it would bind admits none of them.
-For a distinct gateway UID, give the broker-owned parent the shared IPC group and mode
-`0710` (or `0750`). Group traversal selects a `0660` socket in that exact parent group;
-there is no extra configuration key. The broker must itself belong to that group to set
-the socket GID. Neither group writes nor any permissions for others are permitted on
-the IPC parent. A symlink parent, unsafe ancestors, wrong owner, socket symlink, hard
-link, wrong group, unsafe mode, or live listener replacement is refused.
+unreachable UID at once: the socket it would bind admits none of them. For a distinct gateway UID,
+give the broker-owned parent the shared IPC group and mode `0710` (or `0750`). Group traversal
+selects a `0660` socket in that exact parent group; there is no extra configuration key. The broker
+must itself belong to that group to set the socket GID. Neither group writes nor any permissions for
+others are permitted on the IPC parent. A symlink parent, unsafe ancestors, wrong owner, socket
+symlink, hard link, wrong group, unsafe mode, or live listener replacement is refused.
 
-Give the gateway membership in that IPC group, map its actual UID in `identities`, and
-set its existing `broker.serverUid` to the broker UID. The protocol client checks socket and parent
-ownership and mode — the same rule this server binds under — and the live server peer UID before
-writing a request. Unmapped peers receive no capabilities even if their group lets them connect.
-Owner-only clients remain valid.
+Give the gateway membership in that IPC group, map its actual UID in `identities`, and set its
+`broker.serverUid` to the broker UID. The protocol client checks socket and parent ownership and
+mode — the same rule this server binds under — and the live server peer UID before writing a
+request. Unmapped peers receive no capabilities even if their group lets them connect. Owner-only
+clients remain valid.
 
-Keep broker config, credentials, provider files, audit/cache and storage in their separate
-broker-owned protected paths; the IPC directory is not a credential or data directory.
-The gateway's local development **chat** socket stays `0600` under its own private parent.
-The chart's distinct container identities and init layout are documented in the chart.
+Keep broker config, credentials, provider files, audit, cache, and storage in their separate
+broker-owned protected paths; the IPC directory is not a credential or data directory. The gateway's
+local development **chat** socket is `0600` under its own private parent. The chart's distinct
+container identities and init layout are documented in the chart.
 
-The package's `tests/ipc_process.rs` runs real broker/client subprocesses. Unprivileged
-runs exercise owner-UID access, not cross-UID isolation. In a disposable Linux root
-container, require the full UID-switch, unmapped-peer, wrong-server and private-file proof:
+`tests/ipc_process.rs` runs real broker and client subprocesses; an unprivileged run exercises
+owner-UID access, not cross-UID isolation. In a disposable Linux root container, require the full
+UID-switch, unmapped-peer, wrong-server, and private-file proof:
 
 ```console
 DEKOPON_REQUIRE_CROSS_UID=1 cargo test -p dekopon-brokerd --test ipc_process --locked -- --nocapture
 ```
+
+### Telemetry
 
 An optional `telemetry` section enables OTLP export of broker spans:
 
@@ -528,25 +415,18 @@ telemetry:
   telemetryPayloads: false
 ```
 
-`telemetryPayloads: true` adds provider input and HTTP URLs to spans, declaring the telemetry sink in
-scope for the data this broker handles. It never exposes a credential: `Redacted` values render
-their marker in either mode, and append-only audit records are unaffected either way.
+`telemetryPayloads: true` adds provider input and HTTP URLs to spans. It never exposes a credential:
+`Redacted` values render their marker in either mode, and audit records are unaffected either way.
+*Committed direction:* the gate is removed; payloads always on
+([goal 2](../../docs/design.md#constitution)).
 
-It has no credential field by design. Ingest authentication is read from the standard
+The section has no credential field. Ingest authentication is read from the standard
 `OTEL_EXPORTER_OTLP_HEADERS` environment variable by the OpenTelemetry SDK, so a token never enters
-this configuration file, the process command line, or a span attribute. Receiver routing travels
-the same way: over gRPC OpenObserve reads the organization from an `organization` header and
-rejects exports without it, so include `organization=<org>` alongside the token and
-`stream-name`. Export failures disable
-telemetry and log the reason rather than preventing startup. Broker logs are structured JSON on
-stdout, filtered by `RUST_LOG`.
-
-Host, broker, and server limits have conservative defaults (including a 2 MiB frame ceiling) when their entire sections are omitted. `hostLimits` and `brokerLimits` also default field by field, so a partial section keeps the absent-section value for everything it does not name — which is what lets a deployment set `maxTotalMemoryBytes` or `maxReplayIds` alone. `serverLimits` stays all-or-nothing: when it is present every field is required. Unknown fields and unknown API versions are rejected. Startup also requires aggregate provider metadata, every mapped peer's capability response, and the *widest* response any session could receive to fit the frame ceiling. That last bound is the one that matters in a gateway deployment: the connecting peer is typically granted nothing itself, while the principals its `identityMappings` name hold the capability sets that actually reach the wire through an attested `capabilities`. The agent catalog belongs to the gateway, so those contexts cannot be enumerated here and are bounded instead. Shutdown grace must cover one configured host deadline plus two complete frame deadlines, and it is one grace for the whole process: all Unix connections drain under that one deadline rather than each taking a fresh grace period.
-
-`brokerLimits.maxReplayIds` bounds the process-local invocation-ID ledger (default 100 000;
-chart default 200 000). The ledger never evicts during a process lifetime; exhaustion returns
-`capacity-exhausted`, not a retryable outage. Restart starts an empty ledger. Audit file growth
-is independent of this memory bound and requires operator disk monitoring.
+this configuration file, the process command line, or a span attribute. Receiver routing travels the
+same way: over gRPC OpenObserve reads the organization from an `organization` header and rejects
+exports without it, so include `organization=<org>` alongside the token and `stream-name`. Export
+failures disable telemetry and log the reason rather than preventing startup. Broker logs are
+structured JSON on stdout, filtered by `RUST_LOG`.
 
 ### Compilation cache and the concurrent memory budget
 
@@ -559,63 +439,226 @@ hostLimits:
 
 `compileCachePath` is optional. Absent, Cranelift compiles every component at every start and the
 socket binds only after that work finishes — the cost a startup probe has to cover. Present, the
-broker keeps Wasmtime's content-addressed cache there and a restart reads compiled code back
-instead. The directory holds code this privileged process executes, so its parent must be
-owner-only under the same rule as the audit paths; the broker creates the directory
-itself. Components already compile concurrently rather than one at a time either way.
+broker keeps Wasmtime's content-addressed cache there and a restart reads compiled code back. The
+directory holds code this privileged process executes, so its parent must be owner-only under the
+same rule as the audit paths; the broker creates the directory itself. Components compile
+concurrently either way.
 
 `hostLimits.maxMemoryBytes` bounds one invocation. Nothing bounds all of them at once, so the worst
 case is `serverLimits.maxConnections` × `maxMemoryBytes` — 64 × 64 MiB = 4 GiB at the defaults,
 which no small container survives. The broker states that product in one startup line so it is
 budgeted rather than discovered. Optional `hostLimits.maxTotalMemoryBytes` enforces it: a store that
 cannot reserve its share is refused before it exists, turning an OOM kill into a failed invocation.
-It must be at least `maxMemoryBytes`, and it is deliberately absent from the authority commitment —
-it is a concurrency budget, not a ceiling an authorization could narrow, so changing it does not
-rotate stored authority.
+It must be at least `maxMemoryBytes`, and it is absent from the authority commitment — it is a
+concurrency budget, not a ceiling an authorization could narrow, so changing it does not rotate
+stored authority.
 
-```console
-chmod 0700 /home/dekopon/.local/run/dekopon /home/dekopon/.local/state/dekopon
-chmod 0600 /path/to/broker.yaml
-dekopon-brokerd --config /path/to/broker.yaml
+## Policy
+
+Policies are [Cedar](https://cedarpolicy.com), validated at startup against a schema generated from
+this configuration. Everything a policy may name has to exist: principals come from `identities` and
+`identityMappings`, providers and capability actions come from the loaded provider manifests, and
+`agent.prompt` is fixed. A policy naming anything else refuses startup rather than becoming policy
+that can never match.
+
+| Cedar name | Comes from |
+| --- | --- |
+| `Dekopon::Principal::"…"` | an `identities` entry or an `identityMappings` principal |
+| `Dekopon::Provider::"…"` | a loaded provider manifest |
+| `Dekopon::Action::"…"` | a loaded capability, or the fixed `agent.prompt` |
+| `Dekopon::Agent::"…"` | any agent name; the catalog belongs to the gateway, not the broker |
+| `Dekopon::Secret::"drn:…"` | a public DRN declared by the owner-only secret map |
+| `Dekopon::Action::"secret.use"` | fixed separate permission to consume one exact DRN |
+
+The context each action carries is `dekopon-policy`'s
+[context](../dekopon-policy/README.md#context). Every value is derived by the broker from
+authenticated transport state or this configuration — never from a request payload, and never from
+message content or provider input.
+
+An optional `@id("…")` annotation names a policy. That name is what audit records carry as
+`policy_ids`, so it is worth writing; without it Cedar names policies positionally (`policy0`,
+`policy1`, …) and inserting a policy renumbers the ones below it. Names must be unique.
+
+At decision time a capability with no constraint set is denied `unconstrained-capability` before
+Cedar is consulted at all. That refusal is unconditional and is what actually enforces anything.
+
+`strict` (default `false`) decides whether startup *also* complains. Left alone, a policy naming a
+capability no loaded provider offers, and a constraint set naming one, are both warnings: the
+deployment starts, and each is logged as an `audit.event` so the mismatch is visible in traces. That
+is what lets you ship policy for a provider you have not dropped in yet. Set `strict: true` for a
+deployment whose provider set is fixed, where a mismatch means someone made a mistake — then each of
+those warnings becomes a startup refusal.
+
+One thing is fatal in both modes: a policy naming a principal that no `identities` or
+`identityMappings` entry declares. Principals come from this file rather than from a loaded
+component, so an undeclared one is always a typo.
+
+Bounds are startup-fixed: 1 MiB of source, 1024 policies, no templates, Cedar strict validation.
+Evaluation errors deny.
+
+## Managed provider sets
+
+`dekopon-brokerd` contains its provider manager, so resolving an OCI reference, fetching its
+component, validating it, and serving the locked bytes need no `wkg`, ORAS, Docker CLI, shell, or
+package manager beside the broker binary. Provider management is a separate operator mode that exits
+after changing local state; daemon startup is network-free, deterministic, and startup-fixed.
+
+The operator authors exact references:
+
+```yaml
+# providers.yaml
+apiVersion: dekopon.dev/provider-set/v1alpha1
+providers:
+  - source: ghcr.io/dekopon-agents/provider-gh:0.1.0
+  - source: ghcr.io/dekopon-agents/provider-curl@sha256:0123...cdef
 ```
 
-SIGINT and SIGTERM stop Unix acceptance, drain bounded in-flight connections under one shutdown grace, finish audit appends, log `broker_stopped`, and remove only the Unix socket inode created by this process.
+A source must carry a fully qualified registry and either an explicit tag or a canonical lowercase
+SHA-256 **manifest** digest. A tag that looks like `1.2.3` is one exact OCI tag; it is never
+silently interpreted as a SemVer range. An unchanged tag keeps the manifest digest already in the
+lock. To request another resolution, change the authored reference. Explicit SemVer requirements,
+networked outdated checks, and `update` are not in this format.
+
+Resolve and materialize the set:
+
+```console
+dekopon-brokerd provider sync \
+  --provider-set /etc/dekopon/providers.yaml \
+  --lock-file /etc/dekopon/providers.lock.yaml \
+  --store /var/lib/dekopon/provider-store
+
+# Recreate missing local bytes from the existing immutable lock, without resolving a tag:
+dekopon-brokerd provider sync --locked \
+  --provider-set /etc/dekopon/providers.yaml \
+  --lock-file /etc/dekopon/providers.lock.yaml \
+  --store /var/lib/dekopon/provider-store
+
+# Both are offline; list reports byte state/reason, verify also runs complete host validation:
+dekopon-brokerd provider list \
+  --lock-file /etc/dekopon/providers.lock.yaml \
+  --store /var/lib/dekopon/provider-store
+dekopon-brokerd provider verify \
+  --lock-file /etc/dekopon/providers.lock.yaml \
+  --store /var/lib/dekopon/provider-store
+```
+
+`--output json` gives deterministic machine-readable command results. A successful lock change
+applies on the next broker restart; there is no hot reload.
+
+Operator commands never take `--config`; combining them is a usage error. `provider` requires
+`--lock-file` and `--store`; `sync` also requires `--provider-set`. Usage errors exit 2; a failed
+command exits 1. Operator modes print results on stdout and text diagnostics on stderr at `warn`
+(override with `RUST_LOG`); the daemon logs JSON on stdout at `info`.
+
+Resolution accepts one OCI image manifest with schema 2, exact artifact type
+`application/vnd.dekopon.provider.v1+wasm`, the standard empty OCI config, and exactly one positive,
+bounded `application/wasm` layer. Manifest, token, error, and component streams have independent
+byte ceilings and deadlines. Public registries use anonymous OCI Bearer challenge flow. Private
+registry credentials and custom certificate roots are not accepted; TLS verification cannot be
+disabled, ambient proxy environment variables are ignored, redirects may never downgrade to
+unapproved plaintext, and plain HTTP is available only to an exact literal loopback authority named
+with `--plaintext-loopback-registry <HOST[:PORT]>` (repeatable, `provider` subcommands only), for
+development and tests.
+
+Fetched bytes land at:
+
+```text
+<store>/blobs/sha256/<component-digest>.wasm
+```
+
+The manager serializes competing store and activation writers with owner-only advisory locks, writes
+a temporary blob on the destination filesystem, bounds and hashes the stream, synchronizes it,
+publishes without clobbering an existing content address, and synchronizes the parent. It validates
+the **complete** proposed set with the broker host before atomically replacing the generated lock. A
+failed multi-provider validation can leave an unreachable blob, but never a partially activated
+lock. The blob directory has a hard lifetime ceiling of 4 GiB and 1,024 files (stale temporaries
+count), checked under the store lock before another download, so repeated failed or changed
+resolutions cannot grow it without bound. There is no `prune` command; reaching that ceiling
+requires operator-reviewed cleanup until orphan deletion has its own safe lifecycle contract.
+
+The generated lock is strict, byte-capped, source-sorted, timestamp-free, and records both
+identities:
+
+```yaml
+apiVersion: dekopon.dev/provider-lock/v1alpha1
+providers:
+  - source: ghcr.io/dekopon-agents/provider-gh:0.1.0
+    resolvedVersion: 0.1.0
+    manifestDigest: sha256:...
+    componentDigest: sha256:...
+    componentBytes: 585394
+    providerId: gh
+```
+
+Activate it in daemon configuration instead of `providers`:
+
+```yaml
+providerSet:
+  lockPath: /etc/dekopon/providers.lock.yaml
+  storePath: /var/lib/dekopon/provider-store
+```
+
+`providerSet` and `providers` are mutually exclusive. The lock, store, blob directories, and blob
+files are trusted broker input: they must be owned by the broker UID, have protected parents, be
+regular and single-link where applicable, and not be group/world writable. The daemon derives every
+blob path from the locked component digest and performs no registry request. Most importantly, the
+broker host compares the locked component length and SHA-256 against the **same single read buffer**
+it passes to Wasmtime, then compares the bounded `describe` provider ID with the lock. A preflight
+hash of a different read would not provide that guarantee.
+
+A digest proves byte identity, not publisher identity. This manager verifies no GitHub release
+provenance and no OCI attestation, so it does not replace the provenance checks in
+`ci/stage-image-context.sh`, and the Dockerfile remains network-free. Container staging fetches each
+component at a pinned release, checks its SHA-256, and verifies its provenance with
+`gh attestation verify`; it does not use `provider sync --locked`, and a switch would have to keep
+verifying provenance for each downloaded component.
 
 ## Audit
 
 The broker appends metadata-only JSONL records with `sequence` (one-based file line ordinal) and
-`event`. Open counts bounded newline-delimited lines in fixed memory without decoding events,
-verifying integrity, or restoring invocation IDs. Old bytes remain untouched; existing sequence
-fields are not trusted as ordinals. A private readable nonempty file can start on its own.
+`event` at `auditPath`. Open counts bounded newline-delimited lines in fixed memory without decoding
+events, verifying integrity, or restoring invocation IDs. Old bytes remain untouched; existing
+sequence fields are not trusted as ordinals. A private readable nonempty file can start on its own.
 `run` returns `Result<(), BrokerdError>` after clean shutdown.
+*Committed direction:* opt-in sink, off by default; audit is a log record in the trace
+([non-goals](../../docs/design.md#non-goals)).
 
-The file must be regular, single-link, owner-only and exclusively writer-locked, without symlink
+The file must be regular, single-link, owner-only, and exclusively writer-locked, without symlink
 following; its owner and private parent are checked before listening. `auditMaxLineBytes` bounds
-both existing lines and new serialized records (excluding the newline). Unterminated tails are
+both existing lines and new serialized records, excluding the newline. An unterminated tail is
 refused without truncation or repair. Appends write and flush, not fsync; a failed or cancelled
-append can leave partial bytes and poisons the open handle. There is no rollback, crash-recovery,
-file rotation, or total file-size bound. Monitor disk space; I/O failure remains explicit and a
-failed terminal append still reports that provider work may already have completed.
+append can leave partial bytes and poisons the open handle. There is no rollback, crash recovery,
+file rotation, or total file-size bound. Monitor disk space; I/O failure remains explicit, and a
+failed terminal append reports that provider work may already have completed.
 
 ## Boundaries
 
 - The service accepts one strict bounded request per fresh Unix connection.
-- A transient `accept` failure — descriptor or kernel-buffer exhaustion, an aborted peer, a signal — is logged as `broker_accept_retried` and retried after a short backoff. Only a fault that says the listener itself is unusable ends the process, because ending it costs a container restart and a full provider recompile before the socket rebinds.
+- A transient `accept` failure — descriptor or kernel-buffer exhaustion, an aborted peer, a signal —
+  is logged as `broker_accept_retried` and retried after a short backoff. Only a fault that says the
+  listener itself is unusable ends the process.
 - Peer UID mapping is trusted configuration; payload identity claims do not exist.
 - Authorization decisions come from the Cedar policy set; execution bounds come from
   `constraintSets` and are validated against loaded manifests, host ceilings, and the credential
   store at startup. Neither file can widen the other.
 - Audit records carry the determining `policy_ids`, the `policy_digest` of the evaluated set, and
-  the symbolic name of the `credential` the invocation selected.
-- Generic WASI and ambient I/O imports remain unavailable.
+  the symbolic name of the `credential` the invocation selected. Its legacy selection binding
+  [will be replaced by public DRNs](../../docs/design.md#legacy-credential-bindings); this is the current audit shape.
+- Generic WASI and ambient I/O imports are unavailable.
 - Audit appends contain metadata only; replay rejection is bounded process-local state.
-- Credential resolution is destination-bound, capability-scoped, and optionally agent-scoped. Providers receive only explicitly linked Dekopon host interfaces and policy constraints; an injected credential exists solely inside the native HTTP engine and is never observable by guest code.
-- Unprivileged clients submit proposals over the authenticated protocol; only the broker executes providers.
+- Credential resolution is destination-bound, capability-scoped, and optionally agent-scoped.
+  *Committed direction:* legacy `credential`/`credentialByAgent` selection will be replaced by public
+  DRNs without weakening those bounds ([migration requirements](../../docs/design.md#legacy-credential-bindings)).
+  Providers receive only explicitly linked Dekopon host interfaces and policy constraints; an
+  injected credential exists solely inside the native HTTP engine and is never observable by guest
+  code.
+- Unprivileged clients submit proposals over the authenticated protocol; only the broker executes
+  providers.
 
 ## Optional provider storage and chat memory
 
 Presence of `storage` requires every field; absence links storage imports only to a disabled sticky
-context. `rootPath` is disjoint from every broker-owned file/provider path and
+context. `rootPath` is disjoint from every broker-owned file and provider path, and
 `namespaceKeyPath` is one no-follow, server-owned `0600`, single-link, ≤4 KiB document under safe
 ancestors. A deployment with retained data and a missing or changed key fails closed.
 
@@ -702,31 +745,26 @@ constraintSets:
 is an ordinary one on every path however it is spelled: a capability called `memory.chat.export` or
 a provider called `memory-chat` is reserved by nothing. Declared, it takes the capability off the
 generic listing, run, resolve, and invoke paths, takes every command word of its provider out of the
-non-chat vocabulary, and makes the record route reachable only through the delivered-turn
-operation. Renaming the shipped provider therefore drops no reservation, and the reserved names are
-the ones this deployment chose.
+non-chat vocabulary, and makes the record route reachable only through the delivered-turn operation.
+Renaming the shipped provider therefore drops no reservation, and the reserved names are the ones
+this deployment chose.
 
-Each recent/search constraint set's `maxOutputBytes` must leave 1024 bytes beyond
+Each recent and search constraint set's `maxOutputBytes` must leave 1024 bytes beyond
 `chatMemory.maxResultBytes` for the SDK response envelope; record must leave the same fixed envelope
 headroom. Enabling `chatMemory` also requires the routed provider to declare exactly those three
-capabilities and no fourth. Memory/storage composition also rounds each 256 KiB JSONL read request when checking the
-invocation and host-call budgets, requires both logical files, and reserves the direct peak: the
-post-append turn file, live permanent dedup file, and conservative namespace entry metadata
-(including authority-pointer/manifest temporaries), without staged JSONL file copies. Startup accounts the
-worst-case JSON escaping of a bounded search query and additionally proves that raw/decoded files
-plus canonical-ABI compaction copies and fixed allocator headroom fit the independent Wasm
-linear-memory ceiling.
+capabilities and no fourth. Memory and storage composition rounds each 256 KiB JSONL read request
+when checking the invocation and host-call budgets, requires both logical files, and reserves the
+direct peak: the post-append turn file, live permanent dedup file, and conservative namespace entry
+metadata including authority-pointer and manifest temporaries, without staged JSONL file copies.
+Startup accounts the worst-case JSON escaping of a bounded search query and proves that raw and
+decoded files plus canonical-ABI compaction copies and fixed allocator headroom fit the independent
+Wasm linear-memory ceiling.
 
 The gateway peer's attestor additionally needs `chatScopes`. Breadth is an explicit tagged value:
 `transportWide`, `exactChannel`, or `exactConversation`; each names transport kind and configured
-transport ID, and narrower forms name canonical channel/conversation. A local transport must also
-name `localSubjectService`. Subject namespace authority remains independently required. Scope
+transport ID, and narrower forms name canonical channel and conversation. A local transport must
+also name `localSubjectService`. Subject namespace authority remains independently required. Scope
 fields enter Cedar as optional `transportKind`, `transport`, `channel`, and `conversation`.
-
-Filesystem cancellation cannot guarantee a stuck native `fsync` returns by a hard deadline. The
-lease and reservation remain held while a started blocking job drains, and shutdown grace must
-cover host timeout + lock timeout + finalization budget + two frame deadlines; a failed kernel or
-filesystem may still exceed it. Hostile same-UID mutation remains out of scope.
 
 ```yaml
 identities:
@@ -743,11 +781,16 @@ identities:
           conversation: c0123abc:1712345678.000100
 ```
 
+Filesystem cancellation cannot guarantee a stuck native `fsync` returns by a hard deadline. The
+lease and reservation remain held while a started blocking job drains, and shutdown grace must cover
+host timeout + lock timeout + finalization budget + two frame deadlines; a failed kernel or
+filesystem may exceed it. Hostile same-UID mutation is out of scope.
+
 ## Catalog ownership at policy startup
 
 The agent catalog belongs to the gateway. Cedar declares `Dekopon::Agent` but does not enumerate
 agent instances: a misspelled agent literal can validate and then deny every session. The gateway
 rejects a route naming an absent catalog agent; operators must cross-check policy agent literals
-against that catalog. Principal literals are always checked; undeclared providers/capabilities
+against that catalog. Principal literals are always checked; undeclared providers and capabilities
 are fatal with `strict: true`, otherwise reported as schema-only phantoms. Policy cannot widen
 owner-authored execution constraints or bind another credential.

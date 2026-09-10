@@ -2,10 +2,9 @@
 
 Shared OTLP exporter construction and W3C trace context for Dekopon processes.
 
-`dekopon-brokerd` and `dekopond` each export their own spans, so exporter
-construction lives here rather than being duplicated in each binary. The crate depends on no other Dekopon crate: it
-must stay linkable from the gateway without pulling broker code into the gateway's dependency tree,
-which CI rejects.
+`dekopon-brokerd` and `dekopond` each export their own spans, so exporter construction lives here
+rather than in each binary. The crate depends on no other Dekopon crate: it must stay linkable from
+the gateway without pulling broker code into the gateway's dependency tree, which CI rejects.
 
 ## Subscriber installation
 
@@ -39,7 +38,12 @@ This crate configures transport and never resolves credentials. Ingest authentic
 the OpenTelemetry SDK from the standard `OTEL_EXPORTER_OTLP_HEADERS` environment variable, so a
 token is never accepted as a command-line argument, never written to a configuration file this
 crate parses, and never attached to a span attribute or log field. Endpoint URL userinfo is
-rejected; ingest credentials must use the standard header variables..
+rejected; ingest credentials must use the standard header variables.
+
+The telemetry store sits inside the operator's trust boundary
+([`docs/design.md#constitution`](../../docs/design.md#constitution)). *Committed direction:* the
+gate is removed; payloads always on, command words and arguments are recorded, and no span is
+dropped ([exclusions](../../docs/observability.md#exclusions)).
 
 ## Trace context
 
@@ -47,3 +51,6 @@ rejected; ingest credentials must use the standard header variables..
 `remote_context` rebuilds a remote parent from identifiers received over a wire protocol. The
 crate speaks raw identifier bytes rather than a Dekopon wire type; `dekopon-broker-protocol` owns
 `traceparent` parsing, formatting, and validation.
+
+[`docs/observability.md`](../../docs/observability.md#trace-context-across-the-socket) is the
+authoritative account of how the two correlation identifiers relate.

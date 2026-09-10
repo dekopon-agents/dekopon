@@ -49,8 +49,6 @@ if the classic deployment wants final replies only. The Agent profile additional
 requires for Agent View. It also adds `channels:history`/`message.channels` and
 `groups:history`/`message.groups` for exact owned-thread continuation. Opening App Home is not
 itself routed as a prompt, and ambient channel-history events are discarded inside the transport.
-An existing Agent installation must apply the updated manifest and reinstall to grant the two new
-history scopes before owned-thread continuation can receive unmentioned replies.
 
 ### Generate the app-level token (`xapp-…`)
 
@@ -120,7 +118,7 @@ activity:
 `experience` controls conversation semantics and never changes in response to a cosmetic API
 failure. Classic DMs retain top-level replies and one whole-DM conversation. Agent DMs use one
 Slack thread/session per root message, including their conversation history and Stop key. In an
-Agent channel, the initial request still must mention the bot. Fresh authorization then claims the
+Agent channel, the initial request must mention the bot. Fresh authorization then claims the
 exact workspace/channel/root-thread/sender tuple in a bounded process-local registry, allowing only
 that sender's unmentioned follow-ups in that thread. Revocation removes the claim and restart clears
 all claims; another sender must mention and authorize independently.
@@ -128,8 +126,8 @@ all claims; another sender must mention and authorize independently.
 Persistent history is private per authenticated subject unless the route explicitly sets
 `scope: sharedConversation`. Slack sharing is normally root-thread scoped: independently authorized
 participants in that root thread then share retained turns and attachment references, while every
-message still receives its own broker decision. Shared turns send canonical Slack subject IDs to
-the model provider even when telemetry payloads are disabled; this example does not opt in.
+message receives its own broker decision. Shared turns send canonical Slack subject IDs to the
+model provider; this example does not opt in.
 
 In Agent mode, Dekopon sets `processing` once—Slack owns the standard Working UI and one-hour
 processing timeout—sends the durable reply, and queues `active` cleanup.

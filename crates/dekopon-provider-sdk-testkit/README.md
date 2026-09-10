@@ -6,8 +6,7 @@ components.
 A provider's behavior only fully exists when its compiled component runs against a host. HTTP
 providers can approximate that natively by injecting a transport closure; storage providers cannot,
 because `dekopon-provider-storage` exposes free functions that call the WIT import directly and
-those bindings expand to `unreachable!()` off `wasm32`. This crate closes that gap by running the
-real component.
+those bindings expand to `unreachable!()` off `wasm32`. This crate runs the real component.
 
 It is a *fake broker*, not a fake host. Cedar policy and the owner-authored constraint catalog are
 skipped — `FakeBroker` mints its own authorization through `AuthorizationGate`, which is the
@@ -51,14 +50,14 @@ loop.
 - **Continuity is selectable and defaults to `Stable`.** `ContinuityPolicy`'s own default is
   `AuthorityBound`, which mints a fresh non-reusing generation whenever the *effective authority
   commitment* changes. This harness holds that commitment constant, so `AuthorityBound` addresses
-  one generation here exactly as `Stable` does; `.continuity(…)` selects either. `Stable` is the
-  default because it is the policy that survives an authority change, so a harness that later
-  grows a varying authority surface keeps addressing one namespace instead of silently starting
-  over.
+  one generation here exactly as `Stable` does; `.continuity(…)` selects either. `Stable` survives
+  an authority change, so a harness that grows a varying authority surface keeps addressing one
+  namespace instead of silently starting over.
 - **A grant is minted per invocation and consumed by it.** Successive calls get fresh invocation
   ids and identical scope material, which is what keeps them addressing one namespace.
 - **`StorageNamespace::Chat` is the only namespace the storage host will grant.** A provider with
-  nothing to do with chat still needs a transport, channel, and conversation; those are pre-filled.
+  nothing to do with chat needs a transport, channel, and conversation anyway; those are
+  pre-filled.
 - **The namespace key must live outside the root, owner-only.** Written for you at `0600`, in a
   `TempDir` the `FakeBroker` owns.
 

@@ -1,32 +1,23 @@
 # `charts/dekopon`
 
 A Helm chart that runs `dekopon-brokerd` and `dekopond` as one pod on a single-node arm64 k3s
-cluster.
+cluster. It is published to `oci://ghcr.io/dekopon-agents/charts/dekopon` and consumed from ArgoCD
+by registry path, not by Git path; both GHCR packages are public. See
+[Two version numbers](#two-version-numbers) and [Publishing](#publishing).
 
-**Status: published, but never applied to a cluster.** Those are two separate claims and only one of
-them limits you.
-
-*Published* is settled. `dekopon-chart-0.3.0` shipped the chart to
-`oci://ghcr.io/dekopon-agents/charts/dekopon:0.3.0` (0.1.0, 0.2.0 and 0.2.1 precede it), and
-application tags from `v0.4.0` onward publish the container image it pulls, so `helm install` from
-the registry has everything it needs.
-The chart is consumed from ArgoCD by registry path, not by Git path, and both GHCR packages are
-public. See [Two version numbers](#two-version-numbers) and [Publishing](#publishing).
-
-*Never applied* is the real caveat. Every claim below about rendered YAML, file ownership, and file
-modes was verified against `helm template` and the CI render checks, not against a running cluster.
-Nothing here has been installed on a live Kubernetes API server, so treat the manifests as reviewed
-rather than as field-proven.
+**Nothing here has been applied to a cluster.** Every claim below about rendered YAML, file
+ownership, and file modes was verified against `helm template` and the CI render checks, never
+against a live Kubernetes API server. Treat the manifests as reviewed rather than field-proven:
+[What is not proven](#what-is-not-proven).
 
 Read [`crates/dekopon-brokerd/README.md`](https://github.com/dekopon-agents/dekopon/blob/main/crates/dekopon-brokerd/README.md) and
 [`docs/dekopond.md`](https://github.com/dekopon-agents/dekopon/blob/main/docs/dekopond.md) first. The chart places files and sets
 permissions; it does not define or validate their contents, and the two daemons' own documentation
 is the only description of what goes in them.
 
-This unreleased chart boundary requires lockstep daemon binaries containing distinct-UID IPC
-support; select an image built from that source with `image.tag` or `image.digest`. The historical
-`appVersion` default alone does not prove those unreleased binaries are present. No image release
-or deployment is performed by these source changes.
+The chart boundary requires lockstep daemon binaries carrying distinct-UID IPC support. Select an
+image built from that source with `image.tag` or `image.digest`; the `appVersion` default alone does
+not prove those binaries are present.
 
 ## What it deploys
 
@@ -85,8 +76,8 @@ No Kubernetes volume can present a file that satisfies A or B:
 | any of the above plus `fsGroup` | `65532:2000`, `0640` | passes B, fails A — `0o040` is exactly what `mode & 0o077` rejects |
 
 `fsGroup` is worth calling out on its own, because it is the reflex fix for "the pod cannot read its
-volume" and here it is the thing that breaks the credentials file specifically. It is deliberately
-absent from `podSecurityContext` and adding it is a chart render refusal.
+volume" and here it is the thing that breaks the credentials file specifically. It is absent from
+`podSecurityContext`, and adding it is a chart render refusal.
 
 So the chart mounts nothing the daemons read. A `projected` volume gathers every source into
 `/dekopon-source`, visible only to the init container, and the init container copies:
@@ -102,11 +93,11 @@ changes. It cannot see into an `existingSecret`, so roll the pod yourself after 
 
 The init container is the only thing in the chart that runs as root, and it holds `CHOWN` and
 `FOWNER` and nothing else. `CHOWN` is what lets it hand a directory to `65532`; `FOWNER` is what
-lets it `chmod` a directory it no longer owns, on a restart. It deliberately does **not** hold
-`DAC_OVERRIDE`: instead it reclaims the directories to `root` first, which is also why it is
-idempotent across an in-place pod restart where the `emptyDir` still holds the previous run's
-`0700` directory. It asserts its own output with `stat` before exiting, so a wrong file is an init
-failure naming that file rather than a broker that starts and then refuses to serve.
+lets it `chmod` a directory owned by another UID after a restart. It does **not** hold
+`DAC_OVERRIDE`: it reclaims the directories to `root` first, which is also why it is idempotent
+across an in-place pod restart where the `emptyDir` holds the previous run's `0700` directory. It
+asserts its own output with `stat` before exiting, so a wrong file is an init failure naming that
+file rather than a broker that starts and then refuses to serve.
 
 ### What does not need any of this
 
@@ -117,10 +108,10 @@ failure naming that file rather than a broker that starts and then refuses to se
   `broker.yaml`.
 - **The agent catalog.** Tier E. `dekopond` reads `catalogPath` with a plain `read_to_string`, so a
   ConfigMap volume mounted straight at `paths.catalogDir` is fine and nothing is copied. This holds
-  for the catalog file alone. An agent that declares `skills:` — an `[Unreleased]` catalog field
-  in [`CHANGELOG.md`](../../CHANGELOG.md), newer than `appVersion` `0.12.0` — needs each skill
-  directory readable in the pod (a relative path resolves against the catalog file's own
-  directory), and `dekopond` refuses the catalog at startup when one cannot be read.
+  for the catalog file alone. An agent that declares `skills:` needs a daemon binary carrying the
+  skills loader, which the `appVersion` default does not select — pin `image.tag` or `image.digest`
+  — and needs each skill directory readable in the pod (a relative path resolves against the catalog
+  file's own directory); `dekopond` refuses the catalog at startup when one cannot be read.
   `gateway.catalog` projects a single key to a single file and the chart offers no operator-supplied
   volume mount for the gateway, so a catalog with skills cannot come from `gateway.catalog`: bake
   the catalog and its skill directories into an image of your own (skill paths must be real
@@ -190,15 +181,13 @@ There is no HTTP health endpoint, and the image is distroless with no shell, so 
 run `dekopon-brokerd probe --socket /run/dekopon/broker.sock`, which connects
 over the real socket, passes `SO_PEERCRED` in both directions, and gets back the capability list
 policy exposes to this peer. It is evaluated from the constraint catalog and the policy set and
-appends **no audit record**, so probing adds no audit-file growth. Audit appends have no total
-record cap: monitor disk usage and provision for traffic and retention. `maxReplayIds` separately
-bounds process-local replay memory, not disk usage; size that memory independently.
+appends **no audit record**, so probing adds no audit-file growth.
 
 - **`startupProbe`**, 5 s period, 60 failures — five minutes. The broker compiles every `.wasm`
   component through Cranelift before it binds the socket, so "the socket answers" is exactly "fully
   started". Components compile concurrently rather than one at a time, and `compileCachePath` makes
-  a restart read compiled code back from disk instead of recompiling, but the cold path is still
-  Cranelift and the probe budget still has to cover it. The
+  a restart read compiled code back from disk instead of recompiling, but the cold path runs
+  Cranelift and the probe budget has to cover it. The
   margin is large because a startup probe that gives up restarts the container, and a restart loop
   against audit state is the worst thing this chart can produce.
 - **Broker `readinessProbe`**, 30 s period. It keeps pod readiness truthful and, when the optional
@@ -223,7 +212,7 @@ larger of the two. `dekopond` drains in-flight sessions for its own `shutdownGra
 `dekopon-brokerd` then drains connections for `serverLimits.shutdownGraceMs`, and both default to
 `120000`.
 
-Whatever is still draining when the pod's grace expires is `SIGKILL`ed. For the gateway that
+Whatever is draining when the pod's grace expires is `SIGKILL`ed. For the gateway that
 abandons a model turn somebody is waiting on; for the broker it lands mid-invocation and
 mid-audit-append, which is the one place this chart cannot promise a clean failure.
 
@@ -316,10 +305,10 @@ read through it to run the test at all.
 
 ### It lives on the claim, and that is the point
 
-`gateway.chatgpt.subdir` is a single path segment joined onto `paths.stateDir`, not a free path.
-That is deliberate: an `emptyDir` dies with the pod, so a credential seeded there would be re-seeded
-on every reschedule — the same bug, just rarer and harder to see. Making the location composed
-rather than configured means it cannot be pointed somewhere ephemeral by accident.
+`gateway.chatgpt.subdir` is a single path segment joined onto `paths.stateDir`, not a free path. An
+`emptyDir` dies with the pod, so a credential seeded there would be re-seeded on every reschedule —
+the same bug, just rarer and harder to see. Composing the location rather than configuring it means
+it cannot be pointed somewhere ephemeral by accident.
 
 The gateway mounts that directory with `subPath`, so it gets the credential directory and nothing
 else on the claim. The broker mounts its separate sibling; neither daemon mounts the claim
@@ -328,9 +317,14 @@ root, and distinct UID ownership additionally denies access to the other's priva
 `DEKOPON_CHATGPT_AUTH_FILE` is set on the gateway container to that path. Without it, a model with
 no explicit `authFile` falls back to `$XDG_CONFIG_HOME` and then `$HOME`, which is on the read-only
 root filesystem, where `save_credentials` cannot create its temporary sibling. Naming `authFile` in
-`dekopond.yaml` is clearer still, and then neither the environment nor the fallback matters.
+`dekopond.yaml` is clearer, and then neither the environment nor the fallback matters.
 
 ### The broker has a second, independent family
+
+*Committed direction:* the broker's `credential`/`credentialByAgent` bindings will be replaced by
+public DRNs. The shared refresh implementation and independent token families described here must
+survive that migration ([requirements](../../docs/design.md#legacy-credential-bindings)); the chart
+continues to seed the current credential kind.
 
 `broker.chatgpt.*` seeds the same kind of file for `dekopon-brokerd`, which is what a
 `kind: chatgptSubscription` entry in `broker-credentials.yaml` points its `authFile` at:
@@ -376,25 +370,25 @@ document, logs how long the access token has left, and refuses to start naming t
 that fails. A misconfigured credential is a broker that does not come up, not a capability that is in
 service and denies every invocation.
 
-### Re-seeding is deliberate
+### Re-seeding is explicit
 
 `gateway.chatgpt.reseed: true` (and `broker.chatgpt.reseed: true` for the broker's family)
 discards whatever is in the volume and copies the Secret in again.
 It is separate because it is destructive: the credential in the volume is the live one, and the
-exported copy is almost certainly older. Use it after a deliberate local re-login and re-export.
+exported copy is almost certainly older. Use it after a local re-login and re-export.
 
 It is not self-clearing — while it is `true`, every restart re-seeds — so set it back to `false`
 once the pod has rolled. It rolls the pod on its own, because it changes the init container's
 arguments, which are part of the pod template.
 
-There is deliberately **no `checksum/` annotation for either credential Secret**, unlike every other
-file the chart writes. Those annotations exist to push a changed file into a pod that only reads at
-startup. This is the one file whose entire purpose is *not* to be pushed in: the copy in the volume
-is authoritative, so an annotation would restart a working gateway to achieve nothing at all.
+There is **no `checksum/` annotation for either credential Secret**, unlike every other file the chart
+writes. Those annotations exist to push a changed file into a pod that only reads at startup. This
+is the one file whose entire purpose is *not* to be pushed in: the copy in the volume is
+authoritative, so an annotation would restart a working gateway to achieve nothing at all.
 
-### One replica, now for two reasons
+### One replica, for two reasons
 
-`replicas: 1` and `strategy: Recreate` were already forced by the broker's exclusive `flock` on the
+`replicas: 1` and `strategy: Recreate` are forced by the broker's exclusive `flock` on the
 audit log. With this model kind they are load-bearing a second time:
 `CredentialFile` serializes refreshes behind a per-process snapshot and an advisory lock on a sibling
 `.lock` file, so two holders in one pod coordinate — the gateway's model client and the broker's
@@ -405,10 +399,17 @@ loser would be left holding an invalidated refresh token. Neither value is expos
 
 Nothing detects the drift and nothing repairs it. The exported copy has one job — seeding a *new*
 deployment. It is not a backup, and restoring it over a live credential is a way to break a working
-pod, not to fix one. Deliberate rotation is: log in locally again, re-export, update the Secret,
+pod, not to fix one. Rotation is: log in locally again, re-export, update the Secret,
 then either delete the file in the volume and restart, or set `reseed` for one roll.
 
+The broker configuration's legacy `credential`/`credentialByAgent` selection is
+[planned to be replaced by public DRNs](../../docs/design.md#legacy-credential-bindings); that does not
+change seed-once behavior or turn the vault copy into the live token.
+
 ## Sizing the audit volume
+
+*Committed direction:* opt-in sink, off by default; audit is a log record in the trace
+([non-goals](../../docs/design.md#non-goals)).
 
 `local-path` is the target cluster's only StorageClass, it is RWO, and **`ALLOWVOLUMEEXPANSION` is
 `false`**. `state.size` is final for the life of the volume.
@@ -433,7 +434,7 @@ from audit history. Budget this resident memory separately from append-only disk
 ## Storage, uninstall, and recovery
 
 The claim carries `helm.sh/resource-policy: keep`, so `helm uninstall` leaves the audit
-and live model credential intact. Move or delete retained state only deliberately.
+and live model credential intact. Removing retained state is a separate operator action.
 
 It carries `argocd.argoproj.io/sync-options: Prune=false,Delete=false` for the same reason, because
 Helm's annotation means nothing to a GitOps controller. Argo CD syncing with `prune: true` deletes
@@ -451,7 +452,7 @@ and gives each daemon only its own private subdirectory, as in [Paths the chart 
 `mmap` with `PROT_EXEC`, `mprotect`, `memfd_create`, and `SIGSEGV`/`SIGBUS` handlers for guard-page
 traps. `RuntimeDefault` permits all of that, and a provider has been proven to load under Docker's
 equivalent default profile. Do not narrow this to a hand-written profile without proving a component
-still loads; the failure mode is a trap inside the JIT, not a clean error.
+loads; the failure mode is a trap inside the JIT, not a clean error.
 
 `readOnlyRootFilesystem` is `true` for every container. Neither daemon writes outside its mounted
 volumes, and a memory-backed `/tmp` is mounted anyway so an incidental temporary file cannot turn
@@ -468,19 +469,18 @@ The chart and the application it deploys are versioned independently, and both n
 | **chart version** (`Chart.yaml: version`) | a `dekopon-chart-*` Git tag | the version of *this chart* — its templates, defaults, and documentation |
 | **appVersion** (`Chart.yaml: appVersion`) | the application release the chart deploys | what `image.tag` defaults to, and what the pod actually runs |
 
-They move for different reasons. A templating fix ships as `dekopon-chart-0.1.1` and changes no
+They move for different reasons. A templating fix ships as a `dekopon-chart-*` tag and changes no
 `appVersion`; a new application release moves `appVersion` and, with it, the image the chart pulls.
 `v*.*.*` tags publish crates, release archives, and the container image; `dekopon-chart-*` tags
-publish only the chart. That is the whole reason for two tag namespaces — a chart bug should not
-force an application release, and an application release should not republish an unchanged chart.
+publish only the chart. That is the whole reason for two tag namespaces — a chart bug must not
+force an application release, and an application release must not republish an unchanged chart.
 
-`appVersion` is `0.12.0`, the current application release. It is not decorative: `dekopon.labels`
-renders it as `app.kubernetes.io/version` on every object, so an `appVersion` behind the image is a
-cluster answering `kubectl get pods -l app.kubernetes.io/version` with a version nothing is running,
-and every dashboard and alert built on that label reporting the same wrong number. It has to move in
-the application's release-prep commit, alongside the workspace version. The floor is `v0.4.0`:
-`v0.3.0` and earlier predate the container-image workflow and have no image at all, so an
-`appVersion` below that would ship a chart whose default pulls nothing.
+`appVersion` is `0.12.0`. It is not decorative: `dekopon.labels` renders it as
+`app.kubernetes.io/version` on every object, so an `appVersion` behind the image is a cluster
+answering `kubectl get pods -l app.kubernetes.io/version` with a version nothing is running, and
+every dashboard and alert built on that label reporting the same wrong number. It has to move in
+the application's release-prep commit, alongside the workspace version. Its floor is `0.4.0`:
+below that no container image exists, so the chart's default would pull nothing.
 
 The image workflow publishes under the Git tag, so the tag carries a `v`. An empty `image.tag`
 therefore renders `v` + `appVersion`:
@@ -489,7 +489,7 @@ therefore renders `v` + `appVersion`:
 ghcr.io/dekopon-agents/dekopon:v0.12.0
 ```
 
-There is no `latest`. Prefer `image.digest` once a release exists; it pins across the
+There is no `latest`. Prefer `image.digest`; it pins across the
 `linux/amd64` + `linux/arm64` index, and the index digest is what `gh attestation verify` attests.
 
 ## Publishing
@@ -518,10 +518,8 @@ The published coordinates are:
 oci://ghcr.io/dekopon-agents/charts/dekopon
 ```
 
-Chart `0.3.0` is published there. The packaging half is checked on every CI run, which packages the
-chart and diffs the archive's rendered output against the source tree's, and the `dekopon-chart-0.3.0`
-tag ran the push. What remains unproven is the *pull*: no cluster has installed the published chart,
-so a first install should be treated as the first exercise of this path.
+CI packages the chart on every run and diffs the archive's rendered output against the source
+tree's, so a pushed tarball is complete and renders identically to the checkout.
 
 ### Both GHCR packages are public, and that is a manual step
 
@@ -561,7 +559,7 @@ spec:
     namespace: dekopon
 ```
 
-Two mechanics that are easy to get wrong, both checked against 3.3 rather than assumed:
+Two mechanics that are easy to get wrong:
 
 **`repoURL` must be the bare registry path.** Argo CD 3.3 has two different OCI source shapes. A
 Helm chart (`spec.source.chart` set) takes a bare path and the documentation says outright that
@@ -575,8 +573,7 @@ from the repository's `EnableOCI` field, not from the URL — `reposerver` trims
 only when matching credentials — and `db.GetRepository` returns a bare `Repository{Repo: url}` for
 any URL that is not registered, so `EnableOCI` is false and the registry is treated as a classic
 HTTP Helm repository. Being public removes the need for a `username` and `password`; it does not
-remove the need to register. So the follow-up homelab change needs this prerequisite alongside its
-`Application`:
+remove the need to register. So an `Application` needs this prerequisite alongside it:
 
 ```yaml
 apiVersion: v1
@@ -595,9 +592,7 @@ stringData:
 
 No credential fields: the package is public and the pull is anonymous.
 
-One more thing this chart does for you: the retained claims carry
-`argocd.argoproj.io/sync-options: Prune=false,Delete=false`, so `syncPolicy.automated.prune: true`
-cannot take the audit log when the claim stops being rendered. See
+`syncPolicy.automated.prune: true` cannot take the audit log: see
 [Storage, uninstall, and recovery](#storage-uninstall-and-recovery).
 
 ## Configuration values
@@ -649,7 +644,7 @@ matters. Replace it. `gateway.enabled` is `false` by default because a gateway n
 model endpoint, and an agent catalog, and the chart can invent none of them.
 
 `gateway.service` optionally creates a ClusterIP Service and matching named gateway container port.
-The chart intentionally does not create an Ingress: the operator must route only the configured
+The chart does not create an Ingress: the operator must route only the configured
 callback path and terminate public TLS outside the pod. A Kubernetes Service cannot reach loopback,
 so the corresponding transport must bind `0.0.0.0:<gateway.service.port>`. The TCP readiness probe
 keeps the Service endpoint unavailable when the configuration and chart port disagree.
@@ -684,23 +679,18 @@ own volume. It may post one review comment and has no approval, request-changes,
 
 ## What is not proven
 
-- Nothing has been applied to a cluster. The chart has been linted, rendered, and schema-validated
+- No `kubectl apply` has happened. The chart has been linted, rendered, and schema-validated
   with `kubeconform` against Kubernetes 1.29, 1.33 and 1.36, and the init container's rendered
   command has been run verbatim on `linux/arm64` and `linux/amd64` under its rendered
-  `securityContext` against a fixture built to match a projected volume's symlink layout, but no
-  `kubectl apply` has happened.
+  `securityContext` against a fixture built to match a projected volume's symlink layout.
 - The complete provider/model deployment has not been started from this configuration. The
   real-daemon Linux `ipc_process.rs` suite proves mapped/unmapped cross-UID connections and
   server pin/live-peer refusals. `ci/verify-init-permissions.sh` executes actual rendered init
   commands, checks mounts/identities, and runs distinct-UID OS processes against that layout;
   its Python socket fixture is not a real daemon. The image an empty `image.tag`
-  resolves to does exist — `ghcr.io/dekopon-agents/dekopon` carries a tag for every release from
-  `v0.4.0` — but nothing here has watched one boot.
-- **The pull path is unproven.** `dekopon-chart-0.3.0` ran `chart-publish.yml` and chart `0.3.0`
-  exists at `oci://ghcr.io/dekopon-agents/charts/dekopon`, and packaging is checked continuously:
-  CI packages the chart, lints the archive, and diffs the archive's rendered output against the
-  source tree's for both value sets, so the pushed tarball is known to be complete and to render
-  identically. What has not happened is an anonymous `helm pull` or an ArgoCD sync against that
+  resolves to does exist — `ghcr.io/dekopon-agents/dekopon` carries a tag for every application
+  release — but nothing here has watched one boot.
+- **The pull path is unproven.** No anonymous `helm pull` and no ArgoCD sync has run against the
   registry path.
 - The ArgoCD source form above was derived from ArgoCD 3.3's own documentation and source, checked
   against the running v3.3.6, but no `Application` has been created — the real one lands in a

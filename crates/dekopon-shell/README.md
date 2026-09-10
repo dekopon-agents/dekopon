@@ -47,7 +47,7 @@ A here-document lands in that model as a plain string: a block of literal text i
 
 **Dropped and rejected loudly** — the script fails to parse or run, naming the construct: backtick substitution (use `$( )`), job control (a trailing `&`), subshells, the arithmetic command `(( ))`, bash array literals `name=(a b c)`, C-style `for (( ))`, every `set` option this shell does not enforce, descriptors other than 1 and 2, here-strings (`<<<`), `case` fall-through (`;&`, `;;&`), process substitution, `eval`, `exec`, `source`, `declare`, `export`, bash's sparse/associative array emulation, case-conversion and `@`-operator parameter expansions, regex metacharacters in an unflagged `grep`/`sed` pattern, and glob metacharacters in a `case` pattern. A model must never be able to believe something happened that did not.
 
-That last one is where "rejected loudly" reaches inside a construct that was kept. A `case` pattern is matched as literal text, so `*)` remains the default branch — every subject reaches it, which is what a literal matcher concludes too — while `*.json)`, `a?c)`, and `[ab])` are parse errors naming the metacharacter and what it would have meant. This is the same rule `grep` and `sed` patterns follow when they are given no `-E`, for the same reason: a partial wildcard is exactly the pattern a literal matcher answers wrongly and silently. Quoting stays the escape hatch, so `'*')` matches a literal asterisk. A pattern assembled at run time (`p='*.json'; case $f in $p)`) is checked when it is expanded rather than when it is parsed, because that is the first moment its text exists.
+"Rejected loudly" reaches inside `case` too. A `case` pattern is matched as literal text, so `*)` remains the default branch — every subject reaches it, which is what a literal matcher concludes too — while `*.json)`, `a?c)`, and `[ab])` are parse errors naming the metacharacter and what it would have meant. This is the same rule `grep` and `sed` patterns follow when they are given no `-E`, for the same reason: a partial wildcard is exactly the pattern a literal matcher answers wrongly and silently. Quoting stays the escape hatch, so `'*')` matches a literal asterisk. A pattern assembled at run time (`p='*.json'; case $f in $p)`) is checked when it is expanded rather than when it is parsed, because that is the first moment its text exists.
 
 **Dropped and inert** — these are ordinary literal text, and a script cannot tell the difference: globbing (`*`, `?`, `[abc]`), brace expansion (`{a,b}`), tilde expansion (`~`), and POSIX IFS word splitting. There is no filesystem to glob against and no `IFS` to split on, so there is nothing to reject *against*; an unquoted expansion holding a JSON array is what produces multiple words here. This is the one place where the "rejected loudly" rule does not apply, and it is called out rather than folded into the list above.
 
@@ -55,8 +55,7 @@ That last one is where "rejected loudly" reaches inside a construct that was kep
 
 `read [-r] NAME...` is what makes `cmd | while read line; do ...; done` terminate, and it is the one
 place input is *consumed*. Everywhere else a piped value is *offered*: every pipeline in a body sees
-it, deliberately, so a condition that never looks at it cannot swallow it before the command that
-does. `read` instead advances a cursor on the enclosing stage and reports failure at end of input,
+it, so a condition that never looks at it cannot swallow it before the command that does. `read` instead advances a cursor on the enclosing stage and reports failure at end of input,
 which is what ends the loop. End of input is a status and not a diagnostic, because a message there
 would be one per loop, every loop.
 
@@ -71,12 +70,10 @@ exist here, and says so rather than silently finding none.
 
 ## Shell options
 
-`set -e`, `set -u`, and `set -o pipefail` are real, and their `+` forms turn them back off. `set`
-was refused outright before on the grounds that an option changing nothing while looking like it had
-is the exact class of silent wrongness this shell refuses — which stops being an argument once the
-option is enforced, and remains one for every option that is not. So `set -x`, `set -o noclobber`,
-and `set --` **end the script** by name rather than being ignored or letting it carry on without
-what it asked for.
+`set -e`, `set -u`, and `set -o pipefail` are real, and their `+` forms turn them back off. An
+option that changes nothing while looking like it had is the exact class of silent wrongness this
+shell refuses, so `set -x`, `set -o noclobber`, and `set --` **end the script** by name rather than
+being ignored or letting it carry on without what it asked for.
 
 `errexit` exempts the three positions bash exempts, because each is a place the script is already
 asking whether the command failed: an `if`/`while`/`until` condition, every operand of an `&&`/`||`
@@ -104,7 +101,7 @@ spaces where `[ -n $v ]` falls apart.
 One thing is refused rather than translated. In bash the right operand of `==` is a **glob**, so
 `[[ $f == *.json ]]` is a pattern match; the operand here is literal text, and comparing that
 operand literally would answer exactly that script wrongly and silently. The metacharacter is named
-instead, with quoting as the way out while the parser can still see it (`[[ $f == '*' ]]` compares
+instead, with quoting as the way out while the parser can see it (`[[ $f == '*' ]]` compares
 an asterisk) and a run-time-assembled operand checked when it expands. `=~` is refused outright for
 a related reason: `[[ ]]` carries no `-E`, so nothing inside it can say a regular expression was
 what the script meant. `grep -E` is where that opt-in lives.
@@ -120,7 +117,7 @@ They parse through the same production either way, and carry their own redirecti
 `{ a; b; } 2> log`.
 
 A compound stage runs in the **current scope**. There are no subshells here to run it in, so a
-variable a piped `while` loop assigns is still set after the loop — the opposite of bash, where that
+variable a piped `while` loop assigns remains set after the loop — the opposite of bash, where that
 assignment is thrown away with the subshell and is the single most notorious trap in the language.
 The obvious script does the obvious thing.
 
@@ -144,15 +141,15 @@ Two of them answer differently here than in bash, because values are real JSON r
 character count of an object's JSON text would be an answer about its rendering rather than about
 the value. And `${NAME[@]}` is not bash's sparse-array emulation: it selects the elements of a real
 JSON array, so `"${arr[@]}"` yields one word per element the way `"$@"` does, `${arr[*]}` joins
-them, and `${#arr[@]}` counts them. An unquoted `$NAME` holding an array already spread element by
+them, and `${#arr[@]}` counts them. An unquoted `$NAME` holding an array spreads element by
 element; `[@]` is how that survives quoting.
 
 `${NAME#p}`, `${NAME%p}`, and `${NAME/p/r}` take **literal** patterns, the rule an unflagged
 `grep`, an unflagged `sed`, and a `case` pattern already follow. A literal pattern matches in
 exactly one way, so bash's longest/shortest pairs (`##`, `%%`) are accepted as a second spelling of
 the same request rather than as a second behavior. A metacharacter is rejected by name: `${p##*/}` is a parse error, and
-quoting is the way through (`${p#'*'}` strips a literal asterisk) exactly while the parser can still
-see the quotes. A pattern assembled at run time is checked when it expands instead, and quoting
+quoting is the way through (`${p#'*'}` strips a literal asterisk) exactly while the parser can see
+the quotes. A pattern assembled at run time is checked when it expands instead, and quoting
 cannot exempt that one because its quotes are already gone. There is no `basename` or `dirname`;
 `jq -r 'split("/") | last'` covers what `${p##*/}` would have.
 
@@ -166,10 +163,9 @@ crashed host process — the same bound the parser applies to `$( $( ... ) )`.
 
 ## The two streams
 
-A command produces a **value** on stdout and **text** on stderr, and that split was always there:
-`$( )` captures the value while diagnostics escape it to the terminal, exactly as a real shell
-sends command-substitution stderr past the capture. What is new is that a script can address the
-two halves. `2> log` collects a command's diagnostics into a buffer; `>&2` sends its value to the
+A command produces a **value** on stdout and **text** on stderr: `$( )` captures the value while
+diagnostics escape it to the terminal, exactly as a real shell sends command-substitution stderr
+past the capture. A script addresses the two halves separately. `2> log` collects a command's diagnostics into a buffer; `>&2` sends its value to the
 diagnostic stream, which is how `echo "problem" >&2` reports without polluting what the command
 returns; `&> all` sends both to one buffer; and `> /dev/null` discards, that one name being reserved
 rather than a path, because it is the spelling every shell shares and refusing it would be worse
@@ -178,7 +174,7 @@ than admitting it.
 `2>&1` is the one place the value model shows through. Merging a text channel into a value channel
 has to mean something exact, so it means what every text-shaped builtin already means: the
 diagnostics become extra lines. A command that produced no diagnostics has nothing to merge and its
-value is left alone — including its type, so `posts.get 2>&1` still hands `jq` an object rather than
+value is left alone — including its type, so `posts.get 2>&1` hands `jq` an object rather than
 that object's JSON text. The result is that `x=$(cmd 2>&1)` captures *why* something failed, which
 is the idiom the construct exists for.
 
@@ -188,8 +184,8 @@ point. The reversed spelling `2>&1 > buf` is a parse error naming itself: bash c
 rather than descriptions and cannot represent the difference, and that ordering is precisely the one
 a script writes when it believes it captured diagnostics that went somewhere else.
 
-`ScriptOutcome::output` stays one combined, interleaved stream. The streams are addressable from
-inside a script; what a caller receives is still the transcript a terminal would have shown.
+`ScriptOutcome::output` is one combined, interleaved stream. The streams are addressable from
+inside a script; what a caller receives is the transcript a terminal would have shown.
 
 ## Builtins
 
@@ -203,37 +199,39 @@ Reading the wall clock is ambient authority with no capability to go through —
 
 ## Sandboxing
 
-This is a native tree-walking evaluator, so there is no engine fuel meter to fall back on. Every bound is hand-built and configurable: a step budget, a recursion-depth cap, independent output byte and line ceilings with head-and-tail truncation, a wall-clock deadline re-read on every step and around every capability call, a capability-invocation ceiling kept deliberately separate from the step budget, and a cumulative ceiling on the value bytes a script may materialize — the one that bounds a script which is cheap in steps and expensive in memory, such as doubling a string in a loop.
+This is a native tree-walking evaluator, so there is no engine fuel meter to fall back on. Every bound is hand-built and configurable: a step budget, a recursion-depth cap, independent output byte and line ceilings with head-and-tail truncation, a wall-clock deadline re-read on every step and around every capability call, a capability-invocation ceiling kept separate from the step budget, and a cumulative ceiling on the value bytes a script may materialize — the one that bounds a script which is cheap in steps and expensive in memory, such as doubling a string in a loop.
 
 Parsing has its own fixed nesting ceiling, applied before any budget exists, because the parser is recursive and runs on the native stack: deeply nested `$( $( ... ) )` is a syntax error rather than a stack overflow that would abort the host process without producing an outcome at all.
 
-The variable namespace is seeded only from the script's own assignments; the host process environment is never read. That includes `jq`: jaq's standard library exports an `env` filter reading the real process environment, and it is deliberately not linked, along with `now`.
+The variable namespace is seeded only from the script's own assignments; the host process environment is never read. That includes `jq`: jaq's standard library exports an `env` filter reading the real process environment, and it is not linked, along with `now`.
 
-One residual is worth stating plainly rather than leaving to be discovered. jaq has no fuel meter and no safe point to interrupt from outside, so a filter that loops without producing output (`jq 'def f: f; f'`) cannot be stopped cooperatively. It runs on a worker thread whose outputs are charged against the budget as they arrive, and a filter still running at the deadline is abandoned rather than stopped: the script reports its timeout correctly, and that thread stays alive until the process exits.
+One residual is worth stating plainly rather than leaving to be discovered. jaq has no fuel meter and no safe point to interrupt from outside, so a filter that loops without producing output (`jq 'def f: f; f'`) cannot be stopped cooperatively. It runs on a worker thread whose outputs are charged against the budget as they arrive, and a filter running at the deadline is abandoned rather than stopped: the script reports its timeout correctly, and that thread stays alive until the process exits.
 
-Dropping the receiver is the cancellation check for every filter that *does* yield — it fails its next send and returns — so what accumulates is only the non-terminating kind. Each abandonment logs a `tracing::warn!` with the elapsed time, `dekopon_shell::abandoned_filter_workers()` reports how many are still running, and past a small ceiling `jq` refuses to start another filter rather than adding one more spinning thread to a host that is already saturated.
+Dropping the receiver is the cancellation check for every filter that *does* yield — it fails its next send and returns — so what accumulates is only the non-terminating kind. Each abandonment logs a `tracing::warn!` with the elapsed time, `dekopon_shell::abandoned_filter_workers()` reports how many are running, and past a small ceiling `jq` refuses to start another filter rather than adding one more spinning thread to a host that is already saturated.
 
-The worker belongs to the thread, not to the filter: a thread that has run one filter parks its worker on a job channel and hands it the next, so a script full of `curl ... | jq ...` pays one thread rather than one per call. Abandoning a filter also gives up that worker, so the filter nobody can stop is never offered another one and the next `jq` starts from a freshly spawned worker. Values cross the boundary as values — jaq's own type deserializes from `serde_json::Value` and converts back structurally — rather than being rendered to JSON text and re-parsed on each side. jaq's value type is a JSON superset, so the outputs JSON cannot represent (`nan`, `infinite`, byte strings, non-string object keys) are refused by name, as the JSON parser refused them before, and output nesting keeps the same 128-container ceiling that parser applied.
+The worker belongs to the thread, not to the filter: a thread that has run one filter parks its worker on a job channel and hands it the next, so a script full of `curl ... | jq ...` pays one thread rather than one per call. Abandoning a filter also gives up that worker, so the filter nobody can stop is never offered another one and the next `jq` starts from a freshly spawned worker. Values cross the boundary as values — jaq's own type deserializes from `serde_json::Value` and converts back structurally — rather than being rendered to JSON text and re-parsed on each side. jaq's value type is a JSON superset, so the outputs JSON cannot represent (`nan`, `infinite`, byte strings, non-string object keys) are refused by name exactly as the JSON parser refuses them, and output nesting keeps that parser's 128-container ceiling.
 
 ## Observability
 
 Each script run opens a `tracing` span named `shell.script`, and every command word inside it opens
 a `shell.command` span — the span carries the whole record, and there are no events. A trace
-therefore reads as the ordered list of commands a script actually executed — `jq`, then `curl`, then
+therefore reads as the ordered list of commands a script executed — `jq`, then `curl`, then
 `http-probe.fetch`, then `grep` — rather than as one opaque "a script ran, exit 0". One script word
 that drives several executions is shown as several: `xargs` mapping a command over ten items
 produces ten nested spans.
 
 Volume is capped rather than detail. A model-authored `while` loop is bounded only by the step
-budget, so one tool call can execute tens of thousands of command words; the first few hundred
+budget, so one tool call can execute tens of thousands of command words; the first 256
 `shell.command` spans are emitted at INFO and the rest at DEBUG. The `shell.script` span carries the
 run's totals — commands executed, commands traced, capability commands, failed commands — which
-cost the same whether a script ran three commands or thirty thousand.
+cost the same whether a script ran three commands or thirty thousand. *Committed direction:*
+removed; command words and arguments are recorded and no span is dropped
+([goal 2](../../docs/design.md#constitution)).
 
 A word that resolved to nothing is reported as `not-granted` when it names a capability in a
 namespace this session holds, and `not-found` otherwise. Only the namespace is exported, from the
-session's own granted set; the word stays `<withheld>` unless payloads are enabled. The script sees
-identical output either way — the distinction is in the span and nowhere a script can read it.
+session's own granted set; the word itself is `<withheld>` unless payloads are enabled. The script
+sees identical output either way — the distinction is in the span and nowhere a script can read it.
 
 Instrumentation lives at the single seam every command word passes through, so a builtin added
 later is traced without another edit, and none of the twenty builtin implementations carries
@@ -246,7 +244,9 @@ assumed to leave the process, so a command records its name, its resolution kind
 *count*, a duration, an exit code, and a stable outcome label, and never an argument value: a
 `curl -d` body and a `cap <id> {...}` object are capability input wearing argv's clothes. A
 model-authored command word — a shell function's name, or a word that resolved to nothing — is
-reported as `<withheld>` rather than copied, while its kind still says what happened.
+reported as `<withheld>` rather than copied, while its kind says what happened.
+*Committed direction:* removed; command words and arguments are recorded and no span is dropped
+([goal 2](../../docs/design.md#constitution)).
 
 ## License
 

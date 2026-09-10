@@ -49,8 +49,8 @@ status: Ready          # optional
 | `status` | no | Kind-specific. Authored, never observed — see [Reserved and inert fields](#reserved-and-inert-fields). |
 
 Authored structures **reject unknown fields**. A misspelled key is a load failure naming the
-document, not a silently ignored setting. That is deliberate: the catalog is security-adjacent
-configuration, and quietly dropping `capabilties:` would be worse than refusing the file.
+document, not a silently ignored setting: the catalog is security-adjacent configuration, and
+quietly dropping `capabilties:` would be worse than refusing the file.
 
 ### Identifier grammar
 
@@ -105,9 +105,9 @@ Standing orders shape how an agent answers and nothing else. They cannot assert 
 principal, widen a capability, or influence an authorization decision — broker policy never reads
 this field. Treat the text the way you would treat any other model input.
 
-They are also not private. An authorized chat sender can retrieve them verbatim through the
-gateway's `inspect_agent_config` tool, which was added for exactly that purpose. **Do not put a
-secret, a token, or an internal hostname in `instructions`.**
+They are also not private. An authorized chat sender retrieves them verbatim through the
+gateway's `inspect_agent_config` tool, which exists to expose them. **Do not put a secret, a
+token, or an internal hostname in `instructions`.**
 
 ### `skills` are directories the model reads on demand
 
@@ -170,7 +170,7 @@ It is optional for an unrouted agent or a route with an explicit model. Gateway
 `RoutingTable::bind` requires it only when the route does not name a model:
 
 - a route that names `model:` explicitly overrides the class, and then `modelClass` selects nothing
-  (it is still returned by `inspect_agent_config`);
+  (`inspect_agent_config` returns it regardless);
 - a route with no `model:` and an agent with no `modelClass` is a **`dekopond` startup failure**;
 - a route with no `model:`, an agent with a `modelClass`, and no configured model offering that
   class is also a startup failure.
@@ -203,7 +203,7 @@ status: Unknown
 | `provider` | provider ID | yes | Cross-checked at load: must name a `Provider` in the same catalog. |
 | `effect` | `read-only` \| `local-write` \| `external-write` | yes | Stored typed catalog metadata; not used for gateway authorization. |
 | `risk` | `Low` \| `Medium` \| `High` \| `Critical` | yes | Stored typed catalog metadata. |
-| `idempotency` | `idempotent` \| `conditional` \| `non-idempotent` | yes | Stored typed catalog metadata. |
+| `idempotency` | `idempotent` \| `conditional` \| `non-idempotent` | yes | Stored typed catalog metadata. *Committed direction:* removed ([non-goals](design.md#non-goals)); the broker reads only its own `constraintSets` copy. |
 | `permissions` | list of `{ operation, resource? }` | no | Stored typed catalog metadata; no authority is granted. |
 | `status` | `Available` \| `Unavailable` \| `Unknown` | no | Stored typed authored metadata, never observed or reported; omission stays `None`, with no presentation fallback. |
 
@@ -213,11 +213,12 @@ identifier would otherwise silently never expand a `chat-asset:<N>` marker and l
 provider rejecting its own input. Presence is still not a grant — the broker decides the invocation.
 
 **The broker does not read any of this.** The trusted `effect`, `risk`, and `idempotency` a policy
-decision actually sees come from the capability's `constraintSets` entry in `broker.yaml`, validated
-against the loaded provider manifest — as does its `route`, the field that decides whether a
-capability is ordinary or part of the reserved chat-memory surface. The catalog's copy is operator documentation: it is what a
-reviewer reads to understand what the deployment intends, and it can disagree with the broker
-without either process noticing. When they disagree, the broker's copy is the one that decides.
+decision sees come from the capability's `constraintSets` entry in `broker.yaml`, validated against
+the loaded provider manifest — as does its `route`, the field that decides whether a capability is
+ordinary or part of the reserved chat-memory surface. *Committed direction:* `idempotency` is
+removed from the constraint set and the policy context ([non-goals](design.md#non-goals)). The catalog's copy is operator
+documentation: what a reviewer reads to understand what the deployment intends. It can disagree with the broker without either
+process noticing, and the broker's copy is the one that decides.
 
 ## `Provider`
 
@@ -247,13 +248,13 @@ declaration that such a provider is part of the deployment.
 
 ## Reserved and inert fields
 
-Four fields are decoded and retained as typed metadata but have no shipped behavioral reader. They are listed here rather
-than left to be discovered, because each one reads like it selects a behavior.
+Four fields are decoded and retained as typed metadata with no shipped behavioral reader. Each one
+reads like it selects a behavior, so each is listed here rather than left to be discovered.
 
 | Field | Looks like | Actually |
 |---|---|---|
 | `spec.policyProfile` (Agent) | Selects a named policy for the agent | Not consumed by runtime authority. Broker authority comes from the owner-authored Cedar policy file and the per-capability `constraintSets` in `broker.yaml`; naming a profile here selects no policy and changes no decision. |
-| `spec.credentialRef` (Provider) | Names the credential the provider will present | Preserved in the typed catalog but read by no credential resolver. Legacy credential binding is owned by `constraintSets` (`credential:` / `credentialByAgent:`) and the broker's `0600` credentials file. Model-selected public DRNs are owned by the separate typed proposal/private-map/`secret.use` path. Neither mechanism consults this catalog field. A `credentialRef` that matches nothing is not an error, and one that matches a real credential name still binds nothing. |
+| `spec.credentialRef` (Provider) | Names the credential the provider will present | Preserved in the typed catalog, read by no credential resolver. Credential binding is owned by `constraintSets` (`credential:` / `credentialByAgent:`) and the broker's `0600` credentials file; model-selected public DRNs are owned by the separate typed proposal/private-map/`secret.use` path. Neither consults this catalog field. *Committed direction:* `credential`/`credentialByAgent` bindings will be replaced by public DRNs ([migration requirements](design.md#legacy-credential-bindings)); this does not activate `credentialRef`. A `credentialRef` that matches nothing is not an error, and one that names a real credential binds nothing. |
 | `status` (all three kinds) | Observed availability | Authored. No probe, daemon, or reconciler ever writes it, so the catalog records the file, not the deployment. |
 | `metadata.labels` | Selection or grouping | Retained by protocol serde. Nothing filters, selects, or reports on them. |
 
@@ -312,10 +313,8 @@ loadable or wholly refused — there is no partial mode where some resources are
 - [`dekopond.md`](dekopond.md) — routes, model endpoints, sessions, and conversations; the consumer
   that makes `instructions`, `skills`, `enabled`, and `modelClass` load-bearing.
 - [`improvement.md`](improvement.md) — catalog-mounted skills and opt-in suggestions.
-- [`dekopon-brokerd` contract](../crates/dekopon-brokerd/README.md#boundaries) — `constraintSets`, Cedar policy, and why the broker's own
-  configuration is what decides authority.
-- [`crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.md) — the broker
-  configuration this catalog is deliberately separate from.
+- [`dekopon-brokerd` § Boundaries](../crates/dekopon-brokerd/README.md#boundaries) —
+  `constraintSets`, Cedar policy, and the separate broker configuration that decides authority.
 - [`examples/catalog/dekopon.yaml`](../examples/catalog/dekopon.yaml) — a complete authored catalog.
 - [`examples/catalog/skills/pull-request-review/SKILL.md`](../examples/catalog/skills/pull-request-review/SKILL.md)
   — the skill that catalog's `reviewer` agent mounts, with one resource file.

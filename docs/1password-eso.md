@@ -1,8 +1,8 @@
 # 1Password and External Secrets — how a secret reaches a deployed Dekopon
 
-This document traces one path end to end: a credential typed into 1Password, pulled into a Kubernetes cluster by the External Secrets Operator, and turned into a file that `dekopon-brokerd` will actually open. It is both the runbook for the two steps a human performs by hand and the explanation of what each layer in that path does and, more usefully, does not do.
+One path end to end: a credential typed into 1Password, pulled into a Kubernetes cluster by the External Secrets Operator, and turned into a file that `dekopon-brokerd` will actually open. It is both the runbook for the two steps a human performs by hand and the explanation of what each layer in that path does and, more usefully, does not do.
 
-**Status.** The cluster-side plumbing — an Argo CD `AppProject`, the operator, and a `ClusterSecretStore` pointed at the 1Password `Dekopon` vault — is deployed and is quoted here from the manifests merged in `xrl/rpi-homelab`. No `ExternalSecret` for Dekopon exists yet. For legacy whole-file daemon configuration, ESO still stops one step short: the projected symlink farm cannot satisfy the ordinary owner-only file loader. The public-DRN private map now adds a separate, deliberately projection-aware source adapter for individual secret values; [`secrets.md`](secrets.md) states that boundary.
+The cluster-side plumbing — an Argo CD `AppProject`, the operator, and a `ClusterSecretStore` pointed at the 1Password `Dekopon` vault — is deployed, and is quoted here from the manifests merged in `xrl/rpi-homelab`. No `ExternalSecret` for Dekopon exists. ESO ends one step short of a whole-file daemon credential: a projected symlink farm cannot satisfy the ordinary owner-only file loader. The public-DRN private map adds a separate, projection-aware source adapter for individual secret values; [`secrets.md`](secrets.md) states that boundary.
 
 ## The path
 
@@ -11,17 +11,17 @@ Six layers, each with a job the next one cannot do:
 1. **1Password service account** — a token scoped to `read_items` on one vault, minted once by a human.
 2. **A Kubernetes `Secret` holding that token** — `op-rpi`, created by hand, never committed.
 3. **`ClusterSecretStore`** — makes the vault readable from every namespace in the cluster.
-4. **`ExternalSecret`** — the per-application declaration of *which* vault items become *which* Kubernetes Secret. **This does not exist for Dekopon yet.**
+4. **`ExternalSecret`** — the per-application declaration of *which* vault items become *which* Kubernetes Secret. **This does not exist for Dekopon.**
 5. **`Secret`** — an ordinary Kubernetes Secret, written and refreshed by the operator.
 6. **A file on disk inside the pod** — owner-only, regular, single-link. **ESO cannot produce this**, and neither can any Kubernetes volume.
 
 Steps 1 and 2 are the runbook below. Step 3 is deployed. Step 4 arrives with the first application that needs a secret. Steps 5 and 6 are where the interesting failure lives.
 
-## What is deployed today
+## The deployed plumbing
 
 ### The `AppProject`
 
-`apps/external-secrets-project.yaml` is the first scoped project in that cluster; every other application there still runs under `default`, which permits every repository, every destination, and every cluster-scoped resource.
+`apps/external-secrets-project.yaml` is the only scoped project in that cluster; every other application there runs under `default`, which permits every repository, every destination, and every cluster-scoped resource.
 
 ```yaml
 apiVersion: argoproj.io/v1alpha1
@@ -51,17 +51,15 @@ spec:
       kind: "ClusterSecretStore"
 ```
 
-The scoping is worth reading as a list of what the operator's Applications may touch and nothing else: two source repositories, one destination namespace, and five cluster-resource entries — two of them group wildcards, because the chart's RBAC and webhook objects span several kinds each. ESO is the widest-reaching workload in that cluster — it installs 25 CRDs, cluster RBAC, and a validating webhook — which is precisely the argument for giving it a project rather than leaving it under `default`. A project is not a security boundary against a compromised operator; it is a boundary against a mistake in the chart or in the repository, and the resources listed above are the exhaustive statement of what such a mistake could reach.
+That list is the exhaustive statement of what the operator's Applications may touch: two source repositories, one destination namespace, and five cluster-resource entries — two of them group wildcards, because the chart's RBAC and webhook objects span several kinds each. ESO is the widest-reaching workload in that cluster: 25 CRDs, cluster RBAC, and a validating webhook. A project is not a security boundary against a compromised operator; it is a boundary against a mistake in the chart or in the repository.
 
 Two entries exist here that a store riding along in a root kustomize build would not need: the git repository in `sourceRepos`, and `external-secrets.io/ClusterSecretStore` in `clusterResourceWhitelist`. Both are consequences of the split described next. The git URL must be the SSH form — the repository credential Secret in that cluster is keyed on that exact URL, and an `https://` spelling fails authentication rather than falling back.
 
-The file lives in `apps/` rather than a `projects/` directory because the root app-of-apps reads `path: apps` non-recursively; a subdirectory is silently ignored, which is the worst available failure mode.
+The file lives in `apps/` rather than a `projects/` directory because the root app-of-apps reads `path: apps` non-recursively; a subdirectory is silently ignored.
 
 ### Two Applications, not one
 
-The operator and the store are separate Applications. The reason is not taste.
-
-**Argo dry-runs every resource in an Application before applying any of them.** A `ClusterSecretStore` shipped alongside the chart that defines its CRD therefore fails its first sync with `no matches for kind`, and a sync-wave annotation inside the Application does not help, because the dry-run happens before any wave runs. A second Application sidesteps the ordering entirely: by the time it syncs, the CRDs are established.
+The operator and the store are separate Applications, because **Argo dry-runs every resource in an Application before applying any of them.** A `ClusterSecretStore` shipped alongside the chart that defines its CRD therefore fails its first sync with `no matches for kind`, and a sync-wave annotation inside the Application does not help, because the dry-run happens before any wave runs. A second Application sidesteps the ordering entirely: by the time it syncs, the CRDs are established.
 
 The operator, `apps/external-secrets.yaml`:
 
@@ -117,7 +115,7 @@ spec:
       - ServerSideApply=true
 ```
 
-The inline `helm.values` block overrides only what differs from the chart's own defaults. That cluster has no `LimitRange` and no `ResourceQuota`, so every workload states its own numbers and the chart ships `resources: {}` for all three deployments; everything else — one replica, CRD installation, no ServiceMonitor — is already the chart default and is not repeated.
+The inline `helm.values` block overrides only what differs from the chart's own defaults. That cluster has no `LimitRange` and no `ResourceQuota`, so every workload states its own numbers and the chart ships `resources: {}` for all three deployments; one replica, CRD installation, and no ServiceMonitor are chart defaults and are not repeated.
 
 The store, `apps/external-secrets-store.yaml`, carries no wave annotation at all:
 
@@ -146,17 +144,15 @@ spec:
 
 ### Why the waves are negative
 
-Two ordering constraints, one annotation each.
-
 An `Application` whose `project:` names a project that does not exist is rejected by the application controller, and the `AppProject` and both Applications are children of the same app-of-apps sync. So the project takes `sync-wave: "-2"` and the operator `"-1"`.
 
-They are negative rather than `0` and `1` because every other application in that cluster is unannotated, which means wave `0`. Numbering the new work upward would have inserted it into an existing ordering and changed when everything else syncs; numbering it downward runs it ahead of wave `0` and leaves every existing application's position untouched. The store then needs no annotation of its own: it sits in the default wave, by which point the operator's CRDs are established.
+They are negative rather than `0` and `1` because every other application in that cluster is unannotated, which means wave `0`. Numbering the new work upward would insert it into an existing ordering and change when everything else syncs; numbering it downward leaves every existing application's position untouched. The store then needs no annotation of its own: it sits in the default wave, by which point the operator's CRDs are established.
 
 ### `ServerSideApply=true` is a CRD rule, not an ESO quirk
 
-The `secretstores` and `clustersecretstores` CRDs render at roughly 688 KB each. A client-side apply stores the full object in the `kubectl.kubernetes.io/last-applied-configuration` annotation, which the API server caps at 262144 bytes. Without `ServerSideApply=true` the first sync does not degrade — it fails outright with `metadata.annotations: Too long`.
+The `secretstores` and `clustersecretstores` CRDs render at roughly 688 KB each. A client-side apply stores the full object in the `kubectl.kubernetes.io/last-applied-configuration` annotation, which the API server caps at 262144 bytes. Without `ServerSideApply=true` the first sync fails outright with `metadata.annotations: Too long`.
 
-This generalizes. Any Argo Application that installs CRDs of a serious size needs `ServerSideApply=true`, and the failure is at sync time rather than at review time, so it is worth setting before the first sync rather than after it.
+Any Argo Application that installs CRDs of a serious size needs `ServerSideApply=true`, and the failure is at sync time rather than at review time.
 
 ### The `ClusterSecretStore`
 
@@ -191,7 +187,7 @@ Four things in that document decide how the rest of this guide reads.
 
 **`serviceAccountSecretRef` is the contract the runbook has to satisfy.** Secret `op-rpi`, key `OP_TOKEN`, namespace `external-secrets`. None of those three are free choices in step 2 below; they are a reference that must resolve. The `namespace` field is mandatory here specifically because a `ClusterSecretStore` has no namespace of its own for the reference to default to.
 
-`SkipDryRunOnMissingResource=true` is belt-and-braces. The wave ordering above already guarantees the CRD exists before this resource syncs; the annotation keeps a manual out-of-band sync from failing validation if it ever does not.
+`SkipDryRunOnMissingResource=true` is belt-and-braces: the wave ordering guarantees the CRD exists before this resource syncs, and the annotation keeps a manual out-of-band sync from failing validation if it ever does not.
 
 `refreshInterval: 3600` throttles store *validation* — a 1Password `list vaults` read — to hourly rather than the controller's roughly five-minute default. It is integer seconds, per the schema, and is unrelated to how often an `ExternalSecret` refreshes its own data.
 
@@ -205,7 +201,7 @@ Two steps, both performed once by a human, both producing something no manifest 
 
 `op account get` reports `Type: FAMILY` for this account. Service accounts on a Families plan require the **Family Organizer** role, and a member without it cannot create one — the command fails on entitlement, not on syntax.
 
-If it does fail there, **1Password Connect is not the way around it.** Connect needs a credentials file issued from the same Secrets Automation surface that gates service accounts, so swapping the `onepasswordSDK` provider for `onepassword` moves the problem without solving it. That is a wall, not a workaround — the resolution is the account's role or plan — which is why it sits above the command rather than in a troubleshooting section at the bottom.
+If it does fail there, **1Password Connect is not the way around it.** Connect needs a credentials file issued from the same Secrets Automation surface that gates service accounts, so swapping the `onepasswordSDK` provider for `onepassword` moves the problem without solving it. The resolution is the account's role or plan.
 
 ```console
 op service-account create rpi-eso \
@@ -219,7 +215,7 @@ op service-account create rpi-eso \
 
 **The token is printed exactly once and cannot be retrieved again.** There is no "show token" screen and no API to re-read it. Capture it before the terminal scrolls, and store it back in the `Dekopon` vault as an `API_CREDENTIAL` item so a future cluster rebuild does not require minting a replacement.
 
-The account name is a label. Nothing in the cluster reads it; only the token matters. The cluster repository's own README names the same account `eso-rpi-homelab`, which is the same thing under a different label.
+The account name is a label. Nothing in the cluster reads it; only the token matters. The cluster repository's own README names the same account `eso-rpi-homelab`.
 
 ### Step 2 — seed the token into the cluster
 
@@ -234,11 +230,11 @@ unset OP_TOKEN
 
 **The names are the `ClusterSecretStore`'s.** Secret `op-rpi`, key `OP_TOKEN`, namespace `external-secrets` — change any one of them and the store resolves nothing. Re-running the same `create secret` command after a `delete` is also how the token is rotated later.
 
-**`read -rs` rather than an argument, on purpose.** A token passed on a command line is a process argument: visible in `ps` to every user on the host for as long as the command runs, and recorded verbatim in shell history. `read` puts it in a shell variable instead, `-s` keeps it off the terminal, `-r` stops a backslash in the token from being eaten as an escape, and `unset` drops it when the work is done. The token does still reach `kubectl` as an argument in the line above, so it is exposed in `ps` for the lifetime of one command; what this avoids is a value written into a history file that outlives the session.
+**`read -rs` rather than an argument, on purpose.** A token passed on a command line is a process argument: visible in `ps` to every user on the host for as long as the command runs, and recorded verbatim in shell history. `read` puts it in a shell variable instead, `-s` keeps it off the terminal, `-r` stops a backslash in the token from being eaten as an escape, and `unset` drops it when the work is done. The token does reach `kubectl` as an argument in the line above, so it is exposed in `ps` for the lifetime of one command; what this avoids is a value written into a history file that outlives the session.
 
-The namespace is created idempotently first because Argo's `CreateNamespace=true` only creates it at the operator's first sync, and this Secret needs somewhere to live if it is seeded before then. Applying the client-side dry-run output is the idempotent form; a plain `create namespace` fails on the second run.
+The namespace is created first because Argo's `CreateNamespace=true` only creates it at the operator's first sync, and this Secret needs somewhere to live if it is seeded before then. Applying the client-side dry-run output is the repeatable form; a plain `create namespace` fails on the second run.
 
-**This one credential is created by hand and is never committed.** It is the bootstrap the whole chain derives from, and it can read every item in the vault. That is a different class of secret from an application password, and it is a deliberate departure from the surrounding convention: `manifests/openobserve/secret.yaml` in the same repository commits a root password as plain base64, on the reasoning that the host is LAN-only and the blast radius is one homelab app. Neither half of that reasoning survives contact with a token that reads an entire vault. The cost of the departure is honest — `external-secrets-store` is not self-bootstrapping, and a rebuilt cluster needs this step re-run by hand before the store goes ready.
+**This one credential is created by hand and is never committed.** It is the bootstrap the whole chain derives from, and it can read every item in the vault. That is a different class of secret from an application password, and a departure from the surrounding convention: `manifests/openobserve/secret.yaml` in the same repository commits a root password as plain base64, on the reasoning that the host is LAN-only and the blast radius is one homelab app. Neither half of that reasoning survives contact with a token that reads an entire vault. The cost is honest — `external-secrets-store` is not self-bootstrapping, and a rebuilt cluster needs this step re-run by hand before the store goes ready.
 
 ### Verify
 
@@ -246,17 +242,17 @@ The namespace is created idempotently first because Argo's `CreateNamespace=true
 sudo -n k3s kubectl get clustersecretstore op-personal-dekopon-clusterstore
 ```
 
-`Valid` in the status column is the gate. Until step 2 is done the store reports `NotReady` with a missing-secret error, which is the expected state of a correct deployment waiting on a human rather than a broken sync. A store that is `Valid` proves the token exists, is well-formed, and can list the vault; it proves nothing about whether any particular item is readable.
+`Valid` in the status column is the gate. Until step 2 is done the store reports `NotReady` with a missing-secret error, which is the expected state of a correct deployment waiting on a human. A store that is `Valid` proves the token exists, is well-formed, and can list the vault; it proves nothing about whether any particular item is readable.
 
-## What comes next, and does not exist yet
+## The missing `ExternalSecret`
 
 An `ExternalSecret` is the per-application declaration that names this store, names the 1Password items to read, and names the Kubernetes `Secret` to write. **There is no `ExternalSecret` for Dekopon.** Writing one is the job of the change that first deploys a Dekopon component into a cluster, because the mapping from vault items to Secret keys is a property of that deployment and not of this plumbing.
 
-When that change lands it will need to state two things this document cannot state for it: which vault items back which of the broker's credential entries, and what happens on deletion. ESO's `deletionPolicy` defaults to `Retain`, so removing an item from 1Password revokes nothing — the Kubernetes Secret and every copy already mounted into a pod survive. Revocation is an action taken at the credential's own issuer, not in the vault.
+That change states two things this document cannot state for it: which vault items back which of the broker's credential entries, and what happens on deletion. ESO's `deletionPolicy` defaults to `Retain`, so removing an item from 1Password revokes nothing — the Kubernetes Secret and every copy already mounted into a pod survive. Revocation is an action taken at the credential's own issuer, not in the vault.
 
 ## What ESO does not solve
 
-External Secrets is a *provisioning* mechanism. It ends at a Kubernetes `Secret`, and **a projected Kubernetes Secret is still not a legacy whole-file `broker-credentials.yaml`, broker/gateway config, or policy file the ordinary loader will open.** A private secret-map entry may instead opt into the separate `kubernetesProjection` reader for one bounded value.
+External Secrets is a *provisioning* mechanism. It ends at a Kubernetes `Secret`, and **a projected Kubernetes Secret is not a whole-file `broker-credentials.yaml`, broker/gateway config, or policy file the ordinary loader will open.** A private secret-map entry may instead opt into the separate `kubernetesProjection` reader for one bounded value.
 
 Three things compose with an ESO-written Secret, and all are described in [`secrets.md`](secrets.md#source-and-projection-model): `secureFile` reads an owner-only `0600` file the chart's init container copies out of one Secret key (`broker.secretBootstrapFiles` places it at `<paths.configDir>/<file>`); `kubernetesProjection` reads one key straight from the projected volume the chart mounts read-only under `broker.secretSourceVolumes`; and a source bootstrap file (the token or session file an `onePasswordConnect`, Vault, or cloud adapter authenticates with) reaches the broker through the same `broker.secretBootstrapFiles` copy. The broker can also read 1Password directly through the `onePasswordConnect` adapter against a Connect server, which needs no ESO and no cluster Secret for the value — only a bootstrap token file; this document is the path for deployments that already run ESO against a service account.
 
@@ -271,7 +267,7 @@ Three things compose with an ESO-written Secret, and all are described in [`secr
 | provider `.wasm` | `symlink_metadata` | regular, server-owned, `nlink == 1`, `mode & 0o022 == 0`, protected parents, no group/world-writable non-sticky ancestor |
 | audit path | `O_NOFOLLOW` (created `0600` if absent), then `symlink_metadata` | regular, server-owned, `nlink == 1`, `mode & 0o077 == 0`, owner-only parent, no group/world-writable non-sticky ancestor |
 
-The credentials file is strict because the threat it answers is different. For the configuration, policy, and provider files the question is "could another process have *changed* this?", which group and world *write* bits answer. For a file whose entire content is secrets, the question is "could another process *read* this?", so the mask covers group and world read as well — `0o077` rather than `0o022`. The module comment says so directly: readability is the whole threat.
+The credentials file is strict because the threat it answers is different. For the configuration, policy, and provider files the question is "could another process have *changed* this?", which group and world *write* bits answer. For a file whose entire content is secrets, the question is "could another process *read* this?", so the mask covers group and world read as well — `0o077` rather than `0o022`.
 
 ### Why every mount shape fails
 
@@ -285,9 +281,9 @@ A Kubernetes `Secret` mounted as a volume is not a directory of files. It is a s
 
 That third row is the one that catches people: `fsGroup` is the standard fix for "the container cannot read its mounted Secret", it makes the file group-readable, and group-readable is exactly what the credentials file refuses. The fix for the general problem is the cause of the specific one.
 
-**So no Kubernetes volume can present one of the ordinary daemon files directly.** The answer for broker/gateway configuration, Cedar policy, legacy credentials, storage keys, and writable credentials remains an init container that copies each projected file into real owner-only regular files — an `install -m 0600` per file, owner-only directories, and `stat` assertions afterwards. Public-DRN secret values are the scoped exception: `kubernetesProjection` snapshots kubelet's `..data` generation and opens one configured key without following the user-visible key symlink; it does not relax the ordinary loader or make a projected whole-file config valid. The current [`charts/dekopon`](../charts/dekopon/README.md) chart implements and tests that copy boundary for broker/gateway configuration, policy, credentials, the optional provider-storage namespace key, and the seed-once ChatGPT credential. ESO can create the source Secret; the chart still owns the separate file-hygiene step.
+**So no Kubernetes volume can present one of the ordinary daemon files directly.** The answer for broker/gateway configuration, Cedar policy, credentials, storage keys, and writable credentials is an init container that copies each projected file into real owner-only regular files — an `install -m 0600` per file, owner-only directories, and `stat` assertions afterwards. Public-DRN secret values are the scoped exception: `kubernetesProjection` snapshots kubelet's `..data` generation and opens one configured key without following the user-visible key symlink; it does not relax the ordinary loader or make a projected whole-file config valid. The [`charts/dekopon`](../charts/dekopon/README.md) chart implements and tests that copy boundary for broker/gateway configuration, policy, credentials, the optional provider-storage namespace key, and the seed-once ChatGPT credential.
 
-**ESO solves provisioning, not authority.** An init copy remains required for ordinary daemon files. A projection-aware DRN source can read a value without that copy, but capability policy, separate `secret.use` policy, the private sink binding, source bootstrap, path scope, and rotation behavior remain Dekopon responsibilities.
+**ESO solves provisioning, not authority.** A projection-aware DRN source can read a value without the init copy, but capability policy, separate `secret.use` policy, the private sink binding, source bootstrap, path scope, and rotation behavior remain Dekopon responsibilities.
 
 ### The provider-storage namespace key is retained authority
 
@@ -308,14 +304,14 @@ Losing or replacing the key while retained data exists is fatal: opaque physical
 authority-generation pointers, manifests, audit scope, record IDs, and content commitments all use
 distinct HMAC domains under it. It is not an encryption key and Dekopon makes no encryption-at-rest
 claim. Store it as retained recovery authority, not as a routinely rotated application token.
-ESO can provision the Kubernetes Secret, but the same symlink/ownership argument above still
-requires the chart's broker-only copy step.
+ESO can provision the Kubernetes Secret; the same symlink/ownership argument above requires the
+chart's broker-only copy step.
 
 ### The ChatGPT credential is a different problem again
 
 One credential does not fit the pattern at all. The `chatgptSubscription` model kind's credential file holds a refresh token that **rotates**: each refresh invalidates its predecessor and the replacement is written back through a same-directory temporary file and an atomic rename. That needs a writable *directory*, not a writable file, and it means a read-only projected Secret breaks at the first refresh and presents an already-invalidated token on the next restart.
 
-The lifecycle it needs instead is seed-once: export a working local credential, store it in the vault, project it, copy it into a writable directory on first start only, and let refreshes persist there while the vault copy drifts out of date. `dekopond auth chatgpt export` and [`chatgpt-credential.md`](chatgpt-credential.md) are current; the chart implements the seed-once copy and an explicit destructive re-seed gate. Treat that document as the authority on the rotating credential rather than reasoning about it from this provider-storage section.
+The lifecycle it needs instead is seed-once: export a working local credential, store it in the vault, project it, copy it into a writable directory on first start only, and let refreshes persist there while the vault copy drifts out of date. [`chatgpt-credential.md`](chatgpt-credential.md) is the authority on that credential; the chart implements the seed-once copy and an explicit destructive re-seed gate.
 
 ## Related documents
 
