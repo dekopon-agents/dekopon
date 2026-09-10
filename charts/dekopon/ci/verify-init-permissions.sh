@@ -76,7 +76,14 @@ for c,uid in ((gateway,65533),(broker,65532)):
     assert c["securityContext"]["readOnlyRootFilesystem"]
     assert not c["securityContext"]["allowPrivilegeEscalation"]
 gm={m["name"]:m for m in gateway["volumeMounts"]}
-bm={m["name"]:m for m in broker["volumeMounts"]}
+# The state claim is mounted more than once on the broker when broker.chatgpt is enabled: the
+# claim broker/ subPath, plus the credential subdirectory that sits beside it rather than inside
+# it. Index the state root explicitly instead of letting the last entry win.
+bstate=[m for m in broker["volumeMounts"] if m["name"]=="state"]
+bm={m["name"]:m for m in broker["volumeMounts"] if m["name"]!="state"}
+bm["state"]=next(m for m in bstate if m["mountPath"]=="/var/lib/dekopon")
+assert all(m.get("subPath") for m in bstate), bstate
+assert len({m["mountPath"] for m in bstate})==len(bstate), bstate
 assert "config" not in gm and "gateway-config" not in bm
 assert "tmp" not in gm and "gateway-tmp" not in bm
 assert bm["state"]["subPath"]=="broker"
@@ -149,6 +156,40 @@ sha256sum /var/lib/dekopon/chatgpt/chatgpt-auth.json | cut -d' ' -f1
 EOF
 }
 
+broker_credential_digest() {
+  on_state <<'EOF' | tr -d '[:space:]'
+sha256sum /var/lib/dekopon/broker-chatgpt/chatgpt-auth.json | cut -d' ' -f1
+EOF
+}
+
+# run_as_runtime <script-file> — an unprivileged UID 65532 check against the broker's own mounts.
+# The claim root is root-owned 0700 and no daemon traverses it, so this mounts the broker credential
+# subdirectory by subPath exactly as the rendered broker container does.
+run_as_runtime() {
+  docker run --rm -i --platform "$platform" --user 65532:65532 --cap-drop=ALL \
+    --security-opt=no-new-privileges \
+    -v "${resource}-etc":/etc/dekopon -v "${resource}-run":/run/dekopon \
+    --mount "type=volume,src=${resource}-state,dst=/var/lib/dekopon/broker-chatgpt,volume-subpath=broker-chatgpt" \
+    "$python_image" python3 - < "$1"
+}
+
+# render <output-file> [extra helm args...] — the whole manifest, for mount assertions.
+render() {
+  local out="$1"; shift
+  helm template dekopon "$chart_dir" -f "$values" "$@" > "$out"
+}
+
+# python_yaml <program> <input-file> — run a PyYAML program, locally or in a container.
+python_yaml() {
+  if python3 -c 'import yaml' 2>/dev/null; then
+    python3 -c "$1" < "$2"
+  else
+    docker run --rm -i -e PROG="$1" "$python_image" \
+      sh -c 'pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1; exec python3 -c "$PROG"' \
+      < "$2"
+  fi
+}
+
 assert_eq() {
   if [ "$2" = "$3" ]; then
     echo "PASS $1"
@@ -181,10 +222,11 @@ printf '@id("x") permit(principal, action, resource);\n' > "$stamp/policies.ceda
 printf 'apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials: []\n' > "$stamp/broker-credentials.yaml"
 printf 'apiVersion: dekopon.dev/dekopond/v1alpha1\n' > "$stamp/dekopond.yaml"
 printf '{"refresh":"SEED-REFRESH-TOKEN","expires_at":0}\n' > "$stamp/chatgpt-auth.json"
+printf '{"refresh":"BROKER-SEED-REFRESH-TOKEN","expires_at":0}\n' > "$stamp/broker-chatgpt-auth.json"
 printf 'apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n' > "$stamp/storage-key.yaml"
 chmod 0400 "$stamp"/*
 ln -sfn "$stamp" ..data
-for k in broker.yaml policies.cedar broker-credentials.yaml dekopond.yaml chatgpt-auth.json storage-key.yaml; do
+for k in broker.yaml policies.cedar broker-credentials.yaml dekopond.yaml chatgpt-auth.json broker-chatgpt-auth.json storage-key.yaml; do
   ln -sfn "..data/$k" "$k"
 done
 chmod 0755 /dekopon-source
@@ -499,6 +541,11 @@ cat /var/lib/dekopon/audit.jsonl
 OLD
 )
 assert_eq "unmigrated state refused without overwriting" "$old" "old-state-sentinel"
+# Take the sentinel back out: it is a deliberately unmigrated claim, and every later part runs the
+# init container against this same volume.
+on_state <<'OLD'
+rm -f /var/lib/dekopon/audit.jsonl
+OLD
 
 # Missing/mismatched inline server pins cannot fall back to the gateway euid.
 for pin in absent 65533; do
@@ -529,5 +576,178 @@ for argument in podSecurityContext.runAsUser=65533 podSecurityContext.runAsGroup
   echo "PASS refused $argument"
 done
 
+# --------------------------------------------------------------------------------------------
+# Part 3: the broker's own ChatGPT credential — a second, independent token family
+# --------------------------------------------------------------------------------------------
 echo
-echo "OK: every tier satisfied; ChatGPT is seed-once; provider storage/key are retained, separate, and broker-only."
+echo "==> (i) broker ChatGPT credential: cold start, then seed-once across a rotation"
+render_init "$work/init-broker-chatgpt.sh" \
+  --set gateway.chatgpt.enabled=true \
+  --set gateway.chatgpt.existingSecret=dekopon-chatgpt-auth \
+  --set broker.chatgpt.enabled=true \
+  --set broker.chatgpt.existingSecret=dekopon-chatgpt-auth-broker
+reset_mounts
+run_init "$work/init-broker-chatgpt.sh"
+
+docker run --rm --platform "$platform" -v "${resource}-state":/var/lib/dekopon "$busybox" \
+  sh -c "stat -c '%n  uid=%u gid=%g mode=%a links=%h %F' /var/lib/dekopon/broker-chatgpt /var/lib/dekopon/broker-chatgpt/chatgpt-auth.json"
+
+broker_seeded=$(broker_credential_digest)
+broker_source_digest=$(docker run --rm --platform "$platform" -v "${resource}-src":/s "$busybox" \
+  sh -c 'sha256sum /s/broker-chatgpt-auth.json | cut -d" " -f1' | tr -d '[:space:]')
+assert_eq "the broker credential was seeded from its own Secret" \
+  "$broker_seeded" "$broker_source_digest"
+
+# The two families must be separate documents in separate directories. A shared file would have
+# both daemons spending one rotating refresh token, which revokes the family for both.
+gateway_seeded=$(credential_digest)
+if [ "$gateway_seeded" = "$broker_seeded" ]; then
+  echo "FAIL both families were seeded from the same document" >&2
+  exit 1
+fi
+echo "PASS the two ChatGPT families are separate documents"
+
+perms=$(docker run --rm --platform "$platform" -v "${resource}-state":/var/lib/dekopon "$busybox" \
+  sh -c "stat -c '%u:%g:%a:%h:%F' /var/lib/dekopon/broker-chatgpt/chatgpt-auth.json")
+assert_eq "broker credential file permissions" "$perms" "65532:65532:600:1:regular file"
+dperms=$(docker run --rm --platform "$platform" -v "${resource}-state":/var/lib/dekopon "$busybox" \
+  sh -c "stat -c '%u:%a:%F' /var/lib/dekopon/broker-chatgpt")
+assert_eq "broker credential directory permissions" "$dperms" "65532:700:directory"
+
+echo
+echo "==> (j) dekopon-brokerd's own startup checks on the authFile, as UID 65532"
+cat > "$work/broker-auth-check.py" <<'AUTHCHECK'
+import os, stat, sys
+path = "/var/lib/dekopon/broker-chatgpt/chatgpt-auth.json"
+euid = os.geteuid()
+fail = []
+def ok(c, m):
+    print(("PASS " if c else "FAIL ") + m)
+    if not c:
+        fail.append(m)
+
+# read_trusted_file(.., FileTier::Private, ..): regular, owner, mode & 0o077 == 0, one link,
+# opened O_NOFOLLOW.
+fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+st = os.fstat(fd)
+os.close(fd)
+ok(stat.S_ISREG(st.st_mode) and st.st_uid == euid and (st.st_mode & 0o077) == 0
+   and st.st_nlink == 1,
+   f"authFile uid={st.st_uid} mode={oct(st.st_mode & 0o7777)} nlink={st.st_nlink}")
+
+# The parent must be owner-only AND writable: a rotated credential is persisted by creating a
+# sibling temporary file and renaming it over the target.
+parent = os.path.dirname(path)
+pst = os.lstat(parent)
+ok(stat.S_ISDIR(pst.st_mode) and pst.st_uid == euid and (pst.st_mode & 0o077) == 0
+   and (pst.st_mode & 0o200) != 0,
+   f"authFile parent {parent} uid={pst.st_uid} mode={oct(pst.st_mode & 0o7777)}")
+print()
+print("FAILURES:", len(fail))
+sys.exit(1 if fail else 0)
+AUTHCHECK
+run_as_runtime "$work/broker-auth-check.py"
+
+echo
+echo "==> (k) the broker rotates it, and the seed survives every restart afterwards"
+cat > "$work/broker-rotate.py" <<'ROTATE'
+import json, os
+path = "/var/lib/dekopon/broker-chatgpt/chatgpt-auth.json"
+temporary = os.path.splitext(path)[0] + f".tmp-{os.getpid()}"
+fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w") as handle:
+    json.dump({"refresh": "BROKER-ROTATED-REFRESH-TOKEN", "expires_at": 1}, handle)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+os.replace(temporary, path)
+st = os.lstat(path)
+assert st.st_uid == os.geteuid() and (st.st_mode & 0o077) == 0 and st.st_nlink == 1, st
+print(f"PASS the broker wrote a temp sibling and renamed it over the target as uid {os.geteuid()}")
+ROTATE
+run_as_runtime "$work/broker-rotate.py"
+
+broker_rotated=$(broker_credential_digest)
+if [ "$broker_rotated" = "$broker_seeded" ]; then
+  echo "FAIL rotation did not change the file; the rest of this test would be meaningless" >&2
+  exit 1
+fi
+docker volume rm -f "${resource}-etc" "${resource}-run" >/dev/null
+docker volume create "${resource}-etc" >/dev/null
+docker volume create "${resource}-run" >/dev/null
+docker run --rm --platform "$platform" -v "${resource}-etc":/a -v "${resource}-run":/b "$busybox" \
+  sh -c 'chmod 0777 /a /b; chown 0:0 /a /b'
+run_init "$work/init-broker-chatgpt.sh"
+assert_eq "the broker's live credential survived a restart unchanged" \
+  "$(broker_credential_digest)" "$broker_rotated"
+assert_eq "the gateway's live credential is untouched by the broker's seed" \
+  "$(credential_digest)" "$gateway_seeded"
+
+echo
+echo "==> (l) the broker's gated re-seed overwrites only its own family"
+render_init "$work/init-broker-reseed.sh" \
+  --set gateway.chatgpt.enabled=true \
+  --set gateway.chatgpt.existingSecret=dekopon-chatgpt-auth \
+  --set broker.chatgpt.enabled=true \
+  --set broker.chatgpt.existingSecret=dekopon-chatgpt-auth-broker \
+  --set broker.chatgpt.reseed=true
+run_init "$work/init-broker-reseed.sh"
+assert_eq "broker.chatgpt.reseed=true restored the broker seed" \
+  "$(broker_credential_digest)" "$broker_source_digest"
+assert_eq "broker.chatgpt.reseed left the gateway family alone" \
+  "$(credential_digest)" "$gateway_seeded"
+
+echo
+echo "==> (m) the broker credential is reachable by the broker and by nothing else"
+render "$work/broker-chatgpt-render.yaml" \
+  --set gateway.chatgpt.enabled=true \
+  --set gateway.chatgpt.existingSecret=dekopon-chatgpt-auth \
+  --set broker.chatgpt.enabled=true \
+  --set broker.chatgpt.existingSecret=dekopon-chatgpt-auth-broker
+mount_check='import yaml,sys
+BROKER="/var/lib/dekopon/broker-chatgpt"
+STATE="/var/lib/dekopon"
+for d in yaml.safe_load_all(sys.stdin):
+  if not d or d.get("kind") != "Deployment": continue
+  spec=d["spec"]["template"]["spec"]
+  gateway=next(c for c in spec["containers"] if c["name"]=="gateway")
+  paths={m["mountPath"] for m in gateway.get("volumeMounts",[])}
+  assert BROKER not in paths, paths
+  assert STATE not in paths, ("the gateway must never mount the whole claim", paths)
+  broker=next(c for c in spec["initContainers"] if c["name"]=="broker")
+  broker_paths={m["mountPath"] for m in broker.get("volumeMounts",[])}
+  assert STATE in broker_paths, broker_paths
+  # The broker state mount is the broker/ subPath of the claim, so the credential directory needs
+  # its own sibling subPath mount or the path the init container seeded would not exist in here.
+  assert BROKER in broker_paths, broker_paths
+  init=spec["initContainers"][0]
+  assert BROKER in init["args"][0], "the init container must seed the broker credential"'
+python_yaml "$mount_check" "$work/broker-chatgpt-render.yaml"
+echo "PASS the broker reaches its credential through its own state mount; the gateway has neither"
+
+if helm template shared-subdir "$chart_dir" -f "$values" \
+  --set gateway.chatgpt.enabled=true \
+  --set gateway.chatgpt.existingSecret=dekopon-chatgpt-auth \
+  --set broker.chatgpt.enabled=true \
+  --set broker.chatgpt.existingSecret=dekopon-chatgpt-auth-broker \
+  --set broker.chatgpt.subdir=chatgpt >/dev/null 2>&1; then
+  echo "FAIL two token families rendered into one directory" >&2
+  exit 1
+fi
+echo "PASS the two ChatGPT families cannot share a directory"
+
+# broker/ is the broker's own state subPath. A credential directory named for it would mount the
+# same claim subPath twice on one container and seed the credential into the broker state root.
+if helm template reserved-subdir "$chart_dir" -f "$values" \
+  --set gateway.chatgpt.enabled=true \
+  --set gateway.chatgpt.existingSecret=dekopon-chatgpt-auth \
+  --set broker.chatgpt.enabled=true \
+  --set broker.chatgpt.existingSecret=dekopon-chatgpt-auth-broker \
+  --set broker.chatgpt.subdir=broker >/dev/null 2>&1; then
+  echo "FAIL the broker state subPath was accepted as a credential directory" >&2
+  exit 1
+fi
+echo "PASS broker.chatgpt.subdir cannot claim the broker state subPath"
+
+echo
+echo "OK: every tier satisfied; both ChatGPT families are seed-once, separate, and reach only their own daemon; provider storage/key are retained, separate, and broker-only."

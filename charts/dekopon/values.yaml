@@ -179,6 +179,53 @@ broker:
     existingSecret: ""
     existingSecretKey: broker-credentials.yaml
 
+  # Seed a ChatGPT subscription credential for the BROKER once, and never again.
+  #
+  # This is the `kind: chatgptSubscription` entry in broker-credentials.yaml: the broker presents a
+  # ChatGPT access token to an allowed destination and renews it itself, 60 s before expiry, through
+  # the same refresh protocol and the same file format the gateway's model credential uses.
+  #
+  # It is a SEPARATE token family from gateway.chatgpt below, and the two must never point at one
+  # file. The refresh token rotates on every renewal and the authorization server retires its
+  # predecessor, so two independent holders of one file would eventually present a retired token and
+  # revoke the family for both. Run `dekopond auth chatgpt login --auth-file <path>` a second time and
+  # export that file instead. Same ChatGPT account, independent refresh token, independent
+  # revocation. The chart refuses a shared subdir.
+  #
+  # Everything the gateway's block says about seed-once applies here identically: the copy in the
+  # volume is the live one, the copy in your vault is a retired token the moment the broker refreshes,
+  # and restoring it over a live credential breaks a working broker. The difference is who reads it —
+  # so the file lands under the broker's own state directory and the gateway never receives a mount
+  # for it.
+  chatgpt:
+    enabled: false
+    # Prefer existingSecret. `dekopond auth chatgpt export --expose-credential --auth-file <path>`
+    # produces the document; an External Secrets Operator ExternalSecret against a 1Password item
+    # projects the same shape. An inline value is stored in the release and returned by
+    # `helm get values`.
+    inline: ""
+    existingSecret: ""
+    existingSecretKey: chatgpt-auth.json
+    # File name inside the credential directory, and therefore the leaf your broker-credentials.yaml
+    # authFile must name. `save_credentials` derives its temporary sibling by REPLACING this
+    # extension — chatgpt-auth.json becomes chatgpt-auth.tmp-<pid> — and renames over the target, so
+    # the broker needs write access to the directory, not just the file. dekopon-brokerd refuses to
+    # start when that directory is not owner-only and writable.
+    fileName: chatgpt-auth.json
+    # Single path segment, joined onto paths.stateDir. It is not a free path on purpose: the
+    # credential must live on the claim, and a full path could be pointed at an emptyDir. It must
+    # differ from gateway.chatgpt.subdir, and it must not be "broker" — that segment is the broker's
+    # own state subPath.
+    subdir: broker-chatgpt
+    # Deliberate, destructive re-seed. Overwrites the credential in the volume with the one from the
+    # Secret, DISCARDING a refresh token that is almost certainly fresher. Use it only after a
+    # deliberate local re-login and re-export of THIS family.
+    #
+    # It is not self-clearing: while this is true, every restart re-seeds. Set it back to false once
+    # the pod has rolled. Changing it rolls the pod on its own, because it changes the init
+    # container's arguments.
+    reseed: false
+
   # Optional owner-only public-DRN/private-source map. The map contains no values but does contain
   # sensitive physical inventory. Prefer an existing Secret. The init container copies it into the
   # broker-only 0600 config directory; it is never mounted into the gateway.
@@ -284,10 +331,11 @@ gateway:
   # lands with the auth-export change.
   #
   # This is the one file the chart writes that the daemon then OWNS. The refresh token rotates on
-  # every refresh, `refresh_if_needed` returns the result of writing it back, so a failed write
-  # fails the model turn outright, and the copy in your vault is a dead token the moment the pod
-  # refreshes. That is expected, not broken: the exported copy exists to seed a NEW deployment, it
-  # is not a backup, and restoring it over a live credential breaks a working pod.
+  # every refresh and the rotated record is written back atomically, so the copy in your vault is a
+  # dead token the moment the pod refreshes. That is expected, not broken: the exported copy exists
+  # to seed a NEW deployment, it is not a backup, and restoring it over a live credential breaks a
+  # working pod. A write-back that fails logs `chatgpt_credential_save_failed` and keeps going on
+  # the in-memory token, because by then the predecessor on disk is already retired.
   #
   # So it is seeded once, into the persistent claim, and the init container refuses to overwrite
   # it afterwards. It lives on the claim rather than an emptyDir precisely because an emptyDir

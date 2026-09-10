@@ -14,8 +14,10 @@ GATES = {
     "Verify gateway excludes privileged broker machinery": (
         "dekopond", ("broker", "broker-host", "brokerd", "http-host", "storage-host", "policy")
     ),
+    # dekopon-model is deliberately not forbidden here: the broker's refreshing credential
+    # kind resolves through `dekopon_model::chatgpt::CredentialFile`.
     "Verify broker excludes unprivileged orchestration": (
-        "dekopon-brokerd", ("agent", "shell", "model", "process", "config")
+        "dekopon-brokerd", ("agent", "shell", "process", "config")
     ),
 }
 

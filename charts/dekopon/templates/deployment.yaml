@@ -46,13 +46,14 @@ spec:
         checksum/catalog: {{ include (print $.Template.BasePath "/configmap-catalog.yaml") . | sha256sum }}
         {{- end }}
         {{- /*
-          There is deliberately no checksum for the ChatGPT credential Secret. Every other
-          checksum here exists to push a changed file into a pod that only reads at startup; the
+          There is deliberately no checksum for either ChatGPT credential Secret. Every other
+          checksum here exists to push a changed file into a pod that only reads at startup; a
           seed is the one file whose whole point is NOT to be pushed in, because the copy in the
           volume is the live one and the copy in the Secret goes stale at the first refresh. An
-          annotation would restart a working gateway to achieve nothing. The value that does
-          change behaviour, gateway.chatgpt.reseed, rolls the pod by itself: it changes the init
-          container's arguments, which are part of this pod template.
+          annotation would restart a working daemon to achieve nothing. The values that do
+          change behaviour, gateway.chatgpt.reseed and broker.chatgpt.reseed, roll the pod by
+          themselves: they change the init container's arguments, which are part of this pod
+          template.
         */}}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
@@ -161,15 +162,16 @@ spec:
               fi
               {{- end }}
 
-{{- if include "dekopon.chatgptEnabled" . }}
-{{- $seedFile := (first $seed).file }}
+{{- range $seed }}
+{{- $seedUid := ternary "$gateway_uid" "$uid" (eq .owner "gateway") }}
+{{- $seedGid := ternary "$gateway_gid" "$gid" (eq .owner "gateway") }}
 
-              # The ChatGPT credential: seeded once, then never touched again.
+              # A seed-once credential: written on the first boot, then never touched again.
               #
               # Unlike everything above, this file is mutable at runtime and authoritative after
-              # the first boot. dekopond refreshes it, the refresh token rotates, and the rotated
-              # value is written back — so the copy in the Secret is a retired token the moment
-              # the daemon refreshes, and copying it back in would hand a working gateway a dead
+              # the first boot. Its owner refreshes it, the refresh token rotates, and the rotated
+              # value is written back — so the copy in the Secret is a retired token the moment the
+              # daemon refreshes, and copying it back in would hand a working daemon a dead
               # credential. The `[ -e ]` test below is the entire mechanism, because `install`
               # overwrites unconditionally. `-e` and not `-f` or `-s`: anything at that path, even
               # zero bytes, means seeded — do not clobber it.
@@ -178,36 +180,38 @@ spec:
               # with the pod, which would make this "seed on every reschedule" instead.
               #
               # The directory is reclaimed to root first for the same reason the others are: after
-              # a previous run it is 0700 and owned by $gateway_uid, and root without CAP_DAC_OVERRIDE
-              # cannot read through it to test whether the credential is there.
-              [ -d "{{ $chatgptDir }}" ] || mkdir -p "{{ $chatgptDir }}"
-              chown 0:0 "{{ $chatgptDir }}"
-              chmod 0700 "{{ $chatgptDir }}"
-{{- if .Values.gateway.chatgpt.reseed }}
-              # gateway.chatgpt.reseed is set. This discards the credential in the volume, which
-              # is almost certainly fresher than the exported one, and re-seeds from the Secret.
-              echo "reseed: discarding {{ $chatgptDir }}/{{ $seedFile }} and seeding from the Secret" >&2
-              rm -f "{{ $chatgptDir }}/{{ $seedFile }}"
+              # a previous run it is 0700 and owned by {{ $seedUid }}, and root without
+              # CAP_DAC_OVERRIDE cannot read through it to test whether the credential is there.
+              [ -d "{{ .dir }}" ] || mkdir -p "{{ .dir }}"
+              chown 0:0 "{{ .dir }}"
+              chmod 0700 "{{ .dir }}"
+{{- if .reseed }}
+              # {{ .value }} is set. This discards the credential in the volume, which is almost
+              # certainly fresher than the exported one, and re-seeds from the Secret.
+              echo "reseed: discarding {{ .dir }}/{{ .file }} and seeding from the Secret" >&2
+              rm -f "{{ .dir }}/{{ .file }}"
 {{- end }}
-              if [ ! -e "{{ $chatgptDir }}/{{ $seedFile }}" ]; then
-                install -m 0600 -o "$gateway_uid" -g "$gateway_gid" "{{ $src }}/{{ $seedFile }}" "{{ $chatgptDir }}/{{ $seedFile }}"
-                echo "seeded {{ $chatgptDir }}/{{ $seedFile }}"
+              if [ ! -e "{{ .dir }}/{{ .file }}" ]; then
+                install -m 0600 -o "{{ $seedUid }}" -g "{{ $seedGid }}" "{{ $src }}/{{ .source }}" "{{ .dir }}/{{ .file }}"
+                echo "seeded {{ .dir }}/{{ .file }} ({{ .label }})"
               else
-                echo "{{ $chatgptDir }}/{{ $seedFile }} already exists; leaving the live credential alone"
+                echo "{{ .dir }}/{{ .file }} already exists; leaving the live credential alone"
               fi
-              got=$(stat -c '%u:%g:%a:%h:%F' "{{ $chatgptDir }}/{{ $seedFile }}")
-              if [ "$got" != "$gateway_uid:$gateway_gid:600:1:regular file" ]; then
-                echo "{{ $seedFile }}: got $got, want $gateway_uid:$gateway_gid:600:1:regular file" >&2
+              got=$(stat -c '%u:%g:%a:%h:%F' "{{ .dir }}/{{ .file }}")
+              if [ "$got" != "{{ $seedUid }}:{{ $seedGid }}:600:1:regular file" ]; then
+                echo "{{ .file }}: got $got, want {{ $seedUid }}:{{ $seedGid }}:600:1:regular file" >&2
                 rc=1
               fi
               # 0700 on the directory is load-bearing, not hygiene: save_credentials creates a
               # sibling temporary file here — chatgpt-auth.json becomes chatgpt-auth.tmp-<pid>,
               # the extension is replaced rather than appended — and renames it over the target.
-              chmod 0700 "{{ $chatgptDir }}"
-              chown "$gateway_uid:$gateway_gid" "{{ $chatgptDir }}"
-              got=$(stat -c '%u:%a:%F' "{{ $chatgptDir }}")
-              if [ "$got" != "$gateway_uid:700:directory" ]; then
-                echo "{{ $chatgptDir }}: got $got, want $gateway_uid:700:directory" >&2
+              # dekopon-brokerd additionally refuses to start when a credentialsPath authFile sits
+              # in a directory it cannot write.
+              chmod 0700 "{{ .dir }}"
+              chown "{{ $seedUid }}:{{ $seedGid }}" "{{ .dir }}"
+              got=$(stat -c '%u:%a:%F' "{{ .dir }}")
+              if [ "$got" != "{{ $seedUid }}:700:directory" ]; then
+                echo "{{ .dir }}: got $got, want {{ $seedUid }}:700:directory" >&2
                 rc=1
               fi
 {{- end }}
@@ -284,7 +288,7 @@ spec:
             # save_credentials cannot create its temporary sibling. Naming it here means the
             # fallback can never be reached. Naming authFile in dekopond.yaml is clearer still.
             - name: DEKOPON_CHATGPT_AUTH_FILE
-              value: {{ $chatgptDir }}/{{ (first $seed).file }}
+              value: {{ $chatgptDir }}/{{ .Values.gateway.chatgpt.fileName }}
 {{- end }}
             {{- with .Values.gateway.env }}
             {{- toYaml . | nindent 12 }}
@@ -344,12 +348,15 @@ spec:
             # Octal. Only the root init container reads these, and it reads them once.
             defaultMode: 0400
             sources:
+              {{- /* A managed file's projected path is its own name; a seed's is `source`, which
+                     keeps two credential families that both default to chatgpt-auth.json from
+                     claiming one path in this volume. */}}
               {{- range (concat $files $seed) }}
               - secret:
                   name: {{ .secret }}
                   items:
                     - key: {{ .key }}
-                      path: {{ .file }}
+                      path: {{ default .file .source }}
               {{- end }}
         # Memory-backed, so broker-credentials.yaml never reaches the node's disk.
         - name: config

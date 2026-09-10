@@ -7,6 +7,7 @@ use std::{
     collections::BTreeMap,
     env,
     ffi::OsString,
+    fmt,
     fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -47,15 +48,268 @@ pub struct ChatGptAuthStatus {
     pub signed_in: bool,
     /// Whether the current access token has expired.
     pub expired: bool,
+    /// Unix seconds the stored access token expires at, absent when nothing is stored.
+    ///
+    /// A startup check wants the distance to expiry rather than the boolean: a credential that
+    /// expires in ninety seconds is operationally different from one good for a week, and both
+    /// answer `expired: false`.
+    pub expires_at: Option<u64>,
+}
+
+/// What one [`CredentialFile::current`] call did to reach the token it returned.
+///
+/// The distinction is the whole point of the cross-process lock. `Adopted` means another process
+/// had already rotated and this one spent nothing; `Rotated` means this process spent the refresh
+/// token and persisted its replacement; `RotatedUnsaved` means it spent the token and could not
+/// persist it, so the returned value is the only copy that still works.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RefreshOutcome {
+    /// Another process's newer record was adopted; no refresh token was spent.
+    Adopted,
+    /// This call refreshed and persisted the rotated record.
+    Rotated,
+    /// This call refreshed but could not persist; the returned token is in memory only.
+    RotatedUnsaved,
+}
+
+impl RefreshOutcome {
+    /// Stable, low-cardinality label for telemetry.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Adopted => "adopted",
+            Self::Rotated => "rotated",
+            Self::RotatedUnsaved => "rotated-unsaved",
+        }
+    }
+}
+
+/// One resolution of a credential file: what to present, and what reaching it cost.
+#[derive(Clone, Debug)]
+pub struct ResolvedCredential {
+    /// Access token to present as `Bearer <access>`.
+    pub access: Redacted<String>,
+    /// ChatGPT account identifier the route requires beside the bearer token.
+    ///
+    /// It is a claim inside the access token rather than a secret, and a caller that must send it
+    /// as a header cannot read it out of the token itself.
+    pub account_id: String,
+    /// Absent when the stored token was still inside its validity margin.
+    pub refresh: Option<RefreshOutcome>,
+}
+
+/// Dekopon's ChatGPT credential file, with the refresh and write-back protocol it owns.
+///
+/// This is the single definition of "use the credential at this path": take the cross-process lock,
+/// adopt a newer record another process wrote, refresh when the access token is inside its margin,
+/// persist the rotated record atomically, and keep going on the in-memory token when that write
+/// fails. [`ChatGptCodexModel`] below is one consumer and the broker's `chatgptSubscription`
+/// credential kind is the other, and they must not diverge: the refresh token rotates, so a second
+/// implementation of this sequence is a second way to brick the credential.
+///
+/// The in-memory snapshot is what keeps two callers inside one process from both spending a refresh
+/// token. It is a snapshot rather than a held lock because a consumer's own request — a model turn,
+/// an authorized provider invocation — runs against the value and must not serialize every other
+/// caller behind it.
+pub struct CredentialFile {
+    agent: Agent,
+    path: PathBuf,
+    credentials: Mutex<ChatGptCredentials>,
+    endpoints: ChatGptEndpoints,
+}
+
+impl fmt::Debug for CredentialFile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The document inside is a live access token and a rotating refresh token, so the path is
+        // the only field a `Debug` may render.
+        formatter
+            .debug_struct("CredentialFile")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CredentialFile {
+    /// Loads the credential document at `auth_path` and prepares a bounded refresh client.
+    ///
+    /// Reading happens here rather than on first use, so a missing, unreadable, unparseable, or
+    /// unsupported credential is a startup failure naming its cause rather than a surprise on the
+    /// first authorized invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatGptError::Configuration`] for a zero timeout, [`ChatGptError::NotLoggedIn`]
+    /// when the path holds nothing, and the read/parse errors [`ChatGptError`] names otherwise.
+    pub fn open(auth_path: &Path, timeout: Duration) -> Result<Self, ChatGptError> {
+        Self::with_endpoints(auth_path, timeout, ChatGptEndpoints::production())
+    }
+
+    fn with_endpoints(
+        auth_path: &Path,
+        timeout: Duration,
+        endpoints: ChatGptEndpoints,
+    ) -> Result<Self, ChatGptError> {
+        if timeout.is_zero() {
+            return Err(ChatGptError::Configuration(
+                "model timeout must be greater than zero".to_owned(),
+            ));
+        }
+        let credentials = load_credentials(auth_path)?;
+        Ok(Self {
+            agent: crate::agent(timeout),
+            path: auth_path.to_path_buf(),
+            credentials: Mutex::new(credentials),
+            endpoints,
+        })
+    }
+
+    /// The path this credential lives at.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Reports the in-memory snapshot without a network call or a re-read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChatGptError::Configuration`] when the system clock sits before the Unix epoch.
+    pub fn status(&self) -> Result<ChatGptAuthStatus, ChatGptError> {
+        let credentials = self.snapshot();
+        Ok(ChatGptAuthStatus {
+            path: self.path.clone(),
+            signed_in: true,
+            expired: credentials.expires_at <= unix_time()?,
+            expires_at: Some(credentials.expires_at),
+        })
+    }
+
+    /// Returns the token to present, refreshing and persisting it when it is inside its margin.
+    ///
+    /// A refresh that reached the provider but could not be written back returns
+    /// [`RefreshOutcome::RotatedUnsaved`] and an access token that still works: the provider has
+    /// already invalidated the predecessor, so failing here would strand the only live credential
+    /// and leave the retired one on disk for the next process to spend.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refresh failure — [`ChatGptError::TokenRefused`] carrying the OAuth `error` code
+    /// for a rejected grant, [`ChatGptError::Request`] for a transport failure — when the token
+    /// could not be renewed at all. Nothing is returned in that case, because nothing presentable
+    /// exists.
+    pub fn current(&self) -> Result<ResolvedCredential, ChatGptError> {
+        let mut credentials = self.snapshot();
+        let refresh = self.refresh_if_needed(&mut credentials, false)?;
+        if refresh.is_some() {
+            self.install(&credentials);
+        }
+        Ok(ResolvedCredential {
+            access: credentials.access.clone(),
+            account_id: credentials.account_id.clone(),
+            refresh,
+        })
+    }
+
+    /// Reads the credentials this file last saw, without holding the lock across a request.
+    ///
+    /// A consumer's request runs against this snapshot. Holding the guard through a streaming model
+    /// call or an authorized provider invocation instead would serialize every caller on one
+    /// request the moment a client is shared, which `CompletionOptions` already names as the
+    /// obvious next optimization.
+    fn snapshot(&self) -> ChatGptCredentials {
+        self.credentials
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Publishes a rotated credential for the next caller.
+    ///
+    /// A concurrent caller may already have installed a newer one, and the older of the two must
+    /// not win: its refresh token is the invalidated predecessor.
+    fn install(&self, credentials: &ChatGptCredentials) {
+        let mut stored = self
+            .credentials
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if credentials.expires_at >= stored.expires_at {
+            *stored = credentials.clone();
+        }
+    }
+
+    /// Brings `credentials` up to date, reporting what it took when anything happened.
+    ///
+    /// The refresh token rotates: the token endpoint mints a replacement and invalidates its
+    /// predecessor, and standard OAuth reuse detection can revoke the whole family when the
+    /// predecessor is presented again. Every process sharing this credential file therefore
+    /// serializes here on a sibling lock, and whoever loses the race adopts what the winner wrote
+    /// instead of spending a refresh token the provider has already retired.
+    fn refresh_if_needed(
+        &self,
+        credentials: &mut ChatGptCredentials,
+        force: bool,
+    ) -> Result<Option<RefreshOutcome>, ChatGptError> {
+        if !force && !needs_refresh(credentials)? {
+            return Ok(None);
+        }
+        let span = tracing::info_span!(
+            "chatgpt.refresh",
+            forced = force,
+            outcome = tracing::field::Empty,
+            duration_ms = tracing::field::Empty,
+            credential.expires_at = tracing::field::Empty,
+        );
+        let _entered = span.enter();
+        let started = Instant::now();
+
+        let _lock = CredentialLock::acquire(&self.path);
+        let adopted = adopt_stored_credentials(&self.path, credentials);
+        if adopted && !needs_refresh(credentials)? {
+            record_refresh(
+                &span,
+                RefreshOutcome::Adopted.label(),
+                started,
+                credentials.expires_at,
+            );
+            return Ok(Some(RefreshOutcome::Adopted));
+        }
+
+        let refreshed =
+            match refresh_credentials(&self.agent, &self.endpoints, credentials.refresh.expose()) {
+                Ok(refreshed) => refreshed,
+                Err(error) => {
+                    span.record("outcome", "failed");
+                    span.record("duration_ms", elapsed_ms(started));
+                    return Err(error);
+                }
+            };
+        *credentials = refreshed;
+        // The provider has already rotated, so the only credential that still works is the one in
+        // memory. Failing the turn here would strand it and leave the invalidated predecessor on
+        // disk for the next process to spend, which is the reuse-detection trap this whole path
+        // exists to avoid.
+        let outcome = match save_credentials(&self.path, credentials) {
+            Ok(()) => RefreshOutcome::Rotated,
+            Err(error) => {
+                tracing::error!(
+                    event = "chatgpt_credential_save_failed",
+                    path = %self.path.display(),
+                    error = %error,
+                    "ChatGPT credential rotated but could not be persisted; continuing with the \
+                     in-memory token"
+                );
+                RefreshOutcome::RotatedUnsaved
+            }
+        };
+        record_refresh(&span, outcome.label(), started, credentials.expires_at);
+        Ok(Some(outcome))
+    }
 }
 
 /// ChatGPT subscription model backed by OpenAI's Codex Responses endpoint.
 pub struct ChatGptCodexModel {
-    agent: Agent,
     model: String,
-    auth_path: PathBuf,
-    credentials: Mutex<ChatGptCredentials>,
-    endpoints: ChatGptEndpoints,
+    credential: CredentialFile,
 }
 
 impl ChatGptCodexModel {
@@ -74,11 +328,6 @@ impl ChatGptCodexModel {
         timeout: Duration,
         endpoints: ChatGptEndpoints,
     ) -> Result<Self, ChatGptError> {
-        if timeout.is_zero() {
-            return Err(ChatGptError::Configuration(
-                "model timeout must be greater than zero".to_owned(),
-            ));
-        }
         let model = model.into();
         if model.trim().is_empty() {
             return Err(ChatGptError::Configuration(
@@ -86,104 +335,9 @@ impl ChatGptCodexModel {
             ));
         }
         let auth_path = resolve_auth_path(auth_path)?;
-        let credentials = load_credentials(&auth_path)?;
+        let credential = CredentialFile::with_endpoints(&auth_path, timeout, endpoints)?;
 
-        Ok(Self {
-            agent: crate::agent(timeout),
-            model,
-            auth_path,
-            credentials: Mutex::new(credentials),
-            endpoints,
-        })
-    }
-
-    /// Reads the credentials this client last saw, without holding the lock across a request.
-    ///
-    /// The turn below runs against this snapshot. Holding the guard through the streaming request
-    /// instead would serialize every session on one 120-second model call the moment a caller
-    /// shares a client, which `CompletionOptions` already names as the obvious next optimization.
-    fn credentials_snapshot(&self) -> ChatGptCredentials {
-        self.credentials
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
-    }
-
-    /// Publishes a rotated credential for the next turn.
-    ///
-    /// A concurrent turn may already have installed a newer one, and the older of the two must not
-    /// win: its refresh token is the invalidated predecessor.
-    fn install_credentials(&self, credentials: &ChatGptCredentials) {
-        let mut stored = self
-            .credentials
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if credentials.expires_at >= stored.expires_at {
-            *stored = credentials.clone();
-        }
-    }
-
-    /// Brings `credentials` up to date, returning whether they changed.
-    ///
-    /// The refresh token rotates: the token endpoint mints a replacement and invalidates its
-    /// predecessor, and standard OAuth reuse detection can revoke the whole family when the
-    /// predecessor is presented again. Every process sharing this credential file therefore
-    /// serializes here on a sibling lock, and whoever loses the race adopts what the winner wrote
-    /// instead of spending a refresh token the provider has already retired.
-    fn refresh_if_needed(
-        &self,
-        credentials: &mut ChatGptCredentials,
-        force: bool,
-    ) -> Result<bool, ChatGptError> {
-        if !force && !needs_refresh(credentials)? {
-            return Ok(false);
-        }
-        let span = tracing::info_span!(
-            "chatgpt.refresh",
-            forced = force,
-            outcome = tracing::field::Empty,
-            duration_ms = tracing::field::Empty,
-            credential.expires_at = tracing::field::Empty,
-        );
-        let _entered = span.enter();
-        let started = Instant::now();
-
-        let _lock = CredentialLock::acquire(&self.auth_path);
-        let adopted = adopt_stored_credentials(&self.auth_path, credentials);
-        if adopted && !needs_refresh(credentials)? {
-            record_refresh(&span, "adopted", started, credentials.expires_at);
-            return Ok(true);
-        }
-
-        let refreshed =
-            match refresh_credentials(&self.agent, &self.endpoints, credentials.refresh.expose()) {
-                Ok(refreshed) => refreshed,
-                Err(error) => {
-                    span.record("outcome", "failed");
-                    span.record("duration_ms", elapsed_ms(started));
-                    return Err(error);
-                }
-            };
-        *credentials = refreshed;
-        // The provider has already rotated, so the only credential that still works is the one in
-        // memory. Failing the turn here would strand it and leave the invalidated predecessor on
-        // disk for the next process to spend, which is the reuse-detection trap this whole path
-        // exists to avoid.
-        let outcome = match save_credentials(&self.auth_path, credentials) {
-            Ok(()) => "rotated",
-            Err(error) => {
-                tracing::error!(
-                    event = "chatgpt_credential_save_failed",
-                    path = %self.auth_path.display(),
-                    error = %error,
-                    "ChatGPT credential rotated but could not be persisted; continuing this turn \
-                     with the in-memory token"
-                );
-                "rotated-unsaved"
-            }
-        };
-        record_refresh(&span, outcome, started, credentials.expires_at);
-        Ok(true)
+        Ok(Self { model, credential })
     }
 
     fn request_turn(
@@ -195,8 +349,9 @@ impl ChatGptCodexModel {
     ) -> Result<AssistantTurn, ChatGptRequestError> {
         let body = build_request_body(&self.model, messages, tools, options);
         let response = self
+            .credential
             .agent
-            .post(&self.endpoints.responses)
+            .post(&self.credential.endpoints.responses)
             .header(
                 "authorization",
                 &format!("Bearer {}", credentials.access.expose()),
@@ -249,22 +404,26 @@ impl ChatModel for ChatGptCodexModel {
             tool.count = tools.len()
         );
         let _entered = span.enter();
-        let mut credentials = self.credentials_snapshot();
+        let mut credentials = self.credential.snapshot();
         if self
+            .credential
             .refresh_if_needed(&mut credentials, false)
             .map_err(|error| ModelError::Request(error.to_string()))?
+            .is_some()
         {
-            self.install_credentials(&credentials);
+            self.credential.install(&credentials);
         }
 
         match self.request_turn(&credentials, messages, tools, options) {
             Ok(turn) => Ok(turn),
             Err(ChatGptRequestError::Unauthorized) => {
                 if self
+                    .credential
                     .refresh_if_needed(&mut credentials, true)
                     .map_err(|error| ModelError::Request(error.to_string()))?
+                    .is_some()
                 {
-                    self.install_credentials(&credentials);
+                    self.credential.install(&credentials);
                 }
                 self.request_turn(&credentials, messages, tools, options)
                     .map_err(|error| ModelError::Request(error.to_string()))
@@ -319,6 +478,7 @@ pub fn status(auth_path: Option<&Path>) -> Result<ChatGptAuthStatus, ChatGptErro
                 path,
                 signed_in: false,
                 expired: false,
+                expires_at: None,
             });
         }
         Err(error) => return Err(error),
@@ -327,6 +487,7 @@ pub fn status(auth_path: Option<&Path>) -> Result<ChatGptAuthStatus, ChatGptErro
         path,
         signed_in: true,
         expired: credentials.expires_at <= unix_time()?,
+        expires_at: Some(credentials.expires_at),
     })
 }
 
@@ -658,11 +819,18 @@ fn request_token<'a, const N: usize>(
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
         // The OAuth `error` code is the whole diagnostic here: `invalid_grant` says the refresh
-        // token is gone and a human has to log in again, while a bare 400 could be anything.
-        let detail = oauth_failure_detail(response);
-        return Err(ChatGptError::Login(format!(
-            "token endpoint returned HTTP {status}: {detail}"
-        )));
+        // token is gone and a human has to log in again, while a bare 400 could be anything. It is
+        // carried as a field rather than only inside the message because a caller has to classify
+        // on it — the broker turns a revoked family into a permanent failure an operator must fix
+        // and everything else into a transient one — and re-parsing a rendered string to do that
+        // would be a second definition of the same fact.
+        let body = read_error_body(response);
+        let code = oauth_error_code(&body);
+        return Err(ChatGptError::TokenRefused {
+            status,
+            detail: oauth_detail(&body, code.as_deref()),
+            code,
+        });
     }
     let token = response
         .body_mut()
@@ -1139,12 +1307,18 @@ fn format_provider_error(event: &Value) -> String {
 /// credential was issued — and the code is the part that names the failure.
 fn oauth_failure_detail(response: ureq::http::Response<ureq::Body>) -> String {
     let body = read_error_body(response);
-    let Some(code) = oauth_error_code(&body) else {
-        return body;
+    let code = oauth_error_code(&body);
+    oauth_detail(&body, code.as_deref())
+}
+
+/// Renders the OAuth diagnostic: the `error` code with its description, or the bounded body.
+fn oauth_detail(body: &str, code: Option<&str>) -> String {
+    let Some(code) = code else {
+        return body.to_owned();
     };
-    match oauth_error_description(&body) {
+    match oauth_error_description(body) {
         Some(description) => format!("{code}: {description}"),
-        None => code,
+        None => code.to_owned(),
     }
 }
 
@@ -1647,6 +1821,21 @@ pub enum ChatGptError {
     /// Login was rejected.
     #[error("ChatGPT login failed: {0}")]
     Login(String),
+    /// The OAuth token endpoint refused an authorization-code exchange or a refresh.
+    ///
+    /// `code` is the OAuth `error` code the body carried. `invalid_grant`,
+    /// `refresh_token_reused`, `refresh_token_invalidated`, and `refresh_token_expired` all mean
+    /// the token family is gone and only a new device login restores it; every other code, and a
+    /// 5xx with no code at all, is the endpoint's problem rather than the credential's.
+    #[error("ChatGPT token endpoint returned HTTP {status}: {detail}")]
+    TokenRefused {
+        /// HTTP status the endpoint answered with.
+        status: u16,
+        /// OAuth `error` code, when the body carried one.
+        code: Option<String>,
+        /// Rendered diagnostic: the code and its description, or the bounded body.
+        detail: String,
+    },
     /// Login took too long.
     #[error("ChatGPT device login timed out after 15 minutes")]
     LoginTimeout,
@@ -1671,9 +1860,10 @@ mod tests {
 
     use super::{
         AUTH_VERSION, AuthPathEnvironment, ChatGptCodexModel, ChatGptCredentials, ChatGptEndpoints,
-        ChatGptError, DEFAULT_AUTH_FILE_NAME, OsString, PathBuf, build_request_body,
-        credential_lock_path, export_credentials, exported_path, extract_account_id,
-        load_credentials, login_with_endpoints, logout, parse_sse, save_credentials, status,
+        ChatGptError, CredentialFile, DEFAULT_AUTH_FILE_NAME, OsString, PathBuf, RefreshOutcome,
+        build_request_body, credential_lock_path, export_credentials, exported_path,
+        extract_account_id, load_credentials, login_with_endpoints, logout, parse_sse,
+        save_credentials, status,
     };
     use crate::{
         mock::{MockResponse, MockServer},
@@ -2904,5 +3094,192 @@ mod tests {
         let error = export_credentials(Some(&path)).expect_err("malformed credentials must fail");
 
         assert!(error.to_string().contains("could not parse"), "{error}");
+    }
+
+    /// The broker's credential kind and the gateway's model client share this sequence, so the
+    /// rotation, the atomic write-back, and the adoption by a second holder are pinned here rather
+    /// than only through a model turn.
+    ///
+    /// Both files are opened *before* the rotation, which is the only way to exercise adoption: a
+    /// reader that opens afterwards loads the fresh record and never enters the refresh path. The
+    /// mock scripts exactly one token response, so a second refresh would hang on `accept` and
+    /// report a transport failure instead of silently spending a retired token.
+    #[test]
+    fn a_rotated_credential_is_persisted_and_adopted_without_a_second_refresh() {
+        let server = MockServer::start(vec![MockResponse::json(json!({
+            "access_token": fake_access("acct-rotated"),
+            "refresh_token": "refresh-rotated",
+            "expires_in": 3600
+        }))]);
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("auth.json");
+        save_credentials(&path, &credential_fixture("acct-old", "refresh-old", 0))
+            .expect("save credentials");
+        let endpoints = ChatGptEndpoints::local(&server.base_url());
+        let first =
+            CredentialFile::with_endpoints(&path, Duration::from_secs(2), endpoints.clone())
+                .expect("first holder opens the credential");
+        let second = CredentialFile::with_endpoints(&path, Duration::from_secs(2), endpoints)
+            .expect("second holder opens the same credential");
+
+        let rotated = first.current().expect("the refresh succeeds");
+
+        assert_eq!(rotated.refresh, Some(RefreshOutcome::Rotated));
+        assert_eq!(rotated.account_id, "acct-rotated");
+        assert_eq!(rotated.access.expose(), &fake_access("acct-rotated"));
+        let stored = load_credentials(&path).expect("stored credentials");
+        assert_eq!(
+            stored.refresh.expose(),
+            "refresh-rotated",
+            "the rotated refresh token was not written back"
+        );
+        assert!(
+            credential_lock_path(&path)
+                .expect("lock path")
+                .try_exists()
+                .unwrap_or(false),
+            "no lock was taken around the refresh"
+        );
+
+        let adopted = second.current().expect("the second holder adopts");
+
+        assert_eq!(adopted.refresh, Some(RefreshOutcome::Adopted));
+        assert_eq!(adopted.account_id, "acct-rotated");
+        assert_eq!(
+            server.requests().len(),
+            1,
+            "the second holder spent a refresh token the first had already retired"
+        );
+
+        // The snapshot is what stops a third call from re-entering the refresh path at all.
+        let reused = second
+            .current()
+            .expect("the adopted token is still current");
+        assert_eq!(reused.refresh, None);
+        assert_eq!(server.requests().len(), 1);
+    }
+
+    /// `invalid_grant` is the one refresh failure no retry can fix: the token family is gone and a
+    /// human has to log in again. The error has to name it, because that is how a caller tells a
+    /// permanent re-authorization from a transient network failure.
+    #[test]
+    fn a_rejected_refresh_grant_carries_the_oauth_code_as_a_field() {
+        let server = MockServer::start(vec![MockResponse::failure(
+            400,
+            json!({"error": "invalid_grant", "error_description": "token expired or revoked"}),
+        )]);
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("auth.json");
+        save_credentials(&path, &credential_fixture("acct-old", "refresh-old", 0))
+            .expect("save credentials");
+        let credential = CredentialFile::with_endpoints(
+            &path,
+            Duration::from_secs(2),
+            ChatGptEndpoints::local(&server.base_url()),
+        )
+        .expect("the credential opens");
+
+        let refused = credential
+            .current()
+            .expect_err("a rejected grant must not produce a token");
+
+        let ChatGptError::TokenRefused {
+            status,
+            code,
+            detail,
+        } = &refused
+        else {
+            panic!("a refused grant is a token-endpoint refusal: {refused:?}");
+        };
+        assert_eq!(*status, 400);
+        assert_eq!(
+            code.as_deref(),
+            Some("invalid_grant"),
+            "the refusal must carry the OAuth code a caller classifies on, as a field"
+        );
+        assert!(detail.contains("token expired or revoked"), "{detail}");
+        assert_eq!(
+            load_credentials(&path)
+                .expect("stored credentials")
+                .refresh
+                .expose(),
+            "refresh-old",
+            "a failed refresh must not rewrite the stored credential"
+        );
+    }
+
+    /// A rotation the provider accepted but the disk refused still has to be usable: the
+    /// predecessor on disk is already retired, so the in-memory token is the only one that works.
+    /// Fails under root, which can write through a `0o500` directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_rotated_credential_is_returned_when_the_write_back_fails() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let server = MockServer::start(vec![MockResponse::json(json!({
+            "access_token": fake_access("acct-unsaved"),
+            "refresh_token": "refresh-unsaved",
+            "expires_in": 3600
+        }))]);
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("auth.json");
+        save_credentials(&path, &credential_fixture("acct-old", "refresh-old", 0))
+            .expect("save credentials");
+        let credential = CredentialFile::with_endpoints(
+            &path,
+            Duration::from_secs(2),
+            ChatGptEndpoints::local(&server.base_url()),
+        )
+        .expect("the credential opens");
+
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o500))
+            .expect("make the credential directory unwritable");
+        let resolved = credential.current();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
+            .expect("restore the credential directory");
+
+        let resolved = resolved.expect("an unsaved rotation still yields a usable token");
+        assert_eq!(resolved.refresh, Some(RefreshOutcome::RotatedUnsaved));
+        assert_eq!(resolved.account_id, "acct-unsaved");
+        assert_eq!(
+            load_credentials(&path)
+                .expect("stored credentials")
+                .refresh
+                .expose(),
+            "refresh-old",
+            "the write was supposed to have failed"
+        );
+    }
+
+    #[test]
+    fn a_credential_file_reports_its_own_expiry_without_a_network_call() {
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("auth.json");
+        save_credentials(&path, &credential_fixture("acct-test", "refresh-secret", 0))
+            .expect("save credentials");
+        let credential = CredentialFile::with_endpoints(
+            &path,
+            Duration::from_secs(2),
+            ChatGptEndpoints::local("http://127.0.0.1:9"),
+        )
+        .expect("the credential opens");
+
+        let status = credential.status().expect("status reads the snapshot");
+
+        assert_eq!(status.path, path);
+        assert!(status.signed_in);
+        assert!(status.expired);
+        assert_eq!(status.expires_at, Some(0));
+        assert_eq!(credential.path(), path);
+    }
+
+    #[test]
+    fn a_missing_credential_file_refuses_to_open() {
+        let temp = TempDir::new().expect("temporary directory");
+        let refused =
+            CredentialFile::open(&temp.path().join("absent.json"), Duration::from_secs(2))
+                .expect_err("an absent credential cannot be opened");
+
+        assert!(matches!(refused, ChatGptError::NotLoggedIn { .. }));
     }
 }

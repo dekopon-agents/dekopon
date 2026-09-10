@@ -30,7 +30,8 @@ pub use config::{
     ServerLimitsConfig, StorageConfig, TelemetryConfig,
 };
 pub use credentials::{
-    CREDENTIALS_API_VERSION, CredentialsError, HARD_MAX_CREDENTIALS, HARD_MAX_CREDENTIALS_BYTES,
+    CREDENTIALS_API_VERSION, CredentialsError, HARD_MAX_CHATGPT_AUTH_BYTES, HARD_MAX_CREDENTIALS,
+    HARD_MAX_CREDENTIALS_BYTES,
 };
 pub use dekopon_broker::MAX_SECRET_BINDINGS as HARD_MAX_SECRET_BINDINGS;
 pub use provider_manager::{

@@ -9,14 +9,40 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Added
 
-- Helm deployment separates gateway UID 65533 from broker UID 65532, using IPC group
-  65534 only for its socket. Init copies each daemon's private configuration separately,
-  isolates state and temporary mounts, and preserves seed-once model credentials. Existing
-  state claims require the offline ownership/layout migration in the chart README.
 - Broker IPC supports distinct mapped peer UIDs through a broker-owned `0660` socket
   in a non-writable shared-group directory. Owner-only `0600` clients remain supported;
   real peer authentication, server-UID pinning and private credential/store checks remain
   enforced. Group membership grants reachability, never identity or authorization.
+- Added a `chatgptSubscription` credential kind to the broker's owner-only credentials file. It names
+  an absolute `authFile` rather than a `secret`, and the broker resolves it once per authorized
+  invocation through the one implementation of that protocol, `dekopon_model::chatgpt::CredentialFile`
+  — now public and shared with `dekopon-model`'s `chatgptSubscription` model client — so the refresh
+  60 s before expiry, the advisory lock on a sibling `.lock` file, the adoption of a newer record
+  another process wrote, and the atomic write-back have exactly one definition. The renewal is the
+  broker's own HTTPS call: it is not charged to the invocation's `maxRequests`, produces no
+  `HttpCallEvidence` entry, and leaves `credentialInjected: true` and the symbolic credential name in
+  audit exactly as `bearerToken` does. Startup proves the `authFile` through
+  `read_trusted_file(.., FileTier::Private, ..)`, requires its parent directory to be owner-only and
+  writable because a rotation renames a sibling temporary file over the target, parses the document,
+  logs how long the access token has left, and refuses to start naming the cause otherwise. A retired
+  refresh-token family (`invalid_grant`, `refresh_token_reused`, `refresh_token_invalidated`,
+  `refresh_token_expired`) fails that invocation as `credential-unavailable` and logs
+  `broker_chatgpt_credential_reauth_required`; transport failures and 5xx answers fail as
+  `credential-refresh-failed`; either way every other capability keeps serving. The new
+  `broker.credential.refresh` span records `outcome` as `current`, `adopted`, `rotated`,
+  `rotated-unsaved`, or `failed`. Give the broker its own `dekopond auth chatgpt login --auth-file`:
+  sharing one file with the gateway eventually revokes the token family for both.
+- `dekopon-http-host` exposes `destinations_cover`, re-exported by `dekopon-broker-host`, so the
+  policy layer's startup coverage check and `BoundCredential::covers` are one comparison. A
+  refreshing credential has no rendered value to ask at startup, and a second implementation could
+  accept a host the injector then refuses — the runtime mismatch that check exists to make
+  unreachable.
+- `BoundCredential` can carry one fixed companion header beside `authorization`, and
+  `BoundCredential::chatgpt_subscription` uses it for `chatgpt-account-id`, whose value is a claim
+  inside the access token a guest never sees. It is one credential rather than a generic header sink:
+  the companion is inserted under the same destination-binding decision as the bearer token, a guest
+  that sets its name is refused rather than overwritten exactly as for `authorization`, its bytes stay
+  outside accounted request size, and `HttpCallEvidence` gained no field for it.
 - Added strict route-level `conversation.scope` for persistent gateway history:
   `privateConversation` remains the omitted-field default and keys transcript plus attachment state
   by agent, configured transport, transport-derived conversation, and canonical authenticated
@@ -117,9 +143,6 @@ All notable changes to Dekopon are documented here. The format is based on
   which the wire answer deliberately withholds. It is what a broker whose `identities`
   omit its own UID has to show for a pod that never becomes ready, since `dekopon-brokerd
   probe` authenticates as that UID.
-- The Helm chart refuses to render an inline `broker.yaml` whose `identities` never map
-  the broker's own UID: the readiness and liveness probes run `dekopon-brokerd probe` as
-  that UID, so omitting it produces a pod that starts and stays unready.
 - Added `.github/scripts/test_render_homebrew_formula.py`, which renders a formula through
   the entry point the tap workflow invokes and pins that `bin.install`, the caveats table,
   and the smoke test name exactly the executables Dekopon ships, with no stale count word
@@ -155,6 +178,22 @@ All notable changes to Dekopon are documented here. The format is based on
 - `dekopon-brokerd probe --socket <path>` performs a bounded owner-authenticated health check; chart broker probes use it without loading credentials or telemetry.
 - The ChatGPT subscription client sends `user-agent: dekopon/<version>` on every model request;
   that header named the retired `dekopon-run` binary before.
+- `dekopon-brokerd` may now depend on `dekopon-model`, and the CI boundary gate that forbade it was
+  narrowed to `dekopon-(agent|shell|process|config)`. The broker reaches exactly one item across that
+  edge — `dekopon_model::chatgpt::CredentialFile` — because a second implementation of the refresh
+  sequence is a second way to revoke a token family. The gateway's exclusion of every privileged
+  broker crate is unchanged.
+- `dekopon-brokerd`'s credentials file now reports every problem it finds in one refusal instead of
+  the first: a malformed name, a duplicate name, a field the entry's `kind` prohibits, and a field it
+  requires are all listed together. `CredentialsError::InvalidName` and
+  `CredentialsError::InvalidCredential` are replaced by `CredentialsError::Invalid { problems }`. The
+  per-kind field rules are new enforcement — `bearerToken` refuses `authFile`, `chatgptSubscription`
+  refuses `secret` and `scheme` — and no existing valid file changes meaning.
+- `dekopon_model::chatgpt` grew `CredentialFile`, `ResolvedCredential`, and `RefreshOutcome`, and
+  `ChatGptCodexModel` is now a thin consumer of them rather than a second copy of the refresh
+  sequence. A refused token request is `ChatGptError::TokenRefused { status, code, detail }` carrying
+  the OAuth `error` code as a field, because a caller classifying a retired family against a transient
+  outage must not have to re-parse a rendered message. `ChatGptAuthStatus` gained `expires_at`.
 - `dekopon-shell`'s `CapabilityInvoker::run_command` replaces `resolve_command`: it receives the
   piped value rendered as text (strings verbatim, other values as compact JSON) and answers with a
   `CommandRun` — a capability proposal authorized and charged like a direct call, text the provider
@@ -419,6 +458,43 @@ All notable changes to Dekopon are documented here. The format is based on
   walkthrough tells you to paste a live token into. (#1)
 - `docs/dekopond.md` cites the chart's real 270 s pod grace, and `docs/catalog.md` agrees with its
   own four-row reserved-fields table. (#33)
+
+## [dekopon-chart-0.4.0] - 2026-09-10
+
+### Added
+
+- Helm deployment separates gateway UID 65533 from broker UID 65532, using IPC group
+  65534 only for its socket. Init copies each daemon's private configuration separately,
+  isolates state and temporary mounts, and preserves seed-once model credentials. Existing
+  state claims require the offline ownership/layout migration in the chart README.
+- The Helm chart refuses to render an inline `broker.yaml` whose `identities` never map
+  the broker's own UID: the readiness and liveness probes run `dekopon-brokerd probe` as
+  that UID, so omitting it produces a pod that starts and stays unready.
+- `broker.chatgpt.*` seeds a ChatGPT subscription credential for the **broker** once, mirroring
+  `gateway.chatgpt.*`: `enabled`, `inline`, `existingSecret`, `existingSecretKey`, `fileName`,
+  `subdir` (default `broker-chatgpt`), and the deliberate destructive `reseed`. It is the `authFile`
+  a `kind: chatgptSubscription` entry in `broker-credentials.yaml` points at. The file lands in its
+  own subdirectory of the state claim as `0600` owned by the runtime UID in a `0700` directory the
+  broker can write, which is what a rotation's temporary sibling and rename need, and the broker
+  reaches it through its own `subPath` mount of that subdirectory, a sibling of the broker state
+  mount rather than a child of it — the gateway receives no mount for it, and
+  `ci/verify-init-permissions.sh` asserts that against the rendered manifest. The chart refuses to
+  render when the two families would share a directory or collide on one projected source path,
+  because the refresh token rotates and two holders of one document eventually revoke the family for
+  both. Unlike the gateway's block, this one does not require `gateway.enabled`: the consumer is
+  `dekopon-brokerd`.
+
+### Changed
+
+- The init container's seed-once logic is one loop over every seed-once file rather than one copy per
+  credential family, so the `[ -e ]` guard, the `stat` assertions, and the `0700` writable-directory
+  handling have a single definition. Apart from the UID split and mount isolation above, rendered
+  output for a release that enables only `gateway.chatgpt.*` is unchanged.
+- `ci/verify-init-permissions.sh` additionally proves the broker's family across a cold start, a
+  simulated rotation, two restart shapes, and the gated re-seed; that re-seeding one family leaves the
+  other alone; that the two are separate documents; that the `authFile` satisfies
+  `dekopon-brokerd`'s own Tier A and writable-parent checks as UID 65532; and that the rendered
+  gateway container mounts neither the broker's credential directory nor the claim as a whole.
 
 ## [dekopon-chart-0.3.0] - 2026-08-29
 
@@ -1280,6 +1356,7 @@ snapshot is only a comparison marker; no authenticated `v0.1.0` tag exists._
   telemetry, and updated Wasmtime to 36.0.13 for RUSTSEC-2026-0222 (#23, #27, #32).
 
 [Unreleased]: https://github.com/dekopon-agents/dekopon/compare/v0.11.1...HEAD
+[dekopon-chart-0.4.0]: https://github.com/dekopon-agents/dekopon/compare/dekopon-chart-0.3.0...dekopon-chart-0.4.0
 [0.11.1]: https://github.com/dekopon-agents/dekopon/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/dekopon-agents/dekopon/compare/v0.10.0...v0.11.0
 [dekopon-chart-0.2.1]: https://github.com/dekopon-agents/dekopon/compare/dekopon-chart-0.2.0...dekopon-chart-0.2.1

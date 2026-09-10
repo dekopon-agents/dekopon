@@ -363,6 +363,7 @@ its own event so that a key and a canonical subject never share a record.
 | `provider.run_command` | `dekopon-broker-host` | provider, `word`, `command.export` (`run-command`, or the legacy `resolve-command`) |
 | `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `policy-error`, `secret-denied`, `unconstrained-capability`, `agent-denied`, `replayed-invocation`, `attestation-denied`, `unmapped-subject`, `chat-attestation-denied`, `chat-scope-required`, `record-operation-required`, `memory-unavailable`, `invalid-memory-input`, `invalid-turn`), `policy.errors_present`; `subject` and `via` on attested proposals |
 | `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one; `outcome` (`succeeded`, `failed`, `decision-unaudited`, `outcome-unaudited`) and `error` — the same classified reason the terminal audit record carries |
+| `broker.credential.refresh` | `dekopon-brokerd` | the symbolic `credential` name, and `outcome` (`current`, `adopted`, `rotated`, `rotated-unsaved`, `failed`); emitted once per invocation that selects a credential the broker renews per use, and never any token, account identifier, or file content. `chatgpt.refresh` from `dekopon-model` nests inside it |
 | `provider.invoke` | `dekopon-broker-host` | capability, provider |
 | `http.request` | `dekopon-http-host` | `http.request.method`, `server.address`, `http.response.status_code`, `dekopon.http.request.accounted_bytes`, `dekopon.http.response.accounted_bytes`, `outcome`; `error.code` and `error.message` on failure |
 
@@ -405,6 +406,16 @@ the taxonomy callers act on must not shift; this event is the only place an oper
 denial came from a request the schema does not admit — a deployment defect — rather than from a
 policy that considered it and said no.
 
+`broker.credential.refresh` exists because the renewal is work the invocation waited on that nothing
+else in the trace accounts for: it is the broker's own HTTPS call, so it is deliberately absent from
+`HttpCallEvidence`, from the guest's `maxRequests`, and from `accounting.http.request`, and without
+this span a capability that spent a second on a token endpoint would look like a slow component. Its
+`outcome` separates the four things that can happen to a rotating credential — the stored token was
+still good (`current`), another process had already rotated and this one spent nothing (`adopted`),
+this one rotated and persisted (`rotated`), or it rotated and could not persist, so the returned token
+is the only copy that works (`rotated-unsaved`). `rotated-unsaved` is the one an operator should alert
+on alongside `chatgpt_credential_save_failed`: the record on disk is the retired predecessor.
+
 `broker.execute`'s `credential` is the owner-authored symbolic name from `broker.yaml`, never the
 secret and never the header. It exists because one capability can present a different credential per
 acting agent, and a trace that named none of them would make two writes to two different
@@ -427,6 +438,10 @@ only place the cause exists. These events carry it:
 | `broker_capabilities_refused` | warn | `dekopon-broker` | `reason` (`attestation-denied`, `unmapped-subject`, `agent-denied`, `policy-error`), `policy_ids` (the policies that determined it, empty for a refusal reached before any evaluation), canonical `subject`, `agent`, `via` |
 | `broker_policy_evaluation_error` | warn | `dekopon-broker` | `invocation`, `policy.target` (`capability` or `secret`) |
 | `broker_secret_resolution_failed` / `broker_secret_credential_failed` | warn | `dekopon-broker` | `invocation` and low-cardinality source/material `category`; structural credential errors are fixed value-free text. No DRN, locator, revision, value, or value-derived length. |
+| `broker_credential_refresh_failed` | error when `retryable = false`, warn otherwise | `dekopon-broker` | `invocation`, the symbolic `credential` name, low-cardinality `category`, and `retryable`. The invocation's classified reason is `credential-unavailable` when permanent and `credential-refresh-failed` when not; the broker keeps serving every other capability either way. |
+| `broker_chatgpt_credential_reauth_required` | error | `dekopon-brokerd` | the symbolic `credential` name, the `authFile` path, `category`, and the refresh failure's source chain. Emitted when the OAuth `error` code says the refresh-token family is retired (`invalid_grant`, `refresh_token_reused`, `refresh_token_invalidated`, `refresh_token_expired`) or the local credential is unusable: a human must run `dekopond auth chatgpt login --auth-file` again. No token, account identifier, or document content. |
+| `broker_chatgpt_credential_refresh_failed` | warn | `dekopon-brokerd` | the symbolic `credential` name, low-cardinality `category` (`transport`, `token-endpoint-unavailable`, `token-endpoint-rejected`, `token-endpoint-protocol`, `invalid-material`, `refresh-task`), and the failure's source chain. The next invocation may succeed unchanged. |
+| `broker_chatgpt_credential_loaded` | info | `dekopon-brokerd` | once per `chatgptSubscription` credential at startup: the symbolic `credential` name, the `authFile` path, `expires_at`, and `expired`. It is how an operator learns a seeded credential is already stale before the first invocation discovers it. |
 | `secret_source_resolution_failed` / `secret_projection_failed` | warn | `dekopon-brokerd` | adapter `source_kind` and low-cardinality `category`; no DRN, locator, response body, bootstrap credential, selector, or value |
 | `secret_source_cause_classified` / `secret_source_configuration_cause` | debug | `dekopon-brokerd` | safe cause classification behind the stable warn category: I/O kind/errno, HTTP timeout/connect/status, JSON class/line/column, the file-hygiene check name with the errno underneath it, or dependency-error type; URL parsing uses its fixed parser reason. Never endpoint/locator, refused path, or secret-derived bytes/offsets. |
 | `broker_audit_append_failed` | error | `dekopon-broker` | `audit.stage` (`decision`, `authorized-failure`, `outcome`), `category` (`full`, `poisoned`, `record-too-large`, `sequence-overflow`, `serialize`, `io`), `invocation`, and the error's source chain |
