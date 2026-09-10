@@ -53,7 +53,6 @@ pub const HARD_MAX_PROVIDER_STORE_BLOBS: usize = 1024;
 
 const HARD_MAX_TOKEN_BYTES: usize = 64 * 1024;
 const HARD_MAX_REGISTRY_ERROR_BYTES: usize = 64 * 1024;
-const HARD_MAX_CONFIG_DESCRIPTOR_BYTES: i64 = 4 * 1024;
 const REGISTRY_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const REGISTRY_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
 const OCI_MANIFEST_MEDIA_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
@@ -775,10 +774,6 @@ impl OciReference {
         &self.registry
     }
 
-    fn resolve_registry(&self) -> &str {
-        &self.registry
-    }
-
     fn repository(&self) -> &str {
         &self.repository
     }
@@ -1153,7 +1148,7 @@ impl RegistryClient {
         reference: &OciReference,
         suffix: &str,
     ) -> Result<Url, ProviderManagerError> {
-        let registry = reference.resolve_registry();
+        let registry = reference.registry();
         let scheme = if self.plaintext.contains(registry) {
             "http"
         } else {
@@ -1175,11 +1170,7 @@ impl RegistryClient {
         accept: Option<&str>,
         operation: &'static str,
     ) -> Result<reqwest::Response, ProviderManagerError> {
-        let key = format!(
-            "{}/{}",
-            reference.resolve_registry(),
-            reference.repository()
-        );
+        let key = format!("{}/{}", reference.registry(), reference.repository());
         let cached = { self.tokens.lock().await.get(&key).cloned() };
         let mut response = self
             .send_get(url.clone(), accept, cached.as_ref(), operation)
@@ -1400,7 +1391,6 @@ fn validate_manifest(
     if manifest.config.media_type != OCI_EMPTY_CONFIG_MEDIA_TYPE
         || manifest.config.digest != OCI_EMPTY_CONFIG_DIGEST
         || manifest.config.size != 2
-        || manifest.config.size > HARD_MAX_CONFIG_DESCRIPTOR_BYTES
         || manifest
             .config
             .data
@@ -1414,7 +1404,7 @@ fn validate_manifest(
         || manifest.config.artifact_type.is_some()
     {
         return Err(ProviderManagerError::registry(
-            "OCI provider config descriptor is invalid or too large",
+            "OCI provider config descriptor is invalid",
         ));
     }
     if manifest.layers.len() != 1 {
