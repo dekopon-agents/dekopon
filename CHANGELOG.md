@@ -73,6 +73,13 @@ All notable changes to Dekopon are documented here. The format is based on
   span records `process.interruptibility` as `cancellable` and a requested cancellation as
   `process.outcome` `cancelled`. The broker leg in `dekopon-agent` is the one cancellable
   consumer: a gateway session's Stop abandons an in-flight command run through it.
+  `CancelSignal::is_cancelled` is the same request read synchronously, for a boundary that must
+  decide whether to start work rather than await its end; `BrokerLeg::invoke` takes it and answers
+  a capability call proposed after the Stop with the same `session-cancelled` refusal, before any
+  proposal is built. That check used to be a `dekopond`-internal invoker wrapper around the leg,
+  which is deleted: a forwarder in front of the dispatch seam once dropped the `secret.use`
+  proposal a gateway session made, and there is no longer anything between the shell and the leg
+  to drop one.
 - Added `dekopon:provider@0.3.0`, whose new `provider-cli` world exports `run-command`: a command
   word receives its argv and the value piped into it and answers with a capability proposal, text
   it rendered itself (stdout, stderr, and an exit status), or a decline. On the SDK side that is

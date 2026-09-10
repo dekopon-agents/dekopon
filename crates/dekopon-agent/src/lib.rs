@@ -450,8 +450,9 @@ pub struct BrokerLeg {
     attestation: Option<Attestation>,
     /// Broker-derived optional all-three durable-memory surface for this exact chat scope.
     chat_memory: Option<ChatMemorySurface>,
-    /// What cancels a command-word run in flight: [`CancelSignal::never`] until an embedder ties
-    /// it to its own session with [`BrokerLeg::with_cancel_signal`].
+    /// What cancels a command-word run in flight, and refuses a capability call proposed after it
+    /// fires: [`CancelSignal::never`] until an embedder ties it to its own session with
+    /// [`BrokerLeg::with_cancel_signal`].
     cancel: CancelSignal,
     /// Where validated provider attachments go, and how many this reply may carry.
     ///
@@ -527,7 +528,10 @@ impl BrokerLeg {
     ///
     /// A run in flight when `signal` is requested is aborted at its next await and joined before
     /// the leg answers the script with `session-cancelled`; the gateway fires it from a native
-    /// Stop. Without it a run is cancellable in contract only, as in an embedder that supplies no signal.
+    /// Stop. A capability call the script starts *after* that is refused with the same reason
+    /// before any proposal is built, so a stopped session cannot keep spending its budget on the
+    /// broker. Without it a run is cancellable in contract only, as in an embedder that supplies
+    /// no signal.
     #[must_use]
     pub fn with_cancel_signal(mut self, signal: CancelSignal) -> Self {
         self.cancel = signal;
@@ -778,6 +782,16 @@ impl CapabilityInvoker for BrokerLeg {
         input: Value,
         secret_use: Option<dekopon_core::SecretUseProposal>,
     ) -> CapabilityCallResult {
+        // Prevents a script from starting another capability call after the embedder's Stop was
+        // observed. A call already inside the client is not rollbackable; this check is the
+        // cooperative boundary immediately before the broker proposal. It is not a refusal
+        // decision either: no proposal was built, so there is nothing for the broker to have
+        // decided about, and a leg with no signal (`CancelSignal::never`) never takes it.
+        if self.cancel.is_cancelled() {
+            return CapabilityCallResult::Denied {
+                reason: "session-cancelled".to_owned(),
+            };
+        }
         let Ok(parsed) = capability.parse::<CapabilityId>() else {
             return CapabilityCallResult::NotFound;
         };
@@ -1238,7 +1252,7 @@ mod tests {
             write_frame,
         };
         use dekopon_capability::DecisionReference;
-        use dekopon_core::{AgentId, ExternalSubject};
+        use dekopon_core::{AgentId, ExternalSubject, SecretDrn, SecretUseProposal};
         use dekopon_process::CancelSignal;
         use dekopon_shell::{
             CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun,
@@ -1925,6 +1939,67 @@ mod tests {
                 invoke(leg, "totally.unknown").await,
                 CapabilityCallResult::NotFound
             );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_cancelled_session_is_refused_before_a_proposal_is_built() {
+            // No stub server at all, and a socket that was never bound: a call that dispatched
+            // would report the missing broker as a `Failed`, so the refusal proves nothing left
+            // this process. The check answers exactly what an in-flight run's abort answers.
+            let directory = private_broker_directory();
+            let leg = leg_for(&directory.path().join("absent.sock"));
+            let (handle, signal) = CancelSignal::pair();
+            let leg = leg.with_cancel_signal(signal);
+            handle.cancel();
+
+            assert_eq!(
+                invoke(leg, CAPABILITY).await,
+                CapabilityCallResult::Denied {
+                    reason: "session-cancelled".to_owned(),
+                }
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_cancellation_check_never_narrows_what_a_proposal_may_carry() {
+            // A refusal decided before the proposal is one method away from a refusal decided
+            // *about* the proposal. A wrapper in `dekopond` once sat here, forwarded the
+            // two-argument call and inherited a deny-by-default for the third, so a
+            // `curl --user USER:${drn:...}` in a gateway session was refused inside the process
+            // that made it — the broker, the only thing that can decide `secret.use` at all,
+            // never saw it. The check moved in here; the proposal still travels untouched.
+            let directory = private_broker_directory();
+            let (leg, mut observed) = stub_leg_observing(
+                directory.path(),
+                vec![ResponseEnvelope::invocation(result(
+                    InvocationOutcome::Succeeded,
+                    None,
+                ))],
+                None,
+            )
+            .await;
+            let leg = leg.with_cancel_signal(CancelSignal::pair().1);
+            let proposal = SecretUseProposal::HttpBearer {
+                secret: "drn:com.xrl:secret:prod:api/token"
+                    .parse::<SecretDrn>()
+                    .expect("canonical DRN fixture"),
+            };
+            let submitted = proposal.clone();
+
+            assert_eq!(
+                tokio::task::spawn_blocking(move || {
+                    leg.invoke(CAPABILITY, json!({"uri": "http://x/"}), Some(submitted))
+                })
+                .await
+                .expect("blocking dispatch completes"),
+                CapabilityCallResult::Succeeded(json!({"status": 200}))
+            );
+
+            let request = observed.recv().await.expect("stub broker saw one request");
+            let BrokerRequest::Invoke { invocation, .. } = request.request else {
+                panic!("a capability call sends an invoke frame: {request:?}");
+            };
+            assert_eq!(invocation.secret_use, Some(proposal));
         }
 
         #[tokio::test(flavor = "multi_thread")]
