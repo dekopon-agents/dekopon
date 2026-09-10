@@ -727,11 +727,10 @@ impl BufferedHttpClient {
 
     /// Executes one request beneath both the broker grant and native ceilings.
     pub async fn send(&mut self, request: Request) -> Result<Response, HttpError> {
-        // Fields mirror `HttpCallEvidence` exactly, and that is the point rather than a
-        // coincidence: this span is a second egress path for the same call the audit log
-        // records, so it carries the same sanitized set and no more. URL paths and queries,
-        // request and response headers, and both bodies are absent here for the same reason they
-        // are absent from evidence — a trace backend is not an audit boundary.
+        // Evidence's sanitized set, plus the full URL. Request and response headers and both
+        // bodies stay out: an injected credential rides a header, so a header field would hand the
+        // trace the one thing goal 1 keeps out of it. That exclusion is redaction and holds
+        // unconditionally; it is not a verbosity setting.
         // The byte fields are deliberately not the OTel `http.*.body.size` names: what this host
         // accounts is a conservative envelope estimate — encoding overhead, method, URL, headers,
         // and body — not a payload length, and publishing it under the semconv name would make
@@ -748,11 +747,10 @@ impl BufferedHttpClient {
             "url.full" = tracing::field::Empty,
             outcome = tracing::field::Empty,
         );
-        // Opt-in only. `url.full` is the field that carries a path and query, which is exactly
-        // what the metadata-only default withholds.
-        if dekopon_core::telemetry_payloads() {
-            span.record("url.full", request.uri.as_str());
-        }
+        // `url.full` carries the path and query. It is recorded unconditionally: an egress a trace
+        // cannot name is not a reconstructible run. Headers and bodies stay out — that is redaction,
+        // and it is independent of how much of the URL a span carries.
+        span.record("url.full", request.uri.as_str());
 
         let evidence_index = self.evidence.len();
         self.attempted = true;

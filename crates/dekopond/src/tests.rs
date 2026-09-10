@@ -7687,7 +7687,9 @@ async fn a_slack_429_delays_the_identical_answer_once_without_reply_failure() {
     assert!(!recorded.contains("reply-failed"), "{recorded}");
     assert_eq!(recorded.matches("gateway_reply_rate_limited").count(), 1);
     assert!(recorded.contains("retry_after_seconds=1"), "{recorded}");
-    assert!(!recorded.contains("payload-sentinel"), "{recorded}");
+    // The inbound text is on the trace, the way every message is. The bot token is not, and never
+    // was: a credential is goal 1's exclusion and is independent of how much a span carries.
+    assert!(recorded.contains("question-payload-sentinel"), "{recorded}");
     assert!(!recorded.contains("bot-token"), "{recorded}");
 }
 

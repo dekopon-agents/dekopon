@@ -13,9 +13,10 @@
 //! refused here. A canonical subject can be a phone number (`tel.16035550100`), and a channel or
 //! thread identifier can identify a small group, so sending either as a cache key would hand a model
 //! provider extra identity for no benefit — the request routes the same either way. Hashing does
-//! not fix it: a hash of a stable identifier is a stable pseudonym, which is exactly the linkability
-//! this project declines to put in its own telemetry when `telemetryPayloads` is off, and it would
-//! be worse to hand one to a third party. A configured salt is worse still, because it is a new
+//! not fix it: a hash of a stable identifier is a stable pseudonym, and this key is one of the few
+//! things the daemon hands to a party *outside* the operator's trust boundary — where the operator's
+//! own telemetry may hold a canonical subject, a model provider has no claim to one, pseudonymized
+//! or not. A configured salt is worse still, because it is a new
 //! secret to manage whose only purchase is a pseudonym that survives restarts.
 //!
 //! So the identifier is minted from entropy and carries nothing at all. It rotates whenever the
