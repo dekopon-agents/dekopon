@@ -490,6 +490,17 @@ All notable changes to Dekopon are documented here. The format is based on
   still reaches the caller as a `ScriptOutcome`; a syntax error is still the rendered
   `dekopon-shell: syntax error: ...` line on its output, which is the shape every consumer
   actually reads. The grammar is now free to change without a major version.
+- Removed the `schemars` feature from `dekopon-core`, `dekopon-capability`, and `dekopon-protocol`,
+  along with its 41 `#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]` derives, the
+  `schemars` workspace dependency, the one test that called `schemars::schema_for!`, and the lint
+  job's `cargo check -p dekopon-core -p dekopon-capability -p dekopon-protocol --locked` step, which
+  existed only to keep the feature-off state compilable. This reverses `891b4a1`, which flipped the
+  three crates to `default = []`, added `default-features = false` to the `dekopon-protocol`
+  workspace entry, and added that CI step; the feature it made opt-in is now gone rather than
+  merely off. Removing a feature from three published crates is a breaking change: a dependent that
+  writes `features = ["schemars"]` against any of them no longer resolves, and the resource types no
+  longer derive `JsonSchema` for out-of-tree JSON Schema generation. Nothing in the workspace,
+  `dekopon-console`, or any provider repository enabled it.
 
 ### Fixed
 

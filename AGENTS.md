@@ -75,7 +75,7 @@ These are the classes a deep review actually found, repeatedly. Each is checkabl
 
 Branch protection runs [`.github/workflows/ci.yml`](.github/workflows/ci.yml) on pull requests only; a path classifier selects lanes, and any Rust change also selects the documentation lane. The complete, ordered command list behind the required `quality (stable)` context is [Root workspace](docs/development.md#root-workspace); this section only names what the PR template's three lines (fmt, clippy `-D warnings`, test) leave out:
 
-- The release-profile `cargo check` of both daemon binaries, and the feature-off check `cargo check -p dekopon-core -p dekopon-capability -p dekopon-protocol --locked`, which is the only gate that compiles those crates without their opt-in `schemars` feature.
+- The release-profile `cargo check` of both daemon binaries.
 - `cargo machete` (CI pins 0.9.2): any unused dependency fails.
 - Opposite-direction `cargo tree` privilege greps over the normal dependency trees of `dekopond` and `dekopon-brokerd`; any forbidden exact package name fails, while `dekopon-broker-protocol` is allowed.
 - Format, lint, test, and `wasm32-unknown-unknown` check of every `examples/providers/*/Cargo.toml` ([Provider example workspaces](docs/development.md#provider-example-workspaces)), plus wasm32 checks of `dekopon-provider-sdk`, `dekopon-provider-http`, and `dekopon-provider-storage` with each storage feature on its own.

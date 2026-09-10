@@ -17,7 +17,6 @@ use dekopon_core::{CapabilityId, ProviderId};
 use serde::{Deserialize, Serialize};
 
 /// API version supported by this crate.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum ApiVersion {
     /// Initial alpha resource format.
@@ -38,7 +37,6 @@ impl fmt::Display for ApiVersion {
 /// Single-variant: any other `kind` fails to decode. Carrying the discriminator in the type
 /// rather than in a shared enum is what makes `serde` refuse a document naming another resource
 /// while decoding it here, without a caller passing through the configuration loader first.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum AgentKind {
@@ -53,7 +51,6 @@ impl fmt::Display for AgentKind {
 }
 
 /// Common authored metadata.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ObjectMeta {
@@ -76,7 +73,6 @@ impl ObjectMeta {
 }
 
 /// Desired state of an agent.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AgentSpec {
@@ -135,7 +131,6 @@ const fn default_enabled() -> bool {
 }
 
 /// A declarative agent resource.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Agent {
@@ -269,13 +264,5 @@ spec:
         let error = serde_yaml::from_str::<Agent>(input)
             .expect_err("misspelled capabilities must not be ignored");
         assert!(error.to_string().contains("unknown field `capabilties`"));
-    }
-
-    #[cfg(feature = "schemars")]
-    #[test]
-    fn generates_json_schema() {
-        let schema = schemars::schema_for!(Agent);
-        let encoded = serde_json::to_value(schema).expect("schema serializes");
-        assert_eq!(encoded["title"], "Agent");
     }
 }
