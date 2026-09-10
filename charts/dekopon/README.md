@@ -127,11 +127,14 @@ failure naming that file rather than a broker that starts and then refuses to se
   directories and files, not symlinks) and name that path as `catalogPath` in `dekopond.yaml`.
 - **Provider components.** The image already bakes `/opt/dekopon/providers/*.wasm` owned by
   `65532:65532` under a `65532`-owned `0755` directory, which is what Tier B wants.
-- **The ChatGPT credential**, for the opposite reason from all of these. `load_credentials` is a
+- **The ChatGPT credentials**, for the opposite reason from all of these. `load_credentials` is a
   plain `File::open` — no `O_NOFOLLOW`, no owner comparison, no mode check — so a symlink farm
   would read perfectly well. Reading was never the problem there; *writing* is, and that is a
   different problem with a different answer:
-  [The ChatGPT credential is seeded once](#the-chatgpt-credential-is-seeded-once).
+  [The ChatGPT credential is seeded once](#the-chatgpt-credential-is-seeded-once). The broker's own
+  family is the exception to the exception: `dekopon-brokerd` puts every `authFile` through the
+  Tier A check *and* requires its parent directory to be owner-only and writable, so a symlinked or
+  group-readable seed is a startup refusal there.
 
 ## The UID is not a preference
 
@@ -149,8 +152,9 @@ Both containers use `paths.configDir` at runtime, but these are **different tmpf
 Init mounts the gateway volume at `paths.gatewayConfigDir` (default `/etc/dekopon-gateway`)
 only to copy its `dekopond.yaml` as UID 65533. Broker copies remain UID 65532.
 The state claim root stays root-owned `0700`; the broker mounts only its `broker/`
-subdirectory at `paths.stateDir`, and the gateway mounts only the configured ChatGPT
-subdirectory (which must not be `broker`). Neither daemon can rename the other's directory.
+subdirectory at `paths.stateDir` plus, with `broker.chatgpt` enabled, its own credential
+subdirectory beside it, and the gateway mounts only the configured ChatGPT subdirectory.
+Neither ChatGPT subdirectory may be `broker`. Neither daemon can rename the other's directory.
 Private subdirectories are `0700`; files are `0600` with one link. Each daemon gets a separate
 `/tmp` volume. The broker alone mounts provider storage and its namespace key.
 
@@ -173,7 +177,8 @@ configuration. These are offline operator steps, not a live-cluster action perfo
 | broker socket | `/run/dekopon/broker.sock` | protected IPC | the broker, at bind |
 | audit log | `/var/lib/dekopon/audit.jsonl` | A + C | the broker |
 | agent catalog | `/etc/dekopon-catalog/dekopon.yaml` | E | ConfigMap mount |
-| ChatGPT credential | `/var/lib/dekopon/chatgpt/chatgpt-auth.json` | none | init container, **once**; then `dekopond` owns it |
+| gateway ChatGPT credential | `/var/lib/dekopon/chatgpt/chatgpt-auth.json` | none | init container, **once**; then `dekopond` owns it |
+| broker ChatGPT credential | `/var/lib/dekopon/broker-chatgpt/chatgpt-auth.json` | A + writable parent | init container, **once**; then `dekopon-brokerd` owns it |
 | providers | `/opt/dekopon/providers/*.wasm` | B | baked into the image |
 
 `/etc/dekopon` and `/run/dekopon` are memory-backed `emptyDir`s, so the credentials file and the
@@ -272,8 +277,12 @@ The chart then places `/var/lib/dekopon/chatgpt/chatgpt-auth.json`, `0600`, owne
 Every other file the init container writes is overwritten on every start, because the daemons only
 read them. This one the daemon *writes*. The refresh token rotates on every refresh —
 `refresh_credentials` builds a complete replacement record and there is no path that keeps the old
-token — and `refresh_if_needed` **returns** the result of writing it back, so a failed write does not
-degrade into a retry, it fails the model turn.
+token — and the rotated record is written back atomically: same-directory temporary file, `fsync`,
+rename, directory `fsync`. A write that fails does not fail the turn, because by then the
+authorization server has already retired the predecessor and the in-memory token is the only one
+that works; it logs `chatgpt_credential_save_failed` and continues, which leaves the retired token
+on disk for the next process to spend. That is the failure mode the writable `0700` directory
+exists to prevent.
 
 Two consequences the chart is built around:
 
@@ -321,9 +330,56 @@ no explicit `authFile` falls back to `$XDG_CONFIG_HOME` and then `$HOME`, which 
 root filesystem, where `save_credentials` cannot create its temporary sibling. Naming `authFile` in
 `dekopond.yaml` is clearer still, and then neither the environment nor the fallback matters.
 
+### The broker has a second, independent family
+
+`broker.chatgpt.*` seeds the same kind of file for `dekopon-brokerd`, which is what a
+`kind: chatgptSubscription` entry in `broker-credentials.yaml` points its `authFile` at:
+
+```yaml
+broker:
+  chatgpt:
+    enabled: true
+    existingSecret: dekopon-chatgpt-auth-broker
+```
+
+```yaml
+# broker-credentials.yaml
+- name: chatgpt-gpt-image
+  kind: chatgptSubscription
+  authFile: /var/lib/dekopon/broker-chatgpt/chatgpt-auth.json
+  destinations: [chatgpt.com]
+```
+
+Everything above applies to it unchanged: seeded once into the claim, `0600` owned by `65532`, in a
+`0700` directory owned by `65532`, and never overwritten again. Three things differ.
+
+**It is a separate token family, and must be.** Produce it with a second
+`dekopond auth chatgpt login --auth-file <path>` against the same ChatGPT account, then
+`dekopond auth chatgpt export --expose-credential --auth-file <path>`. Never point the broker and the
+gateway at one file: the refresh token rotates and the authorization server retires its predecessor,
+so two independent holders of one file eventually present a retired token and revoke the family for
+both. The chart refuses to render when `broker.chatgpt.subdir` equals `gateway.chatgpt.subdir`, and
+refuses when the two file names would collide on one projected path. Neither subdir may be `broker`:
+that segment is the broker's own state subPath, and a credential directory named for it would mount
+one claim subPath twice on one container.
+
+**The broker mounts it as a sibling.** The broker's state mount is the `broker` subPath of the
+claim, not the claim root, so `<paths.stateDir>/<broker.chatgpt.subdir>` is not reachable through it
+and gets a second `subPath` mount of its own — the same shape the gateway has for its family. The
+gateway mounts only its *own* credential subdirectory, so it never receives a path to the broker's
+family — `ci/verify-init-permissions.sh` asserts exactly that against the rendered manifest.
+
+**`dekopon-brokerd` checks the file itself at startup.** It reads the `authFile` through
+`read_trusted_file(.., FileTier::Private, ..)` — regular, owner-owned, `mode & 0o077 == 0`, one hard
+link, `O_NOFOLLOW` — requires the parent directory to be owner-only *and writable*, parses the
+document, logs how long the access token has left, and refuses to start naming the cause when any of
+that fails. A misconfigured credential is a broker that does not come up, not a capability that is in
+service and denies every invocation.
+
 ### Re-seeding is deliberate
 
-`gateway.chatgpt.reseed: true` discards whatever is in the volume and copies the Secret in again.
+`gateway.chatgpt.reseed: true` (and `broker.chatgpt.reseed: true` for the broker's family)
+discards whatever is in the volume and copies the Secret in again.
 It is separate because it is destructive: the credential in the volume is the live one, and the
 exported copy is almost certainly older. Use it after a deliberate local re-login and re-export.
 
@@ -331,7 +387,7 @@ It is not self-clearing — while it is `true`, every restart re-seeds — so se
 once the pod has rolled. It rolls the pod on its own, because it changes the init container's
 arguments, which are part of the pod template.
 
-There is deliberately **no `checksum/` annotation for the credential Secret**, unlike every other
+There is deliberately **no `checksum/` annotation for either credential Secret**, unlike every other
 file the chart writes. Those annotations exist to push a changed file into a pod that only reads at
 startup. This is the one file whose entire purpose is *not* to be pushed in: the copy in the volume
 is authoritative, so an annotation would restart a working gateway to achieve nothing at all.
@@ -340,9 +396,10 @@ is authoritative, so an annotation would restart a working gateway to achieve no
 
 `replicas: 1` and `strategy: Recreate` were already forced by the broker's exclusive `flock` on the
 audit log. With this model kind they are load-bearing a second time:
-`ChatGptCodexModel` serializes refreshes behind a per-process mutex and cannot coordinate across
-processes, so two pods sharing one credential file would race the rotation and the loser would be
-left holding an invalidated refresh token. Neither value is exposed.
+`CredentialFile` serializes refreshes behind a per-process snapshot and an advisory lock on a sibling
+`.lock` file, so two holders in one pod coordinate — the gateway's model client and the broker's
+credential kind both go through it — but two *pods* sharing one claim would race the rotation and the
+loser would be left holding an invalidated refresh token. Neither value is exposed.
 
 ### The exported copy goes stale, and that is correct
 
@@ -556,7 +613,8 @@ to an object that already exists. Setting both is an error.
 | private secret map | `broker.secretMap.inline` | `broker.secretMap.existingSecret` / `.existingSecretKey` |
 | `dekopond.yaml` | `gateway.config.inline` | `gateway.config.existingSecret` / `.existingSecretKey` |
 | agent catalog | `gateway.catalog.inline` | `gateway.catalog.existingConfigMap` / `.existingConfigMapKey` |
-| ChatGPT credential | `gateway.chatgpt.inline` | `gateway.chatgpt.existingSecret` / `.existingSecretKey` |
+| gateway ChatGPT credential | `gateway.chatgpt.inline` | `gateway.chatgpt.existingSecret` / `.existingSecretKey` |
+| broker ChatGPT credential | `broker.chatgpt.inline` | `broker.chatgpt.existingSecret` / `.existingSecretKey` |
 
 Use `existingSecret` for credentials and the private map. An inline value is stored in the release,
 returned by `helm get values`, and usually committed.
@@ -649,10 +707,13 @@ own volume. It may post one review comment and has no approval, request-changes,
   separate rpi-homelab change.
 - The ChatGPT seed-once behaviour is proven against the rendered init container across a cold
   start, a simulated rotation, two restart shapes, and the gated re-seed — including a negative
-  control confirming that removing the `[ -e ]` test does revert the credential. But no real
-  `dekopond` has refreshed a real token through it. What was exercised is the file-level contract
-  (`0600`, owner `65533`, one link, a `0700` directory, temp sibling plus rename by UID 65533), not
-  a live refresh against OpenAI.
+  control confirming that removing the `[ -e ]` test does revert the credential — for both the
+  gateway's family and the broker's, plus the assertions that the two are separate documents, that
+  re-seeding one leaves the other alone, and that the gateway's rendered mounts reach neither the
+  broker's credential directory nor the claim as a whole. But no real daemon has refreshed a real
+  token through it. What was exercised is the file-level contract (`0600`, one link, a `0700`
+  writable directory, temp sibling plus rename) as each family's own daemon UID — `65533` for the
+  gateway's, `65532` for the broker's — not a live refresh against OpenAI.
 - The `PodSecurity` `restricted` profile would reject this pod: the init container runs as root.
   `baseline` is fine.
 

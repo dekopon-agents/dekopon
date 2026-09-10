@@ -293,7 +293,57 @@ credentials:
     scheme: Bearer
     destinations: [api.github.com]
     secret: github_pat_...
+  - name: chatgpt-gpt-image
+    kind: chatgptSubscription
+    authFile: /var/lib/dekopon/broker-chatgpt/chatgpt-auth.json
+    destinations: [chatgpt.com]
 ```
+
+Every entry takes `name`, `kind` and `destinations`. The rest is per kind, and the file is validated
+as a whole: every missing field, every field that belongs to the other kind, every malformed name, and
+every duplicate name is reported in one refusal, so fixing one does not reveal the next on the
+following start.
+
+| `kind` | Required | Prohibited | Presented as |
+|---|---|---|---|
+| `bearerToken` | `scheme`, `secret` | `authFile` | `authorization: <scheme> <secret>` |
+| `chatgptSubscription` | `authFile` (absolute) | `scheme`, `secret` | `authorization: Bearer <access>` plus `chatgpt-account-id: <accountId>` |
+
+### `chatgptSubscription`: a credential the broker renews itself
+
+A `bearerToken` is a value an operator rotates by hand. A ChatGPT subscription token is not: the
+access token expires hourly and the refresh token rotates on every renewal, so the value to present
+exists only at the moment of use. `authFile` names the credential document
+[`dekopond auth chatgpt login --auth-file <path>`](../../docs/chatgpt-credential.md) writes, and the
+broker runs exactly the same refresh protocol the gateway's model client runs — one definition,
+`dekopon_model::chatgpt::CredentialFile` — 60 s before expiry, serialized across processes on an
+advisory lock on a sibling `.lock` file, with the rotated record written back atomically.
+
+Give the broker its own login. Never point it at the file a `chatgptSubscription` *model* uses: the
+authorization server retires a refresh token's predecessor, so two independent holders of one file
+eventually present a retired token and revoke the family for both. A second device login against the
+same ChatGPT account is the supported shape.
+
+Startup proves the file rather than trusting it. The `authFile` must be absolute and must pass the
+same Tier A check as this credentials file — regular, owned by the broker's UID, `mode & 0o077 == 0`,
+one hard link, opened `O_NOFOLLOW`, under a 64 KiB ceiling — its parent directory must be owner-only
+**and writable**, because a rotated record is persisted by renaming a sibling temporary file over the
+target, and the document must parse as a supported Dekopon credential. Any failure refuses startup
+naming the cause, and a successful load logs `broker_chatgpt_credential_loaded` with how long the
+access token has left. The refresh itself is the broker's own HTTPS call: it is not charged to the
+invocation's `maxRequests`, does not appear in HTTP evidence, and leaves `credentialInjected: true`
+and the symbolic name in audit exactly as a `bearerToken` would.
+
+A renewal that cannot complete fails that invocation and nothing else; the broker keeps serving every
+other capability. The two classes are separate reasons because an operator acts on only one of them:
+a refresh-token family the authorization server has retired (`invalid_grant`,
+`refresh_token_reused`, `refresh_token_invalidated`, `refresh_token_expired`) fails the invocation as
+`credential-unavailable` and logs `broker_chatgpt_credential_reauth_required`, which means someone
+has to run `dekopond auth chatgpt login --auth-file <path>` again; anything else — transport, a 5xx, a
+malformed token response — fails as `credential-refresh-failed` and needs nobody. A renewal that
+reached the authorization server but could not be written back logs
+`chatgpt_credential_save_failed` and continues on the in-memory token, because by then the record on
+disk is the retired one.
 
 ### Public DRNs and private sources
 

@@ -876,14 +876,126 @@ impl ConstraintCatalog {
     }
 }
 
+/// An owner-configured credential whose presentable value is produced once per invocation.
+///
+/// Every other credential in the store is fixed at startup, which is the right shape for a personal
+/// access token an operator rotates by hand. A subscription credential is not: its access token
+/// expires on the hour and its refresh token rotates on every renewal, so the value to present is
+/// only knowable at the moment of use.
+///
+/// Resolution is the deploying process's job, not the broker's. `dekopon-brokerd` implements this
+/// over the credential file format and OAuth refresh grant `dekopon-model` already owns; the broker
+/// calls it after authorization and before constructing the execution context, so a refresh is
+/// never an HTTP call the guest's request grant pays for and never appears in evidence.
+///
+/// The implementation is responsible for serializing concurrent resolutions of the same credential:
+/// a refresh token that two callers spend at once is a revoked token family.
+#[async_trait]
+pub trait RefreshingCredential: Send + Sync + fmt::Debug {
+    /// Authorities this credential may be presented to, in `allowedHosts` grammar.
+    ///
+    /// Answered without resolving, because constraint-set coverage is proven at startup: every
+    /// allowed host of a set that names this credential must appear here verbatim.
+    fn destinations(&self) -> &[String];
+
+    /// Produces the value to present for one invocation.
+    async fn resolve(&self) -> Result<BoundCredential, CredentialRefreshError>;
+}
+
+/// Why a per-invocation credential could not be produced.
+///
+/// The split is the axis a caller acts on. A revoked or reused refresh token cannot be retried into
+/// working — a human has to authorize again — while a transport failure or a 5xx from the token
+/// endpoint is the next invocation's problem and no operator action.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
+pub enum CredentialRefreshError {
+    /// The stored authorization is gone; only an operator re-login restores it.
+    #[error("the credential's authorization is gone and must be renewed by an operator")]
+    ReauthorizationRequired,
+    /// The refresh did not complete; a later invocation may succeed unchanged.
+    #[error("the credential could not be refreshed ({category})")]
+    Unavailable {
+        /// Low-cardinality failure class, never a message derived from credential material.
+        category: &'static str,
+    },
+}
+
+impl CredentialRefreshError {
+    /// Stable, low-cardinality name for telemetry and the invocation's classified reason.
+    #[must_use]
+    pub const fn category(self) -> &'static str {
+        match self {
+            Self::ReauthorizationRequired => "reauthorization-required",
+            Self::Unavailable { category } => category,
+        }
+    }
+
+    /// Whether retrying this invocation unchanged could ever succeed.
+    const fn permanent(self) -> bool {
+        matches!(self, Self::ReauthorizationRequired)
+    }
+
+    /// The classified reason the invocation result and the audit record carry.
+    const fn reason(self) -> &'static str {
+        if self.permanent() {
+            "credential-unavailable"
+        } else {
+            "credential-refresh-failed"
+        }
+    }
+}
+
+/// One entry of the broker's credential store.
+///
+/// Both shapes are owner-authored and destination-bound; they differ only in when the value exists.
+#[derive(Clone, Debug)]
+pub enum StoredCredential {
+    /// Resolved once from owner-only storage at startup.
+    ///
+    /// Boxed because a rendered credential is an order of magnitude larger than a resolver handle,
+    /// and this enum is stored by value for every entry in the store.
+    Fixed(Box<BoundCredential>),
+    /// Re-derived per invocation by the deploying process.
+    Refreshing(Arc<dyn RefreshingCredential>),
+}
+
+impl From<BoundCredential> for StoredCredential {
+    fn from(credential: BoundCredential) -> Self {
+        Self::Fixed(Box::new(credential))
+    }
+}
+
+impl From<Arc<dyn RefreshingCredential>> for StoredCredential {
+    fn from(source: Arc<dyn RefreshingCredential>) -> Self {
+        Self::Refreshing(source)
+    }
+}
+
+impl StoredCredential {
+    /// Whether one allowed-host scope is covered verbatim by this entry's destinations.
+    fn covers(&self, allowed_host: &str) -> bool {
+        match self {
+            Self::Fixed(credential) => credential.covers(allowed_host),
+            Self::Refreshing(source) => {
+                let allowed = allowed_host.trim().to_ascii_lowercase();
+                source
+                    .destinations()
+                    .iter()
+                    .any(|destination| destination.trim().to_ascii_lowercase() == allowed)
+            }
+        }
+    }
+}
+
 /// Broker-held credentials resolvable from constraint sets by symbolic name.
 ///
 /// The store is constructed by the deploying process from owner-only storage and handed to the
 /// broker whole; constraint sets refer to entries by name only, so serialized configuration never
-/// contains secret material. Values inside are [`BoundCredential`]s, whose secrets are `Redacted` end to end.
+/// contains secret material. Values inside are [`BoundCredential`]s, whose secrets are `Redacted`
+/// end to end, or [`RefreshingCredential`] resolvers that produce one per invocation.
 #[derive(Debug, Default)]
 pub struct CredentialStore {
-    entries: BTreeMap<String, BoundCredential>,
+    entries: BTreeMap<String, StoredCredential>,
 }
 
 impl CredentialStore {
@@ -894,19 +1006,22 @@ impl CredentialStore {
     }
 
     /// Builds a store, rejecting duplicate symbolic names.
-    pub fn new(
-        entries: impl IntoIterator<Item = (String, BoundCredential)>,
+    ///
+    /// Entries are `BoundCredential`s, `Arc<dyn RefreshingCredential>`s, or `StoredCredential`s
+    /// directly, so one deploying process can mix the kinds in one pass over its configuration.
+    pub fn new<C: Into<StoredCredential>>(
+        entries: impl IntoIterator<Item = (String, C)>,
     ) -> Result<Self, BrokerBuildError> {
         let mut store = BTreeMap::new();
         for (name, credential) in entries {
-            if store.insert(name.clone(), credential).is_some() {
+            if store.insert(name.clone(), credential.into()).is_some() {
                 return Err(BrokerBuildError::DuplicateCredential { name });
             }
         }
         Ok(Self { entries: store })
     }
 
-    fn get(&self, name: &str) -> Option<&BoundCredential> {
+    fn get(&self, name: &str) -> Option<&StoredCredential> {
         self.entries.get(name)
     }
 }
@@ -1533,6 +1648,8 @@ fn validate_set_credential(
                     capability: capability_id.clone(),
                     name: name.clone(),
                 })?;
+        // Coverage is proven from the entry's declared destinations, which a refreshing entry
+        // answers without resolving: startup must not depend on a reachable token endpoint.
         for host in &http.allowed_hosts {
             if !credential.covers(host) {
                 return Err(BrokerBuildError::CredentialDestinationMismatch {
@@ -4262,10 +4379,61 @@ where
                 }
             }
         } else {
-            legacy_credential_name
+            // The refreshing kind resolves here rather than at startup, and here rather than inside
+            // the execution context: the renewal is the broker's own HTTPS call, so it must not
+            // consume the guest's `maxRequests`, must not reach `HttpCallEvidence`, and must not be
+            // visible to the component at all. What the audit record carries is unchanged either
+            // way — the symbolic name, and `credentialInjected` on the calls that presented it.
+            match legacy_credential_name
                 .as_deref()
                 .and_then(|name| self.credentials.get(name))
-                .cloned()
+            {
+                None => None,
+                Some(StoredCredential::Fixed(credential)) => Some((**credential).clone()),
+                Some(StoredCredential::Refreshing(source)) => match source.resolve().await {
+                    Ok(credential) => Some(credential),
+                    Err(failure) => {
+                        // A credential an operator must re-authorize is the one failure here that
+                        // no retry fixes, so it is reported at `error` and classified permanent.
+                        // Either way the broker keeps serving every other capability: one unusable
+                        // credential is not an outage.
+                        if failure.permanent() {
+                            tracing::error!(
+                                event = "broker_credential_refresh_failed",
+                                invocation = %invocation_id,
+                                credential = legacy_credential_name.as_deref(),
+                                category = failure.category(),
+                                retryable = false,
+                                "a refreshing credential needs operator re-authorization"
+                            );
+                        } else {
+                            tracing::warn!(
+                                event = "broker_credential_refresh_failed",
+                                invocation = %invocation_id,
+                                credential = legacy_credential_name.as_deref(),
+                                category = failure.category(),
+                                retryable = true,
+                                "a refreshing credential could not be renewed"
+                            );
+                        }
+                        return self
+                            .fail_authorized_before_provider(
+                                context,
+                                &invocation_id,
+                                &trace,
+                                &capability,
+                                &decision_id,
+                                decision,
+                                &set,
+                                audit_credential,
+                                &policy_ids,
+                                policy_evidence,
+                                failure.reason(),
+                            )
+                            .await;
+                    }
+                },
+            }
         };
         let started = Instant::now();
         let execution = self

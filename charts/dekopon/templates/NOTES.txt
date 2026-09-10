@@ -57,3 +57,24 @@ says whether this start seeded anything or left the live credential alone.
      to false once this pod has rolled.
 {{- end }}
 {{- end }}
+{{- if include "dekopon.brokerChatgptEnabled" . }}
+
+The BROKER's ChatGPT credential is seeded ONCE into {{ include "dekopon.brokerChatgptDir" . }}/{{ .Values.broker.chatgpt.fileName }}
+on the persistent claim, and the init container never overwrites it again. Point the
+`kind: chatgptSubscription` entry in broker-credentials.yaml at exactly that path; dekopon-brokerd
+refuses to start if it is not an owner-only file in an owner-only writable directory.
+
+This is a SEPARATE refresh-token family from the gateway's. Never point both at one file: the
+refresh token rotates and the authorization server retires its predecessor, so two holders of one
+file eventually revoke the family for both.
+
+  kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "dekopon.fullname" . }} -c prepare-files | grep broker-chatgpt
+
+says whether this start seeded anything or left the live credential alone.
+{{- if .Values.broker.chatgpt.reseed }}
+
+  !! broker.chatgpt.reseed is TRUE. Every start discards the broker's credential in the volume —
+     which is almost certainly fresher than the exported one — and copies the Secret in again. Set
+     it back to false once this pod has rolled.
+{{- end }}
+{{- end }}

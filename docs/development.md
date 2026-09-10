@@ -213,8 +213,10 @@ cargo machete
     printf '%s\n' "$tree" >&2
     exit 1
   fi
+  # dekopon-model is deliberately absent: the broker's `kind: chatgptSubscription` credential
+  # resolves through `dekopon_model::chatgpt::CredentialFile`, the one implementation of it.
   tree=$(cargo tree --locked -p dekopon-brokerd --edges normal --prefix none)
-  if grep -Eq '^dekopon-(agent|shell|model|process|config) v' <<<"$tree"; then
+  if grep -Eq '^dekopon-(agent|shell|process|config) v' <<<"$tree"; then
     printf '%s\n' "$tree" >&2
     exit 1
   fi

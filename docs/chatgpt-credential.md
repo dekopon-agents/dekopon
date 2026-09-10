@@ -3,17 +3,20 @@
 `dekopond auth chatgpt login` runs OpenAI's device authorization flow: it prints a URL and a short
 code and waits for a human to approve the login in a browser. Nothing in a pod can do that. A
 containerized `dekopond` configured with `kind: chatgptSubscription` therefore cannot obtain a
-credential on its own, and it never will — the flow is interactive by design.
+credential on its own, and it never will — the flow is interactive by design. The same is true of
+`dekopon-brokerd`'s `kind: chatgptSubscription` *credential*, which is the second consumer of
+everything below.
 
 This document is the whole lifecycle for getting a credential from a local login into a cluster and
-keeping it correct afterwards. Read [`cli.md`](cli.md) for the command's contract, [`inference.md`](inference.md)
-for the inference boundary, and [`dekopond.md`](dekopond.md) for the `models[].authFile` setting that
-names the file in a pod.
+keeping it correct afterwards. Read [`cli.md`](cli.md) for the command's contract,
+[`inference.md`](inference.md) for the inference boundary, [`dekopond.md`](dekopond.md) for the
+`models[].authFile` setting that names the file in a pod, and
+[`secrets.md`](secrets.md#legacy-credentials-the-broker-renews) for the broker credential kind.
 
 **Status: Current.** `dekopond auth chatgpt export` and the chart-side seed-once copy are both
 implemented: [`charts/dekopon`](../charts/dekopon/README.md#the-chatgpt-credential-is-seeded-once)
-places the credential once under `gateway.chatgpt.*` and re-seeds only on an explicit
-`gateway.chatgpt.reseed: true`.
+places the credential once under `gateway.chatgpt.*`, the broker's own family once under
+`broker.chatgpt.*`, and re-seeds only on an explicit `reseed: true`.
 
 ## What the credential actually is
 
@@ -25,7 +28,7 @@ expiry, and the ChatGPT account ID. Five properties of it decide the whole deplo
 record. There is no path that keeps the old refresh token. Each refresh therefore invalidates its
 predecessor, and any copy of the file taken before that refresh is dead.
 
-**A refresh is serialized across processes.** `refresh_if_needed` takes an exclusive advisory lock
+**A refresh is serialized across processes.** `CredentialFile::refresh_if_needed` takes an exclusive advisory lock
 on a sibling `chatgpt-auth.json.lock` before refreshing, then re-reads the credential file and
 adopts the stored record when its `expiresAt` is later than the one in memory. That is the whole
 defence against the rotation trap: `dekopond` shares one client per configured model, but each
@@ -54,10 +57,13 @@ writable inode. Every save and every `dekopond auth chatgpt logout` also sweeps 
 `chatgpt-auth.tmp-*` siblings, which a `SIGKILL` between create and rename leaves behind holding the
 same plaintext access and refresh tokens as the credential itself.
 
-**Reading is unchecked.** `load_credentials` opens the path with a plain `File::open`. There is no
-`O_NOFOLLOW`, no owner comparison, no mode check — deliberately unlike `dekopon-brokerd`, which
-rejects its own configuration and credential files on all three counts. A symlink farm such as a
-projected Secret volume is therefore perfectly readable. Reading was never the problem; writing is.
+**Reading is unchecked by the loader.** `load_credentials` opens the path with a plain `File::open`.
+There is no `O_NOFOLLOW`, no owner comparison, no mode check, so a symlink farm such as a projected
+Secret volume is perfectly readable. Reading was never the problem; writing is.
+`dekopon-brokerd` is the exception, and it adds the check rather than changing the loader: before
+opening a `chatgptSubscription` `authFile` it puts the path through
+`read_trusted_file(.., FileTier::Private, ..)` and requires the parent directory to be owner-only and
+writable, so a symlinked, group-readable, or read-only-parent seed refuses startup there.
 
 Put together: **a credential mounted read-only into a cluster breaks at the first refresh, and on
 restart the pod would present a refresh token the provider has already invalidated.** The credential
@@ -146,12 +152,47 @@ running it. The requirement the chart satisfies, precisely:
    `false` once the pod has rolled; the chart's `NOTES.txt` warns while it is set, and the chart
    README says why it discards a token fresher than the one in the vault.
 
-6. **One writer only.** `ChatGptCodexModel` serializes refreshes behind an advisory lock on a
-   sibling `.lock` file, and a client that loses the race adopts the record the winner wrote. That
+6. **One writer only.** `CredentialFile` serializes refreshes behind an in-process snapshot and an
+   advisory lock on a sibling `.lock` file, and a holder that loses the race adopts the record the
+   winner wrote. That
    holds within a host and across processes sharing one filesystem; it does not survive an NFS-style
    volume where advisory locking is unreliable, and it says nothing about two pods on separate
    copies of the credential. A deployment using this model kind must still run exactly one replica,
    and must replace rather than overlap them on an update.
+
+## A second family for the broker
+
+`dekopon-brokerd` presents a ChatGPT subscription token to an authorized destination through the
+`kind: chatgptSubscription` credential in `broker-credentials.yaml`. It reads the same document, runs
+the same refresh protocol, takes the same sibling lock, and writes back the same way — one
+implementation, `dekopon_model::chatgpt::CredentialFile`, reached from both processes.
+
+**Never point the broker and the gateway at one file.** Each refresh retires its predecessor, so two
+independent holders of one document eventually present a retired token and OAuth reuse detection can
+revoke the family for both. The supported shape is a second device login against the same ChatGPT
+account:
+
+```console
+dekopond auth chatgpt login  --auth-file ~/.config/dekopon/chatgpt-auth.gpt-image.json
+dekopond auth chatgpt status --auth-file ~/.config/dekopon/chatgpt-auth.gpt-image.json
+dekopond auth chatgpt export --expose-credential --format raw \
+  --auth-file ~/.config/dekopon/chatgpt-auth.gpt-image.json
+```
+
+Same account, independent refresh token, independent revocation. `dekopon-console` already runs a
+second family (`chatgpt-auth.console.json`) for the same reason.
+
+Everything under [What the pod must do with it](#what-the-pod-must-do-with-it) applies unchanged;
+`broker.chatgpt.*` is the chart's seed-once block for this family, landing the file in its own
+subdirectory of the state claim. The broker reaches it through its own `subPath` mount of that
+subdirectory, and the gateway receives no mount for it. Two differences are worth stating:
+
+- **The broker proves the file at startup and refuses to come up otherwise**, including the
+  owner-only-and-writable parent directory a rotation needs. A misconfigured credential is a broker
+  that does not start, not a capability that denies every invocation.
+- **A retired family is an explicit alert.** `broker_chatgpt_credential_reauth_required` at error
+  level names the symbolic credential, and the fix is another
+  `dekopond auth chatgpt login --auth-file <path>` followed by a re-export and a deliberate re-seed.
 
 ## The exported copy drifts, and that is expected
 
@@ -165,8 +206,9 @@ backup, and restoring it over a live credential is a way to break a working pod,
 When you do want to rotate deliberately — a new login, a revoked session, a fresh cluster — the
 sequence is: log in locally again, re-export, update the vault item, delete the file in the volume,
 and restart the pod. That is five steps because each one is a decision; none of them should happen
-implicitly. With the chart, the last two steps are one: set `gateway.chatgpt.reseed: true` for a
-single roll, then set it back to `false`.
+implicitly. With the chart, the last two steps are one: set `gateway.chatgpt.reseed: true` — or
+`broker.chatgpt.reseed: true` for the broker's family — for a single roll, then set it back to
+`false`.
 
 Revoking is separate: `dekopond auth chatgpt logout` deletes only Dekopon's local file. It does not
 invalidate the exported copy, the Secret, the vault item, or the credential the pod is running on.

@@ -115,10 +115,14 @@ jobs:
           fi
       - name: Verify broker excludes unprivileged orchestration
         shell: bash
+        # dekopon-model is deliberately absent from this list: the broker's
+        # `kind: chatgptSubscription` credential resolves through
+        # `dekopon_model::chatgpt::CredentialFile`, and a second implementation of that
+        # refresh sequence is a second way to revoke a token family.
         run: |
           set -euo pipefail
           tree=$(cargo tree --locked -p dekopon-brokerd --edges normal --prefix none)
-          if grep -Eq '^dekopon-(agent|shell|model|process|config) v' <<<"$tree"; then
+          if grep -Eq '^dekopon-(agent|shell|process|config) v' <<<"$tree"; then
             printf '%s\n' "$tree" >&2
             exit 1
           fi

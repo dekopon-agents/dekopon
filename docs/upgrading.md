@@ -84,6 +84,32 @@ swap in the order above.
 Not yet released; the version that carries it is named when it is cut. Nothing here needs a
 configuration edit.
 
+- **`chatgptSubscription` is a new broker credential kind; nothing existing has to change.** Every
+  `bearerToken` entry in `broker-credentials.yaml` keeps its exact meaning. The new kind takes an
+  absolute `authFile` instead of a `secret` and `scheme`, and the broker refuses to start when a
+  `bearerToken` entry sets `authFile` or a `chatgptSubscription` entry sets `secret` or `scheme` — a
+  stricter refusal than before, since per-kind fields were previously unvalidated because there was
+  one kind. Startup also now reports *every* problem in that file at once rather than the first;
+  embedders matching `CredentialsError::InvalidName` or `CredentialsError::InvalidCredential` should
+  match `CredentialsError::Invalid { problems }` instead.
+- **Adopting it needs its own ChatGPT login.** Run
+  `dekopond auth chatgpt login --auth-file <path>` a second time rather than pointing the broker at a
+  `chatgptSubscription` model's file: the refresh token rotates and the authorization server retires
+  its predecessor, so two holders of one document revoke the family for both. The `authFile` must be
+  an owner-only `0600` single-link regular file in an owner-only **writable** directory, because a
+  rotated record is persisted by renaming a sibling temporary file over the target. Under the Helm
+  chart, `broker.chatgpt.*` (new in chart `0.4.0`) seeds it once into
+  `<paths.stateDir>/broker-chatgpt/`. Full lifecycle in
+  [`chatgpt-credential.md`](chatgpt-credential.md#a-second-family-for-the-broker).
+- **Two new classified invocation failures exist.** A capability presenting a refreshing credential
+  can now fail as `credential-unavailable` (the refresh-token family is retired; an operator must log
+  in again, and `broker_chatgpt_credential_reauth_required` says so at error level) or
+  `credential-refresh-failed` (transport, a 5xx, a malformed token response; retrying is the whole
+  remedy). Every other capability keeps serving. Alerting on
+  `broker_chatgpt_credential_reauth_required` and on the `broker.credential.refresh` span's
+  `outcome = rotated-unsaved` is the operational change; see
+  [`observability.md`](observability.md#broker-failure-events).
+
 - **Upgrade the broker before its clients, and both daemons together.** The local protocol
   stays `dekopon.dev/broker/v1alpha2`, but `dekopond` now sends a provider
   command word as `runCommand` — the word, its argv, and the optional piped value — and reads back
