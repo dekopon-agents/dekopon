@@ -249,49 +249,45 @@ impl PolicyWorld {
 
     /// Renders the Cedar schema this world implies.
     fn schema_json(&self) -> serde_json::Value {
+        // Every action's context record starts from the same routing facts: who the request
+        // arrived as, and over what transport. All optional — a direct call has no channel and no
+        // conversation — but all declared, because Cedar's strict validator rejects a policy that
+        // reads an attribute the schema never mentions, and "only from Slack" has to be sayable.
+        const ROUTING: [&str; 7] = [
+            "via",
+            "subject",
+            "agent",
+            "transportKind",
+            "transport",
+            "channel",
+            "conversation",
+        ];
+        let routing_attributes = serde_json::Map::from_iter(ROUTING.map(|name| {
+            (
+                name.to_owned(),
+                json!({ "type": "String", "required": false }),
+            )
+        }));
+        // What an action adds on top is *required*: those are facts the broker stamps on the
+        // request itself, so a policy that reads one must never find it absent.
+        let context = |required: &[&str]| {
+            let mut attributes = routing_attributes.clone();
+            attributes.extend(
+                required
+                    .iter()
+                    .map(|name| ((*name).to_owned(), json!({ "type": "String" }))),
+            );
+            json!({ "type": "Record", "attributes": attributes })
+        };
+
         let entity_shape = json!({ "shape": { "type": "Record", "attributes": {} } });
-        let capability_context = json!({
-            "type": "Record",
-            "attributes": {
-                "via": { "type": "String", "required": false },
-                "subject": { "type": "String", "required": false },
-                "agent": { "type": "String", "required": false },
-                "transportKind": { "type": "String", "required": false },
-                "transport": { "type": "String", "required": false },
-                "channel": { "type": "String", "required": false },
-                "conversation": { "type": "String", "required": false },
-                "effect": { "type": "String" },
-                "risk": { "type": "String" },
-                "idempotency": { "type": "String" },
-            }
-        });
-        let prompt_context = json!({
-            "type": "Record",
-            "attributes": {
-                "via": { "type": "String", "required": false },
-                "subject": { "type": "String", "required": false },
-                "agent": { "type": "String", "required": false },
-                "transportKind": { "type": "String", "required": false },
-                "transport": { "type": "String", "required": false },
-                "channel": { "type": "String", "required": false },
-                "conversation": { "type": "String", "required": false },
-            }
-        });
-        let secret_context = json!({
-            "type": "Record",
-            "attributes": {
-                "via": { "type": "String", "required": false },
-                "subject": { "type": "String", "required": false },
-                "agent": { "type": "String", "required": false },
-                "transportKind": { "type": "String", "required": false },
-                "transport": { "type": "String", "required": false },
-                "channel": { "type": "String", "required": false },
-                "conversation": { "type": "String", "required": false },
-                "capability": { "type": "String" },
-                "provider": { "type": "String" },
-                "sink": { "type": "String" },
-            }
-        });
+        let capability_context = context(&["effect", "risk", "idempotency"]);
+        let prompt_context = context(&[]);
+        // Named rather than folded in with the rest because this trio is goal 1's exact-binding
+        // gate: a `secret.use` policy names the capability, provider and sink a credential may be
+        // released into, and requiring all three is what stops a request whose trusted binding
+        // differs from satisfying that policy.
+        let secret_context = context(&["capability", "provider", "sink"]);
 
         // Phantom capabilities are indistinguishable from routed ones *here*, and only here: the
         // schema is what strict validation checks a policy against, so a phantom is what lets a
