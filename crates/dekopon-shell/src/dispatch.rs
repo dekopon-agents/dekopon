@@ -48,10 +48,7 @@ pub(crate) enum Resolution {
     /// distinction exists only for telemetry: it is the difference between "the model typed
     /// nonsense" and "the model keeps reaching for something we never granted", and only the
     /// second is a trend worth acting on.
-    NotGranted {
-        /// The provider namespace, taken from the session's own granted set.
-        namespace: String,
-    },
+    NotGranted,
     /// A word this shell refuses, with the reason why.
     Rejected(&'static str),
     /// Nothing matched.
@@ -85,27 +82,21 @@ pub(crate) fn resolve(
         if invoker.is_granted(word) {
             return Resolution::Capability;
         }
-        if let Some(namespace) = granted_namespace_of(word, invoker) {
-            return Resolution::NotGranted { namespace };
+        if in_granted_namespace(word, invoker) {
+            return Resolution::NotGranted;
         }
     }
     Resolution::NotFound
 }
 
-/// Returns the provider namespace of a word, when this session already holds that namespace.
+/// Reports whether a word names a provider namespace this session already holds.
 ///
-/// Deliberately bounded by the session's *own* granted set rather than by anything global. The
-/// namespace it returns is therefore always a string the deployment chose, never one the model
-/// composed, which is what makes it safe to export while the word itself stays withheld. A word in
-/// a namespace the session does not hold reveals nothing and yields `None`.
-fn granted_namespace_of(word: &str, invoker: &dyn CapabilityInvoker) -> Option<String> {
-    let namespace = word.split('.').next()?;
-    if namespace.is_empty() || namespace == word {
-        return None;
-    }
-    invoker
-        .grants_namespace(namespace)
-        .then(|| namespace.to_owned())
+/// Deliberately bounded by the session's *own* granted set rather than by anything global: a word
+/// in a namespace the session never held is an ordinary typo, and reporting it as `not-granted`
+/// would tell an operator the model reached for a provider that was never in play.
+fn in_granted_namespace(word: &str, invoker: &dyn CapabilityInvoker) -> bool {
+    let namespace = word.split('.').next().unwrap_or(word);
+    !namespace.is_empty() && namespace != word && invoker.grants_namespace(namespace)
 }
 
 /// Reports whether a word could be a capability identifier.
@@ -356,7 +347,7 @@ mod tests {
         // A word in a held namespace that was not granted is still distinguished for telemetry.
         assert!(matches!(
             resolve("echo.other", &functions, &invoker),
-            Resolution::NotGranted { namespace } if namespace == "echo"
+            Resolution::NotGranted
         ));
         assert!(matches!(
             resolve("nothing.here", &functions, &invoker),
@@ -375,7 +366,7 @@ mod tests {
         ));
         assert!(matches!(
             resolve("echo.missing", &functions, &Granted),
-            Resolution::NotGranted { namespace } if namespace == "echo"
+            Resolution::NotGranted
         ));
         assert!(matches!(
             resolve("other.missing", &functions, &Granted),
