@@ -273,14 +273,22 @@ impl ChatReplier for LocalReplier {
             let ReplyTarget::Local { connection } = target else {
                 return Err(TransportError::Response);
             };
-            let OutboundReply { text, image } = reply;
+            let OutboundReply { text, images } = reply;
             let mut response = serde_json::json!({ "reply": text });
-            if let Some(image) = image {
-                response["images"] = serde_json::json!([{
-                    "filename": image.filename(),
-                    "mediaType": image.media_type(),
-                    "data": STANDARD.encode(image.bytes()),
-                }]);
+            if !images.is_empty() {
+                response["images"] = serde_json::Value::Array(
+                    images
+                        .iter()
+                        .enumerate()
+                        .map(|(index, image)| {
+                            serde_json::json!({
+                                "filename": image.filename(index),
+                                "mediaType": image.media_type(),
+                                "data": STANDARD.encode(image.bytes()),
+                            })
+                        })
+                        .collect(),
+                );
             }
             let line = response.to_string();
             let sender = self

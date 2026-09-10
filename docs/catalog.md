@@ -14,7 +14,7 @@ which is which.
 
 | Process | Reads the catalog? | What it does with it |
 |---|---|---|
-| `dekopond` | Yes, at startup | Binds each route to an agent, resolves that agent's model, hands its `instructions` to the model as a system prompt, mounts its `skills` on every session the route serves. |
+| `dekopond` | Yes, at startup | Binds each route to an agent, resolves that agent's model, hands its `instructions` to the model as a system prompt, mounts its `skills` on every session the route serves, and checks that every capability a route's `chatAssetInputs` names exists here. |
 | `dekopon-brokerd` | **No** | The broker does not link `dekopon-config` and never sees this file. It declares the `Dekopon::Agent` Cedar type and matches instances by name without enumerating them. |
 
 The consequence worth internalizing: **nothing an agent may actually do comes from this file.** The
@@ -206,6 +206,11 @@ status: Unknown
 | `idempotency` | `idempotent` \| `conditional` \| `non-idempotent` | yes | Stored typed catalog metadata. |
 | `permissions` | list of `{ operation, resource? }` | no | Stored typed catalog metadata; no authority is granted. |
 | `status` | `Available` \| `Unavailable` \| `Unknown` | no | Stored typed authored metadata, never observed or reported; omission stays `None`, with no presentation fallback. |
+
+A capability's *existence* here is load-bearing in one more place: `dekopond` refuses to start when a
+route's `chatAssetInputs` names a capability this file does not define, because a misspelled
+identifier would otherwise silently never expand a `chat-asset:<N>` marker and look exactly like a
+provider rejecting its own input. Presence is still not a grant — the broker decides the invocation.
 
 **The broker does not read any of this.** The trusted `effect`, `risk`, and `idempotency` a policy
 decision actually sees come from the capability's `constraintSets` entry in `broker.yaml`, validated

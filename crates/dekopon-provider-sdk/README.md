@@ -51,6 +51,40 @@ dekopon_provider_sdk::export_provider_with_bindings!(Example, bindings);
 
 The composed world must retain the root `describe` and `invoke` exports. Additional imports are embedded in the component type and fail closed unless an authorized broker linker implements them. See the [`http-probe`](../../examples/providers/http-probe/README.md) fixture.
 
+## Attachments out of band
+
+Every value on this boundary is a JSON string, so bytes travel base64-encoded — and an embedding host
+must not print them into a model transcript. One convention solves that, and it is a **documented
+JSON wire shape rather than a type this crate exports**: a provider ships from its own repository
+against its own pinned SDK version, so what the two sides share is the schema below, and each side
+reads it with its own local type. (Exporting a Rust type here would also compile this crate's source
+into every host that reads it, which is the wrong coupling for two strings.)
+
+A capability result object may carry a top-level `attachments` key:
+
+```json
+{
+  "attachments": [{"mediaType": "image/png", "base64": "<standard base64 of the bytes>"}],
+  "image": {"generationId": "…", "bytes": 1234567}
+}
+```
+
+Both fields are required on each entry, and a reader rejects unknown fields inside one. A host that
+supports the convention strips the key before the result reaches its model, validates each entry
+against its own byte and media bounds, delivers the accepted bytes out of band, and replaces the key
+with metadata — `dekopond` writes `attached: [{mediaType, bytes}]`, and `attachmentNote` carrying one
+fixed sentence when it refused an entry (one PNG per entry, at most 8 MiB, only on a route whose
+owner opted in). A host that does not support it simply leaves the result alone.
+
+So treat an attachment as a *delivery request* rather than a guaranteed effect, and keep everything
+the model needs to reason about in the ordinary result fields beside it. The key names `attachments`,
+`attached`, and `attachmentNote` are reserved for this shape on every capability.
+
+The inbound mirror is the same kind of agreement: a host may replace the exact input string
+`chat-asset:<N>` with a `data:<mime>;base64,…` URL before it proposes, for the capabilities its
+operator listed. A provider that receives an unexpanded marker should reject it as invalid input
+rather than guess.
+
 ## Host feature
 
 Providers never enable it, and the default feature set is empty, so a `wasm32-unknown-unknown` build

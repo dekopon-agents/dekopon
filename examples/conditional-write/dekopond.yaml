@@ -43,23 +43,20 @@ models:
     # Matched against the agent's `modelClass` when a route names no model explicitly.
     classes: [reasoning]
 
-# Optional, and the whole block is one generator: a gateway configures at most one. Delete it (and
-# `imageGenerator: true` below) if you do not want a route that can draw — nothing else changes.
-# The credential is read at startup only because a route opts in, so an unset variable is a startup
-# failure naming it rather than a tool that can only fail mid-conversation.
-imageGenerator:
-  model: gpt-image-1
-  # Environment variable NAME, never a value, exactly like the Slack tokens above.
-  apiKeyEnv: OPENAI_IMAGE_API_KEY
-  timeoutMs: 120000
-
 routes:
   - transport: workspace-slack
     match: { kind: directMessage }
     agent: xaviers-conditional-writer
-    # Opt in to the gateway's one image generator. Absent means this route gets no `generate_image`
-    # tool, reads no image credential, and answers with byte-identical text.
-    imageGenerator: true
+    # Let this route deliver the files an authorized capability produced. A capability result may
+    # carry a top-level `attachments: [{mediaType, base64}]`; the gateway strips it, validates each
+    # PNG, and uploads it beside the answer. Delete this block and such a result is refused with a
+    # sentence the model reads — nothing else about the route changes.
+    providerAttachments:
+      maxPerReply: 1
+    # Capabilities whose input may name one of this conversation's attachments as `chat-asset:2`.
+    # The gateway expands the marker to a data URL before proposing; a capability left out of this
+    # list receives the string verbatim and decides for itself.
+    chatAssetInputs: [http-probe.conditional-write]
     limits:
       # One review is a handful of steps: view the pull request, read the files, approve, answer.
       # A budget that cannot finish the job is a bug; a budget that can loop is a bill.

@@ -9,8 +9,6 @@
   cross-process advisory lock, the adoption of a newer record another process wrote, the refresh
   60 s before expiry, and the atomic write-back;
 - request-scoped prompt-cache routing hints plus normalized provider-reported cached-token usage;
-- a fixed-endpoint OpenAI Images client producing one signature-validated PNG under explicit prompt,
-  encoded-response, and 8 MiB decoded bounds; and
 - multimodal message content, where a message carries `ContentPart`s — text, images, documents —
   instead of a single string.
 
@@ -21,10 +19,6 @@ a summary instead, because those are what reach the prompt transcript in the aud
 writes `[image/png, 219136 bytes]` for an image and `[report.pdf (application/pdf), 219136 bytes]`
 for a file; `Debug` writes the same counts as a `bytes: 219136` field. The count is raw bytes, never
 a scaled unit.
-
-`GeneratedImage` renders only media type and byte count under `Debug`; its raw bytes are exposed
-only to the embedding delivery path. The Images client never reuses the undocumented ChatGPT/Codex
-subscription endpoint and never accepts a model-selected endpoint.
 
 `CredentialFile` has two consumers and must not grow a third definition. `ChatGptCodexModel` is one;
 `dekopon-brokerd`'s `kind: chatgptSubscription` provider credential is the other, which is why this

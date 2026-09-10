@@ -30,7 +30,7 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
   `decline_chat_reply` decision lets the agent post nothing when a response would only take the
   last word. Ambient channel history never reaches routing or inference.
 - A chat gateway that can be shown what a person attached: an image or a document becomes a numbered chat asset named in the prompt, which a model opens on demand rather than carrying on every turn. Discord photos and files follow the same bounded lazy path as Slack and Telegram.
-- Explicit route-scoped image generation: an existing chat model may call one fixed-endpoint OpenAI Images meta tool, yielding one bounded PNG delivered natively to Slack, Discord, Telegram, or the local socket without entering conversation memory, telemetry, providers, or broker protocol.
+- Explicit route-scoped file delivery in both directions: bounded PNGs an authorized capability returned are carried to Slack, Discord, Telegram, or the local socket without entering the model transcript, conversation memory, telemetry, or broker protocol, and a capability the route lists can be handed one of the conversation's own attachments by reference.
 - Credential-free agent self-inspection: an authorized gateway session can call `inspect_agent_config` to read its exact standing prompt, route limits, and current effective Cedar grants. Raw policy, identity, endpoints, paths, and every credential name or value stay out.
 - A sandboxed bash-flavored script interpreter (`dekopon-shell`) whose command words dispatch to provider capabilities instead of operating-system processes, with compound commands (`if`/`for`/`while`/`until`/`case`/`{ ...; }`) as pipeline stages, `[[ ... ]]`, enforced `set -e`/`-u`/`-o pipefail`, `read`/`getopts`, real parameter expansion, and two script-addressable streams. The shared agent layer hands the interpreter to a model as its `bash` tool, so a multi-step plan is one tool call rather than many round trips.
 - A small unprivileged Tokio lifecycle seam (`dekopon-process`) that runs one typed async operation
@@ -93,7 +93,8 @@ New in 0.10.0 — a deep-review hardening pass, and three new surfaces:
 - A text-only Meta WhatsApp Cloud API gateway transport with a signed bounded webhook, message-ID
   deduplication, and canonical `whatsapp.<wa_id>` subjects.
 - Opt-in route-scoped OpenAI image generation with bounded generated-PNG replies on Slack, Discord,
-  Telegram, and the local development transport.
+  Telegram, and the local development transport. (Removed after 0.12.0: image generation became a
+  provider effect, and the gateway now only delivers provider-produced attachments.)
 - Broker-owned, namespace-bound provider storage with strict quotas and direct-write JSONL, plus
   the independently released `memory-chat` provider and on-demand `memory recent` / `memory search` commands.
 - 145 verified review findings landed across the workspace: every broker failure now carries a
