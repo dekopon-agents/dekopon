@@ -2,19 +2,20 @@
 //!
 //! `dekopond` connects to chat services, waits efficiently for a wakeup, routes each authenticated
 //! message to a named agent from the catalog, runs one bounded model session with the sandboxed
-//! shell and safe on-demand meta tools, and replies with bounded text plus an optional generated
-//! image unless an optional owned-thread continuation deliberately declines.
+//! shell and safe on-demand meta tools, and replies with bounded text plus any images a provider
+//! result attached unless an optional owned-thread continuation deliberately declines.
 //!
 //! # Authority
 //!
 //! It has none. It holds chat bot credentials and model credentials — the things it needs to hear a
 //! question and to ask a model — and it never holds a provider credential, a policy, or an
-//! authorization. Explicit route-scoped image generation is model inference inside this
-//! unprivileged boundary, with no provider or broker credential. Every provider effect a session
-//! drives is submitted to `dekopon-brokerd` as an *attested*
-//! proposal naming the sender's canonical subject, and the broker alone maps that subject to a
-//! principal, decides what it may do, and executes it. The daemon's dependency set excludes every
-//! privileged broker crate: orchestration holds no effect authority, and CI enforces it.
+//! authorization. Producing an image is a provider effect like any other: image bytes reach a reply
+//! only through a route's `providerAttachments` opt-in, carried on a result the broker already
+//! authorized and executed. Every provider effect a session drives is submitted to
+//! `dekopon-brokerd` as an *attested* proposal naming the sender's canonical subject, and the
+//! broker alone maps that subject to a principal, decides what it may do, and executes it. The
+//! daemon's dependency set excludes every privileged broker crate: orchestration holds no effect
+//! authority, and CI enforces it.
 //!
 //! Everything arriving from a chat service is untrusted, including the agent's own standing orders
 //! from the catalog: neither can assert identity, name a principal, or widen a grant.
@@ -43,14 +44,13 @@ use std::{
 
 use dekopon_broker_protocol::BrokerClient;
 use dekopon_config::LocalCatalog;
-use dekopon_model::image::ImageGenerator;
 use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinSet, time::timeout};
 
 pub use config::{
     ActivityMode, CONFIG_API_VERSION, ConfigApiVersion, ConfigError, ConfigProblem,
     ConversationConfig, ConversationPolicy, ConversationScope, ConversationWindow, DekopondConfig,
-    HARD_MAX_CONFIG_BYTES, ImageGeneratorConfig, NativeActivityConfig, ResolvedConfig,
+    HARD_MAX_CONFIG_BYTES, NativeActivityConfig, ProviderAttachmentsConfig, ResolvedConfig,
     ResolvedRoute, ResolvedTelemetry, SlackActivityConfig, SlackActivityFallback, SlackExperience,
     TelemetryConfig, TransportConfig,
 };
@@ -64,8 +64,8 @@ use crate::{
     conversation::ConversationStore,
     routes::RoutingTable,
     session::{
-        ConfiguredModels, ImageGeneratorStartupError, ModelCache, ModelCredentialError,
-        STOPPED_REPLY, SessionGate, SessionRunner, configured_image_generator, model_bearer_token,
+        ConfiguredModels, ModelCache, ModelCredentialError, STOPPED_REPLY, SessionGate,
+        SessionRunner, model_bearer_token,
     },
     transport::{
         AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind, InboundMessage,
@@ -136,7 +136,6 @@ where
     let catalog = LocalCatalog::load(&config.catalog_path).map_err(DekopondError::Catalog)?;
     let routes = Arc::new(RoutingTable::bind(&config, &catalog)?);
     let Prepared {
-        image_generator,
         transports: built_transports,
     } = prepare(&config, &routes)?;
 
@@ -214,7 +213,6 @@ where
             ASSET_IDLE_TIMEOUT,
         )),
         asset_fetchers,
-        image_generator,
         activities,
         thread_ownership,
         active_sessions: session::ActiveSessions::default(),
@@ -538,16 +536,6 @@ async fn report_transport_health(health: Arc<TransportHealth>) {
 /// told about both at once.
 fn prepare(config: &ResolvedConfig, routes: &RoutingTable) -> Result<Prepared, DekopondError> {
     let mut problems = Vec::new();
-    // A route naming image generation must not start as a tool that can only fail.
-    let referenced = config.routes.iter().any(|route| route.image_generator);
-    let image_generator =
-        match configured_image_generator(config.image_generator.as_ref(), referenced) {
-            Ok(generator) => generator,
-            Err(source) => {
-                problems.push(StartupProblem::ImageGenerator(source));
-                None
-            }
-        };
     for model in routes.bound_models() {
         if let Err(source) = model_bearer_token(model) {
             problems.push(StartupProblem::ModelCredential(source));
@@ -564,10 +552,7 @@ fn prepare(config: &ResolvedConfig, routes: &RoutingTable) -> Result<Prepared, D
         }
     }
     if problems.is_empty() {
-        Ok(Prepared {
-            image_generator,
-            transports,
-        })
+        Ok(Prepared { transports })
     } else {
         Err(DekopondError::Startup { problems })
     }
@@ -575,8 +560,6 @@ fn prepare(config: &ResolvedConfig, routes: &RoutingTable) -> Result<Prepared, D
 
 /// Everything `prepare` resolved, none of it having spoken to a chat service yet.
 struct Prepared {
-    /// The gateway's image generator, absent unless a bound route opted into one.
-    image_generator: Option<Arc<dyn ImageGenerator>>,
     /// One built transport per configured transport, in configuration order.
     transports: Vec<Box<dyn ChatTransport>>,
 }
@@ -712,9 +695,6 @@ pub struct TransportConnectProblem {
 /// deployment missing several secrets is one refusal naming all of them.
 #[derive(Debug, Error)]
 pub enum StartupProblem {
-    /// A named image generator could not resolve its model credential or client.
-    #[error("configured image generator is unavailable")]
-    ImageGenerator(#[source] ImageGeneratorStartupError),
     /// A bound route's model names a credential variable nothing usable can be read from.
     #[error("configured model credential is unavailable")]
     ModelCredential(#[source] ModelCredentialError),

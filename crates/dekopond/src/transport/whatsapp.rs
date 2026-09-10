@@ -881,9 +881,9 @@ impl ChatReplier for WhatsappReplier {
             let ReplyTarget::WhatsApp { recipient } = target else {
                 return Err(TransportError::Response);
             };
-            let OutboundReply { text, image } = reply;
-            if image.is_some() {
-                // Configuration refuses an image generator on a WhatsApp route, so reaching here
+            let OutboundReply { text, images } = reply;
+            if !images.is_empty() {
+                // Configuration refuses provider attachments on a WhatsApp route, so reaching here
                 // means the two disagree. Say which one rather than dropping bytes silently:
                 // sending an image needs Meta's media upload, which this transport does not have.
                 tracing::error!(

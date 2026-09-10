@@ -798,12 +798,14 @@ dependencies = [
 name = "dekopon-agent"
 version = "0.12.0"
 dependencies = [
+ "base64 0.23.1",
  "dekopon-broker-protocol",
  "dekopon-capability",
  "dekopon-config",
  "dekopon-core",
  "dekopon-model",
  "dekopon-process",
+ "dekopon-provider-sdk",
  "dekopon-shell",
  "dekopon-telemetry",
  "rustix",

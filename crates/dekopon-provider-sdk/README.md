@@ -51,6 +51,21 @@ dekopon_provider_sdk::export_provider_with_bindings!(Example, bindings);
 
 The composed world must retain the root `describe` and `invoke` exports. Additional imports are embedded in the component type and fail closed unless an authorized broker linker implements them. See the [`http-probe`](../../examples/providers/http-probe/README.md) fixture.
 
+## Attachments out of band
+
+Every value on this boundary is a JSON string, so bytes travel base64-encoded — and an embedding host
+must not print them into a model transcript. `ResultAttachment` is the shared definition for the one
+convention that solves that: a capability result object may carry a top-level
+`attachments: [{mediaType, base64}]`, and a host that supports the convention strips that key before
+the result reaches its model, validates each entry against its own byte and media bounds, delivers
+the accepted bytes out of band, and replaces the key with metadata. `dekopond` is the host that does
+(one PNG per entry, at most 8 MiB, only on a route whose owner opted in); a host that does not simply
+leaves the result alone.
+
+So treat an attachment as a *delivery request* rather than a guaranteed effect, and keep everything
+the model needs to reason about in the ordinary result fields beside it. The key names `attachments`,
+`attached`, and `attachmentNote` are reserved for this shape on every capability.
+
 ## Host feature
 
 Providers never enable it, and the default feature set is empty, so a `wasm32-unknown-unknown` build

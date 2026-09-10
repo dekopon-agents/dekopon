@@ -26,7 +26,7 @@ model sees bounded metadata first and downloads bytes only if it calls `fetch_ch
    - **Send Messages** under Text Permissions
    - **Send Messages in Threads** under Text Permissions
    - **Read Message History** under Text Permissions
-   - **Attach Files** under Text Permissions, for generated-image replies
+   - **Attach Files** under Text Permissions, for provider-attachment replies
 6. Copy the **Generated URL** at the bottom of the form. The URL used for the one-time server
    installation step will look like this; again, the application ID is illustrative:
 
@@ -130,14 +130,16 @@ from Discord REST, selects the same attachment ID, validates the refreshed CDN U
 bounded download. Attachment bytes are dropped after the model request and are never written to
 conversation history.
 
-## Generated image replies
+## Provider attachment replies
 
-A route that explicitly names an image generator may attach one gateway-named PNG to the first
-Create Message call as `multipart/form-data`. `payload_json` retains the same no-mentions policy
-and inbound reply reference as text-only JSON; `files[0]` carries at most 8 MiB. If Discord accepts
-that first post and rejects a later split text chunk, Dekopon reports partial delivery and performs
-no durable chat-memory record. No configured generator means no generation tool and byte-identical
-text-only requests. The installation needs **Attach Files**, as listed above.
+A route with `providerAttachments` may attach the gateway-named PNGs an authorized capability
+returned to the first Create Message call as `multipart/form-data`. `payload_json` retains the same
+no-mentions policy and inbound reply reference as text-only JSON; each `files[N]` carries at most
+8 MiB, and the filenames carry each attachment's position so two files do not arrive under one name.
+If Discord accepts that first post and rejects a later split text chunk, Dekopon reports partial
+delivery and performs no durable chat-memory record. No opt-in means a capability's `attachments`
+key is stripped and refused, and requests stay byte-identical to text-only ones. The installation
+needs **Attach Files**, as listed above.
 
 ## Replies
 

@@ -7,9 +7,9 @@
 
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
+use dekopon_agent::attachment::GeneratedImage;
 use dekopon_broker_protocol::ChatTransportKind;
 use dekopon_core::{ExternalSubject, Redacted};
-use dekopon_model::image::GeneratedImage;
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 
@@ -481,20 +481,32 @@ impl ChatReplier for TelegramReplier {
             else {
                 return Err(TransportError::Response);
             };
-            let OutboundReply { text, image } = reply;
-            if let Some(image) = image {
+            let OutboundReply { text, images } = reply;
+            if !images.is_empty() {
+                // One `sendPhoto` per attachment; Telegram has no multi-attachment message that also
+                // carries a caption the way a person expects to read it.
                 let caption_fits = text.encode_utf16().count() <= MAX_PHOTO_CAPTION_CHARS;
-                let image_receipt = self
-                    .send_photo(
-                        chat_id,
-                        reply_to,
-                        message_thread_id,
-                        caption_fits.then_some(text.as_str()),
-                        image,
-                    )
-                    .await?;
+                let mut accepted = 0_usize;
+                let mut last = None;
+                for (index, image) in images.into_iter().enumerate() {
+                    let caption = (index == 0 && caption_fits).then_some(text.as_str());
+                    match self
+                        .send_photo(chat_id, reply_to, message_thread_id, caption, image, index)
+                        .await
+                    {
+                        Ok(receipt) => {
+                            accepted += 1;
+                            last = Some(receipt);
+                        }
+                        // One attachment already reached the chat, so this is a reply that arrived
+                        // in part rather than one that never arrived — the same distinction the text
+                        // chunk loop below makes.
+                        Err(_) if accepted > 0 => return Err(TransportError::PartialDelivery),
+                        Err(error) => return Err(error),
+                    }
+                }
                 if caption_fits {
-                    return Ok(image_receipt);
+                    return last.ok_or(TransportError::Response);
                 }
                 return self
                     .send_text_chunks(chat_id, reply_to, message_thread_id, &text, true)
@@ -599,14 +611,16 @@ impl TelegramReplier {
         message_thread_id: Option<i64>,
         caption: Option<&str>,
         image: GeneratedImage,
+        index: usize,
     ) -> Result<DeliveryReceipt, TransportError> {
+        let filename = image.filename(index);
         #[allow(
             clippy::map_err_ignore,
             reason = "mime_str only rejects strings that are not a media type, and this one is the \
                       literal above it"
         )]
         let part = reqwest::multipart::Part::bytes(image.into_bytes())
-            .file_name("generated-image.png")
+            .file_name(filename)
             .mime_str("image/png")
             .map_err(|_| TransportError::Response)?;
         let mut form = reqwest::multipart::Form::new()

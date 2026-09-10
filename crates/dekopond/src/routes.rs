@@ -35,8 +35,13 @@ pub(crate) struct BoundRoute {
     /// can be a megabyte of text that never changes while the daemon runs.
     pub skills: Arc<[Skill]>,
     pub model: Arc<ModelConfig>,
-    /// Whether this route may generate images, already validated against the configured generator.
-    pub image_generator: bool,
+    /// Attachments one reply on this route may carry; zero for a route that delivers none.
+    pub provider_attachments: u8,
+    /// Capabilities whose input may name a chat attachment, already checked against the catalog.
+    ///
+    /// Shared rather than cloned for the reason the skills are: a bound route is cloned per message
+    /// and this list never changes while the daemon runs.
+    pub chat_asset_inputs: Arc<[String]>,
     /// Whether this route's sessions may record improvement suggestions.
     pub improvement_suggestions: bool,
     pub limits: PromptLimits,
@@ -130,6 +135,17 @@ impl RoutingTable {
                     continue;
                 }
             };
+            // Checked against the catalog for the reason the agent is: a misspelled capability in
+            // `chatAssetInputs` would otherwise silently never expand a marker, which looks exactly
+            // like a provider that refuses its own input. Every unknown identifier is named, and a
+            // catalog entry is not a grant — the broker still decides the invocation.
+            for capability in &route.chat_asset_inputs {
+                if catalog.capability(capability).is_none() {
+                    problems.push(RouteProblem::UnknownChatAssetCapability {
+                        capability: capability.to_string(),
+                    });
+                }
+            }
             routes.push(BoundRoute {
                 transport: route.transport.clone(),
                 r#match: route.r#match.clone(),
@@ -139,7 +155,12 @@ impl RoutingTable {
                 instructions: agent.spec.instructions.clone(),
                 skills: Arc::from(catalog.agent_skills(&route.agent).to_vec()),
                 model: Arc::clone(model),
-                image_generator: route.image_generator,
+                provider_attachments: route.provider_attachments,
+                chat_asset_inputs: route
+                    .chat_asset_inputs
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
                 improvement_suggestions: route.improvement_suggestions,
                 limits: PromptLimits {
                     max_steps: route.limits.max_steps,
@@ -159,8 +180,7 @@ impl RoutingTable {
     /// The distinct models bound routes can actually reach, in declaration order.
     ///
     /// Startup resolves each one's credential before any transport accepts work. A configured
-    /// model no route reaches is not a reason to refuse to start, which is the same rule the
-    /// referenced-image-generator set follows.
+    /// model no route reaches is not a reason to refuse to start.
     pub fn bound_models(&self) -> Vec<&ModelConfig> {
         let mut seen = BTreeSet::new();
         self.routes
@@ -222,4 +242,6 @@ pub enum RouteProblem {
     NoModelClass { agent: String },
     #[error("agent {agent:?} needs model class {class:?}, which no configured model offers")]
     NoModelForClass { agent: String, class: String },
+    #[error("route lists chat-asset input capability {capability:?}, which is not in the catalog")]
+    UnknownChatAssetCapability { capability: String },
 }

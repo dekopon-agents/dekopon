@@ -11,8 +11,6 @@ use ureq::{Agent, config::ConfigBuilder, typestate::AgentScope};
 
 /// Native ChatGPT/Codex subscription authentication and Responses transport.
 pub mod chatgpt;
-/// Bounded generated-image clients and output types.
-pub mod image;
 #[cfg(test)]
 mod mock;
 /// Generic chat-model contract and OpenAI-compatible transport.
@@ -20,7 +18,7 @@ pub mod model;
 
 /// Builds the one HTTP agent shape every transport in this crate uses.
 ///
-/// The four call sites differ only in their deadline, so the stance lives here rather than being
+/// The three call sites differ only in their deadline, so the stance lives here rather than being
 /// restated — and silently diverging — at each of them. None of the three settings is ureq's
 /// default:
 ///

@@ -129,6 +129,24 @@ All notable changes to Dekopon are documented here. The format is based on
   65533 and asserts the chart refuses it, so the requirement that a broker's identities
   map its own probe UID cannot regress into a pod that starts and never becomes ready.
 
+- Added two gateway conventions that carry bytes between a capability and a chat conversation
+  without putting them in the model transcript, each an owner-authored route opt-in. `routes[].providerAttachments.maxPerReply`
+  lets a session deliver the attachments an authorized capability produced: a successful result's
+  reserved top-level `attachments: [{mediaType, base64}]` (now `dekopon_provider_sdk::ResultAttachment`)
+  is stripped by the session's broker leg, each entry validated as a PNG of at most 8 MiB against
+  the per-reply ceiling, and the key replaced with `attached: [{mediaType, bytes}]` so the shell and
+  the model see metadata only. `routes[].chatAssetInputs` lists the capabilities whose input may name
+  one of the conversation's own attachments as `chat-asset:<N>`; the leg expands each marker to a
+  `data:<mime>;base64,…` URL before the proposal is submitted, under a per-invocation budget of three
+  expansions and 8.5 MiB decoded that is separate from the model's own `fetch_chat_asset` allowance.
+  Image media types only, both ways. A capability absent from `chatAssetInputs` keeps such a string
+  verbatim and decides for itself. Refusals never fail a script: the result carries `attached: []`
+  plus one fixed gateway sentence, and the cause is audited as `agent.provider_attachment.refused`
+  (`route-disabled`, `invalid-encoding`, `unsupported-media`, `too-large`, `per-reply-limit`) or
+  `agent.chat_asset_input.refused` (`unknown-asset`, `unsupported-media`, `per-invocation-limit`,
+  `byte-budget`, `unavailable`). Attachment bytes never enter model messages, conversation history,
+  telemetry payloads, broker protocol, evidence, or audit.
+
 ### Changed
 
 - Provider storage applies writes per host call through a direct invocation handle, with namespace, key, quota and private-file isolation retained. Failed invocations can leave completed writes; there is no invocation rollback, crash recovery or automatic generation collection.
@@ -145,6 +163,16 @@ All notable changes to Dekopon are documented here. The format is based on
   run `<word> --help` for a provider command word's subcommands and flags. `dekopon-agent` and
   `dekopond` forward the new method, and the broker leg carries it over the new `runCommand`
   operation with the piped value.
+- `OutboundReply` carries `images: Vec<GeneratedImage>` instead of one optional image, and every
+  transport loops over it: Slack makes one external upload per attachment with the answer text as the
+  first upload's `initial_comment`, Discord posts every attachment on the first message, Telegram
+  sends one `sendPhoto` per attachment with the caption on the first, and the local transport's
+  `images` array carries them all. A text-only reply is byte-identical on every transport, and
+  WhatsApp still refuses an attachment it has no media upload for. `GeneratedImage::filename` now
+  takes the attachment's position in the reply, so two files in one reply do not arrive under one
+  name. `dekopon-agent` gains a `dekopon-provider-sdk` dependency (one definition of the
+  `attachments` result shape, already in its tree through `dekopon-broker-protocol`) and `base64`.
+
 - The broker protocol gains `runCommand` (`BrokerRequest::RunCommand`, with an optional `stdin`),
   answered by `BrokerResponse::CommandRun` carrying the guest's own `CommandRunOutcome` — a
   proposal, rendered text with its exit status, or a decline with the provider's stable code and
@@ -198,6 +226,17 @@ All notable changes to Dekopon are documented here. The format is based on
 - Retire the broker web UI, its listener configuration, and gateway inventory/token reporting; daemon traces, model accounting, and provider execution remain.
 - Retired the standalone catalog CLI and package; model-account login, status, logout, and guarded credential export now live in `dekopond auth chatgpt`, without gateway configuration or startup.
 - Remove the broker audit checkpoint sidecar and its required configuration keys. The broker opens the verified audit directly; service run functions return unit on clean shutdown.
+- Removed the gateway's own image-generation meta tool. The `generate_image` model tool, the
+  `imageGenerator:` gateway block, the `routes[].imageGenerator` flag, `dekopon-model`'s
+  `image` module (`OpenAiImageGenerator`, the `ImageGenerator` trait, `ImageGenerationError`), and
+  the audit events `agent.image_generation.refused` and `accounting.model.image_generation` are all
+  gone, and the gateway holds no image credential at all. Generating an image is a provider effect
+  like any other external write: Cedar-governed, audited by the broker, and delivered through the
+  route's `providerAttachments` opt-in above. `dekopon-agent`'s `GeneratedImageOutput` is now
+  `attachment::ReplyAttachments` beside `attachment::GeneratedImage`, and `PromptError` loses
+  `MissingImagePrompt`, `UnexpectedImageArguments`, and `ImagePromptTooLarge`. A configuration that
+  still names `imageGenerator` refuses startup with the unknown field's name; see
+  [`docs/upgrading.md`](docs/upgrading.md).
 
 ### Fixed
 
