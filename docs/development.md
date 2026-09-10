@@ -224,6 +224,21 @@ cargo machete
   fi
 )
 python3 .github/scripts/test_daemon_dependency_gates.py
+# One Wasmtime engine per process. Production code only: `crates/*/src`, minus `#[cfg(test)]`
+# module files and `tests/` directories, which may build throwaway engines freely.
+(
+  set -euo pipefail
+  engines=$(grep -rEn '(^|[^A-Za-z0-9_])Engine::new\(' --include='*.rs' crates/*/src \
+    | grep -vE '(/tests\.rs:|/tests/)' || true)
+  [ "$(grep -c . <<<"$engines" || true)" -eq 1 ]
+  [[ "$engines" == crates/dekopon-provider-sdk/src/host.rs:* ]]
+  callers=$(grep -rn 'host::engine(' --include='*.rs' crates/ \
+    | grep -v '^crates/dekopon-provider-sdk/' || true)
+  [ "$(grep -c . <<<"$callers" || true)" -eq 1 ]
+  [[ "$callers" == crates/dekopon-broker-host/src/lib.rs:* ]]
+  tree=$(cargo tree --locked -p dekopond --edges normal --prefix none)
+  [ "$(grep -ci wasmtime <<<"$tree" || true)" -eq 0 ]
+)
 # The guest host-interface bindings must compile for Wasm, each storage feature on its own.
 rustup target add wasm32-unknown-unknown
 cargo check --locked -p dekopon-provider-sdk --target wasm32-unknown-unknown

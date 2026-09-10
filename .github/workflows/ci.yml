@@ -128,6 +128,39 @@ jobs:
           fi
       - name: Test daemon dependency boundary gates
         run: python3 .github/scripts/test_daemon_dependency_gates.py
+      # One Wasmtime engine per process, shared with one linker and one `InstancePre` per
+      # provider; every invocation gets a fresh, empty store. A second engine duplicates
+      # Cranelift's compiled-code working set and reintroduces per-request compilation.
+      # Production code only: `crates/*/src`, minus `#[cfg(test)]` module files (`tests.rs`)
+      # and any `tests/` directory, which may build throwaway engines freely.
+      - name: Verify one Wasmtime engine per process
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `[^A-Za-z0-9_]` before `Engine::new(` admits `wasmtime::Engine::new(` and
+          # rejects `PolicyEngine::new(`.
+          engines=$(grep -rEn '(^|[^A-Za-z0-9_])Engine::new\(' --include='*.rs' crates/*/src \
+            | grep -vE '(/tests\.rs:|/tests/)' || true)
+          if [ "$(grep -c . <<<"$engines" || true)" -ne 1 ] \
+            || [[ "$engines" != crates/dekopon-provider-sdk/src/host.rs:* ]]; then
+            echo 'expected exactly one wasmtime Engine::new in production code, in crates/dekopon-provider-sdk/src/host.rs' >&2
+            printf '%s\n' "$engines" >&2
+            exit 1
+          fi
+          callers=$(grep -rn 'host::engine(' --include='*.rs' crates/ \
+            | grep -v '^crates/dekopon-provider-sdk/' || true)
+          if [ "$(grep -c . <<<"$callers" || true)" -ne 1 ] \
+            || [[ "$callers" != crates/dekopon-broker-host/src/lib.rs:* ]]; then
+            echo 'expected exactly one host::engine( call site outside dekopon-provider-sdk, in crates/dekopon-broker-host/src/lib.rs' >&2
+            printf '%s\n' "$callers" >&2
+            exit 1
+          fi
+          tree=$(cargo tree --locked -p dekopond --edges normal --prefix none)
+          if [ "$(grep -ci wasmtime <<<"$tree" || true)" -ne 0 ]; then
+            echo 'the gateway must link no wasmtime' >&2
+            printf '%s\n' "$tree" >&2
+            exit 1
+          fi
       - name: Format, lint, and test Rust provider examples
         env:
           CARGO_TARGET_DIR: target/provider-example-native
