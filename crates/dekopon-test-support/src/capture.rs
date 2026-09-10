@@ -35,6 +35,8 @@ pub enum Record {
         name: &'static str,
         /// Every field rendered as ` name=value`.
         fields: String,
+        /// The name of the span this one was created under, when it had a parent.
+        parent: Option<String>,
     },
 }
 
@@ -100,7 +102,22 @@ impl CaptureLayer {
         self.records()
             .into_iter()
             .filter_map(|record| match record {
-                Record::Span { name, fields } => Some((name, fields)),
+                Record::Span { name, fields, .. } => Some((name, fields)),
+                Record::Event { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Every span's name paired with the name of the span it was created under.
+    ///
+    /// Separate from [`Self::spans`] because parenting is what a trace *is*: a test that only reads
+    /// names and fields cannot tell one complete trace from a pile of unrelated roots.
+    #[must_use]
+    pub fn span_parents(&self) -> Vec<(&'static str, Option<String>)> {
+        self.records()
+            .into_iter()
+            .filter_map(|record| match record {
+                Record::Span { name, parent, .. } => Some((name, parent)),
                 Record::Event { .. } => None,
             })
             .collect()
@@ -170,7 +187,7 @@ fn render<'a>(records: impl Iterator<Item = &'a Record>) -> String {
                 output.push_str(target);
                 output.push_str(fields);
             }
-            Record::Span { name, fields } => {
+            Record::Span { name, fields, .. } => {
                 output.push_str(name);
                 output.push_str(fields);
             }
@@ -203,14 +220,20 @@ where
     fn on_new_span(
         &self,
         attributes: &tracing::span::Attributes<'_>,
-        _id: &tracing::span::Id,
-        _context: Context<'_, S>,
+        id: &tracing::span::Id,
+        context: Context<'_, S>,
     ) {
         let mut fields = String::new();
         attributes.record(&mut Visitor(&mut fields));
         self.push(Record::Span {
             name: attributes.metadata().name(),
             fields,
+            // Read back from the registry rather than from `attributes`, so an explicit
+            // `parent:` and an inherited contextual parent are reported the same way.
+            parent: context
+                .span(id)
+                .and_then(|span| span.parent())
+                .map(|parent| parent.metadata().name().to_owned()),
         });
     }
 
@@ -228,6 +251,9 @@ where
         self.push(Record::Span {
             name: span.metadata().name(),
             fields,
+            parent: span
+                .parent()
+                .map(|parent| parent.metadata().name().to_owned()),
         });
     }
 

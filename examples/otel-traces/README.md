@@ -29,9 +29,9 @@ JSON ingestion API and checks its per-record success/failure counts. Native
 shared formatter; records outside valid context have neither ID. The fixture enables only `wasmtime::runtime::code_memory` debug
 logging to obtain existing broker compilation records without compiler debug noise.
 
-The bounded queries require `gateway.message`, `gateway.session`, `broker.invocation`,
-`provider.compile`, and `provider.invoke`. Gateway/session/invocation/provider invocation
-share a trace; startup compilation legitimately has its own. Each daemon's independently
+The bounded queries require `transport.receive`, `gateway.message`, `gateway.session`,
+`broker.invocation`, `provider.compile`, and `provider.invoke`. Receipt/gateway/session/invocation/provider
+invocation share a trace; startup compilation legitimately has its own. Each daemon's independently
 retrieved native log pair must match an actual exported span, not a query-manufactured
 ID. Queries fail on partial or saturated results, and remote log counts must equal
 shipped counts. Payload and fake-credential sentinels are rejected across local stdout,

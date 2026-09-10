@@ -194,7 +194,7 @@ if [ "$observed" -ne 1 ]; then
   exit 1
 fi
 
-for operation_name in gateway.message gateway.session broker.invocation provider.compile provider.invoke; do
+for operation_name in transport.receive gateway.message gateway.session broker.invocation provider.compile provider.invoke; do
   jq -e --arg service "$service_name" --arg operation_name "$operation_name" \
     'any(.hits[]?; .service_name == $service and .operation_name == $operation_name)' \
     "$temporary/search.json" >/dev/null || {
@@ -208,7 +208,7 @@ if grep -Fq "$sentinel" "$temporary/search.json"; then
   exit 1
 fi
 
-for operation_name in gateway.session broker.invocation provider.invoke; do
+for operation_name in transport.receive gateway.session broker.invocation provider.invoke; do
   jq -e --arg service "$service_name" --arg operation "$operation_name" '
     [.hits[] | select(.service_name == $service and .operation_name == "gateway.message") | .trace_id] as $ids
     | any(.hits[]; .service_name == $service and .operation_name == $operation

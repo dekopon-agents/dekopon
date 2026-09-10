@@ -565,15 +565,24 @@ fn attributed_prompt(subject: &dekopon_core::ExternalSubject, text: &str) -> Str
 pub(crate) async fn run_session(
     runner: Arc<SessionRunner>,
     route: BoundRoute,
-    message: InboundMessage,
+    mut message: InboundMessage,
     replier: Arc<dyn ChatReplier>,
 ) {
-    let span = tracing::info_span!(
-        "gateway.message",
-        transport = %message.transport,
-        agent = %route.agent,
-        outcome = tracing::field::Empty
-    );
+    // The trace already exists: the transport opened `transport.receive` when the envelope arrived,
+    // which is what puts the acknowledgment and the routing decision in front of this span rather
+    // than outside the trace entirely. Taking the handle out of the message parents this span under
+    // it and closes it here, so `transport.receive` measures receipt and dispatch instead of the
+    // whole session it started.
+    let span = {
+        let received = std::mem::replace(&mut message.receive_span, tracing::Span::none());
+        tracing::info_span!(
+            parent: &received,
+            "gateway.message",
+            transport = %message.transport,
+            agent = %route.agent,
+            outcome = tracing::field::Empty
+        )
+    };
     let outcome = execute(runner, route, message, replier)
         .instrument(span.clone())
         .await;

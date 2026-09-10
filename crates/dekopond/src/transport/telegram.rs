@@ -12,6 +12,7 @@ use dekopon_broker_protocol::ChatTransportKind;
 use dekopon_core::{ExternalSubject, Redacted};
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
+use tracing::Span;
 
 use crate::{
     asset::{AssetSourceRef, PendingAsset},
@@ -19,8 +20,8 @@ use crate::{
     transport::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
         DeliveryReceipt, InboundMessage, OutboundReply, ReplyTarget, TextUnit, TransportError,
-        TransportEvent, TransportIdentity, bound_inbound, floor_boundary, reconnect_delay,
-        retry_after_from_body, split_message,
+        TransportEvent, TransportIdentity, bound_inbound, floor_boundary, receive_span,
+        reconnect_delay, retry_after_from_body, split_message,
     },
 };
 
@@ -113,10 +114,17 @@ impl TelegramTransport {
             let Some(update_id) = update["update_id"].as_i64() else {
                 continue;
             };
-            // Advance first, unconditionally. An update this daemon chooses not to route still has
-            // to be acknowledged, or the next poll returns it forever.
-            self.offset = self.offset.max(update_id + 1);
-            if let Some(message) = self.routable(&update["message"])? {
+            // One span per poll item, opened before the update is read, so the offset advance that
+            // acknowledges it and the decision not to route it are both inside the item's trace.
+            let received = receive_span(ChatTransportKind::Telegram);
+            let routed = received.in_scope(|| {
+                // Advance first, unconditionally. An update this daemon chooses not to route still
+                // has to be acknowledged, or the next poll returns it forever.
+                self.offset = self.offset.max(update_id + 1);
+                self.routable(&update["message"], &received)
+            })?;
+            if let Some(message) = routed {
+                received.record("message.id", message.message_id.as_str());
                 self.pending.push_back(message);
             }
         }
@@ -124,7 +132,11 @@ impl TelegramTransport {
         Ok(())
     }
 
-    fn routable(&self, message: &Value) -> Result<Option<InboundMessage>, TransportError> {
+    fn routable(
+        &self,
+        message: &Value,
+        received: &Span,
+    ) -> Result<Option<InboundMessage>, TransportError> {
         let (Some(from), Some(chat), Some(message_id)) = (
             message["from"].as_object(),
             message["chat"].as_object(),
@@ -198,6 +210,7 @@ impl TelegramTransport {
                 chat_id,
                 message_thread_id,
             }),
+            receive_span: received.clone(),
         }))
     }
 

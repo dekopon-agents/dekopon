@@ -214,12 +214,29 @@ derived.
 
 ## Gateway spans
 
-`dekopond` wraps each routed chat message in two spans of its own:
+`dekopond` opens a message's trace in the transport that received it and wraps the routed message in
+two further spans of its own:
 
 | Span | Fields |
 |---|---|
+| `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`; the trace root |
 | `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `busy`, `failed`, `cancelled`, `reply-failed`) |
 | `gateway.session` | `agent`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
+
+`transport.receive` is one span per receipt, opened before the payload is parsed, so Slack's
+envelope acknowledgment, WhatsApp's HMAC signature check and its 200, Telegram's `offset` advance,
+Discord's loop-prevention and addressing decisions, and the local transport's line parse are all
+inside the trace of the message they concern — as is routing itself, so a `gateway_message_ignored`
+record says why inside the message's own trace. `gateway.message` nests under it and closes it, so
+the receive span measures receipt and dispatch rather than the session it started.
+
+`message.id` is the service's own identifier for the turn — a Slack `ts`, a Discord snowflake, a
+Telegram `message_id`, a WhatsApp `wamid`, the development transport's boot-scoped counter — and is
+recorded once the payload has been parsed far enough to carry one. A receipt that routes nothing
+closes without it, which is the trace that answers "why did the bot not reply"; so does a refused
+WhatsApp delivery. A WhatsApp delivery carrying more than one message leaves it unset and parents
+every message's `gateway.message` under the one delivery. Neither the sender nor the message text
+goes on this span: those stay on the `gateway.message.received` log event below.
 
 | Event | Level | Fields |
 |---|---|---|
@@ -589,7 +606,7 @@ readability-for-metadata trade, not a free win.
 
 One generated OpenTelemetry trace links the command to spans such as:
 
-- `gateway.message`, `gateway.session`, and `prompt.session`;
+- `transport.receive`, `gateway.message`, `gateway.session`, and `prompt.session`;
 - `process.run` and `process.node` at `DEBUG` for process-lifecycle work;
 - `prompt.model_turn` and `model.complete`, with `chatgpt.refresh` nested inside the latter whenever
   a ChatGPT subscription credential is rotated or adopted — it carries `forced`, `outcome`
@@ -715,8 +732,9 @@ inspect traces in the UI.
 
 `examples/otel-traces/smoke-test.sh` is the repository-level black-box check. It runs real broker
 and gateway processes, a stdlib model stub, and one private local-transport turn that executes an
-authorized echo provider. It asserts `gateway.message`, `gateway.session`, `broker.invocation`,
-`provider.compile`, and `provider.invoke`, including cross-process invocation trace continuity. A
+authorized echo provider. It asserts `transport.receive`, `gateway.message`, `gateway.session`,
+`broker.invocation`, `provider.compile`, and `provider.invoke`, including cross-process invocation
+trace continuity from the transport's receipt onward. A
 smoke-only stdout shipper checks ingestion-record counts; complete bounded remote log queries
 independently correlate each daemon's native ID pair with an actual exported span. Startup
 compilation may have a separate trace. Local, shipped, and remote records must exclude payload and

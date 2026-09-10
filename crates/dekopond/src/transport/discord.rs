@@ -15,6 +15,7 @@ use futures_util::{SinkExt as _, StreamExt as _, future::BoxFuture};
 use serde_json::{Value, json};
 use tokio::{net::TcpStream, sync::Mutex, time::Instant};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
+use tracing::Span;
 
 use crate::{
     asset::{AssetSourceRef, PendingAsset},
@@ -23,7 +24,7 @@ use crate::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
         DeliveryReceipt, InboundMessage, OutboundReply, ReplyTarget, SeenIds, TextUnit,
         TransportError, TransportEvent, TransportIdentity, bound_inbound, floor_boundary,
-        jitter_below, reconnect_delay, retry_after_from_body, split_message,
+        jitter_below, receive_span, reconnect_delay, retry_after_from_body, split_message,
     },
 };
 
@@ -400,11 +401,21 @@ impl DiscordTransport {
                         Ok(PumpResult::Ready)
                     }
                     "RESUMED" => Ok(PumpResult::Ready),
-                    "MESSAGE_CREATE" => self.routable(&frame["d"]).map(|message| {
-                        message.map_or(PumpResult::Idle, |message| {
-                            PumpResult::Message(Box::new(message))
+                    // One span per inbound message event, opened before the payload is read, so
+                    // the loop-prevention and addressing decisions that may drop it are inside the
+                    // event's own trace rather than nowhere. Heartbeats and session control open
+                    // none: they carry no message and route nothing.
+                    "MESSAGE_CREATE" => {
+                        let received = receive_span(ChatTransportKind::Discord);
+                        let routed = received.in_scope(|| self.routable(&frame["d"], &received))?;
+                        Ok(match routed {
+                            Some(message) => {
+                                received.record("message.id", message.message_id.as_str());
+                                PumpResult::Message(Box::new(message))
+                            }
+                            None => PumpResult::Idle,
                         })
-                    }),
+                    }
                     _ => Ok(PumpResult::Idle),
                 }
             }
@@ -461,7 +472,11 @@ impl DiscordTransport {
             .map_err(|source| TransportError::Request(Box::new(source)))
     }
 
-    fn routable(&mut self, message: &Value) -> Result<Option<InboundMessage>, TransportError> {
+    fn routable(
+        &mut self,
+        message: &Value,
+        received: &Span,
+    ) -> Result<Option<InboundMessage>, TransportError> {
         let message_type = message["type"].as_u64().unwrap_or_default();
         if !matches!(message_type, 0 | 19) {
             return Ok(None);
@@ -532,6 +547,7 @@ impl DiscordTransport {
             activity: (self.activity == ActivityMode::Native).then(|| ActivityTarget::Discord {
                 channel_id: channel_id.to_owned(),
             }),
+            receive_span: received.clone(),
         }))
     }
 

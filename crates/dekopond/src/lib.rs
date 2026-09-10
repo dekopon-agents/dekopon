@@ -315,7 +315,20 @@ where
                 };
                 match event {
                     TransportEvent::Message(message) => {
-                        dispatch(&runner, &routes, &identities, &repliers, &mut sessions, *message);
+                        // Routing runs inside the transport's receive span, so a message dropped as
+                        // unrouted or unaddressed says why inside its own trace instead of leaving
+                        // an orphan debug record an operator cannot tie to anything.
+                        let received = message.receive_span.clone();
+                        received.in_scope(|| {
+                            dispatch(
+                                &runner,
+                                &routes,
+                                &identities,
+                                &repliers,
+                                &mut sessions,
+                                *message,
+                            );
+                        });
                     }
                     TransportEvent::SessionStopped(request) => {
                         stop_session(&runner, &mut sessions, request);
