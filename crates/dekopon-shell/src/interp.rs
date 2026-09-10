@@ -225,7 +225,6 @@ pub(crate) fn run(
         stdin: Vec::new(),
         stderr_capture: Vec::new(),
         curl_capability: curl_capability.map(str::to_owned),
-        allow_clock: limits.allow_clock,
         counters: telemetry::ScriptCounters::default(),
         last_status: ExitCode::SUCCESS,
         last_substitution_status: ExitCode::SUCCESS,
@@ -300,8 +299,6 @@ struct Evaluator<'a> {
     /// its own `2>` collects only its own and then restores the function's.
     stderr_capture: Vec<StderrCapture>,
     curl_capability: Option<String>,
-    /// Whether `date` may read the host wall clock; see [`crate::Limits::allow_clock`].
-    allow_clock: bool,
     /// Per-script command totals, and the cap on how many command spans reach INFO.
     counters: telemetry::ScriptCounters,
     last_status: ExitCode,
@@ -1552,7 +1549,6 @@ impl Evaluator<'_> {
                         budget: &mut self.budget,
                         buffers: &mut self.buffers,
                         curl_capability: self.curl_capability.as_deref(),
-                        allow_clock: self.allow_clock,
                     };
                     // The one place a piped value has to become owned. A pipeline stage's own
                     // output is held by nobody else and moves straight through; a function frame's
@@ -1636,7 +1632,6 @@ impl Evaluator<'_> {
                         budget: &mut self.budget,
                         buffers: &mut self.buffers,
                         curl_capability: self.curl_capability.as_deref(),
-                        allow_clock: self.allow_clock,
                     };
                     context.invoke_capability(&capability, input)
                 };
@@ -1665,7 +1660,6 @@ impl Evaluator<'_> {
                         budget: &mut self.budget,
                         buffers: &mut self.buffers,
                         curl_capability: self.curl_capability.as_deref(),
-                        allow_clock: self.allow_clock,
                     };
                     context.invoke_capability(command, input)
                 };
