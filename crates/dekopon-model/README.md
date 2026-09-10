@@ -11,13 +11,14 @@
 - multimodal message content, where a message carries `ContentPart`s — text, images, documents —
   instead of a single string.
 
-A message is text unless it is built with `ModelMessage::user_with_parts`, and a text message
-serializes to exactly the bytes it did before parts existed on both wire formats. Attachment bytes
-are encoded only while a request is being built: `ModelMessage`'s own `Debug` and `Serialize` render
-a summary instead, because those are what reach the prompt transcript in the audit log. `Serialize`
-writes `[image/png, 219136 bytes]` for an image and `[report.pdf (application/pdf), 219136 bytes]`
-for a file; `Debug` writes the same counts as a `bytes: 219136` field. The count is raw bytes, never
-a scaled unit.
+A message is text unless it is built with `ModelMessage::user_with_parts`. A text-only message
+serializes as a bare string on the chat-completions wire and as one `input_text` part on
+Responses. Attachment bytes are encoded only while a request is being built: `ModelMessage`'s own
+`Debug` and `Serialize` render a summary instead, because those are what reach the prompt
+transcript in the audit log. `Serialize` writes
+`[image/png, 219136 bytes]` for an image and `[report.pdf (application/pdf), 219136 bytes]`
+for a file; `Debug` writes the same counts as a `bytes: 219136` field. The count is raw bytes,
+never a scaled unit.
 
 `GeneratedImage` renders only media type and byte count under `Debug`; its raw bytes are exposed
 only to the embedding delivery path. The Images client never reuses the undocumented ChatGPT/Codex
@@ -26,4 +27,5 @@ subscription endpoint and never accepts a model-selected endpoint.
 The gateway executable owns account lifecycle through `dekopond auth`; execution clients such as
 external embeddings consume the resulting credentials. Model credentials are never passed to Wasm
 provider components. [`docs/inference.md`](../../docs/inference.md) traces these types into literal
-ChatGPT wire JSON and distinguishes cache affinity, gateway conversation history, optional broker-provider durable chat-turn retrieval, and broader agent memory.
+ChatGPT wire JSON and distinguishes cache affinity, gateway conversation history, optional
+broker-provider durable chat-turn retrieval, and broader agent memory.

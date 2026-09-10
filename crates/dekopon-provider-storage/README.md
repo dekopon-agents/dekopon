@@ -18,9 +18,8 @@ invocation failure, without invocation-wide rollback.
 dekopon-provider-storage = { version = "0.12", default-features = false, features = ["jsonl"] }
 ```
 
-`0.12` resolves once the interrupted `v0.12.0` crates.io publication is recovered, as described
-under the root README's [crates.io](../../README.md#cratesio) section; until then `0.11.1` is the
-newest `dekopon-provider-storage` on crates.io.
+When crates.io does not carry `0.12`, take the tap or the archives
+([crates.io](../../README.md#cratesio)).
 
 The in-tree [`storage-probe`](../../examples/providers/storage-probe/README.md) fixture depends on
 the crate by `path` and selects `durable-files` the same way.

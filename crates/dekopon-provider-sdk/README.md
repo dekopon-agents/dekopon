@@ -2,7 +2,7 @@
 
 Rust guest SDK for Dekopon WebAssembly component providers.
 
-**Start here:** [Build and run an import-free Wasm provider with Rust](https://dekopon-agents.github.io/guides/provider-sdk/) is a reproducible walkthrough pinned to v0.7.0. Every release since keeps the same provider contract, so the walkthrough still applies to this tree; follow the guide's exact pins rather than mixing release versions.
+**Start here:** [Build and run an import-free Wasm provider with Rust](https://dekopon-agents.github.io/guides/provider-sdk/) is a reproducible walkthrough of the provider contract. Follow its exact pins rather than mixing versions across releases.
 
 Providers bundled with Dekopon consume this same public SDK and runtime contract; they are ordinary components, not privileged plugins.
 
@@ -62,7 +62,7 @@ and `resolve-command` a compiled component offers (the newer one wins when both 
 `check_command_export` is the load gate a manifest declaring `commandWords` must pass,
 `command_input_bytes` is what a host counts against its input bound for one run, and
 `parse_command_run` decodes either export's answer into one `CommandRunOutcome`. It pulls in
-Wasmtime. Each host still owns its own linker and its own way of interrupting a guest that runs too
+Wasmtime. Each host owns its own linker and its own way of interrupting a guest that runs too
 long.
 
 ## WIT package
@@ -76,11 +76,11 @@ wkg get \
   dekopon:provider@0.3.0
 ```
 
-The package contains three worlds and no imports: `provider` exports exactly `describe` and `invoke`; `provider-commands` includes it and adds `resolve-command`; `provider-cli` includes it and adds `run-command`. They are separate so a host can require the base contract and look the command export up by name, which keeps components built against `dekopon:provider@0.1.0` and `@0.2.0` loadable and a `0.2.0` `resolve-command` guest working on the same shell path. A host that finds both exports calls `run-command`. Publishing the package makes the existing authoring contract available to component tooling; it does not add host functions or runtime authority.
+The package contains three worlds and no imports: `provider` exports exactly `describe` and `invoke`; `provider-commands` includes it and adds `resolve-command`; `provider-cli` includes it and adds `run-command`. They are separate so a host can require the base contract and look the command export up by name, which keeps components built against `dekopon:provider@0.1.0` and `@0.2.0` loadable and a `0.2.0` `resolve-command` guest working on the same shell path. A host that finds both exports calls `run-command`. The published package is an authoring contract; it adds no host function and no runtime authority.
 
 ## Command-line providers
 
-A provider's command words can behave like the upstream command-line tool: `gh --help` renders a help page on stdout at status 0, `gh bogus` prints a usage error on stderr at status 2, `gh pr view 7` proposes `gh.pull-request.read` exactly as before, and `echo '{…}' | gh api --input -` receives the piped value. Declare the words in the manifest's `commandWords`, implement `Provider::run_command`, generate bindings for a world including `dekopon:provider/provider-cli@0.3.0`, and export with `export_provider_with_cli!`:
+A provider's command words behave like the upstream command-line tool: `gh --help` renders a help page on stdout at status 0, `gh bogus` prints a usage error on stderr at status 2, `gh pr view 7` proposes `gh.pull-request.read`, and `echo '{…}' | gh api --input -` receives the piped value. Declare the words in the manifest's `commandWords`, implement `Provider::run_command`, generate bindings for a world including `dekopon:provider/provider-cli@0.3.0`, and export with `export_provider_with_cli!`:
 
 ```wit
 world provider {
@@ -88,7 +88,7 @@ world provider {
 }
 ```
 
-`run_command` returns one of three things. `CommandRun::Proposal` is a capability proposal and is authorized on the same path as any other; `CommandRun::Rendered` is text the guest produced by itself, with separate stdout and stderr and an exit status, so the shell's two streams map one to one (`$(gh bogus)` captures nothing while the error still reaches the model); `Err(ProviderError)` is a decline, reported as a usage error. Two paths implement it; both are documented, and the first is the contract the second builds on.
+`run_command` returns one of three things. `CommandRun::Proposal` is a capability proposal and is authorized on the same path as any other; `CommandRun::Rendered` is text the guest produced by itself, with separate stdout and stderr and an exit status, so the shell's two streams map one to one (`$(gh bogus)` captures nothing while the error reaches the model); `Err(ProviderError)` is a decline, reported as a usage error. Two paths implement it, and the hand-rolled one is the contract the `clap` layer builds on.
 
 ### The hand-rolled baseline
 
@@ -166,7 +166,7 @@ fn run_command(argv: &[String], stdin: Option<&str>) -> Result<CommandRun, Provi
 
 The same `const`-per-capability convention applies: `manifest()` and `dispatch` read one identifier, so a rename is a compile error, and a fixture test that walks every dispatch target and finds it in the manifest closes the remaining gap. The tree is built on every call — a command word runs in a fresh store under a fuel bound, and there is no process-lifetime static to hold it — so keep it declarative. What clap cannot know (whether anything was piped into `-`, a bound on a value) is the dispatch closure's to refuse, as a decline naming its cause.
 
-The SDK's clap is deliberately narrow: `std`, `help`, `usage`, `error-context`, and `derive`, declared directly rather than inherited from the workspace so that two features never reach a guest. `env` would let an argument default from a process environment a component does not have and must never read; `color` pulls in a terminal probe and would put escape sequences in text a model reads. The layer never calls `get_matches` (which reads `std::env::args_os`), `Error::exit`, or `Error::print`; rendered text is returned, never printed. The [`cli-probe`](../../examples/providers/cli-probe/README.md) fixture is this path checked in, with clap's exact help page pinned by its lockfile.
+The SDK's clap feature set is narrow: `std`, `help`, `usage`, `error-context`, and `derive`, declared directly rather than inherited from the workspace so that two features never reach a guest. `env` would let an argument default from a process environment a component does not have and must never read; `color` pulls in a terminal probe and would put escape sequences in text a model reads. The layer never calls `get_matches` (which reads `std::env::args_os`), `Error::exit`, or `Error::print`; rendered text is returned, never printed. The [`cli-probe`](../../examples/providers/cli-probe/README.md) fixture is this path checked in, with clap's exact help page pinned by its lockfile.
 
 ## Command words
 
