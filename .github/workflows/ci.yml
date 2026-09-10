@@ -474,6 +474,8 @@ jobs:
         run: python3 .github/scripts/test_verify_changelog.py
       - name: Test release metadata validation
         run: python3 .github/scripts/test_verify_release_metadata.py
+      - name: Test Homebrew formula rendering
+        run: python3 .github/scripts/test_render_homebrew_formula.py
       - name: Check package shell scripts
         if: ${{ needs.changes.outputs.run_package != 'false' }}
         run: shellcheck .github/scripts/prepare-package-cache.sh
@@ -682,6 +684,41 @@ jobs:
             exit 1
           fi
           grep -q 'broker.httpBind is not supported' "$RUNNER_TEMP/http-bind.err"
+          # The pod's probe authenticates as its own UID, so a broker config that maps only
+          # the gateway's 65533 renders a broker that starts, binds, and never becomes ready.
+          # Refuse it at template time, not at rollout.
+          cat > "$RUNNER_TEMP/foreign-uid-broker.yaml" <<'YAML'
+          apiVersion: dekopon.dev/brokerd/v1alpha1
+          socketPath: /run/dekopon/broker.sock
+          auditPath: /var/lib/dekopon/audit.jsonl
+          brokerPrincipal: local-broker
+          policyRevision: chart-default
+          policiesPath: /etc/dekopon/policies.cedar
+          providers:
+            - /opt/dekopon/providers/echo-provider.wasm
+          identities:
+            - uid: 65533
+              principal: dekopon-pod
+              actor:
+                type: service
+                principal: dekopon-pod
+          constraintSets:
+            echo.echo:
+              provider: echo
+              effect: read-only
+              risk: Low
+              idempotency: idempotent
+              constraints:
+                timeoutMs: 30000
+                maxOutputBytes: 1048576
+          YAML
+          if helm template dekopon charts/dekopon \
+            --set-file broker.config.inline="$RUNNER_TEMP/foreign-uid-broker.yaml" \
+            > "$RUNNER_TEMP/foreign-uid.yaml" 2> "$RUNNER_TEMP/foreign-uid.err"; then
+            echo "broker identities that omit the pod's own UID were accepted" >&2
+            exit 1
+          fi
+          grep -q "identities must map the broker's own UID 65532" "$RUNNER_TEMP/foreign-uid.err"
       # The drains run in sequence, so the pod's grace has to cover their sum. A guard that never
       # fires is not a guard: render the two shapes that must be refused and prove the message
       # names the number, not just that something went wrong.

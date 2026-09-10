@@ -44,7 +44,7 @@ class ClassifyCiChangesTests(unittest.TestCase):
 
     def test_direct_binary_source_keeps_path_installation_coverage(self) -> None:
         self.assert_selected(
-            ["crates/dekopon-run/src/main.rs"],
+            ["crates/dekopond/src/main.rs"],
             "run_rust",
             "run_otel",
             "run_cli_install",
@@ -127,6 +127,7 @@ class ClassifyCiChangesTests(unittest.TestCase):
             ".github/scripts/check_docs_duplicates.py",
             ".github/scripts/test_daemon_dependency_gates.py",
             ".github/scripts/render-homebrew-formula.py",
+            ".github/scripts/test_render_homebrew_formula.py",
         ):
             with self.subTest(path=path):
                 self.assert_selected([path], *CATEGORIES)

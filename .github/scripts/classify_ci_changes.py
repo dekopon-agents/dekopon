@@ -33,6 +33,7 @@ FULL_CI_INPUTS = {
     ".github/scripts/ci_metrics.sh",
     ".github/scripts/check_docs_duplicates.py",
     ".github/scripts/render-homebrew-formula.py",
+    ".github/scripts/test_render_homebrew_formula.py",
 }
 
 RUST_ROOT_INPUTS = {
