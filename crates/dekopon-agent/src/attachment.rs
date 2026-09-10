@@ -414,10 +414,11 @@ impl ChatAssetRefusal {
 
 /// Where a session's broker leg gets one chat attachment's bytes for a capability input.
 ///
-/// Separate from the model-facing attachment tool on purpose. That tool spends a session budget on
-/// showing a *model* a file; this spends a per-invocation budget on handing bytes to an authorized
-/// capability, and neither may consume the other's allowance. An embedder that supplies no source
-/// expands no marker, which is what leaves `dekopon-run` exactly as capable as before.
+/// Separate from the model-facing attachment tool on purpose. That tool spends its own session
+/// budget on showing a *model* a file; this spends the per-invocation and per-session allowances in
+/// [`ChatAssetInputs`] on handing bytes to an authorized capability, and neither side may consume the
+/// other's. An embedder that supplies no source expands no marker, which is what leaves every
+/// other embedder exactly as capable as before.
 pub trait ChatAssetSource: Send + Sync {
     /// Returns one attachment's IANA media type and bytes.
     ///
