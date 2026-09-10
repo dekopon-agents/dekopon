@@ -22,10 +22,9 @@ use crate::{
     config::{ActivityMode, DISCORD_ENDPOINT},
     transport::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
-        DeliveryReceipt, InboundMessage, OutboundReply, ReplyTarget, SeenIds, TextUnit,
-        TransportError, TransportEvent, TransportIdentity, bound_inbound, credential_client,
-        floor_boundary, jitter_below, receive_span, reconnect_delay, retry_after_from_body,
-        split_message,
+        InboundMessage, OutboundReply, ReplyTarget, SeenIds, TextUnit, TransportError,
+        TransportEvent, TransportIdentity, bound_inbound, credential_client, floor_boundary,
+        jitter_below, receive_span, reconnect_delay, retry_after_from_body, split_message,
     },
 };
 
@@ -660,7 +659,7 @@ impl ChatReplier for DiscordReplier {
         &self,
         target: ReplyTarget,
         reply: OutboundReply,
-    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
+    ) -> BoxFuture<'_, Result<(), TransportError>> {
         Box::pin(async move {
             let ReplyTarget::Discord {
                 channel_id,
@@ -674,8 +673,7 @@ impl ChatReplier for DiscordReplier {
                 return Err(TransportError::Response);
             }
             let OutboundReply { text, mut images } = reply;
-            let mut accepted = 0_usize;
-            let mut last_id = None;
+            let mut accepted = false;
             // The REST lock is taken per request rather than per reply. One answer's chunks still
             // arrive in order because this loop awaits each one, and no second answer can be
             // posting into the same conversation at the same time — admission control serializes a
@@ -711,17 +709,12 @@ impl ChatReplier for DiscordReplier {
                         .await
                 };
                 match result {
-                    Ok(id) => {
-                        accepted += 1;
-                        last_id = Some(id);
-                    }
-                    Err(_) if accepted > 0 => return Err(TransportError::PartialDelivery),
+                    Ok(()) => accepted = true,
+                    Err(_) if accepted => return Err(TransportError::PartialDelivery),
                     Err(error) => return Err(error),
                 }
             }
-            Ok(DeliveryReceipt::new(
-                last_id.ok_or(TransportError::Response)?,
-            ))
+            accepted.then_some(()).ok_or(TransportError::Response)
         })
     }
 }
@@ -802,11 +795,7 @@ impl ChatActivity for DiscordReplier {
 }
 
 impl DiscordReplier {
-    async fn create_message(
-        &self,
-        channel_id: &str,
-        body: &Value,
-    ) -> Result<String, TransportError> {
+    async fn create_message(&self, channel_id: &str, body: &Value) -> Result<(), TransportError> {
         let url = format!(
             "{}/api/v{API_VERSION}/channels/{channel_id}/messages",
             self.endpoint
@@ -847,7 +836,7 @@ impl DiscordReplier {
             if !is_snowflake(response_id) || response_channel != channel_id {
                 return Err(TransportError::Response);
             }
-            return Ok(response_id.to_owned());
+            return Ok(());
         }
     }
 
@@ -856,7 +845,7 @@ impl DiscordReplier {
         channel_id: &str,
         body: &Value,
         images: Vec<GeneratedImage>,
-    ) -> Result<String, TransportError> {
+    ) -> Result<(), TransportError> {
         let url = format!(
             "{}/api/v{API_VERSION}/channels/{channel_id}/messages",
             self.endpoint
@@ -955,7 +944,7 @@ impl DiscordReplier {
             if !is_snowflake(response_id) || response_channel != channel_id || !accepted_images {
                 return Err(TransportError::Response);
             }
-            return Ok(response_id.to_owned());
+            return Ok(());
         }
     }
 

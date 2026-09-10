@@ -50,8 +50,8 @@ use crate::{
     conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
     routes::BoundRoute,
     transport::{
-        AssetFetcher, ChatActivity, ChatReplier, DeliveryReceipt, InboundMessage, OutboundReply,
-        ReplyTarget, SessionStop, ThreadOwnership, TransportError, bound_inbound, bound_outbound,
+        AssetFetcher, ChatActivity, ChatReplier, InboundMessage, OutboundReply, ReplyTarget,
+        SessionStop, ThreadOwnership, TransportError, bound_inbound, bound_outbound,
         credential_from,
     },
 };
@@ -985,19 +985,18 @@ async fn session(
     } else {
         OutboundReply::with_images(delivered_answer.clone(), attachments)
     };
-    let delivery = deliver(replier, message, reply).await;
+    let delivered = deliver(replier, message, reply).await;
     activity.finish_in_background();
-    match delivery {
-        Some(receipt) if receipt.accepted() => {
-            if recordable
-                && memory_surface.is_some()
-                && let Some(claim) = chat_claim
-            {
-                record_delivered_turn(runner, message, claim, delivered_answer).await;
-            }
-            completed_outcome
+    if delivered {
+        if recordable
+            && memory_surface.is_some()
+            && let Some(claim) = chat_claim
+        {
+            record_delivered_turn(runner, message, claim, delivered_answer).await;
         }
-        Some(_) | None => "reply-failed",
+        completed_outcome
+    } else {
+        "reply-failed"
     }
 }
 
@@ -1292,21 +1291,19 @@ fn memory_record_category(error: &MemoryRecordFailure) -> &'static str {
 /// text, every chat service rejects or mangles an oversized post, and one bound at the session
 /// boundary is one place to read rather than three places to keep in agreement.
 async fn answer(replier: &Arc<dyn ChatReplier>, message: &InboundMessage, text: &str) -> bool {
-    deliver(replier, message, OutboundReply::text(bound_outbound(text)))
-        .await
-        .is_some()
+    deliver(replier, message, OutboundReply::text(bound_outbound(text))).await
 }
 
 async fn deliver(
     replier: &Arc<dyn ChatReplier>,
     message: &InboundMessage,
     reply: OutboundReply,
-) -> Option<DeliveryReceipt> {
+) -> bool {
     match replier.reply(message.reply.clone(), reply).await {
-        Ok(receipt) => Some(receipt),
+        Ok(()) => true,
         Err(error) => {
             tracing::error!(event = "gateway_reply_failed", category = error.category());
-            None
+            false
         }
     }
 }

@@ -19,9 +19,9 @@ use crate::{
     config::ActivityMode,
     transport::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
-        DeliveryReceipt, InboundMessage, OutboundReply, ReplyTarget, TextUnit, TransportError,
-        TransportEvent, TransportIdentity, bound_inbound, credential_client, floor_boundary,
-        receive_span, reconnect_delay, retry_after_from_body, split_message,
+        InboundMessage, OutboundReply, ReplyTarget, TextUnit, TransportError, TransportEvent,
+        TransportIdentity, bound_inbound, credential_client, floor_boundary, receive_span,
+        reconnect_delay, retry_after_from_body, split_message,
     },
 };
 
@@ -477,7 +477,7 @@ impl ChatReplier for TelegramReplier {
         &self,
         target: ReplyTarget,
         reply: OutboundReply,
-    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
+    ) -> BoxFuture<'_, Result<(), TransportError>> {
         Box::pin(async move {
             let ReplyTarget::Telegram {
                 chat_id,
@@ -492,27 +492,23 @@ impl ChatReplier for TelegramReplier {
                 // One `sendPhoto` per attachment; Telegram has no multi-attachment message that also
                 // carries a caption the way a person expects to read it.
                 let caption_fits = text.encode_utf16().count() <= MAX_PHOTO_CAPTION_CHARS;
-                let mut accepted = 0_usize;
-                let mut last = None;
+                let mut accepted = false;
                 for (index, image) in images.into_iter().enumerate() {
                     let caption = (index == 0 && caption_fits).then_some(text.as_str());
                     match self
                         .send_photo(chat_id, reply_to, message_thread_id, caption, image, index)
                         .await
                     {
-                        Ok(receipt) => {
-                            accepted += 1;
-                            last = Some(receipt);
-                        }
+                        Ok(()) => accepted = true,
                         // One attachment already reached the chat, so this is a reply that arrived
                         // in part rather than one that never arrived — the same distinction the text
                         // chunk loop below makes.
-                        Err(_) if accepted > 0 => return Err(TransportError::PartialDelivery),
+                        Err(_) if accepted => return Err(TransportError::PartialDelivery),
                         Err(error) => return Err(error),
                     }
                 }
                 if caption_fits {
-                    return last.ok_or(TransportError::Response);
+                    return accepted.then_some(()).ok_or(TransportError::Response);
                 }
                 return self
                     .send_text_chunks(chat_id, reply_to, message_thread_id, &text, true)
@@ -532,9 +528,11 @@ impl TelegramReplier {
         message_thread_id: Option<i64>,
         text: &str,
         prior_accepted: bool,
-    ) -> Result<DeliveryReceipt, TransportError> {
+    ) -> Result<(), TransportError> {
+        // `accepted` starts from the attachments this reply already posted and decides partial
+        // delivery; `delivered` is about this call alone and decides whether anything went out.
         let mut accepted = prior_accepted;
-        let mut last_receipt = None;
+        let mut delivered = false;
         for (index, chunk) in split_message(text, MAX_MESSAGE_CHARS, TextUnit::Utf16)
             .into_iter()
             .enumerate()
@@ -546,15 +544,15 @@ impl TelegramReplier {
                 .send_text(chat_id, first_text_reply, message_thread_id, chunk)
                 .await
             {
-                Ok(receipt) => {
+                Ok(()) => {
                     accepted = true;
-                    last_receipt = Some(receipt);
+                    delivered = true;
                 }
                 Err(_) if accepted => return Err(TransportError::PartialDelivery),
                 Err(error) => return Err(error),
             }
         }
-        last_receipt.ok_or(TransportError::Response)
+        delivered.then_some(()).ok_or(TransportError::Response)
     }
 
     async fn send_text(
@@ -563,7 +561,7 @@ impl TelegramReplier {
         reply_to: Option<i64>,
         message_thread_id: Option<i64>,
         text: String,
-    ) -> Result<DeliveryReceipt, TransportError> {
+    ) -> Result<(), TransportError> {
         let mut body = json!({ "chat_id": chat_id, "text": text });
         if let Some(reply_to) = reply_to {
             body["reply_to_message_id"] = json!(reply_to);
@@ -592,11 +590,10 @@ impl TelegramReplier {
         let result = response["result"]
             .as_object()
             .ok_or(TransportError::Response)?;
-        let message_id = result
+        let posted = result
             .get("message_id")
             .and_then(Value::as_i64)
-            .filter(|id| *id > 0)
-            .ok_or(TransportError::Response)?;
+            .is_some_and(|id| id > 0);
         let response_chat = result
             .get("chat")
             .and_then(Value::as_object)
@@ -604,10 +601,10 @@ impl TelegramReplier {
             .and_then(Value::as_i64)
             .ok_or(TransportError::Response)?;
         let response_thread = result.get("message_thread_id").and_then(Value::as_i64);
-        if response_chat != chat_id || response_thread != message_thread_id {
+        if !posted || response_chat != chat_id || response_thread != message_thread_id {
             return Err(TransportError::Response);
         }
-        Ok(DeliveryReceipt::new(format!("{chat_id}:{message_id}")))
+        Ok(())
     }
 
     async fn send_photo(
@@ -618,7 +615,7 @@ impl TelegramReplier {
         caption: Option<&str>,
         image: GeneratedImage,
         index: usize,
-    ) -> Result<DeliveryReceipt, TransportError> {
+    ) -> Result<(), TransportError> {
         let filename = image.filename(index);
         #[allow(
             clippy::map_err_ignore,
@@ -659,11 +656,10 @@ impl TelegramReplier {
         let result = response["result"]
             .as_object()
             .ok_or(TransportError::Response)?;
-        let message_id = result
+        let posted = result
             .get("message_id")
             .and_then(Value::as_i64)
-            .filter(|id| *id > 0)
-            .ok_or(TransportError::Response)?;
+            .is_some_and(|id| id > 0);
         let response_chat = result
             .get("chat")
             .and_then(Value::as_object)
@@ -675,10 +671,14 @@ impl TelegramReplier {
             .get("photo")
             .and_then(Value::as_array)
             .is_some_and(|photo| !photo.is_empty());
-        if response_chat != chat_id || response_thread != message_thread_id || !accepted_photo {
+        if !posted
+            || response_chat != chat_id
+            || response_thread != message_thread_id
+            || !accepted_photo
+        {
             return Err(TransportError::Response);
         }
-        Ok(DeliveryReceipt::new(format!("{chat_id}:{message_id}")))
+        Ok(())
     }
 }
 

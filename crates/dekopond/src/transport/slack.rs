@@ -31,10 +31,9 @@ use crate::{
     },
     transport::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
-        DeliveryReceipt, InboundMessage, OutboundReply, ReplyTarget, SeenIds, SessionStop,
-        ThreadClaim, ThreadContinuation, ThreadOwnership, TransportError, TransportEvent,
-        TransportIdentity, bound_inbound, credential_client, floor_boundary, receive_span,
-        reconnect_delay,
+        InboundMessage, OutboundReply, ReplyTarget, SeenIds, SessionStop, ThreadClaim,
+        ThreadContinuation, ThreadOwnership, TransportError, TransportEvent, TransportIdentity,
+        bound_inbound, credential_client, floor_boundary, receive_span, reconnect_delay,
     },
 };
 
@@ -556,7 +555,7 @@ impl ChatReplier for SlackReplier {
         &self,
         target: ReplyTarget,
         reply: OutboundReply,
-    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
+    ) -> BoxFuture<'_, Result<(), TransportError>> {
         Box::pin(async move {
             let ReplyTarget::Slack { channel, thread_ts } = target else {
                 return Err(TransportError::Response);
@@ -631,10 +630,7 @@ impl ChatReplier for SlackReplier {
             if response_channel != expected_channel || !canonical_timestamp(timestamp) {
                 return Err(TransportError::Response);
             }
-            Ok(DeliveryReceipt::new(format!(
-                "{}:{timestamp}",
-                response_channel.to_ascii_lowercase()
-            )))
+            Ok(())
         })
     }
 }
@@ -651,9 +647,8 @@ impl SlackReplier {
         thread_ts: Option<String>,
         text: String,
         images: Vec<GeneratedImage>,
-    ) -> Result<DeliveryReceipt, TransportError> {
-        let mut accepted = 0_usize;
-        let mut last = None;
+    ) -> Result<(), TransportError> {
+        let mut accepted = false;
         for (index, image) in images.into_iter().enumerate() {
             let comment = (index == 0)
                 .then_some(text.as_str())
@@ -662,17 +657,14 @@ impl SlackReplier {
                 .upload_attachment(&channel, thread_ts.as_deref(), comment, image, index)
                 .await
             {
-                Ok(receipt) => {
-                    accepted += 1;
-                    last = Some(receipt);
-                }
+                Ok(()) => accepted = true,
                 // The first attachment is already in the conversation, so this is a reply that
                 // arrived in part rather than one that never arrived.
-                Err(_) if accepted > 0 => return Err(TransportError::PartialDelivery),
+                Err(_) if accepted => return Err(TransportError::PartialDelivery),
                 Err(error) => return Err(error),
             }
         }
-        last.ok_or(TransportError::Response)
+        accepted.then_some(()).ok_or(TransportError::Response)
     }
 
     /// Uploads exactly one attachment and completes it into the conversation.
@@ -683,7 +675,7 @@ impl SlackReplier {
         initial_comment: Option<&str>,
         image: GeneratedImage,
         index: usize,
-    ) -> Result<DeliveryReceipt, TransportError> {
+    ) -> Result<(), TransportError> {
         let filename = image.filename(index);
         let length = image.bytes().len().to_string();
         let described = check_ok(
@@ -762,7 +754,7 @@ impl SlackReplier {
         if !accepted {
             return Err(TransportError::Response);
         }
-        Ok(DeliveryReceipt::new(format!("slack-file:{file_id}")))
+        Ok(())
     }
 }
 

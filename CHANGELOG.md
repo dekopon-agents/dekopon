@@ -252,6 +252,15 @@ All notable changes to Dekopon are documented here. The format is based on
   field with no `=` used to fail the parse outright and now survive as literal text, `U+FFFD`, or an
   empty value. None of them can reach the response — such a `hub.mode` is not `subscribe` and such a
   `hub.verify_token` fails the comparison — so the request still ends in 403, one step later.
+- `ChatReplier::reply` answers `Result<(), TransportError>`, and the crate-private `DeliveryReceipt`
+  it used to return is gone. That value was an opaque redacted string whose one reader asked a
+  boolean that was true by construction: every constructor built it from a non-empty channel or
+  message id. Each transport's echo-back check on the service's answer decides `Ok` against
+  `TransportError::Response` exactly as before — Slack's channel and canonical `ts`, Telegram's
+  chat, thread, positive `message_id` and `photo` array, Discord's snowflake message and attachment
+  ids, WhatsApp's canonical message id — and a reply that reached the chat only in part is still
+  `TransportError::PartialDelivery`, never success. Nothing about redaction changes; the string
+  carried channel and message ids, never tokens.
 - Provider storage applies writes per host call through a direct invocation handle, with namespace, key, quota and private-file isolation retained. Failed invocations can leave completed writes; there is no invocation rollback, crash recovery or automatic generation collection.
 - Durable files are sized by `statat` instead of a full-file in-memory mirror. A positional write,
   truncate, remove, or rename no longer loads the file it changes, which redefines what

@@ -30,9 +30,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::{Instrument as _, Span};
 
 use crate::transport::{
-    ChatReplier, ChatTransport, ConversationKind, DeliveryReceipt, InboundMessage, OutboundReply,
-    ReplyTarget, SeenIds, TextUnit, TransportError, TransportEvent, TransportIdentity,
-    bound_inbound, credential_client, receive_span, split_message,
+    ChatReplier, ChatTransport, ConversationKind, InboundMessage, OutboundReply, ReplyTarget,
+    SeenIds, TextUnit, TransportError, TransportEvent, TransportIdentity, bound_inbound,
+    credential_client, receive_span, split_message,
 };
 
 const MAX_WEBHOOK_BODY_BYTES: usize = 256 * 1024;
@@ -805,7 +805,7 @@ struct WhatsappReplier {
 
 impl WhatsappReplier {
     /// One text message, sent exactly once and never retried.
-    async fn send_text(&self, recipient: &str, body: &str) -> Result<String, TransportError> {
+    async fn send_text(&self, recipient: &str, body: &str) -> Result<(), TransportError> {
         #[allow(
             clippy::map_err_ignore,
             reason = "serializing a serde_json::Value cannot fail: it holds no non-string map keys \
@@ -843,12 +843,14 @@ impl WhatsappReplier {
         if value.get("messaging_product").and_then(Value::as_str) != Some("whatsapp") {
             return Err(TransportError::Response);
         }
-        value
+        if !value
             .pointer("/messages/0/id")
             .and_then(Value::as_str)
-            .filter(|id| canonical_whatsapp_message_id(id))
-            .map(str::to_owned)
-            .ok_or(TransportError::Response)
+            .is_some_and(canonical_whatsapp_message_id)
+        {
+            return Err(TransportError::Response);
+        }
+        Ok(())
     }
 }
 
@@ -857,7 +859,7 @@ impl ChatReplier for WhatsappReplier {
         &self,
         target: ReplyTarget,
         reply: OutboundReply,
-    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
+    ) -> BoxFuture<'_, Result<(), TransportError>> {
         Box::pin(async move {
             let ReplyTarget::WhatsApp { recipient } = target else {
                 return Err(TransportError::Response);
@@ -874,13 +876,9 @@ impl ChatReplier for WhatsappReplier {
                 return Err(TransportError::Response);
             }
             let mut accepted = 0_usize;
-            let mut last_id = None;
             for chunk in split_message(&text, MAX_WHATSAPP_TEXT_CHARS, TextUnit::Scalar) {
                 match self.send_text(&recipient, &chunk).await {
-                    Ok(id) => {
-                        accepted += 1;
-                        last_id = Some(id);
-                    }
+                    Ok(()) => accepted += 1,
                     // Name the cause here: the session only learns that a split answer arrived in
                     // part, and the service code behind that is otherwise discarded.
                     Err(error) if accepted > 0 => {
@@ -894,9 +892,7 @@ impl ChatReplier for WhatsappReplier {
                     Err(error) => return Err(error),
                 }
             }
-            Ok(DeliveryReceipt::new(
-                last_id.ok_or(TransportError::Response)?,
-            ))
+            (accepted > 0).then_some(()).ok_or(TransportError::Response)
         })
     }
 }
@@ -1369,7 +1365,7 @@ mod tests {
                 .build()
                 .expect("client"),
         };
-        let receipt = replier
+        replier
             .reply(
                 ReplyTarget::WhatsApp {
                     recipient: "1603".to_owned(),
@@ -1378,7 +1374,6 @@ mod tests {
             )
             .await
             .expect("reply");
-        assert!(receipt.accepted());
         let request = server.await.expect("server");
         let request = String::from_utf8(request).expect("utf8 request");
         assert!(request.starts_with("POST /v23.0/456/messages HTTP/1.1\r\n"));
@@ -1587,7 +1582,7 @@ mod tests {
         // The session's own outbound bound is twice the WhatsApp ceiling, so this length is
         // reachable from an ordinary answer rather than only from abuse.
         let answer = format!("BEGIN{}END", "x".repeat(MAX_WHATSAPP_TEXT_CHARS));
-        let receipt = replier
+        replier
             .reply(
                 ReplyTarget::WhatsApp {
                     recipient: "1603".to_owned(),
@@ -1596,7 +1591,6 @@ mod tests {
             )
             .await
             .expect("reply");
-        assert!(receipt.accepted());
         let bodies = server.await.expect("server");
         assert_eq!(bodies.len(), 2, "one post per service-sized chunk");
         assert_eq!(bodies.concat(), answer, "no part of the answer is dropped");

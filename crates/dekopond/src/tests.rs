@@ -52,10 +52,9 @@ use crate::{
     },
     transport::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
-        DeliveryReceipt, InboundMessage, MAX_INBOUND_TEXT_BYTES, MAX_OUTBOUND_TEXT_BYTES,
-        OutboundReply, ReplyTarget, ThreadClaim, ThreadContinuation, ThreadOwnership,
-        TransportError, TransportEvent, TransportIdentity, bound_inbound, bound_outbound,
-        credential_value,
+        InboundMessage, MAX_INBOUND_TEXT_BYTES, MAX_OUTBOUND_TEXT_BYTES, OutboundReply,
+        ReplyTarget, ThreadClaim, ThreadContinuation, ThreadOwnership, TransportError,
+        TransportEvent, TransportIdentity, bound_inbound, bound_outbound, credential_value,
     },
 };
 
@@ -2494,7 +2493,7 @@ impl ChatReplier for RecordingReplier {
         &self,
         _target: ReplyTarget,
         reply: OutboundReply,
-    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
+    ) -> BoxFuture<'_, Result<(), TransportError>> {
         Box::pin(async move {
             self.replies.lock().expect("reply lock").push(reply.text);
             self.image_bytes.lock().expect("image reply lock").push(
@@ -2504,7 +2503,7 @@ impl ChatReplier for RecordingReplier {
                     .map(|image| image.bytes().len())
                     .collect(),
             );
-            Ok(DeliveryReceipt::new("test-acceptance"))
+            Ok(())
         })
     }
 }
@@ -2586,13 +2585,13 @@ impl ChatReplier for RecordingSurface {
         &self,
         _target: ReplyTarget,
         reply: OutboundReply,
-    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
+    ) -> BoxFuture<'_, Result<(), TransportError>> {
         Box::pin(async move {
             self.events
                 .lock()
                 .expect("surface event lock")
                 .push(format!("reply:{}", reply.text));
-            Ok(DeliveryReceipt::new("recording-surface"))
+            Ok(())
         })
     }
 }
@@ -2643,13 +2642,13 @@ impl ChatReplier for DelayedSurface {
         &self,
         _target: ReplyTarget,
         _reply: OutboundReply,
-    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
+    ) -> BoxFuture<'_, Result<(), TransportError>> {
         Box::pin(async move {
             self.events
                 .lock()
                 .expect("delayed surface events")
                 .push("reply");
-            Ok(DeliveryReceipt::new("delayed-surface"))
+            Ok(())
         })
     }
 }
@@ -2661,7 +2660,7 @@ impl ChatReplier for PartialDeliveryReplier {
         &self,
         _target: ReplyTarget,
         _reply: OutboundReply,
-    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>> {
+    ) -> BoxFuture<'_, Result<(), TransportError>> {
         Box::pin(async { Err(TransportError::PartialDelivery) })
     }
 }
@@ -7859,7 +7858,7 @@ async fn slack_uploads_one_generated_png_without_sending_the_token_to_the_upload
     *base.lock().expect("base lock") = api.base.clone();
     let replier = slack(&api.base).replier();
 
-    let receipt = replier
+    replier
         .reply(
             ReplyTarget::Slack {
                 channel: "d0123abc".to_owned(),
@@ -7869,7 +7868,6 @@ async fn slack_uploads_one_generated_png_without_sending_the_token_to_the_upload
         )
         .await
         .expect("the complete file share is accepted");
-    assert!(receipt.accepted());
 
     let calls = api.calls();
     assert_eq!(calls.len(), 3);
@@ -7934,7 +7932,7 @@ async fn slack_uploads_each_attachment_and_comments_only_on_the_first() {
     *base.lock().expect("base lock") = api.base.clone();
     let replier = slack(&api.base).replier();
 
-    let receipt = replier
+    replier
         .reply(
             ReplyTarget::Slack {
                 channel: "d0123abc".to_owned(),
@@ -7944,7 +7942,6 @@ async fn slack_uploads_each_attachment_and_comments_only_on_the_first() {
         )
         .await
         .expect("both file shares are accepted");
-    assert!(receipt.accepted());
 
     let calls = api.calls();
     assert_eq!(calls.len(), 6, "three calls per attachment");
@@ -7960,7 +7957,7 @@ async fn slack_uploads_each_attachment_and_comments_only_on_the_first() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn slack_and_telegram_never_issue_receipts_for_non_success_http_statuses() {
+async fn slack_and_telegram_never_accept_non_success_http_statuses() {
     let slack_http = spawn_raw_http_mock(|_| {
         (
             500,
@@ -10084,7 +10081,7 @@ async fn a_long_telegram_answer_is_split_instead_of_being_rejected_whole() {
             ]});
         }
         if path.contains("sendMessage") {
-            // Every chunk is acknowledged as its own message: the receipt is minted from the
+            // Every chunk is acknowledged as its own message: acceptance is read out of the
             // service's answer, so a bare `true` is no longer an accepted delivery.
             return json!({"ok": true, "result": {"message_id": 7, "chat": {"id": -1001}}});
         }
@@ -10485,7 +10482,7 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
     );
     assert_eq!(named.conversation_id, "session-7");
 
-    // The receipt resolves only after the transport writer has completed both `write_all` and
+    // The reply resolves only after the transport writer has completed both `write_all` and
     // `flush`; reading the exact line from the peer proves the kernel-acceptance crossing.
     let reply = tokio::spawn({
         let replier = transport.replier();
@@ -10509,13 +10506,10 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
         text_response.get("images").is_none(),
         "text-only local replies keep their exact legacy shape"
     );
-    assert!(
-        reply
-            .await
-            .expect("reply task completes")
-            .expect("local write and flush are accepted")
-            .accepted()
-    );
+    reply
+        .await
+        .expect("reply task completes")
+        .expect("local write and flush are accepted");
 
     let image_reply = tokio::spawn({
         let replier = transport.replier();
@@ -10557,13 +10551,10 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
             .expect("image data decodes"),
         generated_image().bytes()
     );
-    assert!(
-        image_reply
-            .await
-            .expect("image reply task completes")
-            .expect("image write and flush are accepted")
-            .accepted()
-    );
+    image_reply
+        .await
+        .expect("image reply task completes")
+        .expect("image write and flush are accepted");
 }
 
 // ---------------------------------------------------------------------------
