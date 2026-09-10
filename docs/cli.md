@@ -3,7 +3,6 @@
 `dekopond auth chatgpt {login,status,logout,export}` manages Dekopon's isolated model credential.
 It dispatches synchronously before gateway configuration discovery, telemetry, runtime creation,
 or transport startup. `--config` is required only for ordinary gateway serving and is ignored by auth.
-The standalone catalog CLI has been retired; catalogs remain loaded and validated by `dekopon-config`.
 Daemon serving is documented in [`dekopond.md`](dekopond.md).
 
 ## Commands
@@ -19,7 +18,7 @@ dekopond auth chatgpt export --expose-credential
 
 - `-o, --output <FORMAT>`: `table` (default), `wide`, `json`, `yaml`, or `name`.
 - `--no-color`: disable ANSI color in diagnostics.
-- `--quiet`: suppress successful output; errors still print. Conflicts with `-v`.
+- `--quiet`: suppress successful output; errors print. Conflicts with `-v`.
 - `-v`: emit informational diagnostics and error causes.
 - `-vv`: emit debug diagnostics and debug error context.
 
@@ -38,10 +37,10 @@ Non-parse failures retain their error causes and additional debug context.
 
 `dekopond auth chatgpt export` prints an existing local credential so it can be seeded into a secret store. It exists because device authorization needs a human at a browser: a pod can only ever run on a credential an operator carried out of a local login. It resolves the credential file exactly as `login`, `status`, and `logout` do, including `--auth-file`.
 
-**This is the one Dekopon command whose output is credential material in the clear.** Everywhere else a credential renders a redaction marker. Two gates and a warning make that deliberate rather than incidental:
+**This is the one Dekopon command whose output is credential material in the clear.** Everywhere else a credential renders a redaction marker. Two gates and a warning stand in front of it:
 
 - `--expose-credential` is required. It has no default and no short form, so exporting is something an operator typed, and it is greppable in a shell history or a runbook.
-- Standard output is refused when it is a terminal, because intent does not cover destination: an operator who means to export still should not leave a live refresh token in scrollback, a `tmux` capture, or a screen share. Every intended consumer is a pipe or a redirect. `--allow-terminal` overrides it.
+- Standard output is refused when it is a terminal, because intent does not cover destination: an operator who means to export should not leave a live refresh token in scrollback, a `tmux` capture, or a screen share. Every intended consumer is a pipe or a redirect. `--allow-terminal` overrides it.
 - Both forms warn on standard error that the copy is stale the moment the live credential refreshes, and the Secret manifest repeats that in a comment header, because the manifest outlives the terminal.
 
 | Flag | Meaning |
@@ -57,7 +56,7 @@ Non-parse failures retain their error causes and additional debug context.
 
 The manifest carries the document under the key `chatgpt-auth.json`, matching Dekopon's own file name. Missing, malformed, incomplete, and unsupported-version credential files all fail with exit code `1` and print nothing, so a seeding step never stores a half-formed secret.
 
-The refresh token rotates, so an exported copy is invalidated by the next refresh of the credential it came from. [`chatgpt-credential.md`](chatgpt-credential.md) is the full deployment lifecycle: export, store, seed once into a writable directory, and re-export only on a deliberate rotation.
+The refresh token rotates, so an exported copy is invalidated by the next refresh of the credential it came from. [`chatgpt-credential.md`](chatgpt-credential.md) is the full deployment lifecycle: export, store, seed once into a writable directory, and re-export only on an intentional rotation.
 
 ## Output behavior
 

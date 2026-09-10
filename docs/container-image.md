@@ -2,15 +2,13 @@
 
 Read [`design.md`](design.md) before this document. Packaging changes distribution, not authority:
 the image ships no configuration, no policy, no credentials, and no audit state, and both daemons
-still read owner-owned files that the deployment provides.
+read owner-owned files that the deployment provides.
 
-**Status: current.** [`../Dockerfile`](../Dockerfile) and
-[`../.github/workflows/container-image.yml`](../.github/workflows/container-image.yml) are in the
-repository and build locally today against the `v0.3.0` archives. Publication is a job of
-[`release.yml`](../.github/workflows/release.yml) that runs after the GitHub release and its
-attested archives exist (see [Publication](#publication)); `v0.4.0` is the oldest release with an
-image, and `v0.3.0` and earlier have none. The local build below uses `v0.3.0` only as an example —
-any published tag works.
+[`../Dockerfile`](../Dockerfile) builds the image;
+[`../.github/workflows/container-image.yml`](../.github/workflows/container-image.yml) publishes it
+from an existing release's attested archives (see [Publication](#publication)). Images exist from
+`v0.4.0` onward; earlier tags have none. The local build below stages a release's archives and
+needs no published image.
 
 ## What it is
 
@@ -42,19 +40,15 @@ Nothing is compiled to build this image. `release.yml` builds `dekopon-<version>
 for `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, and `aarch64-apple-darwin`, publishes
 a `.sha256` sidecar for each, and attests them with `actions/attest-build-provenance`. The image
 contains exactly the executables from the two Linux archives; the staging script downloads only
-those.
-
-That is the whole point of the design. A second, independently compiled set of binaries would be
-artifacts nobody has verified, produced by a toolchain that can drift away from the one that built
-the archives users download, at the cost of a native build matrix. Reusing the release's output
-means the image and the tarball are the same bytes, and `sha256sum` proves it.
+those. The image and the tarball are therefore the same bytes, and `sha256sum` proves it. A second,
+independently compiled set of binaries would be artifacts nobody has verified, produced by a
+toolchain that can drift away from the one that built the archives users download.
 
 [`../ci/stage-image-context.sh`](../ci/stage-image-context.sh) verifies before it trusts: it
 downloads each Linux archive, checks it against its published `.sha256`, runs `gh attestation
 verify --repo dekopon-agents/dekopon` on it, and only then extracts the two executables into the
-build context. The workflow runs that script and so does a human building locally — two
-implementations of a verification path would drift, and the local one is the one nobody would
-run. The `Dockerfile` performs no network access at all.
+build context. The workflow and a local build run that one script; the `Dockerfile` performs no
+network access at all.
 
 After building, and before anything is pushed, the workflow extracts each binary back out of both
 platform images and compares its SHA-256 against the archive it came from. Six comparisons, all
@@ -63,21 +57,21 @@ of which must match.
 The runtime base is Debian 13 (glibc 2.41) while the release archives are built on `ubuntu-24.04`.
 Nothing in the release process knows about the image, so the staging script refuses to stage a
 binary that requires a glibc symbol newer than 2.41 (`max_glibc` in `ci/stage-image-context.sh`;
-it mirrors the `FROM` base, so move the two together). Debian 12 (glibc 2.36) held through v0.10.0;
-the v0.11.0 `dekopon` binary names `GLIBC_2.39` for `pidfd_spawnp`/`pidfd_getpid` — weak
-references Rust's std probes and falls back from, but the dynamic linker still refuses a binary
-naming a version node the runtime lacks — which is what forced the move.
+it mirrors the `FROM` base, so move the two together). The dynamic linker refuses a binary that
+names a version node the runtime lacks, even for a symbol Rust's std probes weakly and falls back
+from.
 
 ## The build context is constructed, not filtered
 
 The image needs three things: the release executables, exact checksum- and provenance-verified
-provider components, and the two licences. The staging script copies exactly those into a scratch directory alongside the
-`Dockerfile`, asserts that the result is precisely that twelve-file set, and builds from there.
+provider components, and the two licences. The staging script copies exactly those into a scratch
+directory alongside the `Dockerfile`, asserts that the result is precisely that twelve-file set,
+and builds from there.
 
 The alternative — keeping the whole repository as the context and excluding the rest with a
-`.dockerignore` — is correct only for as long as every file added later stays matched by it. That
-is a standing obligation nobody remembers, and the failure is silent: a new directory quietly joins
-the context, slows every build, and could reach a layer. An allowlist is true by construction.
+`.dockerignore` — is correct only for as long as every file added later stays matched by it. The
+failure is silent: a new directory quietly joins the context, slows every build, and could reach a
+layer. An allowlist is true by construction.
 
 The `Dockerfile` therefore cannot be built from the repository root, and the root `.dockerignore`
 is a single `*` so that trying fails in about a second with a missing `COPY` source rather than
@@ -96,15 +90,14 @@ verification happens while constructing the context.
 `dekopon-brokerd` refuses a provider path that is not a regular file owned by its own euid, that is
 group- or world-writable, or that has more than one link, and it applies the owner and writability
 rule to the containing directory as well (`crates/dekopon-brokerd/src/socket.rs`). It stats with
-`symlink_metadata`, so a symlink to a valid file is still refused. The image therefore ships:
+`symlink_metadata`, so a symlink to a valid file is refused too. The image therefore ships:
 
 - `/opt/dekopon/providers` owned by `65532:65532`, mode `0755`
 - each `.wasm` owned by `65532:65532`, mode `0644`, one link, not a symlink
 
-The `COPY` that places them uses `--chown` and deliberately no `--chmod`, because BuildKit applies
-`--chmod` to the directories it creates as well and a `0644` directory cannot be traversed. The
-components therefore keep the mode they carry in the staged context, which the staging script
-normalises to `0644`.
+The `COPY` that places them uses `--chown` and no `--chmod`, because BuildKit applies `--chmod` to
+the directories it creates as well and a `0644` directory cannot be traversed. The components keep
+the mode they carry in the staged context, which the staging script normalises to `0644`.
 
 The fetched `echo-provider.wasm` is import-free. The other default components import HTTP,
 and fetched optional `memory-chat` imports JSONL. All are loaded only through the broker,
@@ -114,12 +107,11 @@ retention. An operator must name the exact optional file or explicitly scan its 
 `storage-probe` and malicious `memory-reservation-probe` fixtures are not packaged anywhere in
 the image.
 
-`dekopon-brokerd provider sync --locked` has shipped since 0.12.0, but this image-staging path does
-not use it. The current external provider path verifies GitHub build provenance as well as SHA-256
-integrity, while the manager's first exact-reference slice proves byte identity only. Staging may
-use `provider sync --locked` to materialize reviewed OCI digests only if it retains an independent
-`gh attestation verify` (or an equivalent reviewed provenance policy) for every component. Docker
-build itself remains network-free either way.
+Image staging does not use `dekopon-brokerd provider sync --locked`. The external provider path
+verifies GitHub build provenance as well as SHA-256 integrity, while the manager's exact-reference
+slice proves byte identity only. Staging may use `provider sync --locked` to materialize reviewed
+OCI digests only if it retains an independent `gh attestation verify` (or an equivalent reviewed
+provenance policy) for every component. Docker build itself remains network-free either way.
 
 A provider mounted from a volume instead has to satisfy the same rules; a `configMap` or `secret`
 mount will not, because those are symlink farms.
@@ -134,11 +126,10 @@ ci/verify-image-broker.sh ghcr.io/dekopon-agents/dekopon:<VERSION>
 
 The Linux verifier requires Docker, Python 3 and sudo to create broker-owned private files.
 It starts the real broker with the baked echo component and waits under a deadline for the
-socket, which is bound only after compilation and description succeed. New releases also run
-the existing `probe` command; the verifier supplies version-appropriate configuration for
-immutable releases without that command, which prove component-load/startup only. Owned containers and private files
-are removed on exit. This proves the selected release's bytes, not a build of source HEAD.
-There is no replacement general invocation CLI.
+socket, which is bound only after compilation and description succeed, then runs
+`dekopon-brokerd probe` when the image's binary offers that subcommand. Owned containers and
+private files are removed on exit. This proves the selected release's bytes, not a build of
+source HEAD.
 
 In Kubernetes the same selection is `command: ["dekopon-brokerd"]` or `command: ["dekopond"]` with
 `args` carrying `--config`.
@@ -147,17 +138,19 @@ In Kubernetes the same selection is `command: ["dekopon-brokerd"]` or `command: 
 
 - No broker, gateway, or catalog configuration, and no Cedar policy. Every deployment supplies its
   own owner-owned files.
-- No credentials. `dekopon-brokerd` reads an optional legacy credentials file, an optional private
+- No credentials. `dekopon-brokerd` reads an optional credentials file, an optional private
   secret map, and any source bootstrap files the deployment provides; `dekopond` reads environment
   variables the deployment sets. None is baked.
-- No socket or audit log. Those are runtime state on a writable volume.
+- No socket or audit log. Those are runtime state on a writable volume, and `broker.yaml` requires
+  an `auditPath`. *Committed direction:* opt-in sink, off by default; audit is a log record in the
+  trace ([non-goals](design.md#non-goals)).
 - No system CA store dependency. `reqwest` and `ureq` use rustls with compiled-in webpki roots, so
   outbound TLS does not consult `/etc/ssl`.
 
 ## Deployment notes
 
 The chart enforces the [current local process boundary](security-model.md#current-local-process-boundary).
-The image's default UID remains the broker/provider owner; the gateway container overrides it.
+The image's default UID is the broker/provider owner; the gateway container overrides it.
 Private credentials and state do not acquire group permissions. The init container creates
 separate private mounts and the broker-owned IPC directory; a bare `emptyDir` is insufficient.
 See the [chart layout and upgrade instructions](../charts/dekopon/README.md#paths-the-chart-owns).
@@ -167,17 +160,17 @@ See the [chart layout and upgrade instructions](../charts/dekopon/README.md#path
 [`../.github/workflows/container-image.yml`](../.github/workflows/container-image.yml) is a
 reusable workflow. [`release.yml`](../.github/workflows/release.yml) calls it as a job that `needs`
 the job publishing the release, and passes that job's tag. It does not trigger on the `v*.*.*` tag
-push, which would race the archives the image is made of, and it no longer triggers on
-`release: published`, which cannot fire here at all: the release is created by `GITHUB_TOKEN`, and
-GitHub does not start workflow runs from events raised by its own token. The `needs` edge is the
-ordering guarantee — the release, its archives, its `.sha256` sidecars, and their attestations all
-exist before this workflow starts. [`homebrew-tap.yml`](../.github/workflows/homebrew-tap.yml) is
-called the same way. `workflow_dispatch` with a tag re-runs an existing release.
+push, which would race the archives the image is made of, and not on `release: published`, which
+cannot fire here at all: the release is created by `GITHUB_TOKEN`, and GitHub does not start
+workflow runs from events raised by its own token. The `needs` edge is the ordering guarantee — the
+release, its archives, its `.sha256` sidecars, and their attestations all exist before this
+workflow starts. [`homebrew-tap.yml`](../.github/workflows/homebrew-tap.yml) is called the same
+way. `workflow_dispatch` with a tag re-runs an existing release.
 
 Because every instruction is a `COPY`, one runner assembles both platforms in a single build and
 pushes a manifest list directly. There is no per-architecture matrix, no push-by-digest, no digest
-hand-off, and no `imagetools` stitch — and therefore no reason to suppress buildx provenance, which
-now emits provenance and an SBOM per platform. The workflow still asserts that the published tag
+hand-off, and no `imagetools` stitch — and therefore no reason to suppress buildx provenance, so
+the build emits provenance and an SBOM per platform. The workflow asserts that the published tag
 carries exactly `linux/amd64,linux/arm64`, reads the index digest back from the registry, requires
 it to equal what the build pushed, and then attests it:
 
@@ -195,14 +188,14 @@ pointer would contradict that, and it would let a prerelease become the default 
 
 Pull requests that touch the image inputs — the `Dockerfile`, `.dockerignore`, either provider
 fetch/staging script, the workflow, a licence, or a repository-owned component — run every step
-above against the newest published release and
-push nothing. That validates the part a pull request can actually break: the image's layout, the
-provider ownership, and the byte-identity check.
+above against the newest published release and push nothing. That validates the part a pull request
+can actually break: the image's layout, the provider ownership, and the byte-identity check.
 
 ## Build and check it locally
 
-The image is assembled from a release, so stage one first. A release must contain both daemon archives and supported provider inputs; the
-`Dockerfile` copies their bytes without compiling them. This is the same script the workflow runs, with the same arguments.
+The image is assembled from a release, so stage one first. A release must contain both daemon
+archives and supported provider inputs; the `Dockerfile` copies their bytes without compiling them.
+This is the same script the workflow runs, with the same arguments.
 
 ```console
 work=$(mktemp -d)

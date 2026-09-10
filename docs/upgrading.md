@@ -125,7 +125,7 @@ bootstrap limitations.
 - **Delete `allowDevelopmentSubjects` from `broker.yaml` before upgrading the broker.** The field is
   gone, and `broker.yaml` rejects unknown fields, so leaving it is a startup failure rather than a
   value quietly ignored. Delete every `dev.*` `identityMappings` subject and attestor namespace with
-  it: `dev` is no longer a subject service, so those lines no longer parse either. The field was off
+  it: `dev` is not a subject service, so those lines do not parse either. The field was off
   by default and no chart release could set it, so a deployment that never opted in has nothing to
   edit — and no persisted audit log can carry a `dev.*` subject.
 - **Declare `route:` on every chat-memory constraint set before upgrading the broker.** Durable chat
@@ -166,7 +166,7 @@ bootstrap limitations.
   [dekopon-console](https://github.com/dekopon-agents/dekopon-console) pins
   `dekopon-agent = "=0.11.1"` and `dekopon-broker-protocol = "=0.11.1"`, so it still speaks
   `v1alpha1` and cannot talk to a broker built from this tree. It does not merely need a version
-  bump: it calls `BrokerLeg::connect_attested`, which no longer exists, so moving its pin past
+  bump: it calls `BrokerLeg::connect_attested`, which does not exist, so moving its pin past
   0.11.1 is a source change to `crates/dekopon-tui/src/session.rs`. Leave the pin where it is until
   that lands, and do not run the console against an upgraded broker.
 - **The interactive console left this repository.** `dekopon console` and the `dekopon-tui` crate
@@ -184,10 +184,10 @@ bootstrap limitations.
   `apiKeyEnv` out still means the endpoint needs no key, a configured model no route reaches has
   its variable left unread, and `dekopon-run` is unchanged — an unset or blank `--api-key-env`
   variable still means no bearer token. See [`dekopond.md`](dekopond.md#startup-fails-closed).
-- **Model clients no longer follow an ambient `HTTPS_PROXY` or `ALL_PROXY`.** Every
+- **Model clients follow no ambient `HTTPS_PROXY` or `ALL_PROXY`.** Every
   `dekopon-model` transport — the OpenAI-compatible chat client, the ChatGPT subscription client
   and its device-flow login, and the Images client — is built from one agent that sets no proxy
-  and follows no redirect, so an exported proxy variable no longer carries a bearer token, the
+  and follows no redirect, so an exported proxy variable carries no bearer token, the
   device-code exchange, or a prompt through a host nobody named to Dekopon. That is the stance
   `dekopon-http-host` already took for provider HTTP. It reaches `dekopond`, `dekopon-run`, and
   `dekopond auth chatgpt login`; nothing in a configuration file changes, and there is no field or
@@ -367,7 +367,7 @@ update looks like a working deployment with no Working UI.
   [dekopon-provider-gh](https://github.com/dekopon-agents/dekopon-provider-gh) now, an out-of-tree
   provider component fetched and pinned like any other. The container image is unaffected — it still
   stages `gh` at a pinned, attested tag — so an operator running the image has nothing to do; one
-  building a custom image from `examples/providers/` no longer finds `gh` there.
+  building a custom image from `examples/providers/` does not find `gh` there.
 
 ### Chart upgrades
 
