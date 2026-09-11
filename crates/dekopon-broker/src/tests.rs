@@ -593,10 +593,10 @@ fn pre_execution_storage_failures_keep_their_public_category() {
     let reset = super::BrokerError::Storage {
         source: dekopon_storage_host::StorageHostError::Corrupt {
             scope: "authority-pointer",
-            namespace: None,
-            generation: None,
-            path: None,
-            reset: Some("fresh".to_owned()),
+            site: Some(Box::new(dekopon_storage_host::CorruptionSite {
+                reset: Some("fresh".to_owned()),
+                ..dekopon_storage_host::CorruptionSite::default()
+            })),
         },
     };
     assert_eq!(reset.storage_failure_code(), Some("storage-corrupt"));

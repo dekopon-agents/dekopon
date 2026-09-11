@@ -825,15 +825,17 @@ fn a_hard_linked_logical_file_fails_its_own_grant_and_not_the_broker() {
         "hard-link-read",
         StorageAccess::ReadOnly,
     ));
-    let Err(StorageHostError::Corrupt {
-        scope: "private-file",
-        path: Some(path),
-        reset: None,
-        ..
-    }) = &refused
+    let Err(
+        error @ StorageHostError::Corrupt {
+            scope: "private-file",
+            site: Some(site),
+        },
+    ) = &refused
     else {
-        panic!("expected an unreset private-file refusal, got {refused:?}");
+        panic!("expected a private-file refusal naming its site, got {refused:?}");
     };
+    assert!(!error.namespace_reset(), "{error}");
+    let path = site.path.as_ref().expect("the refusal names the file");
     assert!(path.starts_with(&data), "{}", path.display());
     assert_eq!(
         before,
@@ -1638,17 +1640,15 @@ fn a_corrupt_authority_pointer_resets_the_namespace_once() {
     assert!(error.namespace_reset(), "{error}");
     let StorageHostError::Corrupt {
         scope: "authority-pointer",
-        namespace: Some(namespace),
-        generation: Some(generation),
-        path: Some(path),
-        reset: Some(fresh),
+        site: Some(site),
     } = &error
     else {
         panic!("expected a reset authority-pointer corruption, got {error:?}");
     };
-    assert_eq!(*namespace, token);
-    assert_eq!(*generation, previous);
-    assert_eq!(*path, pointer);
+    assert_eq!(site.namespace.as_deref(), Some(token.as_str()));
+    assert_eq!(site.generation.as_deref(), Some(previous.as_str()));
+    assert_eq!(site.path.as_deref(), Some(pointer.as_path()));
+    let fresh = site.reset.as_ref().expect("the fresh generation is named");
     assert_ne!(*fresh, previous);
     let logged = log.events_text();
     assert_eq!(
@@ -1740,19 +1740,17 @@ fn a_corrupt_stable_generation_is_moved_aside_and_reset() {
     let Err(
         error @ StorageHostError::Corrupt {
             scope: "logical-token",
-            generation: Some(generation),
-            reset: Some(fresh),
-            ..
+            site: Some(site),
         },
     ) = &refused
     else {
         panic!("expected a reset logical-token corruption, got {refused:?}");
     };
     assert!(error.namespace_reset());
-    assert_eq!(*generation, stable);
+    assert_eq!(site.generation.as_deref(), Some(stable.as_str()));
     // Stable continuity keeps its deterministic name: the fresh generation takes it, and the
     // corrupt one moved to a new token beside it.
-    assert_eq!(*fresh, stable);
+    assert_eq!(site.reset.as_deref(), Some(stable.as_str()));
     let kept = generations(&base);
     assert_eq!(kept.len(), 2, "{kept:?}");
     let aside = kept
@@ -1845,7 +1843,7 @@ fn symlink_substitution_is_never_followed_at_any_namespace_tree_level() {
             StorageAccess::ReadOnly,
         ));
         assert!(
-            matches!(refused, Err(StorageHostError::Corrupt { reset: None, .. })),
+            matches!(&refused, Err(error @ StorageHostError::Corrupt { .. }) if !error.namespace_reset()),
             "level {level} was followed or reset instead of refused: {refused:?}"
         );
         assert_eq!(

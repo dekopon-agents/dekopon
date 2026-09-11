@@ -145,19 +145,17 @@ impl NamespacePlan {
             Ok(selection) => (selection, None),
             // Every check selection makes is about the generation the namespace names, so moving
             // past that generation is the whole repair.
-            Err(StorageHostError::Corrupt {
-                scope,
-                generation,
-                path,
-                ..
-            }) => (
-                select(true)?,
-                Some(Reset {
-                    check: scope,
-                    previous_generation: generation,
-                    path,
-                }),
-            ),
+            Err(StorageHostError::Corrupt { scope, site }) => {
+                let site = site.map(|site| *site).unwrap_or_default();
+                (
+                    select(true)?,
+                    Some(Reset {
+                        check: scope,
+                        previous_generation: site.generation,
+                        path: site.path,
+                    }),
+                )
+            }
             Err(error) => return Err(error),
         };
 

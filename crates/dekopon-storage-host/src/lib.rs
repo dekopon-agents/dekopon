@@ -749,10 +749,12 @@ fn report_namespace_reset(reset: Reset, fresh: &Namespace) -> StorageHostError {
     );
     StorageHostError::Corrupt {
         scope: reset.check,
-        namespace: Some(fresh.base_token.clone()),
-        generation: reset.previous_generation,
-        path: reset.path,
-        reset: Some(fresh.generation_token.clone()),
+        site: Some(Box::new(CorruptionSite {
+            namespace: Some(fresh.base_token.clone()),
+            generation: reset.previous_generation,
+            path: reset.path,
+            reset: Some(fresh.generation_token.clone()),
+        })),
     }
 }
 
@@ -846,23 +848,13 @@ pub enum StorageHostError {
     #[error("storage key does not match retained data")]
     KeyMismatch,
     /// Retained namespace state failed one check.
-    ///
-    /// Everything but `scope` is filled in where the detecting code knows it.
-    #[error(
-        "storage corruption detected: {scope}{}",
-        CorruptionSite::new(.namespace, .generation, .path, .reset)
-    )]
+    #[error("storage corruption detected: {scope}{}", SiteSuffix(.site))]
     Corrupt {
         /// Compile-time literal naming the check that failed, never retained content.
         scope: &'static str,
-        /// Base token of the namespace directory the check was about.
-        namespace: Option<String>,
-        /// Generation token the check was about.
-        generation: Option<String>,
-        /// The entry that failed the check.
-        path: Option<PathBuf>,
-        /// The fresh generation the namespace was rotated to before this failure was returned.
-        reset: Option<String>,
+        /// Where it was found, filled in where the detecting code knows. Boxed so the error every
+        /// storage call can return stays small.
+        site: Option<Box<CorruptionSite>>,
     },
     #[error("storage quota exceeded")]
     QuotaExceeded,
@@ -901,42 +893,37 @@ pub enum StorageHostError {
     GrantHostMismatch,
 }
 
+/// Where a [`StorageHostError::Corrupt`] was found. Every field is for the operator.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CorruptionSite {
+    /// Base token of the namespace directory the check was about.
+    pub namespace: Option<String>,
+    /// Generation token the check was about.
+    pub generation: Option<String>,
+    /// The entry that failed the check.
+    pub path: Option<PathBuf>,
+    /// The fresh generation the namespace was rotated to before this failure was returned.
+    pub reset: Option<String>,
+}
+
 /// The optional half of a [`StorageHostError::Corrupt`] message.
-struct CorruptionSite<'a> {
-    namespace: &'a Option<String>,
-    generation: &'a Option<String>,
-    path: &'a Option<PathBuf>,
-    reset: &'a Option<String>,
-}
+struct SiteSuffix<'a>(&'a Option<Box<CorruptionSite>>);
 
-impl<'a> CorruptionSite<'a> {
-    const fn new(
-        namespace: &'a Option<String>,
-        generation: &'a Option<String>,
-        path: &'a Option<PathBuf>,
-        reset: &'a Option<String>,
-    ) -> Self {
-        Self {
-            namespace,
-            generation,
-            path,
-            reset,
-        }
-    }
-}
-
-impl fmt::Display for CorruptionSite<'_> {
+impl fmt::Display for SiteSuffix<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(namespace) = self.namespace {
+        let Some(site) = self.0 else {
+            return Ok(());
+        };
+        if let Some(namespace) = &site.namespace {
             write!(formatter, " in namespace {namespace}")?;
         }
-        if let Some(generation) = self.generation {
+        if let Some(generation) = &site.generation {
             write!(formatter, " generation {generation}")?;
         }
-        if let Some(path) = self.path {
+        if let Some(path) = &site.path {
             write!(formatter, " at {}", path.display())?;
         }
-        if let Some(reset) = self.reset {
+        if let Some(reset) = &site.reset {
             write!(formatter, "; reset to generation {reset}")?;
         }
         Ok(())
@@ -947,34 +934,30 @@ impl StorageHostError {
     /// A corruption naming only the check that failed.
     #[must_use]
     pub const fn corrupt(scope: &'static str) -> Self {
-        Self::Corrupt {
-            scope,
-            namespace: None,
-            generation: None,
-            path: None,
-            reset: None,
+        Self::Corrupt { scope, site: None }
+    }
+
+    fn site_mut(&mut self) -> Option<&mut CorruptionSite> {
+        match self {
+            Self::Corrupt { site, .. } => Some(site.get_or_insert_with(Box::default)),
+            _ => None,
         }
     }
 
     /// Names the entry a corruption was found at, unless the detecting site already did.
     pub(crate) fn at(mut self, entry: PathBuf) -> Self {
-        if let Self::Corrupt { path, .. } = &mut self {
-            path.get_or_insert(entry);
+        if let Some(site) = self.site_mut() {
+            site.path.get_or_insert(entry);
         }
         self
     }
 
     /// Names the namespace, and the generation when known, that a corruption belongs to.
     pub(crate) fn in_namespace(mut self, base: &str, generation_token: Option<&str>) -> Self {
-        if let Self::Corrupt {
-            namespace,
-            generation,
-            ..
-        } = &mut self
-        {
-            namespace.get_or_insert_with(|| base.to_owned());
+        if let Some(site) = self.site_mut() {
+            site.namespace.get_or_insert_with(|| base.to_owned());
             if let Some(token) = generation_token {
-                generation.get_or_insert_with(|| token.to_owned());
+                site.generation.get_or_insert_with(|| token.to_owned());
             }
         }
         self
@@ -984,8 +967,8 @@ impl StorageHostError {
     ///
     /// When it did, the storage an immediate retry opens is already usable.
     #[must_use]
-    pub const fn namespace_reset(&self) -> bool {
-        matches!(self, Self::Corrupt { reset: Some(_), .. })
+    pub fn namespace_reset(&self) -> bool {
+        matches!(self, Self::Corrupt { site: Some(site), .. } if site.reset.is_some())
     }
 
     /// The coarse, content-free class this failure is reported under.

@@ -5282,7 +5282,7 @@ impl BrokerError {
     /// The same `storage-corrupt` code either way; this is what lets the answer say the stored
     /// state is gone and an immediate retry will run, instead of asking for reconciliation.
     #[must_use]
-    pub const fn storage_namespace_reset(&self) -> bool {
+    pub fn storage_namespace_reset(&self) -> bool {
         matches!(self, Self::Storage { source } if source.namespace_reset())
     }
 
