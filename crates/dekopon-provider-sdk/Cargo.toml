@@ -24,8 +24,7 @@ host = ["dep:thiserror", "dep:wasmtime"]
 clap = ["dep:clap"]
 
 [dependencies]
-# Only re-exported here (EffectKind, Idempotency, CapabilityId, ProviderId, RiskLevel); a wasm guest
-# never calls a JsonSchema impl, and their `schemars` feature is opt-in, so schemars stays out.
+# Only re-exported here (EffectKind, Idempotency, CapabilityId, ProviderId, RiskLevel).
 dekopon-capability.workspace = true
 dekopon-core.workspace = true
 serde.workspace = true

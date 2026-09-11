@@ -144,7 +144,7 @@ Never edit `.wasm` files directly. Each in-tree source directory is a separate C
 
 ### Dependencies, crates, CI, or releases
 
-Declare shared versions and path dependencies in the root `Cargo.toml`; commit `Cargo.lock`. The `schemars` feature of `dekopon-core`, `dekopon-capability`, and `dekopon-protocol` is opt-in (`default = []`), and all three are inherited with `default-features = false`, so it reaches a build only where a crate asks for it: `dekopon-capability` and `dekopon-protocol` forward it through their own `schemars` features, and nothing in the workspace enables it outside `--all-features`, which keeps `schemars`, `schemars_derive`, and `syn` out of every `examples/providers/*` wasm build and out of a default crates.io dependency. Because every other gate builds `--all-features`, the lint job also runs `cargo check -p dekopon-core -p dekopon-capability -p dekopon-protocol --locked` to keep the feature-off state compilable. Changing that closure changes those workspaces' `Cargo.lock` files, which are committed. New publishable crates also require a meaningful tested responsibility, packaging validation, architecture/roadmap updates, and an entry in the dependency-ordered plan in `.github/release-crates.txt`. Pull-request CI and release validation compare that plan with Cargo metadata and reject omissions, private or unknown entries, duplicates, and any normal, build, or dev dependency published after its consumer—`cargo package` resolves all three while verifying an archive.
+Declare shared versions and path dependencies in the root `Cargo.toml`; commit `Cargo.lock`. Changing a dependency closure changes those workspaces' `Cargo.lock` files, which are committed. New publishable crates also require a meaningful tested responsibility, packaging validation, architecture/roadmap updates, and an entry in the dependency-ordered plan in `.github/release-crates.txt`. Pull-request CI and release validation compare that plan with Cargo metadata and reject omissions, private or unknown entries, duplicates, and any normal, build, or dev dependency published after its consumer—`cargo package` resolves all three while verifying an archive.
 
 [`../CHANGELOG.md`](../CHANGELOG.md) is required release metadata. Keep pending work under `[Unreleased]`; an application release must promote completed bullets into a dated `[VERSION]` section, while an independently versioned chart release uses `[dekopon-chart-<VERSION>]`. `.github/scripts/verify_changelog.py` requires exactly one Unreleased heading and a non-placeholder bullet under a Keep a Changelog category. Pull-request CI compares both the workspace and chart versions with those headings, and the corresponding tag workflow repeats the check before publication.
 
@@ -202,8 +202,6 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 # Release-profile compile of the two daemons; tag workflows perform the final linked builds.
 cargo check --release --locked -p dekopon-brokerd -p dekopond
-# The foundational crates with their opt-in `schemars` feature off, which no other gate compiles.
-cargo check -p dekopon-core -p dekopon-capability -p dekopon-protocol --locked
 # Unused dependencies; CI pins cargo-machete 0.9.2.
 cargo machete
 # Opposite-direction normal-dependency gates; broker-protocol is allowed in both.

@@ -187,7 +187,6 @@ fn validate_identifier(value: &str, kind: &'static str) -> Result<(), Identifier
 macro_rules! identifier {
     ($name:ident, $label:literal, $docs:literal) => {
         #[doc = $docs]
-        #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
         #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
         #[serde(transparent)]
         pub struct $name(String);
@@ -284,7 +283,6 @@ identifier!(
 /// A DRN is deliberately inert: knowing or copying one grants no authority. It contains only a
 /// logical naming authority, realm, and path; backend names, physical locators, fields, selectors,
 /// and versions remain in the broker's owner-only secret map.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct SecretDrn(String);
@@ -423,7 +421,6 @@ impl fmt::Debug for SecretBytes {
 }
 
 /// The native sink in which the broker may consume a proposed secret reference.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SecretSinkKind {
@@ -446,7 +443,6 @@ impl fmt::Display for SecretSinkKind {
 ///
 /// This value may travel in a proposal. It is never authority and is never passed to a provider;
 /// the broker must separately authorize `secret.use` and match an owner-authored use binding.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "camelCase", deny_unknown_fields)]
 pub enum SecretUseProposal {
@@ -508,7 +504,6 @@ where
 }
 
 /// The authenticated actor responsible for an operation.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum Actor {
@@ -530,7 +525,6 @@ pub enum Actor {
 }
 
 /// Coarse risk classification used as policy input.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum RiskLevel {
@@ -551,7 +545,6 @@ impl fmt::Display for RiskLevel {
 }
 
 /// Operational phase reported for an agent.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum AgentStatus {
