@@ -363,11 +363,12 @@ migration is implemented here.
 | Span | Crate | Fields |
 |---|---|---|
 | `provider.compile` | `dekopon-broker-host` | `path`, `artifact_bytes`, `elapsed_ms`; emitted once per provider at startup |
-| `provider.run_command` | `dekopon-broker-host` | provider, `word`, `command.export` (`run-command`, or the legacy `resolve-command`) |
+| `provider.describe` | `dekopon-broker-host` | `path`, `stores`, `instantiations`, `fuel.consumed`; emitted once per provider at startup, for the manifest call |
+| `provider.run_command` | `dekopon-broker-host` | provider, `word`, `command.export` (`run-command`, or the legacy `resolve-command`), `stores`, `instantiations`, `fuel.consumed` |
 | `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `policy-error`, `secret-denied`, `unconstrained-capability`, `agent-denied`, `attestation-denied`, `unmapped-subject`, `chat-attestation-denied`, `chat-scope-required`, `record-operation-required`, `memory-unavailable`, `invalid-memory-input`, `invalid-turn`), `policy.errors_present`; `subject` and `via` on attested proposals |
 | `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one; `outcome` (`succeeded`, `failed`, `decision-unaudited`, `outcome-unaudited`) and `error` — the same classified reason the terminal audit record carries |
 | `broker.credential.refresh` | `dekopon-brokerd` | the symbolic `credential` name, and `outcome` (`current`, `adopted`, `rotated`, `rotated-unsaved`, `failed`); emitted once per invocation that selects a credential the broker renews per use, and never any token, account identifier, or file content. `chatgpt.refresh` from `dekopon-model` nests inside it |
-| `provider.invoke` | `dekopon-broker-host` | capability, provider |
+| `provider.invoke` | `dekopon-broker-host` | capability, provider, `stores`, `instantiations`, `fuel.consumed` |
 | `http.request` | `dekopon-http-host` | `http.request.method`, `server.address`, `http.response.status_code`, `dekopon.http.request.accounted_bytes`, `dekopon.http.response.accounted_bytes`, `outcome`; `error.code` and `error.message` on failure |
 
 `http.request` fields mirror `HttpCallEvidence` exactly: the span reports the same call the audit
@@ -393,6 +394,25 @@ prefix, artifact bytes, compile milliseconds, its capability and command-word co
 `command_export` — `run-command`, `resolve-command`, or `none` — naming which export the host calls
 for its words. The offline `dekopon-brokerd provider sync` and `verify` commands reuse the same host
 validation and can emit the span to their stderr subscriber, but they install no OTLP exporter.
+
+`stores` and `instantiations` are on all three guest-executing spans because the host resolves each
+provider's imports into one `InstancePre` at load: every description, command run, and invocation
+then builds exactly one fresh store and instantiates the component in it exactly once. Both read `1`
+on a healthy operation. A second instantiation under one span is a call path that started rebuilding
+instances per call — a regression with no other symptom than latency — and an operation that
+recorded neither field was refused before a store existed, which is what the input-size and
+aggregate-memory refusals look like from the outside.
+
+`fuel.consumed` joins them on the same three spans: the Wasm instructions the guest actually burned,
+read back from the store when the operation ends as the supplied ceiling minus what Wasmtime says
+remains. It is how much of `DEFAULT_FUEL` a call spent, so a component approaching the ceiling is
+visible before it starts trapping, and a trap is separable from a wall-clock timeout by whether the
+reading arrived at the bound. It is recorded on every path a store can end on — success, trap,
+rejection, and timeout alike — and a store that reports no reading records nothing rather than a
+zero that would read as a component that ran for free.
+
+All three are counts of host work, never provider content, so the storage-backed `provider.invoke`
+span carries them too.
 
 `provider.run_command` carries the provider, the command word, and the export name that served it,
 never the argv or the value piped into the word. Model-authored argv and piped text are untrusted
@@ -499,10 +519,11 @@ render time; this event names it everywhere else.
 
 Storage-backed invocations do not follow the ordinary provider span shape. The `broker.execute` and
 `provider.invoke` storage spans omit provider, capability, agent, subject, transport scope, logical
-names, offsets, search terms, and exact bytes even when payload telemetry is enabled. Provider
-input/output byte totals receive zero for storage calls. Storage metrics retain only
-invocation/operation/sync/quota counts and the largest powers-of-two read/write bucket; these
-metrics and public ceilings never contain root/key paths or opaque tokens.
+names, offsets, search terms, and exact bytes even when payload telemetry is enabled; `stores` and
+`instantiations` are the exception, and they count host work rather than describing the call.
+Storage evidence retains only invocation/operation/sync/quota counts and the largest powers-of-two
+read/write bucket; that evidence and the public ceilings never contain root/key paths or opaque
+tokens.
 
 Storage audit decisions and outcomes omit principal, actor/agent, via/subject, provider, broker
 principal/policy revision, policy IDs/digest, and credential. A separate keyed audit-scope

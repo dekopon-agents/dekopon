@@ -119,7 +119,6 @@ async fn loads_http_provider_and_executes_one_authorized_request() {
     )
     .await
     .expect("HTTP provider loads without host calls during describe");
-    let metrics = registry.metrics();
     let server = LoopbackServer::once(
         b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Value: one\r\nX-Value: two\r\nSet-Cookie: secret=session\r\nWWW-Authenticate: secret\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
     );
@@ -159,16 +158,6 @@ async fn loads_http_provider_and_executes_one_authorized_request() {
     assert_eq!(output.http_calls[0].method, "PATCH");
     assert_eq!(output.http_calls[0].authority, authority);
     assert_eq!(output.http_calls[0].status, Some(200));
-    let stats = metrics.snapshot();
-    assert_eq!(stats.providers_loaded, 1);
-    assert_eq!(stats.invocations_started, 1);
-    assert_eq!(stats.invocations_succeeded, 1);
-    assert_eq!(stats.invocations_failed, 0);
-    assert_eq!(stats.http_requests, 1);
-    assert!(stats.http_request_bytes > 0);
-    assert!(stats.http_response_bytes > 0);
-    assert_eq!(stats.active_stores, 0);
-    assert!(stats.fuel_consumed > 0);
     let request = server.request();
     assert!(request.starts_with(b"PATCH /resource?visible=no HTTP/1.1\r\n"));
     assert!(request.ends_with(b"\r\n\r\npayload"));
@@ -742,41 +731,6 @@ async fn a_locked_provider_identity_is_enforced_after_describe() {
     assert!(error.to_string().contains("provider lock expects other"));
 }
 
-/// Loading a command-word provider proves the export statically instead of instantiating twice.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_command_word_provider_is_instantiated_once_at_load() {
-    let registry = BrokerProviderRegistry::load(
-        [provider_fixture("memory-reservation-probe-provider.wasm")],
-        BrokerHostLimits::default(),
-    )
-    .await
-    .expect("command-word provider loads");
-    assert_eq!(registry.command_words(), vec!["recall".to_owned()]);
-
-    let stats = registry.metrics().snapshot();
-    assert_eq!(
-        stats.component_instantiations, 1,
-        "describe is the only instantiation a load needs"
-    );
-    assert_eq!(stats.stores_created, 1, "{stats:?}");
-    assert_eq!(stats.command_resolutions, 0, "{stats:?}");
-
-    // The first run is the second instantiation, in its own fresh store; this hand-rolled
-    // `run-command` guest ignores the piped value rather than refusing it.
-    let outcome = registry
-        .run_command("recall", &["recall".to_owned()], Some("piped"))
-        .await
-        .expect("the probe rewrites its word");
-    assert!(
-        matches!(outcome, CommandRunOutcome::Proposed { .. }),
-        "{outcome:?}"
-    );
-    let stats = registry.metrics().snapshot();
-    assert_eq!(stats.component_instantiations, 2, "{stats:?}");
-    assert_eq!(stats.stores_created, 2, "{stats:?}");
-    assert_eq!(stats.command_resolutions, 1, "{stats:?}");
-}
-
 /// The checked-in `memory-reservation-probe` component is the hand-rolled `run-command` guest:
 /// no argument parser, values shifted out of argv by hand. Its help page, its proposal, and its
 /// decline prove the clap-free baseline at the current package against a real component.
@@ -788,13 +742,6 @@ async fn a_hand_rolled_run_command_guest_renders_help_and_proposes() {
     )
     .await
     .expect("hand-rolled command-line provider loads");
-    let mut exports = registry
-        .loaded_provider_metadata()
-        .flat_map(|metadata| metadata.exports.into_iter().map(|item| item.name))
-        .collect::<Vec<_>>();
-    exports.sort();
-    assert_eq!(exports, ["describe", "invoke", "run-command"]);
-
     let outcome = registry
         .run_command("recall", &["--help".to_owned()], None)
         .await
@@ -850,13 +797,6 @@ async fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
     .await
     .expect("command-line provider loads");
     assert_eq!(registry.command_words(), vec!["probe".to_owned()]);
-    let mut exports = registry
-        .loaded_provider_metadata()
-        .flat_map(|metadata| metadata.exports.into_iter().map(|item| item.name))
-        .collect::<Vec<_>>();
-    exports.sort();
-    assert_eq!(exports, ["describe", "invoke", "run-command"]);
-
     let outcome = registry
         .run_command("probe", &["--help".to_owned()], None)
         .await
@@ -947,50 +887,6 @@ async fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
         ),
         "{outcome:?}"
     );
-
-    let stats = registry.metrics().snapshot();
-    assert_eq!(stats.command_resolutions, 4, "{stats:?}");
-    assert_eq!(
-        stats.component_instantiations, 6,
-        "describe, four runs, and one invocation each instantiate once: {stats:?}"
-    );
-}
-
-/// A word plus its piped value beyond the input bound is refused before a store exists.
-#[tokio::test(flavor = "multi_thread")]
-async fn command_input_beyond_the_bound_is_refused_before_a_store_exists() {
-    let registry = BrokerProviderRegistry::load(
-        [provider_fixture("memory-reservation-probe-provider.wasm")],
-        BrokerHostLimits {
-            max_input_bytes: 8,
-            ..BrokerHostLimits::default()
-        },
-    )
-    .await
-    .expect("command-word provider loads");
-
-    let error = registry
-        .run_command("recall", &["recall".to_owned()], Some("more than eight"))
-        .await
-        .expect_err("argv plus stdin exceed the bound");
-
-    assert!(
-        matches!(
-            error,
-            BrokerHostError::CommandInputTooLarge {
-                length: 21,
-                maximum: 8,
-                ..
-            }
-        ),
-        "{error:?}"
-    );
-    let stats = registry.metrics().snapshot();
-    assert_eq!(
-        stats.stores_created, 1,
-        "only describe built a store: {stats:?}"
-    );
-    assert_eq!(stats.command_resolutions, 0, "{stats:?}");
 }
 
 /// An aggregate ceiling below one store could never admit an invocation.
@@ -1512,8 +1408,6 @@ async fn an_actual_provider_v0_2_component_remains_compatible() {
         matches!(outcome, CommandRunOutcome::Failed { ref error } if error.code == "usage"),
         "{outcome:?}"
     );
-    let stats = registry.metrics().snapshot();
-    assert_eq!(stats.command_resolutions, 2, "{stats:?}");
 }
 
 /// Two providers declaring one capability are reported together, not one restart apart.

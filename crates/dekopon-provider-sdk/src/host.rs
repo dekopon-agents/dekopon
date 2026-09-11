@@ -47,8 +47,8 @@ pub const RESOLVE_COMMAND_EXPORT: &str = "resolve-command";
 
 /// Maximum bytes of one rendered component signature.
 ///
-/// Signatures come from a component's own type, which its author controls, and end up in load
-/// errors and retained interface metadata; both must remain bounded.
+/// Signatures come from a component's own type, which its author controls, and end up in the load
+/// error naming what a component exports under a command export instead of a callable function.
 const MAX_SIGNATURE_BYTES: usize = 4 * 1024;
 
 /// The bounds Wasmtime itself enforces on one fresh store.
