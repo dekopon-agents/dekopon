@@ -23,7 +23,7 @@ use dekopon_core::{CapabilityId, ProviderId};
 use dekopon_provider_sdk::host::CommandExport;
 pub use dekopon_provider_sdk::host::ProviderConflicts;
 use dekopon_provider_sdk::host::{
-    self, CommandExportProblem, ConflictScan, ConflictWording, EngineError, RESOLVE_COMMAND_EXPORT,
+    self, CommandExportProblem, ConflictScan, EngineError, RESOLVE_COMMAND_EXPORT,
     RUN_COMMAND_EXPORT, StoreLimits, check_command_export, command_export, command_input_bytes,
     parse_command_run,
 };
@@ -1110,15 +1110,6 @@ impl BrokerWasmProvider {
     }
 }
 
-/// How this host addresses an operator in a conflict report.
-///
-/// The broker starts from a configured provider directory; the immediate host loads a component set
-/// named on the command line. Everything else in the report is shared.
-const CONFLICT_WORDING: ConflictWording = ConflictWording {
-    refusing_to: "start",
-    duplicate_provider_remedy: "remove one, or drop it from the provider search path",
-};
-
 /// Deterministic capability registry owned by a privileged broker.
 #[derive(Debug)]
 pub struct BrokerProviderRegistry {
@@ -1221,7 +1212,7 @@ impl BrokerProviderRegistry {
         let mut providers = Vec::with_capacity(sources.len());
         // Every conflict, then one failure. Returning on the first would make fixing a provider
         // directory take one restart per mistake; an operator should see the whole picture once.
-        let mut scan = ConflictScan::new(CONFLICT_WORDING);
+        let mut scan = ConflictScan::new();
         for (source, compiling) in sources.into_iter().zip(compiling) {
             // A compilation task that panicked used to report itself as a fabricated "did not
             // complete", sending an operator to look for a truncated artifact. The join failure
@@ -1700,9 +1691,9 @@ fn validate_authorized_constraints(
 }
 
 fn validate_manifest(manifest: &ProviderManifest, source: &Path) -> Result<(), BrokerHostError> {
-    // No effect gate: the broker authorizes an effect per invocation, so a manifest declaring an
-    // external write is loadable here and refused by policy, not by the loader.
-    host::validate_manifest(manifest, None)
+    // The loader gates on no effect: the broker authorizes an effect per invocation, so a manifest
+    // declaring an external write loads here and is refused by policy, not by the loader.
+    host::validate_manifest(manifest)
         .map_err(|rejection| invalid_manifest(source, rejection.to_string()))
 }
 

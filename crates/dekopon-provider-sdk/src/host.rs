@@ -15,7 +15,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use dekopon_capability::EffectKind;
 use dekopon_core::{CapabilityId, CommandWordConflict, ProviderId};
 use serde_json::Value;
 use thiserror::Error;
@@ -139,32 +138,19 @@ pub fn validate_limits(
 }
 
 /// Why a component's manifest cannot be loaded.
+///
+/// The manifest broke a semantic rule; the message is the operator-facing detail.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
-pub enum ManifestRejection {
-    /// The manifest broke a semantic rule; the message is the operator-facing detail.
-    #[error("{message}")]
-    Invalid {
-        /// What was wrong with the manifest.
-        message: String,
-    },
-    /// A capability declared an effect this host does not permit.
-    #[error("provider {provider} capability {capability} has unsupported effect {effect}")]
-    UnsupportedEffect {
-        /// Provider identity.
-        provider: ProviderId,
-        /// Capability identity.
-        capability: CapabilityId,
-        /// Rejected effect.
-        effect: EffectKind,
-    },
+#[error("{message}")]
+pub struct ManifestRejection {
+    /// What was wrong with the manifest.
+    pub message: String,
 }
 
 /// Checks the manifest rules every Dekopon host enforces.
 ///
-/// `permitted_effect` is the effect gate. `Some(EffectKind::ReadOnly)` is the immediate host, which
-/// links nothing and so cannot honestly host a capability claiming to change the world; `None` is
-/// the broker host, where a declared effect is an input to authorization rather than a load-time
-/// refusal.
+/// A declared effect is an input to authorization rather than a load-time refusal: policy
+/// authorizes an effect per invocation, so nothing here gates on one.
 ///
 /// The caller owns the component path and attaches it to whichever of its own errors this maps to;
 /// nothing here reads the filesystem.
@@ -172,12 +158,8 @@ pub enum ManifestRejection {
 /// # Errors
 ///
 /// Returns [`ManifestRejection`] for an empty description, no capabilities, a duplicated capability
-/// identifier, a capability with an empty description or a non-object input schema, or a capability
-/// outside the effect gate.
-pub fn validate_manifest(
-    manifest: &ProviderManifest,
-    permitted_effect: Option<EffectKind>,
-) -> Result<(), ManifestRejection> {
+/// identifier, or a capability with an empty description or a non-object input schema.
+pub fn validate_manifest(manifest: &ProviderManifest) -> Result<(), ManifestRejection> {
     if manifest.description.trim().is_empty() {
         return Err(invalid("description must not be empty"));
     }
@@ -199,13 +181,6 @@ pub fn validate_manifest(
                 capability.id
             )));
         }
-        if permitted_effect.is_some_and(|permitted| capability.effect != permitted) {
-            return Err(ManifestRejection::UnsupportedEffect {
-                provider: manifest.id.clone(),
-                capability: capability.id.clone(),
-                effect: capability.effect,
-            });
-        }
         let Some(schema) = capability.input_schema.as_object() else {
             return Err(invalid(format!(
                 "capability {} inputSchema must be an object",
@@ -224,18 +199,9 @@ pub fn validate_manifest(
 }
 
 fn invalid(message: impl Into<String>) -> ManifestRejection {
-    ManifestRejection::Invalid {
+    ManifestRejection {
         message: message.into(),
     }
-}
-
-/// The two operator-facing strings that legitimately differ between the hosts' conflict reports.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ConflictWording {
-    /// What this host is refusing to do: `"load"` for the immediate host, `"start"` for the broker.
-    pub refusing_to: &'static str,
-    /// How an operator drops one of two components declaring the same provider identity.
-    pub duplicate_provider_remedy: &'static str,
 }
 
 /// Everything wrong with one provider set, gathered so an operator sees it once.
@@ -246,8 +212,6 @@ pub struct ConflictWording {
 /// one run, not one run per mistake.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderConflicts {
-    /// How this report addresses the operator.
-    pub wording: ConflictWording,
     /// Provider identities declared by more than one component.
     pub providers: Vec<ProviderId>,
     /// Capability identifiers declared by more than one component.
@@ -274,8 +238,7 @@ impl fmt::Display for ProviderConflicts {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             formatter,
-            "refusing to {} \u{2014} {} provider conflict(s)",
-            self.wording.refusing_to,
+            "refusing to start \u{2014} {} provider conflict(s)",
             self.len()
         )?;
         for provider in &self.providers {
@@ -283,8 +246,7 @@ impl fmt::Display for ProviderConflicts {
             writeln!(formatter, "    declared by more than one component")?;
             writeln!(
                 formatter,
-                "    fix: {}",
-                self.wording.duplicate_provider_remedy
+                "    fix: remove one, or drop it from the provider search path"
             )?;
         }
         for capability in &self.capabilities {
@@ -318,9 +280,8 @@ impl fmt::Display for ProviderConflicts {
 ///
 /// A host records each manifest as it loads, in load order, and finishes with either the
 /// deterministic capability routes or the whole report.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ConflictScan {
-    wording: ConflictWording,
     provider_ids: BTreeSet<ProviderId>,
     duplicate_providers: BTreeSet<ProviderId>,
     duplicate_capabilities: BTreeSet<CapabilityId>,
@@ -329,17 +290,10 @@ pub struct ConflictScan {
 }
 
 impl ConflictScan {
-    /// Starts a scan that reports in this host's wording.
+    /// Starts an empty scan.
     #[must_use]
-    pub fn new(wording: ConflictWording) -> Self {
-        Self {
-            wording,
-            provider_ids: BTreeSet::new(),
-            duplicate_providers: BTreeSet::new(),
-            duplicate_capabilities: BTreeSet::new(),
-            declared_words: Vec::new(),
-            routes: BTreeMap::new(),
-        }
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Records one loaded manifest and the index of its component in load order.
@@ -367,15 +321,14 @@ impl ConflictScan {
     /// Returns [`ProviderConflicts`] when a provider identity or capability is claimed twice, or
     /// when a command word collides with another provider's, a shell builtin, or a reserved word.
     pub fn finish(self) -> Result<BTreeMap<CapabilityId, usize>, ProviderConflicts> {
-        // The broker refuses these words at startup; the immediate host has to agree, or an author
-        // learns about a conflict only once the provider reaches `dekopon-brokerd`.
+        // Reserved words and shell builtins are collected here beside the duplicates so one
+        // report carries every reason a provider set cannot start.
         let command_words = dekopon_core::command_word_conflicts(&self.declared_words);
         if !self.duplicate_providers.is_empty()
             || !self.duplicate_capabilities.is_empty()
             || !command_words.is_empty()
         {
             return Err(ProviderConflicts {
-                wording: self.wording,
                 providers: self.duplicate_providers.into_iter().collect(),
                 capabilities: self.duplicate_capabilities.into_iter().collect(),
                 command_words,
@@ -666,24 +619,19 @@ pub fn engine(mut config: Config, compile_cache_dir: Option<&Path>) -> Result<En
 
 #[cfg(test)]
 mod tests {
-    use dekopon_capability::Idempotency;
+    use dekopon_capability::{EffectKind, Idempotency};
     use dekopon_core::RiskLevel;
     use serde_json::json;
 
     use super::{
-        CommandExport, CommandExportProblem, ConflictScan, ConflictWording, EffectKind,
-        MAX_SIGNATURE_BYTES, ManifestRejection, RESOLVE_COMMAND_EXPORT, RUN_COMMAND_EXPORT,
-        StoreLimits, bounded_signature, check_command_export, command_input_bytes,
-        parse_command_run, validate_limits, validate_manifest,
+        CommandExport, CommandExportProblem, ConflictScan, MAX_SIGNATURE_BYTES,
+        RESOLVE_COMMAND_EXPORT, RUN_COMMAND_EXPORT, StoreLimits, bounded_signature,
+        check_command_export, command_input_bytes, parse_command_run, validate_limits,
+        validate_manifest,
     };
     use crate::{
         CommandRunOutcome, ComponentFailure, ProviderApiVersion, ProviderCapability,
         ProviderManifest,
-    };
-
-    const WORDING: ConflictWording = ConflictWording {
-        refusing_to: "load",
-        duplicate_provider_remedy: "remove one",
     };
 
     fn manifest(id: &str, capability: &str, effect: EffectKind) -> ProviderManifest {
@@ -703,34 +651,31 @@ mod tests {
         }
     }
 
-    /// The gate is the whole difference between the two hosts' manifest rules.
+    /// A declared effect is authorization's input, never the loader's: an external write loads.
     #[test]
-    fn the_effect_gate_refuses_only_what_the_host_cannot_host() {
+    fn a_declared_external_write_is_loadable() {
         let writer = manifest("writer", "writer.write", EffectKind::ExternalWrite);
 
-        validate_manifest(&writer, None).expect("the broker authorizes effects separately");
-        let error = validate_manifest(&writer, Some(EffectKind::ReadOnly))
-            .expect_err("immediate mode links nothing and must refuse an external write");
-
-        assert!(matches!(error, ManifestRejection::UnsupportedEffect { .. }));
+        validate_manifest(&writer).expect("the broker authorizes effects per invocation");
     }
 
     #[test]
-    fn a_non_object_input_schema_is_refused_under_either_gate() {
+    fn a_non_object_input_schema_is_refused() {
         let mut fixture = manifest("fixture", "fixture.run", EffectKind::ReadOnly);
         fixture.capabilities[0].input_schema = json!({"type": "string"});
 
-        for gate in [None, Some(EffectKind::ReadOnly)] {
-            let error = validate_manifest(&fixture, gate)
-                .expect_err("prompt tools require object arguments");
-            assert!(matches!(error, ManifestRejection::Invalid { .. }));
-        }
+        let error = validate_manifest(&fixture).expect_err("prompt tools require object arguments");
+
+        assert!(
+            error.message.contains("must declare type object"),
+            "{error}"
+        );
     }
 
     /// Two simultaneous conflicts, both reported: an operator fixes a provider set in one run.
     #[test]
     fn a_scan_reports_every_conflict_rather_than_the_first() {
-        let mut scan = ConflictScan::new(WORDING);
+        let mut scan = ConflictScan::new();
         scan.record(&manifest("shared", "one.run", EffectKind::ReadOnly), 0);
         scan.record(&manifest("shared", "one.run", EffectKind::ReadOnly), 1);
 
@@ -741,14 +686,14 @@ mod tests {
         assert_eq!(report.len(), 2);
         assert!(!report.is_empty());
         let rendered = report.to_string();
-        assert!(rendered.contains("refusing to load"), "{rendered}");
+        assert!(rendered.contains("refusing to start"), "{rendered}");
         assert!(rendered.contains("provider shared"), "{rendered}");
         assert!(rendered.contains("capability one.run"), "{rendered}");
     }
 
     #[test]
     fn an_unambiguous_scan_routes_every_capability() {
-        let mut scan = ConflictScan::new(WORDING);
+        let mut scan = ConflictScan::new();
         scan.record(&manifest("first", "first.run", EffectKind::ReadOnly), 0);
         scan.record(&manifest("second", "second.run", EffectKind::ReadOnly), 1);
 

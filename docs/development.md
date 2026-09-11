@@ -121,10 +121,10 @@ and storage interfaces, consumes `AuthorizedInvocation` and an exact optional st
 and maps WIT values to native engines enforcing exact grants beneath independent ceilings.
 The host does not authenticate callers, evaluate policy, or construct authorization.
 
-The SDK's optional `host` feature retains manifest validation (including the opt-in effect
-gate), complete conflicting-provider-set reports, store bounds, engine construction, and the
-seven shared `DEFAULT_MAX_*` constants, which live only there. These SDK APIs also serve external
-embeddings. The feature is off by default and pulls in Wasmtime, so guest builds must not
+The SDK's optional `host` feature retains manifest validation, complete conflicting-provider-set
+reports, store bounds, engine construction, and the seven shared `DEFAULT_MAX_*` constants, which
+live only there. These SDK APIs also serve external embeddings. The feature is off by default and
+pulls in Wasmtime, so guest builds must not
 enable it. Check wasm32 both with default features and with `--features clap`; the optional
 `cli::run_command` adapter is built without `env` or `color`. The broker owns its linker and
 yields on fuel so a Tokio deadline can cancel a call.
