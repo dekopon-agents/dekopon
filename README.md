@@ -34,7 +34,7 @@ Extensibility through Wasm providers:
 
 The operator surface on top:
 
-- Strict YAML and JSON resources for agents, capabilities, and providers, with cross-reference validation and duplicate and unknown-field detection reported in one refusal.
+- Strict YAML and JSON agent resources, with duplicate, invalid-name and unknown-field detection reported in one refusal.
 - Isolated model-account authentication through `dekopond auth`, with table, wide, JSON, YAML, and name status output.
 - A chat gateway over Slack Socket Mode, Discord Gateway, Telegram long polling, a signed text-only Meta WhatsApp Cloud API webhook, and an owner-only local socket. Authenticated messages route to catalog agents while the broker remains the only authority.
 - Attachments a person sends: an image or document becomes a numbered chat asset named in the prompt, which a model opens on demand rather than carrying on every turn, under media-type, byte, attempt, and per-conversation limits.

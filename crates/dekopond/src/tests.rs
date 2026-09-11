@@ -249,43 +249,13 @@ async fn provider_attachments_and_chat_asset_inputs_are_per_route_opt_ins() {
             .collect::<Vec<_>>(),
         ["echo.echo".to_owned()]
     );
-    let routes = RoutingTable::bind(&resolved, &catalog_with_capability())
+    let routes = RoutingTable::bind(&resolved, &catalog(true, Some("reasoning")))
         .expect("the route binds both opt-ins");
     let bound = routes
         .route("dev", &ConversationKind::DirectMessage)
         .expect("route matches");
     assert_eq!(bound.provider_attachments, 2);
     assert_eq!(&*bound.chat_asset_inputs, ["echo.echo".to_owned()]);
-}
-
-/// A capability nothing in the catalog defines can never expand a marker, and a route naming one is
-/// an authoring mistake that would otherwise look exactly like a provider refusing its own input.
-#[tokio::test]
-async fn unknown_chat_asset_capabilities_are_all_reported_at_startup() {
-    let directory = temporary();
-    let mut document = document(directory.path());
-    document["routes"][0]["chatAssetInputs"] =
-        json!(["echo.echo", "gpt-image.edit", "gpt-image.generate"]);
-    let resolved = load(directory.path(), &document)
-        .await
-        .expect("the identifiers are well formed");
-
-    let error = RoutingTable::bind(&resolved, &catalog_with_capability())
-        .expect_err("two of the three are not in the catalog");
-
-    let named = error
-        .problems
-        .iter()
-        .filter_map(|problem| match problem {
-            RouteProblem::UnknownChatAssetCapability { capability } => Some(capability.clone()),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        named,
-        ["gpt-image.edit".to_owned(), "gpt-image.generate".to_owned()],
-        "every unknown identifier is named in one refusal: {error}"
-    );
 }
 
 /// The cancellation boundary must not narrow what a proposal may carry.
@@ -1634,23 +1604,6 @@ fn catalog(enabled: bool, model_class: Option<&str>) -> LocalCatalog {
         &catalog_text(enabled, model_class),
     )
     .expect("catalog fixture parses")
-}
-
-/// The same catalog with one capability in it, for the route fields that name one.
-fn catalog_with_capability() -> LocalCatalog {
-    let text = format!(
-        "{}---\napiVersion: dekopon.dev/v1alpha1\n\
-         kind: Provider\nmetadata:\n  name: echo\n\
-         spec:\n  description: Echoes its input\n  type: http\n  credentialRef: echo-token\n\
-         status: Unknown\n\
-         ---\napiVersion: dekopon.dev/v1alpha1\n\
-         kind: Capability\nmetadata:\n  name: echo.echo\n\
-         spec:\n  description: Echoes its input\n  provider: echo\n  effect: read-only\n  \
-         risk: Low\n  idempotency: idempotent\nstatus: Unknown\n",
-        catalog_text(true, Some("reasoning"))
-    );
-    LocalCatalog::from_str(Path::new("dekopon.yaml"), &text)
-        .expect("catalog fixture with a capability parses")
 }
 
 async fn resolved(directory: &Path, document: &Value) -> crate::ResolvedConfig {
