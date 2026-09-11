@@ -389,9 +389,6 @@ fn every_authority_ceiling_is_canonical_and_semantic() {
             v.max_pending_transactions += 1
         }),
         ("startupMaxEntries", |v| v.startup_max_entries += 1),
-        ("maxQuarantinedNamespaces", |v| {
-            v.max_quarantined_namespaces += 1
-        }),
     ];
     assert_rotations(&storage, storage_mutations, encoded_storage);
 
@@ -529,16 +526,28 @@ fn pre_execution_storage_failures_keep_their_public_category() {
             "storage-timeout",
         ),
         (
-            dekopon_storage_host::StorageHostError::Corrupt { scope: "test" },
+            dekopon_storage_host::StorageHostError::corrupt("test"),
             "storage-corrupt",
         ),
         (dekopon_storage_host::StorageHostError::Io, "storage-io"),
     ] {
-        assert_eq!(
-            super::BrokerError::Storage { source }.storage_failure_code(),
-            Some(expected)
-        );
+        let error = super::BrokerError::Storage { source };
+        assert_eq!(error.storage_failure_code(), Some(expected));
+        assert!(!error.storage_namespace_reset(), "{expected}");
     }
+
+    // A reset keeps the corrupt code; only whether the store is already usable again differs.
+    let reset = super::BrokerError::Storage {
+        source: dekopon_storage_host::StorageHostError::Corrupt {
+            scope: "authority-pointer",
+            site: Some(Box::new(dekopon_storage_host::CorruptionSite {
+                reset: Some("fresh".to_owned()),
+                ..dekopon_storage_host::CorruptionSite::default()
+            })),
+        },
+    };
+    assert_eq!(reset.storage_failure_code(), Some("storage-corrupt"));
+    assert!(reset.storage_namespace_reset());
 }
 
 /// A permanent exhaustion is not a momentary outage. The bounded in-memory audit does not evict,

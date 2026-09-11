@@ -33,8 +33,9 @@ use dekopon_core::{
     Actor, AgentId, ExternalSubject, InvocationId, PrincipalId, Redacted, RiskLevel, TransportId,
 };
 use dekopon_storage_host::{ContinuityPolicy, StorageGrantRequest, StorageHost, StorageLimits};
-use dekopon_test_support::provider_fixture;
+use dekopon_test_support::{CaptureLayer, Record, provider_fixture};
 use serde_json::json;
+use tracing_subscriber::layer::SubscriberExt as _;
 
 /// One fixture trace context for every request these tests build.
 ///
@@ -1947,6 +1948,97 @@ async fn newest_result_bounds_and_complete_record_corruption_are_publicly_classi
         dekopon_capability::InvocationOutcome::Failed
     );
     assert_eq!(corrupt.error.as_deref(), Some("memory-corrupt"));
+}
+
+/// A corrupt memory namespace fails only the invocation that finds it, and inside that trace.
+///
+/// The model is told once, through the storage failure, and the retry runs on empty memory. The
+/// only test in this binary that installs a global subscriber, which the blocking materialization
+/// thread needs: the span has to travel onto it for the reset record to land in the trace.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_corrupt_memory_namespace_is_reset_by_the_invocation_that_finds_it() {
+    let capture = CaptureLayer::workspace();
+    tracing::subscriber::set_global_default(tracing_subscriber::registry().with(capture.clone()))
+        .expect("no other test in this binary installs a global subscriber");
+    let temporary = tempfile::tempdir().expect("tempdir");
+    let directory = temporary.path().canonicalize().expect("canonical tempdir");
+    let root = directory.join("provider-storage");
+    let key = directory.join("storage-key.yaml");
+    fs::write(&key, "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n").expect("key");
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
+    let broker = build_broker(
+        &root,
+        &key,
+        Arc::new(InMemoryAuditLog::new(32).expect("audit")),
+    )
+    .await;
+    assert_eq!(
+        record_turn(
+            &broker,
+            "reset-record",
+            "1712345678.000130",
+            "remember this",
+            "noted"
+        )
+        .await
+        .outcome,
+        dekopon_capability::InvocationOutcome::Succeeded
+    );
+    let generations = generation_count(&root);
+
+    let base = fs::read_dir(root.join("namespaces"))
+        .expect("namespace root")
+        .next()
+        .expect("one base")
+        .expect("base")
+        .path();
+    let pointer = base.join("current");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&pointer).expect("pointer")).expect("pointer document");
+    document["authority"] = serde_json::Value::from("not-a-token");
+    fs::write(&pointer, serde_json::to_vec(&document).expect("encode")).expect("corrupt pointer");
+
+    let id = "reset-found".parse::<InvocationId>().expect("invocation");
+    let refused = broker
+        .invoke(
+            &gateway(),
+            Some(&grant()),
+            Some(&claim().bound_to(id.clone())),
+            InvocationRequest {
+                id,
+                capability: MEMORY_RECENT.parse().expect("capability"),
+                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
+                input: json!({"last": 1}),
+                secret_use: None,
+            },
+        )
+        .await
+        .expect_err("the invocation that finds the corruption fails");
+    assert_eq!(refused.storage_failure_code(), Some("storage-corrupt"));
+    assert!(refused.storage_namespace_reset(), "{refused}");
+
+    let parents = capture
+        .records()
+        .into_iter()
+        .filter_map(|record| match record {
+            Record::Event { fields, parent, .. } if fields.contains("storage_namespace_reset") => {
+                Some(parent)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(parents, [Some("broker.execute".to_owned())]);
+    assert!(
+        capture.spans().iter().any(
+            |(name, fields)| *name == "broker.execute" && fields.contains("storage.reset=true")
+        ),
+        "{}",
+        capture.spans_text()
+    );
+
+    assert_recent_empty(&broker, "reset-retry").await;
+    drop(broker);
+    assert_eq!(generation_count(&root), generations + 1);
 }
 
 async fn record_turn(

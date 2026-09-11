@@ -9,11 +9,16 @@ defined base-then-generation lease order, and rebuilds logical quota accounting 
 Each invocation uses a direct namespace/VFS handle. Each authorized write affects the live files
 at that host call; provider failure, trap, cancellation, or an invalid response does not undo
 completed writes. There is no invocation-wide atomicity, rollback, crash recovery, or automatic
-collection of inactive generations ([non-goal](../../docs/design.md#non-goals)). Unknown
-retained layout entries are refused/quarantined.
+collection of inactive generations ([non-goal](../../docs/design.md#non-goals)). An unknown
+root entry refuses startup. Namespaces are checked when a grant opens them: a corrupt authority
+pointer, a missing or misshapen generation, or a stray entry in its `data/` rotates the namespace to
+a fresh, empty generation and fails that one invocation with the namespace, both generations and the
+path in `storage_namespace_reset`. A stable namespace's generation is renamed aside first, because
+its name is deterministic. Corruption in the base's own shape — a symlink, hard link or wrong mode —
+fails the grant naming the entry. Nothing is repaired and no previous generation is deleted.
 
 Accounting is logical rather than a physical-disk claim: apparent bytes plus 4096 bytes for every
-file and directory, including quarantine and authority-pointer replacement temporaries. Namespace creation,
+file and directory, including authority-pointer replacement temporaries. Namespace creation,
 authority-pointer replacement, live-file growth and entry count are reserved before mutation.
 The process ledger is rebuilt once at startup and updated by host-owned mutations; unreadable
 usage after a partial syscall failure retains conservative headroom. Sparse gaps, growing truncate,

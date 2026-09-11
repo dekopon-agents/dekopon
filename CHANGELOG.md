@@ -377,6 +377,21 @@ All notable changes to Dekopon are documented here. The format is based on
   argument, so `dekopon-console` builds unchanged; the new `dekopon_core::REDACTION_MARKER` is the
   constant itself. Any log, span, or serialized record that quoted a marker's width now reads
   `[REDACTED]`.
+- A corrupt provider-storage namespace is reset by the invocation that finds it. A grant that finds
+  the authority pointer undecodable, the generation it names missing or misshapen, or a stray entry
+  in that generation's `data/` rotates the namespace to a fresh, empty generation — a stable
+  namespace first renames its generation aside under a new token — logs `storage_namespace_reset`
+  with the base, both generations, the failed check and the path, records `storage.reset = true` on
+  `broker.execute`, and fails that one invocation with `storage-corrupt` and the message "storage
+  for this conversation was corrupt and has been reset; retry". The next call runs on the empty
+  generation; the old one stays on disk. Corruption in the base's own shape — a symlink, a hard link,
+  or a wrong mode anywhere under it — is not reset and fails each grant naming the entry.
+  `StorageHostError::Corrupt` carries `namespace`, `generation`, `path` and `reset`, `CorruptLayout`
+  carries `path`, and `RootIo`, `UnsafeRoot` and `CorruptLayout` print their path.
+- Every authority-bound provider-storage namespace — every chat memory on the default continuity
+  policy — starts a fresh, empty generation on its first use after this release. Removing
+  `maxQuarantinedNamespaces` changed the authority surface each generation is bound to. Stable
+  namespaces keep their data; the previous generations stay on disk and charged to the root quota.
 - The native HTTP host's refusal of a response that carries its credential is now the credential
   echo check, and its message reads `credentialed response echoed the credential` instead of
   `credential-bearing response reflected protected material`. That text is what an operator reads
@@ -530,6 +545,16 @@ All notable changes to Dekopon are documented here. The format is based on
   still reaches the caller as a `ScriptOutcome`; a syntax error is still the rendered
   `dekopon-shell: syntax error: ...` line on its output, which is the shape every consumer
   actually reads. The grammar is now free to change without a major version.
+- Removed namespace quarantine and startup namespace validation. Provider-storage startup checks
+  the root — ancestors, key, `layout`, `writer.lock` — and makes one quota walk; it no longer
+  validates every namespace, and nothing is renamed into `quarantine/`. A namespace that will not
+  scan in that walk is logged as `storage_root_entry_ignored` and left uncharged rather than
+  stopping the broker. `quarantine` left the root-entry allowlist: an existing root's empty
+  `quarantine/` is removed at startup (`storage_quarantine_removed`), and a non-empty one refuses
+  startup naming it. Delete `storage.maxQuarantinedNamespaces` from broker configuration — the
+  storage limits object is `deny_unknown_fields` and refuses it by name. Both `chmodat` calls are
+  gone: the crate no longer chmods a directory it has classified as untrusted. Hard-link, symlink,
+  ownership and mode refusals are unchanged; see [`docs/upgrading.md`](docs/upgrading.md).
 - Removed the `schemars` feature from `dekopon-core`, `dekopon-capability`, and `dekopon-protocol`,
   along with its 41 `#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]` derives, the
   `schemars` workspace dependency, the one test that called `schemars::schema_for!`, and the lint

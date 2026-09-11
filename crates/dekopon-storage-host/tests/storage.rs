@@ -9,12 +9,46 @@ use std::{
 };
 
 use dekopon_capability::{StorageAccess, StorageInterface, StorageNamespace};
+use dekopon_core::error_chain;
 use dekopon_storage_host::{
     ContinuityPolicy, Durability, LockLevel, OpenOptions, StorageGrantRequest, StorageHost,
     StorageHostError, StorageLimits,
 };
-use dekopon_test_support::snapshot_tree;
+use dekopon_test_support::{CaptureLayer, snapshot_tree};
 use tempfile::TempDir;
+use tracing_subscriber::layer::SubscriberExt as _;
+
+/// Runs `body` with every storage log record on this thread captured.
+fn captured<T>(body: impl FnOnce() -> T) -> (T, CaptureLayer) {
+    let capture = CaptureLayer::workspace();
+    let value = tracing::subscriber::with_default(
+        tracing_subscriber::registry().with(capture.clone()),
+        body,
+    );
+    (value, capture)
+}
+
+/// The only namespace base under `root`.
+fn only_base(root: &Path) -> std::path::PathBuf {
+    let mut bases = fs::read_dir(root.join("namespaces"))
+        .expect("namespace root")
+        .map(|entry| entry.expect("base entry").path())
+        .collect::<Vec<_>>();
+    assert_eq!(bases.len(), 1, "{bases:?}");
+    bases.remove(0)
+}
+
+/// Every generation directory under one base, sorted.
+fn generations(base: &Path) -> Vec<String> {
+    let mut names = fs::read_dir(base)
+        .expect("base entries")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
 
 fn fixture() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
     let temporary = tempfile::tempdir().expect("temporary directory");
@@ -529,9 +563,10 @@ fn root_initialization_quota_denial_creates_no_layout_entry() {
     let (_temporary, root, key) = fixture();
     let parent = root.parent().expect("root parent");
     let before = tree_snapshot(parent);
+    // The three root entries fit; the layout document's own bytes do not.
     let limits = StorageLimits {
-        max_root_bytes: 4 * 4_096,
-        max_namespace_bytes: 16 * 1024,
+        max_root_bytes: 3 * 4_096,
+        max_namespace_bytes: 8 * 1024,
         max_file_bytes: 1,
         max_files_per_namespace: 1,
         startup_max_entries: 9,
@@ -743,7 +778,7 @@ fn sparse_growth_obeys_the_exact_file_bound_and_one_byte_over_mutates_nothing() 
 }
 
 #[test]
-fn a_hard_linked_logical_file_is_quarantined_instead_of_served() {
+fn a_hard_linked_logical_file_fails_its_own_grant_and_not_the_broker() {
     let (_temporary, root, key) = fixture();
     let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
     let mut writer = host
@@ -763,18 +798,8 @@ fn a_hard_linked_logical_file_is_quarantined_instead_of_served() {
     writer.commit().expect("commit");
     drop(host);
 
-    let base = fs::read_dir(root.join("namespaces"))
-        .expect("base")
-        .next()
-        .expect("one base")
-        .expect("entry")
-        .path();
-    let generation = fs::read_dir(base)
-        .expect("generation")
-        .filter_map(Result::ok)
-        .find(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .expect("one generation")
-        .path();
+    let base = only_base(&root);
+    let generation = base.join(generations(&base).remove(0));
     let data = generation.join("data");
     let original = fs::read_dir(&data)
         .expect("data")
@@ -784,15 +809,39 @@ fn a_hard_linked_logical_file_is_quarantined_instead_of_served() {
         .path();
     fs::hard_link(&original, data.join("c".repeat(64))).expect("hard link");
 
-    let reopened = StorageHost::open(&root, &key, StorageLimits::default())
-        .expect("isolated corruption is quarantined");
+    let (host, startup) = captured(|| StorageHost::open(&root, &key, StorageLimits::default()));
+    let host = host.expect("one namespace's hard link does not stop the broker");
+    let logged = startup.events_text();
+    assert!(logged.contains("storage_root_entry_ignored"), "{logged}");
+    assert!(logged.contains("private-file"), "{logged}");
+    assert!(logged.contains(&*base.to_string_lossy()), "{logged}");
+
+    // A second link is outside the store's shape, and a fresh generation beside it would fail the
+    // same scan, so the grant is refused naming the file and nothing on disk changes.
+    let before = tree_snapshot(&root);
+    let refused = host.grant(request(
+        b"authority",
+        ContinuityPolicy::Stable,
+        "hard-link-read",
+        StorageAccess::ReadOnly,
+    ));
+    let Err(
+        error @ StorageHostError::Corrupt {
+            scope: "private-file",
+            site: Some(site),
+        },
+    ) = &refused
+    else {
+        panic!("expected a private-file refusal naming its site, got {refused:?}");
+    };
+    assert!(!error.namespace_reset(), "{error}");
+    let path = site.path.as_ref().expect("the refusal names the file");
+    assert!(path.starts_with(&data), "{}", path.display());
     assert_eq!(
-        fs::read_dir(root.join("quarantine"))
-            .expect("quarantine")
-            .count(),
-        1
+        before,
+        tree_snapshot(&root),
+        "a refused grant changes nothing"
     );
-    drop(reopened);
 }
 
 #[test]
@@ -1524,127 +1573,208 @@ fn stable_reactivation_survives_restart() {
 }
 
 #[test]
-fn corrupt_namespace_is_quarantined_without_blocking_a_healthy_neighbor() {
+fn a_corrupt_authority_pointer_resets_the_namespace_once() {
     let (_temporary, root, key) = fixture();
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
-    let first = host
-        .grant(scoped_request(
+    let first_scope = |invocation: &str, access| {
+        scoped_request(
             b"authority",
             ContinuityPolicy::AuthorityBound,
-            "quarantine-first",
-            StorageAccess::ReadWrite,
+            invocation,
+            access,
             "slack.t0123abc.uone",
-        ))
-        .expect("first grant");
-    let mut first = host.begin(first).expect("first transaction");
+        )
+    };
+    let second_scope = |invocation: &str, access| {
+        scoped_request(
+            b"authority",
+            ContinuityPolicy::AuthorityBound,
+            invocation,
+            access,
+            "slack.t0123abc.utwo",
+        )
+    };
+    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
+    let mut first = host
+        .begin(
+            host.grant(first_scope("corrupt-first", StorageAccess::ReadWrite))
+                .expect("first grant"),
+        )
+        .expect("first transaction");
     first
         .jsonl_append("turns.jsonl", 0, br#"{"scope":"first"}"#)
         .expect("first append");
     first.commit().expect("first commit");
-    let first_base = fs::read_dir(root.join("namespaces"))
-        .expect("bases")
-        .next()
-        .expect("first base")
-        .expect("entry")
-        .path();
-
-    let second = host
-        .grant(scoped_request(
-            b"authority",
-            ContinuityPolicy::AuthorityBound,
-            "quarantine-second",
-            StorageAccess::ReadWrite,
-            "slack.t0123abc.utwo",
-        ))
-        .expect("second grant");
-    let mut second = host.begin(second).expect("second transaction");
+    let first_base = only_base(&root);
+    let mut second = host
+        .begin(
+            host.grant(second_scope("corrupt-second", StorageAccess::ReadWrite))
+                .expect("second grant"),
+        )
+        .expect("second transaction");
     second
         .jsonl_append("turns.jsonl", 0, br#"{"scope":"second"}"#)
         .expect("second append");
     second.commit().expect("second commit");
     drop(host);
 
-    // A regular, private, single-link file still needs valid schema and a namespace-key MAC. A
-    // shallow usage scan alone would accept this isolated corruption and leave the base live.
-    fs::write(first_base.join("current"), b"{}\n").expect("corrupt pointer document");
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("reopen");
+    // Still a private single-link JSON document naming a real epoch, so nothing but the pointer
+    // check itself can object to it.
+    let pointer = first_base.join("current");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&pointer).expect("pointer")).expect("pointer document");
+    document["authority"] = serde_json::Value::from("not-a-token");
+    fs::write(&pointer, serde_json::to_vec(&document).expect("encode")).expect("corrupt pointer");
+    let token = first_base
+        .file_name()
+        .expect("base token")
+        .to_string_lossy()
+        .into_owned();
+    let [previous] = <[String; 1]>::try_from(generations(&first_base)).expect("one generation");
+
+    let host = StorageHost::open(&root, &key, StorageLimits::default())
+        .expect("a corrupt namespace does not stop the broker");
+
+    let (refused, log) =
+        captured(|| host.grant(first_scope("corrupt-reset", StorageAccess::ReadOnly)));
+    let error = refused.expect_err("the invocation that finds the corruption fails");
+    assert!(error.namespace_reset(), "{error}");
+    let StorageHostError::Corrupt {
+        scope: "authority-pointer",
+        site: Some(site),
+    } = &error
+    else {
+        panic!("expected a reset authority-pointer corruption, got {error:?}");
+    };
+    assert_eq!(site.namespace.as_deref(), Some(token.as_str()));
+    assert_eq!(site.generation.as_deref(), Some(previous.as_str()));
+    assert_eq!(site.path.as_deref(), Some(pointer.as_path()));
+    let fresh = site.reset.as_ref().expect("the fresh generation is named");
+    assert_ne!(*fresh, previous);
+    let logged = log.events_text();
     assert_eq!(
-        fs::read_dir(root.join("quarantine"))
-            .expect("quarantine")
-            .count(),
-        1
+        logged.matches("storage_namespace_reset").count(),
+        1,
+        "{logged}"
     );
-    let healthy = host
-        .grant(scoped_request(
-            b"authority",
-            ContinuityPolicy::AuthorityBound,
-            "quarantine-read",
-            StorageAccess::ReadOnly,
-            "slack.t0123abc.utwo",
-        ))
-        .expect("healthy grant");
-    let mut healthy = host.begin(healthy).expect("healthy transaction");
-    assert!(healthy.jsonl_size("turns.jsonl").is_ok());
-    healthy.finish_read().expect("finish healthy");
+    for field in [
+        token.as_str(),
+        previous.as_str(),
+        fresh.as_str(),
+        "authority-pointer",
+    ] {
+        assert!(logged.contains(field), "{field} missing from {logged}");
+    }
+    // The operator reads one rendered chain, so the location has to survive Display.
+    let rendered = error_chain(&error);
+    assert!(rendered.contains(&token), "{rendered}");
+    assert!(rendered.contains("authority-pointer"), "{rendered}");
+
+    // The next invocation lands on the fresh generation, and the corrupt one is still on disk.
+    let (retried, log) = captured(|| {
+        let mut retried = host
+            .begin(
+                host.grant(first_scope("corrupt-retry", StorageAccess::ReadOnly))
+                    .expect("the retry is granted"),
+            )
+            .expect("retry transaction");
+        let size = retried.jsonl_size("turns.jsonl");
+        retried.finish_read().expect("finish retry");
+        size
+    });
+    assert!(
+        matches!(retried, Err(StorageHostError::NotFound)),
+        "{retried:?}"
+    );
+    assert!(!log.saw("storage_namespace_reset"), "the reset repeated");
+    let kept = generations(&first_base);
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    assert!(kept.contains(&previous) && kept.contains(fresh), "{kept:?}");
+
+    // The neighbour never noticed.
+    let mut neighbour = host
+        .begin(
+            host.grant(second_scope("neighbour-read", StorageAccess::ReadOnly))
+                .expect("neighbour grant"),
+        )
+        .expect("neighbour transaction");
+    assert_eq!(
+        neighbour.jsonl_size("turns.jsonl").expect("neighbour data"),
+        19
+    );
+    neighbour.finish_read().expect("finish neighbour");
 }
 
 #[test]
-fn inaccessible_namespace_is_quarantined_without_blocking_a_healthy_neighbor() {
+fn a_corrupt_stable_generation_is_moved_aside_and_reset() {
     let (_temporary, root, key) = fixture();
     let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
-    let first = host
-        .grant(scoped_request(
-            b"authority",
-            ContinuityPolicy::Stable,
-            "permission-corrupt-first",
-            StorageAccess::ReadOnly,
-            "slack.t0123abc.uone",
-        ))
-        .expect("first grant");
-    drop(first);
-    let first_base = fs::read_dir(root.join("namespaces"))
-        .expect("bases")
-        .next()
-        .expect("first base")
-        .expect("entry")
-        .path();
-    let second = host
-        .grant(scoped_request(
-            b"authority",
-            ContinuityPolicy::Stable,
-            "permission-corrupt-second",
-            StorageAccess::ReadOnly,
-            "slack.t0123abc.utwo",
-        ))
-        .expect("second grant");
-    drop(second);
-    drop(host);
+    let mut writer = host
+        .begin(
+            host.grant(request(
+                b"authority",
+                ContinuityPolicy::Stable,
+                "stable-seed",
+                StorageAccess::ReadWrite,
+            ))
+            .expect("grant"),
+        )
+        .expect("transaction");
+    writer
+        .jsonl_append("turns.jsonl", 0, br#"{"turn":1}"#)
+        .expect("append");
+    writer.commit().expect("commit");
 
-    fs::set_permissions(&first_base, fs::Permissions::from_mode(0o000))
-        .expect("remove base permissions");
-    let host = StorageHost::open(&root, &key, StorageLimits::default())
-        .expect("one inaccessible namespace is isolated");
-    assert_eq!(
-        fs::read_dir(root.join("quarantine"))
-            .expect("quarantine")
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_name().to_string_lossy().len() == 64)
-            .count(),
-        1
-    );
-    let healthy = host
-        .grant(scoped_request(
-            b"authority",
-            ContinuityPolicy::Stable,
-            "permission-corrupt-healthy",
-            StorageAccess::ReadOnly,
-            "slack.t0123abc.utwo",
-        ))
-        .expect("healthy peer remains usable");
-    host.begin(healthy)
-        .expect("healthy transaction")
-        .finish_read()
-        .expect("healthy read finishes");
+    let base = only_base(&root);
+    let [stable] = <[String; 1]>::try_from(generations(&base)).expect("one generation");
+    // A private file, so the base scan accepts it; only the logical-name check refuses the name.
+    let stray = base.join(&stable).join("data").join("not-a-token");
+    fs::write(&stray, b"stray").expect("stray logical entry");
+    fs::set_permissions(&stray, fs::Permissions::from_mode(0o600)).expect("stray mode");
+
+    let refused = host.grant(request(
+        b"authority",
+        ContinuityPolicy::Stable,
+        "stable-reset",
+        StorageAccess::ReadOnly,
+    ));
+    let Err(
+        error @ StorageHostError::Corrupt {
+            scope: "logical-token",
+            site: Some(site),
+        },
+    ) = &refused
+    else {
+        panic!("expected a reset logical-token corruption, got {refused:?}");
+    };
+    assert!(error.namespace_reset());
+    assert_eq!(site.generation.as_deref(), Some(stable.as_str()));
+    // Stable continuity keeps its deterministic name: the fresh generation takes it, and the
+    // corrupt one moved to a new token beside it.
+    assert_eq!(site.reset.as_deref(), Some(stable.as_str()));
+    let kept = generations(&base);
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    let aside = kept
+        .iter()
+        .find(|name| **name != stable)
+        .expect("the set-aside generation");
+    assert!(base.join(aside).join("data").join("not-a-token").exists());
+
+    let mut retried = host
+        .begin(
+            host.grant(request(
+                b"authority",
+                ContinuityPolicy::Stable,
+                "stable-retry",
+                StorageAccess::ReadOnly,
+            ))
+            .expect("the retry is granted"),
+        )
+        .expect("retry transaction");
+    assert!(matches!(
+        retried.jsonl_size("turns.jsonl"),
+        Err(StorageHostError::NotFound)
+    ));
+    retried.finish_read().expect("finish retry");
 }
 
 #[test]
@@ -1698,17 +1828,33 @@ fn symlink_substitution_is_never_followed_at_any_namespace_tree_level() {
         let replacement = temporary.path().join(format!("substituted-{level}"));
         fs::rename(&victim, &replacement).expect("move trusted entry out of tree");
         symlink(&replacement, &victim).expect("substitute symlink");
+        let outside = snapshot_tree(temporary.path())
+            .into_iter()
+            .filter(|entry| !entry.relative.starts_with("storage"))
+            .map(|entry| (entry.relative, entry.contents))
+            .collect::<Vec<_>>();
 
-        let reopened = StorageHost::open(&root, &key, StorageLimits::default())
-            .expect("isolated namespace substitution is quarantined");
-        assert_eq!(
-            fs::read_dir(root.join("quarantine"))
-                .expect("quarantine")
-                .count(),
-            1,
-            "level {level} was not isolated"
+        let host = StorageHost::open(&root, &key, StorageLimits::default())
+            .unwrap_or_else(|error| panic!("level {level} stopped the broker: {error}"));
+        let refused = host.grant(request(
+            b"authority",
+            ContinuityPolicy::Stable,
+            &format!("substitution-{level}-read"),
+            StorageAccess::ReadOnly,
+        ));
+        assert!(
+            matches!(&refused, Err(error @ StorageHostError::Corrupt { .. }) if !error.namespace_reset()),
+            "level {level} was followed or reset instead of refused: {refused:?}"
         );
-        drop(reopened);
+        assert_eq!(
+            outside,
+            snapshot_tree(temporary.path())
+                .into_iter()
+                .filter(|entry| !entry.relative.starts_with("storage"))
+                .map(|entry| (entry.relative, entry.contents))
+                .collect::<Vec<_>>(),
+            "level {level}: the symlink target changed"
+        );
     }
 }
 
@@ -1768,49 +1914,6 @@ fn root_and_root_layout_symlinks_fail_globally_without_being_followed() {
 }
 
 #[test]
-fn quarantined_wrong_mode_directories_retain_their_complete_quota_charge() {
-    let (_temporary, root, key) = fixture();
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
-    let grant = host
-        .grant(request(
-            b"authority",
-            ContinuityPolicy::Stable,
-            "quarantine-accounting",
-            StorageAccess::ReadOnly,
-        ))
-        .expect("grant");
-    drop(grant);
-    drop(host);
-
-    let base = fs::read_dir(root.join("namespaces"))
-        .expect("namespace")
-        .next()
-        .expect("one namespace")
-        .expect("entry")
-        .path();
-    fs::set_permissions(&base, fs::Permissions::from_mode(0o777)).expect("corrupt base mode");
-    let (bytes, _) = logical_tree_usage(&root);
-    let limits = StorageLimits {
-        max_root_bytes: bytes - 1,
-        max_namespace_bytes: 32 * 1024,
-        max_file_bytes: 1,
-        max_files_per_namespace: 1,
-        ..StorageLimits::default()
-    };
-    assert!(matches!(
-        StorageHost::open(&root, &key, limits),
-        Err(StorageHostError::QuotaExceeded)
-    ));
-    assert_eq!(
-        fs::read_dir(root.join("quarantine"))
-            .expect("quarantine")
-            .count(),
-        1,
-        "isolated corruption is moved but never made quota-free"
-    );
-}
-
-#[test]
 fn key_symlinks_fail_closed() {
     let (_temporary, root, key) = fixture();
     let key_link = key.with_file_name("key-link.yaml");
@@ -1828,7 +1931,7 @@ fn initialized_root_never_recreates_missing_layout_entries_or_accepts_unknown_on
     let before = tree_snapshot(&root);
     assert!(matches!(
         StorageHost::open(&root, &key, StorageLimits::default()),
-        Err(StorageHostError::CorruptLayout)
+        Err(StorageHostError::CorruptLayout { .. })
     ));
     assert_eq!(
         before,
@@ -1844,8 +1947,52 @@ fn initialized_root_never_recreates_missing_layout_entries_or_accepts_unknown_on
     fs::set_permissions(&unknown, fs::Permissions::from_mode(0o600)).expect("unknown mode");
     assert!(matches!(
         StorageHost::open(&root, &key, StorageLimits::default()),
-        Err(StorageHostError::CorruptLayout)
+        Err(StorageHostError::CorruptLayout { .. })
     ));
+}
+
+#[test]
+fn a_root_retaining_the_removed_quarantine_directory_is_refused() {
+    let (_temporary, root, key) = fixture();
+    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
+    drop(host);
+
+    // Bytes an earlier release set aside are the operator's to keep or delete, so a quarantine
+    // that still holds any refuses startup, naming the directory, and startup touches nothing.
+    let retired = root.join("quarantine");
+    fs::create_dir(&retired).expect("retired quarantine directory");
+    fs::set_permissions(&retired, fs::Permissions::from_mode(0o700)).expect("retired mode");
+    fs::write(retired.join("set-aside"), b"kept").expect("quarantined bytes");
+    let before = tree_snapshot(&root);
+    let refused = StorageHost::open(&root, &key, StorageLimits::default());
+    let Err(StorageHostError::CorruptLayout { path }) = &refused else {
+        panic!("expected a corrupt layout naming quarantine, got {refused:?}");
+    };
+    assert_eq!(*path, retired);
+    assert_eq!(
+        before,
+        tree_snapshot(&root),
+        "a refused root keeps every byte it had"
+    );
+}
+
+#[test]
+fn an_empty_retired_quarantine_directory_is_removed_at_startup() {
+    let (_temporary, root, key) = fixture();
+    drop(StorageHost::open(&root, &key, StorageLimits::default()).expect("host"));
+
+    // Every root an earlier release initialized holds one, empty unless something was set aside.
+    let retired = root.join("quarantine");
+    fs::create_dir(&retired).expect("retired quarantine directory");
+    fs::set_permissions(&retired, fs::Permissions::from_mode(0o700)).expect("retired mode");
+    let (host, log) = captured(|| StorageHost::open(&root, &key, StorageLimits::default()));
+    host.expect("an empty quarantine is not retained data");
+    assert!(!retired.exists());
+    assert!(
+        log.saw("storage_quarantine_removed"),
+        "{}",
+        log.events_text()
+    );
 }
 
 /// Every path under `root` paired with its file contents, directories carrying empty contents.
@@ -1949,117 +2096,6 @@ fn empty_positional_growth_matches_live_reads_stat_and_reopen() {
     );
     reader.vfs_close(handle).expect("close reopened handle");
     reader.finish_read().expect("finish");
-}
-
-#[test]
-fn retired_poison_markers_are_quarantined_with_data_and_quota_preserved() {
-    for generation_level in [false, true] {
-        let (_temporary, root, key) = fixture();
-        let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
-        let grant = |subject, invocation, access| {
-            scoped_request(
-                b"authority",
-                ContinuityPolicy::Stable,
-                invocation,
-                access,
-                subject,
-            )
-        };
-        let mut first = host
-            .begin(
-                host.grant(grant(
-                    "slack.t0123abc.uone",
-                    "poison-first",
-                    StorageAccess::ReadWrite,
-                ))
-                .expect("grant"),
-            )
-            .expect("first");
-        first.jsonl_append("turns.jsonl", 0, b"1").expect("data");
-        first.commit().expect("finish");
-        let base = fs::read_dir(root.join("namespaces"))
-            .expect("bases")
-            .next()
-            .expect("base")
-            .expect("entry")
-            .path();
-        let mut healthy = host
-            .begin(
-                host.grant(grant(
-                    "slack.t0123abc.utwo",
-                    "poison-neighbor",
-                    StorageAccess::ReadWrite,
-                ))
-                .expect("grant"),
-            )
-            .expect("neighbor");
-        healthy
-            .jsonl_append("turns.jsonl", 0, b"2")
-            .expect("healthy data");
-        healthy.commit().expect("finish");
-        drop(host);
-        let marker_parent = if generation_level {
-            fs::read_dir(&base)
-                .expect("base entries")
-                .map(|entry| entry.expect("entry").path())
-                .find(|path| path.is_dir())
-                .expect("generation")
-        } else {
-            base.clone()
-        };
-        let marker = marker_parent.join("poisoned");
-        fs::write(&marker, b"").expect("retired marker");
-        fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).expect("private marker");
-        let before = tree_snapshot(&base);
-        let usage = logical_tree_usage(&root);
-        let host =
-            StorageHost::open(&root, &key, StorageLimits::default()).expect("quarantine and open");
-        let quarantined = root
-            .join("quarantine")
-            .join(base.file_name().expect("token"));
-        assert!(!base.exists());
-        assert_eq!(tree_snapshot(&quarantined), before);
-        assert_eq!(logical_tree_usage(&root), usage);
-        assert!(matches!(
-            host.grant(grant(
-                "slack.t0123abc.uone",
-                "poison-refused",
-                StorageAccess::ReadOnly
-            )),
-            Err(StorageHostError::Corrupt { .. })
-        ));
-        let mut healthy = host
-            .begin(
-                host.grant(grant(
-                    "slack.t0123abc.utwo",
-                    "poison-healthy-read",
-                    StorageAccess::ReadOnly,
-                ))
-                .expect("healthy grant"),
-            )
-            .expect("healthy reader");
-        assert_eq!(
-            healthy
-                .jsonl_read_chunk("turns.jsonl", 0, 16)
-                .expect("healthy read")
-                .bytes,
-            b"2\n"
-        );
-        healthy.finish_read().expect("finish");
-        drop(host);
-        let limits = StorageLimits {
-            max_root_bytes: usage.0 - 1,
-            max_namespace_bytes: 3 * 4096,
-            max_file_bytes: 1,
-            max_files_per_namespace: 1,
-            ..StorageLimits::default()
-        };
-        assert!(matches!(
-            StorageHost::open(&root, &key, limits),
-            Err(StorageHostError::QuotaExceeded)
-        ));
-        assert_eq!(tree_snapshot(&quarantined), before);
-    }
 }
 
 #[test]

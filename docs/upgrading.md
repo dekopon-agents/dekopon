@@ -122,10 +122,33 @@ The strict storage limits object accepts only live bounds. Configure the complet
 `StorageLimits` defaults/current fields; omit all GC scheduling/TTL and startup recovery-count
 settings. `maxPendingTransactions` remains the compatibility spelling for concurrent invocation
 handle admission. Keep the existing namespace key private and unchanged. Retained stores with
-unknown root or generation entries are refused or quarantined; there is no automatic migration,
+unknown root or generation entries are refused; there is no automatic migration,
 recursive cleanup or trusted import of legacy layout bytes. Preserve such data offline rather
 than deleting entries to bypass a refusal. A separately provisioned private storage root starts
 empty and does not restore previous data.
+
+## Provider storage: quarantine and startup validation removed (unreleased)
+
+Delete `storage.maxQuarantinedNamespaces` from the broker configuration. The storage limits object
+is `deny_unknown_fields`, so a configuration that still names it is refused with that field name.
+
+Every existing root holds a `quarantine/` directory. An empty one is removed on the first start and
+logged as `storage_quarantine_removed`. One that holds anything refuses startup as a corrupt layout
+naming the directory: move it out of the root and keep or delete those bytes. The broker never reads
+them.
+
+Every authority-bound namespace — every chat memory on the default `authority-bound` continuity —
+starts a fresh, empty generation on its first use after this release, because the removed limit was
+part of the authority surface a generation is bound to. `stable` namespaces keep their data. The
+previous generations stay on disk and stay charged to the root quota; nothing collects them.
+
+A corrupt namespace no longer stops the broker, and startup no longer validates namespaces at all.
+The invocation that finds a corrupt authority pointer or generation resets that namespace to a
+fresh generation and fails once with `storage-corrupt`; its `storage_namespace_reset` record names
+the base token, both generations and the path. A namespace whose own shape is wrong — a symlink,
+hard link or wrong mode under `namespaces/<base>` — is skipped by the startup quota walk
+(`storage_root_entry_ignored`) and fails every grant naming the entry. To clear one, stop the broker
+and remove `namespaces/<base>`; that conversation starts empty.
 
 ## Two rules that apply to every upgrade
 

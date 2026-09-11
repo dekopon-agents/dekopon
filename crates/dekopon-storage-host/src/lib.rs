@@ -70,7 +70,7 @@ use key::{
     DOMAIN_RECORD_ID, StorageKey, random_bytes,
 };
 use layout::{Layout, scan_root_usage, scan_usage, usage_with_directory_entry};
-use namespace::{Namespace, NamespacePlan};
+use namespace::{Namespace, NamespacePlan, Reset};
 use quota::QuotaLedger;
 
 /// Durable chat-memory continuity behavior.
@@ -369,7 +369,10 @@ impl fmt::Debug for StorageHost {
 }
 
 impl StorageHost {
-    /// Opens, locks, validates, and accounts one broker-owned root.
+    /// Opens, locks, and accounts one broker-owned root.
+    ///
+    /// Only the root itself is validated here. Namespaces are checked when a grant opens them, so
+    /// a corrupt conversation fails its own invocation rather than the broker's startup.
     pub fn open(
         root: impl AsRef<Path>,
         namespace_key_path: impl AsRef<Path>,
@@ -384,21 +387,13 @@ impl StorageHost {
             });
         }
         let key = Arc::new(StorageKey::load(&namespace_key_path)?);
-        let minimum = Layout::minimum_usage(&key)?;
+        let minimum = Layout::minimum_usage(&root, &key)?;
         if minimum.bytes > limits.max_root_bytes || minimum.entries > limits.startup_max_entries {
             return Err(StorageHostError::QuotaExceeded);
         }
         let layout = Layout::open(&root, &key)?;
-        quarantine_isolated_namespaces(&layout, &key, &limits)?;
-        let quarantined = layout
-            .quarantine()
-            .entries_prefix(limits.startup_max_entries.saturating_add(1))?
-            .len() as u64;
-        if quarantined > limits.max_quarantined_namespaces {
-            return Err(StorageHostError::Corrupt {
-                scope: "quarantine-capacity",
-            });
-        }
+        // The one startup walk. It charges the quota ledger and nothing else: a namespace that
+        // will not scan is logged and left uncharged, and its own next grant is where it fails.
         let usage = scan_root_usage(&layout, limits.startup_max_entries)?;
         if usage.bytes > limits.max_root_bytes {
             return Err(StorageHostError::QuotaExceeded);
@@ -487,11 +482,6 @@ impl StorageHost {
         let _namespace = namespace_lock
             .lock()
             .expect("storage namespace housekeeping lock");
-        if self.inner.layout.quarantine().exists(&base)? {
-            return Err(StorageHostError::Corrupt {
-                scope: "quarantined-namespace",
-            });
-        }
         let mut namespace_reservation = Some({
             // The observation lock is dropped before any base lease wait, preserving concurrency between
             // distinct namespaces.
@@ -506,12 +496,6 @@ impl StorageHost {
                 .namespaces()
                 .entries_bounded(self.inner.limits.startup_max_entries)?
                 .into_iter()
-                .chain(
-                    self.inner
-                        .layout
-                        .quarantine()
-                        .entries_bounded(self.inner.limits.startup_max_entries)?,
-                )
                 .collect::<BTreeSet<_>>();
             self.inner
                 .ledger
@@ -520,13 +504,14 @@ impl StorageHost {
         // The ledger is rebuilt once at startup and every host mutation reconciles or retains its
         // reservation. Rescanning here would be unsafe: a scan can start before another namespace
         // commits and publish its stale lower total after that commit releases its reservation.
-        let plan = NamespacePlan::prepare(
+        let mut plan = NamespacePlan::prepare(
             self.inner.layout.namespaces(),
             &self.inner.key,
             &request,
             self.inner.limits.lock_timeout_ms,
             self.inner.limits.startup_max_entries,
         )?;
+        let reset = plan.take_reset();
         if plan.maximum_generation_peak_bytes() > self.inner.limits.max_namespace_bytes {
             return Err(StorageHostError::QuotaExceeded);
         }
@@ -548,14 +533,7 @@ impl StorageHost {
             self.inner
                 .layout
                 .namespaces()
-                .entries_bounded(self.inner.limits.startup_max_entries)?
-                .into_iter()
-                .chain(
-                    self.inner
-                        .layout
-                        .quarantine()
-                        .entries_bounded(self.inner.limits.startup_max_entries)?,
-                ),
+                .entries_bounded(self.inner.limits.startup_max_entries)?,
         );
         let namespace = match plan.apply(
             self.inner.layout.namespaces(),
@@ -619,6 +597,11 @@ impl StorageHost {
             .take()
             .expect("namespace reservation")
             .commit();
+        if let Some(cause) = reset {
+            // The fresh generation is on disk and accounted. This invocation still fails, so the
+            // model is told once that what it stored is gone rather than finding it empty.
+            return Err(report_namespace_reset(cause, &namespace));
+        }
         Ok(StorageGrant {
             host_id: self.inner.id,
             invocation: request.invocation,
@@ -745,80 +728,42 @@ fn resolve_parent_leaf(path: &Path, key: bool) -> Result<PathBuf, StorageHostErr
     Ok(traversed)
 }
 
-fn quarantine_isolated_namespaces(
-    layout: &Layout,
-    key: &StorageKey,
-    limits: &StorageLimits,
-) -> Result<(), StorageHostError> {
-    let mut quarantined = layout
-        .quarantine()
-        .entries_prefix(limits.startup_max_entries.saturating_add(1))?
-        .len() as u64;
-    for base in layout
-        .namespaces()
-        .entries_bounded(limits.startup_max_entries)?
-    {
-        let validation = (|| {
-            let metadata =
-                layout
-                    .namespaces()
-                    .metadata(&base)?
-                    .ok_or(StorageHostError::Corrupt {
-                        scope: "namespace-entry",
-                    })?;
-            if metadata.kind != layout::EntryKind::Directory {
-                return Err(StorageHostError::Corrupt {
-                    scope: "namespace-entry",
-                });
-            }
-            let directory = layout.namespaces().open_directory(&base)?;
-            scan_usage(&directory, limits.startup_max_entries)?;
-            namespace::validate_namespace_base(&directory, key, &base)
-        })();
-        match validation {
-            Ok(()) => {}
-            Err(error) if isolated_namespace_corruption(&error) => {
-                if quarantined >= limits.max_quarantined_namespaces {
-                    return Err(StorageHostError::Corrupt {
-                        scope: "quarantine-capacity",
-                    });
-                }
-                if layout.quarantine().exists(&base)? {
-                    return Err(StorageHostError::Corrupt {
-                        scope: "quarantine-collision",
-                    });
-                }
-                if matches!(error, StorageHostError::UnsafeRoot { .. })
-                    || matches!(
-                        error,
-                        StorageHostError::RootIo { ref source, .. }
-                            if source.kind() == std::io::ErrorKind::PermissionDenied
-                    )
-                {
-                    layout
-                        .namespaces()
-                        .make_owned_directory_traversable(&base)?;
-                }
-                layout
-                    .namespaces()
-                    .rename_to(&base, layout.quarantine(), &base)?;
-                layout.namespaces().sync()?;
-                layout.quarantine().sync()?;
-                quarantined = quarantined.saturating_add(1);
-            }
-            Err(error) => return Err(error),
-        }
+/// Logs one namespace reset and returns the failure that tells the caller it happened.
+///
+/// Emitted inside the caller's span, so the record carries the trace of the invocation that found
+/// the corruption. The previous generation stays on disk under its token, uncollected, exactly as
+/// an authority rotation leaves one.
+fn report_namespace_reset(reset: Reset, fresh: &Namespace) -> StorageHostError {
+    tracing::error!(
+        event = "storage_namespace_reset",
+        category = "storage",
+        storage.namespace = %fresh.base_token,
+        storage.generation = %fresh.generation_token,
+        storage.previous_generation = reset.previous_generation.as_deref(),
+        storage.check = reset.check,
+        storage.path = reset
+            .path
+            .as_deref()
+            .map(|path| tracing::field::display(path.display())),
+        "storage namespace was corrupt; it now opens a fresh generation and this invocation failed"
+    );
+    StorageHostError::Corrupt {
+        scope: reset.check,
+        site: Some(Box::new(CorruptionSite {
+            namespace: Some(fresh.base_token.clone()),
+            generation: reset.previous_generation,
+            path: reset.path,
+            reset: Some(fresh.generation_token.clone()),
+        })),
     }
-    Ok(())
 }
 
 /// Reports why one retained document did not decode without echoing the rejected bytes.
 ///
-/// A corruption error names a scope and nothing else, and the physical file is under an opaque
-/// token, so the discarded `serde_json` failure is the only description of what is actually wrong
-/// with the retained state. Class, line, and column are its complete content-free part: they
-/// separate a truncated write from an unknown or wrongly typed field without exporting a name, a
-/// path, a token, or any document content.
+/// The corruption error names the check and the file; the discarded `serde_json` failure is the
+/// only description of what is actually wrong inside it. Class, line, and column are its complete
+/// content-free part: they separate a truncated write from an unknown or wrongly typed field
+/// without exporting any document content.
 pub(crate) fn report_decode_failure(document: &'static str, error: &serde_json::Error) {
     tracing::warn!(
         event = "storage_document_decode_failed",
@@ -829,20 +774,6 @@ pub(crate) fn report_decode_failure(document: &'static str, error: &serde_json::
         decode.column = error.column(),
         "retained storage document did not decode"
     );
-}
-
-fn isolated_namespace_corruption(error: &StorageHostError) -> bool {
-    matches!(
-        error,
-        StorageHostError::Corrupt { .. } | StorageHostError::UnsafeRoot { .. }
-    ) || matches!(
-        error,
-        StorageHostError::RootIo { source, .. }
-            if matches!(
-                source.kind(),
-                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotADirectory
-            )
-    )
 }
 
 /// The coarse class a storage failure is reported under.
@@ -883,12 +814,16 @@ impl std::fmt::Display for StorageFailureClass {
     }
 }
 
-/// Stable native storage failure classes. No variant contains guest names, paths, or content.
+/// Stable native storage failure classes.
+///
+/// No variant carries guest content. Paths and opaque tokens name on-disk entries for the operator
+/// reading a log line; a guest sees only the WIT error enum and a model only the broker's fixed
+/// public code, so nothing here renders to either.
 #[derive(Debug, Error)]
 pub enum StorageHostError {
     #[error(transparent)]
     Configuration(#[from] StorageConfigError),
-    #[error("storage root input/output failed")]
+    #[error("storage root input/output failed at {}", path.display())]
     RootIo {
         path: PathBuf,
         #[source]
@@ -904,16 +839,23 @@ pub enum StorageHostError {
     UnsafeKeyFile { path: PathBuf },
     #[error("storage namespace-key document is invalid")]
     InvalidKeyFile,
-    #[error("storage root or ancestor is unsafe")]
+    #[error("storage root or ancestor is unsafe: {}", path.display())]
     UnsafeRoot { path: PathBuf },
     #[error("another conforming storage writer holds the root")]
     SecondWriter,
-    #[error("storage layout is corrupt")]
-    CorruptLayout,
+    #[error("storage layout is corrupt: {}", path.display())]
+    CorruptLayout { path: PathBuf },
     #[error("storage key does not match retained data")]
     KeyMismatch,
-    #[error("storage corruption detected")]
-    Corrupt { scope: &'static str },
+    /// Retained namespace state failed one check.
+    #[error("storage corruption detected: {scope}{}", SiteSuffix(.site))]
+    Corrupt {
+        /// Compile-time literal naming the check that failed, never retained content.
+        scope: &'static str,
+        /// Where it was found, filled in where the detecting code knows. Boxed so the error every
+        /// storage call can return stays small.
+        site: Option<Box<CorruptionSite>>,
+    },
     #[error("storage quota exceeded")]
     QuotaExceeded,
     #[error("storage resource is busy")]
@@ -951,14 +893,91 @@ pub enum StorageHostError {
     GrantHostMismatch,
 }
 
+/// Where a [`StorageHostError::Corrupt`] was found. Every field is for the operator.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CorruptionSite {
+    /// Base token of the namespace directory the check was about.
+    pub namespace: Option<String>,
+    /// Generation token the check was about.
+    pub generation: Option<String>,
+    /// The entry that failed the check.
+    pub path: Option<PathBuf>,
+    /// The fresh generation the namespace was rotated to before this failure was returned.
+    pub reset: Option<String>,
+}
+
+/// The optional half of a [`StorageHostError::Corrupt`] message.
+struct SiteSuffix<'a>(&'a Option<Box<CorruptionSite>>);
+
+impl fmt::Display for SiteSuffix<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Some(site) = self.0 else {
+            return Ok(());
+        };
+        if let Some(namespace) = &site.namespace {
+            write!(formatter, " in namespace {namespace}")?;
+        }
+        if let Some(generation) = &site.generation {
+            write!(formatter, " generation {generation}")?;
+        }
+        if let Some(path) = &site.path {
+            write!(formatter, " at {}", path.display())?;
+        }
+        if let Some(reset) = &site.reset {
+            write!(formatter, "; reset to generation {reset}")?;
+        }
+        Ok(())
+    }
+}
+
 impl StorageHostError {
+    /// A corruption naming only the check that failed.
+    #[must_use]
+    pub const fn corrupt(scope: &'static str) -> Self {
+        Self::Corrupt { scope, site: None }
+    }
+
+    fn site_mut(&mut self) -> Option<&mut CorruptionSite> {
+        match self {
+            Self::Corrupt { site, .. } => Some(site.get_or_insert_with(Box::default)),
+            _ => None,
+        }
+    }
+
+    /// Names the entry a corruption was found at, unless the detecting site already did.
+    pub(crate) fn at(mut self, entry: PathBuf) -> Self {
+        if let Some(site) = self.site_mut() {
+            site.path.get_or_insert(entry);
+        }
+        self
+    }
+
+    /// Names the namespace, and the generation when known, that a corruption belongs to.
+    pub(crate) fn in_namespace(mut self, base: &str, generation_token: Option<&str>) -> Self {
+        if let Some(site) = self.site_mut() {
+            site.namespace.get_or_insert_with(|| base.to_owned());
+            if let Some(token) = generation_token {
+                site.generation.get_or_insert_with(|| token.to_owned());
+            }
+        }
+        self
+    }
+
+    /// Whether this failure rotated its namespace to a fresh, empty generation before returning.
+    ///
+    /// When it did, the storage an immediate retry opens is already usable.
+    #[must_use]
+    pub fn namespace_reset(&self) -> bool {
+        matches!(self, Self::Corrupt { site: Some(site), .. } if site.reset.is_some())
+    }
+
     /// The coarse, content-free class this failure is reported under.
     #[must_use]
     pub const fn class(&self) -> StorageFailureClass {
         match self {
             Self::QuotaExceeded | Self::Arithmetic => StorageFailureClass::Quota,
             Self::Timeout => StorageFailureClass::Timeout,
-            Self::Corrupt { .. } | Self::CorruptLayout | Self::KeyMismatch => {
+            Self::Corrupt { .. } | Self::CorruptLayout { .. } | Self::KeyMismatch => {
                 StorageFailureClass::Corrupt
             }
             Self::PermissionDenied | Self::GrantHostMismatch => StorageFailureClass::Denied,

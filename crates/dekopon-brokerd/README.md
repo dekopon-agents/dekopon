@@ -689,7 +689,6 @@ storage:
   finalizationBudgetMs: 5000
   maxPendingTransactions: 64
   startupMaxEntries: 100000
-  maxQuarantinedNamespaces: 128
 
 chatMemory:
   continuityPolicy: authority-bound # safe default; stable must be explicit

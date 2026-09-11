@@ -577,6 +577,24 @@ class, line, and column: enough to separate a truncated write from an unknown or
 without exporting a logical name, a path, an opaque token, or any document content. The rejected
 bytes are never echoed.
 
+`storage_namespace_reset` at `ERROR` is a grant that found its namespace corrupt and rotated it to a
+fresh, empty generation. It carries `storage.namespace` (the base directory token),
+`storage.generation` (the fresh generation), `storage.previous_generation` (the corrupt one, when the
+retained pointer still named it), `storage.check` (the check that failed), and `storage.path` (the
+entry that failed it). It is emitted inside that invocation's `broker.execute` span, which records
+`storage.reset = true`; the invocation fails with `storage-corrupt` and the next one runs on the
+fresh generation. The previous generation stays on disk.
+
+`storage_root_entry_ignored` at `WARN` is the startup quota walk skipping a namespace that did not
+scan — a symlink, a hard link, a wrong mode, or an unreadable directory under `namespaces/<base>`.
+It carries `storage.namespace`, `storage.path`, `storage.check`, and the rendered `error`. The broker
+starts without charging that base, and the conversation's next grant fails naming the same entry.
+`storage_quarantine_removed` at `INFO` is startup deleting the empty `quarantine/` directory an
+earlier release created in every root.
+
+These three records name opaque tokens and paths under the storage root. They are for the operator;
+nothing in them reaches a guest or a model.
+
 Entropy and wall/monotonic clock values from durable-files are never emitted as telemetry. A native
 filesystem operation may outlive a timeout signal; `finalizationBudgetMs` prevents the next bounded
 finalization step from starting after its deadline, while the base/generation leases and quota

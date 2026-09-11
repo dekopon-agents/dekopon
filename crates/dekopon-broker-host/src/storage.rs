@@ -130,9 +130,9 @@ impl StorageState {
         let result = match tokio::task::spawn_blocking(move || {
             let _job = job;
             let mut slot = transaction.lock().expect("storage transaction");
-            let transaction = slot.as_mut().ok_or(StorageHostError::Corrupt {
-                scope: "finalized-transaction",
-            })?;
+            let transaction = slot
+                .as_mut()
+                .ok_or(StorageHostError::corrupt("finalized-transaction"))?;
             operation(transaction)
         })
         .await
@@ -185,9 +185,7 @@ impl StorageState {
                 .lock()
                 .expect("storage transaction")
                 .take()
-                .ok_or(StorageHostError::Corrupt {
-                    scope: "finalized-transaction",
-                })?;
+                .ok_or(StorageHostError::corrupt("finalized-transaction"))?;
             if commit && !rejected && Instant::now() >= deadline {
                 transaction.abort();
                 return Err(StorageHostError::Timeout);
@@ -532,7 +530,7 @@ fn map_jsonl_error(error: StorageHostError) -> jsonl::StorageError {
         StorageHostError::Timeout => jsonl::StorageError::Timeout,
         StorageHostError::Unsupported => jsonl::StorageError::Unsupported,
         StorageHostError::Corrupt { .. }
-        | StorageHostError::CorruptLayout
+        | StorageHostError::CorruptLayout { .. }
         | StorageHostError::KeyMismatch => jsonl::StorageError::Corrupt,
         _ => jsonl::StorageError::Io,
     }
@@ -553,7 +551,7 @@ fn map_durable_error(error: StorageHostError) -> durable::StorageError {
         StorageHostError::Timeout => durable::StorageError::Timeout,
         StorageHostError::Unsupported => durable::StorageError::Unsupported,
         StorageHostError::Corrupt { .. }
-        | StorageHostError::CorruptLayout
+        | StorageHostError::CorruptLayout { .. }
         | StorageHostError::KeyMismatch => durable::StorageError::Corrupt,
         _ => durable::StorageError::Io,
     }
