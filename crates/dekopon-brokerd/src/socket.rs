@@ -6,7 +6,7 @@ use std::{
 };
 
 use dekopon_broker_protocol::{ipc_socket_mode, secure_socket, secure_socket_parent};
-use dekopon_core::{AncestorResolution, AncestorScope, FileHygieneError, check_trusted_ancestors};
+use dekopon_core::{AncestorPolicy, FileHygieneError, check_trusted_ancestors};
 use thiserror::Error;
 use tokio::{
     net::{UnixListener, UnixStream},
@@ -101,20 +101,15 @@ pub fn validate_owned_file(path: &Path, expected_uid: u32) -> Result<(), SocketE
     Ok(())
 }
 
-/// Refuses a path whose ancestry is writable outside its owner.
-///
-/// Every caller canonicalizes before calling, because it needs the resolved parent for its own
-/// checks and its own error anyway, so the walk itself is [`AncestorResolution::AsWritten`] over
-/// an already-resolved path — one `canonicalize` rather than two.
+/// Walks as written from `path` inclusive; every caller canonicalized already, because it needs
+/// the resolved parent for its own check and its own error — one `canonicalize`, not two.
 fn validate_ancestors(path: &Path) -> Result<(), SocketError> {
-    check_trusted_ancestors(
-        path,
-        AncestorResolution::AsWritten,
-        AncestorScope::PathAndAbove,
-    )
-    .map_err(|error| match error {
+    let policy = AncestorPolicy {
+        canonicalize: false,
+        include_self: true,
+    };
+    check_trusted_ancestors(path, policy).map_err(|error| match error {
         FileHygieneError::Io { path, source } => SocketError::Metadata { path, source },
-        // The walk returns only `Io` and `UnsafeAncestor`; anything else is a refusal too.
         refusal => SocketError::InsecureAncestor {
             path: refusal.path().to_path_buf(),
         },

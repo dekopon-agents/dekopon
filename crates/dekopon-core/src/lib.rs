@@ -32,8 +32,8 @@ pub use subject::{ExternalSubject, SubjectError, SubjectService};
 pub use trace::{TraceId, TraceIdError};
 #[cfg(unix)]
 pub use trusted_file::{
-    AncestorResolution, AncestorScope, FileHygieneError, FileTier, check_trusted_ancestors,
-    check_trusted_metadata, read_trusted_file,
+    AncestorPolicy, FileHygieneError, FileTier, check_trusted_ancestors, check_trusted_metadata,
+    read_trusted_file,
 };
 
 pub(crate) const MAX_IDENTIFIER_LENGTH: usize = 253;

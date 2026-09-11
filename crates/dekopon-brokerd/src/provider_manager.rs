@@ -21,8 +21,8 @@ use dekopon_broker_host::{
     LoadedProviderMetadata, LockedProviderSource,
 };
 use dekopon_core::{
-    AncestorResolution, AncestorScope, FileHygieneError, FileTier, ProviderId,
-    check_trusted_ancestors, check_trusted_metadata, read_trusted_file,
+    AncestorPolicy, FileHygieneError, FileTier, ProviderId, check_trusted_ancestors,
+    check_trusted_metadata, read_trusted_file,
 };
 use futures_util::StreamExt as _;
 use http_auth::parser::ChallengeParser;
@@ -1818,19 +1818,17 @@ fn validate_directory(
     Ok(())
 }
 
+/// Walks canonically from `path` inclusive, so aliases such as macOS's `/var -> /private/var`
+/// resolve first; the final entry is still inspected with `symlink_metadata` by the caller.
 fn validate_ancestors(path: &Path) -> Result<(), ProviderManagerError> {
-    // Intermediate aliases such as macOS's `/var -> /private/var` are resolved before the walk;
-    // the final entry itself is still inspected with `symlink_metadata` by the caller.
-    check_trusted_ancestors(
-        path,
-        AncestorResolution::Canonical,
-        AncestorScope::PathAndAbove,
-    )
-    .map_err(|error| match error {
+    let policy = AncestorPolicy {
+        canonicalize: true,
+        include_self: true,
+    };
+    check_trusted_ancestors(path, policy).map_err(|error| match error {
         FileHygieneError::Io { path, source } => {
             ProviderManagerError::io_at(INSPECT_STORE_PATH, path, source)
         }
-        // The walk returns only `Io` and `UnsafeAncestor`; anything else is a refusal too.
         refusal => ProviderManagerError::insecure(
             "provider path ancestor permits unprotected group/world writes",
             refusal.path(),
