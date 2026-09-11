@@ -42,14 +42,11 @@ use wasmtime::{Engine, Store};
 
 mod http;
 mod metadata;
-mod metrics;
 mod storage;
 pub use http::{BoundCredential, HttpCallEvidence, HttpConfigurationError, destinations_cover};
 use http::{HttpCeilings, HttpState};
-pub use metadata::{ComponentInterfaceItem, LoadedProviderMetadata};
-use metadata::{component_interface, identify_bytes};
-use metrics::{ActiveStore, TrackingStoreLimits};
-pub use metrics::{BrokerHostMetrics, BrokerHostStats};
+pub use metadata::LoadedProviderMetadata;
+use metadata::identify_bytes;
 
 pub(crate) mod bindings {
     wasmtime::component::bindgen!({
@@ -72,27 +69,6 @@ pub const STORAGE_WIT: &str = include_str!("../wit/deps/storage.wit");
 
 /// Hard maximum source bytes for one provider component (64 MiB).
 pub const HARD_MAX_PROVIDER_COMPONENT_BYTES: u64 = 64 * 1024 * 1024;
-/// Default maximum size of each linear memory in one store (64 MiB).
-#[deprecated(since = "0.12.0", note = "moved to dekopon_provider_sdk::host")]
-pub const DEFAULT_MAX_MEMORY_BYTES: usize = host::DEFAULT_MAX_MEMORY_BYTES;
-/// Default maximum elements in each Wasm table.
-#[deprecated(since = "0.12.0", note = "moved to dekopon_provider_sdk::host")]
-pub const DEFAULT_MAX_TABLE_ELEMENTS: usize = host::DEFAULT_MAX_TABLE_ELEMENTS;
-/// Default maximum core instances in one store.
-#[deprecated(since = "0.12.0", note = "moved to dekopon_provider_sdk::host")]
-pub const DEFAULT_MAX_INSTANCES: usize = host::DEFAULT_MAX_INSTANCES;
-/// Default maximum tables in one store.
-#[deprecated(since = "0.12.0", note = "moved to dekopon_provider_sdk::host")]
-pub const DEFAULT_MAX_TABLES: usize = host::DEFAULT_MAX_TABLES;
-/// Default maximum linear memories in one store.
-#[deprecated(since = "0.12.0", note = "moved to dekopon_provider_sdk::host")]
-pub const DEFAULT_MAX_MEMORIES: usize = host::DEFAULT_MAX_MEMORIES;
-/// Default maximum serialized provider input size (1 MiB).
-#[deprecated(since = "0.12.0", note = "moved to dekopon_provider_sdk::host")]
-pub const DEFAULT_MAX_INPUT_BYTES: usize = host::DEFAULT_MAX_INPUT_BYTES;
-/// Default maximum serialized provider output or manifest size (1 MiB).
-#[deprecated(since = "0.12.0", note = "moved to dekopon_provider_sdk::host")]
-pub const DEFAULT_MAX_OUTPUT_BYTES: usize = host::DEFAULT_MAX_OUTPUT_BYTES;
 /// Default maximum HTTP calls in one invocation.
 pub const DEFAULT_MAX_HTTP_REQUESTS: u32 = 32;
 /// Default maximum accounted HTTP request bytes (1 MiB).
@@ -421,7 +397,6 @@ struct Runtime {
     // instantiation to resolve imports from scratch.
     linker: Linker<StoreState>,
     limits: BrokerHostLimits,
-    metrics: BrokerHostMetrics,
     memory_budget: Option<Arc<MemoryBudget>>,
 }
 
@@ -436,7 +411,6 @@ impl Runtime {
                 name: "max_total_memory_bytes",
             });
         }
-        let metrics = BrokerHostMetrics::new(limits.clone());
         let mut config = host::config();
         // Asynchronous execution: the guest yields on a fuel interval so a Tokio deadline can
         // cancel it without a process-wide epoch interrupt.
@@ -456,7 +430,6 @@ impl Runtime {
             engine,
             linker,
             limits,
-            metrics,
             memory_budget: options.max_total_memory_bytes.map(|maximum| {
                 Arc::new(MemoryBudget {
                     maximum,
@@ -480,18 +453,14 @@ impl Runtime {
             )?),
             None => None,
         };
-        let limits = self.limits.store_bounds().store_limits();
-        let active = self.metrics.enter_store();
         let mut store = Store::new(
             &self.engine,
             StoreState {
-                limits: TrackingStoreLimits::new(limits, self.metrics.clone()),
+                limits: self.limits.store_bounds().store_limits(),
                 http,
                 storage,
                 table: storage::new_table(),
-                fuel_recorded: false,
-                provider_output_bytes: 0,
-                _active: active,
+                instantiations: 0,
                 _reserved: reserved,
             },
         );
@@ -502,18 +471,11 @@ impl Runtime {
         store
             .fuel_async_yield_interval(Some(self.limits.fuel_yield_interval()))
             .map_err(|source| BrokerHostError::Store { source })?;
+        // Every store is built inside a `provider.describe`, `provider.run_command`, or
+        // `provider.invoke` span, and one fresh store per operation is what this attribute makes
+        // readable: an operation that recorded none was refused before a store existed.
+        tracing::Span::current().record("stores", 1_u64);
         Ok(store)
-    }
-
-    fn record_fuel(&self, store: &mut Store<StoreState>) {
-        if store.data().fuel_recorded {
-            return;
-        }
-        let remaining = store.get_fuel();
-        store.data_mut().fuel_recorded = true;
-        if let Ok(remaining) = remaining {
-            self.metrics.record_fuel(self.limits.fuel, remaining);
-        }
     }
 
     fn http_ceilings(&self) -> HttpCeilings {
@@ -528,13 +490,16 @@ impl Runtime {
 }
 
 struct StoreState {
-    limits: TrackingStoreLimits,
+    limits: wasmtime::StoreLimits,
     http: HttpState,
     storage: storage::StorageState,
     table: wasmtime::component::ResourceTable,
-    fuel_recorded: bool,
-    provider_output_bytes: usize,
-    _active: ActiveStore,
+    /// Component instantiations in this store, recorded onto the operation's span when it ends.
+    ///
+    /// Exactly one is the invariant: imports are resolved into an `InstancePre` at load, so a
+    /// second instantiation inside one describe, command run, or invocation would mean a call
+    /// path started rebuilding instances per call, which is invisible without a number to read.
+    instantiations: u64,
     _reserved: Option<MemoryReservation>,
 }
 
@@ -560,9 +525,6 @@ struct CompiledComponent {
     artifact_sha256: String,
     compile_ms: u64,
     pre: bindings::ProviderPre<StoreState>,
-    imports: Vec<ComponentInterfaceItem>,
-    exports: Vec<ComponentInterfaceItem>,
-    interface_truncated: bool,
     command_export: CommandExport,
 }
 
@@ -576,9 +538,6 @@ pub struct BrokerWasmProvider {
     source: PathBuf,
     artifact_bytes: u64,
     artifact_sha256: String,
-    imports: Vec<ComponentInterfaceItem>,
-    exports: Vec<ComponentInterfaceItem>,
-    interface_truncated: bool,
     manifest: ProviderManifest,
     /// Which command export the component offers, read once from its type at compile.
     command_export: CommandExport,
@@ -699,8 +658,6 @@ fn compile_component(
     let elapsed = started.elapsed();
     let compile_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
     compile.record("elapsed_ms", compile_ms);
-    runtime.metrics.record_compilation(elapsed, artifact.bytes);
-    let (imports, exports, interface_truncated) = component_interface(&runtime.engine, &component);
     let command_export = command_export(&runtime.engine, &component);
     let pre = runtime
         .linker
@@ -717,9 +674,6 @@ fn compile_component(
         artifact_sha256: artifact.sha256,
         compile_ms,
         pre,
-        imports,
-        exports,
-        interface_truncated,
         command_export,
     })
 }
@@ -736,12 +690,19 @@ impl BrokerWasmProvider {
             artifact_sha256,
             compile_ms,
             pre,
-            imports,
-            exports,
-            interface_truncated,
             command_export,
         } = compiled;
-        let manifest_json = describe_component(&runtime, &pre, &source).await?;
+        // Startup's only guest execution, and otherwise invisible between `provider.compile` and
+        // the loaded-provider event below.
+        let manifest_json = describe_component(&runtime, &pre, &source)
+            .instrument(tracing::info_span!(
+                "provider.describe",
+                path = %source.display(),
+                stores = tracing::field::Empty,
+                instantiations = tracing::field::Empty,
+                fuel.consumed = tracing::field::Empty,
+            ))
+            .await?;
         if manifest_json.len() > runtime.limits.max_output_bytes {
             return Err(BrokerHostError::OutputTooLarge {
                 provider: source.display().to_string(),
@@ -785,7 +746,6 @@ impl BrokerWasmProvider {
                 }
             });
         }
-        runtime.metrics.record_provider_loaded();
         tracing::info!(
             provider = %manifest.id,
             path = %source.display(),
@@ -803,9 +763,6 @@ impl BrokerWasmProvider {
             source,
             artifact_bytes,
             artifact_sha256,
-            imports,
-            exports,
-            interface_truncated,
             manifest,
             command_export,
         })
@@ -856,7 +813,6 @@ impl BrokerWasmProvider {
                 });
             }
         };
-        self.runtime.metrics.record_command_resolution();
         let operation_timeout = self.runtime.limits.max_timeout;
         let http = HttpState::describe(self.runtime.http_ceilings(), operation_timeout)
             .map_err(|source| BrokerHostError::HttpConfiguration { source })?;
@@ -885,7 +841,7 @@ impl BrokerWasmProvider {
                     path: self.source.clone(),
                     source,
                 })?;
-            self.runtime.metrics.record_instantiation();
+            store.data_mut().instantiations += 1;
             let output = if export_name == RUN_COMMAND_EXPORT {
                 let function = instance
                     .get_typed_func::<(Vec<String>, Option<String>), (String,)>(
@@ -930,7 +886,7 @@ impl BrokerWasmProvider {
                     operation: format!("{export_name} {}", self.manifest.id),
                     timeout_ms: operation_timeout.as_millis() as u64,
                 });
-        self.runtime.record_fuel(&mut store);
+        record_store_outcome(&store, self.runtime.limits.fuel);
         let output = output??;
         if store.data().http.attempted() || store.data().storage.attempted() {
             return Err(BrokerHostError::RunCommandUsedHostImport {
@@ -985,10 +941,6 @@ impl BrokerWasmProvider {
             .into());
         }
 
-        let storage_backed = storage_transaction.is_some();
-        self.runtime
-            .metrics
-            .record_invocation_started(if storage_backed { 0 } else { input_json.len() });
         let operation_timeout = Duration::from_millis(constraints.timeout_ms);
         let http = match HttpState::invoke(
             constraints.http.clone(),
@@ -998,26 +950,13 @@ impl BrokerWasmProvider {
             operation_timeout,
         ) {
             Ok(http) => http,
-            Err(source) => {
-                self.runtime
-                    .metrics
-                    .record_invocation_finished(false, false, 0, &[], None);
-                return Err(BrokerHostError::HttpConfiguration { source }.into());
-            }
+            Err(source) => return Err(BrokerHostError::HttpConfiguration { source }.into()),
         };
         let storage_state = storage_transaction.map_or_else(
             storage::StorageState::disabled,
             storage::StorageState::active,
         );
-        let mut store = match self.runtime.store(http, storage_state) {
-            Ok(store) => store,
-            Err(error) => {
-                self.runtime
-                    .metrics
-                    .record_invocation_finished(false, false, 0, &[], None);
-                return Err(error.into());
-            }
-        };
+        let mut store = self.runtime.store(http, storage_state)?;
         // The store outlives the guest on every path, including the one where the timeout drops
         // the operation future, so evidence for dispatched calls is harvested exactly once and
         // reaches the caller whether the invocation succeeded or failed.
@@ -1043,23 +982,10 @@ impl BrokerWasmProvider {
         {
             executed = Err(BrokerHostError::Storage { source });
         }
-        self.runtime.record_fuel(&mut store);
-        let output_bytes = if storage_backed {
-            0
-        } else {
-            store.data().provider_output_bytes
-        };
-        let timed_out = matches!(&executed, Err(BrokerHostError::Timeout { .. }));
+        record_store_outcome(&store, self.runtime.limits.fuel);
         let mut data = store.into_data();
         let storage = data.storage.take_evidence();
         let http_calls = data.http.into_evidence();
-        self.runtime.metrics.record_invocation_finished(
-            executed.is_ok(),
-            timed_out,
-            output_bytes,
-            &http_calls,
-            storage.as_ref(),
-        );
         match executed {
             Ok(output) => Ok(BrokerInvocationOutput {
                 provider: self.manifest.id.clone(),
@@ -1094,7 +1020,7 @@ impl BrokerWasmProvider {
                     path: self.source.clone(),
                     source,
                 })?;
-            self.runtime.metrics.record_instantiation();
+            store.data_mut().instantiations += 1;
             bindings
                 .call_invoke(&mut *store, capability.as_str(), input_json)
                 .await
@@ -1134,8 +1060,6 @@ impl BrokerWasmProvider {
             });
         }
         let output_json = operation_result?;
-        store.data_mut().provider_output_bytes = output_json.len();
-
         let maximum_output = usize::try_from(constraints.max_output_bytes)
             .unwrap_or(usize::MAX)
             .min(self.runtime.limits.max_output_bytes);
@@ -1375,6 +1299,9 @@ impl BrokerProviderRegistry {
                 provider = %provider.manifest.id,
                 word,
                 command.export = command_export_name(&provider.command_export),
+                stores = tracing::field::Empty,
+                instantiations = tracing::field::Empty,
+                fuel.consumed = tracing::field::Empty,
             ))
             .await?;
         parse_command_run(&provider.command_export, &json).map_err(|source| {
@@ -1401,9 +1328,6 @@ impl BrokerProviderRegistry {
                 artifact_bytes: provider.artifact_bytes,
                 artifact_sha256: provider.artifact_sha256.clone(),
                 manifest: provider.manifest.clone(),
-                imports: provider.imports.clone(),
-                exports: provider.exports.clone(),
-                interface_truncated: provider.interface_truncated,
             })
     }
 
@@ -1422,17 +1346,6 @@ impl BrokerProviderRegistry {
     #[must_use]
     pub fn storage_host(&self) -> Option<StorageHost> {
         self.storage_host.clone()
-    }
-
-    /// Returns a cloneable handle to live Wasmtime host counters.
-    #[must_use]
-    pub fn metrics(&self) -> BrokerHostMetrics {
-        self.providers
-            .first()
-            .expect("a registry is constructed with at least one provider")
-            .runtime
-            .metrics
-            .clone()
     }
 
     /// Returns one routed capability and the provider declaring it, by identifier.
@@ -1580,18 +1493,43 @@ impl BrokerProviderRegistry {
                 storage_transaction,
             )
             .instrument(if storage_backed {
-                tracing::info_span!("provider.invoke", storage = true)
+                tracing::info_span!(
+                    "provider.invoke",
+                    storage = true,
+                    stores = tracing::field::Empty,
+                    instantiations = tracing::field::Empty,
+                    fuel.consumed = tracing::field::Empty,
+                )
             } else {
                 let span = tracing::info_span!(
                     "provider.invoke",
                     capability = %proposal.capability,
                     provider = %provider.manifest.id,
                     input = tracing::field::Empty,
+                    stores = tracing::field::Empty,
+                    instantiations = tracing::field::Empty,
+                    fuel.consumed = tracing::field::Empty,
                 );
                 span.record("input", tracing::field::display(&proposal.input));
                 span
             })
             .await
+    }
+}
+
+/// Records what one operation's store did, on the span that operation is running under.
+///
+/// `stores` is knowable when the store is built; these two are only knowable once the guest has
+/// stopped, so they are recorded together on every path a store can end on — success, trap,
+/// rejection, and timeout alike. Fuel is read back from Wasmtime rather than accumulated
+/// alongside it, because the remaining count in the store is the authority on what the guest
+/// actually burned; a store that reports none records nothing rather than a zero that would read
+/// as an invocation that ran for free.
+fn record_store_outcome(store: &Store<StoreState>, supplied: u64) {
+    let span = tracing::Span::current();
+    span.record("instantiations", store.data().instantiations);
+    if let Ok(remaining) = store.get_fuel() {
+        span.record("fuel.consumed", supplied.saturating_sub(remaining));
     }
 }
 
@@ -1623,7 +1561,7 @@ async fn describe_component(
                 source: error,
             }
         })?;
-        runtime.metrics.record_instantiation();
+        store.data_mut().instantiations += 1;
         bindings
             .call_describe(&mut store)
             .await
@@ -1644,9 +1582,8 @@ async fn describe_component(
                 operation: format!("describe {}", source.display()),
                 timeout_ms: operation_timeout.as_millis() as u64,
             });
-    runtime.record_fuel(&mut store);
+    record_store_outcome(&store, runtime.limits.fuel);
     let manifest = manifest??;
-    runtime.metrics.record_description();
     if store.data().http.attempted() || store.data().storage.attempted() {
         return Err(BrokerHostError::DescribeUsedHostImport {
             path: source.to_path_buf(),
