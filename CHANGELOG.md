@@ -473,6 +473,12 @@ All notable changes to Dekopon are documented here. The format is based on
   auth status has four fields and the table already shows three of them. `-o table` remains the
   default; `json`, `yaml`, and `name` are unchanged. A command line still passing `-o wide` is now
   refused by argument parsing with the accepted values named.
+- `dekopon-shell`'s `ast`, `lexer`, and `parser` modules are private, and `ParseError` no longer
+  re-exports from the crate root. They were semver-committed API no consumer imported — the
+  interpreter's own front end, published only because the modules were declared `pub`. A script
+  still reaches the caller as a `ScriptOutcome`; a syntax error is still the rendered
+  `dekopon-shell: syntax error: ...` line on its output, which is the shape every consumer
+  actually reads. The grammar is now free to change without a major version.
 
 ### Fixed
 

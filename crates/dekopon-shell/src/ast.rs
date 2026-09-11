@@ -257,7 +257,8 @@ pub struct Word {
 impl Word {
     /// Returns the word's text when it is a single unquoted literal.
     #[must_use]
-    pub fn as_literal(&self) -> Option<&str> {
+    #[cfg(test)]
+    pub(crate) fn as_literal(&self) -> Option<&str> {
         match self.parts.as_slice() {
             [WordPart::Literal(text)] => Some(text),
             _ => None,
