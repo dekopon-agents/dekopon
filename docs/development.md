@@ -233,7 +233,7 @@ cargo check --locked -p dekopon-provider-storage --no-default-features --target 
 cargo check --locked -p dekopon-provider-storage --no-default-features --features jsonl --target wasm32-unknown-unknown
 cargo check --locked -p dekopon-provider-storage --no-default-features --features durable-files --target wasm32-unknown-unknown
 # The repository shell scripts.
-shellcheck .github/scripts/ci_metrics.sh ci/fetch-external-provider-components.sh \
+shellcheck ci/fetch-external-provider-components.sh \
   examples/otel-traces/smoke-test.sh examples/providers/build-component.sh examples/providers/*/build.sh
 # Rustdoc with warnings denied.
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked

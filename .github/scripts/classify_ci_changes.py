@@ -30,7 +30,6 @@ FULL_CI_INPUTS = {
     ".github/scripts/classify_ci_changes.py",
     ".github/scripts/test_classify_ci_changes.py",
     ".github/scripts/test_daemon_dependency_gates.py",
-    ".github/scripts/ci_metrics.sh",
     ".github/scripts/check_docs_duplicates.py",
     ".github/scripts/render-homebrew-formula.py",
     ".github/scripts/test_render_homebrew_formula.py",
