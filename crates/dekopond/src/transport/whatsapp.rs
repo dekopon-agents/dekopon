@@ -755,54 +755,21 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     difference == 0
 }
 
+/// Decodes the verification query, refusing any field that could grow the echoed challenge.
+///
+/// `form_urlencoded` is lossy where the hand-written decoder was strict: a malformed escape or a
+/// non-UTF-8 byte survives as literal text or `U+FFFD` instead of failing the parse. Neither can
+/// reach the response — such a `hub.verify_token` fails the constant-time comparison and such a
+/// `hub.mode` is not `subscribe` — so the refusal happens one step later, still as 403.
 fn parse_query(query: &str) -> Result<Vec<(String, String)>, ()> {
     let mut fields = Vec::new();
-    for part in query.split('&') {
-        let (name, value) = part.split_once('=').ok_or(())?;
-        let name = percent_decode(name)?;
-        let value = percent_decode(value)?;
+    for (name, value) in form_urlencoded::parse(query.as_bytes()) {
         if name.len() > MAX_QUERY_VALUE_BYTES || value.len() > MAX_QUERY_VALUE_BYTES {
             return Err(());
         }
-        fields.push((name, value));
+        fields.push((name.into_owned(), value.into_owned()));
     }
     Ok(fields)
-}
-
-#[allow(
-    clippy::map_err_ignore,
-    reason = "FromUtf8Error carries back the attacker-supplied query bytes, and this function's \
-              only caller discards the error entirely to answer 403"
-)]
-fn percent_decode(value: &str) -> Result<String, ()> {
-    let bytes = value.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        match bytes[index] {
-            b'+' => decoded.push(b' '),
-            b'%' if index + 2 < bytes.len() => {
-                decoded.push(
-                    (percent_hex_nibble(bytes[index + 1]).ok_or(())? << 4)
-                        | percent_hex_nibble(bytes[index + 2]).ok_or(())?,
-                );
-                index += 2;
-            }
-            b'%' => return Err(()),
-            byte => decoded.push(byte),
-        }
-        index += 1;
-    }
-    String::from_utf8(decoded).map_err(|_| ())
-}
-
-fn percent_hex_nibble(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
 }
 
 fn exactly_one<'a>(fields: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -1041,6 +1008,8 @@ mod tests {
             "hub.mode=subscribe&hub.challenge=x",
             "hub.mode=subscribe&hub.verify_token=wrong&hub.challenge=x",
             "hub.mode=subscribe&hub.mode=subscribe&hub.verify_token=verify&hub.challenge=x",
+            // A malformed escape now survives the parse as literal text; `%zz` is not `subscribe`.
+            "hub.mode=%zz&hub.verify_token=verify&hub.challenge=x",
         ] {
             let response =
                 verify_subscription(State(state()), RawQuery(Some(query.to_owned()))).await;
@@ -1193,7 +1162,8 @@ mod tests {
         assert_eq!(exactly_one(&fields, "hub.challenge"), Some("✓"));
         let repeated = parse_query("hub.mode=subscribe&hub.mode=subscribe").expect("query");
         assert_eq!(exactly_one(&repeated, "hub.mode"), None);
-        assert!(parse_query("hub.mode=%zz").is_err());
+        let oversized = format!("hub.challenge={}", "x".repeat(MAX_QUERY_VALUE_BYTES + 1));
+        assert!(parse_query(&oversized).is_err());
     }
 
     #[test]

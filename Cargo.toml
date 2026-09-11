@@ -40,6 +40,7 @@ axum = { version = "0.8.9", default-features = false, features = ["http1", "toki
 base64 = "0.23.1"
 cedar-policy = { version = "4.12.0", default-features = false }
 clap = { version = "4.6.4", features = ["derive", "env"] }
+form_urlencoded = "1.2.2"
 getrandom = "0.4.3"
 futures-util = "0.3.31"
 hmac = "0.13.0"

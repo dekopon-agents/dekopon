@@ -212,6 +212,13 @@ All notable changes to Dekopon are documented here. The format is based on
   session's calls are still recoverable by prefix — by the same trace the gateway's own spans carry.
   `BrokerLeg::connect` lost its `trace_prefix` argument and `BrokerLegError::SessionIdentifier` went
   with it. Audit records written before this carry a non-W3C `trace` and no longer decode.
+- The WhatsApp subscription-verification query is decoded by `form_urlencoded::parse` instead of a
+  hand-written percent decoder. The 512-byte per-field bound and the duplicate-key refusal that keep
+  the echoed `hub.challenge` contained are unchanged, as is the constant-time `hub.verify_token`
+  comparison. Strictness is what moves: a malformed escape such as `%zz`, a non-UTF-8 byte, and a
+  field with no `=` used to fail the parse outright and now survive as literal text, `U+FFFD`, or an
+  empty value. None of them can reach the response — such a `hub.mode` is not `subscribe` and such a
+  `hub.verify_token` fails the comparison — so the request still ends in 403, one step later.
 - Provider storage applies writes per host call through a direct invocation handle, with namespace, key, quota and private-file isolation retained. Failed invocations can leave completed writes; there is no invocation rollback, crash recovery or automatic generation collection.
 - Durable files are sized by `statat` instead of a full-file in-memory mirror. A positional write,
   truncate, remove, or rename no longer loads the file it changes, which redefines what
