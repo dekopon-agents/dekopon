@@ -80,6 +80,17 @@ hostLimits:
 `maxTotalMemoryBytes: null` restores the unbounded behavior. A deployment that already sets the
 field — including the Helm chart's own `268435456` — is unaffected.
 
+## Legacy bearer credential shape (unreleased)
+
+Read every `kind: bearerToken` entry in `broker-credentials.yaml` before upgrading. Its `secret` must
+now be at least 16 bytes of printable ASCII with no whitespace, control or non-ASCII bytes — the
+previous rule accepted any non-empty printable value, spaces included — and the broker refuses to
+start, naming the credential and not the value, on one that is not. The secret is now also the byte
+string the native HTTP host searches responses for before returning them, so a short or
+phrase-shaped value would deny answers that never carried it. A real issued token satisfies both
+rules already; a hand-written placeholder or a development stub may not. Replace such a value with
+the real credential rather than working around the refusal.
+
 ## Broker audit configuration (unreleased)
 
 Use only the current [broker configuration fields](../crates/dekopon-brokerd/README.md#configuration);

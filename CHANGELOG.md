@@ -457,6 +457,28 @@ All notable changes to Dekopon are documented here. The format is based on
   carries every executable, so no count ages there at all, and a count with no spelled word is
   a hard error rather than a digit pushed to the tap.
 
+### Security
+
+- Both legacy credential kinds — `bearerToken` and the `chatgptSubscription` built on top of it —
+  are now direct-reflection checked exactly as a DRN-bound credential is. `BoundCredential::bearer`
+  built its list of reflection needles empty, so the filter that refuses a response carrying the
+  credential protected only the DRN path: an endpoint that echoed the `authorization` header it
+  received handed the token back to the provider component and from there to the model, on the
+  credential path deployments actually run today. The raw secret is now the needle. The rendered
+  `<scheme> <secret>` value is not a second one, because the check is a substring search and every
+  response carrying the rendered header already carries the raw secret.
+- A `bearerToken` `secret` must now be at least 16 bytes of printable ASCII with no whitespace,
+  control or non-ASCII bytes; the broker refuses to start, naming the credential and never the
+  value, otherwise. This is what makes the needle above safe to search for: a one-byte or
+  phrase-shaped secret used as a substring needle would refuse responses that never carried it,
+  turning a weak credential into a silent denial of every call the capability makes. Sixteen bytes
+  is below anything an issuer calls a bearer token — a 128-bit value is 22 characters in base64 —
+  and the previous rule admitted spaces, so the whitespace refusal is new too. The same floor now
+  applies to a DRN-resolved secret on both native sinks, which have no startup to refuse at: a
+  resolved value below it fails that invocation as `invalid-material` before the provider runs,
+  logging `broker_secret_credential_failed`, rather than becoming a needle short enough to deny
+  unrelated responses.
+
 ## [0.12.0] - 2026-08-29
 
 ### Added

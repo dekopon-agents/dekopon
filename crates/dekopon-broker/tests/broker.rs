@@ -1935,7 +1935,7 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
                 "fetch-token".to_owned(),
                 BoundCredential::bearer(
                     "Bearer",
-                    Redacted::new("secret".to_owned()),
+                    Redacted::new("fetch-token-secret-value".to_owned()),
                     vec!["api.example.test".to_owned()],
                 )
                 .expect("valid credential fixture"),
@@ -1944,7 +1944,7 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
                 "other-token".to_owned(),
                 BoundCredential::bearer(
                     "Bearer",
-                    Redacted::new("other-secret".to_owned()),
+                    Redacted::new("other-token-secret-value".to_owned()),
                     vec!["other.example.test".to_owned()],
                 )
                 .expect("valid credential fixture"),
