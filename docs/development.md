@@ -392,7 +392,7 @@ wkg get \
 
 No provider or HTTP WIT file changes for this feature: the DRN is a typed top-level proposal field
 and the native HTTP host keeps injection broker-owned. Validate the domain, dual policy, shell,
-path/reflection host, broker swap refusal, strict private map, and mock adapters with:
+path/credential-echo host, broker swap refusal, strict private map, and mock adapters with:
 
 ```console
 cargo test -p dekopon-core --locked

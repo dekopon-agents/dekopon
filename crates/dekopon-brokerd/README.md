@@ -184,7 +184,7 @@ following start.
 
 A `bearerToken` `secret` must be at least 16 bytes of printable ASCII with no whitespace or control
 bytes. The value is also what the native HTTP host searches an authorized response for before
-returning it, and a short or phrase-shaped needle would deny answers that never carried the
+returning it, and a short or phrase-shaped value would deny answers that never carried the
 credential.
 
 ### `chatgptSubscription`: a credential the broker renews itself
@@ -241,8 +241,8 @@ secretMapPath: /etc/dekopon/secret-map.yaml
 ```
 
 Map descriptors are validated without network at startup. Resolution is per authorized invocation,
-with no stale fallback. Basic/Bearer rendering, path and query scope, injection limits, and direct
-reflection checks live in the native HTTP host. See
+with no stale fallback. Basic/Bearer rendering, path and query scope, injection limits, and the
+credential echo check live in the native HTTP host. See
 [`../../docs/secrets.md`](../../docs/secrets.md) for the strict map schema, source fields,
 bootstrap-file hygiene, policies, and examples. `credentialsPath` and `secretMapPath` may coexist
 today; the legacy selection bindings [will be replaced by public DRNs](../../docs/design.md#legacy-credential-bindings).

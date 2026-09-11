@@ -360,6 +360,12 @@ All notable changes to Dekopon are documented here. The format is based on
   argument, so `dekopon-console` builds unchanged; the new `dekopon_core::REDACTION_MARKER` is the
   constant itself. Any log, span, or serialized record that quoted a marker's width now reads
   `[REDACTED]`.
+- The native HTTP host's refusal of a response that carries its credential is now the credential
+  echo check, and its message reads `credentialed response echoed the credential` instead of
+  `credential-bearing response reflected protected material`. That text is what an operator reads
+  in `error.message` on the `http.request` span and the `accounting.http.request` record, and what
+  the provider component receives in `http-error.message`. The responses it refuses and the 16-byte
+  floor are unchanged.
 
 ### Removed
 
