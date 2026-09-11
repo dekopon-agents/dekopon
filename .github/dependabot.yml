@@ -1,7 +1,23 @@
 version: 2
 updates:
   - package-ecosystem: cargo
-    directory: /
+    directories:
+      - /
+      - /examples/providers/cli-probe
+      - /examples/providers/clock-probe
+      - /examples/providers/http-probe
+      - /examples/providers/memory-reservation-probe
+      - /examples/providers/provider-v0-1-compat
+      - /examples/providers/provider-v0-2-compat
+      - /examples/providers/storage-probe
+    groups:
+      component-stack:
+        patterns:
+          - "wasmtime*"
+          - "wit-bindgen*"
+          - "wasm*"
+          - "wit-parser"
+          - "cranelift*"
     schedule:
       interval: weekly
       day: monday

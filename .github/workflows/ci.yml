@@ -63,11 +63,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
-        with:
-          toolchain: stable
-          components: clippy,rustfmt
+      - name: Install Rust
+        run: rustup toolchain install
       - name: Configure compiler cache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
@@ -176,8 +173,9 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --all-features --no-deps
 
-  stable_tests:
-    name: workspace tests (stable)
+  # rust-toolchain.toml pins the MSRV, so this one suite is both the test and the MSRV check.
+  test:
+    name: test (Rust)
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.run_rust != 'false' }}
     runs-on: ubuntu-24.04
@@ -190,10 +188,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
-        with:
-          toolchain: stable
+      - name: Install Rust
+        run: rustup toolchain install
       - name: Configure compiler cache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
@@ -217,6 +213,24 @@ jobs:
         run: cargo test --workspace --all-features --locked
       - name: Test documentation
         run: cargo test --workspace --all-features --locked --doc
+
+  # Releases ship aarch64-unknown-linux-gnu, where Wasmtime generates different machine code: run the
+  # component host's own tests natively there rather than a second copy of the workspace suite.
+  arm64_components:
+    name: broker-host components (Linux ARM64)
+    needs: changes
+    if: ${{ !cancelled() && needs.changes.outputs.run_rust != 'false' }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: rustup toolchain install
+      - name: Fetch exact standalone-provider test fixtures
+        run: ci/fetch-external-provider-components.sh examples/providers
+      - name: Test broker-host component boundaries
+        run: cargo test -p dekopon-broker-host --test host --all-features --locked
 
   # Both gates are toolchain-free, so they stay out of quality_checks: a documentation-only
   # pull request selects no Rust lane and must still fail on a stale duplicate entry or an
@@ -268,7 +282,7 @@ jobs:
   # lane this pull request did not select is skipped, so require each one only under its own gate.
   quality:
     name: quality (stable)
-    needs: [changes, quality_checks, stable_tests, docs]
+    needs: [changes, quality_checks, test, arm64_components, docs]
     if: ${{ always() && !cancelled() && (needs.changes.outputs.run_rust != 'false' || needs.changes.outputs.run_docs != 'false') }}
     runs-on: ubuntu-24.04
     steps:
@@ -278,13 +292,15 @@ jobs:
           RUN_RUST: ${{ needs.changes.outputs.run_rust }}
           RUN_DOCS: ${{ needs.changes.outputs.run_docs }}
           CHECKS_RESULT: ${{ needs.quality_checks.result }}
-          TESTS_RESULT: ${{ needs.stable_tests.result }}
+          TESTS_RESULT: ${{ needs.test.result }}
+          ARM64_RESULT: ${{ needs.arm64_components.result }}
           DOCS_RESULT: ${{ needs.docs.result }}
         run: |
           set -euo pipefail
           if [ "$RUN_RUST" != false ]; then
             test "$CHECKS_RESULT" = success
             test "$TESTS_RESULT" = success
+            test "$ARM64_RESULT" = success
           fi
           if [ "$RUN_DOCS" != false ]; then
             test "$DOCS_RESULT" = success
@@ -310,10 +326,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
-        with:
-          toolchain: stable
+      - name: Install Rust
+        run: rustup toolchain install
       - name: Configure compiler cache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
@@ -345,75 +359,6 @@ jobs:
           OPENOBSERVE_IMAGE: ghcr.io/${{ github.repository_owner }}/openobserve:v0.92.0@sha256:a40c420d5d25f013243dbd7e025db1e39980385dcb9e5de924ce5a6a80957527
         run: examples/otel-traces/smoke-test.sh
 
-  msrv:
-    name: test (Rust 1.89.0)
-    needs: changes
-    if: ${{ !cancelled() && needs.changes.outputs.run_rust != 'false' }}
-    runs-on: ubuntu-24.04
-    # rust-toolchain.toml pins `channel = "stable"`, which outranks the `rustup default`
-    # the toolchain action sets, so this job silently built on stable until 2026-08.
-    # RUSTUP_TOOLCHAIN outranks the toolchain file and is what actually holds the MSRV.
-    env:
-      RUSTUP_TOOLCHAIN: 1.89.0
-      SCCACHE_BASEDIRS: ${{ github.workspace }}
-      SCCACHE_GHA_ENABLED: "true"
-      SCCACHE_GHA_RW_MODE: READ_ONLY
-      SCCACHE_GHA_VERSION: dekopon-v1
-      RUSTC_WRAPPER: sccache
-    steps:
-      - name: Check out source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install minimum supported Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
-        with:
-          toolchain: 1.89.0
-      - name: Configure compiler cache
-        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
-        with:
-          version: v0.17.0
-      - name: Restore Cargo registry
-        id: cargo-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: cargo-registry-v1-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            cargo-registry-v1-${{ runner.os }}-
-      - name: Verify the MSRV toolchain is in effect
-        shell: bash
-        run: |
-          set -euo pipefail
-          expected=1.89.0
-          actual=$(rustc --version | cut -d' ' -f2)
-          if [ "$actual" != "$expected" ]; then
-            printf 'MSRV gate is not binding: expected rustc %s, got %s\n' "$expected" "$actual" >&2
-            rustup show >&2
-            exit 1
-          fi
-      - name: Verify the declared MSRV matches this job
-        shell: bash
-        run: |
-          set -euo pipefail
-          expected=1.89.0
-          declared=$(sed -ne 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
-          if [ "$declared" != "$expected" ]; then
-            printf 'workspace rust-version is %s but this job pins %s; update both\n' "$declared" "$expected" >&2
-            exit 1
-          fi
-      - name: Fetch exact standalone-provider test fixtures
-        run: ci/fetch-external-provider-components.sh examples/providers
-      # Stable CI executes the tests. This gate proves that the same test targets still compile
-      # and link on the declared minimum toolchain without serially executing the suite twice.
-      - name: Compile workspace tests on MSRV
-        run: cargo test --workspace --all-features --locked --no-run
-      # Cargo cannot compile doctests under --no-run, so execute this small set to retain the
-      # compile-fail authority checks on the minimum toolchain.
-      - name: Test documentation on MSRV
-        run: cargo test --workspace --all-features --locked --doc
-
   package:
     name: package crates
     needs: changes
@@ -433,10 +378,8 @@ jobs:
       - name: Check package shell scripts
         if: ${{ needs.changes.outputs.run_package != 'false' }}
         run: shellcheck .github/scripts/prepare-package-cache.sh
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
-        with:
-          toolchain: stable
+      - name: Install Rust
+        run: rustup toolchain install
       # Package verification recompiles unpacked sources under target/package, so its paths do not
       # match the main-workspace compiler cache. Avoid hashing thousands of guaranteed misses.
       - name: Restore Cargo registry
@@ -484,10 +427,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
-        with:
-          toolchain: stable
+      - name: Install Rust
+        run: rustup toolchain install
       - name: Configure compiler cache
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:

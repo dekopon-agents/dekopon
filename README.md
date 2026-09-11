@@ -92,7 +92,7 @@ The newest crate version on crates.io can trail the newest Git tag, because a ta
 
 ### From a checkout
 
-With stable Rust (MSRV 1.89.0, edition 2024):
+With the Rust that [`rust-toolchain.toml`](rust-toolchain.toml) pins (also the MSRV; edition 2024):
 
 ```console
 git clone https://github.com/dekopon-agents/dekopon.git

@@ -243,6 +243,11 @@ swap in the order above.
 Not yet released; the version that carries it is named when it is cut. One item here — the removed
 `imageGenerator:` — **does** need a configuration edit; nothing else does.
 
+- **Building the crates needs Rust 1.98.1.** Every published crate now declares
+  `rust-version = "1.98.1"` (was 1.89.0), the same compiler the repository pins, so `cargo install`
+  on an older compiler refuses them. Release archives, the container image, and the chart are
+  unaffected. An embedding that calls `dekopon-provider-sdk`'s `host` functions moves to Wasmtime 48
+  with it.
 - **`chatgptSubscription` is a new broker credential kind; nothing existing has to change.** Every
   `bearerToken` entry in `broker-credentials.yaml` keeps its exact meaning. The new kind takes an
   absolute `authFile` instead of a `secret` and `scheme`, and the broker refuses to start when a

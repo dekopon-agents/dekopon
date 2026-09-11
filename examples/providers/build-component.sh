@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if (($# != 6)); then
-  echo "usage: $0 <manifest> <core-wasm> <component-wasm> <rust-toolchain> <required-rustc> <metadata-domain>" >&2
+if (($# != 4)); then
+  echo "usage: $0 <manifest> <core-wasm> <component-wasm> <metadata-domain>" >&2
   exit 2
 fi
 
 manifest=$1
 core=$2
 component=$3
-rust_toolchain=$4
-required_rustc=$5
-metadata_domain=$6
+metadata_domain=$4
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
+# The component toolchain pin lives in rust-toolchain.toml and ci/toolchain.env only.
+rust_toolchain=$(sed -n 's/^channel = "\(.*\)"$/\1/p' "$root/rust-toolchain.toml")
+# shellcheck source=/dev/null
+source "$root/ci/toolchain.env"
 
 command -v rustup >/dev/null 2>&1 || {
   echo "error: rustup with Rust $rust_toolchain is required" >&2
@@ -22,21 +24,20 @@ if ! actual_rustc=$(rustup run "$rust_toolchain" rustc --version 2>/dev/null); t
   echo "error: Rust $rust_toolchain is required (rustup toolchain install $rust_toolchain --profile minimal)" >&2
   exit 1
 fi
-if [[ "$actual_rustc" != "$required_rustc" ]]; then
-  echo "error: expected $required_rustc, found $actual_rustc" >&2
+if [[ "$actual_rustc" != "rustc $rust_toolchain "* ]]; then
+  echo "error: expected rustc $rust_toolchain, found $actual_rustc" >&2
   exit 1
 fi
 
-required_wasm_tools_version="1.236.1"
 command -v wasm-tools >/dev/null 2>&1 || {
-  echo "error: wasm-tools $required_wasm_tools_version is required (cargo install wasm-tools --version $required_wasm_tools_version --locked)" >&2
+  echo "error: wasm-tools $WASM_TOOLS_VERSION is required (cargo install wasm-tools --version $WASM_TOOLS_VERSION --locked)" >&2
   exit 1
 }
 actual_wasm_tools=$(wasm-tools --version)
 actual_wasm_tools_version=${actual_wasm_tools#wasm-tools }
 actual_wasm_tools_version=${actual_wasm_tools_version%% *}
-if [[ "$actual_wasm_tools_version" != "$required_wasm_tools_version" ]]; then
-  echo "error: expected wasm-tools $required_wasm_tools_version, found $actual_wasm_tools" >&2
+if [[ "$actual_wasm_tools_version" != "$WASM_TOOLS_VERSION" ]]; then
+  echo "error: expected wasm-tools $WASM_TOOLS_VERSION, found $actual_wasm_tools" >&2
   exit 1
 fi
 

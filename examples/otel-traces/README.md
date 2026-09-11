@@ -8,7 +8,7 @@ isolated environment; provider execution requires the fixture's broker policy.
 
 ## Run
 
-Prerequisites: Docker Compose, Rust 1.89 or newer, Python 3, `curl`, `base64`, and `jq`.
+Prerequisites: Docker Compose, `rustup` (the repository's `rust-toolchain.toml` selects the compiler), Python 3, `curl`, `base64`, and `jq`.
 From the repository root:
 
 ```console

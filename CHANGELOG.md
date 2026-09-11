@@ -223,6 +223,14 @@ All notable changes to Dekopon are documented here. The format is based on
 ### Changed
 
 - Service run functions return unit on clean shutdown.
+- Rust 1.98.1 is both the toolchain and the MSRV (was `stable` and 1.89.0), and the component stack
+  moves with it: Wasmtime 48.0.2, wit-bindgen 0.62.0, and wasm-tools 1.259.0, with every
+  repository-owned provider fixture rebuilt on that stack. `dekopon-provider-sdk`'s `host` feature
+  now takes Wasmtime 48 types. No workflow or script repeats a version: they live in
+  `rust-toolchain.toml`, the manifests, `ci/toolchain.env`, and `deny.toml`, each under a comment
+  listing what moves in lockstep. CI runs the workspace suite once as `test (Rust)`, replacing
+  `workspace tests (stable)` and `test (Rust 1.89.0)`, and adds a native Linux ARM64 lane for the
+  broker-host component tests.
 - Exported telemetry now always carries what `telemetryPayloads` used to gate: `input` on
   `broker.authorize` and `provider.invoke`, `url.full` on `http.request`, and the
   `agent.model.prompt`, `agent.model.answer`, `agent.tool.script`, `agent.tool.output`,
