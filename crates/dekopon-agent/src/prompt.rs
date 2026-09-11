@@ -1296,7 +1296,7 @@ The dialect is eerily close to bash and explicitly not bash. Pipelines, `&&`, `|
 leading `!`, `if`/`elif`/`else`, `for`, `while`, `until`, `case`/`esac`, `[[ ... ]]`, `{ ...; }` \
 groups — the compound ones all usable as pipeline stages, so `cmd | while ...; do ...; done` \
 works and a piped loop keeps what it assigns because nothing here forks — `break`/`continue`, \
-functions with `$1`/`$@`/`$#`/`shift`/`getopts`/`local`, `read`, `$NAME`, `${NAME[index]}`, \
+functions with `$1`/`$@`/`$#`/`shift`/`local`, `read`, `$NAME`, `${NAME[index]}`, \
 `${NAME[@]}`, `${#NAME}`, `${NAME:-default}` and its `:=`/`:?`/`:+`/`#`/`%`/`/` relatives, `$( \
 )`, `$(( ))`, `$?`, `${PIPESTATUS[@]}`, `set -e`/`set -u`/`set -o pipefail`, `return`, `exit`, \
 both quoting forms, here-documents (`<<EOF`, `<<-EOF`, and literal `<<'EOF'`), and redirection of \
@@ -1328,12 +1328,11 @@ ceilings; tripping one ends the script with a message naming it. Filter with `jq
 shell, and print only what you need next.
 
 Builtins: `jq`, `curl`, `cap`, `cat`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, \
-`date`, `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`. Two of them depend on \
-session configuration and report their exact missing prerequisite otherwise: `curl`, which opens \
-no socket of its own but assembles a request for whichever HTTP capability the session was given; \
-and `date`, which reads the host clock and renders `+%s` or an ISO-8601 instant. A provider may \
-contribute further command words, which behave the same way and are authorized identically; any \
-this session has are listed at the end of this description.
+`grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`. One of them depends on session \
+configuration and reports its exact missing prerequisite otherwise: `curl`, which opens no socket \
+of its own but assembles a request for whichever HTTP capability the session was given. There is \
+no clock. A provider may contribute further command words, which behave the same way and are \
+authorized identically; any this session has are listed at the end of this description.
 
 A public secret DRN supplied in your instructions is a name, not a value or grant. Use it only in \
 exact broker-backed forms: `curl --oauth2-bearer '${drn:...}' URL` or `curl -u 'USER:${drn:...}' \

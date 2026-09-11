@@ -24,7 +24,6 @@ use crate::{
 };
 
 pub(crate) mod cap;
-pub(crate) mod clock;
 pub(crate) mod curl;
 pub(crate) mod encode;
 pub(crate) mod jq;
@@ -135,8 +134,6 @@ pub(crate) struct BuiltinContext<'a> {
     pub buffers: &'a mut BTreeMap<String, Value>,
     /// The capability `curl` assembles requests for, when the embedder configured one.
     pub curl_capability: Option<&'a str>,
-    /// Whether `date` may read the host wall clock; see [`clock`].
-    pub allow_clock: bool,
 }
 
 impl BuiltinContext<'_> {
@@ -221,7 +218,6 @@ pub(crate) enum BuiltinKind {
 const REGISTRY: &[&dyn Builtin] = &[
     &jq::Jq,
     &curl::Curl,
-    &clock::Date,
     &misc::Sleep,
     &text::Grep,
     &text::Sed,
@@ -335,29 +331,6 @@ pub(crate) mod test_support {
             budget: &mut budget,
             buffers: &mut buffers,
             curl_capability: None,
-            allow_clock: false,
-        };
-        let arguments = arguments
-            .iter()
-            .map(|argument| (*argument).to_owned())
-            .collect::<Vec<_>>();
-        builtin.run(&mut context, &arguments, None)
-    }
-
-    /// Runs one builtin with the wall clock enabled, for the `date` builtin's own tests.
-    pub(crate) fn run_builtin_with_clock(
-        builtin: &dyn Builtin,
-        arguments: &[&str],
-    ) -> Result<CommandResult, CommandFailure> {
-        let invoker = NoCapabilities;
-        let mut budget = Budget::start(Limits::default());
-        let mut buffers = BTreeMap::new();
-        let mut context = BuiltinContext {
-            invoker: &invoker,
-            budget: &mut budget,
-            buffers: &mut buffers,
-            curl_capability: None,
-            allow_clock: true,
         };
         let arguments = arguments
             .iter()
@@ -382,7 +355,6 @@ pub(crate) mod test_support {
             budget: &mut budget,
             buffers,
             curl_capability,
-            allow_clock: false,
         };
         let arguments = arguments
             .iter()
@@ -417,7 +389,6 @@ mod tests {
             "cat",
             "curl",
             "cut",
-            "date",
             "echo",
             "false",
             "grep",

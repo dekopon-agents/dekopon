@@ -449,6 +449,17 @@ All notable changes to Dekopon are documented here. The format is based on
   `ConflictScan::new` are gone: one host means one wording, and the conflict report itself is
   unchanged — every reserved-word and duplicate collision in a provider set, reported at once,
   fatal at boot.
+- Removed the shell's `getopts`. Nothing calls a function here with flags — a model authors both
+  the caller and the callee, and it writes `f "$x" "$y"` — so a flag parser for the one caller that
+  already knows the argument order was a bash habit rather than a need. `$1`, `$@`, `$#`, and
+  `shift` remain, and `OPTIND`/`OPTARG` are now ordinary variables nothing writes.
+  `dekopon_core::RESERVED_COMMAND_WORDS` loses `getopts` too, so a provider may claim that word.
+- Removed the shell's `date` builtin and the `Limits::allow_clock` opt-in that gated it, along with
+  `DEFAULT_ALLOW_CLOCK`. The gate was never set by any embedder, so no session could read a clock,
+  and the refusal it produced named a `--shell-allow-clock` flag that never existed. A script that
+  asks the time now gets the "command not found" an ungranted capability gets.
+  `dekopon_core::RESERVED_COMMAND_WORDS` loses `date`, which is visible to provider authors: a
+  provider may now claim `date` as its own command word, the way `gh` did once its builtin went.
 - Retired the `dekopon`, `dekopon-webui`, `dekopon-run`, and `dekopon-provider-host` crates. Only `dekopond` and `dekopon-brokerd` ship as binaries; shared agent, shell, model, SDK, and broker libraries remain. Recorded-session listing, transcript reconstruction, and model replay went with the runner, out of `dekopon-agent` as well; live agent tools and telemetry are unaffected. Published versions are not recalled or yanked; publication and a later independent console repin remain follow-ups.
 - Broker audit-chain verification, replay restoration from disk, and the `audit verify` command.
   Audit records now append only `sequence` and `event`; existing bytes are not migrated or

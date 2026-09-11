@@ -225,7 +225,6 @@ pub(crate) fn run(
         stdin: Vec::new(),
         stderr_capture: Vec::new(),
         curl_capability: curl_capability.map(str::to_owned),
-        allow_clock: limits.allow_clock,
         counters: telemetry::ScriptCounters::default(),
         last_status: ExitCode::SUCCESS,
         last_substitution_status: ExitCode::SUCCESS,
@@ -300,8 +299,6 @@ struct Evaluator<'a> {
     /// its own `2>` collects only its own and then restores the function's.
     stderr_capture: Vec<StderrCapture>,
     curl_capability: Option<String>,
-    /// Whether `date` may read the host wall clock; see [`crate::Limits::allow_clock`].
-    allow_clock: bool,
     /// Per-script command totals, and the cap on how many command spans reach INFO.
     counters: telemetry::ScriptCounters,
     last_status: ExitCode,
@@ -811,81 +808,6 @@ impl Evaluator<'_> {
             let field = fields.get(index).copied().unwrap_or_default();
             self.assign(name, Value::String(field.to_owned()))?;
         }
-        Ok(CommandResult::status(ExitCode::SUCCESS))
-    }
-
-    /// `getopts OPTSTRING NAME`: parses one flag out of the current positional parameters.
-    ///
-    /// Scoped to a shell function, because that is the only place positional parameters exist here.
-    /// `OPTIND` and `OPTARG` are ordinary variables, as in bash, so a script resets and inspects
-    /// them the way it already knows how.
-    fn run_getopts(&mut self, arguments: &[String]) -> Result<CommandResult, CommandFailure> {
-        let [optstring, name] = arguments else {
-            return Err(CommandFailure::usage(
-                "getopts: usage: getopts OPTSTRING NAME",
-            ));
-        };
-        if !is_variable_name(name) {
-            return Err(CommandFailure::usage(format!(
-                "getopts: {name:?} is not a valid variable name"
-            )));
-        }
-        if self.frames.is_empty() {
-            return Err(CommandFailure::usage(
-                "getopts: only valid inside a function; positional parameters exist nowhere else \
-                 in this shell",
-            ));
-        }
-
-        let index = self
-            .lookup("OPTIND")
-            .and_then(Value::as_u64)
-            .map_or(1, |index| index as usize)
-            .max(1);
-        let positional = self.positional().to_vec();
-        let Some(argument) = positional.get(index - 1).map(display) else {
-            return Ok(CommandResult::status(ExitCode::FAILURE));
-        };
-        if argument == "--" {
-            self.assign("OPTIND", Value::from(index + 1))?;
-            return Ok(CommandResult::status(ExitCode::FAILURE));
-        }
-        let Some(letter) = argument.strip_prefix('-').and_then(|rest| {
-            let mut characters = rest.chars();
-            characters
-                .next()
-                .filter(|_| characters.next().is_none() && !rest.is_empty())
-        }) else {
-            return Ok(CommandResult::status(ExitCode::FAILURE));
-        };
-
-        let takes_argument = optstring.contains(&format!("{letter}:"));
-        if !optstring.contains(letter) || letter == ':' {
-            self.assign(name, Value::String("?".to_owned()))?;
-            self.assign("OPTARG", Value::String(letter.to_string()))?;
-            self.assign("OPTIND", Value::from(index + 1))?;
-            self.write_line(&format!(
-                "dekopon-shell: getopts: illegal option -- {letter}"
-            ));
-            return Ok(CommandResult::status(ExitCode::SUCCESS));
-        }
-        if takes_argument {
-            let Some(value) = positional.get(index).map(display) else {
-                self.assign(name, Value::String("?".to_owned()))?;
-                self.assign("OPTARG", Value::String(letter.to_string()))?;
-                self.assign("OPTIND", Value::from(index + 1))?;
-                self.write_line(&format!(
-                    "dekopon-shell: getopts: option requires an argument -- {letter}"
-                ));
-                return Ok(CommandResult::status(ExitCode::SUCCESS));
-            };
-            self.assign("OPTARG", Value::String(value))?;
-            self.assign("OPTIND", Value::from(index + 2))?;
-        } else {
-            self.assign("OPTARG", Value::String(String::new()))?;
-            self.assign("OPTIND", Value::from(index + 1))?;
-        }
-        self.assign(name, Value::String(letter.to_string()))?;
         Ok(CommandResult::status(ExitCode::SUCCESS))
     }
 
@@ -1552,7 +1474,6 @@ impl Evaluator<'_> {
                         budget: &mut self.budget,
                         buffers: &mut self.buffers,
                         curl_capability: self.curl_capability.as_deref(),
-                        allow_clock: self.allow_clock,
                     };
                     // The one place a piped value has to become owned. A pipeline stage's own
                     // output is held by nobody else and moves straight through; a function frame's
@@ -1636,7 +1557,6 @@ impl Evaluator<'_> {
                         budget: &mut self.budget,
                         buffers: &mut self.buffers,
                         curl_capability: self.curl_capability.as_deref(),
-                        allow_clock: self.allow_clock,
                     };
                     context.invoke_capability(&capability, input)
                 };
@@ -1665,7 +1585,6 @@ impl Evaluator<'_> {
                         budget: &mut self.budget,
                         buffers: &mut self.buffers,
                         curl_capability: self.curl_capability.as_deref(),
-                        allow_clock: self.allow_clock,
                     };
                     context.invoke_capability(command, input)
                 };
@@ -1745,13 +1664,6 @@ impl Evaluator<'_> {
                 Executed::Flow(Flow::Exit(status))
             }
             "read" => match self.run_read(arguments, input, from_pipe) {
-                Ok(result) => Executed::Result(result),
-                Err(failure) => {
-                    let status = self.absorb(failure)?;
-                    Executed::Result(CommandResult::status(status))
-                }
-            },
-            "getopts" => match self.run_getopts(arguments) {
                 Ok(result) => Executed::Result(result),
                 Err(failure) => {
                     let status = self.absorb(failure)?;

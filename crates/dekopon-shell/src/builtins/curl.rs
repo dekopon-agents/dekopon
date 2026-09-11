@@ -410,7 +410,6 @@ mod tests {
             budget: &mut budget,
             buffers: &mut buffers,
             curl_capability: Some("http-probe.fetch"),
-            allow_clock: false,
         };
         Curl.run(
             &mut context,
@@ -451,7 +450,6 @@ mod tests {
                 budget: &mut budget,
                 buffers: &mut buffers,
                 curl_capability: Some("http-probe.fetch"),
-                allow_clock: false,
             };
             assert!(
                 Curl.run(
@@ -493,7 +491,6 @@ mod tests {
             budget: &mut budget,
             buffers: &mut buffers,
             curl_capability: Some("http-probe.fetch"),
-            allow_clock: false,
         };
 
         let result = Curl
@@ -522,7 +519,6 @@ mod tests {
             budget: &mut budget,
             buffers: &mut buffers,
             curl_capability: None,
-            allow_clock: false,
         };
 
         let failure = Curl

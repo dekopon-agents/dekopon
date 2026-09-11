@@ -183,12 +183,9 @@ fn capture_with(script: &str, limits: Limits, enclose: bool) -> Telemetry {
         // disabled forever, and entering it would prove nothing about nesting.
         let enclosing = enclose.then(|| tracing::info_span!("caller.enclosing"));
         let _entered = enclosing.as_ref().map(tracing::Span::enter);
-        Interpreter::new(Limits {
-            allow_clock: true,
-            ..limits
-        })
-        .with_curl_capability(Some("http-probe.fetch".to_owned()))
-        .run(script, &Fixture::default())
+        Interpreter::new(limits)
+            .with_curl_capability(Some("http-probe.fetch".to_owned()))
+            .run(script, &Fixture::default())
     });
 
     let spans = spans.lock().expect("span lock").clone();
