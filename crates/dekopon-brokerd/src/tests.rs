@@ -771,6 +771,55 @@ fn host_limits_document(max_total_memory_bytes: Option<u64>) -> serde_json::Valu
     limits
 }
 
+/// The aggregate ceiling used to be the one bound that only existed if an operator remembered to
+/// write it, which is why the worst case was 4 GiB. It now defaults, and an omitted `hostLimits`
+/// block, a partial one, and an explicit `null` are three different answers rather than one.
+#[tokio::test]
+async fn the_aggregate_memory_ceiling_defaults_to_256_mib() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    let policies = directory.path().join("policies.cedar");
+    fs::write(directory.path().join("echo.wasm"), b"component fixture")
+        .expect("write provider path fixture");
+    write_owner_only(&policies, POLICIES.as_bytes());
+
+    // An absent block.
+    let mut document = attested_document(uid);
+    write_config(&path, &document);
+    let resolved = config::load(&path, uid)
+        .await
+        .expect("an absent host-limits block loads");
+    assert_eq!(
+        resolved.host_options.max_total_memory_bytes,
+        Some(dekopon_broker_host::DEFAULT_MAX_TOTAL_MEMORY_BYTES)
+    );
+    assert_eq!(
+        dekopon_broker_host::DEFAULT_MAX_TOTAL_MEMORY_BYTES,
+        256 * 1024 * 1024,
+        "the documented default and the constant are one fact"
+    );
+
+    // A complete block that names every other field still defaults this one.
+    document["hostLimits"] = host_limits_document(None);
+    write_config(&path, &document);
+    let resolved = config::load(&path, uid)
+        .await
+        .expect("a complete block without the aggregate ceiling loads");
+    assert_eq!(
+        resolved.host_options.max_total_memory_bytes,
+        Some(dekopon_broker_host::DEFAULT_MAX_TOTAL_MEMORY_BYTES)
+    );
+
+    // Only an explicit null asks for the old unbounded behavior.
+    document["hostLimits"] = json!({ "maxTotalMemoryBytes": serde_json::Value::Null });
+    write_config(&path, &document);
+    let resolved = config::load(&path, uid)
+        .await
+        .expect("an explicitly null aggregate ceiling loads");
+    assert_eq!(resolved.host_options.max_total_memory_bytes, None);
+}
+
 /// Per-store limits bound one invocation; the connection ceiling decides how many exist at once.
 /// Configuration is where that product becomes a stated number rather than an OOM kill.
 #[tokio::test]

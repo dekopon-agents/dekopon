@@ -25,7 +25,12 @@ use opentelemetry_http::{Bytes, HttpClient, HttpError, Request, Response};
 use opentelemetry_otlp::{
     ExporterBuildError, LogExporter, Protocol, SpanExporter, WithExportConfig, WithHttpConfig,
 };
-use opentelemetry_sdk::{Resource, logs::SdkLoggerProvider, trace::SdkTracerProvider};
+use opentelemetry_sdk::{
+    Resource, logs,
+    logs::{BatchLogProcessor, SdkLoggerProvider},
+    trace,
+    trace::{BatchSpanProcessor, SdkTracerProvider},
+};
 use serde::Deserialize;
 use thiserror::Error;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
@@ -81,6 +86,49 @@ impl FromStr for Transport {
         }
     }
 }
+
+/// Span records one export queue holds before the batch processor starts dropping.
+///
+/// See [`MAX_QUEUED_LOG_RECORDS`] for the arithmetic and for why the two signals differ.
+const MAX_QUEUED_SPANS: usize = 1024;
+
+/// Spans one export request carries.
+///
+/// The batch processor exports as soon as this many records have accumulated, so this is the
+/// drain trigger as well as the size of one in-flight request. Every queue here holds four of
+/// these — the same 4:1 ratio the SDK defaults to, so a smaller queue is not more drop-prone per
+/// drain; it simply drains sooner and holds less while it waits.
+const MAX_SPANS_PER_EXPORT: usize = 256;
+
+/// Log records one export queue holds before the batch processor starts dropping.
+///
+/// The SDK's default is 2048 records per queue with **no byte ceiling anywhere**: `BatchConfig`
+/// counts records, and `SpanLimits` counts attributes per span, events, and links. Nothing in
+/// `opentelemetry_sdk` 0.32 truncates an attribute value, so a queue's size in bytes is only ever
+/// `records × the largest attribute the process emits`. Lowering the attribute *counts* would not
+/// bound bytes either; it would silently drop whole attributes, which goal 2 in `docs/design.md`
+/// rejects more firmly than it rejects volume.
+///
+/// So the bound here is a record count, honestly, and it is set per signal because the two carry
+/// different payloads:
+///
+/// - Log records are where the bulk lands. Audit is one structured record per broker decision and
+///   under goal 2 a record carries a prompt, a model answer, or a whole script's output — bounded
+///   by `dekopon-shell`'s 256 KiB accumulated-output ceiling and the broker host's 1 MiB output
+///   ceiling. They also arrive at a fraction of the span rate. 256 records × 256 KiB ≈ **64 MiB**
+///   worst case, against 512 MiB at the SDK default; a realistic queue of few-KiB records is under
+///   a megabyte.
+/// - Spans are numerous and individually small — names, kinds, counts, outcomes, ids. The
+///   constitution says a span is never dropped, so that queue keeps four times the per-script
+///   span budget in reserve rather than the tightest ceiling.
+///
+/// Together the two queues cost a process tens of MiB where they previously cost up to 1 GiB.
+/// Dropping is still possible under a stalled receiver; the SDK counts drops and reports the total
+/// at shutdown.
+const MAX_QUEUED_LOG_RECORDS: usize = 256;
+
+/// Log records one export request carries. See [`MAX_SPANS_PER_EXPORT`].
+const MAX_LOG_RECORDS_PER_EXPORT: usize = 64;
 
 /// Validated settings for one process's OTLP export.
 #[derive(Clone, Debug)]
@@ -243,9 +291,17 @@ impl ExporterSettings {
             signal: "trace",
             source,
         })?;
+        let processor = BatchSpanProcessor::builder(exporter)
+            .with_batch_config(
+                trace::BatchConfigBuilder::default()
+                    .with_max_queue_size(MAX_QUEUED_SPANS)
+                    .with_max_export_batch_size(MAX_SPANS_PER_EXPORT)
+                    .build(),
+            )
+            .build();
         Ok(SdkTracerProvider::builder()
             .with_resource(self.resource())
-            .with_batch_exporter(exporter)
+            .with_span_processor(processor)
             .build())
     }
 
@@ -275,9 +331,17 @@ impl ExporterSettings {
             signal: "log",
             source,
         })?;
+        let processor = BatchLogProcessor::builder(exporter)
+            .with_batch_config(
+                logs::BatchConfigBuilder::default()
+                    .with_max_queue_size(MAX_QUEUED_LOG_RECORDS)
+                    .with_max_export_batch_size(MAX_LOG_RECORDS_PER_EXPORT)
+                    .build(),
+            )
+            .build();
         Ok(SdkLoggerProvider::builder()
             .with_resource(self.resource())
-            .with_batch_exporter(exporter)
+            .with_log_processor(processor)
             .build())
     }
 }

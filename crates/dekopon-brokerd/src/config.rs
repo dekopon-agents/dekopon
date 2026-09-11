@@ -9,7 +9,9 @@ use dekopon_broker::{
     AttestorGrant, AuthenticatedContext, BrokerLimits, ChatMemoryConfig, ConstraintSet,
     ContextError, DEFAULT_MAX_AUDIT_LINE_BYTES,
 };
-use dekopon_broker_host::{BrokerHostLimits, BrokerHostOptions, LockedProviderSource};
+use dekopon_broker_host::{
+    BrokerHostLimits, BrokerHostOptions, DEFAULT_MAX_TOTAL_MEMORY_BYTES, LockedProviderSource,
+};
 use dekopon_broker_protocol::{
     DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, HARD_MAX_FRAME_BYTES, ProtocolError,
 };
@@ -233,13 +235,15 @@ pub struct HostLimitsConfig {
     pub max_timeout_ms: u64,
     /// Aggregate guest linear memory reservable across concurrently live provider stores.
     ///
-    /// `maxMemoryBytes` bounds one invocation. Nothing bounds all of them at once unless this is
-    /// set, so the worst case is `serverLimits.maxConnections` times `maxMemoryBytes` — well past
-    /// a small container's limit at the defaults. Setting it turns an OOM kill into a refusal.
+    /// `maxMemoryBytes` bounds one invocation. This bounds all of them at once, turning an OOM kill
+    /// into a refusal: without it the worst case is `serverLimits.maxConnections` times
+    /// `maxMemoryBytes`, which is 4 GiB at the defaults and well past a small container's limit.
+    /// Defaults to [`dekopon_broker_host::DEFAULT_MAX_TOTAL_MEMORY_BYTES`]; an explicit
+    /// `maxTotalMemoryBytes: null` restores the unbounded behavior for a deployment that has
+    /// budgeted the product itself.
     ///
     /// Deliberately absent from the authority commitment: it is a concurrency budget, not a
     /// ceiling an authorization could narrow, and changing it must not rotate stored authority.
-    #[serde(default)]
     pub max_total_memory_bytes: Option<usize>,
 }
 
@@ -261,7 +265,7 @@ impl Default for HostLimitsConfig {
             max_http_header_bytes: defaults.max_http_header_bytes,
             fuel: defaults.fuel,
             max_timeout_ms: u64::try_from(defaults.max_timeout.as_millis()).unwrap_or(u64::MAX),
-            max_total_memory_bytes: None,
+            max_total_memory_bytes: Some(DEFAULT_MAX_TOTAL_MEMORY_BYTES),
         }
     }
 }
