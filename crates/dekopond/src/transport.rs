@@ -527,6 +527,49 @@ pub(crate) fn credential_value(name: &str, value: String) -> Result<String, Tran
     Ok(value)
 }
 
+/// Builds the one HTTP client shape every credential-bearing chat transport uses.
+///
+/// The four transports differ only in their deadline and, for Discord, a user agent, so the stance
+/// lives here rather than being restated — and silently diverging — at each of them. None of these
+/// settings is reqwest's default:
+///
+/// - `no_proxy()` overrides the `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` reqwest reads from the
+///   environment by default. Left at the default, an exported proxy variable would carry a Slack
+///   app and bot token, a Discord bot token, a Telegram bot token, and a WhatsApp Graph access
+///   token — and the message bytes they authenticate — through a host nobody named to Dekopon.
+///   `dekopon-http-host` takes this stance for provider HTTP, `dekopon-brokerd` for its secret
+///   sources and OCI registries, and `dekopon-model` for model endpoints; a chat token is a
+///   credential like any of them.
+/// - `redirect(Policy::none())` keeps a credential-bearing request on the endpoint it was
+///   addressed to; a followed redirect would hand the bearer token to whatever host answered.
+/// - `retry(never())` disables reqwest's default replay of protocol NACKs. Posting a chat message
+///   is not idempotent, and automatic retries are a stated non-goal: a failed call is the model's
+///   to re-assess.
+///
+/// The caller builds, so Discord can add its user agent without a second definition of the rest.
+pub(crate) fn credential_client(timeout: Duration) -> reqwest::ClientBuilder {
+    credential_client_from(reqwest::Client::builder(), timeout)
+}
+
+/// Applies that stance to whatever builder the caller started from.
+///
+/// Production always starts from `reqwest::Client::builder()`, whose default reads the ambient
+/// proxy variables. The seam exists for the proxy assertion: a default builder on a proxy-free
+/// runner carries no proxy either way, so a builder that had dropped `.no_proxy()` would still
+/// look clean and the test would prove nothing. The test starts from a builder that definitely
+/// carries a proxy and watches this clear it, with no process environment to mutate and nothing
+/// for a concurrent test to race.
+fn credential_client_from(
+    builder: reqwest::ClientBuilder,
+    timeout: Duration,
+) -> reqwest::ClientBuilder {
+    builder
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .retry(reqwest::retry::never())
+        .timeout(timeout)
+}
+
 /// Bounds untrusted inbound text, keeping the head and saying so.
 ///
 /// The head rather than the tail: a chat message states its request first and elaborates
@@ -743,8 +786,54 @@ mod tests {
 
     use super::{
         BASE_RECONNECT_DELAY, MAX_RECONNECT_DELAY, MAX_RECONNECT_DOUBLINGS, RECONNECT_JITTER_MS,
-        SeenIds, TextUnit, jitter_below, reconnect_delay, retry_after_from_body, split_message,
+        SeenIds, TextUnit, credential_client_from, jitter_below, reconnect_delay,
+        retry_after_from_body, split_message,
     };
+
+    /// The discard port: a proxy that is well formed, never dialled, and obvious in a diff.
+    const AMBIENT_PROXY: &str = "http://127.0.0.1:9";
+
+    /// The shape an exported `HTTPS_PROXY=http://127.0.0.1:9` leaves in reqwest's default builder.
+    fn proxied_builder() -> reqwest::ClientBuilder {
+        reqwest::Client::builder()
+            .proxy(reqwest::Proxy::all(AMBIENT_PROXY).expect("a well-formed proxy uri"))
+    }
+
+    /// A chat token is a credential, and the four transports that carry one all build from
+    /// [`credential_client_from`]. `reqwest` exposes no getters for a builder's configuration, so
+    /// the builder's own `Debug` is the reading: it prints `proxies` only when the proxy list is
+    /// non-empty and `redirect_policy` only when the policy is not the default ten-hop limit. The
+    /// retry policy is not printed at all, so this test pins the proxy, the redirect and the
+    /// deadline and cannot see `retry(never())`.
+    #[test]
+    fn a_credential_client_ignores_ambient_proxy_configuration() {
+        // Not read from the environment: a default builder on a proxy-free runner produces the
+        // same empty proxy list whether or not `.no_proxy()` is there, so starting from one would
+        // assert nothing. Starting from a builder that carries a proxy is what makes this fail if
+        // `.no_proxy()` is dropped — and it mutates no process state, so it races no other test.
+        assert!(
+            format!("{:?}", proxied_builder()).contains("proxies"),
+            "the fixture must carry the proxy this test is about"
+        );
+
+        let rendered = format!(
+            "{:?}",
+            credential_client_from(proxied_builder(), Duration::from_secs(30))
+        );
+
+        assert!(
+            !rendered.contains("proxies"),
+            "chat transports must not inherit an ambient proxy: {rendered}"
+        );
+        assert!(
+            rendered.contains("redirect_policy: Policy(None)"),
+            "a credential-bearing request must not follow a redirect: {rendered}"
+        );
+        assert!(
+            rendered.contains("timeout: 30s"),
+            "the caller's deadline must survive the shared stance: {rendered}"
+        );
+    }
 
     /// The delay every transport now shares: doubling from the base, clamped at seven doublings,
     /// ceilinged, and never longer than the ceiling plus one jitter window. The clamp is what

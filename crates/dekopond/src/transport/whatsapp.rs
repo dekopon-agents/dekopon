@@ -32,7 +32,7 @@ use tracing::{Instrument as _, Span};
 use crate::transport::{
     ChatReplier, ChatTransport, ConversationKind, DeliveryReceipt, InboundMessage, OutboundReply,
     ReplyTarget, SeenIds, TextUnit, TransportError, TransportEvent, TransportIdentity,
-    bound_inbound, receive_span, split_message,
+    bound_inbound, credential_client, receive_span, split_message,
 };
 
 const MAX_WEBHOOK_BODY_BYTES: usize = 256 * 1024;
@@ -245,10 +245,7 @@ impl WhatsappTransport {
         access_token: String,
     ) -> Result<Self, TransportError> {
         let (sender, receiver) = mpsc::channel(WEBHOOK_QUEUE);
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .timeout(GRAPH_REQUEST_TIMEOUT)
+        let http = credential_client(GRAPH_REQUEST_TIMEOUT)
             .build()
             .map_err(|source| TransportError::Request(Box::new(source)))?;
         let replier = Arc::new(WhatsappReplier {

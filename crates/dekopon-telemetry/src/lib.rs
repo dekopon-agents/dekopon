@@ -293,10 +293,34 @@ fn signal_endpoint(base: &str, signal: &str) -> String {
 /// Adapter around the workspace's existing TLS-enabled reqwest client.
 ///
 /// `opentelemetry-otlp` otherwise selects its own newer reqwest line, duplicating the HTTP/TLS
-/// stack. Supplying the client also lets us reject redirects so an authorization header cannot be
-/// forwarded to a receiver-selected destination.
+/// stack. Supplying the client also lets us bound where the ingest header may go.
 #[derive(Clone, Debug)]
 struct OtlpHttpClient(reqwest::blocking::Client);
+
+/// The stance the OTLP/HTTP client takes, separated from the thread that builds it.
+///
+/// The SDK reads ingest authentication from `OTEL_EXPORTER_OTLP_HEADERS`, so every export carries
+/// a credential, and neither setting here is reqwest's default:
+///
+/// - `redirect(Policy::none())` keeps that header on the collector the operator named; a followed
+///   redirect would hand it to whatever host answered.
+/// - `no_proxy()` overrides the `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` reqwest otherwise reads from
+///   the environment, which would route the ingest header — and every span and log record — through
+///   a host nobody named to Dekopon. The telemetry store is inside the operator's trust boundary; a
+///   proxy on the way to it is not.
+///
+/// Taking the builder as an argument is what makes the proxy assertion possible: a default builder
+/// on a proxy-free runner carries no proxy whether or not `.no_proxy()` is there, so the test
+/// starts from one that definitely carries a proxy and watches this clear it.
+fn otlp_client_from(
+    builder: reqwest::blocking::ClientBuilder,
+    timeout: Duration,
+) -> reqwest::blocking::ClientBuilder {
+    builder
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+}
 
 impl OtlpHttpClient {
     fn new(timeout: Duration) -> Result<Self, TelemetryError> {
@@ -304,12 +328,7 @@ impl OtlpHttpClient {
         // Dekopon's Tokio runtime. Build it on a plain thread, as the upstream OTLP adapter does.
         let client = std::thread::Builder::new()
             .name("dekopon-otlp-http-client".to_owned())
-            .spawn(move || {
-                reqwest::blocking::Client::builder()
-                    .timeout(timeout)
-                    .redirect(reqwest::redirect::Policy::none())
-                    .build()
-            })
+            .spawn(move || otlp_client_from(reqwest::blocking::Client::builder(), timeout).build())
             .map_err(TelemetryError::HttpClientThread)?
             .join()
             .map_err(|payload| TelemetryError::HttpClientThreadPanicked {
@@ -436,11 +455,51 @@ pub enum TelemetryError {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExporterSettings, TelemetryError, TraceContextParts, Transport, panic_message,
-        remote_context, signal_endpoint,
+        ExporterSettings, TelemetryError, TraceContextParts, Transport, otlp_client_from,
+        panic_message, remote_context, signal_endpoint,
     };
     use opentelemetry::trace::TraceContextExt as _;
     use std::time::Duration;
+
+    /// The discard port: a proxy that is well formed, never dialled, and obvious in a diff.
+    const AMBIENT_PROXY: &str = "http://127.0.0.1:9";
+
+    /// The shape an exported `HTTPS_PROXY=http://127.0.0.1:9` leaves in reqwest's default builder.
+    fn proxied_builder() -> reqwest::blocking::ClientBuilder {
+        reqwest::blocking::Client::builder()
+            .proxy(reqwest::Proxy::all(AMBIENT_PROXY).expect("a well-formed proxy uri"))
+    }
+
+    /// Every export carries the `OTEL_EXPORTER_OTLP_HEADERS` ingest credential, so the collector
+    /// this client reaches has to be the one the operator named. `reqwest` exposes no getters for
+    /// a builder's configuration, so the builder's own `Debug` is the reading: it prints `proxies`
+    /// only when the proxy list is non-empty and `redirect_policy` only when the policy is not the
+    /// default ten-hop limit. The blocking builder keeps its deadline beside the inner
+    /// configuration this `Debug` renders, so the timeout is not visible here and is not asserted.
+    #[test]
+    fn the_otlp_client_ignores_ambient_proxy_configuration() {
+        // A default builder on a proxy-free runner produces the same empty proxy list whether or
+        // not `.no_proxy()` is there, so starting from one would assert nothing. Starting from a
+        // builder that carries a proxy mutates no process state and races no other test.
+        assert!(
+            format!("{:?}", proxied_builder()).contains("proxies"),
+            "the fixture must carry the proxy this test is about"
+        );
+
+        let rendered = format!(
+            "{:?}",
+            otlp_client_from(proxied_builder(), Duration::from_secs(10))
+        );
+
+        assert!(
+            !rendered.contains("proxies"),
+            "the OTLP client must not inherit an ambient proxy: {rendered}"
+        );
+        assert!(
+            rendered.contains("redirect_policy: Policy(None)"),
+            "the ingest header must not follow a redirect: {rendered}"
+        );
+    }
 
     /// The panic payload is the only account of why the client thread died, and it is the whole
     /// reason the failure is reachable: a builder that panics says what it could not build —

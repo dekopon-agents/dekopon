@@ -23,8 +23,9 @@ use crate::{
     transport::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
         DeliveryReceipt, InboundMessage, OutboundReply, ReplyTarget, SeenIds, TextUnit,
-        TransportError, TransportEvent, TransportIdentity, bound_inbound, floor_boundary,
-        jitter_below, receive_span, reconnect_delay, retry_after_from_body, split_message,
+        TransportError, TransportEvent, TransportIdentity, bound_inbound, credential_client,
+        floor_boundary, jitter_below, receive_span, reconnect_delay, retry_after_from_body,
+        split_message,
     },
 };
 
@@ -1254,9 +1255,7 @@ fn is_loopback_host(host: Option<&str>) -> bool {
 }
 
 fn client() -> Result<reqwest::Client, TransportError> {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(REST_TIMEOUT)
+    credential_client(REST_TIMEOUT)
         .user_agent(concat!(
             "dekopond/",
             env!("CARGO_PKG_VERSION"),
