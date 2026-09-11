@@ -40,9 +40,11 @@ use tracing::Instrument as _;
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Engine, Store};
 
+mod clock;
 mod http;
 mod metadata;
 mod storage;
+use clock::ClockState;
 pub use http::{BoundCredential, HttpCallEvidence, HttpConfigurationError, destinations_cover};
 use http::{HttpCeilings, HttpState};
 pub use metadata::LoadedProviderMetadata;
@@ -463,6 +465,7 @@ impl Runtime {
         &self,
         http: HttpState,
         storage: storage::StorageState,
+        clock: ClockState,
     ) -> Result<Store<StoreState>, BrokerHostError> {
         let reserved = match &self.memory_budget {
             Some(budget) => Some(budget.reserve(self.limits.max_memory_bytes).ok_or(
@@ -479,6 +482,7 @@ impl Runtime {
                 limits: self.limits.store_bounds().store_limits(),
                 http,
                 storage,
+                clock,
                 table: storage::new_table(),
                 instantiations: 0,
                 _reserved: reserved,
@@ -513,6 +517,8 @@ struct StoreState {
     limits: wasmtime::StoreLimits,
     http: HttpState,
     storage: storage::StorageState,
+    /// Granted only in an invocation's store; descriptions and command runs are pure.
+    clock: ClockState,
     table: wasmtime::component::ResourceTable,
     /// Component instantiations in this store, recorded onto the operation's span when it ends.
     ///
@@ -836,9 +842,11 @@ impl BrokerWasmProvider {
         let operation_timeout = self.runtime.limits.max_timeout;
         let http = HttpState::describe(self.runtime.http_ceilings(), operation_timeout)
             .map_err(|source| BrokerHostError::HttpConfiguration { source })?;
-        let mut store = self
-            .runtime
-            .store(http, storage::StorageState::disabled())?;
+        let mut store = self.runtime.store(
+            http,
+            storage::StorageState::disabled(),
+            ClockState::describe(),
+        )?;
         let argv = argv.to_vec();
         let stdin = stdin.map(str::to_owned);
         let signature = |source: wasmtime::Error| BrokerHostError::CommandExportSignature {
@@ -907,6 +915,13 @@ impl BrokerWasmProvider {
                     timeout_ms: operation_timeout.as_millis() as u64,
                 });
         record_store_outcome(&store, self.runtime.limits.fuel);
+        // A refused clock read traps, so it is checked before the trap surfaces: the tripwire names
+        // the cause, where the trap would only report that the guest stopped.
+        if store.data().clock.attempted() {
+            return Err(BrokerHostError::RunCommandUsedHostImport {
+                path: self.source.clone(),
+            });
+        }
         let output = output??;
         if store.data().http.attempted() || store.data().storage.attempted() {
             return Err(BrokerHostError::RunCommandUsedHostImport {
@@ -976,7 +991,9 @@ impl BrokerWasmProvider {
             storage::StorageState::disabled,
             storage::StorageState::active,
         );
-        let mut store = self.runtime.store(http, storage_state)?;
+        let mut store = self
+            .runtime
+            .store(http, storage_state, ClockState::invoke())?;
         // The store outlives the guest on every path, including the one where the timeout drops
         // the operation future, so evidence for dispatched calls is harvested exactly once and
         // reaches the caller whether the invocation succeeded or failed.
@@ -1564,7 +1581,11 @@ async fn describe_component(
     let operation_timeout = runtime.limits.max_timeout;
     let http = HttpState::describe(runtime.http_ceilings(), operation_timeout)
         .map_err(|source| BrokerHostError::HttpConfiguration { source })?;
-    let mut store = runtime.store(http, storage::StorageState::disabled())?;
+    let mut store = runtime.store(
+        http,
+        storage::StorageState::disabled(),
+        ClockState::describe(),
+    )?;
     let operation = async {
         let bindings = pre.instantiate_async(&mut store).await.map_err(|error| {
             BrokerHostError::Instantiate {
@@ -1594,6 +1615,12 @@ async fn describe_component(
                 timeout_ms: operation_timeout.as_millis() as u64,
             });
     record_store_outcome(&store, runtime.limits.fuel);
+    // As in a command run: a refused clock read traps, and the tripwire names it before the trap.
+    if store.data().clock.attempted() {
+        return Err(BrokerHostError::DescribeUsedHostImport {
+            path: source.to_path_buf(),
+        });
+    }
     let manifest = manifest??;
     if store.data().http.attempted() || store.data().storage.attempted() {
         return Err(BrokerHostError::DescribeUsedHostImport {

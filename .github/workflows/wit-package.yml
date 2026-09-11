@@ -6,6 +6,7 @@ on:
     paths:
       - ".github/workflows/wit-package.yml"
       - "ci/fetch-external-provider-components.sh"
+      - "crates/dekopon-provider-clock/**"
       - "crates/dekopon-provider-http/src/**"
       - "crates/dekopon-provider-http/wit/**"
       - "crates/dekopon-provider-sdk/src/**"
@@ -14,6 +15,8 @@ on:
       - "crates/dekopon-broker-host/wit/**"
       - "examples/providers/cli-probe/**"
       - "examples/providers/cli-probe-provider.wasm"
+      - "examples/providers/clock-probe/**"
+      - "examples/providers/clock-probe-provider.wasm"
       - "examples/providers/memory-reservation-probe/**"
       - "examples/providers/memory-reservation-probe-provider.wasm"
       - "examples/providers/provider-v0-1-compat/**"
@@ -32,6 +35,7 @@ on:
     paths:
       - ".github/workflows/wit-package.yml"
       - "ci/fetch-external-provider-components.sh"
+      - "crates/dekopon-provider-clock/**"
       - "crates/dekopon-provider-http/src/**"
       - "crates/dekopon-provider-http/wit/**"
       - "crates/dekopon-provider-sdk/src/**"
@@ -40,6 +44,8 @@ on:
       - "crates/dekopon-broker-host/wit/**"
       - "examples/providers/cli-probe/**"
       - "examples/providers/cli-probe-provider.wasm"
+      - "examples/providers/clock-probe/**"
+      - "examples/providers/clock-probe-provider.wasm"
       - "examples/providers/memory-reservation-probe/**"
       - "examples/providers/memory-reservation-probe-provider.wasm"
       - "examples/providers/provider-v0-1-compat/**"
@@ -72,6 +78,7 @@ env:
   PROVIDER_WIT_PACKAGE: dekopon:provider@0.3.0
   HTTP_WIT_PACKAGE: dekopon:http@1.0.0
   STORAGE_WIT_PACKAGE: dekopon:storage@0.1.0
+  CLOCK_WIT_PACKAGE: dekopon:clock@1.0.0
 
 jobs:
   validate:
@@ -161,6 +168,7 @@ jobs:
 
             expected=''
             case "$provider" in
+              clock-probe) expected='dekopon:clock/wall@1.0.0' ;;
               http-probe) expected='dekopon:http/client@1.0.0' ;;
               storage-probe) expected='dekopon:storage/durable-files@0.1.0' ;;
             esac
@@ -190,6 +198,7 @@ jobs:
           for mirror in \
             crates/dekopon-broker-host/wit/deps/provider.wit \
             examples/providers/cli-probe/wit/deps/provider.wit \
+            examples/providers/clock-probe/wit/deps/provider.wit \
             examples/providers/http-probe/wit/deps/provider.wit \
             examples/providers/memory-reservation-probe/wit/deps/provider.wit \
             examples/providers/storage-probe/wit/deps/provider.wit
@@ -204,6 +213,13 @@ jobs:
             examples/providers/http-probe/wit/deps/http.wit
           do
             cmp wit/http/http.wit "$mirror"
+          done
+          for mirror in \
+            crates/dekopon-provider-clock/wit/deps/clock.wit \
+            crates/dekopon-broker-host/wit/deps/clock.wit \
+            examples/providers/clock-probe/wit/deps/clock.wit
+          do
+            cmp wit/clock/clock.wit "$mirror"
           done
           for mirror in \
             crates/dekopon-provider-storage/wit/deps/storage.wit \
@@ -233,7 +249,15 @@ jobs:
               --config ../../wkg/config.toml \
               --cache "$RUNNER_TEMP/wkg-build-cache"
           )
-          git diff --exit-code -- wkg.lock wit/http/wkg.lock wit/storage/wkg.lock
+          (
+            cd wit/clock
+            wkg build \
+              --wit-dir . \
+              --output ../../target/wit-package/dekopon-clock.wasm \
+              --config ../../wkg/config.toml \
+              --cache "$RUNNER_TEMP/wkg-build-cache"
+          )
+          git diff --exit-code -- wkg.lock wit/http/wkg.lock wit/storage/wkg.lock wit/clock/wkg.lock
 
       - name: Verify provider exports and import-free boundary
         shell: bash
@@ -407,6 +431,24 @@ jobs:
             ])
           ' target/wit-package/dekopon-storage.json
 
+      - name: Verify the host wall clock interface
+        shell: bash
+        run: |
+          set -euo pipefail
+          package=target/wit-package/dekopon-clock.wasm
+          wasm-tools validate "$package"
+          wasm-tools component wit --json "$package" > target/wit-package/dekopon-clock.json
+          jq --exit-status --arg package "$CLOCK_WIT_PACKAGE" '
+            (.packages == [{"name": $package, "interfaces": {"wall": 0}, "worlds": {}}]) and
+            (.worlds == []) and
+            (.types == []) and
+            (.interfaces | length == 1) and
+            (.interfaces[0].name == "wall") and
+            (.interfaces[0].functions | with_entries(.value |= {kind, params, result}) == {
+              "now-unix-millis": {"kind": "freestanding", "params": [], "result": "u64"}
+            })
+          ' target/wit-package/dekopon-clock.json
+
       - name: Verify the exact standalone echo component remains import-free
         shell: bash
         run: |
@@ -557,6 +599,31 @@ jobs:
             ' "$description"
           done
 
+      - name: Verify the clock-importing provider fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          component=examples/providers/clock-probe-provider.wasm
+          description=target/wit-package/clock-probe.json
+          grep -Fq 'include dekopon:provider/provider-cli@0.3.0;' \
+            examples/providers/clock-probe/wit/provider.wit
+          wasm-tools validate "$component"
+          wasm-tools component wit --json "$component" > "$description"
+          jq --exit-status '
+            (.packages | map(.name) == ["dekopon:clock@1.0.0", "root:component"]) and
+            (.worlds | length == 1) and
+            (.worlds[0].name == "root") and
+            (.worlds[0].imports == {"interface-0": {"interface": {"id": 0}}}) and
+            ((.worlds[0].exports | keys) == ["describe", "invoke", "run-command"]) and
+            (.interfaces | length == 1) and
+            (.interfaces[0].name == "wall") and
+            ((.interfaces[0].functions | keys) == ["now-unix-millis"])
+          ' "$description"
+          if grep -Eqi 'wasi:|wasm-bindgen|js-sys' "$description"; then
+            echo "forbidden ambient import in $component" >&2
+            exit 1
+          fi
+
       - name: Exercise local wkg publish and fetch
         shell: bash
         run: |
@@ -570,7 +637,7 @@ jobs:
           [registry."local.test".local]
           root = "$registry/packages"
           EOF
-          for artifact in dekopon-provider dekopon-http dekopon-storage; do
+          for artifact in dekopon-provider dekopon-http dekopon-storage dekopon-clock; do
             wkg publish \
               --config "$registry/config.toml" \
               --cache "$registry/publish-cache" \
@@ -591,9 +658,15 @@ jobs:
             --cache "$registry/fetch-cache" \
             --output "$registry/fetched-storage.wasm" \
             "$STORAGE_WIT_PACKAGE"
+          wkg get \
+            --config "$registry/config.toml" \
+            --cache "$registry/fetch-cache" \
+            --output "$registry/fetched-clock.wasm" \
+            "$CLOCK_WIT_PACKAGE"
           cmp target/wit-package/dekopon-provider.wasm "$registry/fetched-provider.wasm"
           cmp target/wit-package/dekopon-http.wasm "$registry/fetched-http.wasm"
           cmp target/wit-package/dekopon-storage.wasm "$registry/fetched-storage.wasm"
+          cmp target/wit-package/dekopon-clock.wasm "$registry/fetched-clock.wasm"
 
       - name: Upload the verified packages
         if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
@@ -604,6 +677,7 @@ jobs:
             target/wit-package/dekopon-provider.wasm
             target/wit-package/dekopon-http.wasm
             target/wit-package/dekopon-storage.wasm
+            target/wit-package/dekopon-clock.wasm
           if-no-files-found: error
           retention-days: 1
 
@@ -648,7 +722,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          for artifact in dekopon-provider dekopon-http dekopon-storage; do
+          for artifact in dekopon-provider dekopon-http dekopon-storage dekopon-clock; do
             wkg publish \
               --skip-dupes \
               --config wkg/config.toml \
@@ -675,9 +749,15 @@ jobs:
             --cache "$RUNNER_TEMP/wkg-verify-cache" \
             --output "$RUNNER_TEMP/published-storage.wasm" \
             "$STORAGE_WIT_PACKAGE"
+          wkg get \
+            --config wkg/config.toml \
+            --cache "$RUNNER_TEMP/wkg-verify-cache" \
+            --output "$RUNNER_TEMP/published-clock.wasm" \
+            "$CLOCK_WIT_PACKAGE"
           cmp target/wit-package/dekopon-provider.wasm "$RUNNER_TEMP/published-provider.wasm"
           cmp target/wit-package/dekopon-http.wasm "$RUNNER_TEMP/published-http.wasm"
           cmp target/wit-package/dekopon-storage.wasm "$RUNNER_TEMP/published-storage.wasm"
+          cmp target/wit-package/dekopon-clock.wasm "$RUNNER_TEMP/published-clock.wasm"
 
       - name: Log out of GHCR
         if: always()

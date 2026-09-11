@@ -1,7 +1,7 @@
 # dekopon-broker-host
 
 Broker-owned asynchronous Wasmtime host for provider components that import the project-owned
-`dekopon:http@1.0.0` or `dekopon:storage@0.1.0` interfaces.
+`dekopon:http@1.0.0`, `dekopon:storage@0.1.0`, or `dekopon:clock@1.0.0` interfaces.
 
 This crate is privileged machinery. Its public invocation API consumes one non-cloneable
 `AuthorizedInvocation`; each call receives a fresh bounded store, exact HTTP constraints, and a
@@ -37,9 +37,10 @@ refuses a manifest whose words have no callable export, calls `run-command` when
 adapts a `resolve-command` answer into the same `CommandRunOutcome`, so
 `BrokerProviderRegistry::run_command` returns one type whichever export served it. A
 `resolve-command` guest never receives `stdin`, by contract. Export precedence rests on the lookup
-order in `dekopon-provider-sdk::host::command_export`; no checked-in component exports both. Every
-checked-in command-word fixture is import-free, so the `RunCommandUsedHostImport` tripwire shares
-its code path with the describe-mode HTTP state and no test drives it directly.
+order in `dekopon-provider-sdk::host::command_export`; no checked-in component exports both. The
+`RunCommandUsedHostImport` tripwire refuses a run that reached for any host import. `clock-probe`'s
+test-only `date --clock-in-run-command` is the checked-in path that drives it; the HTTP and storage
+halves share its code path with the describe-mode states and no fixture drives them directly.
 
 `BrokerHostOptions` carries operational settings that are not host ceilings and are not committed
 into the broker's authority surface:
@@ -62,11 +63,33 @@ fuel ceiling includes headroom for a valid default multi-megabyte memory compact
 composition rejects a lower configured ceiling that would make a full store deterministically trap,
 while the independent wall-clock limit remains enforced.
 
-The linker exposes only `dekopon:http@1.0.0` and `dekopon:storage@0.1.0`; generic WASI and unknown
-imports fail before execution. Provider description is linked so an importing component can
-instantiate, but any host call during `describe` rejects the component. Invocation requires an
-`AuthorizedInvocation`; its provider must match the trusted capability route, and absent exact
-constraints supply no HTTP or storage authority.
+The linker exposes only these imports; generic WASI and unknown imports fail before execution:
+
+| Import | Answered during | Outside `invoke` |
+|---|---|---|
+| `dekopon:http/client@1.0.0` | an invocation carrying an exact HTTP grant | typed `denied`, then the describe or command-run tripwire |
+| `dekopon:storage/jsonl@0.1.0`, `dekopon:storage/durable-files@0.1.0` | an invocation carrying an exact storage grant of that interface | typed `permission-denied`, then the tripwire |
+| `dekopon:clock/wall@1.0.0` | every invocation; no grant | traps, then the tripwire |
+
+Provider description is linked so an importing component can instantiate, but any host call during
+`describe` rejects the component. Invocation requires an `AuthorizedInvocation`; its provider must
+match the trusted capability route, and absent exact constraints supply no HTTP or storage
+authority.
+
+## Wall clock
+
+`now-unix-millis` returns the host's `SystemTime` as milliseconds since the Unix epoch, saturating
+at `0` for a clock set before 1970. The import has no error channel, so a store built for a
+description or command run traps the read and records the attempt, and the operation fails as
+`DescribeUsedHostImport` or `RunCommandUsedHostImport`. A read is not charged against any host-call
+limit: it has no effect and allocates nothing, and fuel and the operation deadline already bound
+the guest loop around it. Each read inside an invocation emits one info-level `provider_clock_read`
+event carrying `unix_millis`, parented by `provider.invoke`, so the value the guest received is in
+the trace.
+
+A component importing the clock does not load on a host older than this import: instantiation
+fails with `component imports instance \`dekopon:clock/wall@1.0.0\`, but a matching implementation
+was not found in the linker`.
 
 ## Buffered HTTP enforcement
 

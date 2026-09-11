@@ -203,6 +203,15 @@ All notable changes to Dekopon are documented here. The format is based on
   admits a scope and `DeliveryIdentity::is_canonical_for`, which already sat on those predicates,
   can no longer drift into disagreeing about which Slack timestamp, Telegram topic or WhatsApp
   triple is canonical. Behaviour is unchanged — the copies were identical when merged.
+- The broker host links a wall clock: the `dekopon:clock/wall@1.0.0` import, one
+  `now-unix-millis` function published as the `dekopon:clock@1.0.0` WIT package. It is the clock a
+  provider reads with no grant, during an authorized `invoke` only; a read during `describe` or a
+  command run traps and fails as `DescribeUsedHostImport` or `RunCommandUsedHostImport`, so a `date`
+  word proposes from `run-command` and reads the time when invoked. Each read emits
+  `provider_clock_read` with `unix_millis` inside `provider.invoke`. The new
+  `dekopon-provider-clock` crate is the Rust guest binding, and the `clock-probe` fixture is its
+  conformance test and an in-tree `date` word. Before this, only a provider holding a durable-files
+  storage grant could read the time, through `wall-time-ms`.
 
 ### Changed
 

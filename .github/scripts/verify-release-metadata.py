@@ -15,10 +15,12 @@ LEGACY_CHANGELOGLESS_TAGS = frozenset(
 )
 
 # cargo-machete finds a dependency nothing uses; it cannot see a whole crate nothing depends on.
-# These two are the only members allowed to have no workspace consumer: they are guest bindings
+# These three are the only members allowed to have no workspace consumer: they are guest bindings
 # compiled into provider components, whose in-repository callers are the excluded
 # examples/providers/* workspaces.
-GUEST_BINDING_PACKAGES = frozenset({"dekopon-provider-http", "dekopon-provider-storage"})
+GUEST_BINDING_PACKAGES = frozenset(
+    {"dekopon-provider-clock", "dekopon-provider-http", "dekopon-provider-storage"}
+)
 
 
 def parse_args() -> argparse.Namespace:

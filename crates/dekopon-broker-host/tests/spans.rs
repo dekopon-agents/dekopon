@@ -13,7 +13,11 @@
 //! `cargo test` runs them as threads in one process against one global capture, and two loads
 //! interleaved in it would be indistinguishable from one load that instantiated twice.
 
-use std::{path::PathBuf, sync::OnceLock};
+use std::{
+    path::PathBuf,
+    sync::OnceLock,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use dekopon_broker_host::{
     BrokerHostError, BrokerHostLimits, BrokerProviderRegistry, CommandRunOutcome,
@@ -257,4 +261,68 @@ async fn every_operation_instantiates_the_component_exactly_once() {
     let fuel = recorded(&capture, "provider.invoke", "fuel.consumed");
     assert_eq!(fuel.len(), 1, "one invocation reports fuel once: {fuel:?}");
     assert!(fuel[0] > 0, "a real invocation burns fuel: {fuel:?}");
+}
+
+/// The host's wall clock, in the units `dekopon:clock/wall@1.0.0` answers in.
+fn unix_millis_now() -> u64 {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the test host's clock reads after 1970");
+    u64::try_from(elapsed.as_millis()).expect("milliseconds fit in u64")
+}
+
+/// `clock.now` reads the host clock during the invocation, and the value the guest received rides
+/// the trace as one `provider_clock_read` event parented by `provider.invoke`. It lives in this
+/// binary because the event is only observable through the one global capture.
+#[tokio::test(flavor = "multi_thread")]
+async fn clock_probe_reads_the_host_clock_inside_the_invoke_window() {
+    let _sequential = SEQUENTIAL.lock().await;
+    let capture = capture();
+    capture.clear();
+
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("clock-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("clock provider loads");
+    let capability = "clock.now".parse::<CapabilityId>().expect("capability");
+
+    let before = unix_millis_now();
+    let output = registry
+        .invoke(authorized("clock-probe", capability, json!({})), None)
+        .await
+        .expect("the clock reads inside invoke");
+    let after = unix_millis_now();
+
+    let unix_millis = output.output["unixMillis"]
+        .as_u64()
+        .expect("unixMillis is a u64");
+    assert!(
+        before <= unix_millis && unix_millis <= after,
+        "the reading must fall inside the invocation: {before} <= {unix_millis} <= {after}"
+    );
+    let rfc3339 = output.output["rfc3339"]
+        .as_str()
+        .expect("rfc3339 is a string");
+    assert_eq!(rfc3339.len(), "1970-01-01T00:00:00Z".len(), "{rfc3339}");
+    assert!(rfc3339.ends_with('Z'), "{rfc3339}");
+
+    let reads = capture
+        .events()
+        .into_iter()
+        .filter(|(fields, _)| fields.contains("provider_clock_read"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        reads,
+        vec![(
+            format!(" event=\"provider_clock_read\" unix_millis={unix_millis}"),
+            Some("provider.invoke".to_owned())
+        )],
+        "one read, carrying the value the guest returned, inside provider.invoke:\n{}",
+        capture.text()
+    );
+    // The load described the component without reading the clock; only the invocation did.
+    assert_one_store_each(&capture, "provider.describe", 1);
+    assert_one_store_each(&capture, "provider.invoke", 1);
 }

@@ -44,6 +44,7 @@ RUST_ROOT_INPUTS = {
     "rust-toolchain.toml",
     "rustfmt.toml",
     "ci/fetch-external-provider-components.sh",
+    "wit/clock/clock.wit",
     "wit/http/http.wit",
     "wit/storage/storage.wit",
 }
