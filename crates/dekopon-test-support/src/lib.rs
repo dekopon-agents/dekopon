@@ -12,12 +12,12 @@
 //! it to `dekopond`'s dev-dependencies cannot put a broker crate in the gateway's dependency tree.
 
 use std::{
-    io::{Read as _, Write as _},
-    net::TcpListener,
+    io::{ErrorKind, Read as _, Write as _},
+    net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 mod capture;
@@ -26,6 +26,9 @@ pub use capture::{CaptureLayer, Record};
 
 /// How long a fixture waits on a peer before deciding the test, not the network, is stuck.
 const FIXTURE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often [`LoopbackServer::pooled`] re-checks its two sources of a client's next move.
+const POOLED_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// The path to one built provider component under `examples/providers/`.
 ///
@@ -223,29 +226,60 @@ impl LoopbackServer {
     ///
     /// A pooling client may or may not have checked its connection back in as idle by the time the
     /// next request starts, which is a race decided by a background task rather than by anything
-    /// the caller controls. Losing it closes the connection instead of hanging it, so this accepts
-    /// a follow-up connection rather than treating that EOF as a fixture failure.
+    /// the caller controls. Both outcomes are served here and neither waits on the other: every
+    /// turn polls the connection already held and then the listener, so a second connection is
+    /// answered as soon as it arrives. Blocking on the held connection's read instead is what put
+    /// this fixture's deadline in a coin flip against the caller's own, which a loaded runner
+    /// loses.
     #[must_use]
     pub fn pooled(response: &[u8], calls: usize) -> Self {
         let response = response.to_vec();
         Self::bind_with("127.0.0.1:0", move |listener, sender| {
+            listener
+                .set_nonblocking(true)
+                .expect("poll the fixture listener");
+            let mut connection: Option<TcpStream> = None;
             let mut served = 0;
-            while served < calls {
-                let Ok((mut stream, _)) = listener.accept() else {
-                    return;
-                };
-                stream
-                    .set_read_timeout(Some(FIXTURE_TIMEOUT))
-                    .expect("set fixture timeout");
-                while served < calls {
-                    let request = read_request(&mut stream);
-                    if request.is_empty() {
-                        break;
+            // Re-armed by every request served and every connection accepted, so the deadline
+            // bounds one wait on the client rather than the whole fixture.
+            let mut deadline = Instant::now() + FIXTURE_TIMEOUT;
+            while served < calls && Instant::now() < deadline {
+                if let Some(stream) = connection.as_mut() {
+                    match peer_state(stream) {
+                        PeerState::Request => {
+                            let request = read_request(stream);
+                            if request.is_empty() {
+                                connection = None;
+                                continue;
+                            }
+                            sender.send(request).expect("record fixture request");
+                            stream.write_all(&response).expect("write fixture response");
+                            stream.flush().expect("flush fixture response");
+                            served += 1;
+                            deadline = Instant::now() + FIXTURE_TIMEOUT;
+                            continue;
+                        }
+                        // A client that closed this connection is about to open another one.
+                        PeerState::Closed => {
+                            connection = None;
+                            continue;
+                        }
+                        PeerState::Idle => {}
                     }
-                    sender.send(request).expect("record fixture request");
-                    stream.write_all(&response).expect("write fixture response");
-                    stream.flush().expect("flush fixture response");
-                    served += 1;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(FIXTURE_TIMEOUT))
+                            .expect("set fixture timeout");
+                        // Any earlier connection is dropped: the client moved on from it.
+                        connection = Some(stream);
+                        deadline = Instant::now() + FIXTURE_TIMEOUT;
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                        thread::sleep(POOLED_POLL_INTERVAL);
+                    }
+                    Err(_) => return,
                 }
             }
         })
@@ -343,10 +377,38 @@ impl LoopbackServer {
     }
 }
 
+/// What a client has done with a connection the fixture is holding open.
+enum PeerState {
+    /// A request has begun arriving on it.
+    Request,
+    /// Nothing yet: the client is still deciding, or has gone to a new connection.
+    Idle,
+    /// The client hung it up, or it is no longer usable, which for this fixture is the same thing.
+    Closed,
+}
+
+/// Reports a connection's state without consuming anything or blocking on it.
+fn peer_state(stream: &mut TcpStream) -> PeerState {
+    stream
+        .set_nonblocking(true)
+        .expect("poll the fixture connection");
+    let mut probe = [0_u8; 1];
+    let state = match stream.peek(&mut probe) {
+        Ok(0) => PeerState::Closed,
+        Ok(_) => PeerState::Request,
+        Err(error) if error.kind() == ErrorKind::WouldBlock => PeerState::Idle,
+        Err(_) => PeerState::Closed,
+    };
+    stream
+        .set_nonblocking(false)
+        .expect("restore the fixture connection to blocking reads");
+    state
+}
+
 /// Reads one complete request: headers, then exactly the declared `content-length` bytes.
 ///
 /// Returns what it has when the peer closes first, which is how a pooled connection ends.
-fn read_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+fn read_request(stream: &mut TcpStream) -> Vec<u8> {
     let mut request = Vec::new();
     let mut buffer = [0_u8; 1024];
     let mut expected = None;
