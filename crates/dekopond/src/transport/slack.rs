@@ -22,6 +22,7 @@ use futures_util::{SinkExt as _, StreamExt as _, future::BoxFuture};
 use serde_json::{Value, json};
 use tokio::{net::TcpStream, time::timeout};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
+use tracing::{Instrument as _, Span};
 
 use crate::{
     asset::{AssetSourceRef, PendingAsset},
@@ -32,7 +33,7 @@ use crate::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
         DeliveryReceipt, InboundMessage, OutboundReply, ReplyTarget, SeenIds, SessionStop,
         ThreadClaim, ThreadContinuation, ThreadOwnership, TransportError, TransportEvent,
-        TransportIdentity, bound_inbound, floor_boundary, reconnect_delay,
+        TransportIdentity, bound_inbound, floor_boundary, receive_span, reconnect_delay,
     },
 };
 
@@ -208,17 +209,35 @@ impl SlackTransport {
         let frame =
             serde_json::from_str::<Value>(&frame).map_err(TransportError::MalformedResponse)?;
 
-        if let Some(envelope) = frame["envelope_id"].as_str() {
-            // Before parsing, before routing, before any model call. Slack resends in about three
-            // seconds and a session runs for far longer, so acknowledging afterwards guarantees
-            // duplicates rather than merely risking them.
-            let ack = json!({ "envelope_id": envelope }).to_string();
-            socket
-                .send(Message::text(ack))
-                .await
-                .map_err(|source| TransportError::Request(Box::new(source)))?;
-        }
+        // One span per envelope, opened before the acknowledgment and before the payload is read,
+        // so the ack, the routing decision, and everything the message goes on to cause share one
+        // trace. `hello` and `disconnect` carry no envelope: they acknowledge nothing and route
+        // nothing, so they open no trace.
+        let received = match frame["envelope_id"].as_str() {
+            Some(envelope) => {
+                let received = receive_span(ChatTransportKind::Slack);
+                // Before parsing, before routing, before any model call. Slack resends in about
+                // three seconds and a session runs for far longer, so acknowledging afterwards
+                // guarantees duplicates rather than merely risking them.
+                let ack = json!({ "envelope_id": envelope }).to_string();
+                socket
+                    .send(Message::text(ack))
+                    .instrument(received.clone())
+                    .await
+                    .map_err(|source| TransportError::Request(Box::new(source)))?;
+                received
+            }
+            None => Span::none(),
+        };
 
+        received.in_scope(|| self.accept(&frame, &received))
+    }
+
+    /// Turns one acknowledged envelope into a pending event, inside its receive span.
+    ///
+    /// Split out of [`Self::pump`] only so the span wraps every branch of it: nothing here awaits,
+    /// so `in_scope` is what enters it.
+    fn accept(&mut self, frame: &Value, received: &Span) -> Result<(), TransportError> {
         match frame["type"].as_str() {
             // Slack rotates sockets on its own schedule; a disconnect is routine, not a failure.
             Some("disconnect") => {
@@ -243,7 +262,8 @@ impl SlackTransport {
                 self.pending
                     .push_back(TransportEvent::SessionStopped(stopped));
             }
-        } else if let Some(message) = self.routable(&team, event)? {
+        } else if let Some(message) = self.routable(&team, event, received)? {
+            received.record("message.id", message.message_id.as_str());
             self.pending
                 .push_back(TransportEvent::Message(Box::new(message)));
         }
@@ -255,6 +275,7 @@ impl SlackTransport {
         &mut self,
         team: &str,
         event: &Value,
+        received: &Span,
     ) -> Result<Option<InboundMessage>, TransportError> {
         if !matches!(event["type"].as_str(), Some("message" | "app_mention")) {
             return Ok(None);
@@ -377,6 +398,7 @@ impl SlackTransport {
                 message_ts: ts.to_owned(),
                 initiator_user_id: user.to_owned(),
             }),
+            receive_span: received.clone(),
         }))
     }
 

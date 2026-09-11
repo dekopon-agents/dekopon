@@ -9,6 +9,16 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Added
 
+- `dekopond` opens a message's trace where the transport received it. `transport.receive` is entered
+  before the payload is parsed, so Slack's envelope acknowledgment, WhatsApp's HMAC check and the 200
+  that answers it, Telegram's `offset` advance, Discord's addressing decision, the local transport's
+  line parse, and the routing decision itself all land inside the trace of the message they concern —
+  including `gateway_message_ignored`, which previously had no trace to be read in. `gateway.message`
+  nests under it and closes it, so the receive span measures receipt and dispatch rather than the
+  session. It carries `transport.kind` and `message.id`, the service's own identifier for the turn,
+  and never the sender or the text; a receipt that routes nothing closes without an identifier, which
+  is the trace that answers why a message went unanswered. The trace root was `gateway.message`,
+  opened after routing had already succeeded, so everything before it was unreconstructible.
 - Broker IPC supports distinct mapped peer UIDs through a broker-owned `0660` socket
   in a non-writable shared-group directory. Owner-only `0600` clients remain supported;
   real peer authentication, server-UID pinning and private credential/store checks remain

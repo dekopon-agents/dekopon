@@ -48,7 +48,7 @@ const MAX_RECONNECT_DOUBLINGS: u32 = 7;
 /// snowflake, WhatsApp's bounded claim set on the `wamid`, and Telegram's advancing `offset`, which
 /// is the acknowledgment. [`Self::message_id`] therefore exists for the delivered-turn attestation
 /// rather than for that question.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct InboundMessage {
     /// The configured transport name this arrived on.
     pub transport: String,
@@ -116,10 +116,36 @@ pub(crate) struct InboundMessage {
     /// Absent for transports or messages with no configured activity surface. These values come
     /// only from the transport envelope and are never model-controlled.
     pub activity: Option<ActivityTarget>,
+    /// The span the transport opened when this message arrived, and the root of its trace.
+    ///
+    /// Built by [`receive_span`] before the payload was parsed, so the acknowledgment, the
+    /// signature check, and the routing decision are already inside it. [`crate::session::run_session`]
+    /// takes it, parents `gateway.message` under it, and drops it — which is what keeps
+    /// `transport.receive` measuring receipt and dispatch rather than the whole session it started.
+    pub receive_span: tracing::Span,
+}
+
+/// Opens the trace one inbound message rides, at the moment its transport received it.
+///
+/// This is the trace root goal 2 of `docs/design.md#constitution` asks for: the acknowledgment, the
+/// parse, the routing decision, `gateway.message`, the model turn, every broker invocation, and
+/// every provider call hang from it, so an operator reconstructs one message from receipt onward
+/// rather than from the point routing had already succeeded. `message.id` is recorded once the
+/// payload has been parsed far enough to carry one; a receipt that routes nothing closes this span
+/// without one, which is the trace that answers "why did the bot not reply".
+///
+/// No credential, sender, or message text goes on it. The sender stays on the payload-gated
+/// `gateway.message.received` record.
+pub(crate) fn receive_span(kind: ChatTransportKind) -> tracing::Span {
+    tracing::info_span!(
+        "transport.receive",
+        transport.kind = %kind,
+        message.id = tracing::field::Empty,
+    )
 }
 
 /// One event produced by a chat transport.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) enum TransportEvent {
     /// A user message eligible for ordinary routing.
     Message(Box<InboundMessage>),
