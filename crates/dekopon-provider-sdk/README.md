@@ -89,9 +89,9 @@ rather than guess.
 
 Providers never enable it, and the default feature set is empty, so a `wasm32-unknown-unknown` build
 never compiles it. The optional `host` feature adds `dekopon_provider_sdk::host`: the Wasmtime
-plumbing consumed by `dekopon-broker-host` and external embeddings — manifest validation behind an
-effect gate, the report a whole conflicting provider set fails with, the bounds on one store, the
-engine constructor, and the command-export plumbing: `command_export` reads which of `run-command`
+plumbing consumed by `dekopon-broker-host` and external embeddings — manifest validation, the report
+a whole conflicting provider set fails with, the bounds on one store, the engine constructor, and
+the command-export plumbing: `command_export` reads which of `run-command`
 and `resolve-command` a compiled component offers (the newer one wins when both exist),
 `check_command_export` is the load gate a manifest declaring `commandWords` must pass,
 `command_input_bytes` is what a host counts against its input bound for one run, and
