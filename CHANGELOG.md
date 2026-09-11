@@ -302,6 +302,16 @@ All notable changes to Dekopon are documented here. The format is based on
   their documentation. The [migration requirements](docs/design.md#legacy-credential-bindings)
   preserve per-agent isolation, destination binding, refresh, and native injection; no runtime or
   configuration migration is implemented by this documentation change.
+- Every `dekopond` chat transport and the OTLP/HTTP exporter refuse an ambient proxy. Slack, Discord,
+  Telegram and WhatsApp build their one client from `transport::credential_client`, which sets
+  `no_proxy()`, refuses redirects, disables reqwest's protocol-NACK replay, and takes the caller's
+  deadline; Discord keeps its user agent and Slack's separate `client()` is gone.
+  `dekopon-telemetry`'s blocking OTLP client sets `no_proxy()` too. An exported `HTTPS_PROXY`,
+  `HTTP_PROXY` or `ALL_PROXY` therefore carries no Slack app or bot token, Discord or Telegram bot
+  token, WhatsApp Graph access token, or `OTEL_EXPORTER_OTLP_HEADERS` ingest header through a host
+  nobody named to Dekopon. There is no field or flag to opt back in: a chat service reachable only
+  through a proxy is unreachable, and a collector reachable only through one stops receiving spans
+  and log records — which, because audit is one log record per broker decision, is audit lost.
 
 ### Removed
 

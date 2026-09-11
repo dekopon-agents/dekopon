@@ -33,7 +33,8 @@ use crate::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
         DeliveryReceipt, InboundMessage, OutboundReply, ReplyTarget, SeenIds, SessionStop,
         ThreadClaim, ThreadContinuation, ThreadOwnership, TransportError, TransportEvent,
-        TransportIdentity, bound_inbound, floor_boundary, receive_span, reconnect_delay,
+        TransportIdentity, bound_inbound, credential_client, floor_boundary, receive_span,
+        reconnect_delay,
     },
 };
 
@@ -58,6 +59,8 @@ const REQUEST_SUBTYPES: [&str; 3] = ["file_share", "me_message", "thread_broadca
 const MAX_ATTACHMENTS: usize = 10;
 /// Ceiling on one file name inside an attachment note.
 const MAX_ATTACHMENT_NAME_BYTES: usize = 128;
+/// The general deadline every Web API call and file transfer this transport makes shares.
+const SLACK_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Activity must never inherit the final reply/file client's general 30-second wait.
 const ACTIVITY_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 /// How long a socket may say nothing before it is treated as dead.
@@ -104,7 +107,9 @@ impl SlackTransport {
         experience: SlackExperience,
         activity: SlackActivityConfig,
     ) -> Result<Self, TransportError> {
-        let http = client()?;
+        let http = credential_client(SLACK_REQUEST_TIMEOUT)
+            .build()
+            .map_err(|source| TransportError::Request(Box::new(source)))?;
         let thread_ownership = Arc::new(SlackThreadOwnership::new(OWNED_THREAD_CAPACITY));
         Ok(Self {
             name,
@@ -1125,8 +1130,9 @@ fn pending_assets(files: &Value) -> Vec<PendingAsset> {
 
 /// The one redirect hop a Slack file download is allowed to take.
 ///
-/// `client()` refuses redirects globally, which is the right default for an API call carrying a
-/// bearer token — a redirect there would forward the credential to whatever host answered.
+/// [`credential_client`] refuses redirects globally, which is the right default for an API call
+/// carrying a bearer token — a redirect there would forward the credential to whatever host
+/// answered.
 /// `url_private_download` genuinely does redirect, to Slack's own file host, so this transport
 /// follows exactly one hop and only to a host it recognises, re-attaching the token itself rather
 /// than letting a redirect policy carry it anywhere.
@@ -1246,15 +1252,6 @@ pub(crate) fn is_slack_upload_url(url: &str, endpoint: &str) -> bool {
             url.host_str().map(str::to_ascii_lowercase).as_deref(),
             Some("localhost" | "127.0.0.1" | "::1")
         )
-}
-
-/// One HTTP client shared across a transport's calls, with redirects refused.
-pub(crate) fn client() -> Result<reqwest::Client, TransportError> {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|source| TransportError::Request(Box::new(source)))
 }
 
 /// Posts an empty form with a bearer token, which is what Slack's token-only methods expect.

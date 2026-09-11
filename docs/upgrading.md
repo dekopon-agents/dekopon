@@ -318,6 +318,18 @@ bootstrap limitations.
   `dekopond auth chatgpt login`; nothing in a configuration file changes, and there is no field or
   flag to opt back in, so a model endpoint that was only reachable through that proxy is
   unreachable after the upgrade.
+- **Chat transports and the OTLP exporter follow no ambient proxy either.** Slack, Discord,
+  Telegram and WhatsApp each build their one HTTP client from a single `credential_client` shape
+  that sets no proxy, follows no redirect, and replays no request, so an exported proxy variable
+  carries no Slack app or bot token, Discord or Telegram bot token, or WhatsApp Graph access token
+  — nor the messages they authenticate — through a host nobody named to Dekopon.
+  `dekopon-telemetry`'s OTLP/HTTP client takes the same stance, so the ingest header in
+  `OTEL_EXPORTER_OTLP_HEADERS` stops travelling that way too. Nothing in a configuration file
+  changes and there is no flag to opt back in. A chat service reachable only through a proxy is
+  unreachable after the upgrade, and **a collector reachable only through `HTTPS_PROXY` must now be
+  addressed directly** — otherwise export stops, and because audit is one structured log record per
+  broker decision emitted through that exporter, losing it loses audit. Point `telemetry.endpoint`
+  at the collector itself, or run one on the host.
 
 #### `imageGenerators:` becomes one `imageGenerator:` block
 
