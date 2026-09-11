@@ -49,7 +49,7 @@ mod bindings {
 dekopon_provider_sdk::export_provider_with_bindings!(Example, bindings);
 ```
 
-The composed world must retain the root `describe` and `invoke` exports. Additional imports are embedded in the component type and fail closed unless an authorized broker linker implements them. See the [`http-probe`](../../examples/providers/http-probe/README.md) fixture.
+The composed world must retain the root `describe` and `invoke` exports. Additional imports are embedded in the component type and fail closed unless an authorized broker linker implements them. See the [`http-probe`](../../examples/providers/http-probe/README.md) fixture, and [`clock-probe`](../../examples/providers/clock-probe/README.md) for the `dekopon:clock/wall@1.0.0` import beside a `run-command` world. Host imports are for `invoke`: `run-command` and `resolve-command` stay pure, and a broker refuses a component that reaches for one there.
 
 ## Attachments out of band
 

@@ -1,0 +1,20 @@
+[package]
+name = "dekopon-provider-clock"
+description = "Rust guest bindings for the Dekopon broker host's wall clock interface"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation = "https://docs.rs/dekopon-provider-clock"
+readme = "README.md"
+keywords = ["agents", "wasm", "components", "clock", "sdk"]
+categories = ["wasm", "api-bindings", "date-and-time"]
+include = ["src/**", "wit/**", "README.md", "Cargo.toml"]
+
+[dependencies]
+wit-bindgen.workspace = true
+
+[lints]
+workspace = true

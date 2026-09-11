@@ -462,6 +462,14 @@ never the argv or the value piped into the word. Model-authored argv and piped t
 content for the same reason `provider.invoke` omits `input`; the help page or usage error a
 `run-command` guest renders travels back in the result, not in telemetry.
 
+Every read of the `dekopon:clock/wall@1.0.0` import emits `provider_clock_read` at `INFO` from
+`dekopon-broker-host`, parented by `provider.invoke`, carrying `unix_millis`: the exact value the
+host handed the guest. A provider's output can depend on the time it read, so the reading is a
+host-supplied input to the run and belongs in the trace beside the proposal's `input`. It is one
+event per read with nothing else attached, and it is not an `audit.event`: audit is one record per
+broker decision, and a clock read is not a decision. Reads outside an invocation emit nothing; they
+trap, and the operation fails as `DescribeUsedHostImport` or `RunCommandUsedHostImport`.
+
 A `policy-denied` outcome the policy engine never evaluated additionally emits
 `audit.event = "policy.request.refused"` at `WARN` with the capability and a rendered reason. The
 wire result and the audit reason both stay `policy-denied`, because the taxonomy callers act on must
@@ -594,7 +602,10 @@ starts without charging that base, and the conversation's next grant fails namin
 Both records name opaque tokens and paths under the storage root. They are for the operator;
 nothing in them reaches a guest or a model.
 
-Entropy and wall/monotonic clock values from durable-files are never emitted as telemetry. A native
+Entropy and wall/monotonic clock values from durable-files are never emitted as telemetry. The
+separate `dekopon:clock/wall@1.0.0` import is not a storage interface; its `provider_clock_read`
+reading is emitted in either span shape, and it names no more than the enclosing span's own
+timestamps already do. A native
 filesystem operation may outlive a timeout signal; `finalizationBudgetMs` prevents the next bounded
 finalization step from starting after its deadline, while the base/generation leases and quota
 reservation remain held until an already-started blocking job drains. Duration is therefore

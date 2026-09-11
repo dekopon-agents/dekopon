@@ -1016,6 +1016,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dekopon-provider-clock"
+version = "0.12.0"
+dependencies = [
+ "wit-bindgen",
+]
+
+[[package]]
 name = "dekopon-provider-http"
 version = "0.12.0"
 dependencies = [

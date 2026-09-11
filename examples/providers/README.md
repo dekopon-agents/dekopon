@@ -36,6 +36,9 @@ The remaining checked components are repository-owned fixtures:
 - [`cli-probe/`](cli-probe/) is the import-free `run-command` guest built on the SDK's `clap`
   layer: its `probe` word renders clap's help and usage errors, reads a piped value, and proposes
   its three read-only capabilities.
+- [`clock-probe/`](clock-probe/) composes the `run-command` world with
+  `dekopon:clock/wall@1.0.0`: its `date` word proposes `clock.now`, and the invocation reads the
+  broker host's clock. It is the clock import's conformance fixture and is never packaged.
 - [`http-probe/`](http-probe/) composes provider exports with
   `dekopon:http/client@1.0.0`. Its `conditional-write` capability keeps two-call host budgets,
   per-call evidence, and etag-guarded writes covered without public network access.

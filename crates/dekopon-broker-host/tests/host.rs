@@ -544,6 +544,61 @@ fn broker_bindings_mirror_the_immutable_packages() {
         STORAGE_WIT,
         include_str!("../../../wit/storage/storage.wit")
     );
+    assert_eq!(
+        include_str!("../wit/deps/clock.wit"),
+        include_str!("../../../wit/clock/clock.wit")
+    );
+}
+
+/// `run-command` is pure by contract. The clock import is linked into every store, but only an
+/// invocation's store may read it: the bare `date` word proposes without touching the clock, and a
+/// guest that reaches for the clock from a command run traps there, surfacing as the same
+/// `RunCommandUsedHostImport` refusal a denied HTTP or storage call produces. It is the one
+/// checked-in fixture that drives that tripwire.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_command_reading_the_clock_traps() {
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("clock-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("clock provider loads");
+    assert_eq!(registry.command_words(), vec!["date".to_owned()]);
+
+    let outcome = registry
+        .run_command("date", &[], None)
+        .await
+        .expect("the bare word proposes");
+    assert_eq!(
+        outcome,
+        CommandRunOutcome::Proposed {
+            capability: "clock.now".parse().expect("capability"),
+            input: json!({}),
+        }
+    );
+
+    let error = registry
+        .run_command("date", &["--clock-in-run-command".to_owned()], None)
+        .await
+        .expect_err("a clock read outside invoke traps");
+    assert!(
+        matches!(
+            error,
+            BrokerHostError::RunCommandUsedHostImport { ref path }
+                if path.ends_with("clock-probe-provider.wasm")
+        ),
+        "expected the host-import tripwire, got {error:?}"
+    );
+
+    // The refusal belongs to that one run: the next bare word still proposes.
+    let outcome = registry
+        .run_command("date", &[], None)
+        .await
+        .expect("a later run is unaffected");
+    assert!(
+        matches!(outcome, CommandRunOutcome::Proposed { .. }),
+        "{outcome:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

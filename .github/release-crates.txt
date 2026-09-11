@@ -2,6 +2,7 @@
 dekopon-core
 dekopon-provider-http
 dekopon-provider-storage
+dekopon-provider-clock
 dekopon-telemetry
 dekopon-capability
 dekopon-storage-host

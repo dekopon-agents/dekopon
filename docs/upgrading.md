@@ -112,6 +112,21 @@ drop them too.
 
 Library callers of `run` receive unit on clean shutdown.
 
+## Provider wall clock import (unreleased)
+
+A provider component that imports `dekopon:clock/wall@1.0.0` requires a broker built with this
+release or newer. An older broker refuses it when it loads the component, before it binds its
+socket:
+
+```text
+could not instantiate broker provider component <path>: component imports instance `dekopon:clock/wall@1.0.0`, but a matching implementation was not found in the linker
+```
+
+Upgrade the broker before installing such a provider. Components that do not import the clock,
+including every provider built against `dekopon:provider@0.1.0` through `0.3.0`, load unchanged. A
+provider that reads the clock outside `invoke` — from `describe`, `run-command`, or
+`resolve-command` — now fails that call as `DescribeUsedHostImport` or `RunCommandUsedHostImport`.
+
 ## Provider storage direct-write contract
 
 Provider storage applies each write immediately; provider traps, invalid responses and cancellation
