@@ -8,6 +8,7 @@ use std::{
     sync::Arc,
 };
 
+use dekopon_core::{AncestorResolution, AncestorScope, FileHygieneError, check_trusted_ancestors};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 
@@ -632,24 +633,23 @@ fn validate_component(name: &str) -> Result<(), StorageHostError> {
     Ok(())
 }
 
+/// Refuses a configured root whose ancestry is writable outside its owner.
+///
+/// The walk is [`AncestorResolution::AsWritten`] because the configured spelling is what the
+/// operator authorized: resolving an alias first would open a root under a directory they never
+/// named, which `configured_root_and_key_ancestor_symlinks_are_rejected_before_canonicalization`
+/// holds to. It is [`AncestorScope::Above`] because the root itself may not exist yet, and once it
+/// does `Directory::validate_self` inspects it under owner rules an ancestor is not held to.
 fn validate_ancestors(path: &Path) -> Result<(), StorageHostError> {
-    let mut current = path.parent();
-    while let Some(ancestor) = current {
-        let metadata =
-            fs::symlink_metadata(ancestor).map_err(|source| StorageHostError::RootIo {
-                path: ancestor.to_path_buf(),
-                source,
-            })?;
-        let mode = metadata.permissions().mode();
-        let sticky = mode & 0o1000 != 0;
-        if !metadata.is_dir() || (mode & 0o022 != 0 && !sticky) {
-            return Err(StorageHostError::UnsafeRoot {
-                path: ancestor.to_path_buf(),
-            });
-        }
-        current = ancestor.parent();
-    }
-    Ok(())
+    check_trusted_ancestors(path, AncestorResolution::AsWritten, AncestorScope::Above).map_err(
+        |error| match error {
+            FileHygieneError::Io { path, source } => StorageHostError::RootIo { path, source },
+            // The walk returns only `Io` and `UnsafeAncestor`; anything else is a refusal too.
+            refusal => StorageHostError::UnsafeRoot {
+                path: refusal.path().to_path_buf(),
+            },
+        },
+    )
 }
 
 #[cfg(test)]

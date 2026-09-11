@@ -6,6 +6,12 @@
 //! read — and the permission mask silently differed between copies with nothing naming the two
 //! tiers. Both tiers are here, named, with the reason they differ in [`FileTier`].
 //!
+//! The directories above the file are the other half of the same question, and were hand-written
+//! four more times — the storage layout, the namespace key, the provider store, and the broker
+//! socket — differing in whether they canonicalized first, in whether they inspected the path
+//! itself, and in which error they raised. [`check_trusted_ancestors`] is the one walk; the two
+//! decisions that legitimately differ between those callers are its parameters.
+//!
 //! This is Unix-only: every caller is a Unix-only process, and `O_NOFOLLOW`, an owning UID, and a
 //! permission mask have no portable equivalent worth pretending to.
 
@@ -118,6 +124,25 @@ pub enum FileHygieneError {
         /// Caller's bound.
         maximum: usize,
     },
+    /// A directory on the path to the file may be rewritten by someone other than its owner.
+    ///
+    /// The file below such a directory carries no more authority than the directory does: whoever
+    /// can write it can rename the file away and leave their own in its place, and no check on the
+    /// file itself sees that happen. The sticky bit is tolerated, because it is exactly the bit
+    /// that makes a shared `/tmp` and the per-user directories under it safe to sit beneath.
+    #[error(
+        "{} is a {observed} with mode {mode:04o}; an ancestor of a trusted path must be a \
+         directory that is not group- or world-writable unless it is sticky",
+        path.display()
+    )]
+    UnsafeAncestor {
+        /// The rejected ancestor.
+        path: PathBuf,
+        /// Observed permission bits, including the sticky bit.
+        mode: u32,
+        /// What the ancestor actually is.
+        observed: &'static str,
+    },
     /// Opening, inspecting, or reading the file failed.
     #[error("could not read {}", path.display())]
     Io {
@@ -142,6 +167,7 @@ impl FileHygieneError {
             Self::WrongOwner { .. } => "wrong-owner",
             Self::HardLinked { .. } => "hard-linked",
             Self::TooLarge { .. } => "too-large",
+            Self::UnsafeAncestor { .. } => "unsafe-ancestor",
             Self::Io { .. } => "io",
         }
     }
@@ -155,6 +181,7 @@ impl FileHygieneError {
             | Self::WrongOwner { path, .. }
             | Self::HardLinked { path, .. }
             | Self::TooLarge { path, .. }
+            | Self::UnsafeAncestor { path, .. }
             | Self::Io { path, .. } => path,
         }
     }
@@ -209,6 +236,87 @@ pub fn check_trusted_metadata(
     Ok(())
 }
 
+/// Whether the ancestor walk resolves the path first or inspects it as the operator wrote it.
+///
+/// [`AsWritten`](Self::AsWritten) refuses a symlinked ancestor where it stands, which is what a
+/// caller needs when the configured spelling is itself the thing being authorized — resolving the
+/// alias first would authorize a directory the operator never named.
+/// [`Canonical`](Self::Canonical) resolves aliases such as macOS's `/var -> /private/var` and
+/// inspects the real directories, which is what a caller needs when the path is a store it
+/// manages rather than a spelling it must preserve.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AncestorResolution {
+    /// Walk the path exactly as given. Any symlinked ancestor is refused, not followed.
+    AsWritten,
+    /// Canonicalize the path before walking it. This requires the path to exist.
+    Canonical,
+}
+
+/// Whether the ancestor walk inspects the path itself or only the directories above it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AncestorScope {
+    /// Inspect `path` first, then every directory above it.
+    PathAndAbove,
+    /// Inspect only the directories above `path`. For a caller that is about to create `path`, or
+    /// that inspects it separately under rules stricter than an ancestor's.
+    Above,
+}
+
+/// Refuses a path whose ancestry would let another user substitute what sits under it.
+///
+/// One walk, four callers. A group- or world-writable ancestor is refused unless it is sticky, and
+/// an ancestor that is not a directory is refused outright — a symlink included, because
+/// `symlink_metadata` reports the link rather than what it points at.
+///
+/// `resolution` and `scope` are the two decisions that legitimately differ between callers; every
+/// other part of the rule is the same everywhere, which is the point of this function existing.
+///
+/// # Errors
+///
+/// Returns [`FileHygieneError::UnsafeAncestor`] naming the first ancestor that fails the rule, and
+/// [`FileHygieneError::Io`] when an ancestor cannot be inspected or, under
+/// [`AncestorResolution::Canonical`], when `path` cannot be resolved. Those two are the only
+/// variants this function produces; a caller that maps them may treat anything else as a refusal.
+pub fn check_trusted_ancestors(
+    path: &Path,
+    resolution: AncestorResolution,
+    scope: AncestorScope,
+) -> Result<(), FileHygieneError> {
+    let canonical;
+    let start = match resolution {
+        AncestorResolution::AsWritten => path,
+        AncestorResolution::Canonical => {
+            canonical = fs::canonicalize(path).map_err(|source| FileHygieneError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?;
+            canonical.as_path()
+        }
+    };
+    let mut current = match scope {
+        AncestorScope::PathAndAbove => Some(start),
+        AncestorScope::Above => start.parent(),
+    };
+    while let Some(ancestor) = current {
+        let metadata = fs::symlink_metadata(ancestor).map_err(|source| FileHygieneError::Io {
+            path: ancestor.to_path_buf(),
+            source,
+        })?;
+        let mode = metadata.permissions().mode() & 0o7777;
+        let writable_outside_owner = mode & 0o022 != 0;
+        let sticky = mode & 0o1000 != 0;
+        if !metadata.is_dir() || (writable_outside_owner && !sticky) {
+            return Err(FileHygieneError::UnsafeAncestor {
+                path: ancestor.to_path_buf(),
+                mode,
+                observed: describe(&metadata),
+            });
+        }
+        current = ancestor.parent();
+    }
+    Ok(())
+}
+
 /// Opens `path` without following a symlink, applies [`check_trusted_metadata`], and reads it.
 ///
 /// The length is checked twice on purpose: once against the metadata, so an oversized file is
@@ -259,7 +367,9 @@ pub fn read_trusted_file(
 
 fn describe(metadata: &Metadata) -> &'static str {
     let file_type = metadata.file_type();
-    if file_type.is_dir() {
+    if file_type.is_file() {
+        "regular file"
+    } else if file_type.is_dir() {
         "directory"
     } else if file_type.is_symlink() {
         "symbolic link"
@@ -290,7 +400,10 @@ mod tests {
 
     use tempfile::TempDir;
 
-    use super::{FileHygieneError, FileTier, read_trusted_file};
+    use super::{
+        AncestorResolution, AncestorScope, FileHygieneError, FileTier, check_trusted_ancestors,
+        read_trusted_file,
+    };
 
     struct Fixture {
         root: TempDir,
@@ -389,5 +502,181 @@ mod tests {
 
         assert_eq!(error.category(), "io");
         assert_eq!(error.path(), link);
+    }
+
+    /// A temporary root with no symlink left in it.
+    ///
+    /// `TMPDIR` is reached through `/var -> /private/var` on macOS, and an `AsWritten` walk
+    /// refuses a symlinked ancestor by design, so every fixture below starts from the resolved
+    /// spelling. That is the same thing the storage-host callers require of their operators.
+    fn resolved_root() -> (TempDir, PathBuf) {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let resolved = root
+            .path()
+            .canonicalize()
+            .expect("canonical temporary root");
+        (root, resolved)
+    }
+
+    /// `AsWritten` + `Above`, as the storage root walks it: the path itself is never inspected.
+    ///
+    /// The root may not exist yet — `Layout::open` creates it — and once it does it is held to
+    /// owner-only rules an ancestor is not held to.
+    #[test]
+    fn an_above_walk_refuses_the_parent_and_ignores_the_path_itself() {
+        let (_root, resolved) = resolved_root();
+        let parent = resolved.join("parent");
+        fs::create_dir(&parent).expect("parent");
+        let target = parent.join("root");
+
+        // The target does not exist and is not consulted.
+        check_trusted_ancestors(&target, AncestorResolution::AsWritten, AncestorScope::Above)
+            .expect("a clean ancestry with no target yet");
+
+        // Neither is a world-writable target of the caller's own.
+        fs::create_dir(&target).expect("target");
+        fs::set_permissions(&target, Permissions::from_mode(0o777)).expect("target mode");
+        check_trusted_ancestors(&target, AncestorResolution::AsWritten, AncestorScope::Above)
+            .expect("the path itself is the caller's business");
+
+        fs::set_permissions(&parent, Permissions::from_mode(0o777)).expect("parent mode");
+        let error =
+            check_trusted_ancestors(&target, AncestorResolution::AsWritten, AncestorScope::Above)
+                .expect_err("a world-writable parent may be replaced under the root");
+        assert_eq!(error.category(), "unsafe-ancestor");
+        assert_eq!(error.path(), parent);
+    }
+
+    /// `AsWritten` + `PathAndAbove`, as the namespace key and the broker socket walk it.
+    ///
+    /// The key's caller passes the directory holding the key, and the socket's callers pass an
+    /// already-canonicalized parent; both need that directory inspected, not just what is above
+    /// it. A symlinked ancestor is refused where it stands rather than resolved.
+    #[test]
+    fn a_path_and_above_walk_refuses_the_path_itself_and_any_symlinked_ancestor() {
+        let (_root, resolved) = resolved_root();
+        let directory = resolved.join("holder");
+        fs::create_dir(&directory).expect("holder");
+        fs::set_permissions(&directory, Permissions::from_mode(0o700)).expect("holder mode");
+        check_trusted_ancestors(
+            &directory,
+            AncestorResolution::AsWritten,
+            AncestorScope::PathAndAbove,
+        )
+        .expect("a clean ancestry");
+
+        fs::set_permissions(&directory, Permissions::from_mode(0o777)).expect("holder mode");
+        let error = check_trusted_ancestors(
+            &directory,
+            AncestorResolution::AsWritten,
+            AncestorScope::PathAndAbove,
+        )
+        .expect_err("the path itself is inspected here");
+        assert_eq!(error.path(), directory);
+
+        fs::set_permissions(&directory, Permissions::from_mode(0o700)).expect("holder mode");
+        let alias = resolved.join("alias");
+        std::os::unix::fs::symlink(&directory, &alias).expect("ancestor symlink");
+        // `key.rs` passes the key file's parent, which is the alias itself: `symlink_metadata`
+        // reports the link, a link is not a directory, and the walk stops there rather than
+        // authorizing a directory the operator never spelled.
+        let error = check_trusted_ancestors(
+            &alias,
+            AncestorResolution::AsWritten,
+            AncestorScope::PathAndAbove,
+        )
+        .expect_err("an alias is not the directory the operator named");
+        assert_eq!(error.category(), "unsafe-ancestor");
+        assert_eq!(error.path(), alias);
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+    }
+
+    /// `Canonical` + `PathAndAbove`, as the provider store walks it.
+    ///
+    /// The store is a directory the broker manages rather than a spelling it must preserve, so an
+    /// alias is resolved and the real directories are the ones inspected. Resolution needs the
+    /// path to exist, which is the one thing this combination refuses that the others do not.
+    #[test]
+    fn a_canonical_walk_resolves_an_alias_and_requires_the_path_to_exist() {
+        let (_root, resolved) = resolved_root();
+        let directory = resolved.join("store");
+        fs::create_dir(&directory).expect("store");
+        fs::set_permissions(&directory, Permissions::from_mode(0o700)).expect("store mode");
+        let alias = resolved.join("alias");
+        std::os::unix::fs::symlink(&directory, &alias).expect("store symlink");
+
+        check_trusted_ancestors(
+            &alias,
+            AncestorResolution::Canonical,
+            AncestorScope::PathAndAbove,
+        )
+        .expect("the alias resolves onto a clean ancestry");
+
+        fs::set_permissions(&directory, Permissions::from_mode(0o777)).expect("store mode");
+        let error = check_trusted_ancestors(
+            &alias,
+            AncestorResolution::Canonical,
+            AncestorScope::PathAndAbove,
+        )
+        .expect_err("the resolved directory is world-writable");
+        assert_eq!(error.category(), "unsafe-ancestor");
+        assert_eq!(error.path(), directory);
+
+        let error = check_trusted_ancestors(
+            &resolved.join("absent"),
+            AncestorResolution::Canonical,
+            AncestorScope::PathAndAbove,
+        )
+        .expect_err("nothing to resolve");
+        assert_eq!(error.category(), "io");
+    }
+
+    /// The sticky bit is tolerated, in every combination, on purpose.
+    ///
+    /// `/tmp` is world-writable and sticky, and so is the per-user directory `TMPDIR` names on
+    /// many systems. Refusing it would refuse the ordinary case; tolerating it is the reason the
+    /// rule says "non-sticky" rather than "not world-writable".
+    #[test]
+    fn a_sticky_world_writable_ancestor_is_tolerated() {
+        let (_root, resolved) = resolved_root();
+        let shared = resolved.join("shared");
+        fs::create_dir(&shared).expect("shared");
+        fs::set_permissions(&shared, Permissions::from_mode(0o1777)).expect("sticky mode");
+        let owned = shared.join("owned");
+        fs::create_dir(&owned).expect("owned");
+        fs::set_permissions(&owned, Permissions::from_mode(0o700)).expect("owned mode");
+
+        check_trusted_ancestors(
+            &owned,
+            AncestorResolution::AsWritten,
+            AncestorScope::PathAndAbove,
+        )
+        .expect("sticky is what makes a shared directory safe to sit beneath");
+        check_trusted_ancestors(&owned, AncestorResolution::AsWritten, AncestorScope::Above)
+            .expect("and the same walk from above");
+        check_trusted_ancestors(
+            &owned,
+            AncestorResolution::Canonical,
+            AncestorScope::PathAndAbove,
+        )
+        .expect("and after resolution");
+    }
+
+    /// An ancestor that is not a directory is refused, and the message says what it is.
+    #[test]
+    fn a_non_directory_ancestor_is_refused_and_described() {
+        let (_root, resolved) = resolved_root();
+        let file = resolved.join("not-a-directory");
+        fs::write(&file, b"contents").expect("file");
+
+        let error = check_trusted_ancestors(
+            &file,
+            AncestorResolution::AsWritten,
+            AncestorScope::PathAndAbove,
+        )
+        .expect_err("a regular file is not a directory");
+        assert_eq!(error.category(), "unsafe-ancestor");
+        assert_eq!(error.path(), file);
+        assert!(error.to_string().contains("regular file"), "{error}");
     }
 }
