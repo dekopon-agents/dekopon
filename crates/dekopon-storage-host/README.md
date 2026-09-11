@@ -19,10 +19,17 @@ The process ledger is rebuilt once at startup and updated by host-owned mutation
 usage after a partial syscall failure retains conservative headroom. Sparse gaps, growing truncate,
 and JSONL's host-added LF consume write/quota budgets. Authority-pointer replacement and entry
 operations retain temporary headroom; direct JSONL replacement and positional writes reserve
-live-file growth, not a staged copy of the existing file. Metadata-only size/stat calls
-do not load a whole file; native reads remain bounded by invocation ceilings.
+live-file growth, not a staged copy of the existing file.
 `maxPendingTransactions` bounds concurrently active invocation handles; it is not a transaction
 queue.
+
+`maxReadBytesPerInvocation` bounds what one invocation pulls into memory. A positional durable-file
+read or JSONL chunk charges the length it asks for, whatever it returns, and `maxReadBytesPerCall`
+bounds each one; a JSONL append or replacement charges the single working copy it loads to build the
+next contents. Durable-file writes, truncates, removes, and renames charge it nothing: they take
+every length they need from `statat` and no call on that path loads a whole file. They remain
+bounded by `maxWriteBytesPerCall`/`maxWriteBytesPerInvocation`, `maxFileBytes`, and
+`maxNamespaceBytes`, so a database many times the read ceiling stays writable under it.
 
 ## Durable-files contract
 
@@ -40,7 +47,9 @@ queue.
 Reads are positional and return available bytes, including an empty short read at or beyond EOF. A
 SQLite adapter must zero-fill its own short-read buffer: turso treats any short read as a hard
 error and zero-fills nothing itself. Positional writes are exact-or-error and
-charge both supplied bytes and any sparse logical growth. Remove, replacement, or rename of an open
+charge both supplied bytes and any sparse logical growth, and nothing against the read budget: a
+write replaces the range it supplies and never reads, assembles, or rewrites the rest of the file.
+Remove, replacement, or rename of an open
 source or target is `busy`. `delete-on-close` marks the file for unlink and applies it only after the
 last invocation handle closes.
 

@@ -859,11 +859,192 @@ fn metadata_calls_do_not_load_whole_files_or_bypass_native_read_memory_bounds() 
             },
         )
         .expect("open metadata only");
+    // A write reads nothing, so it is bounded by the write budgets, not by the read ceiling the
+    // file's own length would exhaust.
+    mutation
+        .vfs_write_at(handle, 0, b"x")
+        .expect("a write charges the read budget nothing");
+    assert_eq!(mutation.vfs_size(handle).expect("size"), 8);
+    assert_eq!(
+        mutation.vfs_read_at(handle, 0, 4).expect("bounded read"),
+        b"x234"
+    );
+    // Four of the four budgeted bytes are spent; the next read of any length is refused.
     assert!(matches!(
-        mutation.vfs_write_at(handle, 0, b"x"),
+        mutation.vfs_read_at(handle, 4, 1),
         Err(StorageHostError::QuotaExceeded)
     ));
     mutation.abort();
+}
+
+/// A SQLite database outlives the invocation that created it and is then extended page by page
+/// and read back in short positional reads. Only the bytes an invocation asks for may be charged
+/// to its read budget: the pages already on disk, and the pages a write is not supplying, are
+/// never pulled into memory, so a database far larger than that budget stays writable,
+/// truncatable, renameable, and removable under it.
+#[test]
+fn a_database_larger_than_the_read_budget_is_extended_and_read_back_in_short_reads() {
+    const PAGE: u64 = 4_096;
+    const PAGES: u64 = 64;
+    const SEEDED: u64 = 32;
+    const FILE_BYTES: u64 = PAGE * PAGES;
+    const READ_BUDGET: u64 = 8 * 1_024;
+
+    fn page_contents(page: u64) -> Vec<u8> {
+        // Never zero, so a sparse hole or a truncated tail cannot read back as valid page bytes.
+        let byte = u8::try_from(page % 200 + 1).expect("page byte");
+        vec![byte; usize::try_from(PAGE).expect("page size")]
+    }
+
+    let (_temporary, root, key) = fixture();
+    let limits = StorageLimits {
+        max_read_bytes_per_call: PAGE,
+        max_read_bytes_per_invocation: READ_BUDGET,
+        ..StorageLimits::default()
+    };
+    let host = StorageHost::open(&root, &key, limits).expect("host");
+
+    let mut creating = host
+        .begin(
+            host.grant(vfs_request("sqlite-create", StorageAccess::ReadWrite))
+                .expect("grant"),
+        )
+        .expect("transaction");
+    let database = creating
+        .vfs_open(
+            "main.db",
+            OpenOptions {
+                read: true,
+                write: true,
+                create: true,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("create database");
+    for page in 0..SEEDED {
+        creating
+            .vfs_write_at(database, page * PAGE, &page_contents(page))
+            .expect("seed page");
+    }
+    let journal = creating
+        .vfs_open(
+            "main.db-wal",
+            OpenOptions {
+                read: true,
+                write: true,
+                create: true,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("create journal");
+    creating
+        .vfs_write_at(journal, 0, b"committed")
+        .expect("journal write");
+    creating.vfs_close(journal).expect("close journal");
+    creating.vfs_close(database).expect("close database");
+    creating.commit().expect("commit");
+
+    // A fresh invocation reopens a database many times its read budget.
+    let mut extending = host
+        .begin(
+            host.grant(vfs_request("sqlite-extend", StorageAccess::ReadWrite))
+                .expect("grant"),
+        )
+        .expect("transaction");
+    assert_eq!(
+        extending
+            .vfs_stat("main.db")
+            .expect("stat")
+            .expect("present")
+            .size,
+        SEEDED * PAGE
+    );
+    let database = extending
+        .vfs_open(
+            "main.db",
+            OpenOptions {
+                read: true,
+                write: true,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("reopen database");
+    for page in SEEDED..PAGES {
+        extending
+            .vfs_write_at(database, page * PAGE, &page_contents(page))
+            .expect("append page to a database larger than the read budget");
+    }
+    assert_eq!(extending.vfs_size(database).expect("size"), FILE_BYTES);
+    assert_eq!(
+        extending
+            .vfs_read_at(database, 0, u32::try_from(PAGE).expect("page"))
+            .expect("first page"),
+        page_contents(0)
+    );
+    assert_eq!(
+        extending
+            .vfs_read_at(
+                database,
+                (PAGES - 1) * PAGE,
+                u32::try_from(PAGE).expect("page")
+            )
+            .expect("last page"),
+        page_contents(PAGES - 1)
+    );
+    // Two pages spend the whole read budget: positional reads remain bounded by it.
+    assert!(matches!(
+        extending.vfs_read_at(database, PAGE, 1),
+        Err(StorageHostError::QuotaExceeded)
+    ));
+    extending.vfs_close(database).expect("close database");
+    // With the read budget exhausted, entry operations on files far larger than it still apply:
+    // neither charges the bytes it moves or unlinks.
+    extending
+        .vfs_rename_atomic("main.db", "main.db.bak", false, Durability::Full)
+        .expect("rename a file larger than the read budget");
+    extending
+        .vfs_remove("main.db-wal", Durability::Full)
+        .expect("remove journal");
+    assert_eq!(
+        extending
+            .vfs_stat("main.db.bak")
+            .expect("stat")
+            .expect("renamed")
+            .size,
+        FILE_BYTES
+    );
+    assert!(extending.vfs_stat("main.db").expect("stat").is_none());
+    assert!(extending.vfs_stat("main.db-wal").expect("stat").is_none());
+    extending.commit().expect("commit");
+
+    let mut shrinking = host
+        .begin(
+            host.grant(vfs_request("sqlite-truncate", StorageAccess::ReadWrite))
+                .expect("grant"),
+        )
+        .expect("transaction");
+    let database = shrinking
+        .vfs_open(
+            "main.db.bak",
+            OpenOptions {
+                read: true,
+                write: true,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("reopen renamed database");
+    shrinking
+        .vfs_truncate(database, PAGE)
+        .expect("truncate a file larger than the read budget");
+    assert_eq!(shrinking.vfs_size(database).expect("size"), PAGE);
+    assert_eq!(
+        shrinking
+            .vfs_read_at(database, 0, u32::try_from(PAGE).expect("page"))
+            .expect("surviving page"),
+        page_contents(0)
+    );
+    shrinking.vfs_close(database).expect("close database");
+    shrinking.commit().expect("commit");
 }
 
 #[test]

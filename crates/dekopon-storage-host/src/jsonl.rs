@@ -96,7 +96,7 @@ impl StorageHandle {
         replacement.reserve(record.len().saturating_add(1));
         replacement.extend_from_slice(record);
         replacement.push(b'\n');
-        let reserved = self.reserve_candidate(&[(&token, Some(replacement.as_slice()))]);
+        let reserved = self.reserve_candidate(&[(&token, Some(replacement.len() as u64))]);
         let planned = match reserved {
             Ok(planned) => planned,
             Err(error) => {
@@ -107,9 +107,12 @@ impl StorageHandle {
             }
         };
         self.write_direct(&token, Some(&replacement), planned)?;
-        let entry = self.entries.get_mut(&token).expect("loaded entry");
-        entry.data = Some(replacement);
-        Ok(entry.data.as_ref().map_or(0, |bytes| bytes.len() as u64))
+        let size = replacement.len() as u64;
+        self.entries
+            .get_mut(&token)
+            .expect("loaded entry")
+            .mirrored(replacement);
+        Ok(size)
     }
 
     pub fn jsonl_replace(
@@ -132,10 +135,12 @@ impl StorageHandle {
         if current_size != expected_size {
             return Err(StorageHostError::Busy);
         }
-        let planned = self.reserve_candidate(&[(&token, Some(contents))])?;
+        let planned = self.reserve_candidate(&[(&token, Some(contents.len() as u64))])?;
         self.write_direct(&token, Some(contents), planned)?;
-        let entry = self.entries.get_mut(&token).expect("loaded entry");
-        entry.data = Some(contents.to_vec());
+        self.entries
+            .get_mut(&token)
+            .expect("loaded entry")
+            .mirrored(contents.to_vec());
         Ok(())
     }
 
