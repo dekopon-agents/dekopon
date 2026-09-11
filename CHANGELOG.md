@@ -460,6 +460,11 @@ All notable changes to Dekopon are documented here. The format is based on
   `MissingImagePrompt`, `UnexpectedImageArguments`, and `ImagePromptTooLarge`. A configuration that
   still names `imageGenerator` refuses startup with the unknown field's name; see
   [`docs/upgrading.md`](docs/upgrading.md).
+- `dekopond auth`'s `-o wide` output format. It rendered the same arm as `table` and produced
+  byte-identical output — the "additional fields" its help text promised never existed, because
+  auth status has four fields and the table already shows three of them. `-o table` remains the
+  default; `json`, `yaml`, and `name` are unchanged. A command line still passing `-o wide` is now
+  refused by argument parsing with the accepted values named.
 
 ### Fixed
 

@@ -215,8 +215,6 @@ fn dns_name(value: &str, limit: usize, dots: bool) -> Result<String, String> {
 pub enum OutputFormat {
     /// Compact human-readable table.
     Table,
-    /// Human-readable table with additional fields.
-    Wide,
     /// Pretty-printed JSON.
     Json,
     /// YAML.
