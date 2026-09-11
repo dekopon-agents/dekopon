@@ -27,11 +27,12 @@ use hyper_util::{rt::TokioIo, service::TowerToHyperService};
 use serde_json::{Value, json};
 use sha2::Sha256;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tracing::{Instrument as _, Span};
 
 use crate::transport::{
     ChatReplier, ChatTransport, ConversationKind, DeliveryReceipt, InboundMessage, OutboundReply,
     ReplyTarget, SeenIds, TextUnit, TransportError, TransportEvent, TransportIdentity,
-    bound_inbound, split_message,
+    bound_inbound, receive_span, split_message,
 };
 
 const MAX_WEBHOOK_BODY_BYTES: usize = 256 * 1024;
@@ -484,9 +485,13 @@ async fn receive_webhook(State(state): State<WebhookState>, request: Request) ->
     let Ok(permit) = Arc::clone(&state.concurrency).try_acquire_owned() else {
         return refuse(&state, Refusal::Saturated, StatusCode::SERVICE_UNAVAILABLE);
     };
+    // One span per delivery, opened before a byte of the body is read, so the signature check, the
+    // dedup claim, and the 200 that acknowledges the delivery are inside the trace of whatever the
+    // delivery turns out to carry — including a refusal, which is a receipt with no message.
+    let received = receive_span(ChatTransportKind::Whatsapp);
     match tokio::time::timeout(
         WEBHOOK_REQUEST_TIMEOUT,
-        process_webhook(&state, request, permit),
+        process_webhook(&state, request, permit, &received).instrument(received.clone()),
     )
     .await
     {
@@ -504,6 +509,7 @@ async fn process_webhook(
     state: &WebhookState,
     request: Request,
     _permit: tokio::sync::OwnedSemaphorePermit,
+    received: &Span,
 ) -> Response {
     if !headers_bounded(request.headers()) {
         return refuse(state, Refusal::Oversize, StatusCode::BAD_REQUEST);
@@ -531,7 +537,7 @@ async fn process_webhook(
         Ok(value) => value,
         Err(_) => return refuse(state, Refusal::Malformed, StatusCode::BAD_REQUEST),
     };
-    let messages = match parse_delivery(state, &value) {
+    let messages = match parse_delivery(state, &value, received) {
         Ok(messages) => messages,
         Err(()) => return refuse(state, Refusal::Malformed, StatusCode::BAD_REQUEST),
     };
@@ -548,6 +554,12 @@ async fn process_webhook(
     let accepted = dedup.claim(messages);
     if accepted.is_empty() {
         return content_free(StatusCode::OK);
+    }
+    // Meta sends one message per delivery in practice and the parser tolerates a batch, so the
+    // identifier is recorded only when the delivery is the one message this span describes. A
+    // batched delivery leaves it unset and parents every message's `gateway.message` here.
+    if let [only] = accepted.as_slice() {
+        received.record("message.id", only.message_id.as_str());
     }
     let permit_count = u32::try_from(accepted.len()).expect("delivery bound fits u32");
     // Only the claimed IDs are needed to undo the claim, so the messages themselves move into the
@@ -572,7 +584,11 @@ async fn process_webhook(
     content_free(StatusCode::OK)
 }
 
-fn parse_delivery(state: &WebhookState, root: &Value) -> Result<Vec<InboundMessage>, ()> {
+fn parse_delivery(
+    state: &WebhookState,
+    root: &Value,
+    received: &Span,
+) -> Result<Vec<InboundMessage>, ()> {
     let object = root.as_object().ok_or(())?;
     if object.get("object").and_then(Value::as_str) != Some("whatsapp_business_account") {
         return Ok(Vec::new());
@@ -654,6 +670,7 @@ fn parse_delivery(state: &WebhookState, root: &Value) -> Result<Vec<InboundMessa
                         recipient: sender.to_owned(),
                     },
                     activity: None,
+                    receive_span: received.clone(),
                 });
             }
         }
@@ -717,7 +734,7 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 }
 
 #[cfg(test)]
-fn hmac_sha256(key: &[u8], body: &[u8]) -> [u8; 32] {
+pub(crate) fn hmac_sha256(key: &[u8], body: &[u8]) -> [u8; 32] {
     let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("HMAC accepts keys of every length");
     mac.update(body);
     mac.finalize().into_bytes().into()
@@ -968,6 +985,11 @@ mod tests {
         )
     }
 
+    /// The receive span the listener would have opened for this delivery.
+    fn received() -> Span {
+        receive_span(ChatTransportKind::Whatsapp)
+    }
+
     fn signature(secret: &[u8], body: &[u8]) -> String {
         let digest = hmac_sha256(secret, body);
         let hex: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
@@ -1047,6 +1069,7 @@ mod tests {
                 .acquire_owned()
                 .await
                 .expect("permit"),
+            &received(),
         )
         .await;
         assert_eq!(first.status(), StatusCode::OK);
@@ -1059,6 +1082,7 @@ mod tests {
                 .acquire_owned()
                 .await
                 .expect("permit"),
+            &received(),
         )
         .await;
         assert_eq!(duplicate.status(), StatusCode::OK);
@@ -1077,6 +1101,7 @@ mod tests {
                 .acquire_owned()
                 .await
                 .expect("permit"),
+            &received(),
         )
         .await;
         assert_eq!(wrong_raw_bytes.status(), StatusCode::UNAUTHORIZED);
@@ -1093,6 +1118,7 @@ mod tests {
                 .acquire_owned()
                 .await
                 .expect("permit"),
+            &received(),
         )
         .await;
         assert_eq!(duplicate_signature.status(), StatusCode::UNAUTHORIZED);
@@ -1114,6 +1140,7 @@ mod tests {
                     .acquire_owned()
                     .await
                     .expect("permit"),
+                &received(),
             )
             .await;
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -1139,6 +1166,7 @@ mod tests {
                 .acquire_owned()
                 .await
                 .expect("permit"),
+            &received(),
         )
         .await;
         assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -1151,6 +1179,7 @@ mod tests {
                 .acquire_owned()
                 .await
                 .expect("permit"),
+            &received(),
         )
         .await;
         assert_eq!(retried.status(), StatusCode::OK);
@@ -1195,7 +1224,7 @@ mod tests {
                 ]}
             ]
         });
-        let messages = parse_delivery(&state(), &payload).expect("delivery");
+        let messages = parse_delivery(&state(), &payload, &received()).expect("delivery");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].message_id, "two");
         assert_eq!(messages[0].subject.canonical(), "whatsapp.1603");
@@ -1213,6 +1242,7 @@ mod tests {
                     "messages":[{"id":"same","from":"1603","type":"text","text":{"body":"hello"}}]
                 }}]}]
             }),
+            &received(),
         )
         .expect("delivery");
         let mut dedup = ClaimedIds::new();

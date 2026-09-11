@@ -38,7 +38,7 @@ use tokio::{
 
 use crate::transport::{
     ChatReplier, ChatTransport, ConversationKind, DeliveryReceipt, InboundMessage, OutboundReply,
-    ReplyTarget, TransportError, TransportEvent, TransportIdentity, bound_inbound,
+    ReplyTarget, TransportError, TransportEvent, TransportIdentity, bound_inbound, receive_span,
 };
 
 /// Longest line the development transport accepts, matching the inbound text bound plus envelope.
@@ -143,15 +143,24 @@ impl LocalTransport {
                 if text.trim().is_empty() {
                     continue;
                 }
-                let Ok(request) = serde_json::from_str::<LocalRequest>(text) else {
-                    tracing::debug!(
-                        event = "gateway_local_request_rejected",
-                        transport = %name,
-                        reason = "malformed-request"
-                    );
+                // One span per inbound line, opened before the request is parsed, so a refusal
+                // and the message a good line becomes share this receipt's trace.
+                let received = receive_span(ChatTransportKind::Local);
+                let Some(request) = received.in_scope(|| {
+                    serde_json::from_str::<LocalRequest>(text).ok().or_else(|| {
+                        tracing::debug!(
+                            event = "gateway_local_request_rejected",
+                            transport = %name,
+                            reason = "malformed-request"
+                        );
+                        None
+                    })
+                }) else {
                     continue;
                 };
                 sequence += 1;
+                let message_id = format!("{boot_nonce}-{connection}-{sequence}");
+                received.record("message.id", message_id.as_str());
                 let message = InboundMessage {
                     transport: name.clone(),
                     transport_kind: ChatTransportKind::Local,
@@ -163,7 +172,7 @@ impl LocalTransport {
                     // has no threads, and the connection number would restart the conversation
                     // every time a developer reconnected.
                     conversation_id: request.channel,
-                    message_id: format!("{boot_nonce}-{connection}-{sequence}"),
+                    message_id,
                     text: bound_inbound(&request.text),
                     // The development transport speaks line-delimited JSON and carries no files.
                     assets: Vec::new(),
@@ -175,6 +184,7 @@ impl LocalTransport {
                     thread_continuation: None,
                     reply: ReplyTarget::Local { connection },
                     activity: None,
+                    receive_span: received,
                 };
                 if inbound.send(message).is_err() {
                     break;

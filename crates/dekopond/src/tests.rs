@@ -2706,6 +2706,9 @@ fn message(text: &str) -> InboundMessage {
         thread_continuation: None,
         reply: ReplyTarget::Local { connection: 1 },
         activity: None,
+        // No transport ran, so there is no receipt to hang this message's trace from. A test that
+        // asserts on the trace root drives a real transport instead.
+        receive_span: tracing::Span::none(),
     }
 }
 
@@ -2777,6 +2780,7 @@ fn owned_slack_message(text: &str, inherited: bool) -> InboundMessage {
             thread_ts: Some("1700000000.000001".to_owned()),
         },
         activity: None,
+        receive_span: tracing::Span::none(),
     }
 }
 
@@ -7512,29 +7516,35 @@ async fn slack_agent_stop_events_are_acknowledged_and_decoded_as_control_not_pro
         .await
         .expect("control event arrives")
         .expect("control event decodes");
+    let TransportEvent::SessionStopped(stopped) = event else {
+        panic!("a native Stop is a session-control event, not a routable message");
+    };
     assert_eq!(
-        event,
-        TransportEvent::SessionStopped(crate::transport::SessionStop {
+        stopped,
+        crate::transport::SessionStop {
             transport: "scientist-slack".to_owned(),
             conversation_id: "d0123abc:1700000000.000001".to_owned(),
             subject: "slack.t0123abc.u9xyz"
                 .parse()
                 .expect("canonical Slack subject"),
-        })
+        }
     );
     let alias = tokio::time::timeout(Duration::from_secs(5), transport.next())
         .await
         .expect("aliased control event arrives")
         .expect("aliased control event decodes");
+    let TransportEvent::SessionStopped(aliased) = alias else {
+        panic!("an aliased native Stop is a session-control event too");
+    };
     assert_eq!(
-        alias,
-        TransportEvent::SessionStopped(crate::transport::SessionStop {
+        aliased,
+        crate::transport::SessionStop {
             transport: "scientist-slack".to_owned(),
             conversation_id: "d0123abc:1700000000.000003".to_owned(),
             subject: "slack.t0123abc.u9xyz"
                 .parse()
                 .expect("canonical Slack subject"),
-        })
+        }
     );
 
     let mut acknowledged = Vec::new();
@@ -10416,4 +10426,251 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
             .expect("image write and flush are accepted")
             .accepted()
     );
+}
+
+// ---------------------------------------------------------------------------
+// The trace opens at transport receipt
+// ---------------------------------------------------------------------------
+
+/// Keeps every workspace span for this thread and the tasks a `current_thread` runtime polls on it.
+///
+/// Thread-local rather than global, because this binary runs these tests beside every other one and
+/// a global subscriber would capture all of them. Thread-local rather than scoped to one future,
+/// because the local and WhatsApp transports build their message inside a task they spawned: a
+/// `current_thread` runtime polls those on this thread, so this is the only scoping that reaches
+/// them. Every test below therefore stays on the default single-threaded runtime.
+fn capture_spans() -> (
+    dekopon_test_support::CaptureLayer,
+    tracing::subscriber::DefaultGuard,
+) {
+    use tracing_subscriber::prelude::*;
+
+    let capture = dekopon_test_support::CaptureLayer::workspace();
+    let guard = tracing_subscriber::registry()
+        .with(capture.clone())
+        .set_default();
+    (capture, guard)
+}
+
+/// Answers one received message with a scripted model, so the span tree is the whole assertion.
+async fn answer_once(message: InboundMessage) {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("echo.echo")],
+            Vec::new(),
+        )],
+    )
+    .await;
+    run_session(
+        runner(broker, ModelScript::new([answer("answered")]), 4),
+        route(model_config()),
+        message,
+        Arc::new(RecordingReplier::default()) as Arc<dyn ChatReplier>,
+    )
+    .await;
+}
+
+/// Asserts one message's trace starts where its transport received it, not where routing succeeded.
+///
+/// Two claims, and both matter: the receive span names the transport family and the service's own
+/// identifier for the turn, and `gateway.message` hangs from that span rather than opening a trace
+/// of its own. The second is what makes the acknowledgment, the signature check, and the routing
+/// decision reachable from the same trace as the model turn that answered.
+fn assert_trace_opens_at_receipt(
+    capture: &dekopon_test_support::CaptureLayer,
+    kind: &str,
+    message_id: &str,
+) {
+    // Joined because a span is captured once at creation and once per later `record`: the kind is
+    // known when the span opens and the identifier only after the payload has been parsed.
+    let received = capture
+        .spans()
+        .into_iter()
+        .filter(|(name, _)| *name == "transport.receive")
+        .map(|(_, fields)| fields)
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        received.contains(&format!("transport.kind={kind}")),
+        "{received}"
+    );
+    assert!(
+        received.contains(&format!("message.id=\"{message_id}\"")),
+        "{received}"
+    );
+    let parents = capture.span_parents();
+    let gateway = parents
+        .iter()
+        .find(|(name, _)| *name == "gateway.message")
+        .expect("the session opened gateway.message");
+    assert_eq!(
+        gateway.1.as_deref(),
+        Some("transport.receive"),
+        "gateway.message opened a trace of its own instead of nesting under the receipt: {parents:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_slack_envelope_opens_its_trace_before_it_is_acknowledged() {
+    let (capture, _subscriber) = capture_spans();
+    let socket = spawn_socket_mock(vec![events_envelope(
+        "envelope-traced",
+        direct_message("u9xyz", "1700000000.000042", "a real question"),
+    )]);
+    let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+    let mut transport = slack(&http.base);
+    transport.connect().await.expect("slack transport connects");
+
+    let message = next_message(&mut transport).await;
+    assert_eq!(message.message_id, "1700000000.000042");
+    answer_once(message).await;
+
+    assert_trace_opens_at_receipt(&capture, "slack", "1700000000.000042");
+}
+
+#[tokio::test]
+async fn a_telegram_poll_item_opens_its_trace_before_the_offset_advances() {
+    let (capture, _subscriber) = capture_spans();
+    let http = spawn_http_mock(telegram_handler(vec![json!({
+        "update_id": 900,
+        "message": telegram_message(16034700182_i64, false, 77, "a person asked this")
+    })]));
+    let mut transport = telegram(&http.base);
+    transport
+        .connect()
+        .await
+        .expect("telegram transport connects");
+
+    let message = next_message(&mut transport).await;
+    assert_eq!(message.message_id, "77");
+    answer_once(message).await;
+
+    assert_trace_opens_at_receipt(&capture, "telegram", "77");
+}
+
+#[tokio::test]
+async fn a_discord_gateway_event_opens_its_trace_before_the_payload_is_read() {
+    let (capture, _subscriber) = capture_spans();
+    let mut event = discord_message(
+        DISCORD_MESSAGE,
+        DISCORD_CHANNEL,
+        Some("777777777777777777"),
+        DISCORD_USER,
+        false,
+        "a real question",
+    );
+    event["mentions"] = json!([{"id": DISCORD_BOT, "username": "dekopon"}]);
+    let socket =
+        spawn_discord_socket_mock(vec![discord_dispatch(2, "MESSAGE_CREATE", event)], None);
+    let http = spawn_http_mock(discord_handler(socket.url.clone()));
+    let mut transport = discord(&http.base);
+    transport
+        .connect()
+        .await
+        .expect("Discord transport connects");
+
+    let message = next_message(&mut transport).await;
+    assert_eq!(message.message_id, DISCORD_MESSAGE);
+    answer_once(message).await;
+
+    assert_trace_opens_at_receipt(&capture, "discord", DISCORD_MESSAGE);
+}
+
+#[tokio::test]
+async fn a_whatsapp_delivery_opens_its_trace_around_the_signature_check() {
+    use tokio::io::AsyncWriteExt as _;
+
+    let (capture, _subscriber) = capture_spans();
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("probe binds");
+    let address = probe.local_addr().expect("probe address");
+    drop(probe);
+    let mut transport = crate::transport::whatsapp::WhatsappTransport::new(
+        "support-whatsapp".to_owned(),
+        address,
+        "/wa".to_owned(),
+        "123".to_owned(),
+        "456".to_owned(),
+        "v23.0".to_owned(),
+        "http://127.0.0.1:9".to_owned(),
+        "secret".to_owned(),
+        "verify".to_owned(),
+        "access".to_owned(),
+    )
+    .expect("WhatsApp transport builds");
+    transport
+        .connect()
+        .await
+        .expect("the webhook listener binds");
+
+    let body = serde_json::to_vec(&json!({
+        "object": "whatsapp_business_account",
+        "entry": [{"id": "123", "changes": [{"field": "messages", "value": {
+            "messaging_product": "whatsapp",
+            "metadata": {"phone_number_id": "456"},
+            "messages": [{
+                "id": "wamid.traced",
+                "from": "16034700182",
+                "type": "text",
+                "text": {"body": "a person asked this"}
+            }]
+        }}]}]
+    }))
+    .expect("the delivery serializes");
+    let digest = crate::transport::whatsapp::hmac_sha256(b"secret", &body);
+    let signature: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    // A raw request rather than a client, so the signed bytes are exactly the bytes posted.
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .expect("the callback accepts a connection");
+    let head = format!(
+        "POST /wa HTTP/1.1\r\nHost: {address}\r\nx-hub-signature-256: sha256={signature}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream
+        .write_all(head.as_bytes())
+        .await
+        .expect("the request head is written");
+    stream
+        .write_all(&body)
+        .await
+        .expect("the signed body is written");
+    stream.flush().await.expect("the delivery is flushed");
+
+    let message = next_message(&mut transport).await;
+    assert_eq!(message.message_id, "wamid.traced");
+    answer_once(message).await;
+
+    assert_trace_opens_at_receipt(&capture, "whatsapp", "wamid.traced");
+}
+
+#[tokio::test]
+async fn a_local_request_opens_its_trace_on_the_line_it_arrived_on() {
+    use tokio::io::AsyncWriteExt as _;
+
+    let (capture, _subscriber) = capture_spans();
+    let directory = temporary();
+    let socket_path = directory.path().join("dev.sock");
+    let mut transport =
+        crate::transport::local::LocalTransport::new("dev".to_owned(), socket_path.clone());
+    transport
+        .connect()
+        .await
+        .expect("the development transport binds");
+    let mut client = tokio::net::UnixStream::connect(&socket_path)
+        .await
+        .expect("a local caller connects");
+    let request = json!({"subject": SUBJECT, "text": "a question"});
+    client
+        .write_all(format!("{request}\n").as_bytes())
+        .await
+        .expect("the request is written");
+
+    let message = next_message(&mut transport).await;
+    let message_id = message.message_id.clone();
+    answer_once(message).await;
+
+    assert_trace_opens_at_receipt(&capture, "local", &message_id);
 }
