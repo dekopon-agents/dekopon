@@ -312,6 +312,21 @@ All notable changes to Dekopon are documented here. The format is based on
   nobody named to Dekopon. There is no field or flag to opt back in: a chat service reachable only
   through a proxy is unreachable, and a collector reachable only through one stops receiving spans
   and log records — which, because audit is one log record per broker decision, is audit lost.
+- `hostLimits.maxTotalMemoryBytes` defaults to 256 MiB instead of being unset. Per-store limits
+  bound one invocation and nothing bounded all of them together, so the effective aggregate was
+  `serverLimits.maxConnections` × `maxMemoryBytes` — 4 GiB at the defaults, a ceiling the container's
+  OOM killer enforced rather than the broker. The new default is four concurrent stores at 64 MiB
+  each: a fifth is refused as a resource failure instead of growing the process. The explicit-config
+  path is unchanged, `maxTotalMemoryBytes: null` restores the unbounded behavior, and the chart
+  already set 256 MiB itself.
+- The OTLP export queues are bounded deliberately rather than by the SDK's defaults: 1024 spans and
+  256 log records, exported in batches of 256 and 64. The defaults were 2048 records per queue with
+  no byte ceiling anywhere in `opentelemetry_sdk`, and under goal 2 a single log record carries a
+  prompt, a model answer, or a whole script's 256 KiB of output — a 512 MiB worst case per queue, the
+  largest unbounded buffer in either daemon. The SDK offers no attribute-value length limit, so this
+  is a record count and nothing more; the log queue is the tighter of the two because that is where
+  the bytes are, and the span queue keeps four drains of headroom because the constitution says a
+  span is never dropped.
 
 ### Removed
 

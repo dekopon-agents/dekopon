@@ -63,6 +63,23 @@ defence is a [non-goal](design.md#non-goals): a caller that must not repeat an e
 resubmit it. The identifier itself is unchanged — it still binds an attestation to its proposal and
 names the call in audit.
 
+## Aggregate guest memory ceiling (unreleased)
+
+`hostLimits.maxTotalMemoryBytes` now defaults to **256 MiB** — four concurrent provider stores at
+the default 64 MiB per store — where it was previously unset and the aggregate unbounded. A broker
+that runs more than four provider invocations at once will now refuse the fifth with a resource
+failure instead of growing toward `serverLimits.maxConnections` × `maxMemoryBytes`, which is 4 GiB
+at the defaults. Raise it in `hostLimits` for a container that has the memory:
+
+```yaml
+hostLimits:
+  maxTotalMemoryBytes: 1073741824
+```
+
+`hostLimits` defaults field by field, so that one line is the whole change. An explicit
+`maxTotalMemoryBytes: null` restores the unbounded behavior. A deployment that already sets the
+field — including the Helm chart's own `268435456` — is unaffected.
+
 ## Broker audit configuration (unreleased)
 
 Use only the current [broker configuration fields](../crates/dekopon-brokerd/README.md#configuration);

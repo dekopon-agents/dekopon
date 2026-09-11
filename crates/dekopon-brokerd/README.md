@@ -440,14 +440,15 @@ directory holds code this privileged process executes, so its parent must be own
 same rule as the audit paths; the broker creates the directory itself. Components compile
 concurrently either way.
 
-`hostLimits.maxMemoryBytes` bounds one invocation. Nothing bounds all of them at once, so the worst
-case is `serverLimits.maxConnections` × `maxMemoryBytes` — 64 × 64 MiB = 4 GiB at the defaults,
-which no small container survives. The broker states that product in one startup line so it is
-budgeted rather than discovered. Optional `hostLimits.maxTotalMemoryBytes` enforces it: a store that
-cannot reserve its share is refused before it exists, turning an OOM kill into a failed invocation.
-It must be at least `maxMemoryBytes`, and it is absent from the authority commitment — it is a
-concurrency budget, not a ceiling an authorization could narrow, so changing it does not rotate
-stored authority.
+`hostLimits.maxMemoryBytes` bounds one invocation; `hostLimits.maxTotalMemoryBytes` bounds all of
+them at once. It defaults to **256 MiB**, four concurrent stores at the default 64 MiB per store: a
+store that cannot reserve its share is refused before it exists, turning an OOM kill into a failed
+invocation. Raise it for a container that has the memory and wants the concurrency; the broker still
+states `serverLimits.maxConnections` × `maxMemoryBytes` — 64 × 64 MiB = 4 GiB at the defaults — in
+one startup line, because that product is what an unbounded aggregate would cost. An explicit
+`maxTotalMemoryBytes: null` restores that unbounded behavior. The value must be at least
+`maxMemoryBytes`, and it is absent from the authority commitment — it is a concurrency budget, not a
+ceiling an authorization could narrow, so changing it does not rotate stored authority.
 
 ## Policy
 
