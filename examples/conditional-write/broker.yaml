@@ -1,19 +1,19 @@
 # dekopon-brokerd — the only process in this example that holds any authority.
 #
-# It owns the socket, the policy, the constraint sets, the the upstream API credential, and the audit log.
+# It owns the socket, the policy, the constraint sets, and the upstream API credential, and it writes
+# every decision to stdout as a `broker.decision` or `broker.execution` audit record.
 # The gateway holds none of those; it holds a Slack token and a model endpoint.
 #
 # Hygiene, all checked at startup and all fatal:
 #   chmod 0600 broker.yaml policies.cedar
 #   chmod 0600 broker-credentials.yaml     # 0o077 — group/world *readable* is refused, not just writable
-#   chmod 0700 ~/.local/run/dekopon ~/.local/state/dekopon
+#   chmod 0700 ~/.local/run/dekopon
 # Every path below that is relative is resolved against this file's own directory, so the example
 # runs from a checkout without editing paths that point inside the repository. The absolute
 # `/home/xavier/...` paths are the ones to change: they are runtime state, not repository content.
 apiVersion: dekopon.dev/brokerd/v1alpha1
 
 socketPath: /home/xavier/.local/run/dekopon/broker.sock
-auditPath: /home/xavier/.local/state/dekopon/audit.jsonl
 
 brokerPrincipal: local-broker
 policyRevision: conditional-write-2026-01

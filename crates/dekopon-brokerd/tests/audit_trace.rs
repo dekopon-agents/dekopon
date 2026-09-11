@@ -178,7 +178,7 @@ async fn broker() -> Arc<Broker<TraceOnlyAuditLog>> {
             .expect("one capability builds a catalog"),
             CredentialStore::empty(),
             IdentityDirectory::empty(),
-            Arc::new(TraceOnlyAuditLog::new()),
+            Arc::new(TraceOnlyAuditLog),
             BrokerLimits::default(),
         )
         .expect("broker starts"),

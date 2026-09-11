@@ -228,8 +228,8 @@ async fn observed(install: Install, work: impl Future<Output = Result<(), AppErr
             ExitCode::FAILURE
         }
     };
-    // Flush failures are reported but do not change the exit code: the broker's durable audit,
-    // not its telemetry, is the record of what happened.
+    // Flush failures are reported but do not change the exit code: serving has already ended, and
+    // a final batch the exporter could not deliver is the audit loss the constitution accepts.
     if let Err(error) = telemetry.shutdown() {
         tracing::error!(event = "broker_telemetry_shutdown_failed", error = %error);
     }

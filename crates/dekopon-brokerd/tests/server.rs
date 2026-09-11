@@ -592,126 +592,11 @@ async fn unmapped_peer_receives_no_capability_information() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn full_service_appends_after_a_restart() {
-    let uid = current_uid();
-    let directory = private_directory();
-    let config_path = directory.path().join("broker.json");
-    let socket_path = directory.path().join("broker.sock");
-    let audit_path = directory.path().join("audit.jsonl");
-    let checkpoint_path = directory.path().join("checkpoint.json");
-    let checkpoint_lock_path = directory.path().join("checkpoint.lock");
-    let policies_path = directory.path().join("policies.cedar");
-    let document = json!({
-        "apiVersion": CONFIG_API_VERSION,
-        "socketPath": &socket_path,
-        "auditPath": &audit_path,
-        "brokerPrincipal": "broker-test",
-        "policyRevision": "policy-test",
-        "policiesPath": &policies_path,
-        "providers": [provider_fixture("echo-provider.wasm")],
-        "identities": [{
-            "uid": uid,
-            "principal": "caller",
-            "actor": {"type": "agent", "agent": "brokerd-test"}
-        }],
-        "constraintSets": {
-            "echo.echo": serde_json::to_value(echo_constraint_set())
-                .expect("constraint set serializes")
-        }
-    });
-    write_owner_only(&policies_path, DIRECT_POLICY.as_bytes());
-    write_owner_only(
-        &config_path,
-        &serde_json::to_vec(&document).expect("config serializes"),
-    );
-
-    let (stop, stopped) = oneshot::channel::<()>();
-    let first_config = config_path.clone();
-    let mut first = tokio::spawn(async move { run(first_config, shutdown_on(stopped)).await });
-    wait_for_socket(&socket_path, &mut first).await;
-    let client = BrokerClient::new(&socket_path, uid, FrameLimits::default())
-        .expect("create service client");
-    let result = client
-        .invoke(None, request("invoke-durable-service"))
-        .await
-        .expect("first invocation completes");
-    assert_eq!(result.outcome, InvocationOutcome::Succeeded);
-    stop.send(()).expect("stop first service");
-    first
-        .await
-        .expect("first service task exits")
-        .expect("first service stops cleanly");
-    assert_eq!(
-        fs::read_to_string(&audit_path)
-            .expect("read audit")
-            .lines()
-            .inspect(|line| {
-                let _: dekopon_broker::AuditRecord =
-                    serde_json::from_str(line).expect("complete audit record");
-            })
-            .count(),
-        2
-    );
-    assert!(!checkpoint_path.exists());
-    assert!(!checkpoint_lock_path.exists());
-    let prior = fs::read(&audit_path).expect("read prior audit bytes");
-
-    let (stop, stopped) = oneshot::channel::<()>();
-    let second_config = config_path.clone();
-    let mut second = tokio::spawn(async move { run(second_config, shutdown_on(stopped)).await });
-    wait_for_socket(&socket_path, &mut second).await;
-    let client = BrokerClient::new(&socket_path, uid, FrameLimits::default())
-        .expect("create restarted service client");
-    let restarted = client
-        .invoke(None, request("invoke-durable-service-again"))
-        .await
-        .expect("restarted invocation receives an accounted result");
-    assert_eq!(restarted.outcome, InvocationOutcome::Succeeded);
-    assert_eq!(restarted.error, None);
-    stop.send(()).expect("stop second service");
-    second
-        .await
-        .expect("second service task exits")
-        .expect("second service stops cleanly");
-    assert_eq!(
-        fs::read_to_string(&audit_path)
-            .expect("read audit")
-            .lines()
-            .inspect(|line| {
-                let _: dekopon_broker::AuditRecord =
-                    serde_json::from_str(line).expect("complete audit record");
-            })
-            .count(),
-        4
-    );
-    assert!(!checkpoint_path.exists());
-    assert!(!checkpoint_lock_path.exists());
-    let audit = fs::read_to_string(&audit_path).expect("read audit before truncation");
-    assert!(audit.as_bytes().starts_with(&prior));
-    let ordinals = audit
-        .lines()
-        .map(|line| {
-            serde_json::from_str::<dekopon_broker::AuditRecord>(line)
-                .expect("complete audit record")
-                .sequence
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(ordinals, [1, 2, 3, 4]);
-    let first = audit.lines().next().expect("audit has a first record");
-    fs::write(&audit_path, format!("{first}\n")).expect("write valid-prefix truncation");
-    run(&config_path, async {})
-        .await
-        .expect("valid audit prefix starts without a sidecar");
-    assert!(!socket_path.exists());
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn full_service_resolves_a_private_map_only_after_dual_drn_authorization() {
     let uid = current_uid();
     let directory = private_directory();
     let config_path = directory.path().join("broker.json");
     let socket_path = directory.path().join("broker.sock");
-    let audit_path = directory.path().join("audit.jsonl");
     let policies_path = directory.path().join("policies.cedar");
     let secret_map_path = directory.path().join("secret-map.yaml");
     let secret_value_path = directory.path().join("api-token");
@@ -796,7 +681,6 @@ when { context.capability == "http-probe.fetch"
     let document = json!({
         "apiVersion": CONFIG_API_VERSION,
         "socketPath": &socket_path,
-        "auditPath": &audit_path,
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "policiesPath": &policies_path,
@@ -872,20 +756,6 @@ when { context.capability == "http-probe.fetch"
         .await
         .expect("service task exits")
         .expect("service stops");
-    assert_eq!(
-        fs::read_to_string(&audit_path)
-            .expect("read audit")
-            .lines()
-            .inspect(|line| {
-                let _: dekopon_broker::AuditRecord =
-                    serde_json::from_str(line).expect("complete audit record");
-            })
-            .count(),
-        4
-    );
-    let audit = fs::read_to_string(audit_path).expect("read audit");
-    assert!(audit.contains("drn:com.xrl:secret:test:api/token"));
-    assert!(!audit.contains("brokerd-secret-value"));
 }
 
 /// Waits until the fixture's socket exists *and* is owner-only.
@@ -1026,9 +896,9 @@ async fn an_attested_invoke_over_the_socket_succeeds_for_an_attestor_peer() {
     let records = audit.records().await;
     assert_eq!(records.len(), 2);
     let encoded: Value = serde_json::to_value(&records).expect("audit serializes");
-    assert_eq!(encoded[0]["event"]["principal"], "cpetersen");
-    assert_eq!(encoded[0]["event"]["via"], "caller");
-    assert_eq!(encoded[0]["event"]["attested_subject"], SLACK_SUBJECT);
+    assert_eq!(encoded[0]["principal"], "cpetersen");
+    assert_eq!(encoded[0]["via"], "caller");
+    assert_eq!(encoded[0]["attested_subject"], SLACK_SUBJECT);
 
     shutdown_send.send(()).expect("signal clean shutdown");
     task.await
@@ -1074,10 +944,10 @@ async fn an_attested_invoke_from_a_peer_without_a_grant_is_denied_not_erred() {
     assert_eq!(records.len(), 1);
     let encoded: Value = serde_json::to_value(&records).expect("audit serializes");
     assert_eq!(
-        encoded[0]["event"]["principal"], "caller",
+        encoded[0]["principal"], "caller",
         "an unauthorized claim is recorded against the peer that made it"
     );
-    assert_eq!(encoded[0]["event"]["reason"], "attestation-denied");
+    assert_eq!(encoded[0]["reason"], "attestation-denied");
 
     shutdown_send.send(()).expect("signal clean shutdown");
     task.await
@@ -1242,7 +1112,6 @@ async fn strict_startup_refuses_every_policy_that_names_something_absent() {
     let document = json!({
         "apiVersion": CONFIG_API_VERSION,
         "socketPath": directory.path().join("broker.sock"),
-        "auditPath": directory.path().join("audit.jsonl"),
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "policiesPath": &policies_path,
@@ -1315,7 +1184,6 @@ async fn default_startup_tolerates_names_no_loaded_provider_declares() {
     let document = json!({
         "apiVersion": CONFIG_API_VERSION,
         "socketPath": directory.path().join("broker.sock"),
-        "auditPath": directory.path().join("audit.jsonl"),
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "policiesPath": &policies_path,

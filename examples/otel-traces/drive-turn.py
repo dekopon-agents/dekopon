@@ -134,7 +134,6 @@ permit(principal == Dekopon::Principal::"smoke-user",
         broker_config = write("broker.json", {
             "apiVersion": "dekopon.dev/brokerd/v1alpha1",
             "socketPath": str(directory / "broker.sock"),
-            "auditPath": str(directory / "audit.jsonl"),
             "brokerPrincipal": "broker-smoke", "policyRevision": "policy-smoke",
             "policiesPath": write("policies.cedar", policy),
             "providers": [str(root / "examples/providers/echo-provider.wasm")],
@@ -176,10 +175,11 @@ permit(principal == Dekopon::Principal::"smoke-user",
         assert len(calls) == 2 and not failures, "model exchange failed"
         stop(gateway)
         stop(broker)
-        events = [json.loads(line)["event"] for line in (directory / "audit.jsonl").read_text().splitlines()]
-        assert any(e.get("type") == "execution" and e.get("capability") == "echo.echo"
-                   and e.get("outcome") == "Succeeded" and e.get("principal") == "smoke-user"
-                   for e in events), "authorized echo execution missing from broker audit"
+        # The audit record is the broker's own stdout JSON line, whatever the exporter did with it.
+        records = [json.loads(line) for line in (directory / "dekopon-brokerd.log").read_text().splitlines()]
+        assert any(r.get("audit.event") == "broker.execution" and r.get("capability.id") == "echo.echo"
+                   and r.get("outcome") == "Succeeded" and r.get("principal") == "smoke-user"
+                   for r in records), "authorized echo execution missing from broker audit"
         print("Real broker + gateway: private local turn, two model calls, authorized echo audit verified")
     finally:
         signal.alarm(0)

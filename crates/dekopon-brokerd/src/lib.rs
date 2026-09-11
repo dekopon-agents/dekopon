@@ -16,8 +16,8 @@ mod socket;
 use std::{collections::BTreeMap, future::Future, path::Path, sync::Arc};
 
 use dekopon_broker::{
-    AuditLog, Broker, ConstraintCatalog, CredentialStore, FileAuditLog, IdentityDirectory,
-    Leniency, PolicyBuildError, PolicyEngine, PolicyWorld,
+    AuditLog, Broker, ConstraintCatalog, CredentialStore, IdentityDirectory, Leniency,
+    PolicyBuildError, PolicyEngine, PolicyWorld, TraceOnlyAuditLog,
 };
 use dekopon_broker_host::BrokerProviderRegistry;
 use dekopon_broker_protocol::ResponseEnvelope;
@@ -96,13 +96,11 @@ where
             });
         }
     }
-    socket::validate_private_parent(&config.audit_path, uid)?;
     for provider in &config.providers {
         socket::validate_owned_file(provider, uid)?;
     }
     // A compilation cache holds compiled code the broker will execute. Anyone who can write into
-    // it can choose what the privileged process runs, so it lives under the same private-parent
-    // rule as the audit log.
+    // it can choose what the privileged process runs, so it must sit under a private parent.
     if let Some(cache) = &config.host_options.compile_cache_dir {
         socket::validate_private_parent(cache, uid)?;
     }
@@ -119,16 +117,9 @@ where
     };
     let secret_drns = secret_catalog.drns().cloned().collect::<Vec<_>>();
 
-    let file_audit = Arc::new(
-        FileAuditLog::open(
-            &config.audit_path,
-            config.server_limits.audit_max_line_bytes,
-        )
-        .await
-        .map_err(BrokerdError::Audit)?,
-    );
-    socket::validate_owned_file(&config.audit_path, uid)?;
-    let audit = file_audit;
+    // The audit record is the log event the broker emits inside the trace: stdout JSON always,
+    // an OTLP log record once `telemetry` names a receiver. Nothing else keeps a copy.
+    let audit = Arc::new(TraceOnlyAuditLog);
     let storage_host = config
         .storage
         .as_ref()
@@ -401,9 +392,6 @@ pub enum BrokerdError {
     /// Owner-only public-DRN to private-source map failed validation.
     #[error("broker private secret map is unavailable or invalid")]
     Secrets(#[from] SecretMapError),
-    /// Owner-only audit could not be opened.
-    #[error("broker durable audit is unavailable")]
-    Audit(#[source] dekopon_broker::FileAuditError),
     /// Provider storage root/key validation could not start.
     #[error("broker provider storage could not start")]
     Storage(#[source] dekopon_storage_host::StorageHostError),

@@ -31,18 +31,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     future::Future,
-    io,
     ops::ControlFlow,
-    path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::Instant,
 };
-
-#[cfg(unix)]
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
 use async_trait::async_trait;
 use dekopon_broker_host::{
@@ -72,11 +64,7 @@ use dekopon_storage_host::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
-use tokio::{
-    fs::{File, OpenOptions},
-    io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader},
-    sync::Mutex,
-};
+use tokio::sync::Mutex;
 use tracing::Instrument as _;
 
 const MAX_POLICY_REVISION_BYTES: usize = 256;
@@ -314,8 +302,6 @@ fn round_up(value: u64, multiple: u64) -> Result<u64, BrokerBuildError> {
 
 /// Default maximum owner-authored constraint sets in one broker instance.
 pub const DEFAULT_MAX_CONSTRAINT_SETS: usize = 1_024;
-/// Default maximum serialized bytes in one durable JSONL audit record (64 KiB).
-pub const DEFAULT_MAX_AUDIT_LINE_BYTES: usize = 64 * 1024;
 
 /// Identity established by a trusted broker transport.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -2227,30 +2213,17 @@ pub enum AuditEvent {
     },
 }
 
-/// One metadata-only audit record.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct AuditRecord {
-    /// One-based ordinal in the file, or in the process-local in-memory log.
-    pub sequence: u64,
-    /// Metadata-only event.
-    pub event: AuditEvent,
-}
-
 /// Asynchronous append boundary owned by a broker deployment.
 pub trait AuditLog: Send + Sync {
-    /// Appends one event, reporting failure rather than claiming an unrecorded success.
-    fn append(
-        &self,
-        event: AuditEvent,
-    ) -> impl Future<Output = Result<AuditRecord, AuditError>> + Send;
+    /// Accepts one event, reporting failure rather than claiming an unrecorded success.
+    fn append(&self, event: AuditEvent) -> impl Future<Output = Result<(), AuditError>> + Send;
 }
 
 /// Bounded process-local audit implementation for tests and embedding.
 #[derive(Debug)]
 pub struct InMemoryAuditLog {
     maximum: usize,
-    state: Mutex<Vec<AuditRecord>>,
+    state: Mutex<Vec<AuditEvent>>,
 }
 
 impl InMemoryAuditLog {
@@ -2265,258 +2238,38 @@ impl InMemoryAuditLog {
         })
     }
 
-    /// Returns a snapshot in sequence order.
-    pub async fn records(&self) -> Vec<AuditRecord> {
+    /// Returns a snapshot in append order.
+    pub async fn records(&self) -> Vec<AuditEvent> {
         self.state.lock().await.clone()
     }
 }
 
 impl AuditLog for InMemoryAuditLog {
-    async fn append(&self, event: AuditEvent) -> Result<AuditRecord, AuditError> {
+    async fn append(&self, event: AuditEvent) -> Result<(), AuditError> {
         let mut records = self.state.lock().await;
         if records.len() >= self.maximum {
             return Err(AuditError::Full {
                 maximum: self.maximum,
             });
         }
-        let sequence = u64::try_from(records.len())
-            .ok()
-            .and_then(|value| value.checked_add(1))
-            .ok_or(AuditError::SequenceOverflow)?;
-        let record = AuditRecord { sequence, event };
-        records.push(record.clone());
-        Ok(record)
+        records.push(event);
+        Ok(())
     }
 }
 
-/// The audit sink for a deployment whose audit is the log record and nothing else.
+/// The audit sink `dekopon-brokerd` runs with: the log record is the audit, and nothing else is.
 ///
 /// Every decision is already a `dekopon_broker::audit` log event inside the live trace before any
-/// sink is reached, so this one writes nothing and only keeps the process-local ordinal the
-/// record shape carries. Losing the log exporter loses audit; that is the accepted consequence of
-/// [the constitution's](../../../docs/design.md#non-goals) rejection of crash-durable audit, and a
-/// deployment that wants a second, durable copy configures [`FileAuditLog`] instead.
-#[derive(Debug, Default)]
-pub struct TraceOnlyAuditLog {
-    count: AtomicU64,
-}
-
-impl TraceOnlyAuditLog {
-    /// Creates a sink whose first record is ordinal 1.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            count: AtomicU64::new(0),
-        }
-    }
-}
+/// sink is reached, so this one keeps nothing. Losing the log exporter loses audit; that is the
+/// accepted consequence of [the constitution's](../../../docs/design.md#non-goals) rejection of
+/// crash-durable audit.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TraceOnlyAuditLog;
 
 impl AuditLog for TraceOnlyAuditLog {
-    async fn append(&self, event: AuditEvent) -> Result<AuditRecord, AuditError> {
-        let previous = self.count.fetch_add(1, Ordering::Relaxed);
-        let sequence = previous
-            .checked_add(1)
-            .ok_or(AuditError::SequenceOverflow)?;
-        Ok(AuditRecord { sequence, event })
+    async fn append(&self, _event: AuditEvent) -> Result<(), AuditError> {
+        Ok(())
     }
-}
-
-/// Append-only, owner-only JSONL audit file.
-///
-/// Open counts newline-delimited records in bounded space solely for the next ordinal, enforcing
-/// the line-size limit but neither decoding nor verifying history. Unterminated tails are refused;
-/// no bytes are repaired or migrated. Appends are flushed, not fsynced. A failed or cancelled append
-/// can leave partial bytes and poisons this handle; there is no rollback or crash-recovery promise.
-#[derive(Debug)]
-pub struct FileAuditLog {
-    path: PathBuf,
-    maximum_line_bytes: usize,
-    state: Mutex<FileAuditState>,
-}
-
-#[derive(Debug)]
-struct FileAuditState {
-    file: File,
-    count: u64,
-    poisoned: bool,
-}
-
-impl FileAuditLog {
-    /// Opens or creates a private single-writer file and counts its bounded lines.
-    pub async fn open(
-        path: impl AsRef<Path>,
-        maximum_line_bytes: usize,
-    ) -> Result<Self, FileAuditError> {
-        if maximum_line_bytes == 0 {
-            return Err(FileAuditError::ZeroMaximumLineBytes);
-        }
-        let path = path.as_ref().to_path_buf();
-        let mut options = OpenOptions::new();
-        options.read(true).append(true).create(true);
-        #[cfg(unix)]
-        {
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        let file = options
-            .open(&path)
-            .await
-            .map_err(|source| FileAuditError::Io { source })?;
-        let metadata = file
-            .metadata()
-            .await
-            .map_err(|source| FileAuditError::Io { source })?;
-        if !metadata.is_file() {
-            return Err(FileAuditError::NotRegularFile);
-        }
-        #[cfg(unix)]
-        if metadata.permissions().mode() & 0o077 != 0 || metadata.nlink() != 1 {
-            return Err(FileAuditError::InsecureFile);
-        }
-        let standard_file = file.into_std().await;
-        standard_file
-            .try_lock()
-            .map_err(|source| FileAuditError::Lock {
-                source: source.into(),
-            })?;
-        let file = File::from_std(standard_file);
-
-        let mut reader = BufReader::new(file);
-        let count = count_audit_lines(&mut reader, maximum_line_bytes).await?;
-        let file = reader.into_inner();
-        Ok(Self {
-            path,
-            maximum_line_bytes,
-            state: Mutex::new(FileAuditState {
-                file,
-                count,
-                poisoned: false,
-            }),
-        })
-    }
-
-    /// Returns the configured file path.
-    #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl AuditLog for FileAuditLog {
-    async fn append(&self, event: AuditEvent) -> Result<AuditRecord, AuditError> {
-        let mut state = self.state.lock().await;
-        if state.poisoned {
-            return Err(AuditError::Poisoned);
-        }
-        let sequence = state
-            .count
-            .checked_add(1)
-            .ok_or(AuditError::SequenceOverflow)?;
-        let record = AuditRecord { sequence, event };
-        let mut line =
-            serde_json::to_vec(&record).map_err(|source| AuditError::Serialize { source })?;
-        if line.len() > self.maximum_line_bytes {
-            return Err(AuditError::RecordTooLarge {
-                length: line.len(),
-                maximum: self.maximum_line_bytes,
-            });
-        }
-        line.push(b'\n');
-
-        state.poisoned = true;
-        if let Err(source) = state.file.write_all(&line).await {
-            return Err(AuditError::Io { source });
-        }
-        if let Err(source) = state.file.flush().await {
-            return Err(AuditError::Io { source });
-        }
-        state.count = sequence;
-        state.poisoned = false;
-        Ok(record)
-    }
-}
-
-// Count delimiters, not JSON identities or integrity state. Memory is the fixed BufReader buffer.
-async fn count_audit_lines(
-    reader: &mut BufReader<File>,
-    maximum: usize,
-) -> Result<u64, FileAuditError> {
-    let mut count = 0_u64;
-    let mut length = 0_usize;
-    loop {
-        let available = reader
-            .fill_buf()
-            .await
-            .map_err(|source| FileAuditError::Io { source })?;
-        if available.is_empty() {
-            if length == 0 {
-                return Ok(count);
-            }
-            return Err(FileAuditError::UnterminatedRecord {
-                line: count
-                    .checked_add(1)
-                    .ok_or(FileAuditError::SequenceOverflow)?,
-            });
-        }
-        let line = count
-            .checked_add(1)
-            .ok_or(FileAuditError::SequenceOverflow)?;
-        let newline = available.iter().position(|byte| *byte == b'\n');
-        let chunk = newline.unwrap_or(available.len());
-        length = length
-            .checked_add(chunk)
-            .filter(|length| *length <= maximum)
-            .ok_or(FileAuditError::RecordTooLarge { line, maximum })?;
-        reader.consume(chunk + usize::from(newline.is_some()));
-        if newline.is_some() {
-            count = line;
-            length = 0;
-        }
-    }
-}
-
-/// Failure to open or count a private append-only audit file.
-#[derive(Debug, Error)]
-pub enum FileAuditError {
-    /// Per-record byte bound was zero.
-    #[error("durable audit line maximum must be greater than zero")]
-    ZeroMaximumLineBytes,
-    /// Audit path did not identify a regular file.
-    #[error("durable audit path must identify a regular file")]
-    NotRegularFile,
-    /// Unix file permissions or hard-link count did not preserve exclusive ownership.
-    #[error("durable audit file must be owner-only and have exactly one hard link")]
-    InsecureFile,
-    /// Another process already owns the audit writer lock.
-    #[error("durable audit file is already locked by another writer")]
-    Lock {
-        /// Lock failure.
-        #[source]
-        source: io::Error,
-    },
-    /// One existing record exceeded its byte bound.
-    #[error("durable audit record on line {line} exceeds {maximum} bytes")]
-    RecordTooLarge {
-        /// One-based line number.
-        line: u64,
-        /// Configured maximum.
-        maximum: usize,
-    },
-    /// Existing final record was only partially written.
-    #[error("durable audit record on line {line} is not newline-terminated")]
-    UnterminatedRecord {
-        /// One-based line number.
-        line: u64,
-    },
-    /// The next file ordinal cannot be represented.
-    #[error("audit sequence overflowed")]
-    SequenceOverflow,
-    /// File operation failed.
-    #[error("durable audit file operation failed")]
-    Io {
-        /// I/O failure.
-        #[source]
-        source: io::Error,
-    },
 }
 
 /// Invalid in-memory audit configuration.
@@ -2536,51 +2289,14 @@ pub enum AuditError {
         /// Configured maximum.
         maximum: usize,
     },
-    /// Durable handle encountered an earlier partial or failed append.
-    #[error("durable audit handle is poisoned after an incomplete append")]
-    Poisoned,
-    /// Serialized durable record exceeded its byte ceiling.
-    #[error("audit record is {length} bytes; maximum is {maximum}")]
-    RecordTooLarge {
-        /// Actual serialized bytes.
-        length: usize,
-        /// Configured maximum.
-        maximum: usize,
-    },
-    /// Sequence could not be represented.
-    #[error("audit sequence overflowed")]
-    SequenceOverflow,
-    /// Record could not be serialized.
-    #[error("could not serialize audit event")]
-    Serialize {
-        /// JSON failure.
-        #[source]
-        source: serde_json::Error,
-    },
-    /// File append or flush failed.
-    #[error("durable audit append failed")]
-    Io {
-        /// I/O failure.
-        #[source]
-        source: io::Error,
-    },
 }
 
 impl AuditError {
     /// Stable low-cardinality classification for logs and span fields.
-    ///
-    /// A designed refusal, a handle that stays dead until restart, and a filesystem that stopped
-    /// accepting writes need three different operator responses, so the failure that reaches
-    /// telemetry must name which one happened.
     #[must_use]
     pub const fn category(&self) -> &'static str {
         match self {
             Self::Full { .. } => "full",
-            Self::Poisoned => "poisoned",
-            Self::RecordTooLarge { .. } => "record-too-large",
-            Self::SequenceOverflow => "sequence-overflow",
-            Self::Serialize { .. } => "serialize",
-            Self::Io { .. } => "io",
         }
     }
 }
@@ -3930,7 +3646,7 @@ where
             .await
     }
 
-    /// Records the refusal's true class durably and answers the peer with `refusal.wire`.
+    /// Records the refusal's true class in audit and answers the peer with `refusal.wire`.
     ///
     /// The two differ only on the chat paths, where every claim refusal answers with one fixed
     /// literal so a peer cannot read the class off its own denial.
@@ -4101,8 +3817,8 @@ where
         policy_ids: Vec<String>,
     ) -> Result<InvocationResult, BrokerError> {
         // Keyed scope/evidence preparation is deliberately non-mutating. The authorization
-        // decision is durably appended before `materialize` may create a namespace, rotate a
-        // generation pointer, or update lifecycle state.
+        // decision is recorded before `materialize` may create a namespace, rotate a generation
+        // pointer, or update lifecycle state.
         let mut storage_preparation = self.prepare_storage_grant(context, &request, &set)?;
         let storage_scope_commitment = storage_preparation
             .as_ref()
@@ -4581,14 +4297,12 @@ where
         Ok(result)
     }
 
-    /// Records one decision in the trace, then offers it to whatever durable sink is configured.
+    /// Records one decision in the trace, then offers it to the configured [`AuditLog`].
     ///
-    /// The log event is the audit record, so it happens exactly once per decision whether or not a
-    /// deployment also asked for a file. The sink still fails closed — a deployment that asked for
-    /// a durable copy and did not get one refuses the invocation — but by then the decision has
-    /// already been recorded, which is the ordering the constitution's "losing the exporter loses
-    /// audit" wants rather than "losing the disk loses audit".
-    async fn record_audit(&self, event: AuditEvent) -> Result<AuditRecord, AuditError> {
+    /// The log event is the audit record, so it happens exactly once per decision whatever the
+    /// sink is. An embedding's bounded sink still fails closed — a full [`InMemoryAuditLog`]
+    /// refuses the invocation — but by then the decision has already been recorded.
+    async fn record_audit(&self, event: AuditEvent) -> Result<(), AuditError> {
         emit_audit_event(&event);
         self.audit.append(event).await
     }
@@ -4966,11 +4680,10 @@ fn report_inspection_refusal(
 /// emitted from inside `broker.authorize` or `broker.execute`, which descend from the
 /// `broker.invocation` span that adopted the client's `traceparent`, so the console JSON
 /// formatter and the OTLP log bridge stamp the live W3C trace and span ids on it without this
-/// crate linking any telemetry SDK. A durable file sink is a second copy, not the record.
+/// crate linking any telemetry SDK.
 ///
-/// Field names follow the record's own names rather than the surrounding span's, because an
-/// operator reading this back is reading what the JSONL sink writes. Absent is not null: a
-/// storage-routed decision names no principal, actor, provider, or policy at all, and every
+/// Field names follow [`AuditEvent`]'s own names rather than the surrounding span's. Absent is not
+/// null: a storage-routed decision names no principal, actor, provider, or policy at all, and every
 /// `Option` field simply disappears, so a present field always means the broker knew it. Nothing
 /// here can carry secret bytes — `secret` and `credential` are the symbolic names owner
 /// configuration already holds, and the HTTP evidence is the same sanitized set the span carries:
@@ -4996,9 +4709,10 @@ fn emit_audit_event(event: &AuditEvent) {
             reason,
             storage_scope_commitment,
             storage,
-            // The digest binds the file's own history rather than the decision an operator reads,
-            // and the trace id below is the correlation identifier the Dekopon one is being
-            // replaced by.
+            // The decision digest is the caller's evidence, not something an operator reads here.
+            // The trace reaches the record without being one of its fields: the OTLP log bridge
+            // stamps it as the native trace id, and the stdout JSON formatter renders the
+            // enclosing `broker.invocation` span, which carries it as `trace`.
             decision_digest: _,
             trace: _,
         } => tracing::info!(
@@ -5055,6 +4769,7 @@ fn emit_audit_event(event: &AuditEvent) {
             http_calls,
             storage_scope_commitment,
             storage,
+            // Stamped from the enclosing span, exactly as on `broker.decision` above.
             trace: _,
         } => tracing::info!(
             target: "dekopon_broker::audit",
@@ -5125,11 +4840,10 @@ fn joined(ids: &[String]) -> Option<String> {
     (!ids.is_empty()).then(|| ids.join(","))
 }
 
-/// Reports why the broker could not durably account for a decision or an outcome.
+/// Reports why the configured audit sink refused a decision or an outcome.
 ///
-/// This is the most consequential failure the broker can have and it used to be anonymous: the
-/// wire code and the connection log both carried a category with no cause, so a bounded log
-/// reaching its limit, a poisoned handle, and a full filesystem all read the same.
+/// The wire code and the connection log carry only a category, so this event is where the cause
+/// reaches the operator.
 fn report_audit_failure(stage: &'static str, invocation: &InvocationId, source: &AuditError) {
     tracing::error!(
         event = "broker_audit_append_failed",
@@ -5380,7 +5094,7 @@ fn public_host_error(error: &BrokerHostError, route: CapabilityRoute) -> &'stati
     }
 }
 
-/// Failure to evaluate or durably account for one broker invocation.
+/// Failure to evaluate or account for one broker invocation.
 #[derive(Debug, Error)]
 pub enum BrokerError {
     /// Optional chat memory was not effective for this trusted context.
@@ -5504,8 +5218,6 @@ impl BrokerError {
             | Self::StorageTask { .. }
             | Self::Authorization { .. }
             | Self::DecisionEvidence { .. }
-            | Self::DecisionAudit { .. }
-            | Self::AuthorizedFailureAudit { .. }
             | Self::OutcomeEvidence { .. }
             | Self::OutcomeAudit { .. } => None,
         }
@@ -5514,8 +5226,8 @@ impl BrokerError {
     /// Invocation whose provider work may already have completed with no terminal audit record.
     ///
     /// `Some` exactly when the failure was raised after [`Broker::invoke`] began provider
-    /// execution: the external effect may have taken place, nothing durably recorded its
-    /// outcome, and the request must not be resubmitted under any identifier. `None` when
+    /// execution: the external effect may have taken place, the audit sink refused its outcome,
+    /// and the request must not be resubmitted under any identifier. `None` when
     /// execution provably never began — which makes resubmission *safe*, not useful:
     /// [`Self::capacity_failure_code`] separates the failures a retry can outlive from the
     /// exhaustions it cannot.

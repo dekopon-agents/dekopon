@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use dekopon_broker::{
     Attestation, AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerBuildError,
     BrokerLimits, CapabilityRoute, ConstraintCatalog, ConstraintSet, CredentialRefreshError,
-    CredentialStore, FileAuditLog, IdentityDirectory, InMemoryAuditLog, InvocationRequest,
-    Leniency, PolicyEngine, PolicyWorld, RefreshingCredential, SecretCatalog, SecretMaterial,
+    CredentialStore, IdentityDirectory, InMemoryAuditLog, InvocationRequest, Leniency,
+    PolicyEngine, PolicyWorld, RefreshingCredential, SecretCatalog, SecretMaterial,
     SecretResolutionError, SecretResolver, SecretUseBinding, StartupWarning,
 };
 use dekopon_broker_host::BoundCredential;
@@ -419,105 +419,12 @@ async fn policy_authorizes_and_audits_no_payloads() {
     let records = audit.records().await;
     assert_eq!(records.len(), 2);
     assert!(matches!(
-        records[0].event,
+        records[0],
         AuditEvent::Decision { allowed: true, .. }
     ));
-    assert!(matches!(records[1].event, AuditEvent::Execution { .. }));
+    assert!(matches!(records[1], AuditEvent::Execution { .. }));
     let serialized = serde_json::to_string(&records).expect("audit serializes");
     assert!(!serialized.contains("top-secret-payload"));
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn file_audit_ordinals_continue_across_a_restart() {
-    let directory = tempfile::tempdir().expect("create durable broker fixture");
-    let path = directory.path().join("audit.jsonl");
-    let audit = Arc::new(
-        FileAuditLog::open(&path, 64 * 1024)
-            .await
-            .expect("create durable audit"),
-    );
-    let policies = direct_policy("caller", "provider-test", "echo.echo");
-    let broker = Broker::new(
-        echo_registry(BrokerHostLimits::default()).await,
-        "broker-test"
-            .parse::<PrincipalId>()
-            .expect("valid broker principal"),
-        "policy-test".to_owned(),
-        echo_engine(&policies, ["caller"]),
-        catalog([("echo.echo", set("echo", ExecutionConstraints::default()))]),
-        CredentialStore::empty(),
-        IdentityDirectory::empty(),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
-    )
-    .expect("durable broker starts");
-    let first = broker
-        .invoke(
-            &context("caller"),
-            None,
-            None,
-            request("invoke-durable", "echo.echo", json!({"message": "hello"})),
-        )
-        .await
-        .expect("first invocation succeeds and is durable");
-    assert_eq!(
-        first.outcome,
-        dekopon_capability::InvocationOutcome::Succeeded
-    );
-    drop(broker);
-    drop(audit);
-
-    let audit = Arc::new(
-        FileAuditLog::open(&path, 64 * 1024)
-            .await
-            .expect("audit reopens"),
-    );
-    let broker = Broker::new(
-        echo_registry(BrokerHostLimits::default()).await,
-        "broker-test"
-            .parse::<PrincipalId>()
-            .expect("valid broker principal"),
-        "policy-test".to_owned(),
-        echo_engine(&policies, ["caller"]),
-        catalog([("echo.echo", set("echo", ExecutionConstraints::default()))]),
-        CredentialStore::empty(),
-        IdentityDirectory::empty(),
-        Arc::clone(&audit),
-        BrokerLimits::default(),
-    )
-    .expect("broker starts against the retained audit file");
-    let second = broker
-        .invoke(
-            &context("caller"),
-            None,
-            None,
-            request(
-                "invoke-durable-again",
-                "echo.echo",
-                json!({"message": "again"}),
-            ),
-        )
-        .await
-        .expect("the restarted broker invokes and appends");
-    assert_eq!(
-        second.outcome,
-        dekopon_capability::InvocationOutcome::Succeeded
-    );
-    assert_eq!(second.error, None);
-    let raw = std::fs::read_to_string(&path).expect("read appended records");
-    let records = raw
-        .lines()
-        .map(|line| {
-            serde_json::from_str::<dekopon_broker::AuditRecord>(line).expect("record decodes")
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(
-        records
-            .iter()
-            .map(|record| record.sequence)
-            .collect::<Vec<_>>(),
-        [1, 2, 3, 4]
-    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -567,7 +474,7 @@ async fn unmatched_identity_is_denied_before_provider_execution() {
     let records = audit.records().await;
     assert_eq!(records.len(), 1);
     assert!(matches!(
-        records[0].event,
+        records[0],
         AuditEvent::Decision { allowed: false, .. }
     ));
 }
@@ -1012,7 +919,7 @@ async fn failed_execution_audits_the_external_write_that_already_landed() {
         outcome,
         http_calls,
         ..
-    } = &records[1].event
+    } = &records[1]
     else {
         panic!("the terminal record is an execution event");
     };
@@ -1275,7 +1182,7 @@ async fn a_refreshing_credential_resolves_once_per_invocation_outside_the_guest_
         credential,
         http_calls,
         ..
-    } = &records[1].event
+    } = &records[1]
     else {
         panic!("the terminal record is an execution event");
     };
@@ -1398,7 +1305,7 @@ async fn an_unrenewable_credential_fails_its_invocation_and_classifies_why() {
 
     let records = audit.records().await;
     for record in &records {
-        if let AuditEvent::Execution { credential, .. } = &record.event {
+        if let AuditEvent::Execution { credential, .. } = record {
             assert_eq!(
                 credential.as_deref(),
                 Some("chatgpt-fixture"),
@@ -1651,7 +1558,7 @@ async fn authorized_source_failure_is_a_terminal_audited_failure_not_an_ambiguou
     assert_eq!(records.len(), 2, "decision plus terminal failed execution");
     let AuditEvent::Execution {
         error, http_calls, ..
-    } = &records[1].event
+    } = &records[1]
     else {
         panic!("terminal record is execution");
     };
@@ -1799,7 +1706,7 @@ async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
         .as_array()
         .expect("records serialize as an array")
         .iter()
-        .filter_map(|record| record["event"]["credential"].as_str())
+        .filter_map(|record| record["credential"].as_str())
         .collect::<Vec<_>>();
     assert_eq!(
         selected,
@@ -1904,7 +1811,7 @@ async fn an_agent_with_no_override_and_no_default_transacts_unauthenticated() {
         .as_array()
         .expect("records serialize as an array")
         .iter()
-        .filter_map(|record| record["event"]["credential"].as_str())
+        .filter_map(|record| record["credential"].as_str())
         .collect::<Vec<_>>();
     assert_eq!(
         selected,
@@ -2257,7 +2164,7 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
             allowed,
             reason,
             ..
-        } = &record.event
+        } = record
         else {
             panic!("a refusal records a decision event");
         };
@@ -2305,7 +2212,7 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
         attested_subject,
         reason,
         ..
-    } = &records[0].event
+    } = &records[0]
     else {
         panic!("a refusal records a decision event");
     };
@@ -2353,10 +2260,10 @@ async fn attested_success_audits_via_and_subject() {
     let records = audit.records().await;
     assert_eq!(records.len(), 2);
     let encoded = serde_json::to_value(&records).expect("audit serializes");
-    // Event field names are the enum's own snake_case, unlike the camelCase record envelope
-    // around them. Asserting the literal wire keys keeps that difference from drifting silently.
+    // Event field names are the enum's own snake_case. Asserting the literal keys keeps them from
+    // drifting silently.
     for (index, kind) in [(0, "decision"), (1, "execution")] {
-        let event = &encoded[index]["event"];
+        let event = &encoded[index];
         assert_eq!(event["type"], kind);
         assert_eq!(event["principal"], "cpetersen");
         assert_eq!(event["via"], "gateway");
@@ -2366,7 +2273,7 @@ async fn attested_success_audits_via_and_subject() {
             json!({"type": "agent", "agent": "some-agent"})
         );
     }
-    assert_eq!(encoded[0]["event"]["allowed"], true);
+    assert_eq!(encoded[0]["allowed"], true);
 
     let serialized = serde_json::to_string(&records).expect("audit serializes");
     assert!(
@@ -2671,19 +2578,16 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
 
     let records = audit.records().await;
     let encoded = serde_json::to_value(&records).expect("audit serializes");
-    // Event fields keep the enum's own snake_case, unlike the camelCase record envelope.
+    // Event fields keep the enum's own snake_case.
     for index in [0, 1] {
-        assert_eq!(
-            encoded[index]["event"]["policy_ids"],
-            json!(["caller-echo"])
-        );
-        assert_eq!(encoded[index]["event"]["policy_digest"], json!(digest));
+        assert_eq!(encoded[index]["policy_ids"], json!(["caller-echo"]));
+        assert_eq!(encoded[index]["policy_digest"], json!(digest));
     }
     // A deny-by-default refusal is reached by no policy, so the absent list is the explanation and
     // the field stays off the wire entirely.
-    assert_eq!(encoded[2]["event"]["reason"], "policy-denied");
-    assert!(encoded[2]["event"].get("policy_ids").is_none());
-    assert_eq!(encoded[2]["event"]["policy_digest"], json!(digest));
+    assert_eq!(encoded[2]["reason"], "policy-denied");
+    assert!(encoded[2].get("policy_ids").is_none());
+    assert_eq!(encoded[2]["policy_digest"], json!(digest));
 }
 
 /// Leniency moves *when* the broker complains, never *whether* it enforces.

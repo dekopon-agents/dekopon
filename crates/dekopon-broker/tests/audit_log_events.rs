@@ -180,7 +180,7 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
         .expect("credential store builds"),
         IdentityDirectory::empty(),
         // No file: the record is the log event, and nothing else is configured to keep it.
-        Arc::new(TraceOnlyAuditLog::new()),
+        Arc::new(TraceOnlyAuditLog),
         BrokerLimits::default(),
     )
     .expect("the credentialed constraint set matches store and destinations");

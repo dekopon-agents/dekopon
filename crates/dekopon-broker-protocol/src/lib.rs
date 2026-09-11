@@ -59,7 +59,7 @@ pub const ERROR_PROVIDER: &str = "provider-error";
 /// Stable failure code: provider work may already have completed and its outcome was not audited.
 ///
 /// The external effect may have taken place. The request must **not** be resubmitted under any
-/// identifier; the durable audit is the only record of what happened.
+/// identifier; the broker's audit log records are the only account of what happened.
 pub const ERROR_OUTCOME_UNAUDITED: &str = "outcome-unaudited";
 /// Stable pre-execution storage failure codes. No provider work began, so a corrected request may
 /// use a fresh invocation identifier.
@@ -74,10 +74,6 @@ pub const ERROR_STORAGE_IO: &str = "storage-io";
 /// Distinct from [`ERROR_BROKER_UNAVAILABLE`]: an embedding's bounded in-memory audit log is full
 /// and does not evict. A new identifier cannot fix capacity within that lifetime. Nothing executed,
 /// but clients must not retry automatically.
-///
-/// The broker's durable file audit is not one of those resources — it bounds each record, never the
-/// number of them — so a full audit filesystem arrives as [`ERROR_BROKER_UNAVAILABLE`] before
-/// execution and [`ERROR_OUTCOME_UNAUDITED`] after it, and never here.
 pub const ERROR_CAPACITY_EXHAUSTED: &str = "capacity-exhausted";
 
 /// Exact protocol version carried by every envelope.

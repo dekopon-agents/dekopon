@@ -64,7 +64,6 @@ fn attested_document(uid: u32) -> serde_json::Value {
     json!({
         "apiVersion": config::CONFIG_API_VERSION,
         "socketPath": "broker.sock",
-        "auditPath": "audit.jsonl",
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "policiesPath": "policies.cedar",
@@ -406,7 +405,6 @@ async fn strict_configuration_resolves_paths_and_rejects_unknown_fields() {
     let document = json!({
         "apiVersion": config::CONFIG_API_VERSION,
         "socketPath": "broker.sock",
-        "auditPath": "audit.jsonl",
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "providers": ["echo.wasm"],
@@ -432,51 +430,15 @@ async fn strict_configuration_resolves_paths_and_rejects_unknown_fields() {
         resolved.socket_path,
         canonical_directory.join("broker.sock")
     );
-    assert_eq!(resolved.audit_path, canonical_directory.join("audit.jsonl"));
     assert_eq!(resolved.providers, [canonical_directory.join("echo.wasm")]);
 
     let mut conflicting = document.clone();
-    conflicting["auditPath"] = json!("broker.sock");
-    fs::write(
-        &path,
-        serde_json::to_vec(&conflicting).expect("conflict fixture serializes"),
-    )
-    .expect("replace config fixture");
+    conflicting["policiesPath"] = json!("broker.yaml");
+    write_config(&path, &conflicting);
     assert!(matches!(
         config::load(&path, uid).await,
         Err(config::ConfigError::ConflictingPaths)
     ));
-
-    for key in ["checkpointPath", "checkpointLockPath"] {
-        let mut retired = document.clone();
-        retired[key] = json!("retired");
-        fs::write(
-            &path,
-            serde_json::to_vec(&retired).expect("fixture serializes"),
-        )
-        .expect("replace config fixture");
-        let error = config::load(&path, uid)
-            .await
-            .expect_err("retired key is unknown");
-        assert!(matches!(error, config::ConfigError::Decode { source }
-            if source.to_string().contains("unknown field") && source.to_string().contains(key)));
-    }
-
-    let mut retired = document.clone();
-    retired["serverLimits"] = json!({
-        "maxFrameBytes": dekopon_broker_protocol::DEFAULT_MAX_FRAME_BYTES,
-        "ioTimeoutMs": 30000,
-        "maxConnections": config::DEFAULT_MAX_CONNECTIONS,
-        "auditMaxLineBytes": dekopon_broker::DEFAULT_MAX_AUDIT_LINE_BYTES,
-        "shutdownGraceMs": 120000,
-        "auditMaxRecords": 200000
-    });
-    write_config(&path, &retired);
-    let error = config::load(&path, uid)
-        .await
-        .expect_err("retired server limit is unknown");
-    assert!(matches!(error, config::ConfigError::Decode { source }
-        if source.to_string().contains("unknown field") && source.to_string().contains("auditMaxRecords")));
 
     let mut invalid = document;
     invalid["principal"] = json!("payload-forgery");
@@ -488,6 +450,41 @@ async fn strict_configuration_resolves_paths_and_rejects_unknown_fields() {
     assert!(config::load(&path, uid).await.is_err());
 }
 
+/// There is no on-disk audit sink, so its two fields refuse startup and the refusal names each one.
+#[tokio::test]
+async fn an_audit_path_in_config_is_refused() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    fs::write(directory.path().join("echo.wasm"), b"component fixture")
+        .expect("write provider path fixture");
+    let mut with_path = provider_config(uid, json!(["echo.wasm"]));
+    with_path["auditPath"] = json!("audit.jsonl");
+    let mut with_line_bound = provider_config(uid, json!(["echo.wasm"]));
+    with_line_bound["serverLimits"] = json!({
+        "maxFrameBytes": dekopon_broker_protocol::DEFAULT_MAX_FRAME_BYTES,
+        "ioTimeoutMs": 30_000,
+        "maxConnections": config::DEFAULT_MAX_CONNECTIONS,
+        "auditMaxLineBytes": 65_536,
+        "shutdownGraceMs": 120_000
+    });
+    for (document, field) in [
+        (with_path, "auditPath"),
+        (with_line_bound, "auditMaxLineBytes"),
+    ] {
+        write_config(&path, &document);
+        let error = config::load(&path, uid)
+            .await
+            .expect_err("an audit sink field is unknown");
+        assert!(
+            matches!(&error, config::ConfigError::Decode { source }
+                if source.to_string().contains("unknown field")
+                    && source.to_string().contains(field)),
+            "{field}: {error}"
+        );
+    }
+}
+
 /// Telemetry is optional, strict when present, and never a place to put a credential.
 #[tokio::test]
 async fn telemetry_section_is_optional_and_strict() {
@@ -497,7 +494,6 @@ async fn telemetry_section_is_optional_and_strict() {
     let base = json!({
         "apiVersion": config::CONFIG_API_VERSION,
         "socketPath": "broker.sock",
-        "auditPath": "audit.jsonl",
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "providers": ["echo.wasm"],
@@ -664,7 +660,6 @@ fn provider_config(uid: u32, providers: serde_json::Value) -> serde_json::Value 
     json!({
         "apiVersion": config::CONFIG_API_VERSION,
         "socketPath": "broker.sock",
-        "auditPath": "audit.jsonl",
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "providers": providers,
@@ -1162,7 +1157,6 @@ async fn refused_storage_and_frame_bounds_keep_the_field_that_refused_them() {
         "maxFrameBytes": dekopon_broker_protocol::DEFAULT_MAX_FRAME_BYTES,
         "ioTimeoutMs": 0,
         "maxConnections": config::DEFAULT_MAX_CONNECTIONS,
-        "auditMaxLineBytes": dekopon_broker::DEFAULT_MAX_AUDIT_LINE_BYTES,
         "shutdownGraceMs": 120_000
     });
     write_config(&path, &document);
@@ -1434,7 +1428,7 @@ async fn ipc_group_socket_keeps_private_paths_private_and_replaces_only_safe_sta
             );
             assert!(
                 socket::validate_private_parent(&path, uid).is_err(),
-                "audit/cache parents stay private"
+                "cache parents stay private"
             );
         }
         assert!(matches!(

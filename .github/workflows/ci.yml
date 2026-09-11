@@ -627,7 +627,6 @@ jobs:
           cat > "$RUNNER_TEMP/foreign-uid-broker.yaml" <<'YAML'
           apiVersion: dekopon.dev/brokerd/v1alpha1
           socketPath: /run/dekopon/broker.sock
-          auditPath: /var/lib/dekopon/audit.jsonl
           brokerPrincipal: local-broker
           policyRevision: chart-default
           policiesPath: /etc/dekopon/policies.cedar
