@@ -16,11 +16,10 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
-cargo check -p dekopon-core -p dekopon-capability -p dekopon-protocol --locked
 cargo machete
 ```
 
-The fetch installs the ignored echo, JSONPlaceholder, and memory-chat fixtures that core tests read. The `cargo check` compiles the foundational crates with their opt-in `schemars` feature off. The complete gate list is in [Root workspace](docs/development.md#root-workspace).
+The fetch installs the ignored echo, JSONPlaceholder, and memory-chat fixtures that core tests read. The complete gate list is in [Root workspace](docs/development.md#root-workspace).
 
 Install `cargo-deny` to run the dependency policy:
 

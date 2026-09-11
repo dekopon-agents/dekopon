@@ -411,12 +411,12 @@ credentials:
 the file is validated as a whole: every missing field, surplus field, malformed name and duplicate
 name is reported in one startup refusal.
 
-Both legacy kinds are direct-reflection checked the way a DRN-bound credential is: the native host
-refuses a response whose body or headers carry the secret rather than returning it to the component.
-A `bearerToken` `secret` is therefore held to a shape the check can search for — at least 16 bytes of
-printable ASCII, no whitespace or control bytes — and an entry that breaks that rule refuses startup
-by name. The same 16-byte floor holds for a DRN-resolved secret, which has no startup to refuse at
-and fails its invocation instead.
+Both legacy kinds go through the credential echo check the way a DRN-bound credential does: the
+native host refuses a response whose body or headers carry the secret rather than returning it to
+the component. A `bearerToken` `secret` is therefore held to a shape the check can search for — at
+least 16 bytes of printable ASCII, no whitespace or control bytes — and an entry that breaks that
+rule refuses startup by name. The same 16-byte floor holds for a DRN-resolved secret, which has no
+startup to refuse at and fails its invocation instead.
 
 **Hygiene.** The `authFile` goes through the same Tier A check as the credentials file itself —
 regular, owned by the broker's UID, `mode & 0o077 == 0`, one hard link, opened `O_NOFOLLOW`, under a
@@ -479,7 +479,7 @@ snapshot. There is no cross-invocation cache and no stale fallback:
   material;
 - a resolved secret shorter than 16 bytes fails the invocation as `invalid-material` before the
   provider runs, on either native sink. The resolved value is what the host searches responses for,
-  and a needle that short would deny answers that never carried it;
+  and a value that short would deny answers that never carried it;
 - no adapter retries automatically.
 
 A source timeout or malformed/oversized response produces a fixed broker failure. Response/error

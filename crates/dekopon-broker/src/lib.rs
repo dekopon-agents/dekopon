@@ -1355,7 +1355,7 @@ impl ChatScopeGrant {
                 channel: channel.to_owned(),
                 conversation: conversation.unwrap_or(channel).to_owned(),
             };
-            if !canonical_chat_scope_shape(&claim) {
+            if !claim.is_canonical_shape() {
                 return Err(BrokerBuildError::InvalidChatScope);
             }
         }
@@ -1700,101 +1700,7 @@ fn canonical_chat_scope(subject: &ExternalSubject, scope: &ChatScopeClaim) -> bo
         (ChatTransportKind::Local, _) => true,
         _ => false,
     };
-    subject_matches && canonical_chat_scope_shape(scope)
-}
-
-fn canonical_chat_scope_shape(scope: &ChatScopeClaim) -> bool {
-    if !scope.is_bounded() {
-        return false;
-    }
-    match scope.kind {
-        ChatTransportKind::Slack => {
-            lowercase_token(&scope.channel)
-                && (scope.conversation == scope.channel
-                    || scope
-                        .conversation
-                        .split_once(':')
-                        .is_some_and(|(channel, timestamp)| {
-                            channel == scope.channel && slack_timestamp(timestamp)
-                        }))
-        }
-        ChatTransportKind::Discord => {
-            // A Discord native thread is itself the channel used for routing and replies. There is
-            // no second thread identifier, so accepting two different decimals would create an
-            // alias for one transport-derived conversation.
-            scope.conversation == scope.channel && canonical_unsigned_decimal(&scope.channel)
-        }
-        ChatTransportKind::Telegram => {
-            canonical_signed_decimal(&scope.channel)
-                && (scope.conversation == scope.channel
-                    || scope
-                        .conversation
-                        .strip_prefix(&format!("{}:topic:", scope.channel))
-                        .is_some_and(canonical_positive_service_decimal))
-        }
-        ChatTransportKind::Whatsapp => {
-            let mut parts = scope.channel.split(':');
-            let canonical = parts.next().is_some_and(canonical_meta_decimal)
-                && parts.next().is_some_and(canonical_meta_decimal)
-                && parts.next().is_some_and(canonical_meta_decimal)
-                && parts.next().is_none();
-            canonical && scope.conversation == scope.channel
-        }
-        ChatTransportKind::Local => {
-            lowercase_scope_value(&scope.channel) && lowercase_scope_value(&scope.conversation)
-        }
-    }
-}
-
-fn lowercase_token(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-}
-
-fn lowercase_scope_value(value: &str) -> bool {
-    !value.is_empty()
-        && value.bytes().all(|byte| {
-            byte.is_ascii_lowercase()
-                || byte.is_ascii_digit()
-                || matches!(byte, b'.' | b'-' | b'_' | b':')
-        })
-}
-
-fn slack_timestamp(value: &str) -> bool {
-    value.split_once('.').is_some_and(|(seconds, fraction)| {
-        seconds.len() == 10
-            && fraction.len() == 6
-            && !seconds.starts_with('0')
-            && seconds.bytes().all(|byte| byte.is_ascii_digit())
-            && fraction.bytes().all(|byte| byte.is_ascii_digit())
-    })
-}
-
-fn canonical_unsigned_decimal(value: &str) -> bool {
-    value
-        .parse::<u64>()
-        .is_ok_and(|number| number != 0 && number.to_string() == value)
-}
-
-fn canonical_meta_decimal(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && !value.starts_with('0')
-        && value.bytes().all(|byte| byte.is_ascii_digit())
-}
-
-fn canonical_positive_service_decimal(value: &str) -> bool {
-    value
-        .parse::<i64>()
-        .is_ok_and(|number| number > 0 && number.to_string() == value)
-}
-
-fn canonical_signed_decimal(value: &str) -> bool {
-    value
-        .parse::<i64>()
-        .is_ok_and(|number| number != 0 && number.to_string() == value)
+    subject_matches && scope.is_canonical_shape()
 }
 
 /// One thing wrong with the deployment's declared capability routes.

@@ -18,8 +18,6 @@ const TRACE_ID_HEX_DIGITS: usize = 32;
 ///
 /// It is not an authorization or routing input, and it is chosen by whoever opened the
 /// trace. Two runs that share one are correlated, not related by authority.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
-#[cfg_attr(feature = "schemars", schemars(with = "String"))]
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TraceId([u8; 16]);
 

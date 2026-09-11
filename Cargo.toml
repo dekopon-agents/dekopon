@@ -67,7 +67,6 @@ opentelemetry_sdk = { version = "0.32.0", default-features = false, features = [
 regex-bites = "0.1.6"
 reqwest ={ version = "0.12.28", default-features = false, features = ["blocking", "http2", "rustls-tls-webpki-roots", "stream"] }
 rustix = { version = "1.1.4", features = ["fs", "process"] }
-schemars = { version = "1.2.2", features = ["derive"] }
 semver = { version = "1.0.28", features = ["serde"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"

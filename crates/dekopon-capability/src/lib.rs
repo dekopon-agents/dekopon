@@ -61,7 +61,6 @@ use serde_json::Value;
 use thiserror::Error;
 
 /// Whether invoking a capability can cause an externally observable effect.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum EffectKind {
@@ -85,7 +84,6 @@ impl fmt::Display for EffectKind {
 }
 
 /// Declared retry behavior for an invocation.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Idempotency {
@@ -109,7 +107,6 @@ impl fmt::Display for Idempotency {
 }
 
 /// A provider permission needed to execute a capability.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Permission {
@@ -128,7 +125,6 @@ pub struct Permission {
 /// `dekopon_broker_protocol::InvocationRequest`, which the broker converts here after
 /// authenticating the envelope. Deriving `Deserialize` would offer a decoding path that no caller
 /// should take.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProposedInvocation {
@@ -179,7 +175,6 @@ impl ProposedInvocation {
 }
 
 /// Broker-enforced buffered HTTP limits attached to one authorization.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct HttpConstraints {
@@ -329,7 +324,6 @@ pub enum HttpConstraintsError {
 }
 
 /// One canonical path rule for a secret-bearing HTTP request.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "match", rename_all = "camelCase", deny_unknown_fields)]
 pub enum HttpPathRule {
@@ -388,7 +382,6 @@ fn canonical_secret_path(path: &str) -> bool {
 }
 
 /// Effective owner-authored scope attached to authorization for one proposed DRN use.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SecretUseGrant {
@@ -488,7 +481,6 @@ pub enum SecretUseGrantError {
 }
 
 /// Exact component storage interface selected for one capability.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StorageInterface {
@@ -499,7 +491,6 @@ pub enum StorageInterface {
 }
 
 /// Storage mutation authority selected for one capability.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StorageAccess {
@@ -510,7 +501,6 @@ pub enum StorageAccess {
 }
 
 /// Broker-owned logical namespace class.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StorageNamespace {
@@ -519,7 +509,6 @@ pub enum StorageNamespace {
 }
 
 /// Exact namespace-bound storage authority attached to one capability.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct StorageConstraints {
@@ -532,7 +521,6 @@ pub struct StorageConstraints {
 }
 
 /// Broker-enforced execution limits attached to an authorization.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ExecutionConstraints {
@@ -571,7 +559,6 @@ impl Default for ExecutionConstraints {
 /// The accessors below exist for evidence and audit inspection inside the broker boundary.
 /// Receipt data reaches every other consumer by [`Serialize`] into the evidence digest, not by
 /// being read field by field.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthorizationReceipt {
@@ -607,7 +594,6 @@ impl AuthorizationReceipt {
 /// the broker-owned execution boundary creates and consumes it once. It is serializable as
 /// inert data for broker-owned audit and evidence recording, but its serialized form is not a
 /// transferable bearer grant and intentionally cannot be deserialized.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthorizedInvocation {
@@ -647,7 +633,6 @@ impl AuthorizedInvocation {
 ///
 /// Unlike [`AuthorizationReceipt`], this value is deserializable because it carries no execution
 /// authority and cannot be converted into an [`AuthorizedInvocation`].
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct DecisionReference {
@@ -660,7 +645,6 @@ pub struct DecisionReference {
 }
 
 /// A piece of evidence produced during authorization or execution.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Evidence {
@@ -676,7 +660,6 @@ pub struct Evidence {
 }
 
 /// Terminal state of an attempted invocation.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum InvocationOutcome {
@@ -689,7 +672,6 @@ pub enum InvocationOutcome {
 }
 
 /// Serializable result and evidence for an invocation.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct InvocationResult {

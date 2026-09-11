@@ -196,6 +196,13 @@ All notable changes to Dekopon are documented here. The format is based on
   not only the spans that produced them. `dekopon_telemetry::optional_logger_provider` mirrors
   `optional_tracer_provider`: an exporter that cannot be built disables log export and says why on
   stderr rather than keeping the broker from starting.
+- `ChatScopeClaim::is_canonical_shape` decides the per-transport channel and conversation grammar
+  once, in `dekopon-broker-protocol`. `dekopon-broker` carried a byte-identical copy of that shape
+  function, its five service predicates and two lowercase helpers; both the broker's chat-grant
+  validation and its `ExternalSubject` correlation now call the protocol method, so the layer that
+  admits a scope and `DeliveryIdentity::is_canonical_for`, which already sat on those predicates,
+  can no longer drift into disagreeing about which Slack timestamp, Telegram topic or WhatsApp
+  triple is canonical. Behaviour is unchanged — the copies were identical when merged.
 
 ### Changed
 
@@ -370,6 +377,12 @@ All notable changes to Dekopon are documented here. The format is based on
   argument, so `dekopon-console` builds unchanged; the new `dekopon_core::REDACTION_MARKER` is the
   constant itself. Any log, span, or serialized record that quoted a marker's width now reads
   `[REDACTED]`.
+- The native HTTP host's refusal of a response that carries its credential is now the credential
+  echo check, and its message reads `credentialed response echoed the credential` instead of
+  `credential-bearing response reflected protected material`. That text is what an operator reads
+  in `error.message` on the `http.request` span and the `accounting.http.request` record, and what
+  the provider component receives in `http-error.message`. The responses it refuses and the 16-byte
+  floor are unchanged.
 
 ### Removed
 
@@ -481,6 +494,17 @@ All notable changes to Dekopon are documented here. The format is based on
   `ConflictScan::new` are gone: one host means one wording, and the conflict report itself is
   unchanged — every reserved-word and duplicate collision in a provider set, reported at once,
   fatal at boot.
+- Removed the shell's `getopts`. Nothing calls a function here with flags — a model authors both
+  the caller and the callee, and it writes `f "$x" "$y"` — so a flag parser for the one caller that
+  already knows the argument order was a bash habit rather than a need. `$1`, `$@`, `$#`, and
+  `shift` remain, and `OPTIND`/`OPTARG` are now ordinary variables nothing writes.
+  `dekopon_core::RESERVED_COMMAND_WORDS` loses `getopts` too, so a provider may claim that word.
+- Removed the shell's `date` builtin and the `Limits::allow_clock` opt-in that gated it, along with
+  `DEFAULT_ALLOW_CLOCK`. The gate was never set by any embedder, so no session could read a clock,
+  and the refusal it produced named a `--shell-allow-clock` flag that never existed. A script that
+  asks the time now gets the "command not found" an ungranted capability gets.
+  `dekopon_core::RESERVED_COMMAND_WORDS` loses `date`, which is visible to provider authors: a
+  provider may now claim `date` as its own command word, the way `gh` did once its builtin went.
 - Retired the `dekopon`, `dekopon-webui`, `dekopon-run`, and `dekopon-provider-host` crates. Only `dekopond` and `dekopon-brokerd` ship as binaries; shared agent, shell, model, SDK, and broker libraries remain. Recorded-session listing, transcript reconstruction, and model replay went with the runner, out of `dekopon-agent` as well; live agent tools and telemetry are unaffected. Published versions are not recalled or yanked; publication and a later independent console repin remain follow-ups.
 - Retire the broker web UI, its listener configuration, and gateway inventory/token reporting; daemon traces, model accounting, and provider execution remain.
 - Retired the standalone catalog CLI and package; model-account login, status, logout, and guarded credential export now live in `dekopond auth chatgpt`, without gateway configuration or startup.
@@ -506,6 +530,17 @@ All notable changes to Dekopon are documented here. The format is based on
   still reaches the caller as a `ScriptOutcome`; a syntax error is still the rendered
   `dekopon-shell: syntax error: ...` line on its output, which is the shape every consumer
   actually reads. The grammar is now free to change without a major version.
+- Removed the `schemars` feature from `dekopon-core`, `dekopon-capability`, and `dekopon-protocol`,
+  along with its 41 `#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]` derives, the
+  `schemars` workspace dependency, the one test that called `schemars::schema_for!`, and the lint
+  job's `cargo check -p dekopon-core -p dekopon-capability -p dekopon-protocol --locked` step, which
+  existed only to keep the feature-off state compilable. This reverses `891b4a1`, which flipped the
+  three crates to `default = []`, added `default-features = false` to the `dekopon-protocol`
+  workspace entry, and added that CI step; the feature it made opt-in is now gone rather than
+  merely off. Removing a feature from three published crates is a breaking change: a dependent that
+  writes `features = ["schemars"]` against any of them no longer resolves, and the resource types no
+  longer derive `JsonSchema` for out-of-tree JSON Schema generation. Nothing in the workspace,
+  `dekopon-console`, or any provider repository enabled it.
 
 ### Fixed
 
