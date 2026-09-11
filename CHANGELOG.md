@@ -489,6 +489,16 @@ All notable changes to Dekopon are documented here. The format is based on
   resolved value below it fails that invocation as `invalid-material` before the provider runs,
   logging `broker_secret_credential_failed`, rather than becoming a needle short enough to deny
   unrelated responses.
+- Every Telegram Bot API failure now renders without its URL. The Bot API puts the bot token in
+  each request path, reqwest retains that URL on send and body-read failures and prints it in both
+  the `Display` and the `Debug` of its error, and `TransportError` is public, `Debug`, and
+  re-exported from a published crate — so an out-of-tree embedder that printed one printed the
+  token. Only `getMe` and the shared response decoder stripped it; `getUpdates`, `getFile`, the
+  file download and each of its body chunks, `sendChatAction` and its response body, `sendMessage`,
+  and `sendPhoto` did not. All ten now build that error through one Telegram-local constructor, so
+  a new call site cannot forget. Nothing leaked out of the daemon, which logs `category()` alone.
+  Slack, Discord, and WhatsApp send their token in a header, so their URLs remain in the error as
+  legitimate trace content.
 
 ## [0.12.0] - 2026-08-29
 

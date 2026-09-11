@@ -1478,6 +1478,190 @@ async fn aggregate_telegram_connect_failures_never_render_bot_tokens() {
     );
 }
 
+/// Every Bot API call carries the bot token in its path, so every failure of one is a place the
+/// credential can escape through `TransportError`'s `Debug`. This drives each credential-bearing
+/// call to a failure and proves the rendered error never contains the token, while the peer
+/// asserts the token really was on the wire.
+#[tokio::test]
+async fn telegram_call_failures_never_render_bot_tokens() {
+    use std::error::Error as _;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    const TOKEN: &str = "synthetic-telegram-token-every-call";
+    const FILE_PATH: &str = "documents/report.pdf";
+
+    let described = format!(r#"{{"ok":true,"result":{{"file_path":"{FILE_PATH}"}}}}"#);
+    let answered = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{described}",
+        described.len()
+    );
+    // A hundred promised bytes and one delivered: the send succeeds and the read that follows it
+    // fails, which is the other half of the sites that hold a credential-bearing URL.
+    let truncated = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{";
+    // One entry per connection the transport is about to open, in order: the request line it must
+    // send, and what this peer answers before closing. `None` closes without a byte.
+    let script: Vec<(String, Option<String>)> = vec![
+        (format!("GET /bot{TOKEN}/getUpdates?"), None),
+        (format!("GET /bot{TOKEN}/getFile?"), None),
+        (format!("GET /bot{TOKEN}/getFile?"), Some(answered.clone())),
+        (format!("GET /file/bot{TOKEN}/{FILE_PATH} "), None),
+        (format!("GET /bot{TOKEN}/getFile?"), Some(answered)),
+        (
+            format!("GET /file/bot{TOKEN}/{FILE_PATH} "),
+            Some(truncated.to_owned()),
+        ),
+        (format!("POST /bot{TOKEN}/sendChatAction "), None),
+        (
+            format!("POST /bot{TOKEN}/sendChatAction "),
+            Some(truncated.to_owned()),
+        ),
+        (format!("POST /bot{TOKEN}/sendMessage "), None),
+        (format!("POST /bot{TOKEN}/sendPhoto "), None),
+    ];
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback peer");
+    let endpoint = format!("http://{}", listener.local_addr().expect("bound address"));
+    let peer = tokio::spawn(async move {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for (expected, answer) in script {
+                let (mut stream, _) = listener.accept().await.expect("accept Bot API call");
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    assert!(request.len() < 8192, "bounded request headers");
+                    request.push(stream.read_u8().await.expect("read request byte"));
+                }
+                let request = String::from_utf8(request).expect("ASCII headers");
+                assert!(
+                    request.starts_with(&expected),
+                    "the credential is on the wire: expected {expected:?}"
+                );
+                if let Some(answer) = answer {
+                    stream
+                        .write_all(answer.as_bytes())
+                        .await
+                        .expect("send scripted answer");
+                }
+            }
+        })
+        .await
+        .expect("peer lifetime is bounded");
+    });
+
+    let mut transport = crate::transport::telegram::TelegramTransport::new(
+        "token-bearing-telegram".to_owned(),
+        endpoint,
+        TOKEN.to_owned(),
+        ActivityMode::Native,
+    )
+    .expect("build token-owning transport");
+    let fetcher = transport
+        .asset_fetcher()
+        .expect("Telegram fetches its own attachments");
+    let activity = transport.activity().expect("native activity is configured");
+    let replier = transport.replier();
+    let asset = AssetSourceRef::Telegram {
+        file_id: "synthetic-file-id".to_owned(),
+    };
+    let showing = ActivityTarget::Telegram {
+        chat_id: 4242,
+        message_thread_id: None,
+    };
+    let answering = ReplyTarget::Telegram {
+        chat_id: 4242,
+        reply_to: None,
+        message_thread_id: None,
+    };
+
+    let failures = tokio::time::timeout(Duration::from_secs(10), async {
+        vec![
+            (
+                "poll",
+                transport.poll_once().await.expect_err("broken peer"),
+            ),
+            (
+                "fetch: getFile",
+                fetcher.fetch(&asset, 1024).await.expect_err("broken peer"),
+            ),
+            (
+                "fetch: download",
+                fetcher.fetch(&asset, 1024).await.expect_err("broken peer"),
+            ),
+            (
+                "fetch: download body",
+                fetcher.fetch(&asset, 1024).await.expect_err("broken peer"),
+            ),
+            (
+                "show",
+                activity
+                    .show(showing.clone())
+                    .await
+                    .expect_err("broken peer"),
+            ),
+            (
+                "show: response body",
+                activity.show(showing).await.expect_err("broken peer"),
+            ),
+            (
+                "send_text",
+                replier
+                    .reply(answering.clone(), OutboundReply::text("an answer"))
+                    .await
+                    .expect_err("broken peer"),
+            ),
+            (
+                "send_photo",
+                replier
+                    .reply(
+                        answering,
+                        OutboundReply {
+                            text: "a caption".to_owned(),
+                            images: generated_images(1),
+                        },
+                    )
+                    .await
+                    .expect_err("broken peer"),
+            ),
+        ]
+    })
+    .await
+    .expect("every call fails promptly");
+    peer.await.expect("peer completed");
+
+    for (call, error) in &failures {
+        let TransportError::Request(cause) = error else {
+            panic!("{call}: expected a typed request failure, got {error:?}");
+        };
+        let request = cause
+            .downcast_ref::<reqwest::Error>()
+            .expect("reqwest cause preserved");
+        assert!(
+            request.is_request() || request.is_body() || request.is_decode(),
+            "{call}: a send or a read of the answer failed"
+        );
+        assert!(
+            request.url().is_none(),
+            "{call}: credential-bearing URL is removed"
+        );
+        assert!(
+            request.source().is_some(),
+            "{call}: underlying failure remains inspectable"
+        );
+        for rendered in [
+            error.to_string(),
+            format!("{error:?}"),
+            dekopon_core::error_chain(error),
+        ] {
+            assert!(
+                !rendered.contains(TOKEN),
+                "{call}: bot token must never be rendered: {rendered}"
+            );
+        }
+        assert_eq!(error.category(), "request");
+    }
+}
+
 #[tokio::test]
 async fn a_discord_transport_resolves_its_pinned_rest_endpoint() {
     let directory = temporary();

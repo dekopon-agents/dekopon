@@ -90,20 +90,23 @@ impl TelegramTransport {
         format!("{}/bot{}/{method}", self.endpoint, self.token.expose())
     }
 
+    /// Runs one long-poll cycle and hands back what it failed with.
+    ///
+    /// Test-only: the daemon reaches [`Self::poll`] through [`Self::next`], which logs the
+    /// category and retries, so a poll failure is otherwise never returned to anything that
+    /// could render it.
+    #[cfg(test)]
+    pub(crate) async fn poll_once(&mut self) -> Result<(), TransportError> {
+        self.poll().await
+    }
+
     async fn poll(&mut self) -> Result<(), TransportError> {
         let url = format!(
             "{}?timeout={POLL_SECONDS}&offset={}",
             self.method("getUpdates"),
             self.offset
         );
-        let body = decode(
-            self.http
-                .get(url)
-                .send()
-                .await
-                .map_err(|source| TransportError::Request(Box::new(source)))?,
-        )
-        .await?;
+        let body = decode(self.http.get(url).send().await.map_err(request_failed)?).await?;
         let updates = body["result"]
             .as_array()
             .ok_or(TransportError::Response)?
@@ -267,8 +270,7 @@ impl ChatTransport for TelegramTransport {
                     .get(self.method("getMe"))
                     .send()
                     .await
-                    // Telegram puts the credential in the URL, which reqwest retains on failure.
-                    .map_err(|source| TransportError::Request(Box::new(source.without_url())))?,
+                    .map_err(request_failed)?,
             )
             .await?;
             let handle = body["result"]["username"]
@@ -343,7 +345,7 @@ impl AssetFetcher for TelegramReplier {
                     .query(&[("file_id", file_id.as_str())])
                     .send()
                     .await
-                    .map_err(|source| TransportError::Request(Box::new(source)))?,
+                    .map_err(request_failed)?,
             )
             .await?;
             let path = described["result"]["file_path"]
@@ -358,7 +360,7 @@ impl AssetFetcher for TelegramReplier {
                 ))
                 .send()
                 .await
-                .map_err(|source| TransportError::Request(Box::new(source)))?;
+                .map_err(request_failed)?;
             if !response.status().is_success() {
                 return Err(TransportError::Service {
                     code: response.status().as_u16().to_string(),
@@ -367,11 +369,7 @@ impl AssetFetcher for TelegramReplier {
             // Streamed against the ceiling rather than buffered and measured afterwards, for the
             // same reason the Slack path is: a declared length is not a bound.
             let mut body = Vec::new();
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(|source| TransportError::Request(Box::new(source)))?
-            {
+            while let Some(chunk) = response.chunk().await.map_err(request_failed)? {
                 if body.len().saturating_add(chunk.len()) as u64 > max_bytes {
                     return Err(TransportError::Service {
                         code: "asset-too-large".to_owned(),
@@ -431,11 +429,8 @@ impl ChatActivity for TelegramReplier {
                 .timeout(ACTIVITY_REQUEST_TIMEOUT)
                 .send()
                 .await
-                .map_err(|source| TransportError::Request(Box::new(source)))?;
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|source| TransportError::Request(Box::new(source)))?;
+                .map_err(request_failed)?;
+            let bytes = response.bytes().await.map_err(request_failed)?;
             let body = serde_json::from_slice::<Value>(&bytes)
                 .map_err(TransportError::MalformedResponse)?;
             if body["ok"] == Value::Bool(true) {
@@ -592,7 +587,7 @@ impl TelegramReplier {
             .body(serde_json::to_vec(&body).map_err(|_| TransportError::Response)?)
             .send()
             .await
-            .map_err(|source| TransportError::Request(Box::new(source)))?;
+            .map_err(request_failed)?;
         let response = decode(response).await?;
         let result = response["result"]
             .as_object()
@@ -659,7 +654,7 @@ impl TelegramReplier {
             .multipart(form)
             .send()
             .await
-            .map_err(|source| TransportError::Request(Box::new(source)))?;
+            .map_err(request_failed)?;
         let response = decode(response).await?;
         let result = response["result"]
             .as_object()
@@ -687,14 +682,22 @@ impl TelegramReplier {
     }
 }
 
+/// Turns one Bot API failure into a transport error with the credential-bearing URL removed.
+///
+/// Every call in this transport puts the bot token in its path, and reqwest keeps the request URL
+/// on both send and body-read failures, rendering it in the `Display` *and* the `Debug` of its
+/// error. `TransportError` is public, `Debug`, and re-exported from a published crate, so an
+/// embedder that printed one would print the token. This is the only construction of
+/// [`TransportError::Request`] from a Bot API call for exactly that reason; the client-builder
+/// failure in [`TelegramTransport::new`] carries no URL and is built inline.
+fn request_failed(source: reqwest::Error) -> TransportError {
+    TransportError::Request(Box::new(source.without_url()))
+}
+
 /// Decodes a Bot API response, turning `ok: false` into its stable description.
 async fn decode(response: reqwest::Response) -> Result<Value, TransportError> {
     let status = response.status();
-    let bytes = response
-        .bytes()
-        .await
-        // Body-read failures retain the same credential-bearing request URL as send failures.
-        .map_err(|source| TransportError::Request(Box::new(source.without_url())))?;
+    let bytes = response.bytes().await.map_err(request_failed)?;
     let body =
         serde_json::from_slice::<Value>(&bytes).map_err(TransportError::MalformedResponse)?;
     if status.is_success() && body["ok"] == Value::Bool(true) {
