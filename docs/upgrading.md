@@ -115,20 +115,28 @@ recursive cleanup or trusted import of legacy layout bytes. Preserve such data o
 than deleting entries to bypass a refusal. A separately provisioned private storage root starts
 empty and does not restore previous data.
 
-## Namespace quarantine removal (unreleased)
-
-Before upgrading, move `quarantine/` out of the storage root. The root-entry allowlist is now
-`layout`, `namespaces` and `writer.lock`; a root that still holds a `quarantine/` directory fails
-startup as a corrupt layout, empty or not. Move the directory somewhere outside the root and keep
-it — the broker will not read, migrate, or delete those bytes.
+## Provider storage: quarantine and startup validation removed (unreleased)
 
 Delete `storage.maxQuarantinedNamespaces` from the broker configuration. The storage limits object
 is `deny_unknown_fields`, so a configuration that still names it is refused with that field name.
 
-A namespace that does not validate at startup is no longer moved aside. Startup ends with
-`storage namespace <base> is corrupt` plus the check that failed, and the broker does not serve —
-including the namespaces that are healthy. Move the named base out of `namespaces/` to start
-without it; the bytes are yours to keep or discard, and nothing recreates them.
+Every existing root holds a `quarantine/` directory. An empty one is removed on the first start and
+logged as `storage_quarantine_removed`. One that holds anything refuses startup as a corrupt layout
+naming the directory: move it out of the root and keep or delete those bytes. The broker never reads
+them.
+
+Every authority-bound namespace — every chat memory on the default `authority-bound` continuity —
+starts a fresh, empty generation on its first use after this release, because the removed limit was
+part of the authority surface a generation is bound to. `stable` namespaces keep their data. The
+previous generations stay on disk and stay charged to the root quota; nothing collects them.
+
+A corrupt namespace no longer stops the broker, and startup no longer validates namespaces at all.
+The invocation that finds a corrupt authority pointer or generation resets that namespace to a
+fresh generation and fails once with `storage-corrupt`; its `storage_namespace_reset` record names
+the base token, both generations and the path. A namespace whose own shape is wrong — a symlink,
+hard link or wrong mode under `namespaces/<base>` — is skipped by the startup quota walk
+(`storage_root_entry_ignored`) and fails every grant naming the entry. To clear one, stop the broker
+and remove `namespaces/<base>`; that conversation starts empty.
 
 ## Two rules that apply to every upgrade
 

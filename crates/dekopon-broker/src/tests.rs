@@ -579,16 +579,28 @@ fn pre_execution_storage_failures_keep_their_public_category() {
             "storage-timeout",
         ),
         (
-            dekopon_storage_host::StorageHostError::Corrupt { scope: "test" },
+            dekopon_storage_host::StorageHostError::corrupt("test"),
             "storage-corrupt",
         ),
         (dekopon_storage_host::StorageHostError::Io, "storage-io"),
     ] {
-        assert_eq!(
-            super::BrokerError::Storage { source }.storage_failure_code(),
-            Some(expected)
-        );
+        let error = super::BrokerError::Storage { source };
+        assert_eq!(error.storage_failure_code(), Some(expected));
+        assert!(!error.storage_namespace_reset(), "{expected}");
     }
+
+    // A reset keeps the corrupt code; only whether the store is already usable again differs.
+    let reset = super::BrokerError::Storage {
+        source: dekopon_storage_host::StorageHostError::Corrupt {
+            scope: "authority-pointer",
+            namespace: None,
+            generation: None,
+            path: None,
+            reset: Some("fresh".to_owned()),
+        },
+    };
+    assert_eq!(reset.storage_failure_code(), Some("storage-corrupt"));
+    assert!(reset.storage_namespace_reset());
 }
 
 /// A permanent exhaustion is not a momentary outage. The bounded in-memory audit does not evict,

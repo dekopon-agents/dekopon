@@ -14,8 +14,41 @@ use dekopon_storage_host::{
     ContinuityPolicy, Durability, LockLevel, OpenOptions, StorageGrantRequest, StorageHost,
     StorageHostError, StorageLimits,
 };
-use dekopon_test_support::snapshot_tree;
+use dekopon_test_support::{CaptureLayer, snapshot_tree};
 use tempfile::TempDir;
+use tracing_subscriber::layer::SubscriberExt as _;
+
+/// Runs `body` with every storage log record on this thread captured.
+fn captured<T>(body: impl FnOnce() -> T) -> (T, CaptureLayer) {
+    let capture = CaptureLayer::workspace();
+    let value = tracing::subscriber::with_default(
+        tracing_subscriber::registry().with(capture.clone()),
+        body,
+    );
+    (value, capture)
+}
+
+/// The only namespace base under `root`.
+fn only_base(root: &Path) -> std::path::PathBuf {
+    let mut bases = fs::read_dir(root.join("namespaces"))
+        .expect("namespace root")
+        .map(|entry| entry.expect("base entry").path())
+        .collect::<Vec<_>>();
+    assert_eq!(bases.len(), 1, "{bases:?}");
+    bases.remove(0)
+}
+
+/// Every generation directory under one base, sorted.
+fn generations(base: &Path) -> Vec<String> {
+    let mut names = fs::read_dir(base)
+        .expect("base entries")
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
 
 fn fixture() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
     let temporary = tempfile::tempdir().expect("temporary directory");
@@ -745,7 +778,7 @@ fn sparse_growth_obeys_the_exact_file_bound_and_one_byte_over_mutates_nothing() 
 }
 
 #[test]
-fn a_hard_linked_logical_file_refuses_startup_instead_of_being_served() {
+fn a_hard_linked_logical_file_fails_its_own_grant_and_not_the_broker() {
     let (_temporary, root, key) = fixture();
     let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
     let mut writer = host
@@ -765,18 +798,8 @@ fn a_hard_linked_logical_file_refuses_startup_instead_of_being_served() {
     writer.commit().expect("commit");
     drop(host);
 
-    let base = fs::read_dir(root.join("namespaces"))
-        .expect("base")
-        .next()
-        .expect("one base")
-        .expect("entry")
-        .path();
-    let generation = fs::read_dir(base)
-        .expect("generation")
-        .filter_map(Result::ok)
-        .find(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-        .expect("one generation")
-        .path();
+    let base = only_base(&root);
+    let generation = base.join(generations(&base).remove(0));
     let data = generation.join("data");
     let original = fs::read_dir(&data)
         .expect("data")
@@ -786,10 +809,37 @@ fn a_hard_linked_logical_file_refuses_startup_instead_of_being_served() {
         .path();
     fs::hard_link(&original, data.join("c".repeat(64))).expect("hard link");
 
-    assert!(matches!(
-        StorageHost::open(&root, &key, StorageLimits::default()),
-        Err(StorageHostError::CorruptNamespace { .. })
+    let (host, startup) = captured(|| StorageHost::open(&root, &key, StorageLimits::default()));
+    let host = host.expect("one namespace's hard link does not stop the broker");
+    let logged = startup.events_text();
+    assert!(logged.contains("storage_root_entry_ignored"), "{logged}");
+    assert!(logged.contains("private-file"), "{logged}");
+    assert!(logged.contains(&*base.to_string_lossy()), "{logged}");
+
+    // A second link is outside the store's shape, and a fresh generation beside it would fail the
+    // same scan, so the grant is refused naming the file and nothing on disk changes.
+    let before = tree_snapshot(&root);
+    let refused = host.grant(request(
+        b"authority",
+        ContinuityPolicy::Stable,
+        "hard-link-read",
+        StorageAccess::ReadOnly,
     ));
+    let Err(StorageHostError::Corrupt {
+        scope: "private-file",
+        path: Some(path),
+        reset: None,
+        ..
+    }) = &refused
+    else {
+        panic!("expected an unreset private-file refusal, got {refused:?}");
+    };
+    assert!(path.starts_with(&data), "{}", path.display());
+    assert_eq!(
+        before,
+        tree_snapshot(&root),
+        "a refused grant changes nothing"
+    );
 }
 
 #[test]
@@ -1521,76 +1571,212 @@ fn stable_reactivation_survives_restart() {
 }
 
 #[test]
-fn a_corrupt_namespace_refuses_startup_naming_the_namespace_and_the_cause() {
+fn a_corrupt_authority_pointer_resets_the_namespace_once() {
     let (_temporary, root, key) = fixture();
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
-    let first = host
-        .grant(scoped_request(
+    let first_scope = |invocation: &str, access| {
+        scoped_request(
             b"authority",
             ContinuityPolicy::AuthorityBound,
-            "corrupt-first",
-            StorageAccess::ReadWrite,
+            invocation,
+            access,
             "slack.t0123abc.uone",
-        ))
-        .expect("first grant");
-    let mut first = host.begin(first).expect("first transaction");
+        )
+    };
+    let second_scope = |invocation: &str, access| {
+        scoped_request(
+            b"authority",
+            ContinuityPolicy::AuthorityBound,
+            invocation,
+            access,
+            "slack.t0123abc.utwo",
+        )
+    };
+    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
+    let mut first = host
+        .begin(
+            host.grant(first_scope("corrupt-first", StorageAccess::ReadWrite))
+                .expect("first grant"),
+        )
+        .expect("first transaction");
     first
         .jsonl_append("turns.jsonl", 0, br#"{"scope":"first"}"#)
         .expect("first append");
     first.commit().expect("first commit");
-    let first_base = fs::read_dir(root.join("namespaces"))
-        .expect("bases")
-        .next()
-        .expect("first base")
-        .expect("entry")
-        .path();
-
-    let second = host
-        .grant(scoped_request(
-            b"authority",
-            ContinuityPolicy::AuthorityBound,
-            "corrupt-second",
-            StorageAccess::ReadWrite,
-            "slack.t0123abc.utwo",
-        ))
-        .expect("second grant");
-    let mut second = host.begin(second).expect("second transaction");
+    let first_base = only_base(&root);
+    let mut second = host
+        .begin(
+            host.grant(second_scope("corrupt-second", StorageAccess::ReadWrite))
+                .expect("second grant"),
+        )
+        .expect("second transaction");
     second
         .jsonl_append("turns.jsonl", 0, br#"{"scope":"second"}"#)
         .expect("second append");
     second.commit().expect("second commit");
     drop(host);
 
-    // A regular, private, single-link file still needs valid schema and a namespace-key MAC. A
-    // shallow usage scan alone would accept this corruption and leave the base live.
-    fs::write(first_base.join("current"), b"{}\n").expect("corrupt pointer document");
+    // Still a private single-link JSON document naming a real epoch, so nothing but the pointer
+    // check itself can object to it.
+    let pointer = first_base.join("current");
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&pointer).expect("pointer")).expect("pointer document");
+    document["authority"] = serde_json::Value::from("not-a-token");
+    fs::write(&pointer, serde_json::to_vec(&document).expect("encode")).expect("corrupt pointer");
     let token = first_base
         .file_name()
         .expect("base token")
         .to_string_lossy()
         .into_owned();
-    let Err(error) = StorageHost::open(&root, &key, StorageLimits::default()) else {
-        panic!("a corrupt namespace must stop the broker");
-    };
-    let StorageHostError::CorruptNamespace { namespace, source } = &error else {
-        panic!("expected a named namespace refusal, got {error}");
+    let [previous] = <[String; 1]>::try_from(generations(&first_base)).expect("one generation");
+
+    let host = StorageHost::open(&root, &key, StorageLimits::default())
+        .expect("a corrupt namespace does not stop the broker");
+
+    let (refused, log) =
+        captured(|| host.grant(first_scope("corrupt-reset", StorageAccess::ReadOnly)));
+    let error = refused.expect_err("the invocation that finds the corruption fails");
+    assert!(error.namespace_reset(), "{error}");
+    let StorageHostError::Corrupt {
+        scope: "authority-pointer",
+        namespace: Some(namespace),
+        generation: Some(generation),
+        path: Some(path),
+        reset: Some(fresh),
+    } = &error
+    else {
+        panic!("expected a reset authority-pointer corruption, got {error:?}");
     };
     assert_eq!(*namespace, token);
-    assert!(
-        matches!(
-            **source,
-            StorageHostError::Corrupt {
-                scope: "authority-pointer"
-            }
-        ),
-        "{source}"
+    assert_eq!(*generation, previous);
+    assert_eq!(*path, pointer);
+    assert_ne!(*fresh, previous);
+    let logged = log.events_text();
+    assert_eq!(
+        logged.matches("storage_namespace_reset").count(),
+        1,
+        "{logged}"
     );
-    // The operator reads one rendered chain, so both halves have to survive Display.
+    for field in [
+        token.as_str(),
+        previous.as_str(),
+        fresh.as_str(),
+        "authority-pointer",
+    ] {
+        assert!(logged.contains(field), "{field} missing from {logged}");
+    }
+    // The operator reads one rendered chain, so the location has to survive Display.
     let rendered = error_chain(&error);
     assert!(rendered.contains(&token), "{rendered}");
     assert!(rendered.contains("authority-pointer"), "{rendered}");
-    // The healthy neighbour is untouched on disk; only startup refuses.
-    assert!(root.join("namespaces").join(&token).exists());
+
+    // The next invocation lands on the fresh generation, and the corrupt one is still on disk.
+    let (retried, log) = captured(|| {
+        let mut retried = host
+            .begin(
+                host.grant(first_scope("corrupt-retry", StorageAccess::ReadOnly))
+                    .expect("the retry is granted"),
+            )
+            .expect("retry transaction");
+        let size = retried.jsonl_size("turns.jsonl");
+        retried.finish_read().expect("finish retry");
+        size
+    });
+    assert!(
+        matches!(retried, Err(StorageHostError::NotFound)),
+        "{retried:?}"
+    );
+    assert!(!log.saw("storage_namespace_reset"), "the reset repeated");
+    let kept = generations(&first_base);
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    assert!(kept.contains(&previous) && kept.contains(fresh), "{kept:?}");
+
+    // The neighbour never noticed.
+    let mut neighbour = host
+        .begin(
+            host.grant(second_scope("neighbour-read", StorageAccess::ReadOnly))
+                .expect("neighbour grant"),
+        )
+        .expect("neighbour transaction");
+    assert_eq!(
+        neighbour.jsonl_size("turns.jsonl").expect("neighbour data"),
+        19
+    );
+    neighbour.finish_read().expect("finish neighbour");
+}
+
+#[test]
+fn a_corrupt_stable_generation_is_moved_aside_and_reset() {
+    let (_temporary, root, key) = fixture();
+    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
+    let mut writer = host
+        .begin(
+            host.grant(request(
+                b"authority",
+                ContinuityPolicy::Stable,
+                "stable-seed",
+                StorageAccess::ReadWrite,
+            ))
+            .expect("grant"),
+        )
+        .expect("transaction");
+    writer
+        .jsonl_append("turns.jsonl", 0, br#"{"turn":1}"#)
+        .expect("append");
+    writer.commit().expect("commit");
+
+    let base = only_base(&root);
+    let [stable] = <[String; 1]>::try_from(generations(&base)).expect("one generation");
+    // A private file, so the base scan accepts it; only the logical-name check refuses the name.
+    let stray = base.join(&stable).join("data").join("not-a-token");
+    fs::write(&stray, b"stray").expect("stray logical entry");
+    fs::set_permissions(&stray, fs::Permissions::from_mode(0o600)).expect("stray mode");
+
+    let refused = host.grant(request(
+        b"authority",
+        ContinuityPolicy::Stable,
+        "stable-reset",
+        StorageAccess::ReadOnly,
+    ));
+    let Err(
+        error @ StorageHostError::Corrupt {
+            scope: "logical-token",
+            generation: Some(generation),
+            reset: Some(fresh),
+            ..
+        },
+    ) = &refused
+    else {
+        panic!("expected a reset logical-token corruption, got {refused:?}");
+    };
+    assert!(error.namespace_reset());
+    assert_eq!(*generation, stable);
+    // Stable continuity keeps its deterministic name: the fresh generation takes it, and the
+    // corrupt one moved to a new token beside it.
+    assert_eq!(*fresh, stable);
+    let kept = generations(&base);
+    assert_eq!(kept.len(), 2, "{kept:?}");
+    let aside = kept
+        .iter()
+        .find(|name| **name != stable)
+        .expect("the set-aside generation");
+    assert!(base.join(aside).join("data").join("not-a-token").exists());
+
+    let mut retried = host
+        .begin(
+            host.grant(request(
+                b"authority",
+                ContinuityPolicy::Stable,
+                "stable-retry",
+                StorageAccess::ReadOnly,
+            ))
+            .expect("the retry is granted"),
+        )
+        .expect("retry transaction");
+    assert!(matches!(
+        retried.jsonl_size("turns.jsonl"),
+        Err(StorageHostError::NotFound)
+    ));
+    retried.finish_read().expect("finish retry");
 }
 
 #[test]
@@ -1644,13 +1830,32 @@ fn symlink_substitution_is_never_followed_at_any_namespace_tree_level() {
         let replacement = temporary.path().join(format!("substituted-{level}"));
         fs::rename(&victim, &replacement).expect("move trusted entry out of tree");
         symlink(&replacement, &victim).expect("substitute symlink");
+        let outside = snapshot_tree(temporary.path())
+            .into_iter()
+            .filter(|entry| !entry.relative.starts_with("storage"))
+            .map(|entry| (entry.relative, entry.contents))
+            .collect::<Vec<_>>();
 
+        let host = StorageHost::open(&root, &key, StorageLimits::default())
+            .unwrap_or_else(|error| panic!("level {level} stopped the broker: {error}"));
+        let refused = host.grant(request(
+            b"authority",
+            ContinuityPolicy::Stable,
+            &format!("substitution-{level}-read"),
+            StorageAccess::ReadOnly,
+        ));
         assert!(
-            matches!(
-                StorageHost::open(&root, &key, StorageLimits::default()),
-                Err(StorageHostError::CorruptNamespace { .. })
-            ),
-            "level {level} was followed instead of refused"
+            matches!(refused, Err(StorageHostError::Corrupt { reset: None, .. })),
+            "level {level} was followed or reset instead of refused: {refused:?}"
+        );
+        assert_eq!(
+            outside,
+            snapshot_tree(temporary.path())
+                .into_iter()
+                .filter(|entry| !entry.relative.starts_with("storage"))
+                .map(|entry| (entry.relative, entry.contents))
+                .collect::<Vec<_>>(),
+            "level {level}: the symlink target changed"
         );
     }
 }
@@ -1728,7 +1933,7 @@ fn initialized_root_never_recreates_missing_layout_entries_or_accepts_unknown_on
     let before = tree_snapshot(&root);
     assert!(matches!(
         StorageHost::open(&root, &key, StorageLimits::default()),
-        Err(StorageHostError::CorruptLayout)
+        Err(StorageHostError::CorruptLayout { .. })
     ));
     assert_eq!(
         before,
@@ -1744,7 +1949,7 @@ fn initialized_root_never_recreates_missing_layout_entries_or_accepts_unknown_on
     fs::set_permissions(&unknown, fs::Permissions::from_mode(0o600)).expect("unknown mode");
     assert!(matches!(
         StorageHost::open(&root, &key, StorageLimits::default()),
-        Err(StorageHostError::CorruptLayout)
+        Err(StorageHostError::CorruptLayout { .. })
     ));
 }
 
@@ -1754,20 +1959,41 @@ fn a_root_retaining_the_removed_quarantine_directory_is_refused() {
     let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
     drop(host);
 
-    // The root-entry allowlist no longer admits `quarantine`, so a root written by a release that
-    // still had one does not start. The operator moves those bytes out; startup never touches them.
+    // Bytes an earlier release set aside are the operator's to keep or delete, so a quarantine
+    // that still holds any refuses startup, naming the directory, and startup touches nothing.
     let retired = root.join("quarantine");
     fs::create_dir(&retired).expect("retired quarantine directory");
     fs::set_permissions(&retired, fs::Permissions::from_mode(0o700)).expect("retired mode");
+    fs::write(retired.join("set-aside"), b"kept").expect("quarantined bytes");
     let before = tree_snapshot(&root);
-    assert!(matches!(
-        StorageHost::open(&root, &key, StorageLimits::default()),
-        Err(StorageHostError::CorruptLayout)
-    ));
+    let refused = StorageHost::open(&root, &key, StorageLimits::default());
+    let Err(StorageHostError::CorruptLayout { path }) = &refused else {
+        panic!("expected a corrupt layout naming quarantine, got {refused:?}");
+    };
+    assert_eq!(*path, retired);
     assert_eq!(
         before,
         tree_snapshot(&root),
         "a refused root keeps every byte it had"
+    );
+}
+
+#[test]
+fn an_empty_retired_quarantine_directory_is_removed_at_startup() {
+    let (_temporary, root, key) = fixture();
+    drop(StorageHost::open(&root, &key, StorageLimits::default()).expect("host"));
+
+    // Every root an earlier release initialized holds one, empty unless something was set aside.
+    let retired = root.join("quarantine");
+    fs::create_dir(&retired).expect("retired quarantine directory");
+    fs::set_permissions(&retired, fs::Permissions::from_mode(0o700)).expect("retired mode");
+    let (host, log) = captured(|| StorageHost::open(&root, &key, StorageLimits::default()));
+    host.expect("an empty quarantine is not retained data");
+    assert!(!retired.exists());
+    assert!(
+        log.saw("storage_quarantine_removed"),
+        "{}",
+        log.events_text()
     );
 }
 

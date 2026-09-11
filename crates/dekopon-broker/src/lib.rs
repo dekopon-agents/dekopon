@@ -3870,6 +3870,7 @@ where
             tracing::info_span!(
                 "broker.execute",
                 storage = true,
+                storage.reset = tracing::field::Empty,
                 outcome = tracing::field::Empty,
                 error = tracing::field::Empty,
             )
@@ -4232,12 +4233,22 @@ where
 
         let storage_grant = match storage_preparation.take() {
             None => None,
-            Some(preparation) => Some(
-                tokio::task::spawn_blocking(move || preparation.materialize())
-                    .await
-                    .map_err(|source| BrokerError::StorageTask { source })?
-                    .map_err(|source| BrokerError::Storage { source })?,
-            ),
+            Some(preparation) => {
+                // Carried onto the blocking thread so a reset the host logs there lands in this
+                // invocation's trace rather than in no span at all.
+                let span = tracing::Span::current();
+                let materialized = tokio::task::spawn_blocking(move || {
+                    span.in_scope(|| preparation.materialize())
+                })
+                .await
+                .map_err(|source| BrokerError::StorageTask { source })?;
+                Some(materialized.map_err(|source| {
+                    if source.namespace_reset() {
+                        tracing::Span::current().record("storage.reset", true);
+                    }
+                    BrokerError::Storage { source }
+                })?)
+            }
         };
 
         // Legacy credentials remain owner-selected by capability/agent. A public DRN is different:
@@ -5129,8 +5140,7 @@ fn public_host_error(error: &BrokerHostError, route: CapabilityRoute) -> &'stati
             dekopon_storage_host::StorageHostError::Busy => "storage-busy",
             dekopon_storage_host::StorageHostError::Timeout => "storage-timeout",
             dekopon_storage_host::StorageHostError::Corrupt { .. }
-            | dekopon_storage_host::StorageHostError::CorruptNamespace { .. }
-            | dekopon_storage_host::StorageHostError::CorruptLayout
+            | dekopon_storage_host::StorageHostError::CorruptLayout { .. }
             | dekopon_storage_host::StorageHostError::KeyMismatch => "storage-corrupt",
             _ => "storage-io",
         },
@@ -5261,11 +5271,19 @@ impl BrokerError {
             dekopon_storage_host::StorageHostError::Busy => "storage-busy",
             dekopon_storage_host::StorageHostError::Timeout => "storage-timeout",
             dekopon_storage_host::StorageHostError::Corrupt { .. }
-            | dekopon_storage_host::StorageHostError::CorruptNamespace { .. }
-            | dekopon_storage_host::StorageHostError::CorruptLayout
+            | dekopon_storage_host::StorageHostError::CorruptLayout { .. }
             | dekopon_storage_host::StorageHostError::KeyMismatch => "storage-corrupt",
             _ => "storage-io",
         })
+    }
+
+    /// Whether a storage failure rotated its namespace to a fresh, empty generation.
+    ///
+    /// The same `storage-corrupt` code either way; this is what lets the answer say the stored
+    /// state is gone and an immediate retry will run, instead of asking for reconciliation.
+    #[must_use]
+    pub const fn storage_namespace_reset(&self) -> bool {
+        matches!(self, Self::Storage { source } if source.namespace_reset())
     }
 
     /// Stable class for an exhaustion that no resubmission can outlast.

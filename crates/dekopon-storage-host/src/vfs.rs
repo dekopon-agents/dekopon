@@ -130,9 +130,7 @@ impl StorageHandle {
             self.write_direct(&state.token, None, planned)?;
             self.entries
                 .get_mut(&state.token)
-                .ok_or(StorageHostError::Corrupt {
-                    scope: "handle-entry",
-                })?
+                .ok_or(StorageHostError::corrupt("handle-entry"))?
                 .absent();
             self.pending_delete.remove(&state.token);
         }

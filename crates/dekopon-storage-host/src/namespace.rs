@@ -2,6 +2,7 @@
 
 use std::{
     fs::{File, TryLockError},
+    path::PathBuf,
     time::{Duration, Instant},
 };
 
@@ -13,7 +14,10 @@ use crate::{
         DOMAIN_AUDIT_SCOPE, DOMAIN_AUTHORITY, DOMAIN_GENERATION, DOMAIN_NAMESPACE_PATH, StorageKey,
         random_bytes,
     },
-    layout::{Directory, ENTRY_CHARGE, EntryKind, Usage, scan_usage, usage_with_directory_entry},
+    layout::{
+        Directory, ENTRY_CHARGE, EntryKind, EntryMetadata, Usage, scan_usage,
+        usage_with_directory_entry,
+    },
 };
 
 const POINTER_VERSION: &str = "dekopon.dev/storage-authority-pointer/v1alpha1";
@@ -29,6 +33,17 @@ pub(crate) struct Namespace {
     pub(crate) _base_lease: File,
 }
 
+/// Why a plan rotates its namespace to a fresh generation instead of opening the one it names.
+#[derive(Debug)]
+pub(crate) struct Reset {
+    /// The check the retained state failed.
+    pub(crate) check: &'static str,
+    /// The generation that failed it, when the retained state still named one.
+    pub(crate) previous_generation: Option<String>,
+    /// The entry that failed it.
+    pub(crate) path: Option<PathBuf>,
+}
+
 /// A fully materialized, non-mutating namespace plan.
 ///
 /// Random epochs, MACed pointers, existing target lengths, and the base lease are all
@@ -40,12 +55,26 @@ pub(crate) struct NamespacePlan {
     generation_token: String,
     authority_pointer: Option<Vec<u8>>,
     remove_authority_pointer: bool,
+    /// The name a corrupt stable generation is moved to, freeing its deterministic name.
+    set_aside: Option<String>,
+    reset: Option<Reset>,
     existing_base: Option<Directory>,
     existing_base_lease: Option<File>,
     before_usage: Usage,
     reserved_bytes: u64,
     reserved_entries: u64,
     maximum_generation_peak_bytes: u64,
+}
+
+/// The generation one grant opens and the pointer housekeeping selecting it takes.
+struct Selection {
+    generation_token: String,
+    authority_pointer: Option<Vec<u8>>,
+    /// Length of the stale pointer a stable grant removes.
+    removed_pointer_length: Option<u64>,
+    /// Measured peak of the retained generation this grant reopens; `None` when it creates one.
+    retained_peak_bytes: Option<u64>,
+    set_aside: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -80,108 +109,87 @@ impl NamespacePlan {
         debug_assert_ne!(base_token, scope_commitment);
         let authority = key.token(DOMAIN_AUTHORITY, &[request.authority_surface()]);
 
-        let (existing_base, existing_base_lease, before_usage) =
-            if namespaces_root.exists(&base_token)? {
-                let base = namespaces_root.open_directory(&base_token)?;
-                let lease = base.open_private("base.lock", false)?;
-                lock_exclusive(&lease, lock_timeout_ms)?;
-                if !namespaces_root.retains_child(&base_token, &base)? {
-                    return Err(StorageHostError::Busy);
-                }
-                let usage = usage_with_directory_entry(scan_usage(&base, maximum_entries)?)?;
-                (Some(base), Some(lease), usage)
-            } else {
-                (None, None, Usage::default())
-            };
+        // Faults up to here are the base's own shape: a symlink, a hard link, or a wrong mode
+        // anywhere under it. A fresh generation would sit beside them and fail the same scan, so
+        // they fail the grant, naming the entry, and nothing is rotated.
+        let (existing_base, existing_base_lease, before_usage, pointer_length) = (|| {
+            if !namespaces_root.exists(&base_token)? {
+                return Ok((None, None, Usage::default(), None));
+            }
+            let base = namespaces_root.open_directory(&base_token)?;
+            let lease = base.open_private("base.lock", false)?;
+            lock_exclusive(&lease, lock_timeout_ms)?;
+            if !namespaces_root.retains_child(&base_token, &base)? {
+                return Err(StorageHostError::Busy);
+            }
+            let usage = usage_with_directory_entry(scan_usage(&base, maximum_entries)?)?;
+            let pointer_length = file_length(&base, "current")?;
+            Ok((Some(base), Some(lease), usage, pointer_length))
+        })()
+        .map_err(|error: StorageHostError| error.in_namespace(&base_token, None))?;
 
-        let previous_pointer = match &existing_base {
-            Some(base) => read_pointer(base, key, &base_token)?,
-            None => None,
+        let base = existing_base.as_ref();
+        let select = |reset| {
+            select_generation(
+                base,
+                key,
+                &base_token,
+                &authority,
+                request.continuity_policy(),
+                pointer_length,
+                maximum_entries,
+                reset,
+            )
         };
-        let stable_generation = key.token(DOMAIN_GENERATION, &[base_token.as_bytes(), b"stable"]);
-        let (generation_token, authority_pointer, remove_authority_pointer, generation_must_exist) =
-            match request.continuity_policy() {
-                ContinuityPolicy::Stable => {
-                    // A stale authority pointer must not survive a period of explicit stable
-                    // continuity. Otherwise authority-bound A -> stable -> A would reopen A's old
-                    // random epoch instead of minting the required non-reusing generation.
-                    (
-                        stable_generation.clone(),
-                        None,
-                        previous_pointer.is_some(),
-                        false,
-                    )
-                }
-                ContinuityPolicy::AuthorityBound => {
-                    if let Some(pointer) = &previous_pointer
-                        && pointer.authority == authority
-                    {
-                        (
-                            key.token(
-                                DOMAIN_GENERATION,
-                                &[base_token.as_bytes(), pointer.epoch.as_bytes()],
-                            ),
-                            None,
-                            false,
-                            true,
-                        )
-                    } else {
-                        let epoch = crate::key::hex(&random_bytes(32)?);
-                        let generation = key.token(
-                            DOMAIN_GENERATION,
-                            &[base_token.as_bytes(), epoch.as_bytes()],
-                        );
-                        let pointer = encode_pointer(key, &base_token, authority, epoch)?;
-                        (generation, Some(pointer), false, false)
-                    }
-                }
-            };
+        let (selection, reset) = match select(false) {
+            Ok(selection) => (selection, None),
+            // Every check selection makes is about the generation the namespace names, so moving
+            // past that generation is the whole repair.
+            Err(StorageHostError::Corrupt {
+                scope,
+                generation,
+                path,
+                ..
+            }) => (
+                select(true)?,
+                Some(Reset {
+                    check: scope,
+                    previous_generation: generation,
+                    path,
+                }),
+            ),
+            Err(error) => return Err(error),
+        };
 
         let mut simulation = Simulation::default();
-        let base = existing_base.as_ref();
         if base.is_none() {
             simulation.create_entry(0)?; // namespace base directory
             simulation.create_entry(0)?; // base.lock
         }
-        let generation = base
-            .and_then(|base| open_optional_directory(base, &generation_token).transpose())
-            .transpose()?;
-        if generation_must_exist && generation.is_none() {
-            return Err(StorageHostError::Corrupt {
-                scope: "missing-current-generation",
-            });
-        }
-        let maximum_generation_peak_bytes;
-        if let Some(generation) = &generation {
-            require_directory(generation, "data")?;
-            require_private_file(generation, "lease.lock")?;
-            maximum_generation_peak_bytes =
-                usage_with_directory_entry(scan_usage(generation, maximum_entries)?)?.bytes;
-        } else {
-            simulation.create_entry(0)?; // generation directory
-            simulation.create_entry(0)?; // data directory
-            simulation.create_entry(0)?; // lease.lock
-            maximum_generation_peak_bytes = 3_u64
-                .checked_mul(ENTRY_CHARGE)
-                .ok_or(StorageHostError::Arithmetic)?;
-        }
-
-        let old_pointer_length = base
-            .and_then(|base| file_length(base, "current").transpose())
-            .transpose()?;
-        if let Some(pointer) = &authority_pointer {
-            simulation.replace(old_pointer_length, pointer.len() as u64)?;
-        } else if remove_authority_pointer {
-            simulation.remove(old_pointer_length.ok_or(StorageHostError::Corrupt {
-                scope: "missing-authority-pointer",
-            })?)?;
+        let maximum_generation_peak_bytes = match selection.retained_peak_bytes {
+            Some(peak) => peak,
+            None => {
+                simulation.create_entry(0)?; // generation directory
+                simulation.create_entry(0)?; // data directory
+                simulation.create_entry(0)?; // lease.lock
+                3_u64
+                    .checked_mul(ENTRY_CHARGE)
+                    .ok_or(StorageHostError::Arithmetic)?
+            }
+        };
+        if let Some(pointer) = &selection.authority_pointer {
+            simulation.replace(pointer_length, pointer.len() as u64)?;
+        } else if let Some(length) = selection.removed_pointer_length {
+            simulation.remove(length)?;
         }
         Ok(Self {
             base_token,
             scope_commitment,
-            generation_token,
-            authority_pointer,
-            remove_authority_pointer,
+            generation_token: selection.generation_token,
+            authority_pointer: selection.authority_pointer,
+            remove_authority_pointer: selection.removed_pointer_length.is_some(),
+            set_aside: selection.set_aside,
+            reset,
             existing_base,
             existing_base_lease,
             before_usage,
@@ -207,6 +215,11 @@ impl NamespacePlan {
         self.maximum_generation_peak_bytes
     }
 
+    /// Why this plan rotates past the generation its namespace names, when it does.
+    pub(crate) const fn take_reset(&mut self) -> Option<Reset> {
+        self.reset.take()
+    }
+
     pub(crate) fn apply(
         mut self,
         namespaces_root: &Directory,
@@ -221,13 +234,13 @@ impl NamespacePlan {
                 lock_exclusive(&lease, lock_timeout_ms)?;
                 (base, lease)
             }
-            _ => {
-                return Err(StorageHostError::Corrupt {
-                    scope: "namespace-plan",
-                });
-            }
+            _ => return Err(StorageHostError::corrupt("namespace-plan")),
         };
 
+        if let Some(aside) = &self.set_aside {
+            base.rename_to(&self.generation_token, &base, aside)?;
+            base.sync()?;
+        }
         let (directory, data_directory) = ensure_generation(&base, &self.generation_token)?;
         if let Some(pointer) = &self.authority_pointer {
             base.replace_private("current", pointer)?;
@@ -244,6 +257,156 @@ impl NamespacePlan {
             _base_lease: base_lease,
         })
     }
+}
+
+/// Chooses the generation a grant opens and checks the retained one it would reopen.
+///
+/// With `reset`, nothing retained is read or reopened: an authority-bound namespace mints a fresh
+/// epoch and a stable one moves its generation aside, so the fault that failed the first pass is
+/// no longer on the path.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "every argument is one already-derived input of the single selection both passes share"
+)]
+fn select_generation(
+    base: Option<&Directory>,
+    key: &StorageKey,
+    base_token: &str,
+    authority: &str,
+    policy: ContinuityPolicy,
+    pointer_length: Option<u64>,
+    maximum_entries: u64,
+    reset: bool,
+) -> Result<Selection, StorageHostError> {
+    match policy {
+        ContinuityPolicy::Stable => {
+            let generation_token =
+                key.token(DOMAIN_GENERATION, &[base_token.as_bytes(), b"stable"]);
+            let set_aside = match base {
+                Some(base) if reset && base.exists(&generation_token)? => {
+                    Some(crate::key::hex(&random_bytes(32)?))
+                }
+                _ => None,
+            };
+            let retained_peak_bytes = match base {
+                Some(base) if set_aside.is_none() => {
+                    retained_generation(base, base_token, &generation_token, maximum_entries)?
+                }
+                _ => None,
+            };
+            // A stale authority pointer must not survive a period of explicit stable continuity.
+            // Otherwise authority-bound A -> stable -> A would reopen A's old random epoch instead
+            // of minting the required non-reusing generation. Its contents are irrelevant here, so
+            // they are not read.
+            Ok(Selection {
+                generation_token,
+                authority_pointer: None,
+                removed_pointer_length: pointer_length,
+                retained_peak_bytes,
+                set_aside,
+            })
+        }
+        ContinuityPolicy::AuthorityBound => {
+            let previous = match base {
+                Some(base) if !reset => read_pointer(base, key, base_token)?,
+                _ => None,
+            };
+            if let Some(base) = base
+                && let Some(pointer) = previous.filter(|pointer| pointer.authority == authority)
+            {
+                let generation_token = key.token(
+                    DOMAIN_GENERATION,
+                    &[base_token.as_bytes(), pointer.epoch.as_bytes()],
+                );
+                let retained =
+                    retained_generation(base, base_token, &generation_token, maximum_entries)?
+                        .ok_or_else(|| {
+                            base.corrupt(&generation_token, "missing-current-generation")
+                                .in_namespace(base_token, Some(&generation_token))
+                        })?;
+                return Ok(Selection {
+                    generation_token,
+                    authority_pointer: None,
+                    removed_pointer_length: None,
+                    retained_peak_bytes: Some(retained),
+                    set_aside: None,
+                });
+            }
+            let epoch = crate::key::hex(&random_bytes(32)?);
+            let generation_token = key.token(
+                DOMAIN_GENERATION,
+                &[base_token.as_bytes(), epoch.as_bytes()],
+            );
+            let authority_pointer = encode_pointer(key, base_token, authority.to_owned(), epoch)?;
+            let retained_peak_bytes = match base {
+                Some(base) => {
+                    retained_generation(base, base_token, &generation_token, maximum_entries)?
+                }
+                None => None,
+            };
+            Ok(Selection {
+                generation_token,
+                authority_pointer: Some(authority_pointer),
+                removed_pointer_length: None,
+                retained_peak_bytes,
+                set_aside: None,
+            })
+        }
+    }
+}
+
+/// Checks one retained generation's shape and measures its peak; `None` when it does not exist.
+fn retained_generation(
+    base: &Directory,
+    base_token: &str,
+    generation_token: &str,
+    maximum_entries: u64,
+) -> Result<Option<u64>, StorageHostError> {
+    let located = |error: StorageHostError| error.in_namespace(base_token, Some(generation_token));
+    let generation = match base.metadata(generation_token).map_err(located)? {
+        None => return Ok(None),
+        Some(metadata) if metadata.kind == EntryKind::Directory => {
+            base.open_directory(generation_token).map_err(located)?
+        }
+        Some(_) => return Err(located(base.corrupt(generation_token, "generation-type"))),
+    };
+    (|| {
+        let data = match generation.metadata("data")? {
+            Some(metadata) if metadata.kind == EntryKind::Directory => {
+                generation.open_directory("data")?
+            }
+            _ => return Err(generation.corrupt("data", "generation-layout")),
+        };
+        if !generation.exists("lease.lock")? {
+            return Err(generation.corrupt("lease.lock", "generation-layout"));
+        }
+        let _ = generation.open_private("lease.lock", false)?;
+        for token in data.entries_bounded(maximum_entries)? {
+            logical_file(&data, &token)?;
+        }
+        Ok(Some(
+            usage_with_directory_entry(scan_usage(&generation, maximum_entries)?)?.bytes,
+        ))
+    })()
+    .map_err(located)
+}
+
+/// The one shape a retained logical file has: a token-named, single-link regular private file.
+pub(crate) fn logical_file(
+    data: &Directory,
+    token: &str,
+) -> Result<EntryMetadata, StorageHostError> {
+    if !is_token(token) {
+        return Err(data.corrupt(token, "logical-token"));
+    }
+    let metadata = data
+        .metadata(token)?
+        .ok_or_else(|| data.corrupt(token, "logical-token"))?;
+    if metadata.kind != EntryKind::File || metadata.nlink != 1 {
+        return Err(data.corrupt(token, "logical-file"));
+    }
+    let _ = data.open_private(token, false)?;
+    Ok(metadata)
 }
 
 #[derive(Default)]
@@ -323,40 +486,6 @@ impl Simulation {
     }
 }
 
-fn open_optional_directory(
-    parent: &Directory,
-    name: &str,
-) -> Result<Option<Directory>, StorageHostError> {
-    match parent.metadata(name)? {
-        None => Ok(None),
-        Some(metadata) if metadata.kind == EntryKind::Directory => {
-            parent.open_directory(name).map(Some)
-        }
-        Some(_) => Err(StorageHostError::Corrupt {
-            scope: "generation-type",
-        }),
-    }
-}
-
-fn require_directory(parent: &Directory, name: &str) -> Result<(), StorageHostError> {
-    if parent
-        .metadata(name)?
-        .is_some_and(|metadata| metadata.kind == EntryKind::Directory)
-    {
-        let _ = parent.open_directory(name)?;
-        Ok(())
-    } else {
-        Err(StorageHostError::Corrupt {
-            scope: "generation-layout",
-        })
-    }
-}
-
-fn require_private_file(parent: &Directory, name: &str) -> Result<(), StorageHostError> {
-    let _ = parent.open_private(name, false)?;
-    Ok(())
-}
-
 fn file_length(parent: &Directory, name: &str) -> Result<Option<u64>, StorageHostError> {
     match parent.metadata(name)? {
         None => Ok(None),
@@ -364,9 +493,7 @@ fn file_length(parent: &Directory, name: &str) -> Result<Option<u64>, StorageHos
             let _ = parent.open_private(name, false)?;
             Ok(Some(metadata.len))
         }
-        Some(_) => Err(StorageHostError::Corrupt {
-            scope: "housekeeping-file",
-        }),
+        Some(_) => Err(parent.corrupt(name, "housekeeping-file")),
     }
 }
 
@@ -387,9 +514,8 @@ fn encode_pointer(
         authority,
         epoch,
     };
-    let encoded = serde_json::to_vec(&body).map_err(|_| StorageHostError::Corrupt {
-        scope: "authority-pointer",
-    })?;
+    let encoded =
+        serde_json::to_vec(&body).map_err(|_| StorageHostError::corrupt("authority-pointer"))?;
     let document = PointerDocument {
         api_version: body.api_version,
         authority: body.authority,
@@ -399,9 +525,7 @@ fn encode_pointer(
             &[base_token.as_bytes(), encoded.as_slice()],
         ),
     };
-    serde_json::to_vec(&document).map_err(|_| StorageHostError::Corrupt {
-        scope: "authority-pointer",
-    })
+    serde_json::to_vec(&document).map_err(|_| StorageHostError::corrupt("authority-pointer"))
 }
 
 fn ensure_generation(
@@ -431,9 +555,7 @@ fn read_pointer(
     )
     .map_err(|error| {
         crate::report_decode_failure("authority-pointer", &error);
-        StorageHostError::Corrupt {
-            scope: "authority-pointer",
-        }
+        base_directory.corrupt("current", "authority-pointer")
     })?;
     let body = PointerBody {
         api_version: document.api_version.clone(),
@@ -445,9 +567,8 @@ fn read_pointer(
         reason = "serializing this owned all-string pointer body has no failing case; only the \
                   decode above can actually reject retained bytes"
     )]
-    let encoded = serde_json::to_vec(&body).map_err(|_| StorageHostError::Corrupt {
-        scope: "authority-pointer",
-    })?;
+    let encoded =
+        serde_json::to_vec(&body).map_err(|_| StorageHostError::corrupt("authority-pointer"))?;
     let expected = key.commitment(
         crate::key::DOMAIN_MANIFEST,
         &[base_token.as_bytes(), encoded.as_slice()],
@@ -457,147 +578,19 @@ fn read_pointer(
         || !is_token(&document.epoch)
         || !is_token(&document.authority)
     {
-        return Err(StorageHostError::Corrupt {
-            scope: "authority-pointer",
+        // A pointer that still decodes names the generation it pointed at, which is the directory
+        // an operator goes looking for.
+        let previous = is_token(&document.epoch).then(|| {
+            key.token(
+                DOMAIN_GENERATION,
+                &[base_token.as_bytes(), document.epoch.as_bytes()],
+            )
         });
+        return Err(base_directory
+            .corrupt("current", "authority-pointer")
+            .in_namespace(base_token, previous.as_deref()));
     }
     Ok(Some(document))
-}
-
-pub(crate) fn current_generation(
-    base_directory: &Directory,
-    key: &StorageKey,
-    base_token: &str,
-) -> Result<Option<String>, StorageHostError> {
-    Ok(Some(match read_pointer(base_directory, key, base_token)? {
-        Some(document) => key.token(
-            DOMAIN_GENERATION,
-            &[base_token.as_bytes(), document.epoch.as_bytes()],
-        ),
-        // Absence of an authority pointer is the explicit stable publication state. Treat the
-        // deterministic stable generation as current.
-        None => key.token(DOMAIN_GENERATION, &[base_token.as_bytes(), b"stable"]),
-    }))
-}
-
-/// Validates one complete isolated namespace without following or trusting any path entry.
-///
-/// An error returned here names one base as the thing that is wrong; the caller refuses the whole
-/// root rather than setting that base aside, so no unvalidated tree is ever retained or served.
-pub(crate) fn validate_namespace_base(
-    base_directory: &Directory,
-    key: &StorageKey,
-    base_token: &str,
-) -> Result<(), StorageHostError> {
-    if !is_token(base_token) {
-        return Err(StorageHostError::Corrupt {
-            scope: "namespace-token",
-        });
-    }
-    let mut generations = Vec::new();
-    let mut saw_base_lease = false;
-    for name in base_directory.entries()? {
-        let metadata = base_directory
-            .metadata(&name)?
-            .ok_or(StorageHostError::Corrupt {
-                scope: "namespace-entry",
-            })?;
-        match (name.as_str(), metadata.kind) {
-            ("base.lock", EntryKind::File) => {
-                if file_length(base_directory, "base.lock")? != Some(0) {
-                    return Err(StorageHostError::Corrupt {
-                        scope: "base-lease",
-                    });
-                }
-                saw_base_lease = true;
-            }
-            ("current", EntryKind::File) => {
-                // Full decoding/MAC verification follows below.
-                let _ = file_length(base_directory, "current")?;
-            }
-
-            (_, EntryKind::Directory) if is_token(&name) => generations.push(name),
-            _ => {
-                return Err(StorageHostError::Corrupt {
-                    scope: "namespace-entry",
-                });
-            }
-        }
-    }
-    if !saw_base_lease || generations.is_empty() {
-        return Err(StorageHostError::Corrupt {
-            scope: "namespace-layout",
-        });
-    }
-
-    let current = current_generation(base_directory, key, base_token)?;
-    if current
-        .as_ref()
-        .is_some_and(|current| !generations.contains(current))
-    {
-        return Err(StorageHostError::Corrupt {
-            scope: "missing-current-generation",
-        });
-    }
-    for generation_token in generations {
-        let generation = base_directory.open_directory(&generation_token)?;
-        validate_generation(&generation)?;
-    }
-    Ok(())
-}
-
-fn validate_generation(generation: &Directory) -> Result<(), StorageHostError> {
-    let mut saw_data = false;
-    let mut saw_lease = false;
-    for name in generation.entries()? {
-        let metadata = generation
-            .metadata(&name)?
-            .ok_or(StorageHostError::Corrupt {
-                scope: "generation-entry",
-            })?;
-        match (name.as_str(), metadata.kind) {
-            ("data", EntryKind::Directory) => {
-                let data = generation.open_directory("data")?;
-                for token in data.entries()? {
-                    if !is_token(&token) {
-                        return Err(StorageHostError::Corrupt {
-                            scope: "logical-token",
-                        });
-                    }
-                    let metadata = data.metadata(&token)?.ok_or(StorageHostError::Corrupt {
-                        scope: "logical-file",
-                    })?;
-                    if metadata.kind != EntryKind::File || metadata.nlink != 1 {
-                        return Err(StorageHostError::Corrupt {
-                            scope: "logical-file",
-                        });
-                    }
-                    let _ = data.open_private(&token, false)?;
-                }
-                saw_data = true;
-            }
-            ("lease.lock", EntryKind::File) => {
-                if file_length(generation, "lease.lock")? != Some(0) {
-                    return Err(StorageHostError::Corrupt {
-                        scope: "generation-lease",
-                    });
-                }
-                saw_lease = true;
-            }
-
-            _ => {
-                return Err(StorageHostError::Corrupt {
-                    scope: "generation-entry",
-                });
-            }
-        }
-    }
-    if !saw_data || !saw_lease {
-        return Err(StorageHostError::Corrupt {
-            scope: "generation-layout",
-        });
-    }
-    Ok(())
 }
 
 /// Takes a lease, polling until another holder releases it or `timeout_ms` elapses.

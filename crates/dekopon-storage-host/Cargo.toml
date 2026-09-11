@@ -28,6 +28,7 @@ tracing.workspace = true
 [dev-dependencies]
 dekopon-test-support = { path = "../dekopon-test-support" }
 tempfile.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

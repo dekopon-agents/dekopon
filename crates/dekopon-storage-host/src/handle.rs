@@ -4,7 +4,7 @@ use crate::{
     key::{DOMAIN_LOGICAL_PATH, DOMAIN_OPERATION_EVIDENCE, DOMAIN_OUTPUT_EVIDENCE, StorageKey},
     layout::{ENTRY_CHARGE, EntryKind, Usage, scan_usage, usage_with_directory_entry},
     metrics::byte_bucket,
-    namespace::{Namespace, is_token, lock_exclusive},
+    namespace::{Namespace, lock_exclusive, logical_file},
     quota::{QuotaLedger, Reservation},
     vfs::LockLevel,
 };
@@ -143,46 +143,12 @@ impl StorageHandle {
         grant: StorageGrant,
         ledger: Arc<QuotaLedger>,
     ) -> Result<Self, StorageHostError> {
-        // `Namespace::resolve` already holds the base lease. This is the one defined lock order.
-        let lease = grant
-            .namespace
-            .directory
-            .open_private("lease.lock", false)?;
-        lock_exclusive(&lease, grant.limits.lock_timeout_ms)?;
-
-        // The one tree walk of this invocation. Every mutation below carries its own delta
-        // forward instead of asking the tree again.
-        let usage = usage_with_directory_entry(scan_usage(
-            &grant.namespace.directory,
-            grant.limits.startup_max_entries,
-        )?)?;
-        let mut baseline_files = BTreeSet::new();
-        for token in grant
-            .namespace
-            .data_directory
-            .entries_bounded(grant.limits.max_files_per_namespace)?
-        {
-            if !is_token(&token) {
-                return Err(StorageHostError::Corrupt {
-                    scope: "logical-token",
-                });
-            }
-            let metadata = grant.namespace.data_directory.metadata(&token)?.ok_or(
-                StorageHostError::Corrupt {
-                    scope: "logical-token",
-                },
-            )?;
-            if metadata.kind != EntryKind::File || metadata.nlink != 1 {
-                return Err(StorageHostError::Corrupt {
-                    scope: "logical-file",
-                });
-            }
-            if metadata.len > grant.limits.max_file_bytes {
-                return Err(StorageHostError::QuotaExceeded);
-            }
-            let _ = grant.namespace.data_directory.open_private(&token, false)?;
-            baseline_files.insert(token);
-        }
+        let (lease, usage, baseline_files) = Self::open_generation(&grant).map_err(|error| {
+            error.in_namespace(
+                &grant.namespace.base_token,
+                Some(&grant.namespace.generation_token),
+            )
+        })?;
         if baseline_files.len() as u64 > grant.limits.max_files_per_namespace {
             return Err(StorageHostError::QuotaExceeded);
         }
@@ -221,6 +187,38 @@ impl StorageHandle {
             finalized: false,
             failed: false,
         })
+    }
+
+    /// Takes the generation lease, walks the generation once, and lists its logical files.
+    ///
+    /// The grant already checked this generation's shape and rotated past a corrupt one while it
+    /// held the base lease, which it still holds; a corruption here is a race with a writer that
+    /// does not take the leases.
+    fn open_generation(
+        grant: &StorageGrant,
+    ) -> Result<(File, Usage, BTreeSet<String>), StorageHostError> {
+        // `Namespace::resolve` already holds the base lease. This is the one defined lock order.
+        let lease = grant
+            .namespace
+            .directory
+            .open_private("lease.lock", false)?;
+        lock_exclusive(&lease, grant.limits.lock_timeout_ms)?;
+
+        // The one tree walk of this invocation. Every mutation below carries its own delta
+        // forward instead of asking the tree again.
+        let usage = usage_with_directory_entry(scan_usage(
+            &grant.namespace.directory,
+            grant.limits.startup_max_entries,
+        )?)?;
+        let data = &grant.namespace.data_directory;
+        let mut baseline_files = BTreeSet::new();
+        for token in data.entries_bounded(grant.limits.max_files_per_namespace)? {
+            if logical_file(data, &token)?.len > grant.limits.max_file_bytes {
+                return Err(StorageHostError::QuotaExceeded);
+            }
+            baseline_files.insert(token);
+        }
+        Ok((lease, usage, baseline_files))
     }
 
     #[must_use]
@@ -354,9 +352,10 @@ impl StorageHandle {
                     (true, metadata.len)
                 }
                 Some(_) => {
-                    return Err(StorageHostError::Corrupt {
-                        scope: "logical-file",
-                    });
+                    return Err(self
+                        .namespace
+                        .data_directory
+                        .corrupt(&token, "logical-file"));
                 }
                 None => (false, 0),
             };
@@ -386,9 +385,10 @@ impl StorageHandle {
     }
 
     pub(crate) fn load_token(&mut self, token: &str) -> Result<(), StorageHostError> {
-        let entry = self.entries.get(token).ok_or(StorageHostError::Corrupt {
-            scope: "logical-entry",
-        })?;
+        let entry = self
+            .entries
+            .get(token)
+            .ok_or(StorageHostError::corrupt("logical-entry"))?;
         if entry.loaded {
             return Ok(());
         }
@@ -405,9 +405,10 @@ impl StorageHandle {
             .data_directory
             .read_bounded(token, self.limits.max_file_bytes)?;
         if bytes.len() as u64 != entry.size {
-            return Err(StorageHostError::Corrupt {
-                scope: "logical-size-race",
-            });
+            return Err(self
+                .namespace
+                .data_directory
+                .corrupt(token, "logical-size-race"));
         }
         let entry = self.entries.get_mut(token).expect("entry checked above");
         entry.data = Some(bytes);

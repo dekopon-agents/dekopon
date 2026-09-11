@@ -548,7 +548,11 @@ async fn write_broker_failure(
     } else if let Some(code) = error.storage_failure_code() {
         (
             code,
-            "broker-owned provider storage failed before provider execution",
+            if error.storage_namespace_reset() {
+                "storage for this conversation was corrupt and has been reset; retry"
+            } else {
+                "broker-owned provider storage failed before provider execution"
+            },
             ConnectionError::Broker { source: error },
         )
     } else {
