@@ -3,6 +3,10 @@
 //! This crate performs no authorization transition. It consumes a broker-produced
 //! [`HttpConstraints`] value beneath independent native ceilings and returns bounded buffers plus
 //! sanitized evidence metadata. Provider-facing WIT conversion remains in `dekopon-broker-host`.
+//!
+//! A credentialed context runs the credential echo check on every response it receives: a response
+//! whose body or any header value carries the raw or encoded secret is refused as
+//! [`ErrorCode::Denied`] rather than returned to the component.
 
 #![forbid(unsafe_code)]
 
@@ -53,7 +57,7 @@ pub const DEFAULT_MAX_HEADER_BYTES: usize = 64 * 1024;
 pub const MAX_CREDENTIAL_BYTES: usize = 4096;
 /// Minimum secret bytes accepted into a legacy scheme-prefixed bound credential.
 ///
-/// A credential's secret is also its direct-reflection needle, and that check is a substring
+/// A credential's secret is also its echo needle, and the credential echo check is a substring
 /// search over every response the credentialed context receives. A short or
 /// phrase-shaped secret would therefore refuse responses that never carried it: `token` as a
 /// credential would deny every JSON body that mentions the word. Sixteen bytes is shorter than any
@@ -239,7 +243,8 @@ pub struct BoundCredential {
     companion_header: Option<(HeaderName, Redacted<String>)>,
     destinations: Vec<String>,
     secret_binding: Option<SecretBindingIdentity>,
-    reflection_needles: Vec<SecretBytes>,
+    /// What the credential echo check searches every response for.
+    echo_needles: Vec<SecretBytes>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -261,7 +266,7 @@ impl fmt::Debug for BoundCredential {
             )
             .field("destinations", &self.destinations)
             .field("secret_binding", &self.secret_binding.is_some())
-            .field("reflection_needles", &self.reflection_needles)
+            .field("echo_needles", &self.echo_needles)
             .finish()
     }
 }
@@ -271,9 +276,9 @@ impl BoundCredential {
     ///
     /// The secret is held to the same shape [`Self::secret_bearer`] holds a DRN-resolved one to —
     /// printable ASCII with no whitespace or control bytes, between [`MIN_CREDENTIAL_BYTES`] and
-    /// [`MAX_CREDENTIAL_BYTES`] — because the value becomes this credential's direct-reflection
-    /// needle. Those two rules are what make the needle safe to substring-search for: a secret that
-    /// could be a word or a byte cannot reach the check and deny unrelated responses.
+    /// [`MAX_CREDENTIAL_BYTES`] — because the value becomes this credential's echo needle. Those
+    /// two rules are what make the needle safe to substring-search for: a secret that could be a
+    /// word or a byte cannot reach the credential echo check and deny unrelated responses.
     ///
     /// # Errors
     ///
@@ -300,7 +305,7 @@ impl BoundCredential {
             }
             // ASCII graphic excludes space, every other whitespace byte, the controls, and
             // everything non-ASCII: the header-value rule `render` relies on and the
-            // no-whitespace-or-controls rule the reflection needle relies on, in one test.
+            // no-whitespace-or-controls rule the echo needle relies on, in one test.
             if !value.bytes().all(|byte| byte.is_ascii_graphic()) {
                 return Err(invalid(
                     "secret contains whitespace, control, or non-ASCII bytes",
@@ -318,10 +323,10 @@ impl BoundCredential {
                 "destinations must be host or host:port authorities",
             ));
         }
-        // The legacy path is reflection-checked exactly as the DRN path is. The raw secret is the
-        // only needle it needs: the rendered `<scheme> <secret>` value strictly contains it, and
-        // `reflected_in` is a substring search, so a response carrying the rendered header already
-        // matches on the raw needle.
+        // The legacy path is echo-checked exactly as the DRN path is. The raw secret is the only
+        // needle it needs: the rendered `<scheme> <secret>` value strictly contains it, and
+        // `echoes_credential` is a substring search, so a response carrying the rendered header
+        // already matches on the raw needle.
         let needle = SecretBytes::new(secret.expose().as_bytes().to_vec());
         let header_value = Redacted::new(format!("{scheme} {}", secret.expose()));
         Ok(Self {
@@ -329,7 +334,7 @@ impl BoundCredential {
             companion_header: None,
             destinations,
             secret_binding: None,
-            reflection_needles: vec![needle],
+            echo_needles: vec![needle],
         })
     }
 
@@ -386,7 +391,7 @@ impl BoundCredential {
                 reason: "Bearer secret must be UTF-8",
             }
         })?;
-        // The resolved token becomes this credential's reflection needle, so it takes the same
+        // The resolved token becomes this credential's echo needle, so it takes the same
         // floor a legacy secret does: a one-byte needle would deny responses that never carried it.
         if token.len() < MIN_CREDENTIAL_BYTES {
             return Err(ConfigurationError::InvalidCredential {
@@ -411,9 +416,9 @@ impl BoundCredential {
                 grant: grant.clone(),
             }),
             // `Bearer <token>` is not a second needle: it strictly contains the token, the token is
-            // never empty, and `reflected_in` is a substring search — every response the rendered
-            // needle would catch the raw one already catches.
-            reflection_needles: vec![secret],
+            // never empty, and `echoes_credential` is a substring search — every response the
+            // rendered needle would catch the raw one already catches.
+            echo_needles: vec![secret],
         })
     }
 
@@ -427,7 +432,7 @@ impl BoundCredential {
                 reason: "Basic secret use requires a fixed username",
             });
         };
-        // The resolved password is a reflection needle beside the encoded pair, and takes the same
+        // The resolved password is an echo needle beside the encoded pair, and takes the same
         // floor for the same reason. Its own refusal, because "structurally invalid" would leave an
         // operator with a working password and no idea which rule it broke.
         if password.expose().len() < MIN_CREDENTIAL_BYTES {
@@ -462,7 +467,7 @@ impl BoundCredential {
             }),
             // The password and its base64 pair are independent needles; `Basic <encoded>` is not,
             // because it strictly contains the never-empty encoded pair.
-            reflection_needles: vec![password, SecretBytes::new(encoded.into_bytes())],
+            echo_needles: vec![password, SecretBytes::new(encoded.into_bytes())],
         })
     }
 
@@ -494,8 +499,8 @@ impl BoundCredential {
         }
     }
 
-    fn reflected_in(&self, response: &Response) -> bool {
-        self.reflection_needles.iter().any(|needle| {
+    fn echoes_credential(&self, response: &Response) -> bool {
+        self.echo_needles.iter().any(|needle| {
             let needle = needle.expose();
             !needle.is_empty()
                 && (contains_bytes(&response.body, needle)
@@ -996,11 +1001,11 @@ impl BufferedHttpClient {
             if self
                 .credential
                 .as_ref()
-                .is_some_and(|credential| credential.reflected_in(&response))
+                .is_some_and(|credential| credential.echoes_credential(&response))
             {
                 Err(http_error(
                     ErrorCode::Denied,
-                    "credential-bearing response reflected protected material",
+                    "credentialed response echoed the credential",
                 ))
             } else {
                 Ok((response, bytes))
@@ -2041,7 +2046,7 @@ mod tests {
             ("", secret(), destinations()),
             ("Bea rer", secret(), destinations()),
             ("Bearer", Redacted::new(String::new()), destinations()),
-            // The secret is this credential's reflection needle, so a short or phrase-shaped one
+            // The secret is this credential's echo needle, so a short or phrase-shaped one
             // is refused at construction rather than left to deny unrelated responses later.
             ("Bearer", Redacted::new("x".repeat(15)), destinations()),
             (
@@ -2289,7 +2294,7 @@ mod tests {
 
     #[test]
     fn a_drn_bound_bearer_secret_below_the_floor_is_refused() {
-        // A resolved secret is a reflection needle exactly as a legacy one is, so it takes the same
+        // A resolved secret is an echo needle exactly as a legacy one is, so it takes the same
         // floor. Without it a one-byte DRN secret would deny every response containing that byte.
         let grant = secret_grant("api.example.test", SecretSinkKind::HttpBearer, None, "/v1");
         let error = BoundCredential::secret_bearer(
@@ -2324,12 +2329,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn direct_credential_reflection_is_discarded() {
+    async fn direct_credential_echo_is_discarded() {
         let response: &[u8] =
             b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\nfixture-bearer-token";
         let server = LoopbackServer::once(response);
         let authority = server.authority().to_owned();
-        let secret = secret_grant(&authority, SecretSinkKind::HttpBearer, None, "/reflect");
+        let secret = secret_grant(&authority, SecretSinkKind::HttpBearer, None, "/echo");
         let credential = BoundCredential::secret_bearer(
             SecretBytes::new(b"fixture-bearer-token".to_vec()),
             &secret,
@@ -2346,12 +2351,12 @@ mod tests {
         let error = client
             .send(Request {
                 method: "GET".to_owned(),
-                uri: format!("http://{authority}/reflect"),
+                uri: format!("http://{authority}/echo"),
                 headers: Vec::new(),
                 body: Vec::new(),
             })
             .await
-            .expect_err("reflected token is never returned");
+            .expect_err("an echoed token is never returned");
         assert_eq!(error.code, ErrorCode::Denied);
         assert!(!error.message.contains("fixture-bearer-token"), "{error}");
         let evidence = client.into_evidence();
@@ -2361,8 +2366,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn legacy_credential_reflection_is_discarded() {
-        // The twin of `direct_credential_reflection_is_discarded` on the credential path that is
+    async fn legacy_credential_echo_is_discarded() {
+        // The twin of `direct_credential_echo_is_discarded` on the credential path that is
         // actually deployed. A `bearerToken` entry used to carry no needles at all, so an endpoint
         // that echoed the `authorization` header handed the token to the provider and then to the
         // model. One needle covers both shapes: the rendered `Bearer <secret>` value strictly
@@ -2384,12 +2389,12 @@ mod tests {
             let error = client
                 .send(Request {
                     method: "GET".to_owned(),
-                    uri: format!("http://{authority}/reflect"),
+                    uri: format!("http://{authority}/echo"),
                     headers: Vec::new(),
                     body: Vec::new(),
                 })
                 .await
-                .expect_err("a reflected legacy credential is never returned");
+                .expect_err("an echoed legacy credential is never returned");
             assert_eq!(error.code, ErrorCode::Denied);
             assert!(!error.message.contains("fixture-secret-value"), "{error}");
             // The call happened and is accounted for; only its answer is withheld.
