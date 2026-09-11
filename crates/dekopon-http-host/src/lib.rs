@@ -51,6 +51,22 @@ pub const DEFAULT_MAX_HEADERS: usize = 128;
 pub const DEFAULT_MAX_HEADER_BYTES: usize = 64 * 1024;
 /// Maximum secret bytes accepted into one bound credential.
 pub const MAX_CREDENTIAL_BYTES: usize = 4096;
+/// Minimum secret bytes accepted into a legacy scheme-prefixed bound credential.
+///
+/// A credential's secret is also its direct-reflection needle, and that check is a substring
+/// search over every response the credentialed context receives. A short or
+/// phrase-shaped secret would therefore refuse responses that never carried it: `token` as a
+/// credential would deny every JSON body that mentions the word. Sixteen bytes is shorter than any
+/// real bearer token — the shortest thing an issuer calls one is a 128-bit value, 22 characters in
+/// base64 and 32 in hex — and long enough that its appearance in a response body means the endpoint
+/// echoed the credential.
+///
+/// It applies to every constructor that turns a secret into a needle: the legacy scheme-prefixed
+/// credential and both DRN-bound sinks.
+pub const MIN_CREDENTIAL_BYTES: usize = 16;
+// Each of those constructors names this bound in the refusal an operator reads, because the number
+// is what makes the message actionable. This is what keeps the messages and the constant together.
+const _: () = assert!(MIN_CREDENTIAL_BYTES == 16);
 
 /// One ordered byte-valued HTTP header.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -252,6 +268,19 @@ impl fmt::Debug for BoundCredential {
 
 impl BoundCredential {
     /// Builds a scheme-prefixed credential such as `Bearer <secret>` or `token <secret>`.
+    ///
+    /// The secret is held to the same shape [`Self::secret_bearer`] holds a DRN-resolved one to —
+    /// printable ASCII with no whitespace or control bytes, between [`MIN_CREDENTIAL_BYTES`] and
+    /// [`MAX_CREDENTIAL_BYTES`] — because the value becomes this credential's direct-reflection
+    /// needle. Those two rules are what make the needle safe to substring-search for: a secret that
+    /// could be a word or a byte cannot reach the check and deny unrelated responses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigurationError::InvalidCredential`] naming the offending *field* — never any
+    /// part of the value — when the scheme is not a printable ASCII token, the secret is short,
+    /// oversized or carries whitespace or control bytes, or the destinations are not bare
+    /// authorities.
     pub fn bearer(
         scheme: &str,
         secret: Redacted<String>,
@@ -263,17 +292,19 @@ impl BoundCredential {
         }
         {
             let value = secret.expose();
-            if value.is_empty() {
-                return Err(invalid("secret must not be empty"));
+            if value.len() < MIN_CREDENTIAL_BYTES {
+                return Err(invalid("secret is shorter than the 16-byte minimum"));
             }
             if value.len() > MAX_CREDENTIAL_BYTES {
                 return Err(invalid("secret exceeds the credential byte limit"));
             }
-            if !value
-                .bytes()
-                .all(|byte| byte.is_ascii_graphic() || byte == b' ')
-            {
-                return Err(invalid("secret contains bytes invalid in a header value"));
+            // ASCII graphic excludes space, every other whitespace byte, the controls, and
+            // everything non-ASCII: the header-value rule `render` relies on and the
+            // no-whitespace-or-controls rule the reflection needle relies on, in one test.
+            if !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+                return Err(invalid(
+                    "secret contains whitespace, control, or non-ASCII bytes",
+                ));
             }
         }
         if destinations.is_empty() {
@@ -287,13 +318,18 @@ impl BoundCredential {
                 "destinations must be host or host:port authorities",
             ));
         }
+        // The legacy path is reflection-checked exactly as the DRN path is. The raw secret is the
+        // only needle it needs: the rendered `<scheme> <secret>` value strictly contains it, and
+        // `reflected_in` is a substring search, so a response carrying the rendered header already
+        // matches on the raw needle.
+        let needle = SecretBytes::new(secret.expose().as_bytes().to_vec());
         let header_value = Redacted::new(format!("{scheme} {}", secret.expose()));
         Ok(Self {
             header_value,
             companion_header: None,
             destinations,
             secret_binding: None,
-            reflection_needles: Vec::new(),
+            reflection_needles: vec![needle],
         })
     }
 
@@ -350,8 +386,14 @@ impl BoundCredential {
                 reason: "Bearer secret must be UTF-8",
             }
         })?;
-        if token.is_empty()
-            || token.len() > MAX_CREDENTIAL_BYTES
+        // The resolved token becomes this credential's reflection needle, so it takes the same
+        // floor a legacy secret does: a one-byte needle would deny responses that never carried it.
+        if token.len() < MIN_CREDENTIAL_BYTES {
+            return Err(ConfigurationError::InvalidCredential {
+                reason: "Bearer secret is shorter than the 16-byte minimum",
+            });
+        }
+        if token.len() > MAX_CREDENTIAL_BYTES
             || token
                 .bytes()
                 .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
@@ -362,13 +404,16 @@ impl BoundCredential {
         }
         let rendered = format!("Bearer {token}");
         Ok(Self {
-            header_value: Redacted::new(rendered.clone()),
+            header_value: Redacted::new(rendered),
             companion_header: None,
             destinations: grant.allowed_hosts.clone(),
             secret_binding: Some(SecretBindingIdentity {
                 grant: grant.clone(),
             }),
-            reflection_needles: vec![secret, SecretBytes::new(rendered.into_bytes())],
+            // `Bearer <token>` is not a second needle: it strictly contains the token, the token is
+            // never empty, and `reflected_in` is a substring search — every response the rendered
+            // needle would catch the raw one already catches.
+            reflection_needles: vec![secret],
         })
     }
 
@@ -382,11 +427,18 @@ impl BoundCredential {
                 reason: "Basic secret use requires a fixed username",
             });
         };
+        // The resolved password is a reflection needle beside the encoded pair, and takes the same
+        // floor for the same reason. Its own refusal, because "structurally invalid" would leave an
+        // operator with a working password and no idea which rule it broke.
+        if password.expose().len() < MIN_CREDENTIAL_BYTES {
+            return Err(ConfigurationError::InvalidCredential {
+                reason: "Basic secret is shorter than the 16-byte minimum",
+            });
+        }
         if grant.sink != SecretSinkKind::HttpBasic
             || username.is_empty()
             || username.contains(':')
             || username.bytes().any(|byte| byte.is_ascii_control())
-            || password.expose().is_empty()
             || password.expose().len() > MAX_CREDENTIAL_BYTES
             || password.expose().contains(&b'\n')
             || password.expose().contains(&b'\r')
@@ -402,17 +454,15 @@ impl BoundCredential {
         let encoded = STANDARD.encode(&pair);
         let rendered = format!("Basic {encoded}");
         Ok(Self {
-            header_value: Redacted::new(rendered.clone()),
+            header_value: Redacted::new(rendered),
             companion_header: None,
             destinations: grant.allowed_hosts.clone(),
             secret_binding: Some(SecretBindingIdentity {
                 grant: grant.clone(),
             }),
-            reflection_needles: vec![
-                password,
-                SecretBytes::new(encoded.into_bytes()),
-                SecretBytes::new(rendered.into_bytes()),
-            ],
+            // The password and its base64 pair are independent needles; `Basic <encoded>` is not,
+            // because it strictly contains the never-empty encoded pair.
+            reflection_needles: vec![password, SecretBytes::new(encoded.into_bytes())],
         })
     }
 
@@ -461,8 +511,8 @@ impl BoundCredential {
         #[allow(
             clippy::map_err_ignore,
             reason = "`InvalidHeaderValue` reports only that parsing failed, and `bearer` already \
-                      restricted these bytes to ASCII graphic and space; nothing derived from a \
-                      credential value may be reported anyway"
+                      restricted these bytes to ASCII graphic; nothing derived from a credential \
+                      value may be reported anyway"
         )]
         let mut value = HeaderValue::from_str(self.header_value.expose()).map_err(|_| {
             // Unreachable when construction validated the bytes; message carries no value detail.
@@ -1631,8 +1681,9 @@ mod tests {
 
     use super::{
         BoundCredential, BufferedHttpClient, ConfigurationError, ErrorCode, Header,
-        HttpCallEvidence, HttpHostCeilings, MAX_RESOLVED_ADDRESSES, Request, authority_matches,
-        bounded_addresses, bounded_message, is_forbidden_public_destination, map_reqwest_error,
+        HttpCallEvidence, HttpHostCeilings, MAX_RESOLVED_ADDRESSES, MIN_CREDENTIAL_BYTES, Request,
+        authority_matches, bounded_addresses, bounded_message, is_forbidden_public_destination,
+        map_reqwest_error,
     };
 
     fn grant(authority: String, method: &str) -> HttpConstraints {
@@ -1983,16 +2034,30 @@ mod tests {
 
     #[test]
     fn bound_credentials_fail_closed_on_structural_problems() {
-        let secret = || Redacted::new("secret".to_owned());
+        // Long enough to pass the length rule, so every case below fails on the field it names.
+        let secret = || Redacted::new("fixture-secret-value".to_owned());
         let destinations = || vec!["api.example.test".to_owned()];
         for (scheme, secret, destinations) in [
             ("", secret(), destinations()),
             ("Bea rer", secret(), destinations()),
             ("Bearer", Redacted::new(String::new()), destinations()),
+            // The secret is this credential's reflection needle, so a short or phrase-shaped one
+            // is refused at construction rather than left to deny unrelated responses later.
+            ("Bearer", Redacted::new("x".repeat(15)), destinations()),
+            (
+                "Bearer",
+                Redacted::new("phrase shaped secret".to_owned()),
+                destinations(),
+            ),
+            (
+                "Bearer",
+                Redacted::new("tab\tseparated-secret".to_owned()),
+                destinations(),
+            ),
             ("Bearer", Redacted::new("x".repeat(4097)), destinations()),
             (
                 "Bearer",
-                Redacted::new("bad\r\nheader".to_owned()),
+                Redacted::new("bad\r\nheader-value-here".to_owned()),
                 destinations(),
             ),
             ("Bearer", secret(), Vec::new()),
@@ -2008,10 +2073,17 @@ mod tests {
                 Err(ConfigurationError::InvalidCredential { .. })
             ));
         }
+        // Exactly the minimum is accepted; the bound is a floor, not a gap.
+        BoundCredential::bearer(
+            "Bearer",
+            Redacted::new("x".repeat(MIN_CREDENTIAL_BYTES)),
+            destinations(),
+        )
+        .expect("a minimum-length secret is a valid credential");
         // The one thing a credential error must never carry is the secret itself.
         let error = BoundCredential::bearer(
             "Bearer",
-            Redacted::new("tell-nobody\n".to_owned()),
+            Redacted::new("tell-nobody-not-even-once\n".to_owned()),
             destinations(),
         )
         .expect_err("control bytes are refused");
@@ -2026,9 +2098,11 @@ mod tests {
             None,
             "/v1/allowed",
         );
-        let credential =
-            BoundCredential::secret_bearer(SecretBytes::new(b"fixture-token".to_vec()), &original)
-                .expect("credential");
+        let credential = BoundCredential::secret_bearer(
+            SecretBytes::new(b"fixture-bearer-token".to_vec()),
+            &original,
+        )
+        .expect("credential");
         let mut swapped = original;
         swapped.allowed_paths = vec![HttpPathRule::Exact {
             path: "/v1/other".to_owned(),
@@ -2188,7 +2262,7 @@ mod tests {
             "http://127.0.0.1:9/api//v1/thing",
         ] {
             let credential = BoundCredential::secret_bearer(
-                SecretBytes::new(b"fixture-token".to_vec()),
+                SecretBytes::new(b"fixture-bearer-token".to_vec()),
                 &secret,
             )
             .expect("credential");
@@ -2213,16 +2287,54 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_drn_bound_bearer_secret_below_the_floor_is_refused() {
+        // A resolved secret is a reflection needle exactly as a legacy one is, so it takes the same
+        // floor. Without it a one-byte DRN secret would deny every response containing that byte.
+        let grant = secret_grant("api.example.test", SecretSinkKind::HttpBearer, None, "/v1");
+        let error = BoundCredential::secret_bearer(
+            SecretBytes::new(vec![b'x'; MIN_CREDENTIAL_BYTES - 1]),
+            &grant,
+        )
+        .expect_err("a short resolved secret is refused");
+        assert!(error.to_string().contains("16-byte minimum"), "{error}");
+        assert!(!error.to_string().contains('x'), "{error}");
+        BoundCredential::secret_bearer(SecretBytes::new(vec![b'x'; MIN_CREDENTIAL_BYTES]), &grant)
+            .expect("a minimum-length resolved secret is a valid credential");
+    }
+
+    #[test]
+    fn a_drn_bound_basic_secret_below_the_floor_is_refused() {
+        // The password is a needle beside the encoded pair, so the floor applies to it too.
+        let grant = secret_grant(
+            "api.example.test",
+            SecretSinkKind::HttpBasic,
+            Some("userA"),
+            "/v1",
+        );
+        let error = BoundCredential::secret_basic(
+            SecretBytes::new(vec![b'x'; MIN_CREDENTIAL_BYTES - 1]),
+            &grant,
+        )
+        .expect_err("a short resolved password is refused");
+        assert!(error.to_string().contains("16-byte minimum"), "{error}");
+        assert!(!error.to_string().contains('x'), "{error}");
+        BoundCredential::secret_basic(SecretBytes::new(vec![b'x'; MIN_CREDENTIAL_BYTES]), &grant)
+            .expect("a minimum-length resolved password is a valid credential");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn direct_credential_reflection_is_discarded() {
         let response: &[u8] =
-            b"HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nfixture-token";
+            b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\nfixture-bearer-token";
         let server = LoopbackServer::once(response);
         let authority = server.authority().to_owned();
         let secret = secret_grant(&authority, SecretSinkKind::HttpBearer, None, "/reflect");
-        let credential =
-            BoundCredential::secret_bearer(SecretBytes::new(b"fixture-token".to_vec()), &secret)
-                .expect("credential");
+        let credential = BoundCredential::secret_bearer(
+            SecretBytes::new(b"fixture-bearer-token".to_vec()),
+            &secret,
+        )
+        .expect("credential");
         let mut client = BufferedHttpClient::authorized_with_secret_credential(
             grant(authority.clone(), "GET"),
             secret,
@@ -2241,11 +2353,51 @@ mod tests {
             .await
             .expect_err("reflected token is never returned");
         assert_eq!(error.code, ErrorCode::Denied);
-        assert!(!error.message.contains("fixture-token"), "{error}");
+        assert!(!error.message.contains("fixture-bearer-token"), "{error}");
         let evidence = client.into_evidence();
         assert_eq!(evidence[0].status, Some(200));
         assert!(evidence[0].response_bytes > 0);
         server.join();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn legacy_credential_reflection_is_discarded() {
+        // The twin of `direct_credential_reflection_is_discarded` on the credential path that is
+        // actually deployed. A `bearerToken` entry used to carry no needles at all, so an endpoint
+        // that echoed the `authorization` header handed the token to the provider and then to the
+        // model. One needle covers both shapes: the rendered `Bearer <secret>` value strictly
+        // contains the raw secret, and the check is a substring search.
+        for body in ["fixture-secret-value", "Bearer fixture-secret-value"] {
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let server = LoopbackServer::once(response.as_bytes());
+            let authority = server.authority().to_owned();
+            let mut client = BufferedHttpClient::authorized_with_credential(
+                grant(authority.clone(), "GET"),
+                Some(credential_for(&authority)),
+                HttpHostCeilings::default(),
+                Duration::from_secs(5),
+            )
+            .expect("valid fixture authorization");
+            let error = client
+                .send(Request {
+                    method: "GET".to_owned(),
+                    uri: format!("http://{authority}/reflect"),
+                    headers: Vec::new(),
+                    body: Vec::new(),
+                })
+                .await
+                .expect_err("a reflected legacy credential is never returned");
+            assert_eq!(error.code, ErrorCode::Denied);
+            assert!(!error.message.contains("fixture-secret-value"), "{error}");
+            // The call happened and is accounted for; only its answer is withheld.
+            let evidence = client.into_evidence();
+            assert_eq!(evidence[0].status, Some(200));
+            assert!(evidence[0].credential_injected);
+            server.join();
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2443,14 +2595,15 @@ mod tests {
             assert!(rendered.contains("account identifier"), "{rendered}");
             assert!(!rendered.contains("fixture-access-token"), "{rendered}");
         }
-        // The access token itself is still validated by the bearer constructor underneath.
+        // The access token itself is still validated by the bearer constructor underneath, whose
+        // length floor subsumes the empty case.
         let error = BoundCredential::chatgpt_subscription(
             Redacted::new(String::new()),
             "acct-fixture",
             vec!["chatgpt.com".to_owned()],
         )
         .expect_err("an empty access token is refused");
-        assert!(error.to_string().contains("secret must not be empty"));
+        assert!(error.to_string().contains("16-byte minimum"), "{error}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
