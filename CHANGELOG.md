@@ -180,6 +180,13 @@ All notable changes to Dekopon are documented here. The format is based on
   `session-limit`, `byte-budget`, `unavailable`); a refused marker submits no proposal and the model
   reads that the *gateway* refused before the broker saw anything. Attachment bytes never enter model messages, conversation history,
   telemetry payloads, broker protocol, evidence, or audit.
+- `ChatScopeClaim::is_canonical_shape` decides the per-transport channel and conversation grammar
+  once, in `dekopon-broker-protocol`. `dekopon-broker` carried a byte-identical copy of that shape
+  function, its five service predicates and two lowercase helpers; both the broker's chat-grant
+  validation and its `ExternalSubject` correlation now call the protocol method, so the layer that
+  admits a scope and `DeliveryIdentity::is_canonical_for`, which already sat on those predicates,
+  can no longer drift into disagreeing about which Slack timestamp, Telegram topic or WhatsApp
+  triple is canonical. Behaviour is unchanged — the copies were identical when merged.
 
 ### Changed
 

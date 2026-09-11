@@ -348,6 +348,73 @@ impl ChatScopeClaim {
     pub fn is_bounded(&self) -> bool {
         bounded_scope_part(&self.channel) && bounded_scope_part(&self.conversation)
     }
+
+    /// Whether channel and conversation are the exact forms the claimed transport mints.
+    ///
+    /// One definition of the chat-scope grammar: the broker's grant validation, its
+    /// subject correlation, and [`DeliveryIdentity::is_canonical_for`] all decide the same
+    /// shapes here, so no layer can accept a scope another rejects. Structural only — it
+    /// consults no grant and decides nothing about authority — and it fails closed on any
+    /// value outside the wire bounds.
+    #[must_use]
+    pub fn is_canonical_shape(&self) -> bool {
+        if !self.is_bounded() {
+            return false;
+        }
+        match self.kind {
+            ChatTransportKind::Slack => {
+                lowercase_token(&self.channel)
+                    && (self.conversation == self.channel
+                        || self
+                            .conversation
+                            .split_once(':')
+                            .is_some_and(|(channel, timestamp)| {
+                                channel == self.channel && canonical_slack_timestamp(timestamp)
+                            }))
+            }
+            ChatTransportKind::Discord => {
+                // A Discord native thread is itself the channel used for routing and replies.
+                // There is no second thread identifier, so accepting two different decimals
+                // would create an alias for one transport-derived conversation.
+                self.conversation == self.channel && canonical_unsigned_decimal(&self.channel)
+            }
+            ChatTransportKind::Telegram => {
+                canonical_signed_decimal(&self.channel)
+                    && (self.conversation == self.channel
+                        || self
+                            .conversation
+                            .strip_prefix(&format!("{}:topic:", self.channel))
+                            .is_some_and(canonical_positive_service_decimal))
+            }
+            ChatTransportKind::Whatsapp => {
+                let mut parts = self.channel.split(':');
+                let canonical = parts.next().is_some_and(canonical_meta_decimal)
+                    && parts.next().is_some_and(canonical_meta_decimal)
+                    && parts.next().is_some_and(canonical_meta_decimal)
+                    && parts.next().is_none();
+                canonical && self.conversation == self.channel
+            }
+            ChatTransportKind::Local => {
+                lowercase_scope_value(&self.channel) && lowercase_scope_value(&self.conversation)
+            }
+        }
+    }
+}
+
+fn lowercase_token(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+fn lowercase_scope_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b'-' | b'_' | b':')
+        })
 }
 
 fn bounded_scope_part(value: &str) -> bool {

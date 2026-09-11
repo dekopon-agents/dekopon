@@ -637,6 +637,77 @@ fn chat_scope_turn_and_attestation_debug_are_fully_redacted_and_bounded() {
 }
 
 #[test]
+fn one_canonical_chat_scope_shape_decides_every_transport() {
+    let claim = |kind, channel: &str, conversation: &str| ChatScopeClaim {
+        transport: "scientist-slack".parse().expect("valid transport fixture"),
+        kind,
+        channel: channel.to_owned(),
+        conversation: conversation.to_owned(),
+    };
+
+    for (kind, channel, conversation) in [
+        (ChatTransportKind::Slack, "c0123abc", "c0123abc"),
+        (
+            ChatTransportKind::Slack,
+            "c0123abc",
+            "c0123abc:1712345678.000100",
+        ),
+        (ChatTransportKind::Discord, "123", "123"),
+        (ChatTransportKind::Telegram, "-1001", "-1001"),
+        (ChatTransportKind::Telegram, "-1001", "-1001:topic:7"),
+        (
+            ChatTransportKind::Whatsapp,
+            "123:456:16034700182",
+            "123:456:16034700182",
+        ),
+        (ChatTransportKind::Local, "cli.session-1", "cli.session-1:2"),
+    ] {
+        assert!(
+            claim(kind, channel, conversation).is_canonical_shape(),
+            "{kind} {channel} {conversation} is the form the transport mints"
+        );
+    }
+
+    for (kind, channel, conversation) in [
+        // Uppercase, a foreign channel prefix, and a short fraction are three ways to spell one
+        // Slack conversation; exactly one of them is canonical.
+        (ChatTransportKind::Slack, "C0123ABC", "C0123ABC"),
+        (
+            ChatTransportKind::Slack,
+            "c0123abc",
+            "c0999zzz:1712345678.000100",
+        ),
+        (
+            ChatTransportKind::Slack,
+            "c0123abc",
+            "c0123abc:1712345678.1",
+        ),
+        (ChatTransportKind::Discord, "00123", "00123"),
+        (ChatTransportKind::Discord, "123", "456"),
+        (ChatTransportKind::Telegram, "-1001", "-1001:topic:00"),
+        (
+            ChatTransportKind::Telegram,
+            "-1001",
+            "-1001:topic:9223372036854775808",
+        ),
+        (ChatTransportKind::Whatsapp, "123:456", "123:456"),
+        (
+            ChatTransportKind::Whatsapp,
+            "123:456:16034700182",
+            "123:456",
+        ),
+        (ChatTransportKind::Local, "CLI", "CLI"),
+        // Outside the wire bounds the grammar never runs: an unbounded part fails closed.
+        (ChatTransportKind::Local, "a", &"b".repeat(257)),
+    ] {
+        assert!(
+            !claim(kind, channel, conversation).is_canonical_shape(),
+            "{kind} {channel} {conversation} is an alias for a canonical scope"
+        );
+    }
+}
+
+#[test]
 fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
     let slack = ChatScopeClaim {
         transport: "scientist-slack".parse().expect("transport"),
