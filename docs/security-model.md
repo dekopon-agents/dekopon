@@ -14,7 +14,7 @@ A capability name in an agent spec permits the agent to propose that operation. 
 2. **Authorization decision** — the privileged broker authenticates the transport, derives the actor/workload from trusted mapping, evaluates policy and current context, then either denies the proposal or creates a constrained `AuthorizedInvocation` inside its execution boundary.
 3. **External effect** — the broker consumes that authorization state while a narrow provider executes only the authorized capability using broker-held credentials and enforced constraints.
 4. **Evidence** — policy decisions and provider execution produce digests or bounded records that support later verification. *Committed direction:* removed; the trace is the record ([design.md](design.md#core-concepts)).
-5. **Audit record** — the broker links proposal, trusted identity, policy revision, authorization receipt, effect outcome, and evidence under an invocation ID and the W3C trace id. *Committed direction:* removed; the W3C trace id is the only correlation identifier ([goal 2](design.md#constitution)).
+5. **Audit record** — the broker links proposal, trusted identity, policy revision, authorization receipt, effect outcome, and evidence under an invocation ID and the W3C trace id the request carried, which is also the trace the decision's spans are recorded in ([goal 2](design.md#constitution)).
 
 The local daemon-to-broker request carries only a proposal over an authenticated Unix connection, not identity claims or an `AuthorizedInvocation` for the broker to trust. The broker does not return transferable authorization to `dekopond`; a serialized authorization representation is inert audit/evidence data rather than a bearer grant.
 

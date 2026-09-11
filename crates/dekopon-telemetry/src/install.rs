@@ -469,6 +469,85 @@ mod tests {
         }
     }
 
+    /// Why a broker request must carry a trace the caller minted rather than one it read.
+    ///
+    /// [`TelemetryBuilder::install`] attaches the `tracing-opentelemetry` layer only when an OTLP
+    /// trace exporter is configured. Without one there is no OpenTelemetry context behind an open
+    /// span at all, so `current_trace_context` answers `None` however deep the span stack is — the
+    /// identifiers are absent, not invalid, and no amount of span nesting produces them. With the
+    /// layer attached the context is valid even though this provider exports nowhere, which is
+    /// what separates the two cases: the exporter decides where spans go, the layer decides
+    /// whether they have identifiers at all.
+    #[test]
+    fn an_active_span_has_no_trace_context_until_the_opentelemetry_layer_is_installed() {
+        use opentelemetry::trace::TracerProvider as _;
+
+        tracing::subscriber::with_default(registry(), || {
+            let outer = tracing::info_span!("gateway.session");
+            let _outer = outer.enter();
+            let inner = tracing::info_span!("broker.leg");
+            let _inner = inner.enter();
+            assert!(
+                crate::current_trace_context().is_none(),
+                "no layer means no context to read"
+            );
+        });
+
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let subscriber =
+            registry().with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("gateway.session");
+            let _entered = span.enter();
+            assert!(
+                crate::current_trace_context().is_some(),
+                "the layer mints identifiers whether or not anything exports them"
+            );
+        });
+        provider.shutdown().expect("shutdown");
+    }
+
+    /// The `sampled` bit on an adopted remote parent decides whether the child records at all.
+    ///
+    /// `dekopon-brokerd` joins a client's trace by handing [`remote_context`] to `set_parent`, and
+    /// no Dekopon process configures a sampler, so the SDK default `ParentBased(AlwaysOn)` applies:
+    /// beneath an unsampled parent every span is created non-recording and never exported. That is
+    /// why a client that exports nothing still mints its `traceparent` with the flag *set* — the
+    /// bit instructs the receiver rather than describing the sender, and clearing it would silence
+    /// an exporting broker sitting behind a non-exporting gateway.
+    #[test]
+    fn an_unsampled_remote_parent_makes_every_span_beneath_it_non_recording() {
+        use opentelemetry::trace::{TraceContextExt as _, TracerProvider as _};
+        use tracing_opentelemetry::OpenTelemetrySpanExt as _;
+
+        for (flags, recorded) in [(0x00_u8, false), (0x01_u8, true)] {
+            let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+            let subscriber = registry()
+                .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+            tracing::subscriber::with_default(subscriber, || {
+                let span = tracing::info_span!("broker.invocation");
+                span.set_parent(crate::remote_context(crate::TraceContextParts {
+                    trace_id: [0x11; 16],
+                    span_id: [0x22; 8],
+                    flags,
+                }))
+                .expect("the parent context is well formed");
+
+                let context = span.context();
+                let child = context.span();
+                let child_context = child.span_context();
+                assert_eq!(
+                    child_context.trace_id().to_bytes(),
+                    [0x11; 16],
+                    "the child joins the parent's trace either way"
+                );
+                assert_eq!(child_context.is_sampled(), recorded, "flags {flags:#04x}");
+                assert_eq!(child.is_recording(), recorded, "flags {flags:#04x}");
+            });
+            provider.shutdown().expect("shutdown");
+        }
+    }
+
     /// Records the target of every event a layer is actually asked to handle.
     #[derive(Clone, Default)]
     struct RecordTargets(Arc<Mutex<Vec<String>>>);

@@ -852,7 +852,9 @@ mod tests {
             Actor::Agent {
                 agent: "reviewer".parse::<AgentId>().expect("valid fixture"),
             },
-            "trace-1".parse::<TraceId>().expect("valid fixture"),
+            "0000000000000000000000000000f1c7"
+                .parse::<TraceId>()
+                .expect("valid fixture"),
             json!({"body": "Looks good"}),
         )
     }
@@ -1086,7 +1088,7 @@ mod tests {
                     "id": "invoke-1",
                     "capability": "github.pull-request.comment",
                     "actor": {"type": "agent", "agent": "reviewer"},
-                    "trace": "trace-1",
+                    "trace": "0000000000000000000000000000f1c7",
                     "input": {"body": "Looks good"}
                 },
                 "provider": "github",

@@ -17,7 +17,6 @@ use std::{
 use dekopon_agent::{
     BrokerLeg, BrokerLegError, IdSequence, ShellRuntime,
     attachment::{ChatAssetInputs, ReplyAttachments},
-    current_trace_parent,
     meta::{
         AgentConfigView, ConversationConfigView, ConversationScopeView, SessionConfigView,
         SkillView,
@@ -56,9 +55,6 @@ use crate::{
         credential_from,
     },
 };
-
-/// Trace-identifier prefix, so every broker record a gateway session made is recoverable by prefix.
-const TRACE_PREFIX: &str = "dekopond-session";
 
 /// The refusal a subject with no granted capabilities receives.
 pub(crate) const UNAUTHORIZED_REPLY: &str = "You're not authorized to use this agent.";
@@ -1091,7 +1087,7 @@ async fn connect(
         runner.broker.server_uid,
         runner.broker.frame,
     )?;
-    BrokerLeg::connect(client, TRACE_PREFIX, Some(chat_claim(route, message)?))
+    BrokerLeg::connect(client, Some(chat_claim(route, message)?))
         .await
         .map_err(SessionError::from)
 }
@@ -1134,12 +1130,9 @@ async fn record_delivered_turn(
         return;
     };
     let result: Result<(), MemoryRecordFailure> = async {
-        let identifiers = IdSequence::new("dekopond-memory-record").map_err(|error| {
-            MemoryRecordFailure::Broker(BrokerLegError::SessionIdentifier(error))
-        })?;
-        let id = identifiers.next_invocation().map_err(|error| {
-            MemoryRecordFailure::Broker(BrokerLegError::SessionIdentifier(error))
-        })?;
+        // The record rides the session's own trace: this runs inside `gateway.session`, so the
+        // turn the broker stores and the conversation that produced it are one trace to read.
+        let identifiers = IdSequence::for_session();
         let client = BrokerClient::new(
             &runner.broker.socket_path,
             runner.broker.server_uid,
@@ -1150,9 +1143,8 @@ async fn record_delivered_turn(
             .record_delivered_turn(
                 claim,
                 DeliveredTurnRequest {
-                    id,
-                    trace: identifiers.trace().clone(),
-                    trace_parent: current_trace_parent(),
+                    id: identifiers.next_invocation(),
+                    trace_parent: identifiers.trace_parent(),
                     delivery,
                     user: message.text.clone(),
                     assistant,
@@ -1278,7 +1270,6 @@ fn memory_record_category(error: &MemoryRecordFailure) -> &'static str {
             code, ..
         })) if code == ERROR_STORAGE_IO => ERROR_STORAGE_IO,
         MemoryRecordFailure::Broker(BrokerLegError::Client(_)) => "broker",
-        MemoryRecordFailure::Broker(BrokerLegError::SessionIdentifier(_)) => "identifier",
         MemoryRecordFailure::Broker(BrokerLegError::DuplicateCapabilities { .. }) => {
             "duplicate-capability"
         }

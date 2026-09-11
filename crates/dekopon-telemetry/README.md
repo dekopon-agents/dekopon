@@ -52,5 +52,10 @@ dropped ([exclusions](../../docs/observability.md#exclusions)).
 crate speaks raw identifier bytes rather than a Dekopon wire type; `dekopon-broker-protocol` owns
 `traceparent` parsing, formatting, and validation.
 
+`current_trace_context` answers `None` whenever no OpenTelemetry layer is installed, which is every
+process that configured no OTLP trace exporter: the identifiers are absent rather than invalid, and
+no depth of span nesting produces them. A caller that must put a trace on a wire mints its own
+instead — see `dekopon_agent::session_trace_parent`.
+
 [`docs/observability.md`](../../docs/observability.md#trace-context-across-the-socket) is the
-authoritative account of how the two correlation identifiers relate.
+authoritative account of the trace identifier every record carries.

@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use dekopon_core::{CapabilityId, InvocationId, SecretUseProposal, TraceId};
+use dekopon_core::{CapabilityId, InvocationId, SecretUseProposal};
 use serde_json::json;
 use tokio::io::{AsyncWriteExt as _, duplex};
 
@@ -54,10 +54,9 @@ fn invocation() -> InvocationRequest {
         capability: "echo.echo"
             .parse::<CapabilityId>()
             .expect("valid capability fixture"),
-        trace: "trace-test"
-            .parse::<TraceId>()
-            .expect("valid trace fixture"),
-        trace_parent: None,
+        trace_parent: SAMPLE_TRACE_PARENT
+            .parse::<TraceParent>()
+            .expect("valid traceparent fixture"),
         secret_use: None,
         input: json!({"message": "hello"}),
     }
@@ -107,48 +106,51 @@ fn trace_parent_rejects_malformed_unsupported_and_zero_values() {
     );
 }
 
-/// `traceParent` is always written and decodes from both forms.
+/// `traceParent` is mandatory, and it carries the trace the audit record is correlated by.
 ///
-/// Serde treats an `Option` field as implicitly optional, so an omitted key and an explicit `null`
-/// both mean "this client exports no telemetry" — the same thing. That is the intended reading:
-/// absence is a real state, not a client bug worth failing a decode over. What must hold is that
-/// the field is never silently dropped when it *is* set.
+/// It used to be an `Option` beside a separate Dekopon `trace` field, and a client that exported
+/// no telemetry sent `null`. Both halves are gone: the broker sources its audit correlation from
+/// this one field, so a request that omits it names no trace for the decision it is about to
+/// cause, and a decode that accepted the omission would write exactly the record an operator
+/// cannot find.
 #[test]
-fn invocation_request_always_writes_trace_parent_and_decodes_both_forms() {
+fn invocation_request_requires_one_well_formed_trace_parent() {
     let complete = serde_json::to_value(invocation()).expect("request serializes");
-    assert_eq!(complete.get("traceParent"), Some(&json!(null)));
+    assert_eq!(
+        complete.get("traceParent"),
+        Some(&json!(SAMPLE_TRACE_PARENT))
+    );
+    assert!(
+        complete.get("trace").is_none(),
+        "the second identifier is gone"
+    );
 
-    let mut omitted = complete.clone();
+    let decoded =
+        serde_json::from_value::<InvocationRequest>(complete.clone()).expect("request decodes");
+    assert_eq!(decoded.trace_parent.to_string(), SAMPLE_TRACE_PARENT);
+    assert_eq!(
+        decoded.trace_parent.trace().to_string(),
+        "4bf92f3577b34da6a3ce929d0e0e4736"
+    );
+
+    for rejected in [json!(null), json!("not-a-traceparent")] {
+        let mut request = complete.clone();
+        request
+            .as_object_mut()
+            .expect("request object")
+            .insert("traceParent".to_owned(), rejected.clone());
+        assert!(
+            serde_json::from_value::<InvocationRequest>(request).is_err(),
+            "accepted {rejected}"
+        );
+    }
+
+    let mut omitted = complete;
     omitted
         .as_object_mut()
         .expect("request object")
         .remove("traceParent");
-    assert!(
-        serde_json::from_value::<InvocationRequest>(omitted)
-            .expect("omitted traceparent decodes")
-            .trace_parent
-            .is_none()
-    );
-
-    let mut populated = complete;
-    populated
-        .as_object_mut()
-        .expect("request object")
-        .insert("traceParent".to_owned(), json!(SAMPLE_TRACE_PARENT));
-    let decoded =
-        serde_json::from_value::<InvocationRequest>(populated).expect("populated request decodes");
-    let parent = decoded.trace_parent.expect("traceparent present");
-    assert_eq!(parent.flags(), 1);
-    assert_eq!(parent.to_string(), SAMPLE_TRACE_PARENT);
-
-    // An invalid value is still a decode failure: a malformed parent would attach broker spans to
-    // a trace that does not exist, which is worse than sending none.
-    let mut malformed = serde_json::to_value(invocation()).expect("request serializes");
-    malformed
-        .as_object_mut()
-        .expect("request object")
-        .insert("traceParent".to_owned(), json!("not-a-traceparent"));
-    assert!(serde_json::from_value::<InvocationRequest>(malformed).is_err());
+    assert!(serde_json::from_value::<InvocationRequest>(omitted).is_err());
 }
 
 #[tokio::test]
@@ -372,7 +374,7 @@ fn wire_invocation_contains_no_identity_or_authority_fields() {
                 "invocation": {
                     "id": "invoke-test",
                     "capability": "echo.echo",
-                    "trace": "trace-test",
+                    "traceParent": SAMPLE_TRACE_PARENT,
                     "input": {},
                     "actor": {"type": "service", "principal": "forged"}
                 }
@@ -598,8 +600,9 @@ fn chat_scope_turn_and_attestation_debug_are_fully_redacted_and_bounded() {
     let attestation = session.bound_to("invoke-chat".parse().expect("invocation"));
     let turn = DeliveredTurnRequest {
         id: "invoke-chat".parse().expect("invocation"),
-        trace: "trace-chat".parse().expect("trace"),
-        trace_parent: None,
+        trace_parent: SAMPLE_TRACE_PARENT
+            .parse()
+            .expect("valid traceparent fixture"),
         delivery: DeliveryIdentity::Slack {
             channel: "c0123abc".to_owned(),
             timestamp: "1712345678.000100".to_owned(),
@@ -929,8 +932,9 @@ mod broker_socket_discovery {
 fn every_verb_is_one_operation_whatever_attestation_accompanies_it() {
     let turn = DeliveredTurnRequest {
         id: "invoke-chat".parse().expect("valid invocation fixture"),
-        trace: "trace-chat".parse().expect("valid trace fixture"),
-        trace_parent: None,
+        trace_parent: SAMPLE_TRACE_PARENT
+            .parse()
+            .expect("valid traceparent fixture"),
         delivery: DeliveryIdentity::Slack {
             channel: "c0123abc".to_owned(),
             timestamp: "1712345678.000100".to_owned(),

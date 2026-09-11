@@ -185,6 +185,23 @@ All notable changes to Dekopon are documented here. The format is based on
   never reduced export volume; it only hid spans from the local console. Argument *values* are still
   recorded as a count: a `curl -d` body is secret bytes wearing argv's clothes, and that exclusion is
   goal 1's rather than the retired gate's.
+- One trace, one identifier. `dekopon_core::TraceId` is now the W3C trace identifier — sixteen
+  bytes, thirty-two lowercase hexadecimal digits, all-zero refused — rather than a free-form Dekopon
+  identifier minted beside it. `traceParent` is mandatory and no longer an `Option` on
+  `InvocationRequest` and `DeliveredTurnRequest`, their separate `trace` field is gone, and the
+  broker sources both its audit records and its spans from the one field: `null`, an omitted key,
+  and a malformed value are all decode failures now. A client that exports no telemetry still sends
+  a trace — `tracing-opentelemetry` attaches its layer only when an OTLP exporter is configured, so
+  a non-exporting process has no span context to read at all, and `dekopon_agent::session_trace_parent`
+  mints one from OS entropy rather than leaving a decision record no operator can find. A minted
+  context sets `sampled`, which instructs the receiver rather than describing the sender: under the
+  SDK default `ParentBased(AlwaysOn)` an unsampled parent would make every broker span beneath it
+  non-recording, silencing an exporting broker behind a non-exporting gateway. `IdSequence` is re-rooted on that trace and both of its fallible constructors are gone:
+  `IdSequence::for_session()` replaces `IdSequence::new(prefix)`, `trace()` returns a `TraceId`,
+  `next_invocation()` is infallible, and an invocation identifier is `<trace>-<counter>`, so a
+  session's calls are still recoverable by prefix — by the same trace the gateway's own spans carry.
+  `BrokerLeg::connect` lost its `trace_prefix` argument and `BrokerLegError::SessionIdentifier` went
+  with it. Audit records written before this carry a non-W3C `trace` and no longer decode.
 - Provider storage applies writes per host call through a direct invocation handle, with namespace, key, quota and private-file isolation retained. Failed invocations can leave completed writes; there is no invocation rollback, crash recovery or automatic generation collection.
 - OTLP smoke CI exercises a real broker/gateway local turn with a stub model and authorized provider. Daemon JSON stdout includes valid active native trace/span IDs; smoke-only shipping verifies independent remote correlation and redaction without a production log exporter.
 - `dekopon-brokerd probe --socket <path>` performs a bounded owner-authenticated health check; chart broker probes use it without loading credentials or telemetry.
@@ -291,6 +308,10 @@ All notable changes to Dekopon are documented here. The format is based on
   ([goal 2](docs/design.md#constitution)). What telemetry excludes is unchanged and was never gated:
   secret bytes, the gateway's own credentials, and HTTP request and response headers and bodies
   never reached a span and still do not.
+- The separate Dekopon trace identifier: the `trace` field on `InvocationRequest`,
+  `DeliveredTurnRequest`, `ProposedInvocation`, and `AuthorizedInvocation`'s serialized proposal now
+  holds the request's W3C trace id instead of a second, independently chosen one, and nothing mints
+  a Dekopon-native trace any more (goal 2, "one trace, complete").
 - Retired the `dekopon`, `dekopon-webui`, `dekopon-run`, and `dekopon-provider-host` crates. Only `dekopond` and `dekopon-brokerd` ship as binaries; shared agent, shell, model, SDK, and broker libraries remain. Recorded-session listing, transcript reconstruction, and model replay went with the runner, out of `dekopon-agent` as well; live agent tools and telemetry are unaffected. Published versions are not recalled or yanked; publication and a later independent console repin remain follow-ups.
 - Broker audit-chain verification, replay restoration from disk, and the `audit verify` command.
   Audit records now append only `sequence` and `event`; existing bytes are not migrated or

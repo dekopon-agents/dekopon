@@ -469,7 +469,9 @@ impl FakeBroker {
             Actor::Agent {
                 agent: self.agent.clone(),
             },
-            "testkit-trace".parse::<TraceId>()?,
+            // Sixteen ASCII bytes, so a trace that reaches a failure dump reads as the fixture it
+            // is rather than as a run somebody has to go looking for.
+            TraceId::new(*b"dekopon-testkit!").expect("the fixture bytes are not all zeroes"),
             input,
         );
         let authorized = AuthorizationGate::new().authorize(

@@ -57,11 +57,10 @@ The reusable agent session layer consumed by `dekopond` and external embeddings 
   a provider's `CommandRunOutcome` onto the shell's `CommandRun`, and the one
   `agent.command.unobserved` record for a run whose caller was dropped, shared by the
   broker leg and external embeddings.
-- `IdSequence` — collision-free Dekopon `TraceId` and invocation identifiers under a
-  caller-chosen session prefix, the second correlation identifier described in
+- `IdSequence` — one session's W3C trace and the collision-free invocation identifiers that
+  extend it, adopted from the exporting span or minted when the process exports nothing, as
+  described in
   [`docs/observability.md`](../../docs/observability.md#trace-context-across-the-socket).
-  *Committed direction:* removed; the W3C trace id is the only correlation identifier
-  ([goal 2](../../docs/design.md#constitution)).
 
 `meta::AgentConfigView` is the narrow introspection shape: exact standing
 instructions, session limits, and effective capability classifications. Its type has no
