@@ -169,14 +169,9 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
     ConstraintCatalog::new(entries).expect("constraints")
 }
 
-async fn build_broker(
-    root: &Path,
-    key: &Path,
-    audit: Arc<InMemoryAuditLog>,
-) -> Broker<InMemoryAuditLog> {
+async fn build_broker(root: &Path, audit: Arc<InMemoryAuditLog>) -> Broker<InMemoryAuditLog> {
     build_broker_with(
         root,
-        key,
         audit,
         memory_config(),
         StorageLimits::default(),
@@ -188,7 +183,6 @@ async fn build_broker(
 
 async fn build_broker_with(
     root: &Path,
-    key: &Path,
     audit: Arc<InMemoryAuditLog>,
     memory: ChatMemoryConfig,
     storage_limits: StorageLimits,
@@ -197,7 +191,6 @@ async fn build_broker_with(
 ) -> Broker<InMemoryAuditLog> {
     build_broker_with_principal(
         root,
-        key,
         audit,
         memory,
         storage_limits,
@@ -216,7 +209,6 @@ async fn build_broker_with(
 )]
 async fn build_broker_with_principal(
     root: &Path,
-    key: &Path,
     audit: Arc<InMemoryAuditLog>,
     memory: ChatMemoryConfig,
     storage_limits: StorageLimits,
@@ -226,7 +218,7 @@ async fn build_broker_with_principal(
     authority_credential: Option<(&str, &str)>,
     permit_generic_storage: bool,
 ) -> Broker<InMemoryAuditLog> {
-    let storage = StorageHost::open(root, key, storage_limits).expect("storage host");
+    let storage = StorageHost::open(root, storage_limits).expect("storage host");
     let mut providers = vec![
         provider_fixture("memory-chat-provider.wasm"),
         provider_fixture("echo-provider.wasm"),
@@ -392,13 +384,9 @@ async fn authorization_audit_failure_precedes_every_storage_tree_mutation() {
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
     let root = directory.join("provider-storage");
-    let key = directory.join("storage-key.yaml");
-    fs::write(&key, "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n").expect("key");
-    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
     let audit = Arc::new(InMemoryAuditLog::new(1).expect("one-record audit"));
     let broker = build_broker_with(
         &root,
-        &key,
         Arc::clone(&audit),
         memory_config(),
         StorageLimits::default(),
@@ -452,12 +440,8 @@ async fn generic_storage_surfaces_require_an_effective_chat_scope() {
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
     let root = directory.join("provider-storage");
-    let key = directory.join("storage-key.yaml");
-    fs::write(&key, "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n").expect("key");
-    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
     let broker = build_broker_with_principal(
         &root,
-        &key,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         memory_config(),
         StorageLimits::default(),
@@ -729,10 +713,7 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
     let root = directory.join("provider-storage");
-    let key = directory.join("storage-key.yaml");
-    fs::write(&key, "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n").expect("key");
-    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
-    let storage = StorageHost::open(&root, &key, StorageLimits::default()).expect("storage host");
+    let storage = StorageHost::open(&root, StorageLimits::default()).expect("storage host");
     let registry = BrokerProviderRegistry::load_with_storage(
         [provider_fixture("memory-reservation-probe-provider.wasm")],
         BrokerHostLimits::default(),
@@ -818,10 +799,7 @@ async fn a_rendered_page_never_reaches_a_reserved_memory_route() {
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
     let root = directory.join("provider-storage");
-    let key = directory.join("storage-key.yaml");
-    fs::write(&key, "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n").expect("key");
-    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
-    let storage = StorageHost::open(&root, &key, StorageLimits::default()).expect("storage host");
+    let storage = StorageHost::open(&root, StorageLimits::default()).expect("storage host");
     let registry = BrokerProviderRegistry::load_with_storage(
         [provider_fixture("memory-reservation-probe-provider.wasm")],
         BrokerHostLimits::default(),
@@ -917,10 +895,7 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
     let root = directory.join("provider-storage");
-    let key = directory.join("storage-key.yaml");
-    fs::write(&key, "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n").expect("key");
-    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
-    let storage = StorageHost::open(&root, &key, StorageLimits::default()).expect("storage host");
+    let storage = StorageHost::open(&root, StorageLimits::default()).expect("storage host");
     let registry = BrokerProviderRegistry::load_with_storage(
         [provider_fixture("storage-probe-provider.wasm")],
         BrokerHostLimits::default(),
@@ -1170,11 +1145,8 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
     let root = directory.join("provider-storage");
-    let key = directory.join("storage-key.yaml");
-    fs::write(&key, "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n").expect("key");
-    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
     let audit = Arc::new(InMemoryAuditLog::new(32).expect("audit"));
-    let broker = build_broker(&root, &key, Arc::clone(&audit)).await;
+    let broker = build_broker(&root, Arc::clone(&audit)).await;
     let claim = claim();
     let grant = grant();
     let (capabilities, words, memory) = broker
@@ -1336,12 +1308,12 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
     assert!(
         commitments
             .iter()
-            .all(|digest| digest.starts_with("hmac-sha256:"))
+            .all(|digest| digest.starts_with("sha256:"))
     );
     drop(broker);
 
     let audit_after_restart = Arc::new(InMemoryAuditLog::new(32).expect("audit"));
-    let broker = build_broker(&root, &key, audit_after_restart).await;
+    let broker = build_broker(&root, audit_after_restart).await;
     let recent_id = "recent-1".parse::<InvocationId>().expect("invocation");
     let recent = broker
         .invoke(
@@ -1406,10 +1378,7 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
                 assert!(policy_ids.is_empty() && policy_digest.is_none());
                 if invocation.as_str() == "record-1" {
                     let scope = storage_scope_commitment.expect("scope commitment");
-                    assert_ne!(
-                        scope.as_str().trim_start_matches("hmac-sha256:"),
-                        physical_base
-                    );
+                    assert_ne!(scope.as_str().trim_start_matches("sha256:"), physical_base);
                 }
             }
             AuditEvent::Execution {
@@ -1476,9 +1445,6 @@ async fn generated_wasm_b1_original_loads_are_independent_of_write_growth() {
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
     let root = directory.join("provider-storage");
-    let key = directory.join("storage-key.yaml");
-    fs::write(&key, "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n").expect("key");
-    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
     let mut config = memory_config();
     config.continuity_policy = ContinuityPolicy::Stable;
     config.max_lookback_turns = 1;
@@ -1496,22 +1462,22 @@ async fn generated_wasm_b1_original_loads_are_independent_of_write_growth() {
     let conversation = "c0123abc:1712345678.000430";
     let turns = seed_turn_file(262_000, 1_000);
     let mut dedup = Vec::new();
-    for index in 0..1_153 {
+    for index in 0..1_206 {
         // Field order matches the checksum-pinned provider's canonical Dedup struct.
         let line = format!(
-            "{{\"format\":\"dekopon.chat-memory.dedup\",\"version\":1,\"id\":\"hmac-sha256:{index:064x}\",\"commitment\":\"hmac-sha256:{}\"}}\n",
+            "{{\"format\":\"dekopon.chat-memory.dedup\",\"version\":1,\"id\":\"sha256:{index:064x}\",\"commitment\":\"sha256:{}\"}}\n",
             "0".repeat(64)
         );
-        assert_eq!(line.len(), 227);
+        assert_eq!(line.len(), 217);
         dedup.extend_from_slice(line.as_bytes());
     }
-    assert_eq!(dedup.len(), 261_731);
+    assert_eq!(dedup.len(), 261_702);
     let user = "B1 user";
     let assistant = "x".repeat((1_000 - canonical_turn_line_bytes(user, "")) as usize);
     assert_eq!(canonical_turn_line_bytes(user, &assistant), 1_000);
-    assert_eq!(turns.len() + dedup.len(), 523_731);
+    assert_eq!(turns.len() + dedup.len(), 523_702);
     assert!(turns.len() + dedup.len() + 1_000 > 524_288);
-    let storage = StorageHost::open(&root, &key, StorageLimits::default()).expect("seed host");
+    let storage = StorageHost::open(&root, StorageLimits::default()).expect("seed host");
     let grant = storage
         .grant(StorageGrantRequest::new(
             "b1-seed".parse().expect("invocation"),
@@ -1541,7 +1507,6 @@ async fn generated_wasm_b1_original_loads_are_independent_of_write_growth() {
     drop(storage);
     let broker = build_broker_with(
         &root,
-        &key,
         Arc::new(InMemoryAuditLog::new(32).expect("audit")),
         config.clone(),
         limits,
@@ -1575,10 +1540,10 @@ async fn generated_wasm_b1_original_loads_are_independent_of_write_growth() {
         .iter()
         .find(|bytes| bytes.starts_with(&dedup))
         .expect("dedup preserved");
-    assert_eq!(actual_dedup.len(), 261_731 + 227);
+    assert_eq!(actual_dedup.len(), 261_702 + 217);
     assert_eq!(
         actual_dedup.iter().filter(|byte| **byte == b'\n').count(),
-        1_154
+        1_207
     );
     let compacted = data
         .iter()
@@ -1607,9 +1572,6 @@ async fn generated_wasm_compaction(storage_limits: StorageLimits) {
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
     let root = directory.join("provider-storage");
-    let key = directory.join("storage-key.yaml");
-    fs::write(&key, "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n").expect("key");
-    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
     let mut config = memory_config();
     config.continuity_policy = ContinuityPolicy::Stable;
     let cases = [
@@ -1635,7 +1597,7 @@ async fn generated_wasm_compaction(storage_limits: StorageLimits) {
         finalization_budget_ms: 60_000,
         ..StorageLimits::default()
     };
-    let storage = StorageHost::open(&root, &key, seed_limits).expect("storage host");
+    let storage = StorageHost::open(&root, seed_limits).expect("storage host");
     for (index, (conversation, user, assistant, delta)) in cases.iter().enumerate() {
         let appended = canonical_turn_line_bytes(user, assistant);
         let seed_size = config
@@ -1675,7 +1637,6 @@ async fn generated_wasm_compaction(storage_limits: StorageLimits) {
 
     let broker = build_broker_with(
         &root,
-        &key,
         Arc::new(InMemoryAuditLog::new(32).expect("audit")),
         config.clone(),
         storage_limits,
@@ -1737,9 +1698,6 @@ async fn dedup_conflict_capacity_search_and_compaction_preserve_bounded_reads() 
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
     let root = directory.join("provider-storage");
-    let key = directory.join("storage-key.yaml");
-    fs::write(&key, "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n").expect("key");
-    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
     let mut config = memory_config();
     config.max_lookback_turns = 2;
     config.max_recent_turns = 2;
@@ -1750,7 +1708,6 @@ async fn dedup_conflict_capacity_search_and_compaction_preserve_bounded_reads() 
     config.compaction_threshold_bytes = 5_000;
     let broker = build_broker_with(
         &root,
-        &key,
         Arc::new(InMemoryAuditLog::new(64).expect("audit")),
         config,
         StorageLimits::default(),
@@ -1882,15 +1839,11 @@ async fn newest_result_bounds_and_complete_record_corruption_are_publicly_classi
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
     let root = directory.join("provider-storage");
-    let key = directory.join("storage-key.yaml");
-    fs::write(&key, "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n").expect("key");
-    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
     let mut config = memory_config();
     config.max_turn_bytes = 2_048;
     config.max_result_bytes = 512;
     let broker = build_broker_with(
         &root,
-        &key,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         config,
         StorageLimits::default(),
@@ -1963,15 +1916,7 @@ async fn a_corrupt_memory_namespace_is_reset_by_the_invocation_that_finds_it() {
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
     let root = directory.join("provider-storage");
-    let key = directory.join("storage-key.yaml");
-    fs::write(&key, "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n").expect("key");
-    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
-    let broker = build_broker(
-        &root,
-        &key,
-        Arc::new(InMemoryAuditLog::new(32).expect("audit")),
-    )
-    .await;
+    let broker = build_broker(&root, Arc::new(InMemoryAuditLog::new(32).expect("audit"))).await;
     assert_eq!(
         record_turn(
             &broker,
@@ -2032,6 +1977,22 @@ async fn a_corrupt_memory_namespace_is_reset_by_the_invocation_that_finds_it() {
         capture.spans().iter().any(
             |(name, fields)| *name == "broker.execute" && fields.contains("storage.reset=true")
         ),
+        "{}",
+        capture.spans_text()
+    );
+    // The same span names the directory, which is how an operator gets from this trace to the
+    // bytes on disk.
+    let token = base
+        .file_name()
+        .expect("base token")
+        .to_string_lossy()
+        .into_owned();
+    let named = format!("storage.namespace=\"{token}\"");
+    assert!(
+        capture
+            .spans()
+            .iter()
+            .any(|(name, fields)| *name == "broker.execute" && fields.contains(&named)),
         "{}",
         capture.spans_text()
     );
@@ -2165,15 +2126,7 @@ async fn two_authorized_conversations_remain_physically_and_logically_isolated()
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
     let root = directory.join("provider-storage");
-    let key = directory.join("storage-key.yaml");
-    fs::write(&key, "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n").expect("key");
-    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
-    let broker = build_broker(
-        &root,
-        &key,
-        Arc::new(InMemoryAuditLog::new(32).expect("audit")),
-    )
-    .await;
+    let broker = build_broker(&root, Arc::new(InMemoryAuditLog::new(32).expect("audit"))).await;
     let first = claim_for("c0123abc:1712345678.000100");
     let second = claim_for("c0123abc:1712345678.000200");
     let grant = grant_for(&["c0123abc:1712345678.000100", "c0123abc:1712345678.000200"]);
@@ -2251,9 +2204,6 @@ async fn search_reads_complete_records_across_the_fixed_chunk_boundary() {
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
     let root = directory.join("provider-storage");
-    let key = directory.join("storage-key.yaml");
-    fs::write(&key, "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n").expect("key");
-    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
     let mut config = memory_config();
     config.max_lookback_turns = 7;
     config.max_recent_turns = 7;
@@ -2263,7 +2213,6 @@ async fn search_reads_complete_records_across_the_fixed_chunk_boundary() {
     config.compaction_threshold_bytes = 600_000;
     let broker = build_broker_with(
         &root,
-        &key,
         Arc::new(InMemoryAuditLog::new(32).expect("audit")),
         config,
         StorageLimits::default(),
@@ -2314,13 +2263,9 @@ async fn selected_symbolic_credential_rotates_authority_without_hashing_its_valu
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
     let root = directory.join("provider-storage");
-    let key = directory.join("storage-key.yaml");
-    fs::write(&key, "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n").expect("key");
-    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
     let config = memory_config();
     let broker = build_broker_with_principal(
         &root,
-        &key,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         config.clone(),
         StorageLimits::default(),
@@ -2349,7 +2294,6 @@ async fn selected_symbolic_credential_rotates_authority_without_hashing_its_valu
     // selected symbolic reference keeps the current generation and its existing text.
     let broker = build_broker_with_principal(
         &root,
-        &key,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         config.clone(),
         StorageLimits::default(),
@@ -2373,7 +2317,6 @@ async fn selected_symbolic_credential_rotates_authority_without_hashing_its_valu
 
     let broker = build_broker_with_principal(
         &root,
-        &key,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         config.clone(),
         StorageLimits::default(),
@@ -2390,7 +2333,6 @@ async fn selected_symbolic_credential_rotates_authority_without_hashing_its_valu
 
     let broker = build_broker_with_principal(
         &root,
-        &key,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         config,
         StorageLimits::default(),
@@ -2425,14 +2367,10 @@ async fn explicit_stable_memory_survives_semantic_authority_changes() {
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
     let root = directory.join("provider-storage");
-    let key = directory.join("storage-key.yaml");
-    fs::write(&key, "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n").expect("key");
-    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
     let mut stable = memory_config();
     stable.continuity_policy = ContinuityPolicy::Stable;
     let broker = build_broker_with(
         &root,
-        &key,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         stable.clone(),
         StorageLimits::default(),
@@ -2458,7 +2396,6 @@ async fn explicit_stable_memory_survives_semantic_authority_changes() {
     changed_host.max_tables += 1;
     let broker = build_broker_with(
         &root,
-        &key,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         stable,
         StorageLimits::default(),
@@ -2482,14 +2419,10 @@ async fn unreachable_memory_authority_never_rotates_generic_durable_storage() {
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
     let root = directory.join("provider-storage");
-    let key = directory.join("storage-key.yaml");
-    fs::write(&key, "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n").expect("key");
-    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
     let mut memory = memory_config();
     memory.enabled_agents = vec!["other-agent".parse().expect("agent")];
     let broker = build_broker_with_principal(
         &root,
-        &key,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         memory.clone(),
         StorageLimits::default(),
@@ -2509,7 +2442,6 @@ async fn unreachable_memory_authority_never_rotates_generic_durable_storage() {
     memory.max_recent_turns -= 1;
     let broker = build_broker_with_principal(
         &root,
-        &key,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         memory,
         StorageLimits::default(),
@@ -2559,9 +2491,6 @@ async fn authority_surface_ignores_order_and_denied_provider_but_rotates_every_s
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
     let root = directory.join("provider-storage");
-    let key = directory.join("storage-key.yaml");
-    fs::write(&key, "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n").expect("key");
-    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
 
     let mut baseline_memory = memory_config();
     baseline_memory
@@ -2569,7 +2498,6 @@ async fn authority_surface_ignores_order_and_denied_provider_but_rotates_every_s
         .push("other-agent".parse().expect("agent"));
     let broker = build_broker_with(
         &root,
-        &key,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         baseline_memory.clone(),
         StorageLimits::default(),
@@ -2601,7 +2529,6 @@ async fn authority_surface_ignores_order_and_denied_provider_but_rotates_every_s
     // continuity exactly as provider order, policy formatting, and unrelated denied providers do.
     let broker = build_broker_with_principal(
         &root,
-        &key,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         baseline_memory.clone(),
         StorageLimits::default(),
@@ -2627,7 +2554,6 @@ async fn authority_surface_ignores_order_and_denied_provider_but_rotates_every_s
     reordered.enabled_agents.reverse();
     let broker = build_broker_with(
         &root,
-        &key,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         reordered,
         StorageLimits::default(),
@@ -2654,7 +2580,6 @@ async fn authority_surface_ignores_order_and_denied_provider_but_rotates_every_s
     host_limits.max_tables += 1;
     let broker = build_broker_with(
         &root,
-        &key,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         baseline_memory.clone(),
         StorageLimits::default(),
@@ -2670,7 +2595,6 @@ async fn authority_surface_ignores_order_and_denied_provider_but_rotates_every_s
     // reopened merely because its canonical bytes recur.
     let broker = build_broker_with(
         &root,
-        &key,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         baseline_memory.clone(),
         StorageLimits::default(),
@@ -2686,7 +2610,6 @@ async fn authority_surface_ignores_order_and_denied_provider_but_rotates_every_s
     memory_limit.max_recent_turns -= 1;
     let broker = build_broker_with(
         &root,
-        &key,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         memory_limit,
         StorageLimits::default(),
@@ -2704,7 +2627,6 @@ async fn authority_surface_ignores_order_and_denied_provider_but_rotates_every_s
     };
     let broker = build_broker_with(
         &root,
-        &key,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         baseline_memory,
         storage_limit,
@@ -2750,7 +2672,7 @@ struct SeedTurn<'a> {
 }
 
 fn canonical_turn_line_bytes(user: &str, assistant: &str) -> u64 {
-    let commitment = format!("hmac-sha256:{}", "0".repeat(64));
+    let commitment = format!("sha256:{}", "0".repeat(64));
     serde_json::to_vec(&SeedTurn {
         format: "dekopon.chat-memory.turn",
         version: 1,
@@ -2766,13 +2688,13 @@ fn canonical_turn_line_bytes(user: &str, assistant: &str) -> u64 {
 
 fn seed_turn_file(target: u64, maximum_line: u64) -> Vec<u8> {
     const RECORDS: usize = 400;
-    let commitment = format!("hmac-sha256:{}", "0".repeat(64));
+    let commitment = format!("sha256:{}", "0".repeat(64));
     let minimum_lines = (0..RECORDS)
         .map(|index| {
             serde_json::to_vec(&SeedTurn {
                 format: "dekopon.chat-memory.turn",
                 version: 1,
-                id: format!("hmac-sha256:{index:064x}"),
+                id: format!("sha256:{index:064x}"),
                 commitment: commitment.clone(),
                 user: "seed",
                 assistant: String::new(),
@@ -2798,7 +2720,7 @@ fn seed_turn_file(target: u64, maximum_line: u64) -> Vec<u8> {
         let line = serde_json::to_vec(&SeedTurn {
             format: "dekopon.chat-memory.turn",
             version: 1,
-            id: format!("hmac-sha256:{index:064x}"),
+            id: format!("sha256:{index:064x}"),
             commitment: commitment.clone(),
             user: "seed",
             assistant: "x".repeat(filler as usize),
@@ -2867,10 +2789,7 @@ async fn chat_memory_without_routes_names_every_missing_role() {
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
     let root = directory.join("provider-storage");
-    let key = directory.join("storage-key.yaml");
-    fs::write(&key, "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n").expect("key");
-    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
-    let storage = StorageHost::open(&root, &key, StorageLimits::default()).expect("storage host");
+    let storage = StorageHost::open(&root, StorageLimits::default()).expect("storage host");
     let registry = BrokerProviderRegistry::load_with_storage(
         [provider_fixture("memory-chat-provider.wasm")],
         BrokerHostLimits::default(),

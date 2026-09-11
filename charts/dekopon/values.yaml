@@ -404,19 +404,14 @@ state:
   existingClaim: ""
 
 # Optional provider storage is physically and lifecycle-separate from the state claim. The generated
-# claim is always retained. The namespace key is operator-managed and never chart-created, so an
-# uninstall cannot destroy the only key capable of reopening retained data.
+# claim is always retained.
 providerStorage:
   enabled: false
   storageClassName: local-path
   accessModes: [ReadWriteOnce]
   size: 2Gi
   existingClaim: ""
-  existingKeySecret: ""
-  existingKeySecretKey: storage-key.yaml
   rootPath: /var/lib/dekopon-provider-storage
-  keyDir: /etc/dekopon-storage-key
-  keyFileName: storage-key.yaml
 
 # tmpfs sizes. Both are memory-backed so the credentials file and the socket never touch the
 # node's disk; both count against the pod's memory limit, which is why they are small.

@@ -159,7 +159,7 @@ The agent daemon must not gain effect authority merely because it coordinates a 
 ### Provider storage and durable chat memory
 
 **Status: current.** `dekopon-brokerd` may opt into a separate broker-only
-storage root and namespace key. Exact `jsonl` or `durable-files` plus read-only/read-write authority
+storage root. Exact `jsonl` or `durable-files` plus read-only/read-write authority
 is bound to one authorization; HTTP and storage cannot coexist in one v1 capability. Raw scope and
 logical names never select paths. Each host call applies its mutation directly. A failed provider result or trap does not undo
 completed writes ([non-goals](#non-goals)).

@@ -121,34 +121,40 @@ cross-file commit, or crash recovery. Inactive generations remain charged to the
 The strict storage limits object accepts only live bounds. Configure the complete object using
 `StorageLimits` defaults/current fields; omit all GC scheduling/TTL and startup recovery-count
 settings. `maxPendingTransactions` remains the compatibility spelling for concurrent invocation
-handle admission. Keep the existing namespace key private and unchanged. Retained stores with
+handle admission. Retained stores with
 unknown root or generation entries are refused; there is no automatic migration,
 recursive cleanup or trusted import of legacy layout bytes. Preserve such data offline rather
 than deleting entries to bypass a refusal. A separately provisioned private storage root starts
 empty and does not restore previous data.
 
-## Provider storage: quarantine and startup validation removed (unreleased)
+## Provider storage starts empty (unreleased)
 
-Delete `storage.maxQuarantinedNamespaces` from the broker configuration. The storage limits object
-is `deny_unknown_fields`, so a configuration that still names it is refused with that field name.
+Provider storage starts empty at this release. Before upgrading a broker that has `storage:`
+configured:
 
-Every existing root holds a `quarantine/` directory. An empty one is removed on the first start and
-logged as `storage_quarantine_removed`. One that holds anything refuses startup as a corrupt layout
-naming the directory: move it out of the root and keep or delete those bytes. The broker never reads
-them.
+1. Stop the broker.
+2. Move the storage root aside. Keep it if those bytes matter; nothing in this release reads it.
+3. Delete `storage.namespaceKeyPath` and `storage.maxQuarantinedNamespaces` from `broker.yaml`.
+   Both are refused by name at startup.
+4. In the chart, delete `providerStorage.existingKeySecret`, `existingKeySecretKey`, `keyDir` and
+   `keyFileName`, which `helm template` refuses by name, then delete the key Secret itself.
 
-Every authority-bound namespace — every chat memory on the default `authority-bound` continuity —
-starts a fresh, empty generation on its first use after this release, because the removed limit was
-part of the authority surface a generation is bound to. `stable` namespaces keep their data. The
-previous generations stay on disk and stay charged to the root quota; nothing collects them.
+A root from an earlier release does not open: its `layout` still carries `keyCommitment` and it
+still holds `quarantine/`, and startup refuses it as a corrupt layout naming the root. Nothing
+migrates it. Every namespace name is derived differently now, so there is no subset of it — stable
+continuity included — that a new broker could address, and nothing about it is corrupt in the sense
+of `storage_namespace_reset`: it is simply a different layout. This one note covers every storage
+change in this release: the key deletion, the quarantine-limit removal, and the idempotency byte
+leaving the authority surface. None of them needs a separate step.
 
-A corrupt namespace no longer stops the broker, and startup no longer validates namespaces at all.
-The invocation that finds a corrupt authority pointer or generation resets that namespace to a
-fresh generation and fails once with `storage-corrupt`; its `storage_namespace_reset` record names
-the base token, both generations and the path. A namespace whose own shape is wrong — a symlink,
-hard link or wrong mode under `namespaces/<base>` — is skipped by the startup quota walk
+After the upgrade, a corrupt namespace no longer stops the broker, and startup no longer validates
+namespaces at all. The invocation that finds a corrupt authority pointer or generation resets that
+namespace to a fresh generation and fails once with `storage-corrupt`; its `storage_namespace_reset`
+record names the base token, both generations and the path. A namespace whose own shape is wrong — a
+symlink, hard link or wrong mode under `namespaces/<base>` — is skipped by the startup quota walk
 (`storage_root_entry_ignored`) and fails every grant naming the entry. To clear one, stop the broker
-and remove `namespaces/<base>`; that conversation starts empty.
+and remove `namespaces/<base>`; that conversation starts empty. The `broker.execute` span's
+`storage.namespace` names the base for any traced invocation.
 
 ## Two rules that apply to every upgrade
 

@@ -1,7 +1,9 @@
 //! Direct per-invocation namespace storage and bounded native resources.
 use crate::{
     StorageEvidence, StorageGrant, StorageHostError,
-    key::{DOMAIN_LOGICAL_PATH, DOMAIN_OPERATION_EVIDENCE, DOMAIN_OUTPUT_EVIDENCE, StorageKey},
+    key::{
+        DOMAIN_LOGICAL_PATH, DOMAIN_OPERATION_EVIDENCE, DOMAIN_OUTPUT_EVIDENCE, commitment, token,
+    },
     layout::{ENTRY_CHARGE, EntryKind, Usage, scan_usage, usage_with_directory_entry},
     metrics::byte_bucket,
     namespace::{Namespace, lock_exclusive, logical_file},
@@ -109,7 +111,6 @@ pub struct StorageHandle {
     pub(crate) access: StorageAccess,
     pub(crate) namespace: Namespace,
     pub(crate) limits: crate::StorageLimits,
-    pub(crate) key: Arc<StorageKey>,
     pub(crate) ledger: Arc<QuotaLedger>,
     pub(crate) entries: BTreeMap<String, FileEntry>,
     /// What the namespace tree holds, carried forward by every mutation this invocation applies.
@@ -167,7 +168,6 @@ impl StorageHandle {
             access: grant.access,
             namespace: grant.namespace,
             limits: grant.limits,
-            key: grant.key,
             ledger,
             entries: BTreeMap::new(),
             usage,
@@ -326,7 +326,7 @@ impl StorageHandle {
 
     pub(crate) fn logical_token(&self, name: &str) -> Result<String, StorageHostError> {
         Self::validate_name(name)?;
-        Ok(self.key.token(
+        Ok(token(
             DOMAIN_LOGICAL_PATH,
             &[
                 self.namespace.base_token.as_bytes(),
@@ -698,10 +698,10 @@ impl StorageHandle {
         }
     }
 
-    /// Commits the exact successful provider output under its dedicated namespace-keyed domain.
+    /// Commits the exact successful provider output under its dedicated per-namespace domain.
     #[must_use]
     pub fn output_commitment(&self, bytes: &[u8]) -> String {
-        self.key.commitment(
+        commitment(
             DOMAIN_OUTPUT_EVIDENCE,
             &[
                 self.namespace.base_token.as_bytes(),
@@ -722,7 +722,7 @@ impl StorageHandle {
             quota_denials: self.evidence.quota_denials,
             read_byte_bucket: byte_bucket(self.evidence.read_bytes),
             write_byte_bucket: byte_bucket(self.evidence.write_bytes),
-            evidence_commitment: self.key.commitment(
+            evidence_commitment: commitment(
                 DOMAIN_OPERATION_EVIDENCE,
                 &[
                     self.namespace.scope_commitment.as_bytes(),
@@ -773,19 +773,12 @@ mod tests {
         layout::{scan_usage, usage_with_directory_entry},
     };
     use dekopon_capability::{StorageAccess, StorageInterface, StorageNamespace};
-    use std::{fs, os::unix::fs::PermissionsExt as _};
+
     fn probe_host(limits: StorageLimits) -> (tempfile::TempDir, StorageHost) {
         let temporary = tempfile::tempdir().expect("temporary directory");
         let directory = temporary.path().canonicalize().expect("canonical tempdir");
-        let key = directory.join("key.yaml");
-        fs::write(
-            &key,
-            "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
-        )
-        .expect("write key");
-        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
         let host =
-            StorageHost::open(directory.join("storage"), &key, limits).expect("durable-files host");
+            StorageHost::open(directory.join("storage"), limits).expect("durable-files host");
         (temporary, host)
     }
 

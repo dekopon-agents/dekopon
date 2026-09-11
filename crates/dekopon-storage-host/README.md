@@ -2,7 +2,7 @@
 
 Wasmtime-independent broker-owned storage engine for namespace-bound provider imports.
 
-The host derives opaque paths with domain-separated HMAC-SHA-256, retains directory descriptors for
+The host derives opaque paths with domain-separated, unkeyed SHA-256, retains directory descriptors for
 the complete tree, and performs opens, scans, creation, rename, and unlink relative to those
 descriptors with no-follow and identity/link checks. It keeps an exclusive root writer lock and a
 defined base-then-generation lease order, and rebuilds logical quota accounting on startup.

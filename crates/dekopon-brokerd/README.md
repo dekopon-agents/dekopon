@@ -655,9 +655,7 @@ stricter than `info` on the `dekopon_broker::audit` target drops the records fro
 ## Optional provider storage and chat memory
 
 Presence of `storage` requires every field; absence links storage imports only to a disabled sticky
-context. `rootPath` is disjoint from every broker-owned file and provider path, and
-`namespaceKeyPath` is one no-follow, server-owned `0600`, single-link, ≤4 KiB document under safe
-ancestors. A deployment with retained data and a missing or changed key fails closed.
+context. `rootPath` is disjoint from every broker-owned file and provider path.
 
 `maxReadBytesPerInvocation` bounds what one invocation pulls into memory: each positional
 durable-file read or JSONL chunk charges the length it requests, and a JSONL append or replacement
@@ -670,7 +668,6 @@ the largest database it keeps.
 ```yaml
 storage:
   rootPath: /var/lib/dekopon-provider-storage
-  namespaceKeyPath: /etc/dekopon-storage-key/storage-key.yaml
   maxRootBytes: 2147483648
   maxNamespaces: 4096
   maxNamespaceBytes: 67108864

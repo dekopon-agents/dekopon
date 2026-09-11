@@ -125,10 +125,6 @@ fn broker_config(directory: &Path, uid: u32) -> Value {
         "rootPath".to_owned(),
         json!(directory.join("provider-storage")),
     );
-    fields.insert(
-        "namespaceKeyPath".to_owned(),
-        json!(directory.join("storage-key.yaml")),
-    );
     json!({
         "apiVersion": dekopon_brokerd::CONFIG_API_VERSION,
         "socketPath": directory.join("broker.sock"),
@@ -592,10 +588,6 @@ async fn boot_in_with_scope(
     let uid = dekopon_brokerd::current_uid();
 
     let broker_path = directory.path().join("broker.json");
-    write_owner_only(
-        &directory.path().join("storage-key.yaml"),
-        b"apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
-    );
     write_owner_only(
         &directory.path().join("policies.cedar"),
         broker_policies().as_bytes(),

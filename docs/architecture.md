@@ -91,7 +91,7 @@ Only such an inherited message marks its reply optional. The shared prompt loop 
 
 A storage-enabled operation follows the ordinary authorization transition and additionally consumes one non-cloneable `StorageGrant`. The grant binds the exact component interface and access mode; a wrong-interface call and a denied, quota-exceeded, or over-budget call become sticky even when guest code catches the WIT error. A base-then-generation lease order serializes one scope's authority pointer and invocation access while distinct opaque namespaces overlap freely; grant and begin run as tracked blocking work, so a lease wait cannot stall Tokio workers. Each authorized host write applies directly. A failed response, a trap, and cancellation roll back no completed write. Quota headroom and leases stay held while started native jobs drain; the host makes no invocation-wide atomicity or crash-recovery promise.
 
-The exact standalone memory-chat release is staged under `/opt/dekopon/optional-providers`, outside the default provider scan. The chart mounts its retained provider-storage claim and the copied operator-managed namespace key into the broker container alone. The gateway receives neither mount and sends only one typed record proposal after an opaque transport-acceptance receipt.
+The exact standalone memory-chat release is staged under `/opt/dekopon/optional-providers`, outside the default provider scan. The chart mounts its retained provider-storage claim into the broker container alone. The gateway receives no such mount and sends only one typed record proposal after an opaque transport-acceptance receipt.
 
 ## Resource evolution
 

@@ -1041,17 +1041,16 @@ async fn storage_root_rejects_future_socket_and_broker_file_collisions() {
         POLICIES.as_bytes(),
     );
     write_owner_only(&directory.path().join("echo.wasm"), b"component fixture");
-    write_owner_only(&directory.path().join("storage-key.yaml"), b"key fixture");
     fs::create_dir(directory.path().join("provider-storage")).expect("storage root");
 
     let mut document = attested_document(uid);
     document["socketPath"] = json!("provider-storage/broker.sock");
     let mut storage = serde_json::to_value(dekopon_storage_host::StorageLimits::default())
         .expect("storage limits serialize");
-    storage.as_object_mut().expect("storage object").extend([
-        ("rootPath".to_owned(), json!("provider-storage")),
-        ("namespaceKeyPath".to_owned(), json!("storage-key.yaml")),
-    ]);
+    storage
+        .as_object_mut()
+        .expect("storage object")
+        .extend([("rootPath".to_owned(), json!("provider-storage"))]);
     document["storage"] = storage;
     write_config(&path, &document);
     assert!(matches!(
@@ -1067,10 +1066,10 @@ async fn storage_root_rejects_future_socket_and_broker_file_collisions() {
     document["providers"] = json!(["provider-storage/inside.wasm"]);
     let mut storage = serde_json::to_value(dekopon_storage_host::StorageLimits::default())
         .expect("storage limits serialize");
-    storage.as_object_mut().expect("storage object").extend([
-        ("rootPath".to_owned(), json!("provider-storage")),
-        ("namespaceKeyPath".to_owned(), json!("storage-key.yaml")),
-    ]);
+    storage
+        .as_object_mut()
+        .expect("storage object")
+        .extend([("rootPath".to_owned(), json!("provider-storage"))]);
     document["storage"] = storage;
     write_config(&path, &document);
     assert!(matches!(
@@ -1089,7 +1088,6 @@ async fn configured_storage_ancestor_symlinks_are_not_canonicalized_away() {
         POLICIES.as_bytes(),
     );
     write_owner_only(&directory.path().join("echo.wasm"), b"component fixture");
-    write_owner_only(&directory.path().join("storage-key.yaml"), b"key fixture");
     let actual = directory.path().join("actual-storage-parent");
     fs::create_dir(&actual).expect("actual parent");
     fs::set_permissions(&actual, fs::Permissions::from_mode(0o700)).expect("parent mode");
@@ -1099,13 +1097,10 @@ async fn configured_storage_ancestor_symlinks_are_not_canonicalized_away() {
     let mut document = attested_document(uid);
     let mut storage = serde_json::to_value(dekopon_storage_host::StorageLimits::default())
         .expect("storage limits serialize");
-    storage.as_object_mut().expect("storage object").extend([
-        (
-            "rootPath".to_owned(),
-            json!("storage-parent/provider-storage"),
-        ),
-        ("namespaceKeyPath".to_owned(), json!("storage-key.yaml")),
-    ]);
+    storage.as_object_mut().expect("storage object").extend([(
+        "rootPath".to_owned(),
+        json!("storage-parent/provider-storage"),
+    )]);
     document["storage"] = storage;
     write_config(&path, &document);
     assert!(matches!(
@@ -1128,7 +1123,6 @@ async fn refused_storage_and_frame_bounds_keep_the_field_that_refused_them() {
         POLICIES.as_bytes(),
     );
     write_owner_only(&directory.path().join("echo.wasm"), b"component fixture");
-    write_owner_only(&directory.path().join("storage-key.yaml"), b"key fixture");
     fs::create_dir(directory.path().join("provider-storage")).expect("storage root");
 
     let mut document = attested_document(uid);
@@ -1136,7 +1130,6 @@ async fn refused_storage_and_frame_bounds_keep_the_field_that_refused_them() {
         .expect("storage limits serialize");
     storage.as_object_mut().expect("storage object").extend([
         ("rootPath".to_owned(), json!("provider-storage")),
-        ("namespaceKeyPath".to_owned(), json!("storage-key.yaml")),
         ("maxFileBytes".to_owned(), json!(0)),
     ]);
     document["storage"] = storage;
@@ -1184,16 +1177,15 @@ async fn chat_memory_rejects_a_host_fuel_ceiling_that_cannot_reach_compaction() 
         POLICIES.as_bytes(),
     );
     write_owner_only(&directory.path().join("echo.wasm"), b"component fixture");
-    write_owner_only(&directory.path().join("storage-key.yaml"), b"key fixture");
     fs::create_dir(directory.path().join("provider-storage")).expect("storage root");
 
     let mut document = attested_document(uid);
     let mut storage = serde_json::to_value(dekopon_storage_host::StorageLimits::default())
         .expect("storage limits serialize");
-    storage.as_object_mut().expect("storage object").extend([
-        ("rootPath".to_owned(), json!("provider-storage")),
-        ("namespaceKeyPath".to_owned(), json!("storage-key.yaml")),
-    ]);
+    storage
+        .as_object_mut()
+        .expect("storage object")
+        .extend([("rootPath".to_owned(), json!("provider-storage"))]);
     document["storage"] = storage;
     document["chatMemory"] = serde_json::to_value(dekopon_broker::ChatMemoryConfig {
         continuity_policy: dekopon_storage_host::ContinuityPolicy::AuthorityBound,
@@ -1253,10 +1245,6 @@ fn storage_section_is_optional_all_or_nothing_and_strict() {
         "rootPath".to_owned(),
         json!("/var/lib/dekopon-provider-storage"),
     );
-    object.insert(
-        "namespaceKeyPath".to_owned(),
-        json!("/etc/dekopon-storage-key/storage-key.yaml"),
-    );
     document["storage"] = storage.clone();
     let decoded = serde_json::from_value::<config::BrokerdConfig>(document.clone())
         .expect("complete strict storage section decodes");
@@ -1272,6 +1260,32 @@ fn storage_section_is_optional_all_or_nothing_and_strict() {
     assert!(
         serde_json::from_value::<config::BrokerdConfig>(document).is_err(),
         "presence requires every storage field"
+    );
+}
+
+/// The namespace key is gone. A configuration still naming it is refused, and the error says which
+/// field, rather than the key quietly going unread while the operator believes it protects names.
+#[test]
+fn an_old_config_naming_namespace_key_path_is_refused() {
+    let mut document = attested_document(current_uid());
+    let mut storage = serde_json::to_value(dekopon_storage_host::StorageLimits::default())
+        .expect("storage limits serialize");
+    storage.as_object_mut().expect("limits object").extend([
+        (
+            "rootPath".to_owned(),
+            json!("/var/lib/dekopon-provider-storage"),
+        ),
+        (
+            "namespaceKeyPath".to_owned(),
+            json!("/etc/dekopon-storage-key/storage-key.yaml"),
+        ),
+    ]);
+    document["storage"] = storage;
+    let refused = serde_json::from_value::<config::BrokerdConfig>(document)
+        .expect_err("a retired storage field is refused");
+    assert!(
+        refused.to_string().contains("namespaceKeyPath"),
+        "{refused}"
     );
 }
 

@@ -388,10 +388,15 @@ All notable changes to Dekopon are documented here. The format is based on
   or a wrong mode anywhere under it — is not reset and fails each grant naming the entry.
   `StorageHostError::Corrupt` carries `namespace`, `generation`, `path` and `reset`, `CorruptLayout`
   carries `path`, and `RootIo`, `UnsafeRoot` and `CorruptLayout` print their path.
-- Every authority-bound provider-storage namespace — every chat memory on the default continuity
-  policy — starts a fresh, empty generation on its first use after this release. Removing
-  `maxQuarantinedNamespaces` changed the authority surface each generation is bound to. Stable
-  namespaces keep their data; the previous generations stay on disk and charged to the root quota.
+- **Breaking: provider storage starts empty.** Every storage name and commitment is now an unkeyed,
+  domain-separated SHA-256, so every namespace directory name changes, and a root initialized under
+  the namespace key is refused at startup as a corrupt layout: its `layout` still carries
+  `keyCommitment`, and its `quarantine/` is outside the root allowlist. Stop the broker, move the
+  root aside, and start on an empty one; stable and authority-bound namespaces alike start over.
+  Commitments on storage audit records and dedup entries are written `sha256:` instead of
+  `hmac-sha256:`, and the authority pointer is `{apiVersion, authority, epoch}` without a `mac`.
+  `broker.execute` storage spans carry `storage.namespace`, the base directory token, so a trace
+  leads to its conversation's directory. See [`docs/upgrading.md`](docs/upgrading.md).
 - The native HTTP host's refusal of a response that carries its credential is now the credential
   echo check, and its message reads `credentialed response echoed the credential` instead of
   `credential-bearing response reflected protected material`. That text is what an operator reads
@@ -545,13 +550,20 @@ All notable changes to Dekopon are documented here. The format is based on
   still reaches the caller as a `ScriptOutcome`; a syntax error is still the rendered
   `dekopon-shell: syntax error: ...` line on its output, which is the shape every consumer
   actually reads. The grammar is now free to change without a major version.
+- Removed the provider-storage namespace key. `storage.namespaceKeyPath` is gone from broker
+  configuration and refused by name; the chart's `providerStorage.existingKeySecret`,
+  `existingKeySecretKey`, `keyDir`, and `keyFileName` are refused at render, and the key copy, its
+  tmpfs, and its projected Secret are gone from the pod. `StorageHost::open` takes the root and the
+  limits, and `resolve_namespace_key_path` and `StorageHostError::{KeyIo, UnsafeKeyFile,
+  InvalidKeyFile, KeyMismatch}` are gone. The key was a MAC over one pointer file that only the
+  broker's own UID or root could write, and it kept chat scope unguessable to an operator who can
+  already read the root; neither serves a goal. Remove the key Secret once the root is moved aside.
 - Removed namespace quarantine and startup namespace validation. Provider-storage startup checks
   the root — ancestors, key, `layout`, `writer.lock` — and makes one quota walk; it no longer
   validates every namespace, and nothing is renamed into `quarantine/`. A namespace that will not
   scan in that walk is logged as `storage_root_entry_ignored` and left uncharged rather than
-  stopping the broker. `quarantine` left the root-entry allowlist: an existing root's empty
-  `quarantine/` is removed at startup (`storage_quarantine_removed`), and a non-empty one refuses
-  startup naming it. Delete `storage.maxQuarantinedNamespaces` from broker configuration — the
+  stopping the broker. `quarantine` left the root-entry allowlist. Delete
+  `storage.maxQuarantinedNamespaces` from broker configuration — the
   storage limits object is `deny_unknown_fields` and refuses it by name. Both `chmodat` calls are
   gone: the crate no longer chmods a directory it has classified as untrusted. Hard-link, symlink,
   ownership and mode refusals are unchanged; see [`docs/upgrading.md`](docs/upgrading.md).
@@ -788,6 +800,11 @@ All notable changes to Dekopon are documented here. The format is based on
   stays for the two seed-once ChatGPT credentials. Audit is the broker's `broker.decision` and
   `broker.execution` log records, on the pod's stdout and on the OTLP receiver `telemetry` names.
   An `audit.jsonl` left on an existing claim is inert.
+- The chart has no provider-storage namespace key. `providerStorage.existingKeySecret`,
+  `existingKeySecretKey`, `keyDir` and `keyFileName` are refused at render, and the key's projected
+  Secret, its init copy, its tmpfs and its broker mount are gone. A storage root from an earlier
+  release is refused at broker startup; move it aside first, as
+  [`docs/upgrading.md`](docs/upgrading.md#provider-storage-starts-empty-unreleased) describes.
 
 ### Changed
 

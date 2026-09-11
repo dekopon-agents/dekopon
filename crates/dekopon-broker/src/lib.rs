@@ -84,14 +84,14 @@ const STORAGE_EVIDENCE_MEDIA_TYPE: &str = "application/vnd.dekopon.storage-evide
 /// and that name is what a delivered-turn record carries. This is only the label the refusal
 /// record uses when there is no such set to name.
 const UNROUTED_RECORD_CAPABILITY: &str = "memory.chat.record";
-/// Conservative complete line bound for broker-curated HMAC dedup records.
+/// Conservative complete line bound for broker-curated dedup records.
 ///
-/// The current canonical JSON is 227 bytes including LF. Keeping explicit headroom decouples
+/// The current canonical JSON is 217 bytes including LF. Keeping explicit headroom decouples
 /// composition safety from incidental serde field formatting while remaining a fixed trusted
 /// bound rather than a guest claim.
 const MEMORY_DEDUP_LINE_BYTES: u64 = 256;
-/// Exact minimum canonical turn line with empty text and broker-generated HMAC fields.
-const MEMORY_MIN_TURN_LINE_BYTES: u64 = 251;
+/// Exact minimum canonical turn line with empty text and broker-generated `sha256:` fields.
+const MEMORY_MIN_TURN_LINE_BYTES: u64 = 241;
 /// SDK success/failure envelope around the provider's already-bounded result value.
 const MEMORY_PROVIDER_OUTPUT_OVERHEAD_BYTES: u64 = 1_024;
 /// Curated record/query fields and worst-case JSON string escaping at the component boundary.
@@ -2032,7 +2032,7 @@ pub enum AuditEvent {
         reason: Option<String>,
         /// Digest binding the complete decision material without logging it.
         decision_digest: String,
-        /// Keyed scope commitment for storage records, distinct from physical path tokens.
+        /// Scope commitment for storage records, distinct from physical path tokens.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         storage_scope_commitment: Option<StorageScopeCommitment>,
         /// Content-free storage evidence, normally present on terminal execution only.
@@ -2110,7 +2110,7 @@ pub enum AuditEvent {
         /// Sanitized HTTP metadata; never paths, queries, headers, or bodies.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         http_calls: Vec<HttpCallEvidence>,
-        /// Keyed scope commitment for storage records, distinct from physical path tokens.
+        /// Scope commitment for storage records, distinct from physical path tokens.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         storage_scope_commitment: Option<StorageScopeCommitment>,
         /// Content-free coarse storage evidence.
@@ -3527,6 +3527,7 @@ where
             tracing::info_span!(
                 "broker.execute",
                 storage = true,
+                storage.namespace = tracing::field::Empty,
                 storage.reset = tracing::field::Empty,
                 outcome = tracing::field::Empty,
                 error = tracing::field::Empty,
@@ -3723,10 +3724,15 @@ where
         set: ConstraintSet,
         policy_ids: Vec<String>,
     ) -> Result<InvocationResult, BrokerError> {
-        // Keyed scope/evidence preparation is deliberately non-mutating. The authorization
-        // decision is recorded before `materialize` may create a namespace, rotate a generation
+        // Scope/evidence preparation is deliberately non-mutating. The authorization decision is
+        // recorded before `materialize` may create a namespace, rotate a generation
         // pointer, or update lifecycle state.
         let mut storage_preparation = self.prepare_storage_grant(context, &request, &set)?;
+        // The directory this invocation's chat scope lives in, so an operator reading the trace
+        // can go straight to it.
+        if let Some(preparation) = &storage_preparation {
+            tracing::Span::current().record("storage.namespace", preparation.namespace());
+        }
         let storage_scope_commitment = storage_preparation
             .as_ref()
             .map(StorageGrantPreparation::scope_commitment);
@@ -4970,8 +4976,7 @@ fn public_host_error(error: &BrokerHostError, route: CapabilityRoute) -> &'stati
             dekopon_storage_host::StorageHostError::Busy => "storage-busy",
             dekopon_storage_host::StorageHostError::Timeout => "storage-timeout",
             dekopon_storage_host::StorageHostError::Corrupt { .. }
-            | dekopon_storage_host::StorageHostError::CorruptLayout { .. }
-            | dekopon_storage_host::StorageHostError::KeyMismatch => "storage-corrupt",
+            | dekopon_storage_host::StorageHostError::CorruptLayout { .. } => "storage-corrupt",
             _ => "storage-io",
         },
         BrokerHostError::Invoke { .. } => "provider-trap",
@@ -5101,8 +5106,7 @@ impl BrokerError {
             dekopon_storage_host::StorageHostError::Busy => "storage-busy",
             dekopon_storage_host::StorageHostError::Timeout => "storage-timeout",
             dekopon_storage_host::StorageHostError::Corrupt { .. }
-            | dekopon_storage_host::StorageHostError::CorruptLayout { .. }
-            | dekopon_storage_host::StorageHostError::KeyMismatch => "storage-corrupt",
+            | dekopon_storage_host::StorageHostError::CorruptLayout { .. } => "storage-corrupt",
             _ => "storage-io",
         })
     }

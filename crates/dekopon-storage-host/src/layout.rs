@@ -11,10 +11,7 @@ use std::{
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 
-use crate::{
-    StorageHostError,
-    key::{DOMAIN_AUTHORITY, StorageKey, random_bytes},
-};
+use crate::{StorageHostError, key::random_bytes};
 
 pub(crate) const ENTRY_CHARGE: u64 = 4_096;
 const LAYOUT_VERSION: &str = "dekopon.dev/provider-storage-layout/v1alpha1";
@@ -58,11 +55,14 @@ pub(crate) struct Layout {
     _writer_lock: File,
 }
 
+/// The root's initialization commit point.
+///
+/// Strict, so a root initialized under the namespace key, whose document still carries its
+/// `keyCommitment`, is refused as a corrupt layout rather than opened with every name changed.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct LayoutDocument {
     api_version: String,
-    key_commitment: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -86,14 +86,13 @@ pub(crate) fn usage_with_directory_entry(mut usage: Usage) -> Result<Usage, Stor
 }
 
 impl Layout {
-    pub(crate) fn minimum_usage(root: &Path, key: &StorageKey) -> Result<Usage, StorageHostError> {
+    pub(crate) fn minimum_usage(root: &Path) -> Result<Usage, StorageHostError> {
         let document = LayoutDocument {
             api_version: LAYOUT_VERSION.to_owned(),
-            key_commitment: key.commitment(DOMAIN_AUTHORITY, &[b"layout-key-v1"]),
         };
         #[allow(
             clippy::map_err_ignore,
-            reason = "serializing this owned two-string document has no failing case, and \
+            reason = "serializing this owned one-string document has no failing case, and \
                       TryFromIntError carries only out-of-range, which Arithmetic already states"
         )]
         let encoded = u64::try_from(
@@ -116,14 +115,13 @@ impl Layout {
         })
     }
 
-    pub(crate) fn open(root: &Path, key: &StorageKey) -> Result<Self, StorageHostError> {
+    pub(crate) fn open(root: &Path) -> Result<Self, StorageHostError> {
         validate_ancestors(root)?;
         ensure_root_directory(root)?;
         let root = Directory::open_path(root, true)?;
         let corrupt_layout = |path: PathBuf| StorageHostError::CorruptLayout { path };
-        // One more than the allowlist: a root from a release that still created `quarantine/`.
-        let initial_entries = root.entries_prefix(5)?;
-        if initial_entries.len() > 4 {
+        let initial_entries = root.entries_prefix(4)?;
+        if initial_entries.len() > 3 {
             return Err(corrupt_layout(root.path().to_path_buf()));
         }
         let has_layout = initial_entries.iter().any(|name| name == "layout");
@@ -156,17 +154,15 @@ impl Layout {
             .try_lock()
             .map_err(|source| writer_lock_failure(&root, source))?;
 
-        let key_commitment = key.commitment(DOMAIN_AUTHORITY, &[b"layout-key-v1"]);
         let namespaces = if has_layout {
             let encoded = root.read_bounded("layout", 4_096)?;
             let document: LayoutDocument = serde_json::from_slice(&encoded).map_err(|error| {
                 crate::report_decode_failure("layout", &error);
                 corrupt_layout(root.diagnostic_child("layout"))
             })?;
-            if document.api_version != LAYOUT_VERSION || document.key_commitment != key_commitment {
-                return Err(StorageHostError::KeyMismatch);
+            if document.api_version != LAYOUT_VERSION {
+                return Err(corrupt_layout(root.diagnostic_child("layout")));
             }
-            remove_retired_quarantine(&root)?;
             let expected = ["layout", "namespaces", "writer.lock"];
             let retained = root.entries_prefix(expected.len() as u64 + 1)?;
             if retained.len() != expected.len() || retained.iter().map(String::as_str).ne(expected)
@@ -178,11 +174,10 @@ impl Layout {
             let namespaces = root.ensure_directory("namespaces")?;
             let document = LayoutDocument {
                 api_version: LAYOUT_VERSION.to_owned(),
-                key_commitment,
             };
             #[allow(
                 clippy::map_err_ignore,
-                reason = "serializing this owned two-string document has no failing case"
+                reason = "serializing this owned one-string document has no failing case"
             )]
             let mut encoded = serde_json::to_vec(&document)
                 .map_err(|_| corrupt_layout(root.diagnostic_child("layout")))?;
@@ -433,9 +428,9 @@ impl Directory {
         file: &File,
     ) -> Result<(), StorageHostError> {
         let metadata = file.metadata().map_err(|source| self.io_error(source))?;
-        // Private: a namespace key and the layout documents beside it are secret material, so
-        // group- or world-readability is already the loss. `Corrupt` stays opaque to the guest,
-        // so which check refused it is logged here rather than returned.
+        // Private: every retained file is broker-owned state, so group- or world-readability is
+        // already the loss. `Corrupt` stays opaque to the guest, so which check refused it is
+        // logged here rather than returned.
         if let Err(error) = dekopon_core::check_trusted_metadata(
             &self.diagnostic_child(name),
             &metadata,
@@ -799,37 +794,6 @@ pub(crate) fn scan_root_usage(
         }
     }
     Ok(usage)
-}
-
-/// Removes the empty `quarantine/` a root created before quarantine was deleted still holds.
-///
-/// A non-empty one holds bytes an earlier release set aside. Deleting those is the operator's call,
-/// so startup refuses and names it.
-fn remove_retired_quarantine(root: &Directory) -> Result<(), StorageHostError> {
-    if root
-        .metadata("quarantine")?
-        .is_none_or(|metadata| metadata.kind != EntryKind::Directory)
-    {
-        // Absent, or not a directory, which the root allowlist refuses by itself.
-        return Ok(());
-    }
-    let path = root.diagnostic_child("quarantine");
-    match rustix::fs::unlinkat(root.file.as_ref(), "quarantine", AtFlags::REMOVEDIR) {
-        Ok(()) => {
-            root.sync()?;
-            tracing::info!(
-                event = "storage_quarantine_removed",
-                category = "storage",
-                storage.path = %path.display(),
-                "removed the empty quarantine directory an earlier release created"
-            );
-            Ok(())
-        }
-        Err(rustix::io::Errno::NOTEMPTY | rustix::io::Errno::EXIST) => {
-            Err(StorageHostError::CorruptLayout { path })
-        }
-        Err(source) => Err(root.io_error(std::io::Error::from(source))),
-    }
 }
 
 #[cfg(test)]

@@ -50,25 +50,14 @@ fn generations(base: &Path) -> Vec<String> {
     names
 }
 
-fn fixture() -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+fn fixture() -> (TempDir, std::path::PathBuf) {
     let temporary = tempfile::tempdir().expect("temporary directory");
-    let directory = temporary
+    let root = temporary
         .path()
         .canonicalize()
-        .expect("canonical temporary directory");
-    let root = directory.join("storage");
-    let key = directory.join("storage-key.yaml");
-    write_key(&key);
-    (temporary, root, key)
-}
-
-fn write_key(path: &Path) {
-    fs::write(
-        path,
-        "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
-    )
-    .expect("write key");
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("key mode");
+        .expect("canonical temporary directory")
+        .join("storage");
+    (temporary, root)
 }
 
 fn vfs_request(invocation: &str, access: StorageAccess) -> StorageGrantRequest {
@@ -132,8 +121,8 @@ fn request(
 
 #[test]
 fn jsonl_commits_and_reopens_without_raw_scope_paths() {
-    let (_temporary, root, key) = fixture();
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
     let grant = host
         .grant(request(
             b"authority-a",
@@ -152,7 +141,7 @@ fn jsonl_commits_and_reopens_without_raw_scope_paths() {
     transaction.commit().expect("commit");
     drop(host);
 
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("reopen");
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("reopen");
     let grant = host
         .grant(request(
             b"authority-a",
@@ -191,8 +180,8 @@ fn jsonl_commits_and_reopens_without_raw_scope_paths() {
 
 #[test]
 fn authority_bound_never_reuses_an_old_generation() {
-    let (_temporary, root, key) = fixture();
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
     for (index, surface) in [b"a".as_slice(), b"b", b"a"].into_iter().enumerate() {
         let grant = host
             .grant(request(
@@ -224,8 +213,8 @@ fn authority_bound_never_reuses_an_old_generation() {
 
 #[test]
 fn authority_bound_does_not_reopen_an_epoch_after_stable_continuity() {
-    let (_temporary, root, key) = fixture();
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
 
     let mut first = host
         .begin(
@@ -291,30 +280,113 @@ fn authority_bound_does_not_reopen_an_epoch_after_stable_continuity() {
 }
 
 #[test]
-fn wrong_key_and_second_writer_fail_closed() {
-    let (_temporary, root, key) = fixture();
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("first host");
+fn a_second_writer_fails_closed() {
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("first host");
     assert!(matches!(
-        StorageHost::open(&root, &key, StorageLimits::default()),
+        StorageHost::open(&root, StorageLimits::default()),
         Err(StorageHostError::SecondWriter)
     ));
     drop(host);
-    fs::write(
-        &key,
-        "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
-    )
-    .expect("replace key");
-    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
-    assert!(matches!(
-        StorageHost::open(&root, &key, StorageLimits::default()),
-        Err(StorageHostError::KeyMismatch)
-    ));
+    StorageHost::open(&root, StorageLimits::default()).expect("the lock went with the first host");
+}
+
+#[test]
+fn namespace_tokens_are_stable_across_processes() {
+    let (_temporary, root) = fixture();
+    let (_elsewhere, other_root) = fixture();
+    let scope = |invocation: &str, access| {
+        request(
+            b"authority",
+            ContinuityPolicy::AuthorityBound,
+            invocation,
+            access,
+        )
+    };
+
+    let first = StorageHost::open(&root, StorageLimits::default()).expect("first host");
+    let preparation = first
+        .prepare_grant(scope("stable-token-write", StorageAccess::ReadWrite))
+        .expect("preparation");
+    let token = preparation.namespace().to_owned();
+    let mut writer = first
+        .begin(preparation.materialize().expect("grant"))
+        .expect("transaction");
+    writer
+        .jsonl_append("turns.jsonl", 0, br#"{"turn":1}"#)
+        .expect("append");
+    writer.commit().expect("commit");
+    drop(first);
+    assert_eq!(
+        only_base(&root)
+            .file_name()
+            .expect("base name")
+            .to_string_lossy(),
+        token
+    );
+
+    // A second process over the same root resolves the same scope to the same directory, and a
+    // second root derives the same name: nothing about a deployment enters the derivation.
+    let second = StorageHost::open(&root, StorageLimits::default()).expect("second host");
+    let preparation = second
+        .prepare_grant(scope("stable-token-read", StorageAccess::ReadOnly))
+        .expect("preparation");
+    assert_eq!(preparation.namespace(), token);
+    let mut reader = second
+        .begin(preparation.materialize().expect("grant"))
+        .expect("transaction");
+    assert_eq!(reader.jsonl_size("turns.jsonl").expect("retained"), 11);
+    reader.finish_read().expect("finish");
+    let elsewhere = StorageHost::open(&other_root, StorageLimits::default()).expect("other root");
+    assert_eq!(
+        elsewhere
+            .prepare_grant(scope("stable-token-other-root", StorageAccess::ReadOnly))
+            .expect("preparation")
+            .namespace(),
+        token
+    );
+}
+
+#[test]
+fn a_root_from_the_keyed_layout_is_refused_at_open() {
+    let keyed = concat!(
+        r#"{"apiVersion":"dekopon.dev/provider-storage-layout/v1alpha1","#,
+        r#""keyCommitment":"hmac-sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"}"#,
+        "\n"
+    );
+
+    // Every root an earlier release initialized: a keyed layout and its `quarantine/` beside it.
+    let (_temporary, root) = fixture();
+    drop(StorageHost::open(&root, StorageLimits::default()).expect("host"));
+    fs::write(root.join("layout"), keyed).expect("keyed layout");
+    let retired = root.join("quarantine");
+    fs::create_dir(&retired).expect("retired quarantine directory");
+    fs::set_permissions(&retired, fs::Permissions::from_mode(0o700)).expect("retired mode");
+    let before = tree_snapshot(&root);
+    let refused = StorageHost::open(&root, StorageLimits::default());
+    let Err(StorageHostError::CorruptLayout { path }) = &refused else {
+        panic!("expected a corrupt layout, got {refused:?}");
+    };
+    assert_eq!(*path, root);
+    assert_eq!(
+        before,
+        tree_snapshot(&root),
+        "a refused root keeps every byte"
+    );
+
+    // The keyed document on its own is refused too, naming it: an unknown field is not ignored.
+    fs::remove_dir(&retired).expect("remove quarantine");
+    let refused = StorageHost::open(&root, StorageLimits::default());
+    let Err(StorageHostError::CorruptLayout { path }) = &refused else {
+        panic!("expected a corrupt layout, got {refused:?}");
+    };
+    assert_eq!(*path, root.join("layout"));
 }
 
 #[test]
 fn every_trusted_scope_dimension_isolated_from_the_others() {
-    let (_temporary, root, key) = fixture();
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
     let grant = host
         .grant(request(
             b"authority",
@@ -426,8 +498,8 @@ fn every_trusted_scope_dimension_isolated_from_the_others() {
 
 #[test]
 fn tighter_file_and_namespace_limits_rotate_away_from_valid_historical_bytes() {
-    let (_temporary, root, key) = fixture();
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
     let mut old = host
         .begin(
             host.grant(request(
@@ -450,7 +522,7 @@ fn tighter_file_and_namespace_limits_rotate_away_from_valid_historical_bytes() {
         max_file_bytes: 1_024,
         ..StorageLimits::default()
     };
-    let host = StorageHost::open(&root, &key, limits).expect("historical quota is not corruption");
+    let host = StorageHost::open(&root, limits).expect("historical quota is not corruption");
     let mut current = host
         .begin(
             host.grant(request(
@@ -471,8 +543,8 @@ fn tighter_file_and_namespace_limits_rotate_away_from_valid_historical_bytes() {
 
 #[test]
 fn explicit_stable_continuity_survives_authority_surface_changes() {
-    let (_temporary, root, key) = fixture();
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
     let grant = host
         .grant(request(
             b"authority-a",
@@ -502,12 +574,12 @@ fn explicit_stable_continuity_survives_authority_surface_changes() {
 
 #[test]
 fn exact_file_quota_succeeds_and_one_byte_overflow_mutates_nothing() {
-    let (_temporary, root, key) = fixture();
+    let (_temporary, root) = fixture();
     let limits = StorageLimits {
         max_file_bytes: 11,
         ..StorageLimits::default()
     };
-    let host = StorageHost::open(&root, &key, limits).expect("host");
+    let host = StorageHost::open(&root, limits).expect("host");
     let grant = host
         .grant(request(
             b"authority",
@@ -560,7 +632,7 @@ fn exact_file_quota_succeeds_and_one_byte_overflow_mutates_nothing() {
 
 #[test]
 fn root_initialization_quota_denial_creates_no_layout_entry() {
-    let (_temporary, root, key) = fixture();
+    let (_temporary, root) = fixture();
     let parent = root.parent().expect("root parent");
     let before = tree_snapshot(parent);
     // The three root entries fit; the layout document's own bytes do not.
@@ -573,7 +645,7 @@ fn root_initialization_quota_denial_creates_no_layout_entry() {
         ..StorageLimits::default()
     };
     assert!(matches!(
-        StorageHost::open(&root, &key, limits),
+        StorageHost::open(&root, limits),
         Err(StorageHostError::QuotaExceeded)
     ));
     assert!(!root.exists());
@@ -582,14 +654,14 @@ fn root_initialization_quota_denial_creates_no_layout_entry() {
 
 #[test]
 fn namespace_housekeeping_quota_denial_precedes_every_mutation() {
-    let (_temporary, root, key) = fixture();
+    let (_temporary, root) = fixture();
     let limits = StorageLimits {
         // Generation directory, data directory and lease: one byte below their live peak.
         max_namespace_bytes: 3 * 4_096 - 1,
         max_file_bytes: 1,
         ..StorageLimits::default()
     };
-    let host = StorageHost::open(&root, &key, limits).expect("host");
+    let host = StorageHost::open(&root, limits).expect("host");
     let before = tree_snapshot(&root);
     assert!(matches!(
         host.grant(request(
@@ -611,8 +683,8 @@ fn namespace_housekeeping_quota_denial_precedes_every_mutation() {
 
 #[test]
 fn read_only_vfs_rejects_every_write_bearing_open_before_a_handle_exists() {
-    let (_temporary, root, key) = fixture();
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
     let mut writer = host
         .begin(
             host.grant(vfs_request("vfs-seed", StorageAccess::ReadWrite))
@@ -670,8 +742,8 @@ fn read_only_vfs_rejects_every_write_bearing_open_before_a_handle_exists() {
 
 #[test]
 fn logical_names_reject_traversal_and_separators_without_creating_data_entries() {
-    let (_temporary, root, key) = fixture();
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
     let mut transaction = host
         .begin(
             host.grant(request(
@@ -708,12 +780,12 @@ fn logical_names_reject_traversal_and_separators_without_creating_data_entries()
 
 #[test]
 fn sparse_growth_obeys_the_exact_file_bound_and_one_byte_over_mutates_nothing() {
-    let (_temporary, root, key) = fixture();
+    let (_temporary, root) = fixture();
     let limits = StorageLimits {
         max_file_bytes: 16,
         ..StorageLimits::default()
     };
-    let host = StorageHost::open(&root, &key, limits).expect("host");
+    let host = StorageHost::open(&root, limits).expect("host");
     let mut exact = host
         .begin(
             host.grant(vfs_request("sparse-exact", StorageAccess::ReadWrite))
@@ -779,8 +851,8 @@ fn sparse_growth_obeys_the_exact_file_bound_and_one_byte_over_mutates_nothing() 
 
 #[test]
 fn a_hard_linked_logical_file_fails_its_own_grant_and_not_the_broker() {
-    let (_temporary, root, key) = fixture();
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
     let mut writer = host
         .begin(
             host.grant(request(
@@ -809,7 +881,7 @@ fn a_hard_linked_logical_file_fails_its_own_grant_and_not_the_broker() {
         .path();
     fs::hard_link(&original, data.join("c".repeat(64))).expect("hard link");
 
-    let (host, startup) = captured(|| StorageHost::open(&root, &key, StorageLimits::default()));
+    let (host, startup) = captured(|| StorageHost::open(&root, StorageLimits::default()));
     let host = host.expect("one namespace's hard link does not stop the broker");
     let logged = startup.events_text();
     assert!(logged.contains("storage_root_entry_ignored"), "{logged}");
@@ -846,8 +918,8 @@ fn a_hard_linked_logical_file_fails_its_own_grant_and_not_the_broker() {
 
 #[test]
 fn metadata_calls_do_not_load_whole_files_or_bypass_native_read_memory_bounds() {
-    let (_temporary, root, key) = fixture();
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
     let mut writer = host
         .begin(
             host.grant(vfs_request("metadata-seed", StorageAccess::ReadWrite))
@@ -875,7 +947,7 @@ fn metadata_calls_do_not_load_whole_files_or_bypass_native_read_memory_bounds() 
         max_read_bytes_per_invocation: 4,
         ..StorageLimits::default()
     };
-    let host = StorageHost::open(&root, &key, limits).expect("reopen");
+    let host = StorageHost::open(&root, limits).expect("reopen");
     let mut metadata = host
         .begin(
             host.grant(vfs_request("metadata-stat", StorageAccess::ReadOnly))
@@ -945,13 +1017,13 @@ fn a_database_larger_than_the_read_budget_is_extended_and_read_back_in_short_rea
         vec![byte; usize::try_from(PAGE).expect("page size")]
     }
 
-    let (_temporary, root, key) = fixture();
+    let (_temporary, root) = fixture();
     let limits = StorageLimits {
         max_read_bytes_per_call: PAGE,
         max_read_bytes_per_invocation: READ_BUDGET,
         ..StorageLimits::default()
     };
-    let host = StorageHost::open(&root, &key, limits).expect("host");
+    let host = StorageHost::open(&root, limits).expect("host");
 
     let mut creating = host
         .begin(
@@ -1098,12 +1170,12 @@ fn a_database_larger_than_the_read_budget_is_extended_and_read_back_in_short_rea
 
 #[test]
 fn counted_resource_drop_cannot_mask_an_exhausted_host_call_budget() {
-    let (_temporary, root, key) = fixture();
+    let (_temporary, root) = fixture();
     let limits = StorageLimits {
         max_host_calls_per_invocation: 1,
         ..StorageLimits::default()
     };
-    let host = StorageHost::open(&root, &key, limits).expect("host");
+    let host = StorageHost::open(&root, limits).expect("host");
     let mut transaction = host
         .begin(
             host.grant(vfs_request("drop-budget", StorageAccess::ReadWrite))
@@ -1148,8 +1220,8 @@ fn counted_resource_drop_cannot_mask_an_exhausted_host_call_budget() {
 
 #[test]
 fn rename_then_recreate_assigns_a_fresh_live_identity() {
-    let (_temporary, root, key) = fixture();
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
     let mut transaction = host
         .begin(
             host.grant(vfs_request("vfs-incarnation", StorageAccess::ReadWrite))
@@ -1191,8 +1263,8 @@ fn rename_then_recreate_assigns_a_fresh_live_identity() {
 
 #[test]
 fn pending_lock_blocks_a_new_shared_reader_while_existing_readers_drain() {
-    let (_temporary, root, key) = fixture();
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
     let mut transaction = host
         .begin(
             host.grant(vfs_request("vfs-locks", StorageAccess::ReadWrite))
@@ -1248,9 +1320,8 @@ fn barrier_concurrent_first_grants_publish_one_epoch_and_authority_changes_publi
             2,
         ),
     ] {
-        let (_temporary, root, key) = fixture();
-        let host =
-            Arc::new(StorageHost::open(&root, &key, StorageLimits::default()).expect("host"));
+        let (_temporary, root) = fixture();
+        let host = Arc::new(StorageHost::open(&root, StorageLimits::default()).expect("host"));
         let barrier = Arc::new(Barrier::new(surfaces.len() + 1));
         let workers = surfaces
             .into_iter()
@@ -1294,8 +1365,8 @@ fn barrier_concurrent_first_grants_publish_one_epoch_and_authority_changes_publi
 
 #[test]
 fn same_namespace_serializes_while_a_distinct_namespace_can_overlap() {
-    let (_temporary, root, key) = fixture();
-    let host = Arc::new(StorageHost::open(&root, &key, StorageLimits::default()).expect("host"));
+    let (_temporary, root) = fixture();
+    let host = Arc::new(StorageHost::open(&root, StorageLimits::default()).expect("host"));
     let held = host
         .grant(scoped_request(
             b"authority",
@@ -1360,12 +1431,12 @@ fn same_namespace_serializes_while_a_distinct_namespace_can_overlap() {
 
 #[test]
 fn concurrent_namespace_cap_is_atomic_and_a_denial_mutates_nothing() {
-    let (_temporary, root, key) = fixture();
+    let (_temporary, root) = fixture();
     let limits = StorageLimits {
         max_namespaces: 1,
         ..StorageLimits::default()
     };
-    let host = Arc::new(StorageHost::open(&root, &key, limits).expect("host"));
+    let host = Arc::new(StorageHost::open(&root, limits).expect("host"));
     let barrier = Arc::new(Barrier::new(3));
     let mut threads = Vec::new();
     for (index, subject) in ["slack.t0123abc.uone", "slack.t0123abc.utwo"]
@@ -1423,14 +1494,14 @@ fn concurrent_namespace_cap_is_atomic_and_a_denial_mutates_nothing() {
 
 #[test]
 fn concurrent_root_byte_and_entry_caps_are_exact_and_denials_are_byte_identical() {
-    let (_seed_temporary, seed_root, seed_key) = fixture();
+    let (_seed_temporary, seed_root) = fixture();
     let seed_limits = StorageLimits {
         max_namespace_bytes: 32 * 1024,
         max_file_bytes: 1,
         max_files_per_namespace: 1,
         ..StorageLimits::default()
     };
-    let seed = StorageHost::open(&seed_root, &seed_key, seed_limits.clone()).expect("seed host");
+    let seed = StorageHost::open(&seed_root, seed_limits.clone()).expect("seed host");
     let seed_grant = seed
         .grant(scoped_request(
             b"authority",
@@ -1444,13 +1515,13 @@ fn concurrent_root_byte_and_entry_caps_are_exact_and_denials_are_byte_identical(
     drop(seed);
     let exact = logical_tree_usage(&seed_root);
 
-    let (_temporary, root, key) = fixture();
+    let (_temporary, root) = fixture();
     let limits = StorageLimits {
         max_root_bytes: exact.0,
         startup_max_entries: exact.1,
         ..seed_limits
     };
-    let host = Arc::new(StorageHost::open(&root, &key, limits).expect("exact-cap host"));
+    let host = Arc::new(StorageHost::open(&root, limits).expect("exact-cap host"));
     let barrier = Arc::new(Barrier::new(3));
     let mut workers = Vec::new();
     for (index, subject) in ["slack.t0123abc.uone", "slack.t0123abc.utwo"]
@@ -1503,11 +1574,11 @@ fn concurrent_root_byte_and_entry_caps_are_exact_and_denials_are_byte_identical(
 
 #[test]
 fn stable_reactivation_survives_restart() {
-    let (_temporary, root, key) = fixture();
+    let (_temporary, root) = fixture();
     let limits = StorageLimits {
         ..StorageLimits::default()
     };
-    let host = StorageHost::open(&root, &key, limits.clone()).expect("host");
+    let host = StorageHost::open(&root, limits.clone()).expect("host");
     let stable = host
         .grant(request(
             b"authority-a",
@@ -1558,7 +1629,7 @@ fn stable_reactivation_survives_restart() {
     reader.finish_read().expect("finish reader");
     drop(host);
 
-    let host = StorageHost::open(&root, &key, limits).expect("restart");
+    let host = StorageHost::open(&root, limits).expect("restart");
     let reader = host
         .grant(request(
             b"authority-e",
@@ -1574,7 +1645,7 @@ fn stable_reactivation_survives_restart() {
 
 #[test]
 fn a_corrupt_authority_pointer_resets_the_namespace_once() {
-    let (_temporary, root, key) = fixture();
+    let (_temporary, root) = fixture();
     let first_scope = |invocation: &str, access| {
         scoped_request(
             b"authority",
@@ -1593,7 +1664,7 @@ fn a_corrupt_authority_pointer_resets_the_namespace_once() {
             "slack.t0123abc.utwo",
         )
     };
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
     let mut first = host
         .begin(
             host.grant(first_scope("corrupt-first", StorageAccess::ReadWrite))
@@ -1631,7 +1702,7 @@ fn a_corrupt_authority_pointer_resets_the_namespace_once() {
         .into_owned();
     let [previous] = <[String; 1]>::try_from(generations(&first_base)).expect("one generation");
 
-    let host = StorageHost::open(&root, &key, StorageLimits::default())
+    let host = StorageHost::open(&root, StorageLimits::default())
         .expect("a corrupt namespace does not stop the broker");
 
     let (refused, log) =
@@ -1706,8 +1777,8 @@ fn a_corrupt_authority_pointer_resets_the_namespace_once() {
 
 #[test]
 fn a_corrupt_stable_generation_is_moved_aside_and_reset() {
-    let (_temporary, root, key) = fixture();
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
     let mut writer = host
         .begin(
             host.grant(request(
@@ -1780,8 +1851,8 @@ fn a_corrupt_stable_generation_is_moved_aside_and_reset() {
 #[test]
 fn symlink_substitution_is_never_followed_at_any_namespace_tree_level() {
     for level in ["base", "generation", "data", "logical-file"] {
-        let (temporary, root, key) = fixture();
-        let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
+        let (temporary, root) = fixture();
+        let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
         let mut transaction = host
             .begin(
                 host.grant(request(
@@ -1834,7 +1905,7 @@ fn symlink_substitution_is_never_followed_at_any_namespace_tree_level() {
             .map(|entry| (entry.relative, entry.contents))
             .collect::<Vec<_>>();
 
-        let host = StorageHost::open(&root, &key, StorageLimits::default())
+        let host = StorageHost::open(&root, StorageLimits::default())
             .unwrap_or_else(|error| panic!("level {level} stopped the broker: {error}"));
         let refused = host.grant(request(
             b"authority",
@@ -1859,7 +1930,7 @@ fn symlink_substitution_is_never_followed_at_any_namespace_tree_level() {
 }
 
 #[test]
-fn configured_root_and_key_ancestor_symlinks_are_rejected_before_canonicalization() {
+fn a_configured_root_ancestor_symlink_is_rejected_before_canonicalization() {
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
     let actual_parent = directory.join("actual-parent");
@@ -1867,42 +1938,23 @@ fn configured_root_and_key_ancestor_symlinks_are_rejected_before_canonicalizatio
     fs::set_permissions(&actual_parent, fs::Permissions::from_mode(0o700)).expect("parent mode");
     let alias_parent = directory.join("alias-parent");
     symlink(&actual_parent, &alias_parent).expect("ancestor symlink");
-    let key = directory.join("key.yaml");
-    write_key(&key);
 
     assert!(matches!(
-        StorageHost::open(alias_parent.join("storage"), &key, StorageLimits::default()),
+        StorageHost::open(alias_parent.join("storage"), StorageLimits::default()),
         Err(StorageHostError::RootIo { .. } | StorageHostError::UnsafeRoot { .. })
     ));
     assert!(!actual_parent.join("storage").exists());
-
-    let actual_key_parent = directory.join("actual-key-parent");
-    fs::create_dir(&actual_key_parent).expect("key parent");
-    fs::set_permissions(&actual_key_parent, fs::Permissions::from_mode(0o700))
-        .expect("key parent mode");
-    let actual_key = actual_key_parent.join("key.yaml");
-    write_key(&actual_key);
-    let key_alias = directory.join("key-alias");
-    symlink(&actual_key_parent, &key_alias).expect("key ancestor symlink");
-    assert!(matches!(
-        StorageHost::open(
-            directory.join("safe-storage"),
-            key_alias.join("key.yaml"),
-            StorageLimits::default()
-        ),
-        Err(StorageHostError::KeyIo { .. } | StorageHostError::UnsafeKeyFile { .. })
-    ));
 }
 
 #[test]
 fn root_and_root_layout_symlinks_fail_globally_without_being_followed() {
-    let (temporary, root, key) = fixture();
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
+    let (temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
     drop(host);
     let actual = temporary.path().join("actual-root");
     fs::rename(&root, &actual).expect("move root");
     symlink(&actual, &root).expect("root symlink");
-    assert!(StorageHost::open(&root, &key, StorageLimits::default()).is_err());
+    assert!(StorageHost::open(&root, StorageLimits::default()).is_err());
 
     fs::remove_file(&root).expect("remove root symlink");
     fs::rename(&actual, &root).expect("restore root");
@@ -1910,27 +1962,19 @@ fn root_and_root_layout_symlinks_fail_globally_without_being_followed() {
     let actual_namespaces = temporary.path().join("actual-namespaces");
     fs::rename(&namespaces, &actual_namespaces).expect("move namespaces");
     symlink(&actual_namespaces, &namespaces).expect("namespace-root symlink");
-    assert!(StorageHost::open(&root, &key, StorageLimits::default()).is_err());
-}
-
-#[test]
-fn key_symlinks_fail_closed() {
-    let (_temporary, root, key) = fixture();
-    let key_link = key.with_file_name("key-link.yaml");
-    symlink(&key, &key_link).expect("key symlink");
-    assert!(StorageHost::open(&root, &key_link, StorageLimits::default()).is_err());
+    assert!(StorageHost::open(&root, StorageLimits::default()).is_err());
 }
 
 #[test]
 fn initialized_root_never_recreates_missing_layout_entries_or_accepts_unknown_ones() {
-    let (_temporary, root, key) = fixture();
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
+    let (_temporary, root) = fixture();
+    let host = StorageHost::open(&root, StorageLimits::default()).expect("host");
     drop(host);
 
     fs::remove_dir(root.join("namespaces")).expect("remove required directory");
     let before = tree_snapshot(&root);
     assert!(matches!(
-        StorageHost::open(&root, &key, StorageLimits::default()),
+        StorageHost::open(&root, StorageLimits::default()),
         Err(StorageHostError::CorruptLayout { .. })
     ));
     assert_eq!(
@@ -1946,53 +1990,9 @@ fn initialized_root_never_recreates_missing_layout_entries_or_accepts_unknown_on
     fs::write(&unknown, b"unknown").expect("write unknown root entry");
     fs::set_permissions(&unknown, fs::Permissions::from_mode(0o600)).expect("unknown mode");
     assert!(matches!(
-        StorageHost::open(&root, &key, StorageLimits::default()),
+        StorageHost::open(&root, StorageLimits::default()),
         Err(StorageHostError::CorruptLayout { .. })
     ));
-}
-
-#[test]
-fn a_root_retaining_the_removed_quarantine_directory_is_refused() {
-    let (_temporary, root, key) = fixture();
-    let host = StorageHost::open(&root, &key, StorageLimits::default()).expect("host");
-    drop(host);
-
-    // Bytes an earlier release set aside are the operator's to keep or delete, so a quarantine
-    // that still holds any refuses startup, naming the directory, and startup touches nothing.
-    let retired = root.join("quarantine");
-    fs::create_dir(&retired).expect("retired quarantine directory");
-    fs::set_permissions(&retired, fs::Permissions::from_mode(0o700)).expect("retired mode");
-    fs::write(retired.join("set-aside"), b"kept").expect("quarantined bytes");
-    let before = tree_snapshot(&root);
-    let refused = StorageHost::open(&root, &key, StorageLimits::default());
-    let Err(StorageHostError::CorruptLayout { path }) = &refused else {
-        panic!("expected a corrupt layout naming quarantine, got {refused:?}");
-    };
-    assert_eq!(*path, retired);
-    assert_eq!(
-        before,
-        tree_snapshot(&root),
-        "a refused root keeps every byte it had"
-    );
-}
-
-#[test]
-fn an_empty_retired_quarantine_directory_is_removed_at_startup() {
-    let (_temporary, root, key) = fixture();
-    drop(StorageHost::open(&root, &key, StorageLimits::default()).expect("host"));
-
-    // Every root an earlier release initialized holds one, empty unless something was set aside.
-    let retired = root.join("quarantine");
-    fs::create_dir(&retired).expect("retired quarantine directory");
-    fs::set_permissions(&retired, fs::Permissions::from_mode(0o700)).expect("retired mode");
-    let (host, log) = captured(|| StorageHost::open(&root, &key, StorageLimits::default()));
-    host.expect("an empty quarantine is not retained data");
-    assert!(!retired.exists());
-    assert!(
-        log.saw("storage_quarantine_removed"),
-        "{}",
-        log.events_text()
-    );
 }
 
 /// Every path under `root` paired with its file contents, directories carrying empty contents.
@@ -2020,12 +2020,12 @@ fn logical_tree_usage(root: &Path) -> (u64, u64) {
 
 #[test]
 fn empty_positional_growth_matches_live_reads_stat_and_reopen() {
-    let (_temporary, root, key) = fixture();
+    let (_temporary, root) = fixture();
     let limits = StorageLimits {
         max_file_bytes: 8,
         ..StorageLimits::default()
     };
-    let host = StorageHost::open(&root, &key, limits).expect("host");
+    let host = StorageHost::open(&root, limits).expect("host");
     let mut writer = host
         .begin(
             host.grant(vfs_request("empty-growth", StorageAccess::ReadWrite))
@@ -2100,8 +2100,8 @@ fn empty_positional_growth_matches_live_reads_stat_and_reopen() {
 
 #[test]
 fn b1_original_load_budget_and_write_growth_are_independent() {
-    let (_temporary, root, key) = fixture();
-    let storage = StorageHost::open(&root, &key, StorageLimits::default()).expect("seed host");
+    let (_temporary, root) = fixture();
+    let storage = StorageHost::open(&root, StorageLimits::default()).expect("seed host");
     let grant = storage
         .grant(request(
             b"b1",
@@ -2123,7 +2123,7 @@ fn b1_original_load_budget_and_write_growth_are_independent() {
         max_write_bytes_per_invocation: 12,
         ..StorageLimits::default()
     };
-    let storage = StorageHost::open(&root, &key, limits).expect("bounded host");
+    let storage = StorageHost::open(&root, limits).expect("bounded host");
     let grant = storage
         .grant(request(
             b"b1",

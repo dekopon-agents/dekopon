@@ -606,8 +606,7 @@ jobs:
             --set gateway.chatgpt.enabled=true \
             --set gateway.chatgpt.existingSecret=dekopon-chatgpt-auth > "$RUNNER_TEMP/chatgpt.yaml"
           helm template dekopon charts/dekopon \
-            --set providerStorage.enabled=true \
-            --set providerStorage.existingKeySecret=dekopon-storage-key > "$RUNNER_TEMP/provider-storage.yaml"
+            --set providerStorage.enabled=true > "$RUNNER_TEMP/provider-storage.yaml"
           helm template dekopon charts/dekopon \
             -f charts/dekopon/values-pr-summarizer-linter.yaml \
             --set gateway.service.enabled=true > "$RUNNER_TEMP/gateway-service.yaml"
@@ -617,6 +616,13 @@ jobs:
             exit 1
           fi
           grep -q 'broker.httpBind is not supported' "$RUNNER_TEMP/http-bind.err"
+          # The namespace key is gone; a values file that still names it must say so.
+          if helm template dekopon charts/dekopon --set providerStorage.enabled=true \
+            --set providerStorage.existingKeySecret=dekopon-storage-key > "$RUNNER_TEMP/storage-key.yaml" 2> "$RUNNER_TEMP/storage-key.err"; then
+            echo "retired provider-storage key configuration was accepted" >&2
+            exit 1
+          fi
+          grep -q 'providerStorage.existingKeySecret is not supported' "$RUNNER_TEMP/storage-key.err"
           # The pod's probe authenticates as its own UID, so a broker config that maps only
           # the gateway's 65533 renders a broker that starts, binds, and never becomes ready.
           # Refuse it at template time, not at rollout.
