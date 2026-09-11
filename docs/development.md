@@ -123,8 +123,8 @@ The host does not authenticate callers, evaluate policy, or construct authorizat
 
 The SDK's optional `host` feature retains manifest validation (including the opt-in effect
 gate), complete conflicting-provider-set reports, store bounds, engine construction, and the
-seven shared `DEFAULT_MAX_*` constants. The broker host re-exports the deprecated constants for
-one minor cycle. These SDK APIs also serve external embeddings. The feature is off by default and pulls in Wasmtime, so guest builds must not
+seven shared `DEFAULT_MAX_*` constants, which live only there. These SDK APIs also serve external
+embeddings. The feature is off by default and pulls in Wasmtime, so guest builds must not
 enable it. Check wasm32 both with default features and with `--features clap`; the optional
 `cli::run_command` adapter is built without `env` or `color`. The broker owns its linker and
 yields on fuel so a Tokio deadline can cancel a call.
@@ -171,7 +171,7 @@ Privileged broker path:
 - `BufferedHttpClient` accepts a broker-produced `HttpConstraints` grant but performs no authorization transition itself.
 - Grants can narrow but never widen native ceilings for HTTP call count, request bytes, response bytes, and headers.
 - Native HTTP disables redirects, ambient proxies, and decompression; DNS results are checked and pinned before connection.
-- `BrokerProviderRegistry` retains one async Wasmtime engine and compiled components, then creates a fresh bounded store and component instance for each description or invocation. Its cloneable metrics handle observes compilation/store/instantiation/invocation/fuel, limiter memory/table requests, and sanitized HTTP byte/count totals; Wasmtime exposes no allocator-wide resident-memory or JIT-cache statistic through this embedding API.
+- `BrokerProviderRegistry` retains one async Wasmtime engine and compiled components, then creates a fresh bounded store and component instance for each description or invocation. The `provider.describe`, `provider.run_command`, and `provider.invoke` spans record `stores` and `instantiations`, which is where the one-store-one-instance shape of an operation is read.
 - Description uses a disabled HTTP context; any attempted host call rejects loading even if the guest catches the WIT error.
 - Public execution consumes `AuthorizedInvocation`; policy rejections remain terminal after guest code returns.
 - `dekopon-broker` validates owner-authored constraint sets against loaded routes, host ceilings, and the credential store. A typed DRN proposal additionally passes separate `secret.use` policy and a private binding before one brokerd resolver snapshot is rendered by the native host. It audits only metadata/digests plus policy IDs/digest and the selected symbolic name/DRN.

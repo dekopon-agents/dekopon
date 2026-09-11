@@ -26,9 +26,8 @@ supplies expected byte length, SHA-256, and provider ID; the host compares all t
 read/describe boundary before accepting the component, rather than trusting a preflight hash of
 different bytes. A directly named path carries no expected lock identity.
 
-The registry retains artifact path, size, and SHA-256, bounded Wasmtime-visible import/export
-documentation, and a cloneable process-local metrics handle; broker validation and the provider
-manager consume loaded-provider metadata. Imports are resolved into one `InstancePre` per provider
+The registry retains artifact path, size, and SHA-256; broker validation and the provider manager
+consume loaded-provider metadata. Imports are resolved into one `InstancePre` per provider
 at load, so a description, invocation, or command run instantiates without rebuilding a linker or
 re-resolving imports, and each gets a fresh store and component instance.
 
@@ -54,10 +53,9 @@ into the broker's authority surface:
   refusal. A store that cannot reserve its share is refused before it exists.
 
 Stores have per-memory size, memory/table/instance count, table-element, fuel, input, output, and
-wall-clock ceilings. Host metrics observe compilation, stores, successful instantiations,
-invocations, fuel readings, resource-limiter memory/table requests, and sanitized HTTP byte and
-count evidence. Wasmtime exposes no allocator-wide resident-memory or JIT-cache statistic through
-this embedding API. Wasm execution yields on bounded fuel intervals so Tokio deadlines can cancel
+wall-clock ceilings. Every description, command run, and invocation records `stores` and
+`instantiations` on its own span, so the one-store-one-instance shape of an operation is readable
+without a process-global counter. Wasm execution yields on bounded fuel intervals so Tokio deadlines can cancel
 computation without a process-wide epoch interrupt or a global execution mutex. The broker default
 fuel ceiling includes headroom for a valid default multi-megabyte memory compaction; `chatMemory`
 composition rejects a lower configured ceiling that would make a full store deterministically trap,
@@ -114,5 +112,5 @@ quota, budget, corruption, and timeout errors stay terminal after a guest catche
 Writes take effect per host call, and a completed write is not undone by invocation failure. A
 successful provider result requires storage resource finalization, whose deadline starts before
 already-dispatched blocking jobs drain; no later filesystem step starts after expiry. Storage spans
-and metrics omit identity, scope, provider, capability, and exact provider byte totals, retaining
+and evidence omit identity, scope, provider, capability, and exact provider byte totals, retaining
 only content-free operation/sync/quota counts and coarse byte buckets.

@@ -353,6 +353,42 @@ All notable changes to Dekopon are documented here. The format is based on
   propose. A misspelled `chatAssetInputs` entry now silently leaves the marker unexpanded. An
   agent's own `capabilities`, `providers`, `policyProfile`, `status`, and `metadata.labels` are
   still decoded and still read by nothing.
+- `dekopon-broker-host`'s `BrokerHostMetrics` and `BrokerHostStats`, and
+  `BrokerProviderRegistry::metrics`. Thirty-six process-local atomics counted compilations, stores,
+  instantiations, invocations, fuel, limiter requests, and HTTP and storage byte totals; nothing in
+  the broker, the daemon, or any consumer ever read a snapshot, and no exporter published one, so
+  the counters described work only to a debugger. The facts they were the only record of now ride
+  the spans an operator already reads: `provider.describe` — a new span for the startup manifest
+  call — `provider.run_command`, and `provider.invoke` each record `stores` and `instantiations`,
+  both `1` on a healthy operation, absent when the operation was refused before a store existed.
+  The same three spans record `fuel.consumed`, the Wasm instructions the guest burned, read back
+  from the store as the supplied ceiling minus what Wasmtime says remains. HTTP byte totals were
+  already on `http.request` and in `HttpCallEvidence`; storage counts were already in
+  `StorageEvidence`. Nothing the atomics were the only record of is lost.
+
+- **Breaking:** `dekopon-broker-host`'s seven `#[deprecated(since = "0.12.0")]` re-exports of
+  `dekopon_provider_sdk::host` constants — `DEFAULT_MAX_MEMORY_BYTES`,
+  `DEFAULT_MAX_TABLE_ELEMENTS`, `DEFAULT_MAX_INSTANCES`, `DEFAULT_MAX_TABLES`,
+  `DEFAULT_MAX_MEMORIES`, `DEFAULT_MAX_INPUT_BYTES`, and `DEFAULT_MAX_OUTPUT_BYTES`. 0.12.0 moved
+  them to the SDK and promised the old paths for one minor cycle; this is that cycle closing on
+  schedule, not an expiry already past. Import them from `dekopon_provider_sdk::host`, which is
+  where 0.12.0's deprecation note already pointed. `HARD_MAX_PROVIDER_COMPONENT_BYTES` and the
+  `DEFAULT_MAX_HTTP_*` constants are this crate's own and stay.
+
+- `dekopon-broker-host`'s recursive component interface summarizer:
+  `ComponentInterfaceItem`, `LoadedProviderMetadata`'s `imports`, `exports`, and
+  `interface_truncated` fields, and the bounded walk over Wasmtime's component type behind them.
+  145 lines rendered every import, export, nested instance member, and core-module export of every
+  loaded component into a tree with its own item and depth budgets, and no caller ever read one:
+  the broker reads `artifact_sha256`, the provider manager reads `artifact_bytes`,
+  `artifact_sha256`, and `manifest`, and nothing read an interface. Nothing is lost with it. The
+  refusal of generic WASI comes from the linker, which exposes only `dekopon:http@1.0.0` and
+  `dekopon:storage@0.1.0` and fails an unknown import before execution; the proof that a provider
+  declaring command words can actually run one comes from `check_command_export` reading the
+  component's own type; and the digest-pinned lock check compares length, SHA-256, and provider ID
+  at the same read the compiler consumed. `identify_bytes` and the SDK's `item_kind` and
+  `function_signature` stay.
+
 - Retired the `dekopon`, `dekopon-webui`, `dekopon-run`, and `dekopon-provider-host` crates. Only `dekopond` and `dekopon-brokerd` ship as binaries; shared agent, shell, model, SDK, and broker libraries remain. Recorded-session listing, transcript reconstruction, and model replay went with the runner, out of `dekopon-agent` as well; live agent tools and telemetry are unaffected. Published versions are not recalled or yanked; publication and a later independent console repin remain follow-ups.
 - Broker audit-chain verification, replay restoration from disk, and the `audit verify` command.
   Audit records now append only `sequence` and `event`; existing bytes are not migrated or
