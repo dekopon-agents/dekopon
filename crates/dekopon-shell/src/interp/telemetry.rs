@@ -9,84 +9,54 @@
 //! each newly added one silently untraced, and would put the same twenty-line preamble in twenty
 //! files.
 //!
-//! # What is recorded, and what is withheld
+//! # What is recorded
 //!
-//! This crate knows nothing about where its spans go: it emits plain `tracing` spans and events,
-//! and the embedding binary's subscriber decides whether they reach a terminal, a file, or a
-//! remote collector. It must therefore assume they leave the process, and record only what is safe
-//! to export:
+//! Every command word, whoever wrote it: a builtin name, a control word, a capability identifier, a
+//! shell function the model declared, and a word that resolved to nothing. The operator's trace is
+//! the record of what an agent did, and a word replaced by a placeholder makes the run
+//! unreconstructible for the reader the trace exists for. Alongside it go the resolution kind, the
+//! argument *count*, the duration, the exit code, and a stable outcome label.
 //!
-//! - the resolution kind, the argument *count*, the duration, the exit code, and a stable outcome
-//!   label — all bounded, low-cardinality, and derived rather than copied from the script;
-//! - the command word itself, but **only when it came from a fixed vocabulary this crate owns**: a
-//!   builtin name, a control word, a word the shell refuses by name, or a capability identifier.
-//!
-//! Argument *values* are never recorded in any form. `curl -d '{"apiKey":...}'` and
-//! `cap some.id '{"token":...}'` put secrets in argv exactly the way capability input does, and
-//! capability input is already excluded from this workspace's telemetry. For the same reason a
-//! model-authored command word — a shell function's name, or a word that resolved to nothing — is
-//! reported as [`WITHHELD`] rather than copied, mirroring the runner's existing refusal to copy a
-//! model-selected invalid tool name into a rejection event.
+//! Argument *values* are the one exclusion, and it is goal 1's rather than this module's:
+//! `curl -d '{"apiKey":...}'` puts a credential in argv, and secret bytes are the material no part
+//! of this workspace exports. That exclusion is unconditional and has no switch.
 //!
 //! # How much is recorded
 //!
-//! One span per command word is the right reading for a script a person wrote and an unaffordable
-//! one for a script a model wrote: a `while` loop is bounded only by
-//! [`crate::limits::DEFAULT_MAX_STEPS`], so one tool call can execute tens of thousands of command
-//! words, and exporting a span for each is tens of megabytes over OTLP from a workload whose whole
-//! point was to be one round trip.
+//! One span per command word, always. A model-authored `while` loop bounded by
+//! [`crate::limits::DEFAULT_MAX_STEPS`] can run tens of thousands of them, and every one is
+//! exported: a span is never dropped, and a trace that thins out partway through is a trace that
+//! answers "what happened" with "up to here". Nothing is special-cased by construct — a loop body
+//! and an `xargs` sub-invocation are ordinary command words here.
 //!
-//! So the volume is capped rather than the detail. Each script run opens one [`SCRIPT_SPAN`]
-//! carrying [`ScriptCounters`]' totals, which cost the same whether a script ran three commands or
-//! thirty thousand. Inside it, the first [`MAX_TRACED_COMMANDS`] command words get their span at
-//! INFO and the rest at DEBUG — still emitted, still complete, and off by default at the level
-//! production runs at. Nothing is special-cased by construct: a loop body and an `xargs`
-//! sub-invocation are ordinary command words here, and the cap treats them as such.
+//! Each script run also opens one [`SCRIPT_SPAN`] carrying [`ScriptCounters`]' totals, which cost
+//! the same whether a script ran three commands or thirty thousand and give a reader the shape of
+//! the run before they walk it.
 
 use crate::{ExitCode, builtins::FatalError, dispatch::Resolution, limits::LimitExceeded};
 
 /// The span one whole script run opens, and the home of its totals.
 pub(crate) const SCRIPT_SPAN: &str = "shell.script";
 
-/// How many `shell.command` spans one script run emits at INFO before the rest drop to DEBUG.
+/// Per-script command totals.
 ///
-/// Large enough that every script a person would read in a trace is complete, small enough that a
-/// runaway loop costs a bounded number of exported spans instead of one per step.
-pub(crate) const MAX_TRACED_COMMANDS: u64 = 256;
-
-/// The level one `shell.command` span is emitted at.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum SpanLevel {
-    /// Within the per-script cap: exported wherever INFO goes.
-    Info,
-    /// Past the cap: emitted, but off at the level production runs at.
-    Debug,
-}
-
-/// Per-script command totals, and the span cap they enforce.
-///
-/// These are what survives the cap: whatever a script did, the counters describe its whole run in
-/// four bounded integers, recorded on the [`SCRIPT_SPAN`] when it closes.
+/// Whatever a script did, these describe its whole run in three bounded integers, recorded on the
+/// [`SCRIPT_SPAN`] when it closes — the shape of the run, ahead of the per-command spans that give
+/// it in full.
 #[derive(Debug, Default)]
 pub(crate) struct ScriptCounters {
     commands: u64,
-    traced: u64,
     capability_commands: u64,
     failed_commands: u64,
 }
 
 impl ScriptCounters {
-    /// Charges one command word, returning the level its span belongs at.
-    pub(crate) fn charge(&mut self, kind: CommandKind) -> SpanLevel {
+    /// Charges one command word.
+    pub(crate) fn charge(&mut self, kind: CommandKind) {
         self.commands = self.commands.saturating_add(1);
         if matches!(kind, CommandKind::Capability | CommandKind::ProviderCommand) {
             self.capability_commands = self.capability_commands.saturating_add(1);
         }
-        if self.traced >= MAX_TRACED_COMMANDS {
-            return SpanLevel::Debug;
-        }
-        self.traced = self.traced.saturating_add(1);
-        SpanLevel::Info
     }
 
     /// Records the status one command reported.
@@ -99,44 +69,21 @@ impl ScriptCounters {
     /// Writes the totals onto the enclosing script span.
     pub(crate) fn record_on(&self, span: &tracing::Span) {
         span.record("shell.script.commands", self.commands);
-        span.record("shell.script.commands_traced", self.traced);
         span.record("shell.script.capability_commands", self.capability_commands);
         span.record("shell.script.failed_commands", self.failed_commands);
     }
 }
 
-/// Opens the span for one command word at the level the per-script cap allows.
-///
-/// The two arms are written out rather than parameterized because `tracing`'s level is part of a
-/// span's static callsite metadata, which is exactly what makes a filtered-out DEBUG span nearly
-/// free: the subscriber's interest is cached per callsite, so a capped command word costs an atomic
-/// load rather than a formatted span.
-pub(crate) fn command_span(
-    level: SpanLevel,
-    name: &str,
-    kind: CommandKind,
-    argument_count: usize,
-) -> tracing::Span {
-    match level {
-        SpanLevel::Info => tracing::info_span!(
-            "shell.command",
-            shell.command.name = name,
-            shell.command.kind = kind.label(),
-            shell.command.argument_count = argument_count,
-            shell.command.exit_code = tracing::field::Empty,
-            capability.namespace = tracing::field::Empty,
-            outcome = tracing::field::Empty,
-        ),
-        SpanLevel::Debug => tracing::debug_span!(
-            "shell.command",
-            shell.command.name = name,
-            shell.command.kind = kind.label(),
-            shell.command.argument_count = argument_count,
-            shell.command.exit_code = tracing::field::Empty,
-            capability.namespace = tracing::field::Empty,
-            outcome = tracing::field::Empty,
-        ),
-    }
+/// Opens the span for one command word.
+pub(crate) fn command_span(name: &str, kind: CommandKind, argument_count: usize) -> tracing::Span {
+    tracing::info_span!(
+        "shell.command",
+        shell.command.name = name,
+        shell.command.kind = kind.label(),
+        shell.command.argument_count = argument_count,
+        shell.command.exit_code = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+    )
 }
 
 /// Opens the span covering one whole script run.
@@ -144,17 +91,10 @@ pub(crate) fn script_span() -> tracing::Span {
     tracing::info_span!(
         SCRIPT_SPAN,
         shell.script.commands = tracing::field::Empty,
-        shell.script.commands_traced = tracing::field::Empty,
         shell.script.capability_commands = tracing::field::Empty,
         shell.script.failed_commands = tracing::field::Empty,
     )
 }
-
-/// Stands in for a command word this crate declines to copy into telemetry.
-///
-/// A fixed placeholder rather than an absent field: "this word was model-authored" is itself worth
-/// knowing, and a missing field would be indistinguishable from instrumentation that never ran.
-pub(crate) const WITHHELD: &str = "<withheld>";
 
 /// Command words [`super::Evaluator::run_control_word`] executes itself, before dispatch.
 ///
@@ -204,7 +144,7 @@ impl CommandKind {
             Resolution::Builtin(_) => Self::Builtin,
             Resolution::Capability => Self::Capability,
             Resolution::ProviderCommand => Self::ProviderCommand,
-            Resolution::NotGranted { .. } => Self::NotGranted,
+            Resolution::NotGranted => Self::NotGranted,
             Resolution::Rejected(_) => Self::Rejected,
             Resolution::NotFound => Self::NotFound,
         }
@@ -222,38 +162,6 @@ impl CommandKind {
             Self::NotFound => "not-found",
             Self::NotGranted => "not-granted",
         }
-    }
-
-    /// Reports whether a word of this kind came from a fixed vocabulary rather than the script.
-    ///
-    /// A builtin, control, or rejected word was matched against a table compiled into this crate,
-    /// so recording it can only ever emit one of that table's own entries. A capability identifier
-    /// is already this workspace's canonical `capability.id` telemetry field. A function name and
-    /// an unresolved word are neither: they are whatever the script's author typed.
-    pub(crate) const fn name_is_fixed_vocabulary(self) -> bool {
-        match self {
-            // A provider command word came from a loaded manifest, so it is as much fixed
-            // vocabulary as a builtin name: the deployment chose it, not the script.
-            Self::Control
-            | Self::Builtin
-            | Self::Rejected
-            | Self::Capability
-            | Self::ProviderCommand => true,
-            // `NotGranted` is the interesting one. Its *namespace* comes from the session's granted
-            // set and is exported; the word itself is still whatever the script typed, so it is
-            // still withheld. Knowing the model reached into a provider and missed is the trend worth
-            // having, and it costs no channel to record.
-            Self::Function | Self::NotFound | Self::NotGranted => false,
-        }
-    }
-}
-
-/// Returns the command word when exporting it is safe, and [`WITHHELD`] when it is not.
-pub(crate) fn traceable_name(kind: CommandKind, command: &str) -> &str {
-    if kind.name_is_fixed_vocabulary() || dekopon_core::telemetry_payloads() {
-        command
-    } else {
-        WITHHELD
     }
 }
 

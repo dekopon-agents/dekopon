@@ -34,10 +34,12 @@ The bounded queries require `gateway.message`, `gateway.session`, `broker.invoca
 share a trace; startup compilation legitimately has its own. Each daemon's independently
 retrieved native log pair must match an actual exported span, not a query-manufactured
 ID. Queries fail on partial or saturated results, and remote log counts must equal
-shipped counts. Payload and fake-credential sentinels are rejected across local stdout,
-stderr, shipped records, and both complete remote signal responses. Failure controls
-exercise missing/wrong correlation, ingestion rejection, missing IDs, query truncation,
-connection failure, and redaction failures using the actual smoke assertion blocks.
+shipped counts. The payload sentinel must *appear* in both complete remote signal
+responses — payloads are exported and a trace that lost them is a failed run — while the
+fake-credential sentinel is rejected across local stdout, stderr, shipped records, and
+both responses. Failure controls exercise missing/wrong correlation, ingestion rejection,
+missing IDs, query truncation, connection failure, and redaction failures using the
+actual smoke assertion blocks.
 
 ## Bounds and cleanup
 

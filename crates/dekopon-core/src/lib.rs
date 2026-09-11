@@ -15,7 +15,6 @@ mod diagnostics;
 mod redaction;
 mod skill;
 mod subject;
-mod telemetry_payloads;
 #[cfg(unix)]
 mod trusted_file;
 
@@ -29,7 +28,6 @@ pub use diagnostics::error_chain;
 pub use redaction::{Redacted, redaction_marker, serialize_exposed};
 pub use skill::{MAX_SKILL_NAME_LENGTH, SkillId, SkillIdError};
 pub use subject::{ExternalSubject, SubjectError, SubjectService};
-pub use telemetry_payloads::{set_telemetry_payloads, telemetry_payloads};
 #[cfg(unix)]
 pub use trusted_file::{FileHygieneError, FileTier, check_trusted_metadata, read_trusted_file};
 

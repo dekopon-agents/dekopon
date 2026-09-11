@@ -532,8 +532,7 @@ async fn telemetry_section_is_optional_and_strict() {
         "endpoint": "http://rpi.localdomain",
         "transport": "grpc",
         "serviceName": "dekopon-brokerd",
-        "exportTimeoutMs": 5000,
-        "telemetryPayloads": false
+        "exportTimeoutMs": 5000
     });
     write(&enabled);
     let resolved = config::load(&path, uid)
@@ -548,38 +547,35 @@ async fn telemetry_section_is_optional_and_strict() {
         settings.settings.timeout(),
         std::time::Duration::from_millis(5_000)
     );
-    assert!(!settings.telemetry_payloads);
-
-    // A partial section, an unknown transport, and a zero timeout are all rejected rather than
-    // quietly defaulted; the section follows the same all-fields-required rule as every other one.
+    // A partial section, an unknown transport, a zero timeout, and a retired key are all rejected
+    // rather than quietly defaulted; the section follows the same all-fields-required rule as every
+    // other one.
     for broken in [
         json!({"endpoint": "http://rpi.localdomain", "transport": "grpc"}),
-        // Every field is required once the section is present, so omitting only `telemetryPayloads`
-        // fails rather than defaulting to the quiet setting — an operator who meant to enable it
-        // and mistyped the key finds out at startup.
         json!({
             "endpoint": "http://rpi.localdomain",
-            "transport": "grpc",
+            "transport": "thrift",
             "serviceName": "dekopon-brokerd",
             "exportTimeoutMs": 5000
         }),
         json!({
             "endpoint": "http://rpi.localdomain",
-            "transport": "thrift",
-            "serviceName": "dekopon-brokerd",
-            "exportTimeoutMs": 5000,
-            "telemetryPayloads": false
-        }),
-        json!({
-            "endpoint": "http://rpi.localdomain",
             "transport": "http",
             "serviceName": "dekopon-brokerd",
-            "exportTimeoutMs": 0,
-            "telemetryPayloads": false
+            "exportTimeoutMs": 0
         }),
         json!({
             "endpoint": "  ",
             "transport": "http",
+            "serviceName": "dekopon-brokerd",
+            "exportTimeoutMs": 5000
+        }),
+        // `telemetryPayloads` is gone rather than ignored. A config that still carries it is
+        // refused at startup, so an operator upgrading finds out at once instead of discovering
+        // months later that the key stopped meaning anything.
+        json!({
+            "endpoint": "http://rpi.localdomain",
+            "transport": "grpc",
             "serviceName": "dekopon-brokerd",
             "exportTimeoutMs": 5000,
             "telemetryPayloads": false

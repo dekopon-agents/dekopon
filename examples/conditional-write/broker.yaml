@@ -109,4 +109,3 @@ constraintSets:
 #   transport: http
 #   serviceName: dekopon-brokerd
 #   exportTimeoutMs: 5000
-#   telemetryPayloads: false

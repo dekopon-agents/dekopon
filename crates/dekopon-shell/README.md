@@ -220,18 +220,16 @@ therefore reads as the ordered list of commands a script executed — `jq`, then
 that drives several executions is shown as several: `xargs` mapping a command over ten items
 produces ten nested spans.
 
-Volume is capped rather than detail. A model-authored `while` loop is bounded only by the step
-budget, so one tool call can execute tens of thousands of command words; the first 256
-`shell.command` spans are emitted at INFO and the rest at DEBUG. The `shell.script` span carries the
-run's totals — commands executed, commands traced, capability commands, failed commands — which
-cost the same whether a script ran three commands or thirty thousand. *Committed direction:*
-removed; command words and arguments are recorded and no span is dropped
-([goal 2](../../docs/design.md#constitution)).
+Nothing is capped. A model-authored `while` loop is bounded only by the step budget, so one tool
+call can execute tens of thousands of command words, and each of them gets its INFO span: an
+attribute may be truncated, a span is never dropped ([goal 2](../../docs/design.md#constitution)).
+The `shell.script` span carries the run's totals beside them — commands executed, capability
+commands, failed commands — which cost the same whether a script ran three commands or thirty
+thousand.
 
 A word that resolved to nothing is reported as `not-granted` when it names a capability in a
-namespace this session holds, and `not-found` otherwise. Only the namespace is exported, from the
-session's own granted set; the word itself is `<withheld>` unless payloads are enabled. The script
-sees identical output either way — the distinction is in the span and nowhere a script can read it.
+namespace this session holds, and `not-found` otherwise. The script sees identical output either
+way — the distinction is in the span and nowhere a script can read it.
 
 Instrumentation lives at the single seam every command word passes through, so a builtin added
 later is traced without another edit, and none of the twenty builtin implementations carries
@@ -240,13 +238,12 @@ telemetry code.
 `tracing` is this crate's only dependency for that. There is no exporter here, no collector, and no
 telemetry protocol — the embedding binary's subscriber decides where spans go, exactly as `curl`
 here links no HTTP client and only assembles a request for one capability. Spans must therefore be
-assumed to leave the process, so a command records its name, its resolution kind, its argument
-*count*, a duration, an exit code, and a stable outcome label, and never an argument value: a
-`curl -d` body and a `cap <id> {...}` object are capability input wearing argv's clothes. A
-model-authored command word — a shell function's name, or a word that resolved to nothing — is
-reported as `<withheld>` rather than copied, while its kind says what happened.
-*Committed direction:* removed; command words and arguments are recorded and no span is dropped
-([goal 2](../../docs/design.md#constitution)).
+assumed to leave the process, and they are: a command records its name — whoever wrote it, a
+model-authored function name included — its resolution kind, its argument *count*, a duration, an
+exit code, and a stable outcome label. Argument *values* are the one exclusion, because a `curl -d`
+body and a `cap <id> {...}` object are secret bytes wearing argv's clothes. *Committed direction:*
+arguments are recorded too, with secret material excluded where it is identified rather than by
+withholding the vector ([goal 2](../../docs/design.md#constitution)).
 
 ## License
 

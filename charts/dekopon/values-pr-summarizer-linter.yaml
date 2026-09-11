@@ -152,7 +152,6 @@ broker:
         transport: grpc
         serviceName: dekopon-brokerd
         exportTimeoutMs: 5000
-        telemetryPayloads: false
 
   policies:
     inline: |

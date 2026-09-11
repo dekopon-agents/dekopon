@@ -52,9 +52,8 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
 - **Improvement suggestions** — a route with `improvementSuggestions: true` (default `false`)
   also offers `suggest_improvement`, a bounded channel for the model to tell the operator what
   to fix, at most three notes per session. Each note is written to telemetry as
-  `agent.improvement.suggested` independent of the `telemetryPayloads` gate, which is why the
-  route flag is off by default: the record carries model-authored text, and setting the flag is
-  that consent. A suggestion is advisory by construction — no instruction, skill, limit, or grant
+  `agent.improvement.suggested`, which is why the route flag is off by default: the record
+  carries model-authored text, and setting the flag is that consent. A suggestion is advisory by construction — no instruction, skill, limit, or grant
   moves because a model asked — and the gateway never relays it to chat.
 - **Self-inspection** — every authorized session offers `inspect_agent_config`, returning its
   standing prompt, mounted skills by name, description, and resource file paths (never their
@@ -80,8 +79,7 @@ credential: a capability the broker authorized returns the bytes, and owner conf
 authenticated envelope fix whether and where they go. The model chooses neither — it reads only
 `attached` metadata. Attachment bytes cross broker IPC in expanded inputs and provider results,
 but the gateway keeps them out of the shell, model transcript, and conversation history. Broker
-input spans may include expanded data under `telemetryPayloads: true`; the byte-free gateway result
-is not a broker-telemetry filter.
+input spans include expanded data; the byte-free gateway result is not a broker-telemetry filter.
 
 Message text is untrusted end to end, and so are the agent's own standing orders and mounted
 skills from the catalog: none of them can assert identity, name a principal, or widen a grant. An

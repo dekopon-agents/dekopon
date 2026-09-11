@@ -124,14 +124,6 @@ where
 {
     let uid = current_uid();
     let config = config::load(config_path, uid).await?;
-    // Span verbosity is process state rather than a parameter because it describes the deployment.
-    // Set before any message is routed so none is recorded under the wrong mode.
-    dekopon_core::set_telemetry_payloads(
-        config
-            .telemetry
-            .as_ref()
-            .is_some_and(|telemetry| telemetry.telemetry_payloads),
-    );
 
     let catalog = LocalCatalog::load(&config.catalog_path).map_err(DekopondError::Catalog)?;
     let routes = Arc::new(RoutingTable::bind(&config, &catalog)?);

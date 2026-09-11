@@ -604,21 +604,19 @@ where
         // repeat what this turn's `agent.model.answer`, `agent.tool.script`, and
         // `agent.tool.output` already said. Later turns log the messages appended since the
         // previous one, so the events of a session still concatenate back into the exact request.
-        if dekopon_core::telemetry_payloads() {
-            let scope = if transcribed == 0 { "full" } else { "delta" };
-            tracing::info!(
-                target: "dekopon_agent::audit",
-                {
-                    audit.event = "agent.model.prompt",
-                    model.turn = model_turns,
-                    transcript.scope = scope,
-                    message.count = messages.len(),
-                    messages = %transcript(&messages[transcribed..]),
-                },
-                "model turn prompt"
-            );
-            transcribed = messages.len();
-        }
+        let scope = if transcribed == 0 { "full" } else { "delta" };
+        tracing::info!(
+            target: "dekopon_agent::audit",
+            {
+                audit.event = "agent.model.prompt",
+                model.turn = model_turns,
+                transcript.scope = scope,
+                message.count = messages.len(),
+                messages = %transcript(&messages[transcribed..]),
+            },
+            "model turn prompt"
+        );
+        transcribed = messages.len();
         let model_started = Instant::now();
         let turn = match model.complete_with(&messages, &model_tools, options) {
             Ok(turn) => turn,
@@ -667,18 +665,16 @@ where
             },
             "model turn accounted"
         );
-        if dekopon_core::telemetry_payloads() {
-            tracing::info!(
-                target: "dekopon_agent::audit",
-                {
-                    audit.event = "agent.model.answer",
-                    model.turn = model_turns,
-                    answer = turn.content.as_deref().unwrap_or_default(),
-                    tool_calls = %tool_calls_json(&turn.tool_calls),
-                },
-                "model turn answer"
-            );
-        }
+        tracing::info!(
+            target: "dekopon_agent::audit",
+            {
+                audit.event = "agent.model.answer",
+                model.turn = model_turns,
+                answer = turn.content.as_deref().unwrap_or_default(),
+                tool_calls = %tool_calls_json(&turn.tool_calls),
+            },
+            "model turn answer"
+        );
         drop(model_entered);
         check_cancelled(cancellation)?;
         messages.push(assistant_message(&turn));
@@ -846,36 +842,32 @@ where
             );
             let outcome = {
                 let _entered = span.enter();
-                if dekopon_core::telemetry_payloads() {
-                    tracing::info!(
-                        target: "dekopon_agent::audit",
-                        {
-                            audit.event = "agent.tool.script",
-                            model.turn = model_turns,
-                            tool_call.index = tool_call_index,
-                            script = script.as_str(),
-                        },
-                        "agent tool script"
-                    );
-                }
+                tracing::info!(
+                    target: "dekopon_agent::audit",
+                    {
+                        audit.event = "agent.tool.script",
+                        model.turn = model_turns,
+                        tool_call.index = tool_call_index,
+                        script = script.as_str(),
+                    },
+                    "agent tool script"
+                );
                 // `run_script` returns no `Result`: a failed script is an outcome the model reads
                 // and recovers from, so the `prompt.script` span always closes normally and
                 // reports the script's own exit code rather than a host error.
                 check_cancelled(cancellation)?;
                 let outcome = runtime.run_script(&script, remaining);
                 check_cancelled(cancellation)?;
-                if dekopon_core::telemetry_payloads() {
-                    tracing::info!(
-                        target: "dekopon_agent::audit",
-                        {
-                            audit.event = "agent.tool.output",
-                            model.turn = model_turns,
-                            tool_call.index = tool_call_index,
-                            output = outcome.output.as_str(),
-                        },
-                        "agent tool output"
-                    );
-                }
+                tracing::info!(
+                    target: "dekopon_agent::audit",
+                    {
+                        audit.event = "agent.tool.output",
+                        model.turn = model_turns,
+                        tool_call.index = tool_call_index,
+                        output = outcome.output.as_str(),
+                    },
+                    "agent tool output"
+                );
                 outcome
             };
             script_calls = script_calls.saturating_add(1);

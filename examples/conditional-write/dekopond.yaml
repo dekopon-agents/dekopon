@@ -83,11 +83,11 @@ sessions:
 
 shutdownGraceMs: 120000
 
-# Optional, same shape as broker.yaml's. `telemetryPayloads: true` would add chat text and the
-# canonical subject to spans, which declares the sink in scope for every message this gateway sees.
+# Optional, same shape as broker.yaml's. Exported spans and log records carry chat text and the
+# canonical subject: the telemetry store is inside the operator's trust boundary and there is no
+# metadata-only mode.
 # telemetry:
 #   endpoint: http://127.0.0.1:5080/api/default
 #   transport: http
 #   serviceName: dekopond
 #   exportTimeoutMs: 10000
-#   telemetryPayloads: false

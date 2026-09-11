@@ -486,10 +486,8 @@ This describes today's audit schema, not an already-shipped field migration. Raw
 backend, locator, selector, source revision, path/query, headers and bodies are absent. A record
 without those optional fields retains its serialized bytes and chain hashes.
 
-Telemetry carries model-authored scripts and therefore public DRNs under `telemetryPayloads: true`.
-*Committed direction:* the gate is removed; payloads always on
-([goal 2](design.md#constitution)). Telemetry cannot carry resolved bytes, which never enter a
-value it reads.
+Telemetry carries model-authored scripts and therefore public DRNs. It cannot carry resolved bytes,
+which never enter a value it reads.
 
 ## Current non-goals
 
