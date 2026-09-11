@@ -48,9 +48,10 @@ into the broker's authority surface:
   compiled code back instead of running Cranelift again. The directory holds code the privileged
   broker executes, so it must be writable by the broker and nobody else.
 - `max_total_memory_bytes` bounds the guest linear memory reservable across concurrently live
-  stores. Per-store limits bound one invocation; without this, the worst case is the daemon's
-  connection ceiling times `max_memory_bytes`, and the container's OOM killer arrives instead of a
-  refusal. A store that cannot reserve its share is refused before it exists.
+  stores, and defaults to 256 MiB — four stores at the default per-store ceiling. Per-store limits
+  bound one invocation; with this set to `None` the worst case is the daemon's connection ceiling
+  times `max_memory_bytes`, and the container's OOM killer arrives instead of a refusal. A store
+  that cannot reserve its share is refused before it exists.
 
 Stores have per-memory size, memory/table/instance count, table-element, fuel, input, output, and
 wall-clock ceilings. Every description, command run, and invocation records `stores` and

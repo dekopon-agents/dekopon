@@ -88,6 +88,16 @@ pub const DEFAULT_MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
 pub const DEFAULT_FUEL: u64 = 8_000_000_000;
 /// Host ceiling for one provider description or invocation.
 pub const DEFAULT_MAX_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default aggregate guest linear memory across concurrently live stores (256 MiB).
+///
+/// [`BrokerHostLimits::max_memory_bytes`] bounds one store; nothing bounded all of them together
+/// until this default existed, so the effective ceiling was the daemon's connection ceiling times
+/// the per-store ceiling — 4 GiB at `dekopon-brokerd`'s defaults, a number the container's OOM
+/// killer enforced rather than the broker. 256 MiB is four concurrent stores at the default 64 MiB
+/// per store, which is the value `crates/dekopon-brokerd/README.md` and the Helm chart already
+/// carried as the example worth copying. A deployment that wants more concurrency raises it; one
+/// that genuinely wants the old unbounded behavior writes `maxTotalMemoryBytes: null`.
+pub const DEFAULT_MAX_TOTAL_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 
 /// Broker-owned ceilings that authorization may narrow but never widen.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -148,7 +158,7 @@ impl Default for BrokerHostLimits {
 /// Nothing here narrows or widens what an authorization may do, which is why it is separate from
 /// [`BrokerHostLimits`]: the broker commits its host ceilings into the effective-authority
 /// generation, and pointing a compilation cache at a different directory must not rotate that.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrokerHostOptions {
     /// Absolute directory for Wasmtime's content-addressed compilation cache.
     ///
@@ -160,9 +170,19 @@ pub struct BrokerHostOptions {
     ///
     /// [`BrokerHostLimits::max_memory_bytes`] bounds one invocation; this bounds all of them at
     /// once, so a daemon that accepts many connections refuses cleanly instead of being OOM-killed.
-    /// `None` leaves the aggregate unbounded, which is only safe when the connection ceiling
-    /// multiplied by the per-store ceiling still fits the container.
+    /// Defaults to [`DEFAULT_MAX_TOTAL_MEMORY_BYTES`]. `None` leaves the aggregate unbounded, which
+    /// is only safe when the connection ceiling multiplied by the per-store ceiling still fits the
+    /// container.
     pub max_total_memory_bytes: Option<usize>,
+}
+
+impl Default for BrokerHostOptions {
+    fn default() -> Self {
+        Self {
+            compile_cache_dir: None,
+            max_total_memory_bytes: Some(DEFAULT_MAX_TOTAL_MEMORY_BYTES),
+        }
+    }
 }
 
 /// One content-locked provider component the broker may compile.

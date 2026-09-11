@@ -35,6 +35,18 @@ silences that prefix on every OTLP layer it builds whatever directive the callin
 so an export failure reaches stdout or stderr and can never be re-exported through the exporter
 that produced it.
 
+## Export queues
+
+Both batch processors are configured rather than left on the SDK's defaults: 1024 spans and 256 log
+records queued, drained in batches of 256 and 64. The SDK's default is 2048 records per queue and it
+has no byte ceiling anywhere — `BatchConfig` counts records and `SpanLimits` counts attributes, and
+nothing truncates an attribute value — so a queue's size is `records × the largest attribute the
+process emits`. Under [goal 2](../../docs/design.md#constitution) that attribute is a prompt, a
+model answer, or a whole script's 256 KiB of output, which put the log queue's worst case at half a
+gigabyte. The log queue is the tighter of the two because that is where the bytes are; the span
+queue keeps four drains of headroom because a span is never dropped. Records are still dropped if a
+receiver stalls long enough to fill a queue, and the SDK reports the total at shutdown.
+
 ## Authority
 
 This crate configures transport and never resolves credentials. Ingest authentication is read by

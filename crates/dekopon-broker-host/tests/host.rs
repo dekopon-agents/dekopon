@@ -889,6 +889,26 @@ async fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
     );
 }
 
+/// The default is a ceiling, not the absence of one: an embedder that never sets the field still
+/// gets a bounded aggregate, and it has to admit at least one store or nothing could ever run.
+#[test]
+fn the_default_aggregate_ceiling_is_256_mib_and_admits_a_store() {
+    let options = BrokerHostOptions::default();
+    assert_eq!(
+        options.max_total_memory_bytes,
+        Some(dekopon_broker_host::DEFAULT_MAX_TOTAL_MEMORY_BYTES)
+    );
+    assert_eq!(
+        dekopon_broker_host::DEFAULT_MAX_TOTAL_MEMORY_BYTES,
+        256 * 1024 * 1024
+    );
+    assert!(
+        dekopon_broker_host::DEFAULT_MAX_TOTAL_MEMORY_BYTES
+            >= BrokerHostLimits::default().max_memory_bytes,
+        "a default that `Runtime::new` would reject is worse than none"
+    );
+}
+
 /// An aggregate ceiling below one store could never admit an invocation.
 #[tokio::test(flavor = "multi_thread")]
 async fn rejects_an_aggregate_ceiling_smaller_than_one_store() {
