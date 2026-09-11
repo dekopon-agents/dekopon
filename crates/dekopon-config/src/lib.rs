@@ -7,15 +7,15 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     env, fmt, fs, io,
     path::{Path, PathBuf},
     str::FromStr,
 };
 
-use dekopon_core::{AgentId, CapabilityId, IdentifierError, ProviderId};
-use dekopon_protocol::{Agent, ApiVersion, Capability, Provider};
-use serde::{Deserialize, Serialize};
+use dekopon_core::{AgentId, IdentifierError};
+use dekopon_protocol::{Agent, ApiVersion};
+use serde::Deserialize;
 use serde_yaml::Value;
 use thiserror::Error;
 
@@ -31,8 +31,6 @@ pub const CONFIG_ENV: &str = "DEKOPON_CONFIG";
 pub struct LocalCatalog {
     source: PathBuf,
     agents: BTreeMap<AgentId, Agent>,
-    capabilities: BTreeMap<CapabilityId, Capability>,
-    providers: BTreeMap<ProviderId, Provider>,
     /// Every agent's mounted skills, in the order its `spec.skills` names them.
     ///
     /// Read once here, at load, so a session never touches the filesystem to show a model a
@@ -89,32 +87,24 @@ impl LocalCatalog {
         }
 
         let mut agents = ResourceSet::<Agent>::default();
-        let mut capabilities = ResourceSet::<Capability>::default();
-        let mut providers = ResourceSet::<Provider>::default();
         let mut problems = Vec::new();
-        // A resource that never reached its set cannot be referenced by name, so reference
-        // checks below would blame the resources pointing at it as well. Report the real
-        // failure alone rather than twice.
-        let mut incomplete = false;
 
         for (origin, value) in resources {
             let outcome = match string_field(&value, "kind").map(str::to_owned) {
                 Some(kind) => match kind.as_str() {
                     Agent::KIND => agents.insert(&origin, value),
-                    Capability::KIND => capabilities.insert(&origin, value),
-                    Provider::KIND => providers.insert(&origin, value),
+                    // Named rather than folded into the unknown-kind message. These documents
+                    // were authored against a shipped schema, so the refusal points at the
+                    // upgrade instead of sending an operator to hunt for a typo in a file that
+                    // is exactly what they wrote.
+                    "Capability" | "Provider" => Err(CatalogProblem::RemovedKind { origin, kind }),
                     _ => Err(CatalogProblem::UnsupportedKind { origin, kind }),
                 },
                 None => Err(CatalogProblem::MissingKind { origin }),
             };
             if let Err(problem) = outcome {
-                incomplete |= problem.drops_resource();
                 problems.push(problem);
             }
-        }
-
-        if !incomplete {
-            validate_references(&agents, &capabilities, &providers, &mut problems);
         }
         // Skills reference files rather than other resources, so an agent that decoded can have
         // its skills checked whatever happened to the rest of the catalog. Relative paths resolve
@@ -132,8 +122,6 @@ impl LocalCatalog {
         Ok(Self {
             source,
             agents: agents.into_map(),
-            capabilities: capabilities.into_map(),
-            providers: providers.into_map(),
             skills,
         })
     }
@@ -149,32 +137,10 @@ impl LocalCatalog {
         self.agents.values()
     }
 
-    /// Capabilities in deterministic identifier order.
-    pub fn capabilities(&self) -> impl ExactSizeIterator<Item = &Capability> {
-        self.capabilities.values()
-    }
-
-    /// Providers in deterministic identifier order.
-    pub fn providers(&self) -> impl ExactSizeIterator<Item = &Provider> {
-        self.providers.values()
-    }
-
     /// Looks up an agent by validated identifier.
     #[must_use]
     pub fn agent(&self, id: &AgentId) -> Option<&Agent> {
         self.agents.get(id)
-    }
-
-    /// Looks up a capability by validated identifier.
-    #[must_use]
-    pub fn capability(&self, id: &CapabilityId) -> Option<&Capability> {
-        self.capabilities.get(id)
-    }
-
-    /// Looks up a provider by validated identifier.
-    #[must_use]
-    pub fn provider(&self, id: &ProviderId) -> Option<&Provider> {
-        self.providers.get(id)
     }
 
     /// The skills one agent mounts, in the order its `spec.skills` names them.
@@ -185,31 +151,6 @@ impl LocalCatalog {
     pub fn agent_skills(&self, id: &AgentId) -> &[Skill] {
         self.skills.get(id).map_or(&[], Vec::as_slice)
     }
-
-    /// Creates an owned, serializable view of the loaded catalog.
-    #[must_use]
-    pub fn snapshot(&self) -> CatalogSnapshot {
-        CatalogSnapshot {
-            api_version: ApiVersion::V1Alpha1,
-            agents: self.agents().cloned().collect(),
-            capabilities: self.capabilities().cloned().collect(),
-            providers: self.providers().cloned().collect(),
-        }
-    }
-}
-
-/// Canonical serializable view of a local catalog.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct CatalogSnapshot {
-    /// Resource schema version.
-    pub api_version: ApiVersion,
-    /// Agents ordered by name.
-    pub agents: Vec<Agent>,
-    /// Capabilities ordered by name.
-    pub capabilities: Vec<Capability>,
-    /// Providers ordered by name.
-    pub providers: Vec<Provider>,
 }
 
 fn string_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
@@ -234,24 +175,6 @@ trait Resource: Sized + for<'de> Deserialize<'de> {
 impl Resource for Agent {
     type Id = AgentId;
     const KIND: &'static str = "Agent";
-
-    fn name(&self) -> &str {
-        &self.metadata.name
-    }
-}
-
-impl Resource for Capability {
-    type Id = CapabilityId;
-    const KIND: &'static str = "Capability";
-
-    fn name(&self) -> &str {
-        &self.metadata.name
-    }
-}
-
-impl Resource for Provider {
-    type Id = ProviderId;
-    const KIND: &'static str = "Provider";
 
     fn name(&self) -> &str {
         &self.metadata.name
@@ -314,14 +237,6 @@ impl<T: Resource> ResourceSet<T> {
         Ok(())
     }
 
-    fn contains(&self, id: &T::Id) -> bool {
-        self.entries.contains_key(id)
-    }
-
-    fn get(&self, id: &T::Id) -> Option<&T> {
-        self.entries.get(id).map(|(_, resource)| resource)
-    }
-
     fn iter(&self) -> impl Iterator<Item = (&T::Id, &T)> {
         self.entries
             .iter()
@@ -333,79 +248,6 @@ impl<T: Resource> ResourceSet<T> {
             .into_iter()
             .map(|(id, (_, resource))| (id, resource))
             .collect()
-    }
-}
-
-fn validate_references(
-    agents: &ResourceSet<Agent>,
-    capabilities: &ResourceSet<Capability>,
-    providers: &ResourceSet<Provider>,
-    problems: &mut Vec<CatalogProblem>,
-) {
-    for (agent_id, agent) in agents.iter() {
-        // Which provider each capability routes to, so the agent's own provider list can be held
-        // to the capabilities it actually declares rather than merely to existing names.
-        let mut required = BTreeMap::<&ProviderId, &CapabilityId>::new();
-        let mut every_capability_resolved = true;
-        for capability in &agent.spec.capabilities {
-            match capabilities.get(capability) {
-                Some(declared) => {
-                    required
-                        .entry(&declared.spec.provider)
-                        .or_insert(capability);
-                }
-                None => {
-                    every_capability_resolved = false;
-                    problems.push(CatalogProblem::MissingCapability {
-                        agent: agent_id.to_string(),
-                        capability: capability.to_string(),
-                    });
-                }
-            }
-        }
-
-        let listed = agent.spec.providers.iter().collect::<BTreeSet<_>>();
-        for provider in &agent.spec.providers {
-            if !providers.contains(provider) {
-                problems.push(CatalogProblem::MissingProvider {
-                    resource_kind: "agent",
-                    resource: agent_id.to_string(),
-                    provider: provider.to_string(),
-                });
-            }
-        }
-        for (provider, capability) in &required {
-            if !listed.contains(provider) {
-                problems.push(CatalogProblem::UnlistedAgentProvider {
-                    agent: agent_id.to_string(),
-                    provider: provider.to_string(),
-                    capability: capability.to_string(),
-                });
-            }
-        }
-        // An unresolved capability hides the provider it would have required, so a listed
-        // provider cannot be called unreachable until every capability is known. A provider that
-        // is not in the catalog at all has already been reported once, by its real name.
-        if every_capability_resolved {
-            for provider in listed {
-                if !required.contains_key(provider) && providers.contains(provider) {
-                    problems.push(CatalogProblem::UnreachableAgentProvider {
-                        agent: agent_id.to_string(),
-                        provider: provider.to_string(),
-                    });
-                }
-            }
-        }
-    }
-
-    for (capability_id, capability) in capabilities.iter() {
-        if !providers.contains(&capability.spec.provider) {
-            problems.push(CatalogProblem::MissingProvider {
-                resource_kind: "capability",
-                resource: capability_id.to_string(),
-                provider: capability.spec.provider.to_string(),
-            });
-        }
     }
 }
 
@@ -669,6 +511,18 @@ pub enum CatalogProblem {
         /// Authored kind.
         kind: String,
     },
+    /// The authored resource kind was withdrawn from the catalog.
+    #[error(
+        "{origin}: kind {kind} is no longer part of the catalog; remove the document. \
+         Capabilities and providers come from the broker, which builds them from provider \
+         manifests and its own constraint sets"
+    )]
+    RemovedKind {
+        /// Document location.
+        origin: String,
+        /// Authored kind.
+        kind: String,
+    },
     /// The authored API version is not the one this crate implements.
     #[error("{origin}: unsupported API version {version:?}")]
     UnsupportedApiVersion {
@@ -713,45 +567,6 @@ pub enum CatalogProblem {
         /// Duplicate declaration.
         duplicate: String,
     },
-    /// An agent referenced a capability not present in the catalog.
-    #[error("agent {agent:?} references missing capability {capability:?}")]
-    MissingCapability {
-        /// Agent name.
-        agent: String,
-        /// Missing capability name.
-        capability: String,
-    },
-    /// An agent or capability referenced a provider not present in the catalog.
-    #[error("{resource_kind} {resource:?} references missing provider {provider:?}")]
-    MissingProvider {
-        /// Referencing resource kind.
-        resource_kind: &'static str,
-        /// Referencing resource name.
-        resource: String,
-        /// Missing provider name.
-        provider: String,
-    },
-    /// An agent omitted a provider its own capabilities route to.
-    #[error(
-        "agent {agent:?} omits provider {provider:?}, required by capability {capability:?}, \
-         from spec.providers"
-    )]
-    UnlistedAgentProvider {
-        /// Agent name.
-        agent: String,
-        /// Provider the capability routes to.
-        provider: String,
-        /// Capability requiring the provider.
-        capability: String,
-    },
-    /// An agent listed a provider none of its capabilities route to.
-    #[error("agent {agent:?} lists provider {provider:?}, which none of its capabilities route to")]
-    UnreachableAgentProvider {
-        /// Agent name.
-        agent: String,
-        /// Unreachable provider name.
-        provider: String,
-    },
     /// An agent named a skill directory that could not be mounted.
     #[error("agent {agent:?} mounts skill {path:?}, which could not be loaded: {source}")]
     Skill {
@@ -777,20 +592,6 @@ pub enum CatalogProblem {
         /// The second path carrying it.
         duplicate: String,
     },
-}
-
-impl CatalogProblem {
-    /// Whether the problem kept a resource out of the catalog.
-    const fn drops_resource(&self) -> bool {
-        matches!(
-            self,
-            Self::MissingKind { .. }
-                | Self::UnsupportedKind { .. }
-                | Self::UnsupportedApiVersion { .. }
-                | Self::Decode { .. }
-                | Self::InvalidName { .. }
-        )
-    }
 }
 
 #[cfg(test)]

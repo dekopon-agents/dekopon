@@ -144,7 +144,7 @@ A gateway that starts and then refuses everything is worse than one that does no
 - a transport `endpoint` override (`graphEndpoint` on `whatsappCloudApi`) that is neither its pinned production origin (Slack, Discord, Telegram, or the Meta Graph API) nor a literal loopback `http://` URL. Literal means `127.0.0.1` or `::1`: the name `localhost` is resolved by whatever the host's resolver says today, which is not the same promise;
 - a `channel` written beside `kind: directMessage`. The field belongs to the other kind, and a decoder that shrugged at it would leave an operator convinced they had scoped a route to one channel while it claimed every direct message on the transport;
 - a missing or blank chat or bound-route model credential environment variable. A model's `apiKeyEnv` is optional and absent means "this endpoint needs no key", which a loopback llama.cpp genuinely does not; naming a variable that is unset or exported blank is the opposite claim, and this process cannot see one exported after it started;
-- a route naming `providerAttachments` on a text-only transport, which today means `whatsappCloudApi`, or one whose `providerAttachments.maxPerReply` is `0` (omit the block instead), or one whose `chatAssetInputs` names a capability the catalog does not define;
+- a route naming `providerAttachments` on a text-only transport, which today means `whatsappCloudApi`, or one whose `providerAttachments.maxPerReply` is `0` (omit the block instead);
 - an unknown Slack experience, activity mode/fallback, or field inside those strict blocks; an off
   Slack activity with a reaction fallback, or classic native activity with no reaction fallback,
   is also refused because the configured fallback could never take effect;
@@ -177,8 +177,8 @@ render as concise Markdown tables:
   mounted;
 - route step/capability limits and one-shot or persistent conversation bounds, including the effective persistent scope; and
 - the capability metadata in this sender's fresh `capabilities(subject, agent, scope)` result:
-  identifier, selected provider, description, effect, risk, and idempotency, as
-  [`catalog.md`](catalog.md#capability) defines them. *Committed direction:* removed
+  identifier, selected provider, description, effect, risk, and idempotency, as the provider
+  manifest and the broker's `constraintSets` define them. *Committed direction:* removed
   ([non-goals](design.md#non-goals)).
 
 That last section is an **effective Cedar view**, not Cedar source. Raw policy, policy IDs and

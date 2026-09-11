@@ -930,7 +930,6 @@ dependencies = [
 name = "dekopon-config"
 version = "0.12.0"
 dependencies = [
- "dekopon-capability",
  "dekopon-core",
  "dekopon-protocol",
  "serde",
@@ -1010,7 +1009,6 @@ dependencies = [
 name = "dekopon-protocol"
 version = "0.12.0"
 dependencies = [
- "dekopon-capability",
  "dekopon-core",
  "schemars 1.2.2",
  "serde",

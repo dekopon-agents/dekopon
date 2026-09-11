@@ -3,14 +3,11 @@
 //!
 //! A catalog that stops parsing, or an agent whose capability list drifts from the workflow the
 //! example promises, breaks instructions a reader follows literally. Both review examples may
-//! propose a comment and neither may approve or merge; the end-to-end example additionally proves
-//! that its complete surface agrees with the broker configuration and the provider manifest.
+//! propose a comment and neither may approve or merge.
 
 use std::path::{Path, PathBuf};
 
-use dekopon_capability::{EffectKind, Idempotency};
 use dekopon_config::LocalCatalog;
-use dekopon_core::RiskLevel;
 
 fn example(relative: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -31,14 +28,6 @@ fn the_local_reviewer_example_has_comment_but_no_approval_authority() {
         .expect("the reviewer agent exists");
 
     assert!(reviewer.spec.enabled);
-    let comment = catalog
-        .capability(
-            &"github.pull-request.comment"
-                .parse()
-                .expect("valid capability id"),
-        )
-        .expect("comment is declared");
-    assert_eq!(comment.spec.effect, EffectKind::ExternalWrite);
     let skills = catalog.agent_skills(&"reviewer".parse().expect("valid agent id"));
     assert_eq!(skills.len(), 1);
     assert_eq!(skills[0].name().as_str(), "pull-request-review");
@@ -62,7 +51,7 @@ fn the_local_reviewer_example_has_comment_but_no_approval_authority() {
 }
 
 #[test]
-fn the_conditional_write_example_matches_the_http_probe_provider_manifest() {
+fn the_conditional_write_example_declares_the_slice_the_broker_constrains() {
     let catalog = load(&example("conditional-write/dekopon.yaml"));
 
     let agent = catalog
@@ -97,50 +86,4 @@ fn the_conditional_write_example_matches_the_http_probe_provider_manifest() {
         !capabilities.contains(&"http-probe.purge"),
         "the manifest exposes more than this deployment grants, and it must stay that way"
     );
-
-    // The classification a reader compares against the manifest and broker.yaml. The broker
-    // refuses startup when a constraint set disagrees with the manifest; this test keeps the
-    // unprivileged catalog from disagreeing with both.
-    let expected = [
-        (
-            "http-probe.fetch",
-            EffectKind::ReadOnly,
-            RiskLevel::Low,
-            Idempotency::Idempotent,
-        ),
-        (
-            "http-probe.conditional-write",
-            EffectKind::ExternalWrite,
-            RiskLevel::High,
-            Idempotency::Conditional,
-        ),
-    ];
-    for (name, effect, risk, idempotency) in expected {
-        let capability = catalog
-            .capability(&name.parse().expect("valid capability id"))
-            .unwrap_or_else(|| panic!("{name} is declared"));
-        assert_eq!(capability.spec.effect, effect, "{name} effect");
-        assert_eq!(capability.spec.risk, risk, "{name} risk");
-        assert_eq!(
-            capability.spec.idempotency, idempotency,
-            "{name} idempotency"
-        );
-        assert_eq!(
-            capability.spec.provider.as_str(),
-            "http-probe",
-            "{name} routes to the probe provider"
-        );
-        assert!(
-            !capability.spec.permissions.is_empty(),
-            "{name} declares the provider permissions it needs"
-        );
-    }
-
-    let provider = catalog
-        .provider(&"http-probe".parse().expect("valid provider id"))
-        .expect("the probe provider is declared");
-    assert_eq!(provider.spec.provider_type, "http");
-    // Symbolic, and the same name the broker's constraint sets bind. The value lives in the
-    // broker's credentials file and nowhere else.
-    assert_eq!(provider.spec.credential_ref, "api-token");
 }

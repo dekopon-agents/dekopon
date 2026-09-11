@@ -16,10 +16,9 @@ include = ["src/**", "README.md", "Cargo.toml"]
 [features]
 default = []
 # `JsonSchema` derives for every public type, including the types they embed. Opt-in.
-schemars = ["dep:schemars", "dekopon-capability/schemars", "dekopon-core/schemars"]
+schemars = ["dep:schemars", "dekopon-core/schemars"]
 
 [dependencies]
-dekopon-capability.workspace = true
 dekopon-core.workspace = true
 schemars = { workspace = true, optional = true }
 serde.workspace = true
