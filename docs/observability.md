@@ -619,18 +619,16 @@ conspicuous `expose`. Persisting a real credential — the ChatGPT auth file is 
 requires an explicit `#[serde(serialize_with = "dekopon_core::serialize_exposed")]` per field, so
 the safe behaviour is what you get by default and the exception is visible in review.
 
-The marker is padded to the character width of the value it replaces, so a redacted field keeps the
-shape of the record around it:
+The marker is the constant `[REDACTED]`, whatever it replaced:
 
 ```text
-sk-live-abcdef012345       ->  [     REDACTED     ]
-short                      ->  *****
+sk-live-abcdef012345       ->  [REDACTED]
+short                      ->  [REDACTED]
 ```
 
-Below the width of `[REDACTED]` the word cannot fit, so the marker degrades to asterisks rather than
-truncating into something that reads like a different token. Preserving width leaks one fact — how
-long the secret was — which can narrow down an issuer or credential class. It is a
-readability-for-metadata trade, not a free win.
+An earlier marker was padded to the value's character width so a record kept its column alignment.
+That leaked how long the secret was, which narrows down an issuer or a credential class, and it is
+the one fact a redacted field has no reason to carry.
 
 ## Trace and log model
 
