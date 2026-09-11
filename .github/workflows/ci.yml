@@ -63,8 +63,6 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Start CI metrics
-        run: .github/scripts/ci_metrics.sh start
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
         with:
@@ -172,7 +170,6 @@ jobs:
       - name: Check repository shell scripts
         run: |
           shellcheck \
-            .github/scripts/ci_metrics.sh \
             ci/fetch-external-provider-components.sh \
             examples/otel-traces/smoke-test.sh \
             examples/providers/build-component.sh \
@@ -181,15 +178,6 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --all-features --no-deps
-      - name: Finish CI metrics
-        if: ${{ always() }}
-        env:
-          CARGO_CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
-          CARGO_CACHE_MATCHED_KEY: ${{ steps.cargo-cache.outputs.cache-matched-key }}
-        run: |
-          if [[ -x .github/scripts/ci_metrics.sh ]]; then
-            .github/scripts/ci_metrics.sh finish
-          fi
 
   stable_tests:
     name: workspace tests (stable)
@@ -205,8 +193,6 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Start CI metrics
-        run: .github/scripts/ci_metrics.sh start
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
         with:
@@ -234,15 +220,6 @@ jobs:
         run: cargo test --workspace --all-features --locked
       - name: Test documentation
         run: cargo test --workspace --all-features --locked --doc
-      - name: Finish CI metrics
-        if: ${{ always() }}
-        env:
-          CARGO_CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
-          CARGO_CACHE_MATCHED_KEY: ${{ steps.cargo-cache.outputs.cache-matched-key }}
-        run: |
-          if [[ -x .github/scripts/ci_metrics.sh ]]; then
-            .github/scripts/ci_metrics.sh finish
-          fi
 
   # Both gates are toolchain-free, so they stay out of quality_checks: a documentation-only
   # pull request selects no Rust lane and must still fail on a stale duplicate entry or an
@@ -336,8 +313,6 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Start CI metrics
-        run: .github/scripts/ci_metrics.sh start
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
         with:
@@ -372,15 +347,6 @@ jobs:
           OPENOBSERVE_PORT: "15080"
           OPENOBSERVE_IMAGE: ghcr.io/${{ github.repository_owner }}/openobserve:v0.92.0@sha256:a40c420d5d25f013243dbd7e025db1e39980385dcb9e5de924ce5a6a80957527
         run: examples/otel-traces/smoke-test.sh
-      - name: Finish CI metrics
-        if: ${{ always() }}
-        env:
-          CARGO_CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
-          CARGO_CACHE_MATCHED_KEY: ${{ steps.cargo-cache.outputs.cache-matched-key }}
-        run: |
-          if [[ -x .github/scripts/ci_metrics.sh ]]; then
-            .github/scripts/ci_metrics.sh finish
-          fi
 
   msrv:
     name: test (Rust 1.89.0)
@@ -400,8 +366,6 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Start CI metrics
-        run: .github/scripts/ci_metrics.sh start
       - name: Install minimum supported Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
         with:
@@ -452,15 +416,6 @@ jobs:
       # compile-fail authority checks on the minimum toolchain.
       - name: Test documentation on MSRV
         run: cargo test --workspace --all-features --locked --doc
-      - name: Finish CI metrics
-        if: ${{ always() }}
-        env:
-          CARGO_CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
-          CARGO_CACHE_MATCHED_KEY: ${{ steps.cargo-cache.outputs.cache-matched-key }}
-        run: |
-          if [[ -x .github/scripts/ci_metrics.sh ]]; then
-            .github/scripts/ci_metrics.sh finish
-          fi
 
   package:
     name: package crates
@@ -470,8 +425,6 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Start CI metrics
-        run: .github/scripts/ci_metrics.sh start
       - name: Test CI path classification
         run: python3 .github/scripts/test_classify_ci_changes.py
       - name: Test changelog validation
@@ -519,15 +472,6 @@ jobs:
       - name: Test package-cache cleanup
         if: ${{ needs.changes.outputs.run_package != 'false' }}
         run: .github/scripts/prepare-package-cache.sh
-      - name: Finish CI metrics
-        if: ${{ always() }}
-        env:
-          CARGO_CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
-          CARGO_CACHE_MATCHED_KEY: ${{ steps.cargo-cache.outputs.cache-matched-key }}
-        run: |
-          if [[ -x .github/scripts/ci_metrics.sh ]]; then
-            .github/scripts/ci_metrics.sh finish
-          fi
 
   cli-smoke:
     name: CLI smoke tests
@@ -543,8 +487,6 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Start CI metrics
-        run: .github/scripts/ci_metrics.sh start
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
         with:
@@ -617,15 +559,6 @@ jobs:
           cargo install --debug --locked --path crates/dekopond --root "$RUNNER_TEMP/dekopon-install"
           "$RUNNER_TEMP/dekopon-install/bin/dekopon-brokerd" --version
           "$RUNNER_TEMP/dekopon-install/bin/dekopond" --version
-      - name: Finish CI metrics
-        if: ${{ always() }}
-        env:
-          CARGO_CACHE_HIT: ${{ steps.cargo-cache.outputs.cache-hit }}
-          CARGO_CACHE_MATCHED_KEY: ${{ steps.cargo-cache.outputs.cache-matched-key }}
-        run: |
-          if [[ -x .github/scripts/ci_metrics.sh ]]; then
-            .github/scripts/ci_metrics.sh finish
-          fi
 
   deny:
     name: dependency policy
