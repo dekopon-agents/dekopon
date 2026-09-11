@@ -26,7 +26,7 @@ use thiserror::Error;
 
 pub use accept::{ACCEPT_BACKOFF_MS, MAX_ACCEPT_BACKOFF_MS, retryable_accept_error};
 pub use diagnostics::error_chain;
-pub use redaction::{Redacted, redaction_marker, serialize_exposed};
+pub use redaction::{REDACTION_MARKER, Redacted, redaction_marker, serialize_exposed};
 pub use skill::{MAX_SKILL_NAME_LENGTH, SkillId, SkillIdError};
 pub use subject::{ExternalSubject, SubjectError, SubjectService};
 pub use trace::{TraceId, TraceIdError};
