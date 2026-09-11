@@ -13,14 +13,7 @@ keywords = ["agents", "capabilities", "security", "types"]
 categories = ["data-structures"]
 include = ["src/**", "README.md", "Cargo.toml"]
 
-[features]
-default = []
-# `JsonSchema` derives for every public type. Opt-in: leaving it off keeps schemars,
-# schemars_derive, and syn out of every consumer that never calls a `JsonSchema` impl.
-schemars = ["dep:schemars"]
-
 [dependencies]
-schemars = { workspace = true, optional = true }
 serde.workspace = true
 thiserror.workspace = true
 

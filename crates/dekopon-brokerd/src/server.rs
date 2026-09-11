@@ -169,8 +169,7 @@ fn observe_task(
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => {
             // The category answers "which failure class"; the chain answers "why", which is the
-            // half that used to be dropped. `ENOSPC` during an audit append reaches an operator
-            // only through this line.
+            // half that used to be dropped.
             let cause = dekopon_core::error_chain(&error);
             // An unaudited outcome is the only connection failure an operator must act on: it
             // names the one invocation whose effect may have happened with nothing recording it.

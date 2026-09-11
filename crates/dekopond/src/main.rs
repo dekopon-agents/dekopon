@@ -132,8 +132,8 @@ async fn serve(config: std::path::PathBuf) -> ExitCode {
         }
     };
 
-    // Flush failures are reported but do not change the exit code: the broker's durable audit,
-    // not this daemon's telemetry, is the record of what happened.
+    // Flush failures are reported but do not change the exit code: serving has already ended, and a
+    // final batch the exporter could not deliver is not a reason to report the run as failed.
     if let Err(error) = telemetry.shutdown() {
         tracing::error!(event = "gateway_telemetry_shutdown_failed", error = %error);
     }

@@ -13,12 +13,14 @@ the goal this document serves; [the constitution](design.md#constitution) states
 
 | Signal | Question | Lifetime |
 |---|---|---|
-| **Broker audit** | What was *authorized*? | Append-only JSONL, owner-only |
+| **Broker audit** | What was *authorized*? | One log record per decision, inside the trace |
 | **Traces** | What did the code do, and how long did it take? | Sampled; expires with trace retention |
 | **Logs** | What could not be a span, and what must outlive one? | Retained independently |
 
-*Committed direction:* opt-in sink, off by default; audit is a log record in the trace
-([non-goals](design.md#non-goals)).
+Broker audit is not a fourth place records live: it is two log records, described under
+[the broker audit record](#the-broker-audit-record) below, and nothing else keeps a copy. Losing the
+log exporter loses audit; that is the accepted consequence of the constitution's rejection of
+crash-durable audit ([non-goals](design.md#non-goals)).
 
 **A span is a span of time; a log is a fact that is not a duration.** A log event justifies itself
 as a payload — text too large or too unbounded for a span attribute, the model and tool transcript
@@ -90,6 +92,46 @@ model wrote into those fields.
 
 An event name is part of this contract: CI fails a pull request that emits an `audit.event` name
 this file does not mention, so a rename lands here in the same change.
+
+## The broker audit record
+
+Every broker decision is one structured log record, emitted from inside the span that made it and
+therefore inside the caller's trace. Two events carry the whole record:
+
+| Event | Level | Emitted by | Carries |
+|---|---|---|---|
+| `broker.decision` | info | `dekopon-broker` | `invocation.id`, `capability.id`, `decision.id`, `decision.allowed`, `decision.reason` on a denial, `principal`, `actor.kind`/`actor.id`, `via`, `subject`, `provider`, `authorized.by`, `policy.revision`, `policy.ids`, `policy.digest`, `secret`/`secret.sink` when a public DRN was proposed, and `storage.scope_commitment`/`storage.evidence` on a storage-routed decision |
+| `broker.execution` | info | `dekopon-broker` | everything `broker.decision` carries except the decision verdict, plus `effect`, `risk`, `idempotency`, `credential` — the symbolic name only — `outcome`, `duration_ms`, `error` and `output.digest` when there is one, and `http.calls`: the sanitized `HttpCallEvidence` array, method, authority, status, accounted bytes, and `credentialInjected` |
+
+Both ride the `dekopon_broker::audit` target. An optional field is absent rather than null when the
+record does not carry it: a storage-routed decision names no principal, actor, provider, or policy
+at all, so a present field always means the broker knew it.
+
+Four decisions produce a record — a denial, an allow, a failure after authorization but before the
+provider ran, and the terminal outcome — and each produces exactly one. The record is emitted before
+the broker offers the decision to its `AuditLog` sink, so no sink can suppress it; `dekopon-brokerd`
+runs `TraceOnlyAuditLog`, which keeps nothing.
+
+Every record is a JSON line on the broker's stdout. When `broker.yaml` has a `telemetry` block it
+is also an OTLP log record, sent to the same endpoint, with the same `OTEL_EXPORTER_OTLP_HEADERS`
+and crate set, as the spans ([Broker export](#broker-export)). Without one, audit lasts as long as
+whatever keeps the process's stdout — `kubectl logs` for a pod — so a deployment that needs audit
+past a pod restart configures `telemetry`. `RUST_LOG` filters the stdout copy only: a level stricter
+than `info` on the `dekopon_broker::audit` target drops the records from it.
+
+Nothing here can carry secret bytes. `secret` and `credential` are the symbolic names owner
+configuration already holds, and the HTTP evidence is the same sanitized set the `http.request`
+span carries: no URL path or query, no headers, no bodies.
+
+The W3C trace id is not a field of the record, and it reaches it two ways. With export configured,
+the record is emitted inside `broker.authorize` or `broker.execute`, which descend from the
+`broker.invocation` span that adopted the client's `traceParent`, and the console JSON formatter and
+the OTLP log bridge each stamp the live `trace_id` and `span_id` on the way out. Without export
+there is no OpenTelemetry context and neither id is fabricated — but `broker.invocation` carries the
+client's trace identifier as its `trace` field (32 lowercase hex), and the JSON formatter renders
+every enclosing span into the line's `spans` array, so a stdout record still names the trace the
+gateway started. An operator gets correlation from stdout alone; what an exporter adds is the span
+id and the trace to pivot into.
 
 ## Enable OTLP export
 
@@ -173,9 +215,10 @@ attribute. With `transport: grpc` the endpoint names no organization, so the hea
 `organization=<org>`.
 
 Telemetry never blocks startup. An exporter that cannot be built disables export and logs why;
-authorization and append-only audit are the service's contract, and a missing exporter must not
-cost a working authority boundary. Flush failures at shutdown are logged and do not change the exit
-code.
+authorization is the service's contract, and a missing exporter must not cost a working authority
+boundary. The broker installs the OTLP log bridge alongside the span layer from the same block, so
+a configured receiver gets the audit records and not only the spans that produced them. Flush
+failures at shutdown are logged and do not change the exit code.
 
 The broker's log output is structured JSON on stdout, filtered by `RUST_LOG` and defaulting to
 `info`. Shipping those logs to storage is left to whatever reads stdout, so the broker holds one
@@ -188,12 +231,12 @@ including disabled trace export, neither ID is fabricated.
 `InvocationRequest` and `DeliveredTurnRequest` each carry a mandatory W3C `traceParent`. The shared
 broker leg fills it from the span that requested the capability, and the broker opens
 `broker.invocation` beneath it as a remote parent, so one trace spans both processes. The trace
-identifier inside it is the only correlation identifier the system has: the broker writes it into
-every audit record it appends and onto every span it opens for the call, and the invocation
-identifier extends it (`<trace>-<counter>`), so one session's calls are recoverable by prefix.
+identifier inside it is the only correlation identifier the system has: every span the broker opens
+for the call and every audit record it emits sits inside that trace, and the invocation identifier
+extends it (`<trace>-<counter>`), so one session's calls are recoverable by prefix.
 
-It is mandatory because a record with no correlation identifier is the inverse of what the audit
-log is for. A client that exports no telemetry still sends one: `tracing-opentelemetry` attaches
+It is mandatory because a record with no correlation identifier is the inverse of what an audit
+record is for. A client that exports no telemetry still sends one: `tracing-opentelemetry` attaches
 its layer only when an OTLP trace exporter is configured, so a non-exporting process has no span
 context to read at all — absent rather than invalid — and mints a session-local trace from OS
 entropy instead of omitting the field. Nothing off-box receives that minted trace; it still ties
@@ -214,7 +257,7 @@ spans and audit alike.
 
 An attested proposal adds routing fields to both spans: `broker.invocation` records the claimed
 `subject` and `agent`, and `broker.authorize` records the `subject` and the `via` peer the broker
-derived the context through — the same values the audit log keeps. All of them are canonical
+derived the context through — the same values the audit record carries. All of them are canonical
 identifiers (`slack.t0123abc.u9xyz`), never the chat message that prompted the invocation. A refusal
 records the claimed subject and its `outcome` with no `via`, because no attested context was
 derived.
@@ -372,7 +415,7 @@ migration is implemented here.
 | `http.request` | `dekopon-http-host` | `http.request.method`, `server.address`, `http.response.status_code`, `dekopon.http.request.accounted_bytes`, `dekopon.http.response.accounted_bytes`, `outcome`; `error.code` and `error.message` on failure |
 
 `http.request` fields mirror `HttpCallEvidence` exactly: the span reports the same call the audit
-log records, so URL paths and queries, request and response headers, and both bodies are absent
+record carries, so URL paths and queries, request and response headers, and both bodies are absent
 here for the same reason they are absent from evidence. A test in `dekopon-http-host` drives a real
 loopback request whose path, query, header, and body are each a distinct sentinel and asserts that
 none of them reach a span field.
@@ -466,7 +509,7 @@ the refresh failure classes remain part of the migration contract.
 | `broker_chatgpt_credential_loaded` | info | `dekopon-brokerd` | once per `chatgptSubscription` credential at startup: the symbolic `credential` name, the `authFile` path, `expires_at`, and `expired`. It is how an operator learns a seeded credential is already stale before the first invocation discovers it. |
 | `secret_source_resolution_failed` / `secret_projection_failed` | warn | `dekopon-brokerd` | adapter `source_kind` and low-cardinality `category`; no DRN, locator, response body, bootstrap credential, selector, or value |
 | `secret_source_cause_classified` / `secret_source_configuration_cause` | debug | `dekopon-brokerd` | safe cause classification behind the stable warn category: I/O kind/errno, HTTP timeout/connect/status, JSON class/line/column, the file-hygiene check name with the errno underneath it, or dependency-error type; URL parsing uses its fixed parser reason. Never endpoint/locator, refused path, or secret-derived bytes/offsets. |
-| `broker_audit_append_failed` | error | `dekopon-broker` | `audit.stage` (`decision`, `authorized-failure`, `outcome`), `category` (`full`, `poisoned`, `record-too-large`, `sequence-overflow`, `serialize`, `io`), `invocation`, and the error's source chain |
+| `broker_audit_append_failed` | error | `dekopon-broker` | `audit.stage` (`decision`, `authorized-failure`, `outcome`), `category` (`full`), `invocation`, and the error's source chain. Only an embedding's bounded `InMemoryAuditLog` refuses an append; `dekopon-brokerd`'s sink never does. |
 | `broker_request_frame_invalid` | warn | `dekopon-brokerd` | `error.kind` (`timeout`, `io`, `empty-frame`, `frame-too-large`, `deserialize`, …) and the bounded protocol message |
 | `broker_connection_failed` / `broker_outcome_unaudited` | warn / error | `dekopon-brokerd` | `category`, the failure's source chain, and — for an unaudited outcome — `invocation.id` |
 | `broker_capacity_exhausted` | error | `dekopon-brokerd` | `category`, and the chain naming which bound was reached |
@@ -485,23 +528,20 @@ gateway span. It marks refusals, not traffic: an honored session emits nothing.
 A chat-scoped `invoke` and `recordDeliveredTurn` withhold the same fact for the same reason, but
 they are accounted decisions rather than unanswered inspections, so the peer receives a `Denied`
 result whose reason is the one fixed literal `chat-attestation-denied` whatever the claim failed on.
-`broker.authorize`'s `outcome` and the durable decision record keep the real class and its
-`policy_ids`. A subject-only attested proposal answers with its own class; no chat transport takes
+`broker.authorize`'s `outcome` and the `broker.decision` record keep the real class and its
+`policy.ids`. A subject-only attested proposal answers with its own class; no chat transport takes
 that path.
 
-The source chain is the diagnosable half. `ConnectionError::Broker` renders as "broker failed" and
-`AuditError::Io` as "durable audit append failed" (an error label, not a crash-durability
-guarantee); the errno that says *why* — `ENOSPC` on an audit filesystem shared with anything else —
-lives one or two levels down, and these events render the whole chain as one `a: b: c` line. Frame
-contents never join it: a decode failure names its kind, not the bytes that failed to decode.
+The source chain is the diagnosable half. `ConnectionError::Broker` renders as "broker failed"; the
+errno that says *why* — a provider-storage I/O failure, say — lives one or two levels down, and
+these events render the whole chain as one `a: b: c` line. Frame contents never join it: a decode
+failure names its kind, not the bytes that failed to decode.
 
 `broker_capacity_exhausted` and `broker_accept_retried` report a condition outside any one request.
-The first says a bounded broker resource — an embedding's in-memory audit log — is full and does
-not evict; every caller receives `capacity-exhausted` and no
-retry clears it within that process lifetime. The durable file audit is not one of those bounds: it
-bounds each record, not their number, so a full audit filesystem arrives as
-`broker_audit_append_failed` with `category=io` — and, once execution has begun, as
-`broker_outcome_unaudited` — rather than here. The second says the daemon survived an `accept`
+The first says a bounded broker resource — the in-memory audit log of an embedding that serves
+`BrokerServer` over one — is full and does not evict; every caller receives `capacity-exhausted` and
+no retry clears it within that process lifetime. `dekopon-brokerd`'s own sink keeps nothing and
+never fills. The second says the daemon survived an `accept`
 failure; a steady stream of it at `error.kind=process-descriptor-limit` is a descriptor leak the
 daemon absorbs silently, which is what makes it worth alerting on.
 
@@ -578,8 +618,8 @@ withholds half of it serves nobody the constitution recognizes ([goal
 This is **data**, not credentials. Request and response headers and HTTP bodies stay out — a
 credential is injected into a header at the native HTTP boundary — and a `Redacted` value renders
 its marker wherever it is formatted, because that is a property of the value. Both exclusions are
-unconditional and neither ever had a switch. Append-only audit records carry their own metadata-only
-shape, unchanged by any of this.
+unconditional and neither ever had a switch. Audit records carry their own metadata-only shape,
+unchanged by any of this.
 
 A storage-backed `broker.authorize` and `provider.invoke` still open the blind span: identifiers and
 the decision only. *Committed direction:* that arm records its input like every other one.

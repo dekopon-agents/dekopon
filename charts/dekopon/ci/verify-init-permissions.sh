@@ -76,18 +76,13 @@ for c,uid in ((gateway,65533),(broker,65532)):
     assert c["securityContext"]["readOnlyRootFilesystem"]
     assert not c["securityContext"]["allowPrivilegeEscalation"]
 gm={m["name"]:m for m in gateway["volumeMounts"]}
-# The state claim is mounted more than once on the broker when broker.chatgpt is enabled: the
-# claim broker/ subPath, plus the credential subdirectory that sits beside it rather than inside
-# it. Index the state root explicitly instead of letting the last entry win.
-bstate=[m for m in broker["volumeMounts"] if m["name"]=="state"]
-bm={m["name"]:m for m in broker["volumeMounts"] if m["name"]!="state"}
-bm["state"]=next(m for m in bstate if m["mountPath"]=="/var/lib/dekopon")
-assert all(m.get("subPath") for m in bstate), bstate
-assert len({m["mountPath"] for m in bstate})==len(bstate), bstate
+bm={m["name"]:m for m in broker["volumeMounts"]}
+# Neither daemon mounts the claim root. Each reaches only its own credential subdirectory, and only
+# when that family is enabled.
+assert "state" not in bm or bm["state"]["subPath"]=="broker-chatgpt", bm.get("state")
+assert "state" not in gm or gm["state"]["subPath"]=="chatgpt", gm.get("state")
 assert "config" not in gm and "gateway-config" not in bm
 assert "tmp" not in gm and "gateway-tmp" not in bm
-assert bm["state"]["subPath"]=="broker"
-assert "state" not in gm or gm["state"]["subPath"] != "broker"
 assert "config-source" not in gm and "config-source" not in bm
 expected={"config-source":"/dekopon-source", "config":"/etc/dekopon",
           "gateway-config":"/etc/dekopon-gateway", "runtime":"/run/dekopon",
@@ -99,7 +94,7 @@ if "provider-storage" in bm:
 assert {m["name"]:m["mountPath"] for m in ic["volumeMounts"]}==expected
 assert gm["gateway-config"]["mountPath"]==bm["config"]["mountPath"]=="/etc/dekopon"
 assert gm["runtime"]["mountPath"]==bm["runtime"]["mountPath"]=="/run/dekopon"
-assert bm["state"]["mountPath"]=="/var/lib/dekopon"
+assert "state" not in bm or bm["state"]["mountPath"]=="/var/lib/dekopon/broker-chatgpt"
 assert "state" not in gm or gm["state"]["mountPath"]=="/var/lib/dekopon/chatgpt"
 config=next(d["stringData"] for d in docs if d["kind"]=="Secret" and "broker.yaml" in d.get("stringData",{}))
 broker_config=yaml.safe_load(config["broker.yaml"])
@@ -283,28 +278,12 @@ def ancestors(d):
             break
         p = os.path.dirname(p) or "/"
 
-def private_parent(path):
-    parent = os.path.realpath(os.path.dirname(path))
-    ancestors(parent)
-    st = os.lstat(parent)
-    ok(stat.S_ISDIR(st.st_mode) and st.st_uid == euid and (st.st_mode & 0o077) == 0,
-       f"private parent {parent} uid={st.st_uid} mode={oct(st.st_mode & 0o7777)}")
-
 print("== Tier A: credentials (mode & 0o077) ==")
 owned_file("/etc/dekopon/broker-credentials.yaml", 0o077, "credentials")
 print("== Tier B: broker.yaml, policies.cedar (mode & 0o022) ==")
 for f in ("broker.yaml", "policies.cedar"):
     owned_file(f"/etc/dekopon/{f}", 0o022, "config")
-print("== Tier C and D: audit parents, and every ancestor ==")
-for p in ("/var/lib/dekopon/broker/audit.jsonl",):
-    private_parent(p)
-print("== what the broker creates for itself ==")
-fd = os.open("/var/lib/dekopon/broker/audit.jsonl",
-             os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
-st = os.fstat(fd)
-os.close(fd)
-ok((st.st_mode & 0o077) == 0 and st.st_nlink == 1 and st.st_uid == euid,
-   f"audit.jsonl mode={oct(st.st_mode & 0o7777)} uid={st.st_uid} nlink={st.st_nlink}")
+print("== Tier D: the IPC parent and every ancestor ==")
 ancestors("/run/dekopon")
 st = os.lstat("/run/dekopon")
 ok(st.st_uid == 65532 and st.st_gid == 65534 and stat.S_IMODE(st.st_mode) == 0o710,
@@ -315,7 +294,7 @@ sys.exit(1 if fail else 0)
 CHECK
 docker run --rm -i --platform "$platform" --user 65532:65532 --group-add=65534 --cap-drop=ALL \
   --security-opt=no-new-privileges \
-  -v "${resource}-etc":/etc/dekopon -v "${resource}-run":/run/dekopon --mount "type=volume,src=${resource}-state,dst=/var/lib/dekopon/broker,volume-subpath=broker" \
+  -v "${resource}-etc":/etc/dekopon -v "${resource}-run":/run/dekopon \
   "$python_image" python3 - < "$work/check.py"
 
 # --------------------------------------------------------------------------------------------
@@ -452,10 +431,10 @@ if helm template collision "$chart_dir" \
   --set providerStorage.existingKeySecret=dekopon-storage-key \
   --set providerStorage.existingClaim=shared \
   --set state.existingClaim=shared >/dev/null 2>&1; then
-  echo "FAIL exact audit/provider storage claim collision rendered" >&2
+  echo "FAIL exact state/provider storage claim collision rendered" >&2
   exit 1
 fi
-echo "PASS exact audit/provider storage claim collision is rejected"
+echo "PASS exact state/provider storage claim collision is rejected"
 
 if helm template overlap "$chart_dir" \
   --set providerStorage.enabled=true \
@@ -521,31 +500,10 @@ docker run --rm -i --platform "$platform" --user 0:0 \
   --security-opt=no-new-privileges --read-only \
   -v "${resource}-etc":/etc/dekopon -v "${resource}-gateway-etc":/etc/dekopon-gateway \
   -v "${resource}-run":/run/dekopon \
-  --mount "type=volume,src=${resource}-state,dst=/broker-state,volume-subpath=broker" \
   --mount "type=volume,src=${resource}-state,dst=/gateway-state,volume-subpath=chatgpt" \
   -v "${resource}-storage":/var/lib/dekopon-provider-storage \
   -v "${resource}-storage-key":/etc/dekopon-storage-key \
   "$python_image" python3 - < "$chart_dir/ci/check-ipc-layout.py"
-
-echo "==> refuse old state layout without modifying its bytes"
-on_state <<'OLD'
-printf 'old-state-sentinel' > /var/lib/dekopon/audit.jsonl
-OLD
-if run_init "$work/init-storage.sh" > "$work/old-layout.log" 2>&1; then
-  echo "FAIL unmigrated state claim accepted" >&2
-  exit 1
-fi
-grep -q "move broker state" "$work/old-layout.log"
-old=$(on_state <<'OLD'
-cat /var/lib/dekopon/audit.jsonl
-OLD
-)
-assert_eq "unmigrated state refused without overwriting" "$old" "old-state-sentinel"
-# Take the sentinel back out: it is a deliberately unmigrated claim, and every later part runs the
-# init container against this same volume.
-on_state <<'OLD'
-rm -f /var/lib/dekopon/audit.jsonl
-OLD
 
 # Missing/mismatched inline server pins cannot fall back to the gateway euid.
 for pin in absent 65533; do
@@ -565,8 +523,7 @@ done
 
 # Changing one UID or widening credential groups cannot silently remove the boundary.
 for argument in podSecurityContext.runAsUser=65533 podSecurityContext.runAsGroup=65533 \
-  podSecurityContext.fsGroup=65534 'podSecurityContext.supplementalGroups[0]=65532' \
-  gateway.chatgpt.subdir=broker; do
+  podSecurityContext.fsGroup=65534 'podSecurityContext.supplementalGroups[0]=65532'; do
   if helm template unsafe "$chart_dir" -f "$values" \
     --set gateway.chatgpt.enabled=true --set gateway.chatgpt.existingSecret=seed \
     --set "$argument" > /dev/null 2> "$work/refused.err"; then
@@ -716,14 +673,14 @@ for d in yaml.safe_load_all(sys.stdin):
   assert STATE not in paths, ("the gateway must never mount the whole claim", paths)
   broker=next(c for c in spec["initContainers"] if c["name"]=="broker")
   broker_paths={m["mountPath"] for m in broker.get("volumeMounts",[])}
-  assert STATE in broker_paths, broker_paths
-  # The broker state mount is the broker/ subPath of the claim, so the credential directory needs
-  # its own sibling subPath mount or the path the init container seeded would not exist in here.
+  assert STATE not in broker_paths, ("the broker must never mount the whole claim", broker_paths)
+  # The credential directory is the only view of the claim the broker has: its own subPath mount at
+  # the path the init container seeded.
   assert BROKER in broker_paths, broker_paths
   init=spec["initContainers"][0]
   assert BROKER in init["args"][0], "the init container must seed the broker credential"'
 python_yaml "$mount_check" "$work/broker-chatgpt-render.yaml"
-echo "PASS the broker reaches its credential through its own state mount; the gateway has neither"
+echo "PASS the broker reaches its credential through its own subPath mount; the gateway has neither"
 
 if helm template shared-subdir "$chart_dir" -f "$values" \
   --set gateway.chatgpt.enabled=true \
@@ -735,19 +692,6 @@ if helm template shared-subdir "$chart_dir" -f "$values" \
   exit 1
 fi
 echo "PASS the two ChatGPT families cannot share a directory"
-
-# broker/ is the broker's own state subPath. A credential directory named for it would mount the
-# same claim subPath twice on one container and seed the credential into the broker state root.
-if helm template reserved-subdir "$chart_dir" -f "$values" \
-  --set gateway.chatgpt.enabled=true \
-  --set gateway.chatgpt.existingSecret=dekopon-chatgpt-auth \
-  --set broker.chatgpt.enabled=true \
-  --set broker.chatgpt.existingSecret=dekopon-chatgpt-auth-broker \
-  --set broker.chatgpt.subdir=broker >/dev/null 2>&1; then
-  echo "FAIL the broker state subPath was accepted as a credential directory" >&2
-  exit 1
-fi
-echo "PASS broker.chatgpt.subdir cannot claim the broker state subPath"
 
 echo
 echo "OK: every tier satisfied; both ChatGPT families are seed-once, separate, and reach only their own daemon; provider storage/key are retained, separate, and broker-only."

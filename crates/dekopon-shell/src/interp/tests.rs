@@ -851,7 +851,9 @@ fn a_here_document_body_charges_the_value_byte_ceiling() {
 }
 
 #[test]
-fn the_clock_is_not_a_command_this_session_has_unless_it_was_granted() {
+fn the_clock_is_not_a_command_this_shell_has() {
+    // There is no provider for "what time is it" and no capability to go through, so the word is
+    // simply not a command here — indistinguishable from any capability this session lacks.
     let outcome = run("date");
     assert_eq!(outcome.exit_code, ExitCode::NOT_FOUND);
     assert!(
@@ -859,35 +861,6 @@ fn the_clock_is_not_a_command_this_session_has_unless_it_was_granted() {
         "{}",
         outcome.output
     );
-
-    let enabled = run_with(
-        "date +%s",
-        Limits {
-            allow_clock: true,
-            ..Limits::default()
-        },
-    );
-    assert_eq!(enabled.exit_code, ExitCode::SUCCESS);
-    assert!(
-        enabled.output.parse::<i64>().is_ok(),
-        "an epoch second is a number: {}",
-        enabled.output
-    );
-}
-
-#[test]
-fn the_clock_builtin_cannot_reach_the_process_environment() {
-    // `date` reads a monotonic-free wall clock and nothing else. It must not become a second way
-    // to observe `TZ`, or anything else the namespace-isolation rule already excludes.
-    let outcome = run_with(
-        "date",
-        Limits {
-            allow_clock: true,
-            ..Limits::default()
-        },
-    );
-    assert!(outcome.output.ends_with('Z'), "{}", outcome.output);
-    assert_eq!(outcome.output.len(), 20, "{}", outcome.output);
 }
 
 #[test]
@@ -926,7 +899,7 @@ for item in "${arr[@]}"; do echo "[$item]"; done"#
 }
 
 // ---------------------------------------------------------------------------
-// `read` and `getopts`
+// `read`
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -996,53 +969,6 @@ fn read_refuses_what_it_does_not_implement() {
             outcome.output
         );
     }
-}
-
-#[test]
-fn getopts_parses_a_functions_own_flags() {
-    assert_eq!(
-        output(
-            r#"parse() {
-  while getopts "vn:" opt; do
-    case $opt in
-      v) echo "verbose" ;;
-      n) echo "name=$OPTARG" ;;
-      *) echo "other" ;;
-    esac
-  done
-}
-parse -v -n dekopon"#
-        ),
-        "verbose\nname=dekopon"
-    );
-}
-
-#[test]
-fn getopts_reports_a_bad_flag_and_a_missing_argument() {
-    assert!(
-        output(
-            r#"parse() { getopts "n:" opt; echo "opt=$opt OPTARG=$OPTARG"; }
-parse -z"#
-        )
-        .contains("opt=? OPTARG=z"),
-    );
-    assert!(
-        output(
-            r#"parse() { getopts "n:" opt; echo "opt=$opt"; }
-parse -n"#
-        )
-        .contains("requires an argument")
-    );
-}
-
-#[test]
-fn getopts_is_scoped_to_a_function_because_positionals_are() {
-    let outcome = run("getopts \"v\" opt");
-    assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
-    assert!(
-        outcome.output.contains("only valid inside a function"),
-        "{outcome:?}"
-    );
 }
 
 // ---------------------------------------------------------------------------

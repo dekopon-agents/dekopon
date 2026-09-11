@@ -180,9 +180,33 @@ All notable changes to Dekopon are documented here. The format is based on
   `session-limit`, `byte-budget`, `unavailable`); a refused marker submits no proposal and the model
   reads that the *gateway* refused before the broker saw anything. Attachment bytes never enter model messages, conversation history,
   telemetry payloads, broker protocol, evidence, or audit.
+- Every broker decision is now a structured log record inside the caller's trace. `dekopon-broker`
+  emits `broker.decision` and `broker.execution` on the `dekopon_broker::audit` target at all four
+  append sites — a denial, an allow, a failure after authorization but before the provider ran, and
+  the terminal outcome — from inside `broker.authorize` or `broker.execute`, so the console JSON
+  formatter and the OTLP log bridge each stamp the live W3C trace and span ids on it without the
+  broker crate linking any telemetry SDK. The record carries `policy_ids`, `policy_digest`,
+  `policy_revision`, `secret_sink`, and the sanitized `HttpCallEvidence` array, so a complete trace
+  says which policy authorized a write. It is metadata-only: `secret` and `credential` are the
+  symbolic names owner configuration already holds, and no HTTP path, query, header, or body
+  appears. With no `telemetry` block the stdout line still names the caller's trace, through the
+  `trace` field of the enclosing `broker.invocation` span the JSON formatter renders.
+- `dekopon-brokerd` installs the OTLP log bridge alongside its span layer, from the same
+  `telemetry` block and over the same crate set, so a configured receiver gets the audit records and
+  not only the spans that produced them. `dekopon_telemetry::optional_logger_provider` mirrors
+  `optional_tracer_provider`: an exporter that cannot be built disables log export and says why on
+  stderr rather than keeping the broker from starting.
+- `ChatScopeClaim::is_canonical_shape` decides the per-transport channel and conversation grammar
+  once, in `dekopon-broker-protocol`. `dekopon-broker` carried a byte-identical copy of that shape
+  function, its five service predicates and two lowercase helpers; both the broker's chat-grant
+  validation and its `ExternalSubject` correlation now call the protocol method, so the layer that
+  admits a scope and `DeliveryIdentity::is_canonical_for`, which already sat on those predicates,
+  can no longer drift into disagreeing about which Slack timestamp, Telegram topic or WhatsApp
+  triple is canonical. Behaviour is unchanged — the copies were identical when merged.
 
 ### Changed
 
+- Service run functions return unit on clean shutdown.
 - Exported telemetry now always carries what `telemetryPayloads` used to gate: `input` on
   `broker.authorize` and `provider.invoke`, `url.full` on `http.request`, and the
   `agent.model.prompt`, `agent.model.answer`, `agent.tool.script`, `agent.tool.output`,
@@ -211,7 +235,7 @@ All notable changes to Dekopon are documented here. The format is based on
   `next_invocation()` is infallible, and an invocation identifier is `<trace>-<counter>`, so a
   session's calls are still recoverable by prefix — by the same trace the gateway's own spans carry.
   `BrokerLeg::connect` lost its `trace_prefix` argument and `BrokerLegError::SessionIdentifier` went
-  with it. Audit records written before this carry a non-W3C `trace` and no longer decode.
+  with it.
 - The WhatsApp subscription-verification query is decoded by `form_urlencoded::parse` instead of a
   hand-written percent decoder. The 512-byte per-field bound and the duplicate-key refusal that keep
   the echoed `hub.challenge` contained are unchanged, as is the constant-time `hub.verify_token`
@@ -368,9 +392,30 @@ All notable changes to Dekopon are documented here. The format is based on
   policy — starts a fresh, empty generation on its first use after this release. Removing
   `maxQuarantinedNamespaces` changed the authority surface each generation is bound to. Stable
   namespaces keep their data; the previous generations stay on disk and charged to the root quota.
+- The native HTTP host's refusal of a response that carries its credential is now the credential
+  echo check, and its message reads `credentialed response echoed the credential` instead of
+  `credential-bearing response reflected protected material`. That text is what an operator reads
+  in `error.message` on the `http.request` span and the `accounting.http.request` record, and what
+  the provider component receives in `http-error.message`. The responses it refuses and the 16-byte
+  floor are unchanged.
 
 ### Removed
 
+- **Breaking configuration change.** The on-disk audit sink is gone. The audit record is the
+  `broker.decision` or `broker.execution` log record the broker emits inside the caller's trace: on
+  stdout as JSON always, and as an OTLP log record when `telemetry` names a receiver. Losing the
+  exporter loses audit, which is the constitution's accepted consequence; a deployment that wants
+  audit past a pod restart configures `telemetry`. `auditPath` and `serverLimits.auditMaxLineBytes`
+  are unknown fields now, so a `broker.yaml` that still names either refuses startup naming the
+  field — as do `checkpointPath`, `checkpointLockPath`, and `serverLimits.auditMaxRecords`, the
+  keys of the hash-chained audit and its checkpoint sidecar, which went with the chain verification,
+  replay restoration from disk, and the `audit verify` command. Removed from `dekopon-broker`
+  (semver break): `FileAuditLog`, `FileAuditError`, `DEFAULT_MAX_AUDIT_LINE_BYTES`, `AuditRecord`
+  and its `sequence` ordinal, and `AuditError::{Poisoned, RecordTooLarge, SequenceOverflow,
+  Serialize, Io}`; `AuditLog::append` returns `()`, `InMemoryAuditLog::records` returns the events
+  in append order, `TraceOnlyAuditLog` is a unit struct, and `libc` is no longer a dependency. From
+  `dekopon-brokerd`: `BrokerdAuditLog` and `BrokerdError::Audit`. An existing `audit.jsonl` is inert
+  and may be deleted; see [`docs/upgrading.md`](docs/upgrading.md).
 - **Breaking configuration change.** The `telemetryPayloads` gate and every metadata-only telemetry
   mode are gone. `telemetry.telemetryPayloads` is removed from both daemons' configuration, and both
   sections are `deny_unknown_fields`, so a daemon started on a file that still carries the key
@@ -464,14 +509,20 @@ All notable changes to Dekopon are documented here. The format is based on
   `ConflictScan::new` are gone: one host means one wording, and the conflict report itself is
   unchanged — every reserved-word and duplicate collision in a provider set, reported at once,
   fatal at boot.
+- Removed the shell's `getopts`. Nothing calls a function here with flags — a model authors both
+  the caller and the callee, and it writes `f "$x" "$y"` — so a flag parser for the one caller that
+  already knows the argument order was a bash habit rather than a need. `$1`, `$@`, `$#`, and
+  `shift` remain, and `OPTIND`/`OPTARG` are now ordinary variables nothing writes.
+  `dekopon_core::RESERVED_COMMAND_WORDS` loses `getopts` too, so a provider may claim that word.
+- Removed the shell's `date` builtin and the `Limits::allow_clock` opt-in that gated it, along with
+  `DEFAULT_ALLOW_CLOCK`. The gate was never set by any embedder, so no session could read a clock,
+  and the refusal it produced named a `--shell-allow-clock` flag that never existed. A script that
+  asks the time now gets the "command not found" an ungranted capability gets.
+  `dekopon_core::RESERVED_COMMAND_WORDS` loses `date`, which is visible to provider authors: a
+  provider may now claim `date` as its own command word, the way `gh` did once its builtin went.
 - Retired the `dekopon`, `dekopon-webui`, `dekopon-run`, and `dekopon-provider-host` crates. Only `dekopond` and `dekopon-brokerd` ship as binaries; shared agent, shell, model, SDK, and broker libraries remain. Recorded-session listing, transcript reconstruction, and model replay went with the runner, out of `dekopon-agent` as well; live agent tools and telemetry are unaffected. Published versions are not recalled or yanked; publication and a later independent console repin remain follow-ups.
-- Broker audit-chain verification, replay restoration from disk, and the `audit verify` command.
-  Audit records now append only `sequence` and `event`; existing bytes are not migrated or
-  integrity-checked. Remove `serverLimits.auditMaxRecords` from broker configuration; unknown
-  fields remain errors. The file has no total record cap or crash-durability guarantee.
 - Retire the broker web UI, its listener configuration, and gateway inventory/token reporting; daemon traces, model accounting, and provider execution remain.
 - Retired the standalone catalog CLI and package; model-account login, status, logout, and guarded credential export now live in `dekopond auth chatgpt`, without gateway configuration or startup.
-- Remove the broker audit checkpoint sidecar and its required configuration keys. The broker opens the verified audit directly; service run functions return unit on clean shutdown.
 - Removed the gateway's own image-generation meta tool. The `generate_image` model tool, the
   `imageGenerator:` gateway block, the `routes[].imageGenerator` flag, `dekopon-model`'s
   `image` module (`OpenAiImageGenerator`, the `ImageGenerator` trait, `ImageGenerationError`), and
@@ -504,6 +555,17 @@ All notable changes to Dekopon are documented here. The format is based on
   storage limits object is `deny_unknown_fields` and refuses it by name. Both `chmodat` calls are
   gone: the crate no longer chmods a directory it has classified as untrusted. Hard-link, symlink,
   ownership and mode refusals are unchanged; see [`docs/upgrading.md`](docs/upgrading.md).
+- Removed the `schemars` feature from `dekopon-core`, `dekopon-capability`, and `dekopon-protocol`,
+  along with its 41 `#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]` derives, the
+  `schemars` workspace dependency, the one test that called `schemars::schema_for!`, and the lint
+  job's `cargo check -p dekopon-core -p dekopon-capability -p dekopon-protocol --locked` step, which
+  existed only to keep the feature-off state compilable. This reverses `891b4a1`, which flipped the
+  three crates to `default = []`, added `default-features = false` to the `dekopon-protocol`
+  workspace entry, and added that CI step; the feature it made opt-in is now gone rather than
+  merely off. Removing a feature from three published crates is a breaking change: a dependent that
+  writes `features = ["schemars"]` against any of them no longer resolves, and the resource types no
+  longer derive `JsonSchema` for out-of-tree JSON Schema generation. Nothing in the workspace,
+  `dekopon-console`, or any provider repository enabled it.
 
 ### Fixed
 
@@ -516,11 +578,6 @@ All notable changes to Dekopon are documented here. The format is based on
   probe, and leave that peer looping on `EACCES`. The refusal names every unreachable UID
   and the server UID in one message; group-traversable (`0710`/`0750`) parents, which bind
   a `0660` socket, are unaffected.
-- Documentation for the `capacity-exhausted` failure code no longer describes the durable
-  file audit as a bounded resource. It bounds each record, not their number, so a full
-  audit filesystem surfaces as `broker-unavailable` before execution and
-  `outcome-unaudited` after it; `docs/observability.md` also no longer claims the replay
-  ledger is restored from durable history, which a restart has never done.
 - The generated Homebrew formula no longer counts executables the tap does not install.
   `.github/scripts/render-homebrew-formula.py` derives its `bin.install` list, the caveats
   count and table, and the `brew test` `--version` checks from one `EXECUTABLES` tuple, the
@@ -716,6 +773,27 @@ All notable changes to Dekopon are documented here. The format is based on
   walkthrough tells you to paste a live token into. (#1)
 - `docs/dekopond.md` cites the chart's real 270 s pod grace, and `docs/catalog.md` agrees with its
   own four-row reserved-fields table. (#33)
+
+## [dekopon-chart-0.5.0] - 2026-09-11
+
+### Removed
+
+- The chart's broker keeps no audit file. The default `broker.config.inline` and
+  `values-pr-summarizer-linter.yaml` no longer set `auditPath` or `serverLimits.auditMaxLineBytes`,
+  which the broker refuses as unknown fields; an inline or `existingSecret` `broker.yaml` has to
+  drop both before it runs an image with that broker. The broker container no longer mounts the
+  state claim's `broker/` subdirectory, so it sees the claim only through its own ChatGPT credential
+  subdirectory when `broker.chatgpt` is enabled; the init container no longer creates `broker/`,
+  refuses a root-level `audit.jsonl`, or reserves `broker` as a ChatGPT `subdir`. The state claim
+  stays for the two seed-once ChatGPT credentials. Audit is the broker's `broker.decision` and
+  `broker.execution` log records, on the pod's stdout and on the OTLP receiver `telemetry` names.
+  An `audit.jsonl` left on an existing claim is inert.
+
+### Changed
+
+- `ci/verify-init-permissions.sh` asserts that neither daemon mounts the claim root, and drops the
+  audit-parent tier, the unmigrated-layout refusal, and the reserved-subdirectory render checks with
+  the behaviour they covered.
 
 ## [dekopon-chart-0.4.0] - 2026-09-10
 

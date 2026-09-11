@@ -7,12 +7,12 @@ metadata:
     {{- include "dekopon.labels" . | nindent 4 }}
   annotations:
     {{- if .Values.state.keepOnUninstall }}
-    # Retain audit evidence and the live model credential across uninstall.
+    # Retain the live model credentials across uninstall.
     helm.sh/resource-policy: keep
     # That annotation is a Helm-uninstall protection and a GitOps controller does not read it. Argo
     # CD syncing with prune deletes any live object the rendered desired state stops containing —
-    # set state.existingClaim, or leave the chart source briefly unresolvable, and the audit log,
-    # and the live ChatGPT credential go with it. Prune=false covers the sync, Delete=false covers the
+    # set state.existingClaim, or leave the chart source briefly unresolvable, and the live ChatGPT
+    # credentials go with it. Prune=false covers the sync, Delete=false covers the
     # Application itself being deleted. Argo reads both off the live object.
     argocd.argoproj.io/sync-options: Prune=false,Delete=false
     {{- end }}

@@ -318,8 +318,8 @@ impl TelemetryGuard {
     /// Logs are stopped before traces, and a process that configured neither succeeds without
     /// doing anything. What a caller does with a failure is its own policy: a short-lived command
     /// fails, because a successful run reported as fully observed when it was not is a lie; a
-    /// daemon logs and carries on, because the broker's durable audit rather than telemetry is the
-    /// record of what happened.
+    /// daemon logs and carries on, because its work has already ended and a lost final batch is
+    /// the exporter loss the constitution accepts.
     ///
     /// # Errors
     ///
@@ -373,6 +373,25 @@ pub fn optional_tracer_provider(
         Ok(provider) => Some(provider),
         Err(error) => {
             eprintln!("{program}: telemetry disabled: {error}");
+            None
+        }
+    }
+}
+
+/// Builds a logger provider for a process that must start even when export cannot.
+///
+/// The mirror of [`optional_tracer_provider`], for the same reason: an audit record that cannot be
+/// exported is worse than one that reaches stdout only, and neither is worse than a broker that
+/// refuses to start.
+#[must_use]
+pub fn optional_logger_provider(
+    settings: Option<&ExporterSettings>,
+    program: &str,
+) -> Option<SdkLoggerProvider> {
+    match settings?.logger_provider() {
+        Ok(provider) => Some(provider),
+        Err(error) => {
+            eprintln!("{program}: log export disabled: {error}");
             None
         }
     }

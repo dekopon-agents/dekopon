@@ -268,7 +268,9 @@ for response in responses:
     assert not response.get("is_partial", False), "partial search"
 spans, logs = [response["hits"] for response in responses]
 shipped = json.loads((folder / "shipped.json").read_text())
-assert len(logs) == len(shipped), "remote log coverage mismatch"
+# The broker exports its own log records now, so this stream holds more than the shipper put into
+# it. Every shipped row must still be there.
+assert len(logs) >= len(shipped), "remote log coverage mismatch"
 for daemon in ("dekopond", "dekopon-brokerd"):
     pairs = {(row["trace_id"], row["span_id"]) for row in shipped
              if row["daemon"] == daemon and row.get("trace_id")
@@ -278,7 +280,14 @@ for daemon in ("dekopond", "dekopon-brokerd"):
                and (row.get("trace_id"), row.get("span_id")) in pairs
                and any(span.get("trace_id") == row["trace_id"] and span.get("span_id") == row["span_id"]
                        for span in spans) for row in logs), f"independent correlation missing for {daemon}"
+# Audit is a log record in the trace, so the broker's own exporter — not the smoke shipper — has to
+# have delivered one into the caller's trace. A shipped row carries the `daemon` field this script
+# added; a record from the real OTLP log bridge does not.
+assert [row for row in logs
+        if row.get("daemon") is None and row.get("trace_id") == trace
+        and "broker.decision" in json.dumps(row)], "no exported broker.decision record in the trace"
 print("Both daemon stdout native ID pairs independently correlated with remote spans")
+print("Broker audit record exported into the caller's trace")
 PYCORRELATE
 
 # The log path carries the transcript and the inbound message; the traces check above never reads

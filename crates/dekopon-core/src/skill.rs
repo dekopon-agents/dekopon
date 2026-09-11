@@ -51,7 +51,6 @@ pub enum SkillIdError {
 }
 
 /// A validated skill name, equal to the name of the directory the skill lives in.
-#[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(transparent)]
 pub struct SkillId(String);

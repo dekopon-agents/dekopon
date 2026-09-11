@@ -7,7 +7,7 @@ the record moved between the read and the write, and nobody's edit gets silently
 The gateway authenticates the message and vouches for the sender; it decides nothing. The broker
 maps that Slack identity to the principal `cpetersen`, checks a Cedar policy, resolves the two
 capabilities that policy permits, injects an API token bound to `api.example.com`, executes the
-`http-probe` WebAssembly component, and appends metadata-only audit records naming the person
+`http-probe` WebAssembly component, and emits metadata-only audit records naming the person
 who asked. The token is never visible to the model, the shell session, the agent, or the component
 that uses it — the broker's native HTTP engine adds the header after the guest's own headers have
 been validated, and audit records `credentialInjected: true` and never a value.
@@ -69,8 +69,7 @@ Exactly these, and nothing else:
 
 | Placeholder | File | Replace with |
 |---|---|---|
-| `/home/xavier/.local/{run,state}/dekopon/…` | `broker.yaml` | your own paths — two entries: socket and audit |
-| `/home/xavier/.local/run/dekopon/broker.sock` | `dekopond.yaml` | the same socket path as `broker.yaml` |
+| `/home/xavier/.local/run/dekopon/broker.sock` | `broker.yaml`, `dekopond.yaml` | your own socket path, the same in both |
 | `uid: 501` | `broker.yaml` | your UID (`id -u`) |
 | `serverUid: 501` | `dekopond.yaml` | the same UID |
 | `slack.t0123abcd` | `broker.yaml`, `attestor.namespaces` | `slack.` + your lowercased team ID |
@@ -90,8 +89,8 @@ Rename them together or not at all.
 Then make the directories private and the configurations owner-only:
 
 ```console
-mkdir -p ~/.local/run/dekopon ~/.local/state/dekopon
-chmod 700 ~/.local/run/dekopon ~/.local/state/dekopon
+mkdir -p ~/.local/run/dekopon
+chmod 700 ~/.local/run/dekopon
 chmod 600 broker.yaml policies.cedar dekopond.yaml
 ```
 
@@ -201,77 +200,77 @@ instead of overwriting work nobody read.
 
 *Committed direction:* removed ([non-goals](../../docs/design.md#non-goals)).
 
-## 7. What the audit log holds
+## 7. What the audit record holds
 
-*Committed direction:* opt-in sink, off by default; audit is a log record in the trace
-([non-goals](../../docs/design.md#non-goals)).
-
-```console
-tail -1 ~/.local/state/dekopon/audit.jsonl | jq .
-```
+Every decision the broker makes is one JSON line on its stdout — the terminal from step 4 —
+carrying `"audit.event":"broker.decision"` or `"audit.event":"broker.execution"`. That line is the
+audit record. Add a `telemetry` block to `broker.yaml` and the same record is also exported as an
+OTLP log record; without one, the broker's stdout is the only copy.
+`jq 'select(."audit.event" == "broker.execution")'` over that stdout keeps only the outcomes. This
+one is the write's, pretty-printed and trimmed to the record's fields and its invocation span:
 
 ```json
 {
-  "sequence": 6,
-  "event": {
-    "type": "execution",
-    "invocation": "4bf92f3577b34da6a3ce929d0e0e4736-3",
-    "trace": "4bf92f3577b34da6a3ce929d0e0e4736",
-    "principal": "cpetersen",
-    "actor": { "type": "agent", "agent": "xaviers-conditional-writer" },
-    "via": "dekopond-gateway",
-    "attested_subject": "slack.t0123abcd.u0123abcd",
-    "capability": "http-probe.conditional-write",
-    "provider": "http-probe",
-    "authorized_by": "local-broker",
-    "decision_id": "allow-4bf92f3577b34da6a3ce929d0e0e4736-3",
-    "policy_revision": "conditional-write-2026-01",
-    "policy_ids": ["conditional-writer-surface"],
-    "policy_digest": "sha256:7c31…",
-    "effect": "external-write",
-    "risk": "High",
-    "idempotency": "conditional",
-    "credential": "api-token",
-    "outcome": "Succeeded",
-    "duration_ms": 812,
-    "output_digest": "sha256:9ab4…",
-    "http_calls": [
-      { "method": "GET",  "authority": "api.example.com", "status": 200,
-        "requestBytes": 214, "responseBytes": 8931, "credentialInjected": true },
-      { "method": "POST", "authority": "api.example.com", "status": 200,
-        "requestBytes": 486, "responseBytes": 1204, "credentialInjected": true }
-    ]
-  }
+  "level": "INFO",
+  "audit.event": "broker.execution",
+  "invocation.id": "4bf92f3577b34da6a3ce929d0e0e4736-3",
+  "capability.id": "http-probe.conditional-write",
+  "decision.id": "allow-4bf92f3577b34da6a3ce929d0e0e4736-3",
+  "principal": "cpetersen",
+  "actor.kind": "agent",
+  "actor.id": "xaviers-conditional-writer",
+  "via": "dekopond-gateway",
+  "subject": "slack.t0123abcd.u0123abcd",
+  "provider": "http-probe",
+  "authorized.by": "local-broker",
+  "policy.revision": "conditional-write-2026-01",
+  "policy.ids": "conditional-writer-surface",
+  "policy.digest": "sha256:7c31…",
+  "effect": "ExternalWrite",
+  "risk": "High",
+  "idempotency": "Conditional",
+  "credential": "api-token",
+  "outcome": "Succeeded",
+  "duration_ms": 812,
+  "output.digest": "sha256:9ab4…",
+  "http.calls": "[{\"method\":\"GET\",\"authority\":\"api.example.com\",\"status\":200,\"requestBytes\":214,\"responseBytes\":8931,\"credentialInjected\":true},{\"method\":\"POST\",\"authority\":\"api.example.com\",\"status\":200,\"requestBytes\":486,\"responseBytes\":1204,\"credentialInjected\":true}]",
+  "target": "dekopon_broker::audit",
+  "spans": [
+    { "name": "broker.invocation", "trace": "4bf92f3577b34da6a3ce929d0e0e4736",
+      "invocation": "4bf92f3577b34da6a3ce929d0e0e4736-3", "capability": "http-probe.conditional-write",
+      "subject": "slack.t0123abcd.u0123abcd", "agent": "xaviers-conditional-writer" }
+  ]
 }
 ```
 
 What each part is doing:
 
 - `principal: cpetersen` — the effect is attributed to the person who asked, not to the process
-  that relayed the message. `via: dekopond-gateway` records which gateway vouched, and
-  `attested_subject` records the claim it made. All three, or none of them: a direct peer's record
-  has no `via` and no subject.
-- `policy_ids` — the `@id("…")` names from `policies.cedar`. That is why writing them is worth it:
-  positional names renumber when a policy is inserted above them. `policy_digest` fingerprints the
-  whole evaluated policy set, so two brokers reporting the same digest evaluated the same surface.
-- Two `http_calls` — the pre-read and the write, exactly the budget the constraint set allowed.
-  `credentialInjected: true` says broker-held authority was presented; the value appears nowhere,
-  and `requestBytes` excludes the injected header so its length cannot leak either.
+  that relayed the message. `via: dekopond-gateway` records which gateway vouched, and `subject`
+  records the claim it made. All three, or none of them: a direct peer's record has no `via` and no
+  subject.
+- `policy.ids` — the `@id("…")` names from `policies.cedar`, comma-separated. That is why writing
+  them is worth it: positional names renumber when a policy is inserted above them. `policy.digest`
+  fingerprints the whole evaluated policy set, so two brokers reporting the same digest evaluated the
+  same surface.
+- Two entries in `http.calls` — the pre-read and the write, exactly the budget the constraint set
+  allowed. `credentialInjected: true` says broker-held authority was presented; the value appears
+  nowhere, and `requestBytes` excludes the injected header so its length cannot leak either.
 - `credential: api-token` — *which* authority, by the symbolic name in `broker.yaml`. This is the
   current legacy binding, [planned to be replaced by public DRNs](../../docs/design.md#legacy-credential-bindings).
   One example
   has one token, so it reads as redundant here; a deployment whose constraint set names a different
   credential per agent is one where the two organizations' writes would otherwise be identical
   records.
-- No record body, no request payload, no written text, no Slack message, no URL path or query. The
-  log records that something happened and to what; provider output is a digest.
+- No record body, no request payload, no written text, no Slack message, no URL path or query in the
+  record's own fields. It records that something happened and to what; provider output is a digest.
 
-Records 1 through 5 are the rest of the same session — among them a `decision` and an `execution`
-for the read, then the `decision` that allowed this write. The `trace` is the session's W3C trace
-id, the same one the gateway's own spans carry, and each invocation extends it with a counter, so
-`grep 4bf92f3577b34da6a3ce929d0e0e4736` recovers the whole conversation's effects from the audit log
-and the same identifier pivots to its spans in the telemetry store. Each JSONL record carries its
-`sequence` ordinal and a metadata-only `event`.
+The audit lines before it are the rest of the same session — a `broker.decision` and a
+`broker.execution` for the read, then the `broker.decision` that allowed this write. The `trace` on
+`broker.invocation` is the session's W3C trace id, the same one the gateway's own spans carry, and
+each `invocation.id` extends it with a counter, so `grep 4bf92f3577b34da6a3ce929d0e0e4736` over the
+broker's stdout recovers the whole conversation's effects, and the same identifier pivots to its
+spans in the telemetry store.
 
 ## 8. When it does not work
 
@@ -279,7 +278,7 @@ and the same identifier pivots to its spans in the telemetry store. Each JSONL r
 |---|---|---|
 | Slack replies `You're not authorized to use this agent.` | any one of three: the sender's subject is not in `identityMappings`; the peer identity has no `attestor` grant, or the subject sits outside its `namespaces`; or no policy permits `agent.prompt` for that principal and agent — check the `via` condition names your gateway's `principal`. The broker answers all three identically on purpose: a refusal must not disclose whether a subject is even mapped. | gateway stdout, `{"event":"gateway_session_rejected","reason":"attestation-refused"}`. **No audit record** — a refused capability listing is not a proposal, so there is nothing to audit and no model call was paid for. Work the three causes in the configuration. |
 | The same reply, but the log says `"reason":"unauthorized"` | attested, mapped, and permitted to drive the agent — and policy grants it zero capabilities. Usually the second policy statement's `context.agent` or `context.via` disagreeing with the first's. | gateway stdout |
-| The agent answers that it could not write | the write was denied or refused | a `decision` with `"allowed": false` and a `reason` (`attestation-denied`, `unmapped-subject`, `agent-denied`, `unconstrained-capability`, or an empty `policy_ids` deny-by-default), or a `precondition-failed` provider error when the record moved |
+| The agent answers that it could not write | the write was denied or refused | broker stdout, a `broker.decision` with `"decision.allowed": false` and a `decision.reason` (`attestation-denied`, `unmapped-subject`, `agent-denied`, `unconstrained-capability`, or a deny-by-default with no `policy.ids`), or a `precondition-failed` provider error when the record moved |
 | Broker exits: `policy permits capability X, which has no constraint set` | `policies.cedar` names a capability `broker.yaml` does not constrain | startup, before the socket is bound |
 | Broker exits: `constraint set for X names unknown credential "api-token"` | `broker-credentials.yaml` was never copied, or names the credential differently | startup |
 | Broker exits: `broker credentials must be single-link, owned by the server UID, and unreadable by group and world` | `chmod 600 broker-credentials.yaml` | startup |

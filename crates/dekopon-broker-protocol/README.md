@@ -145,14 +145,15 @@ message is human-facing and may change. Codes are exported as constants from
 | `unauthenticated` | The connected peer UID is not mapped by broker policy. | Not until the peer is mapped. |
 | `invalid-request` | The request frame could not be decoded, or an attestation was malformed or mismatched to its operation or proposal. | Yes, once corrected. |
 | `broker-unavailable` | The broker could not complete the request and **no provider work began**. | Yes, under a fresh invocation identifier. |
-| `capacity-exhausted` | A bounded broker resource — an embedding's in-memory audit log — is full and does not evict. The append-only file audit has no record cap, so a full disk arrives as `broker-unavailable` or `outcome-unaudited` instead. No provider work began. | Safe, and futile: it fails identically until an operator raises the bound. **Do not retry.** |
+| `capacity-exhausted` | A bounded broker resource — the in-memory audit log of an embedding that serves `BrokerServer` over one — is full and does not evict. `dekopon-brokerd`'s own audit sink never fills. No provider work began. | Safe, and futile: it fails identically until an operator raises the bound. **Do not retry.** |
 | `provider-error` | A `runCommand` or `resolveCommand` run did not produce an answer: no loaded provider declares the word, the argv plus piped value exceeded the host's input bound, the guest failed, or its answer would not decode. **No invocation existed and nothing executed.** | Not without changing the word, its arguments, or the piped value; an identical retry fails identically. |
 | `outcome-unaudited` | Provider work may already have completed and the broker did not record its outcome. | **No.** The external effect may have taken place. |
 | `storage-quota`, `storage-busy`, `storage-timeout`, `storage-corrupt`, `storage-io` | Broker-owned namespace/grant setup failed before provider execution. A `storage-corrupt` whose message says the storage was reset has already moved that conversation to fresh, empty storage. | Yes under a fresh identifier after correcting or reconciling the storage condition; after a reset, immediately. |
 
 `outcome-unaudited` separates "nothing happened" from "something may have happened and nothing
-recorded it". It is emitted only for failures raised after execution began — a failed terminal audit
-append, or a failure to hash terminal evidence. The server logs `broker_outcome_unaudited` with the
+recorded it". It is emitted only for failures raised after execution began: terminal evidence that
+fails to hash, or an embedding's bounded audit sink refusing the terminal record, which
+`dekopon-brokerd`'s own sink never does. The server logs `broker_outcome_unaudited` with the
 invocation identifier, so the invocation needing manual reconciliation is identifiable without
 correlating client-side state. A denied or failed *invocation* is not a failure response at all: it
 returns a normal result carrying its outcome and decision linkage.
@@ -165,8 +166,7 @@ above.
 
 `capacity-exhausted` separates an exhausted bounded embedding in-memory audit log from a momentary
 outage. It does not evict during its lifetime, so clients must not retry automatically. The server
-logs `broker_capacity_exhausted`; an operator must address capacity. The append-only file has no
-record cap.
+logs `broker_capacity_exhausted`; an operator must address capacity.
 
 A refused or unresolvable DRN is never a failure response: refusal is a normal `Denied` invocation
 (`secret-denied`) and a post-authorization source failure is a normal `Failed` invocation

@@ -204,7 +204,6 @@ broker's configuration can disagree with every one of them without either proces
   `ObjectMeta`, `AgentSpec` and `AgentStatus` own the typed serde storage of labels,
   policyProfile, capability and provider names, descriptions and the optional authored status.
   Storage and serialization are not a catalog display command.
-  Optional Schemars derives consume Rustdoc as schema description metadata, not validation rules.
 - [`dekopond/src/routes.rs`](../crates/dekopond/src/routes.rs), `RoutingTable::bind`:
   checks enabled, resolves explicit model or modelClass, and binds instructions and loaded skills.
 - [`dekopon-config/src/skill.rs`](../crates/dekopon-config/src/skill.rs), `Skill` and `load_skill`:

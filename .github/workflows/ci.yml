@@ -96,10 +96,6 @@ jobs:
       # release-profile compile gate here; tag workflows still perform the final linked builds.
       - name: Check release CLIs
         run: cargo check --release --locked -p dekopon-brokerd -p dekopond
-      # Every other gate builds --all-features, so nothing else compiles the foundational crates
-      # with their opt-in `schemars` feature off — the state a crates.io consumer gets by default.
-      - name: Check foundational crates without the schemars feature
-        run: cargo check -p dekopon-core -p dekopon-capability -p dekopon-protocol --locked
       - name: Detect unused dependencies
         run: cargo machete
       - name: Verify gateway excludes privileged broker machinery
@@ -627,7 +623,6 @@ jobs:
           cat > "$RUNNER_TEMP/foreign-uid-broker.yaml" <<'YAML'
           apiVersion: dekopon.dev/brokerd/v1alpha1
           socketPath: /run/dekopon/broker.sock
-          auditPath: /var/lib/dekopon/audit.jsonl
           brokerPrincipal: local-broker
           policyRevision: chart-default
           policiesPath: /etc/dekopon/policies.cedar

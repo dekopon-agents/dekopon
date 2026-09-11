@@ -13,9 +13,9 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use dekopon_broker::{
-    AuditError, AuditEvent, AuditLog, AuditRecord, AuthenticatedContext, Broker, BrokerLimits,
-    CapabilityRoute, ConstraintCatalog, ConstraintSet, CredentialStore, IdentityDirectory,
-    InMemoryAuditLog, InvocationRequest, PolicyEngine, PolicyWorld,
+    AuditError, AuditEvent, AuditLog, AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute,
+    ConstraintCatalog, ConstraintSet, CredentialStore, IdentityDirectory, InMemoryAuditLog,
+    InvocationRequest, PolicyEngine, PolicyWorld,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency, InvocationOutcome};
@@ -48,7 +48,7 @@ struct GatedAudit {
 }
 
 impl AuditLog for GatedAudit {
-    async fn append(&self, event: AuditEvent) -> Result<AuditRecord, AuditError> {
+    async fn append(&self, event: AuditEvent) -> Result<(), AuditError> {
         #[allow(
             clippy::let_underscore_must_use,
             reason = "the gate announces that it was entered; a test that has stopped listening \

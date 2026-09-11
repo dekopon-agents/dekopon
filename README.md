@@ -12,14 +12,14 @@ Start with [`docs/design.md`](docs/design.md) for the product model, authority f
 
 Ordered by the goals it serves. Credentials stay inside the broker:
 
-- Public inert secret DRNs, decided by a separate Cedar `secret.use` grant against an owner-only source/use map, with invocation-pinned secure-file/Kubernetes/1Password/Vault/AWS/GCP/Azure adapters, canonical host/method/path/query bounds, native Basic/Bearer rendering, binding-swap refusal, and direct-reflection filtering. Providers see neither references nor values. See [`docs/secrets.md`](docs/secrets.md).
+- Public inert secret DRNs, decided by a separate Cedar `secret.use` grant against an owner-only source/use map, with invocation-pinned secure-file/Kubernetes/1Password/Vault/AWS/GCP/Azure adapters, canonical host/method/path/query bounds, native Basic/Bearer rendering, binding-swap refusal, and a credential echo check. Providers see neither references nor values. See [`docs/secrets.md`](docs/secrets.md).
 - One capability presents a different credential per acting agent through `credential`/`credentialByAgent`. *Committed direction:* these bindings will be replaced by public DRNs ([migration requirements](docs/design.md#legacy-credential-bindings)).
 - Credential-free self-inspection: an authorized session calls `inspect_agent_config` for its exact standing prompt, route limits, and the capabilities Cedar currently grants that sender. Raw policy, identity, endpoints, paths, and every credential name or value stay out.
 
 One complete trace per message:
 
 - Correlated OpenTelemetry traces and logs across transport receipt, agent session, model turn, shell command, broker decision, provider invocation, and native HTTP egress. [`examples/otel-traces`](examples/otel-traces/README.md) runs an OpenObserve receiver and a real gateway/broker smoke test.
-- Append-only JSONL audit records carrying the decision and the outcome.
+- Broker audit as one structured log record per decision and per outcome, inside the same trace.
 
 Extensibility through Wasm providers:
 
@@ -29,7 +29,7 @@ Extensibility through Wasm providers:
 - An offline `dekopon-brokerd provider` manager for exact fully qualified OCI tags or manifest digests: strict desired and generated-lock files, a content-addressed component store, complete provider-set validation before atomic activation, offline list and verify, and a startup comparison of locked digest, length, and provider ID against the exact Wasmtime input buffer. It adds no daemon-startup network path.
 - Out-of-tree components carry new capability: a standalone JSONPlaceholder provider with separately authorized post-read and external-write capabilities, and a SQLite-compatible [`turso-sql`](https://github.com/dekopon-agents/dekopon-provider-turso-sql) engine compiled to `wasm32-unknown-unknown` that imports only `dekopon:storage/durable-files@0.1.0`.
 - Strongly typed identifiers and an invocation typestate that separates a proposal from broker authorization.
-- A sandboxed bash-flavored script interpreter (`dekopon-shell`) whose command words dispatch to provider capabilities instead of operating-system processes, with compound commands (`if`/`for`/`while`/`until`/`case`/`{ ...; }`) as pipeline stages, `[[ ... ]]`, enforced `set -e`/`-u`/`-o pipefail`, `read`/`getopts`, real parameter expansion, and two script-addressable streams. The shared agent layer hands it to a model as its `bash` tool, so a multi-step plan is one tool call rather than many round trips.
+- A sandboxed bash-flavored script interpreter (`dekopon-shell`) whose command words dispatch to provider capabilities instead of operating-system processes, with compound commands (`if`/`for`/`while`/`until`/`case`/`{ ...; }`) as pipeline stages, `[[ ... ]]`, enforced `set -e`/`-u`/`-o pipefail`, `read`, real parameter expansion, and two script-addressable streams. The shared agent layer hands it to a model as its `bash` tool, so a multi-step plan is one tool call rather than many round trips.
 - An unprivileged Tokio lifecycle seam (`dekopon-process`) that runs one typed async operation as one payload-free traced task and joins it before returning; if the outer caller is dropped, its required observer receives the full outcome anyway. The agent's broker leg is a cancellable node tied to gateway session Stop.
 
 The operator surface on top:
@@ -108,7 +108,7 @@ A multi-architecture container image publishes to `ghcr.io/dekopon-agents/dekopo
 
 ### Before running the broker
 
-`dekopon-brokerd` requires an owner-controlled strict configuration, a protected socket directory and private audit directory, and pinned provider component paths:
+`dekopon-brokerd` requires an owner-controlled strict configuration, a protected socket directory, and pinned provider component paths:
 
 ```console
 dekopon-brokerd --config /path/to/broker.yaml
@@ -120,7 +120,7 @@ For Kubernetes, [`charts/dekopon`](charts/dekopon/README.md) runs both daemons a
 
 ## Run the flagship example
 
-[`examples/conditional-write`](examples/conditional-write/README.md) is the whole system in one deployment: a mapped sender asks in Slack for a record to be updated, the gateway attests to the sender and decides nothing, and the broker authorizes one bounded read and one etag-pinned conditional write. The delete the same component exposes is absent, and unreachable: no constraint set describes it. The broker injects a token bound to `api.example.com` and appends owner-only JSONL audit records naming the person who asked; the token is never visible to the model, shell session, or component. Catalog, broker configuration, Cedar policy, credentials template, gateway configuration, and the deny table are pinned against the real machinery by `crates/dekopon-brokerd/tests/examples.rs`.
+[`examples/conditional-write`](examples/conditional-write/README.md) is the whole system in one deployment: a mapped sender asks in Slack for a record to be updated, the gateway attests to the sender and decides nothing, and the broker authorizes one bounded read and one etag-pinned conditional write. The delete the same component exposes is absent, and unreachable: no constraint set describes it. The broker injects a token bound to `api.example.com` and emits audit records naming the person who asked; the token is never visible to the model, shell session, or component. Catalog, broker configuration, Cedar policy, credentials template, gateway configuration, and the deny table are pinned against the real machinery by `crates/dekopon-brokerd/tests/examples.rs`.
 
 The GitHub reviewer walkthrough ships with its provider: [`examples/pr-summarizer-linter`](https://github.com/dekopon-agents/dekopon-provider-gh/blob/main/examples/pr-summarizer-linter/README.md) in `dekopon-provider-gh`.
 
