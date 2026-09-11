@@ -26,7 +26,7 @@ dekopon-model.workspace = true
 dekopon-shell.workspace = true
 dekopon-telemetry.workspace = true
 # A session that exports no telemetry still mints its own W3C trace, and the invocation
-# identifiers derived from it are the broker's replay-rejection keys.
+# identifiers derived from it bind attestations to proposals and name calls in audit.
 getrandom.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -311,8 +311,6 @@ fn round_up(value: u64, multiple: u64) -> Result<u64, BrokerBuildError> {
 
 /// Default maximum owner-authored constraint sets in one broker instance.
 pub const DEFAULT_MAX_CONSTRAINT_SETS: usize = 1_024;
-/// Default process-lifetime invocation identifiers retained for replay rejection.
-pub const DEFAULT_MAX_REPLAY_IDS: usize = 100_000;
 /// Default maximum serialized bytes in one durable JSONL audit record (64 KiB).
 pub const DEFAULT_MAX_AUDIT_LINE_BYTES: usize = 64 * 1024;
 
@@ -1535,26 +1533,22 @@ impl IdentityDirectory {
     }
 }
 
-/// Independent broker limits for constraint and replay state.
+/// Independent broker limits for owner-authored constraint state.
 ///
 /// Every field defaults independently to the value [`BrokerLimits::default`] gives it, which is
-/// the same value an entirely absent `brokerLimits` block produces. An operator raising one bound
-/// therefore writes one line instead of restating the others, and a restated default cannot drift
-/// away from the one the code uses.
+/// the same value an entirely absent `brokerLimits` block produces, so a restated default cannot
+/// drift away from the one the code uses.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct BrokerLimits {
     /// Maximum owner-authored constraint sets accepted at construction.
     pub max_constraint_sets: usize,
-    /// Maximum invocation IDs retained for this process lifetime; exhaustion fails closed.
-    pub max_replay_ids: usize,
 }
 
 impl Default for BrokerLimits {
     fn default() -> Self {
         Self {
             max_constraint_sets: DEFAULT_MAX_CONSTRAINT_SETS,
-            max_replay_ids: DEFAULT_MAX_REPLAY_IDS,
         }
     }
 }
@@ -2556,28 +2550,6 @@ impl AuditError {
     }
 }
 
-#[derive(Debug)]
-struct ReplayLedger {
-    maximum: usize,
-    ids: Mutex<BTreeSet<InvocationId>>,
-}
-
-impl ReplayLedger {
-    async fn reserve(&self, invocation: &InvocationId) -> Result<bool, BrokerError> {
-        let mut ids = self.ids.lock().await;
-        if ids.contains(invocation) {
-            return Ok(false);
-        }
-        if ids.len() >= self.maximum {
-            return Err(BrokerError::ReplayLedgerFull {
-                maximum: self.maximum,
-            });
-        }
-        ids.insert(invocation.clone());
-        Ok(true)
-    }
-}
-
 /// Broker-owned authorization, execution, evidence, and audit coordinator.
 #[derive(Debug)]
 pub struct Broker<A> {
@@ -2592,7 +2564,6 @@ pub struct Broker<A> {
     broker_principal: PrincipalId,
     gate: AuthorizationGate,
     audit: Arc<A>,
-    replay: ReplayLedger,
     chat_memory: Option<ChatMemoryConfig>,
 }
 
@@ -2673,11 +2644,6 @@ where
                 field: "max_constraint_sets",
             });
         }
-        if limits.max_replay_ids == 0 {
-            return Err(BrokerBuildError::ZeroLimit {
-                field: "max_replay_ids",
-            });
-        }
         validate_policy_revision(&policy_revision)?;
         if leniency == Leniency::Tolerant {
             // Drop before validating: a set naming a capability nothing routes has no manifest to
@@ -2719,10 +2685,6 @@ where
                 broker_principal,
                 gate: AuthorizationGate::new(),
                 audit,
-                replay: ReplayLedger {
-                    maximum: limits.max_replay_ids,
-                    ids: Mutex::new(BTreeSet::new()),
-                },
                 chat_memory: None,
             },
             warnings,
@@ -3198,10 +3160,10 @@ where
     /// `peer` is the connected transport identity, `grant` is that peer's owner-configured
     /// attestor authority (`None` when it has none), and `attestation` is the on-behalf-of claim —
     /// absent when the peer proposes as itself. The broker — never the peer — performs the
-    /// subject-to-principal mapping. Every refusal is an audited, replay-consuming denial with a
-    /// stable class (`attestation-denied` for a missing or out-of-scope grant, `unmapped-subject`
-    /// for a subject the directory does not name), so a compromised or misconfigured gateway
-    /// leaves a decision trail rather than a silent error. A denied `agent.prompt` is reported as
+    /// subject-to-principal mapping. Every refusal is an audited denial with a stable class
+    /// (`attestation-denied` for a missing or out-of-scope grant, `unmapped-subject` for a subject
+    /// the directory does not name), so a compromised or misconfigured gateway leaves a decision
+    /// trail rather than a silent error. A denied `agent.prompt` is reported as
     /// `agent-denied` under the *attested* context: the attestation itself was honored, and the
     /// refusal is about who may drive this agent.
     ///
@@ -3761,26 +3723,12 @@ where
         if !storage_candidate {
             authorize.record("input", tracing::field::display(&request.input));
         }
-        // Instrumented rather than entered with a guard: this section awaits the replay ledger and,
-        // on every denial, an audit append that can suspend. A guard held across those awaits
-        // stays entered on the worker thread while this task is suspended, so another connection's
-        // spans parent under this request's authorization and this request's own events lose it
-        // when the task resumes elsewhere.
+        // Instrumented rather than entered with a guard: on every denial this section awaits an
+        // audit append that can suspend. A guard held across that await stays entered on the
+        // worker thread while this task is suspended, so another connection's spans parent under
+        // this request's authorization and this request's own events lose it when the task
+        // resumes elsewhere.
         let authorized = async {
-            if !self.replay.reserve(&request.id).await? {
-                authorize.record("outcome", "replayed-invocation");
-                return self
-                    .deny(
-                        context,
-                        &request,
-                        unevaluated_refusal("replayed-invocation"),
-                    )
-                    .await
-                    .map(ControlFlow::Break);
-            }
-            // A refused attestation or agent gate still consumes its invocation identifier above:
-            // the denial is a decision about this exact proposal, and letting the same identifier
-            // come back with a different claim would make the audit trail ambiguous.
             if let Some(refusal) = refusal {
                 authorize.record("outcome", refusal.reason);
                 return self
@@ -5225,12 +5173,6 @@ fn public_host_error(error: &BrokerHostError, route: CapabilityRoute) -> &'stati
 /// Failure to evaluate or durably account for one broker invocation.
 #[derive(Debug, Error)]
 pub enum BrokerError {
-    /// Process-lifetime replay ledger reached its configured bound.
-    #[error("broker replay ledger reached its {maximum}-identifier bound")]
-    ReplayLedgerFull {
-        /// Configured maximum.
-        maximum: usize,
-    },
     /// Optional chat memory was not effective for this trusted context.
     #[error("chat memory is unavailable")]
     MemoryUnavailable,
@@ -5330,17 +5272,16 @@ impl BrokerError {
 
     /// Stable class for an exhaustion that no resubmission can outlast.
     ///
-    /// The retriable class is for a broker that could not complete *this* request. These two
-    /// cannot complete any request. The process-local replay ledger and bounded embedding audit
-    /// log never evict during their lifetime. A fresh identifier cannot fix that exhaustion;
-    /// reporting it as `broker-unavailable` invites an unbounded retry loop.
+    /// The retriable class is for a broker that could not complete *this* request. This one
+    /// cannot complete any request: a bounded embedding audit log never evicts during its
+    /// lifetime. A fresh identifier cannot fix that exhaustion; reporting it as
+    /// `broker-unavailable` invites an unbounded retry loop.
     ///
     /// A *terminal* audit failure is deliberately absent: [`Self::OutcomeAudit`] is an unaudited
     /// outcome first, whatever exhausted it, and that classification must not be weakened here.
     #[must_use]
     pub const fn capacity_failure_code(&self) -> Option<&'static str> {
         match self {
-            Self::ReplayLedgerFull { .. } => Some("capacity-exhausted"),
             Self::DecisionAudit {
                 source: AuditError::Full { .. },
             }
@@ -5377,8 +5318,7 @@ impl BrokerError {
             Self::OutcomeEvidence { invocation, .. } | Self::OutcomeAudit { invocation, .. } => {
                 Some(invocation)
             }
-            Self::ReplayLedgerFull { .. }
-            | Self::MemoryUnavailable
+            Self::MemoryUnavailable
             | Self::InvalidMemoryInput
             | Self::Storage { .. }
             | Self::StorageTask { .. }

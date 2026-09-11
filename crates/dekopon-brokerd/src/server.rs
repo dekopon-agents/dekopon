@@ -308,8 +308,8 @@ fn invocation_span(
 
 /// Joins the span to the trace the client sent.
 ///
-/// An untrusted client chooses this parent. It reaches correlation and nothing else: policy and
-/// replay rejection never read it, and the audit record it lands on is correlated by the same
+/// An untrusted client chooses this parent. It reaches correlation and nothing else: policy never
+/// reads it, and the audit record it lands on is correlated by the same
 /// trace whether or not this call succeeds — the span still records, just as its own root — so a
 /// parent the local SDK rejects is a debug event rather than a failure.
 fn adopt_trace_parent(span: &tracing::Span, parent: TraceParent) {

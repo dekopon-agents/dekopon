@@ -370,7 +370,7 @@ async fn attested_broker(
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn policy_authorizes_once_and_audits_no_payloads() {
+async fn policy_authorizes_and_audits_no_payloads() {
     let registry = echo_registry(BrokerHostLimits::default()).await;
     let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
     let broker = Broker::new(
@@ -416,27 +416,8 @@ async fn policy_authorizes_once_and_audits_no_payloads() {
     );
     assert_eq!(result.evidence.len(), 2);
 
-    let replay = broker
-        .invoke(
-            &context("caller"),
-            None,
-            None,
-            request(
-                "invoke-once",
-                "echo.echo",
-                json!({"message": "top-secret-payload"}),
-            ),
-        )
-        .await
-        .expect("replay denial is audited");
-    assert_eq!(
-        replay.outcome,
-        dekopon_capability::InvocationOutcome::Denied
-    );
-    assert_eq!(replay.error.as_deref(), Some("replayed-invocation"));
-
     let records = audit.records().await;
-    assert_eq!(records.len(), 3);
+    assert_eq!(records.len(), 2);
     assert!(matches!(
         records[0].event,
         AuditEvent::Decision { allowed: true, .. }
@@ -447,7 +428,7 @@ async fn policy_authorizes_once_and_audits_no_payloads() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn file_audit_continues_but_replay_ledger_is_process_local() {
+async fn file_audit_ordinals_continue_across_a_restart() {
     let directory = tempfile::tempdir().expect("create durable broker fixture");
     let path = directory.path().join("audit.jsonl");
     let audit = Arc::new(
@@ -504,21 +485,25 @@ async fn file_audit_continues_but_replay_ledger_is_process_local() {
         Arc::clone(&audit),
         BrokerLimits::default(),
     )
-    .expect("broker starts with process-local replay state");
-    let replay = broker
+    .expect("broker starts against the retained audit file");
+    let second = broker
         .invoke(
             &context("caller"),
             None,
             None,
-            request("invoke-durable", "echo.echo", json!({"message": "again"})),
+            request(
+                "invoke-durable-again",
+                "echo.echo",
+                json!({"message": "again"}),
+            ),
         )
         .await
-        .expect("restart does not restore replay state");
+        .expect("the restarted broker invokes and appends");
     assert_eq!(
-        replay.outcome,
+        second.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
     );
-    assert_eq!(replay.error, None);
+    assert_eq!(second.error, None);
     let raw = std::fs::read_to_string(&path).expect("read appended records");
     let records = raw
         .lines()
@@ -2330,49 +2315,6 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
         Some(SLACK_SUBJECT.to_owned())
     );
     assert_eq!(reason.as_deref(), Some("unmapped-subject"));
-}
-
-/// The replay ledger is reserved before the attestation is judged, so a refusal spends the
-/// identifier exactly as an allow does. Letting a refused identifier come back with a different
-/// claim would make the audit trail ambiguous about which proposal a decision described.
-#[tokio::test(flavor = "multi_thread")]
-async fn attested_denials_still_consume_the_invocation_identifier() {
-    let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
-    let broker = attested_broker(
-        directory([(SLACK_SUBJECT, "cpetersen")]),
-        Arc::clone(&audit),
-    )
-    .await;
-    let refused = broker
-        .invoke(
-            &service_context("gateway"),
-            None,
-            Some(&attestation(
-                &subject(SLACK_SUBJECT),
-                "some-agent",
-                "invoke-shared-id",
-            )),
-            request("invoke-shared-id", "echo.echo", json!({"message": "claim"})),
-        )
-        .await
-        .expect("a refused attestation is accounted");
-    assert_eq!(refused.error.as_deref(), Some("attestation-denied"));
-
-    let reused = broker
-        .invoke(
-            &agent_context("cpetersen", "some-agent"),
-            None,
-            None,
-            request("invoke-shared-id", "echo.echo", json!({"message": "retry"})),
-        )
-        .await
-        .expect("the reused identifier is accounted");
-    assert_eq!(
-        reused.outcome,
-        dekopon_capability::InvocationOutcome::Denied
-    );
-    assert_eq!(reused.error.as_deref(), Some("replayed-invocation"));
-    assert_eq!(audit.records().await.len(), 2);
 }
 
 /// An allowed attested invocation records who it ran as (`principal`), who vouched for it

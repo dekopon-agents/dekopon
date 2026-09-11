@@ -142,12 +142,9 @@ broker:
         maxConnections: 64
         auditMaxLineBytes: 8192
         shutdownGraceMs: 120000
-      brokerLimits:
-        # Unlike serverLimits, brokerLimits and hostLimits default field by field: everything
-        # omitted here keeps the daemon's own value. Replay IDs are bounded process-local memory;
-        # restart starts an empty ledger. This limit does not bound audit file growth.
-        maxReplayIds: 200000
       hostLimits:
+        # Unlike serverLimits, hostLimits defaults field by field: everything omitted here keeps
+        # the daemon's own value.
         # maxMemoryBytes bounds one invocation (64 MiB by default); nothing bounds all of them at
         # once, so the worst case is maxConnections x maxMemoryBytes = 64 x 64 MiB = 4 GiB, four
         # times the memory limit below. 256 MiB lets four invocations hold their full ceiling and
@@ -284,7 +281,7 @@ broker:
     timeoutSeconds: 10
     # 5 minutes. Component compilation on a Raspberry Pi 5 is seconds, not minutes; the margin is
     # there because a startup probe that gives up restarts the container, and a restart loop
-    # can interrupt work and reset process-local replay protection.
+    # can interrupt work mid-invocation.
     failureThreshold: 60
   readinessProbe:
     periodSeconds: 30
@@ -404,8 +401,7 @@ state:
   accessModes: [ReadWriteOnce]
   # Audit appends have no total record cap: size for expected traffic and retention, and monitor
   # disk usage before this fixed-size volume fills. The per-record byte bound is not a disk budget.
-  # maxReplayIds separately bounds process-local replay memory, not audit-file growth; size that
-  # memory independently. See README.md ("Sizing the audit volume").
+  # See README.md ("Sizing the audit volume").
   size: 2Gi
   # Named annotation, not a comment: helm uninstall must not delete the audit log.
   keepOnUninstall: true

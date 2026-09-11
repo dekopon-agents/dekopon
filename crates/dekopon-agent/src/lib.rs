@@ -245,11 +245,11 @@ pub fn session_trace_parent() -> TraceParent {
 /// Mints a session-local W3C context for a process that exports nothing.
 ///
 /// Drawn from the OS rather than from the clock or the process identifier, because the invocation
-/// identifiers derived from the trace are the broker's replay-rejection keys: a container runtime
-/// that starts two daemons in the same millisecond with the same PID must not hand them one key
-/// space. An OS that refuses entropy falls back to the hasher construction rather than failing the
-/// session — a degraded trace still correlates, and refusing to answer a chat message over the
-/// quality of a correlation identifier is the worse trade.
+/// identifiers derived from the trace bind attestations to their proposals and name calls in audit:
+/// a container runtime that starts two daemons in the same millisecond with the same PID must not
+/// hand them one identifier space. An OS that refuses entropy falls back to the hasher construction
+/// rather than failing the session — a degraded trace still correlates, and refusing to answer a
+/// chat message over the quality of a correlation identifier is the worse trade.
 fn minted_trace_parent() -> TraceParent {
     let mut bytes = [0_u8; 24];
     if let Err(error) = getrandom::fill(&mut bytes) {
@@ -860,8 +860,8 @@ impl CapabilityInvoker for BrokerLeg {
             // timeout cannot distinguish a `gh.issue.comment` that ran 29s against a 30s deadline
             // from one that never ran, and `outcome-unaudited` says outright that the effect may
             // have happened. `Failed` exits 1, which a model reads as "the call errored, try
-            // again" — and a retry carries a fresh invocation identifier, so replay rejection
-            // cannot catch the duplicate external effect. `Denied` (126) is the interpreter's only
+            // again" — and the broker suppresses no duplicate, so a retry repeats the external
+            // effect. `Denied` (126) is the interpreter's only
             // non-retryable status, so an unaudited outcome takes it and says why.
             Err(error) if error.may_have_executed() => CapabilityCallResult::Denied {
                 reason: format!(
@@ -881,11 +881,12 @@ impl CapabilityInvoker for BrokerLeg {
 
 /// One session's W3C trace and the invocation identifiers derived from it.
 ///
-/// The broker treats an invocation identifier as a durable replay-rejection key, so two calls must
-/// never share one and a script that calls the same capability in a loop must not collide with
-/// itself. Both properties come from the trace: it is 128 bits an attacker cannot guess, drawn
-/// from the OS or adopted from the exporting span that opened the session, and a monotonic counter
-/// beneath it makes collisions *within* a session impossible rather than merely unlikely.
+/// An invocation identifier binds an attestation to its proposal and names the call in the audit
+/// record, so two calls must never share one and a script that calls the same capability in a loop
+/// must not collide with itself. Both properties come from the trace: it is 128 bits an attacker
+/// cannot guess, drawn from the OS or adopted from the exporting span that opened the session, and a
+/// monotonic counter beneath it makes collisions *within* a session impossible rather than merely
+/// unlikely.
 ///
 /// Every identifier here is one identifier: an invocation is `<trace>-<counter>`, so every call a
 /// session made is recoverable from the broker's audit log by trace prefix, and the audit records
@@ -1944,8 +1945,8 @@ mod tests {
 
         #[tokio::test]
         async fn invocation_identifiers_are_unique_and_extend_the_session_trace() {
-            // The broker treats an invocation ID as a durable replay-rejection key, so a script
-            // calling one capability in a loop must not collide with itself.
+            // An invocation ID names one call in the broker's audit record, so a script calling
+            // one capability in a loop must not collide with itself.
             let identifiers = IdSequence::for_session();
             let first = identifiers.next_invocation();
             let second = identifiers.next_invocation();
