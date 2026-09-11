@@ -280,31 +280,9 @@ A Kubernetes `Secret` mounted as a volume is not a directory of files. It is a s
 
 That third row is the one that catches people: `fsGroup` is the standard fix for "the container cannot read its mounted Secret", it makes the file group-readable, and group-readable is exactly what the credentials file refuses. The fix for the general problem is the cause of the specific one.
 
-**So no Kubernetes volume can present one of the ordinary daemon files directly.** The answer for broker/gateway configuration, Cedar policy, credentials, storage keys, and writable credentials is an init container that copies each projected file into real owner-only regular files — an `install -m 0600` per file, owner-only directories, and `stat` assertions afterwards. Public-DRN secret values are the scoped exception: `kubernetesProjection` snapshots kubelet's `..data` generation and opens one configured key without following the user-visible key symlink; it does not relax the ordinary loader or make a projected whole-file config valid. The [`charts/dekopon`](../charts/dekopon/README.md) chart implements and tests that copy boundary for broker/gateway configuration, policy, credentials, the optional provider-storage namespace key, and the seed-once ChatGPT credential.
+**So no Kubernetes volume can present one of the ordinary daemon files directly.** The answer for broker/gateway configuration, Cedar policy, credentials, and writable credentials is an init container that copies each projected file into real owner-only regular files — an `install -m 0600` per file, owner-only directories, and `stat` assertions afterwards. Public-DRN secret values are the scoped exception: `kubernetesProjection` snapshots kubelet's `..data` generation and opens one configured key without following the user-visible key symlink; it does not relax the ordinary loader or make a projected whole-file config valid. The [`charts/dekopon`](../charts/dekopon/README.md) chart implements and tests that copy boundary for broker/gateway configuration, policy, credentials, and the seed-once ChatGPT credential.
 
 **ESO solves provisioning, not authority.** A projection-aware DRN source can read a value without the init copy, but capability policy, separate `secret.use` policy, the private sink binding, source bootstrap, path scope, and rotation behavior remain Dekopon responsibilities.
-
-### The provider-storage namespace key is retained authority
-
-Optional provider storage adds a second non-rotating file with stricter lifecycle consequences:
-
-```yaml
-apiVersion: dekopon.dev/storage-key/v1alpha1
-key: <64 lowercase hex>
-```
-
-The chart requires an **existing operator-managed Secret** and never templates one. Its init
-container copies that projected key into a separate broker-only `0700` tmpfs directory as one
-server-owned `0600`, single-link regular file. The gateway mounts neither that directory nor the
-separate provider-storage PVC. The generated PVC carries `helm.sh/resource-policy: keep`, and the
-key Secret is external to the release, so uninstall deletes neither half by accident.
-
-Losing or replacing the key while retained data exists is fatal: opaque physical names,
-authority-generation pointers, manifests, audit scope, record IDs, and content commitments all use
-distinct HMAC domains under it. It is not an encryption key and Dekopon makes no encryption-at-rest
-claim. Store it as retained recovery authority, not as a routinely rotated application token.
-ESO can provision the Kubernetes Secret; the same symlink/ownership argument above requires the
-chart's broker-only copy step.
 
 ### The ChatGPT credential is a different problem again
 

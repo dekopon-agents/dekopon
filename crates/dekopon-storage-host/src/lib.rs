@@ -67,7 +67,7 @@ pub use vfs::{Durability, FileStat, LockLevel, OpenOptions};
 
 use key::{
     DOMAIN_AUDIT_SCOPE, DOMAIN_CONTENT, DOMAIN_DECISION_EVIDENCE, DOMAIN_NAMESPACE_PATH,
-    DOMAIN_RECORD_ID, StorageKey, random_bytes,
+    DOMAIN_RECORD_ID, commitment, random_bytes, token,
 };
 use layout::{Layout, scan_root_usage, scan_usage, usage_with_directory_entry};
 use namespace::{Namespace, NamespacePlan, Reset};
@@ -84,7 +84,7 @@ pub enum ContinuityPolicy {
     AuthorityBound,
 }
 
-/// Opaque keyed commitment identifying a storage scope without disclosing it.
+/// Opaque commitment identifying a storage scope without spelling it out.
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct StorageScopeCommitment(String);
@@ -114,7 +114,7 @@ pub struct StorageEvidence {
     /// Coarse powers-of-two write bucket; never exact bytes.
     pub write_byte_bucket: u8,
     pub evidence_commitment: String,
-    /// Keyed commitment to the exact successful provider output, when one was supplied.
+    /// Commitment to the exact successful provider output, when one was supplied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_commitment: Option<String>,
 }
@@ -202,15 +202,14 @@ impl StorageGrantRequest {
 
 /// Non-mutating, single-use preparation for one invocation-bound storage grant.
 ///
-/// Preparation derives only keyed opaque values. It performs no filesystem operation and reserves
-/// no quota, so dropping it after an authorization-audit failure leaves the storage tree exactly
+/// Preparation derives only opaque values. It performs no filesystem operation and reserves no
+/// quota, so dropping it after an authorization-audit failure leaves the storage tree exactly
 /// unchanged. [`materialize`](Self::materialize) is the explicit mutation boundary.
 pub struct StorageGrantPreparation {
     host: StorageHost,
     request: StorageGrantRequest,
     base_token: String,
     scope_commitment: StorageScopeCommitment,
-    record_key: [u8; 32],
 }
 
 impl fmt::Debug for StorageGrantPreparation {
@@ -225,16 +224,24 @@ impl StorageGrantPreparation {
         self.scope_commitment.clone()
     }
 
-    /// Derives one stable namespace-keyed record identifier without touching the namespace tree.
+    /// The base directory token this grant will open under `namespaces/`.
+    ///
+    /// It is what joins a trace's chat scope to a directory an operator can inspect.
     #[must_use]
-    pub fn record_id(&self, delivery: &[u8]) -> String {
-        StorageKey::from_bytes(self.record_key).commitment(DOMAIN_RECORD_ID, &[delivery])
+    pub fn namespace(&self) -> &str {
+        &self.base_token
     }
 
-    /// Derives keyed low-entropy decision evidence without materializing storage authority.
+    /// Derives one stable per-namespace record identifier without touching the namespace tree.
+    #[must_use]
+    pub fn record_id(&self, delivery: &[u8]) -> String {
+        record_id(&self.base_token, delivery)
+    }
+
+    /// Derives decision evidence without materializing storage authority.
     #[must_use]
     pub fn evidence_commitment(&self, label: &str, bytes: &[u8]) -> String {
-        self.host.inner.key.commitment(
+        commitment(
             DOMAIN_DECISION_EVIDENCE,
             &[self.base_token.as_bytes(), label.as_bytes(), bytes],
         )
@@ -243,14 +250,7 @@ impl StorageGrantPreparation {
     /// Derives the provider's content/dedup commitment before filesystem mutation.
     #[must_use]
     pub fn content_commitment(&self, user: &str, assistant: &str) -> String {
-        self.host.inner.key.commitment(
-            DOMAIN_CONTENT,
-            &[
-                self.base_token.as_bytes(),
-                user.as_bytes(),
-                assistant.as_bytes(),
-            ],
-        )
+        content_commitment(&self.base_token, user, assistant)
     }
 
     /// Crosses the explicit filesystem mutation boundary after durable authorization audit.
@@ -270,7 +270,6 @@ pub struct StorageGrant {
     namespace_kind: StorageNamespace,
     namespace: Namespace,
     limits: StorageLimits,
-    key: Arc<StorageKey>,
 }
 
 impl fmt::Debug for StorageGrant {
@@ -308,20 +307,16 @@ impl StorageGrant {
     pub fn scope_commitment(&self) -> StorageScopeCommitment {
         StorageScopeCommitment(self.namespace.scope_commitment.clone())
     }
-    /// Derives one stable namespace-keyed record identifier from a bounded delivery identity.
+    /// Derives one stable per-namespace record identifier from a bounded delivery identity.
     #[must_use]
     pub fn record_id(&self, delivery: &[u8]) -> String {
-        let record_key = self.key.bytes(
-            DOMAIN_RECORD_ID,
-            &[self.namespace.base_token.as_bytes(), b"record-key-v1"],
-        );
-        StorageKey::from_bytes(record_key).commitment(DOMAIN_RECORD_ID, &[delivery])
+        record_id(&self.namespace.base_token, delivery)
     }
-    /// Derives keyed low-entropy evidence distinct from every path and content domain.
+    /// Derives evidence distinct from every path and content domain.
     #[must_use]
     pub fn evidence_commitment(&self, label: &str, bytes: &[u8]) -> String {
-        self.key.commitment(
-            key::DOMAIN_DECISION_EVIDENCE,
+        commitment(
+            DOMAIN_DECISION_EVIDENCE,
             &[
                 self.namespace.base_token.as_bytes(),
                 label.as_bytes(),
@@ -333,22 +328,25 @@ impl StorageGrant {
     /// Derives a content/dedup commitment distinct from paths, record IDs, audit, and evidence.
     #[must_use]
     pub fn content_commitment(&self, user: &str, assistant: &str) -> String {
-        self.key.commitment(
-            DOMAIN_CONTENT,
-            &[
-                self.namespace.base_token.as_bytes(),
-                user.as_bytes(),
-                assistant.as_bytes(),
-            ],
-        )
+        content_commitment(&self.namespace.base_token, user, assistant)
     }
+}
+
+fn record_id(base_token: &str, delivery: &[u8]) -> String {
+    commitment(DOMAIN_RECORD_ID, &[base_token.as_bytes(), delivery])
+}
+
+fn content_commitment(base_token: &str, user: &str, assistant: &str) -> String {
+    commitment(
+        DOMAIN_CONTENT,
+        &[base_token.as_bytes(), user.as_bytes(), assistant.as_bytes()],
+    )
 }
 
 #[derive(Debug)]
 struct HostInner {
     id: [u8; 32],
     layout: Layout,
-    key: Arc<StorageKey>,
     ledger: Arc<QuotaLedger>,
     limits: StorageLimits,
     namespace_locks: Mutex<BTreeMap<String, Arc<Mutex<()>>>>,
@@ -373,25 +371,14 @@ impl StorageHost {
     ///
     /// Only the root itself is validated here. Namespaces are checked when a grant opens them, so
     /// a corrupt conversation fails its own invocation rather than the broker's startup.
-    pub fn open(
-        root: impl AsRef<Path>,
-        namespace_key_path: impl AsRef<Path>,
-        limits: StorageLimits,
-    ) -> Result<Self, StorageHostError> {
+    pub fn open(root: impl AsRef<Path>, limits: StorageLimits) -> Result<Self, StorageHostError> {
         limits.validate()?;
         let root = resolve_storage_root_path(root.as_ref())?;
-        let namespace_key_path = resolve_namespace_key_path(namespace_key_path.as_ref())?;
-        if namespace_key_path == root || namespace_key_path.starts_with(&root) {
-            return Err(StorageHostError::UnsafeKeyFile {
-                path: namespace_key_path,
-            });
-        }
-        let key = Arc::new(StorageKey::load(&namespace_key_path)?);
-        let minimum = Layout::minimum_usage(&root, &key)?;
+        let minimum = Layout::minimum_usage(&root)?;
         if minimum.bytes > limits.max_root_bytes || minimum.entries > limits.startup_max_entries {
             return Err(StorageHostError::QuotaExceeded);
         }
-        let layout = Layout::open(&root, &key)?;
+        let layout = Layout::open(&root)?;
         // The one startup walk. It charges the quota ledger and nothing else: a namespace that
         // will not scan is logged and left uncharged, and its own next grant is where it fails.
         let usage = scan_root_usage(&layout, limits.startup_max_entries)?;
@@ -411,7 +398,6 @@ impl StorageHost {
             inner: Arc::new(HostInner {
                 id,
                 layout,
-                key,
                 ledger,
                 limits,
                 namespace_locks: Mutex::new(BTreeMap::new()),
@@ -420,14 +406,11 @@ impl StorageHost {
         })
     }
 
-    /// Produces deployment-keyed evidence without deriving or creating a namespace.
-    ///
-    /// Used for denied storage proposals, which must not create storage merely to avoid an
-    /// unkeyed low-entropy digest.
+    /// Produces evidence for a denied storage proposal without deriving or creating a namespace.
     #[must_use]
     pub fn evidence_commitment(&self, label: &str, bytes: &[u8]) -> String {
-        self.inner.key.commitment(
-            key::DOMAIN_DECISION_EVIDENCE,
+        commitment(
+            DOMAIN_DECISION_EVIDENCE,
             &[b"denied-storage", label.as_bytes(), bytes],
         )
     }
@@ -442,18 +425,11 @@ impl StorageHost {
         }
         let values = request.scope_values();
         let fields = values.iter().map(String::as_bytes).collect::<Vec<_>>();
-        let base_token = self.inner.key.token(DOMAIN_NAMESPACE_PATH, &fields);
         Ok(StorageGrantPreparation {
             host: self.clone(),
+            base_token: token(DOMAIN_NAMESPACE_PATH, &fields),
+            scope_commitment: StorageScopeCommitment(commitment(DOMAIN_AUDIT_SCOPE, &fields)),
             request,
-            scope_commitment: StorageScopeCommitment(
-                self.inner.key.commitment(DOMAIN_AUDIT_SCOPE, &fields),
-            ),
-            record_key: self
-                .inner
-                .key
-                .bytes(DOMAIN_RECORD_ID, &[base_token.as_bytes(), b"record-key-v1"]),
-            base_token,
         })
     }
 
@@ -469,7 +445,7 @@ impl StorageHost {
     ) -> Result<StorageGrant, StorageHostError> {
         debug_assert_eq!(
             base,
-            self.inner.key.token(
+            token(
                 DOMAIN_NAMESPACE_PATH,
                 &request
                     .scope_values()
@@ -506,7 +482,6 @@ impl StorageHost {
         // commits and publish its stale lower total after that commit releases its reservation.
         let mut plan = NamespacePlan::prepare(
             self.inner.layout.namespaces(),
-            &self.inner.key,
             &request,
             self.inner.limits.lock_timeout_ms,
             self.inner.limits.startup_max_entries,
@@ -612,7 +587,6 @@ impl StorageHost {
             namespace_kind: request.namespace,
             namespace,
             limits: self.inner.limits.clone(),
-            key: Arc::clone(&self.inner.key),
         })
     }
 
@@ -645,38 +619,12 @@ fn namespace_lock(
 
 /// Resolves a configured storage root without following any original ancestor symlink.
 pub fn resolve_storage_root_path(path: &Path) -> Result<PathBuf, StorageHostError> {
-    resolve_parent_leaf(path, false)
-}
-
-/// Resolves a configured namespace-key path without following any original ancestor symlink.
-pub fn resolve_namespace_key_path(path: &Path) -> Result<PathBuf, StorageHostError> {
-    resolve_parent_leaf(path, true)
-}
-
-fn resolve_parent_leaf(path: &Path, key: bool) -> Result<PathBuf, StorageHostError> {
-    let io_error = |path: &Path, source: std::io::Error| {
-        if key {
-            StorageHostError::KeyIo {
-                path: path.to_path_buf(),
-                source,
-            }
-        } else {
-            StorageHostError::RootIo {
-                path: path.to_path_buf(),
-                source,
-            }
-        }
+    let io_error = |path: &Path, source: std::io::Error| StorageHostError::RootIo {
+        path: path.to_path_buf(),
+        source,
     };
-    let unsafe_path = |path: &Path| {
-        if key {
-            StorageHostError::UnsafeKeyFile {
-                path: path.to_path_buf(),
-            }
-        } else {
-            StorageHostError::UnsafeRoot {
-                path: path.to_path_buf(),
-            }
-        }
+    let unsafe_path = |path: &Path| StorageHostError::UnsafeRoot {
+        path: path.to_path_buf(),
     };
     let absolute = if path.is_absolute() {
         path.to_path_buf()
@@ -785,7 +733,7 @@ pub enum StorageFailureClass {
     Quota,
     /// The operation ran out of its budget.
     Timeout,
-    /// Retained data, layout, or the namespace key disagreed with itself.
+    /// Retained data or layout disagreed with itself.
     Corrupt,
     /// The grant or the filesystem refused the access.
     Denied,
@@ -829,24 +777,12 @@ pub enum StorageHostError {
         #[source]
         source: std::io::Error,
     },
-    #[error("storage namespace-key input/output failed")]
-    KeyIo {
-        path: PathBuf,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("storage namespace-key file is unsafe")]
-    UnsafeKeyFile { path: PathBuf },
-    #[error("storage namespace-key document is invalid")]
-    InvalidKeyFile,
     #[error("storage root or ancestor is unsafe: {}", path.display())]
     UnsafeRoot { path: PathBuf },
     #[error("another conforming storage writer holds the root")]
     SecondWriter,
     #[error("storage layout is corrupt: {}", path.display())]
     CorruptLayout { path: PathBuf },
-    #[error("storage key does not match retained data")]
-    KeyMismatch,
     /// Retained namespace state failed one check.
     #[error("storage corruption detected: {scope}{}", SiteSuffix(.site))]
     Corrupt {
@@ -977,9 +913,7 @@ impl StorageHostError {
         match self {
             Self::QuotaExceeded | Self::Arithmetic => StorageFailureClass::Quota,
             Self::Timeout => StorageFailureClass::Timeout,
-            Self::Corrupt { .. } | Self::CorruptLayout { .. } | Self::KeyMismatch => {
-                StorageFailureClass::Corrupt
-            }
+            Self::Corrupt { .. } | Self::CorruptLayout { .. } => StorageFailureClass::Corrupt,
             Self::PermissionDenied | Self::GrantHostMismatch => StorageFailureClass::Denied,
             // An unaudited outcome is unknown rather than any one class, so it reports the
             // catch-all here and names what actually broke in its own `cause` instead.

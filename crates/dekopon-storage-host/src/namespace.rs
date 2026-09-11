@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ContinuityPolicy, StorageGrantRequest, StorageHostError,
     key::{
-        DOMAIN_AUDIT_SCOPE, DOMAIN_AUTHORITY, DOMAIN_GENERATION, DOMAIN_NAMESPACE_PATH, StorageKey,
-        random_bytes,
+        DOMAIN_AUDIT_SCOPE, DOMAIN_AUTHORITY, DOMAIN_GENERATION, DOMAIN_NAMESPACE_PATH, commitment,
+        random_bytes, token,
     },
     layout::{
         Directory, ENTRY_CHARGE, EntryKind, EntryMetadata, Usage, scan_usage,
@@ -46,7 +46,7 @@ pub(crate) struct Reset {
 
 /// A fully materialized, non-mutating namespace plan.
 ///
-/// Random epochs, MACed pointers, existing target lengths, and the base lease are all
+/// Random epochs, encoded pointers, existing target lengths, and the base lease are all
 /// fixed here. The host can therefore reserve the exact peak before [`apply`](Self::apply) performs
 /// the first mutation.
 pub(crate) struct NamespacePlan {
@@ -79,35 +79,25 @@ struct Selection {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct PointerBody {
-    api_version: String,
-    authority: String,
-    epoch: String,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct PointerDocument {
     api_version: String,
     authority: String,
     epoch: String,
-    mac: String,
 }
 
 impl NamespacePlan {
     pub(crate) fn prepare(
         namespaces_root: &Directory,
-        key: &StorageKey,
         request: &StorageGrantRequest,
         lock_timeout_ms: u64,
         maximum_entries: u64,
     ) -> Result<Self, StorageHostError> {
         let values = request.scope_values();
         let fields = values.iter().map(String::as_bytes).collect::<Vec<_>>();
-        let base_token = key.token(DOMAIN_NAMESPACE_PATH, &fields);
-        let scope_commitment = key.commitment(DOMAIN_AUDIT_SCOPE, &fields);
+        let base_token = token(DOMAIN_NAMESPACE_PATH, &fields);
+        let scope_commitment = commitment(DOMAIN_AUDIT_SCOPE, &fields);
         debug_assert_ne!(base_token, scope_commitment);
-        let authority = key.token(DOMAIN_AUTHORITY, &[request.authority_surface()]);
+        let authority = token(DOMAIN_AUTHORITY, &[request.authority_surface()]);
 
         // Faults up to here are the base's own shape: a symlink, a hard link, or a wrong mode
         // anywhere under it. A fresh generation would sit beside them and fail the same scan, so
@@ -132,7 +122,6 @@ impl NamespacePlan {
         let select = |reset| {
             select_generation(
                 base,
-                key,
                 &base_token,
                 &authority,
                 request.continuity_policy(),
@@ -268,7 +257,6 @@ impl NamespacePlan {
 )]
 fn select_generation(
     base: Option<&Directory>,
-    key: &StorageKey,
     base_token: &str,
     authority: &str,
     policy: ContinuityPolicy,
@@ -278,8 +266,7 @@ fn select_generation(
 ) -> Result<Selection, StorageHostError> {
     match policy {
         ContinuityPolicy::Stable => {
-            let generation_token =
-                key.token(DOMAIN_GENERATION, &[base_token.as_bytes(), b"stable"]);
+            let generation_token = token(DOMAIN_GENERATION, &[base_token.as_bytes(), b"stable"]);
             let set_aside = match base {
                 Some(base) if reset && base.exists(&generation_token)? => {
                     Some(crate::key::hex(&random_bytes(32)?))
@@ -306,13 +293,13 @@ fn select_generation(
         }
         ContinuityPolicy::AuthorityBound => {
             let previous = match base {
-                Some(base) if !reset => read_pointer(base, key, base_token)?,
+                Some(base) if !reset => read_pointer(base, base_token)?,
                 _ => None,
             };
             if let Some(base) = base
                 && let Some(pointer) = previous.filter(|pointer| pointer.authority == authority)
             {
-                let generation_token = key.token(
+                let generation_token = token(
                     DOMAIN_GENERATION,
                     &[base_token.as_bytes(), pointer.epoch.as_bytes()],
                 );
@@ -331,11 +318,11 @@ fn select_generation(
                 });
             }
             let epoch = crate::key::hex(&random_bytes(32)?);
-            let generation_token = key.token(
+            let generation_token = token(
                 DOMAIN_GENERATION,
                 &[base_token.as_bytes(), epoch.as_bytes()],
             );
-            let authority_pointer = encode_pointer(key, base_token, authority.to_owned(), epoch)?;
+            let authority_pointer = encode_pointer(authority.to_owned(), epoch)?;
             let retained_peak_bytes = match base {
                 Some(base) => {
                     retained_generation(base, base_token, &generation_token, maximum_entries)?
@@ -497,33 +484,17 @@ fn file_length(parent: &Directory, name: &str) -> Result<Option<u64>, StorageHos
 
 #[allow(
     clippy::map_err_ignore,
-    reason = "serializing these owned all-string pointer structs has no failing case; serde_json \
+    reason = "serializing this owned all-string pointer struct has no failing case; serde_json \
               fails only on a non-string map key or a Serialize implementation error, and neither \
               exists here"
 )]
-fn encode_pointer(
-    key: &StorageKey,
-    base_token: &str,
-    authority: String,
-    epoch: String,
-) -> Result<Vec<u8>, StorageHostError> {
-    let body = PointerBody {
+fn encode_pointer(authority: String, epoch: String) -> Result<Vec<u8>, StorageHostError> {
+    serde_json::to_vec(&PointerDocument {
         api_version: POINTER_VERSION.to_owned(),
         authority,
         epoch,
-    };
-    let encoded =
-        serde_json::to_vec(&body).map_err(|_| StorageHostError::corrupt("authority-pointer"))?;
-    let document = PointerDocument {
-        api_version: body.api_version,
-        authority: body.authority,
-        epoch: body.epoch,
-        mac: key.commitment(
-            crate::key::DOMAIN_MANIFEST,
-            &[base_token.as_bytes(), encoded.as_slice()],
-        ),
-    };
-    serde_json::to_vec(&document).map_err(|_| StorageHostError::corrupt("authority-pointer"))
+    })
+    .map_err(|_| StorageHostError::corrupt("authority-pointer"))
 }
 
 fn ensure_generation(
@@ -542,7 +513,6 @@ fn ensure_generation(
 
 fn read_pointer(
     base_directory: &Directory,
-    key: &StorageKey,
     base_token: &str,
 ) -> Result<Option<PointerDocument>, StorageHostError> {
     if !base_directory.exists("current")? {
@@ -555,31 +525,14 @@ fn read_pointer(
         crate::report_decode_failure("authority-pointer", &error);
         base_directory.corrupt("current", "authority-pointer")
     })?;
-    let body = PointerBody {
-        api_version: document.api_version.clone(),
-        authority: document.authority.clone(),
-        epoch: document.epoch.clone(),
-    };
-    #[allow(
-        clippy::map_err_ignore,
-        reason = "serializing this owned all-string pointer body has no failing case; only the \
-                  decode above can actually reject retained bytes"
-    )]
-    let encoded =
-        serde_json::to_vec(&body).map_err(|_| StorageHostError::corrupt("authority-pointer"))?;
-    let expected = key.commitment(
-        crate::key::DOMAIN_MANIFEST,
-        &[base_token.as_bytes(), encoded.as_slice()],
-    );
     if document.api_version != POINTER_VERSION
-        || document.mac != expected
         || !is_token(&document.epoch)
         || !is_token(&document.authority)
     {
         // A pointer that still decodes names the generation it pointed at, which is the directory
         // an operator goes looking for.
         let previous = is_token(&document.epoch).then(|| {
-            key.token(
+            token(
                 DOMAIN_GENERATION,
                 &[base_token.as_bytes(), document.epoch.as_bytes()],
             )

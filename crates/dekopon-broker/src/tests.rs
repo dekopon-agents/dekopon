@@ -121,11 +121,11 @@ fn memory_composition_reserves_dedup_calls_and_pre_compaction_peak() {
     minimal.max_lookback_turns = 1;
     minimal.max_recent_turns = 1;
     minimal.max_search_results = 1;
-    minimal.max_turn_bytes = 251;
+    minimal.max_turn_bytes = 241;
     minimal.max_dedup_records = 1;
     minimal.max_dedup_bytes = 256;
-    minimal.compaction_target_bytes = 251;
-    minimal.compaction_threshold_bytes = 252;
+    minimal.compaction_target_bytes = 241;
+    minimal.compaction_threshold_bytes = 242;
     let too_small_call = dekopon_storage_host::StorageLimits {
         max_write_bytes_per_call: 255,
         ..dekopon_storage_host::StorageLimits::default()

@@ -227,8 +227,8 @@ configured transport and agent keys prevent aliasing another route's history.
 
 ## Provider storage and durable on-demand chat memory
 
-**Status: current.** The broker may hold a separate provider-storage PVC
-and a 32-byte namespace key. Components receive no WASI, host path, environment, socket, or
+**Status: current.** The broker may hold a separate provider-storage PVC.
+Components receive no WASI, host path, environment, socket, or
 ambient I/O: an exact JSONL or durable-files import is linked to a single-use grant bound to host
 instance, invocation, capability, provider, interface, access, chat namespace, scope commitment,
 and limits. HTTP and storage authority cannot coexist in one v1 capability. Description and command
@@ -268,8 +268,11 @@ fresh dedicated request after acceptance, waits once, and never retries after ti
 or outcome-unknown. Its already delivered answer remains answered.
 
 Storage audit records omit principal, actor/agent, via/subject, provider, broker principal/policy
-revision, policy IDs/digest, and credential. Separate HMAC domains keep physical paths, audit scope,
-record IDs, content/dedup, evidence, authority, generation, and authority pointers unlinkable by equality.
+revision, policy IDs/digest, and credential. Physical paths, audit scope, record IDs, content/dedup,
+evidence, authority, and generations are separate unkeyed SHA-256 domains, so no two are equal.
+Nothing in them is secret: isolation is the broker granting only the caller's own scope and the host
+binding each handle to that scope's directory, and a name the operator can recompute is a name the
+operator could already list.
 Storage spans omit identity/scope/provider/capability and exact payload bytes; only operation/sync/
 quota counts and powers-of-two byte buckets remain.
 

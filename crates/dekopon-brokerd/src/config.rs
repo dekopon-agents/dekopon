@@ -138,7 +138,6 @@ pub struct ManagedProviderSetConfig {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct StorageConfig {
     pub root_path: PathBuf,
-    pub namespace_key_path: PathBuf,
     #[serde(flatten)]
     pub limits: StorageLimits,
 }
@@ -569,15 +568,6 @@ async fn resolve(
             storage.root_path =
                 dekopon_storage_host::resolve_storage_root_path(&resolve_path(storage.root_path))
                     .map_err(|source| ConfigError::StoragePath { source })?;
-            storage.namespace_key_path = dekopon_storage_host::resolve_namespace_key_path(
-                &resolve_path(storage.namespace_key_path),
-            )
-            .map_err(|source| ConfigError::StoragePath { source })?;
-            if storage.namespace_key_path.starts_with(&storage.root_path)
-                || storage.namespace_key_path == storage.root_path
-            {
-                return Err(ConfigError::StorageStateCollision);
-            }
             storage
                 .limits
                 .validate()
@@ -677,9 +667,6 @@ async fn resolve(
         }) {
             return Err(ConfigError::ProviderStateCollision);
         }
-    }
-    if let Some(storage) = &storage {
-        reserved.push(storage.namespace_key_path.clone());
     }
     if let Some(storage) = &storage
         && (reserved

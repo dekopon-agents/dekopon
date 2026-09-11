@@ -529,9 +529,9 @@ fn map_jsonl_error(error: StorageHostError) -> jsonl::StorageError {
         StorageHostError::Busy => jsonl::StorageError::Busy,
         StorageHostError::Timeout => jsonl::StorageError::Timeout,
         StorageHostError::Unsupported => jsonl::StorageError::Unsupported,
-        StorageHostError::Corrupt { .. }
-        | StorageHostError::CorruptLayout { .. }
-        | StorageHostError::KeyMismatch => jsonl::StorageError::Corrupt,
+        StorageHostError::Corrupt { .. } | StorageHostError::CorruptLayout { .. } => {
+            jsonl::StorageError::Corrupt
+        }
         _ => jsonl::StorageError::Io,
     }
 }
@@ -550,9 +550,9 @@ fn map_durable_error(error: StorageHostError) -> durable::StorageError {
         StorageHostError::Busy => durable::StorageError::Busy,
         StorageHostError::Timeout => durable::StorageError::Timeout,
         StorageHostError::Unsupported => durable::StorageError::Unsupported,
-        StorageHostError::Corrupt { .. }
-        | StorageHostError::CorruptLayout { .. }
-        | StorageHostError::KeyMismatch => durable::StorageError::Corrupt,
+        StorageHostError::Corrupt { .. } | StorageHostError::CorruptLayout { .. } => {
+            durable::StorageError::Corrupt
+        }
         _ => durable::StorageError::Io,
     }
 }
@@ -569,11 +569,7 @@ fn terminal(error: &StorageHostError) -> bool {
 }
 #[cfg(test)]
 mod tests {
-    use std::{
-        fs,
-        os::unix::fs::PermissionsExt as _,
-        time::{Duration, Instant},
-    };
+    use std::time::{Duration, Instant};
 
     use dekopon_capability::{StorageAccess, StorageInterface, StorageNamespace};
     use dekopon_storage_host::{
@@ -628,16 +624,8 @@ mod tests {
             .canonicalize()
             .expect("canonical directory");
         let root = directory.join("root");
-        let key = directory.join("key.yaml");
-        fs::write(
-            &key,
-            "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
-        )
-        .expect("write key");
-        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
         let host = StorageHost::open(
             &root,
-            &key,
             StorageLimits {
                 finalization_budget_ms: 30,
                 ..StorageLimits::default()
@@ -701,16 +689,8 @@ mod tests {
             .canonicalize()
             .expect("canonical directory");
         let root = directory.join("root");
-        let key = directory.join("key.yaml");
-        fs::write(
-            &key,
-            "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
-        )
-        .expect("write key");
-        fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).expect("key mode");
         let host = StorageHost::open(
             &root,
-            &key,
             StorageLimits {
                 lock_timeout_ms: 1_000,
                 ..StorageLimits::default()

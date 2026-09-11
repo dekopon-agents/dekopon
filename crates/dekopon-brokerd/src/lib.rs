@@ -124,11 +124,7 @@ where
         .storage
         .as_ref()
         .map(|storage| {
-            dekopon_storage_host::StorageHost::open(
-                &storage.root_path,
-                &storage.namespace_key_path,
-                storage.limits.clone(),
-            )
+            dekopon_storage_host::StorageHost::open(&storage.root_path, storage.limits.clone())
         })
         .transpose()
         .map_err(BrokerdError::Storage)?;

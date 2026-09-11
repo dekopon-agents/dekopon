@@ -75,7 +75,7 @@ reserves anything. Recent and search are visible only as an all-three surface; r
 only through the dedicated typed post-acceptance operation.
 
 Storage audit records replace raw identity, provider, and policy metadata with a domain-separated
-keyed scope commitment and content-free evidence. `authority-bound` continuity hashes only the
+scope commitment and content-free evidence. `authority-bound` continuity hashes only the
 sorted effective capability/artifact/constraint/selected-credential/host/storage/memory surface plus
 persisted random epochs, so a semantic A→B→A creates three generations. Provider and config
 ordering, unrelated denied providers, enabled-agent ordering, policy formatting, and a principal

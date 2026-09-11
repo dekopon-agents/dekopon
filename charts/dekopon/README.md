@@ -147,7 +147,7 @@ The state claim root stays root-owned `0700` and neither daemon mounts it. With 
 enabled the broker mounts only its own credential subdirectory, and the gateway mounts only the
 configured ChatGPT subdirectory. Neither daemon can rename the other's directory.
 Private subdirectories are `0700`; files are `0600` with one link. Each daemon gets a separate
-`/tmp` volume. The broker alone mounts provider storage and its namespace key.
+`/tmp` volume. The broker alone mounts provider storage.
 
 **Upgrade with both daemons stopped:** an `audit.jsonl` on the claim, at its root or under
 `broker/`, is inert; the broker keeps no audit file, so delete it once any records you want are
@@ -683,7 +683,7 @@ exported as an audit log record over OTLP. It may post one review comment and ha
 - The `PodSecurity` `restricted` profile would reject this pod: the init container runs as root.
   `baseline` is fine.
 
-## Optional provider-storage claim and namespace key
+## Optional provider-storage claim
 
 `providerStorage.enabled` creates (or mounts) a claim physically separate from `state`, mounted only
 into the broker at `/var/lib/dekopon-provider-storage`. A generated claim always carries
@@ -691,22 +691,17 @@ into the broker at `/var/lib/dekopon-provider-storage`. A generated claim always
 neither an uninstall nor a GitOps prune takes durable provider data; an existing claim remains
 operator-owned. Rendering fails when the resolved state and provider-storage claim names are equal.
 
-The chart never creates the namespace key. `providerStorage.existingKeySecret` is required and is
-operator-managed, so uninstall cannot delete the key for retained data. The init container alone
-mounts its projected symlink farm, copies the selected key into a separate broker-only tmpfs
-`0700` directory as one `0600`, UID-65532, single-link regular file, and verifies it. The gateway
-mounts neither key tmpfs nor provider-storage PVC. Every chart mount path must be a canonical
-absolute sequence of safe non-dot segments (no repeated slash). Storage root/key paths must not
-overlap each other, another chart mount, projected init sources, or baked image paths including
-`/opt/dekopon/providers` and `/opt/dekopon/optional-providers`; key source/destination names must be
-non-dot path segments. Invalid combinations fail during `helm template` before a volume can shadow
-configuration, packaged providers, or init-script text. The `storage-probe` and malicious
-`memory-reservation-probe` fixtures are not present in the image; `memory-chat-provider.wasm` is
-baked only under `/opt/dekopon/optional-providers`, outside
-the default scan.
+The gateway does not mount the provider-storage PVC. Every chart mount path must be a canonical
+absolute sequence of safe non-dot segments (no repeated slash). The storage root must not overlap
+another chart mount, projected init sources, or baked image paths including
+`/opt/dekopon/providers` and `/opt/dekopon/optional-providers`. Invalid combinations fail during
+`helm template` before a volume can shadow configuration, packaged providers, or init-script text.
+The `storage-probe` and malicious `memory-reservation-probe` fixtures are not present in the image;
+`memory-chat-provider.wasm` is baked only under `/opt/dekopon/optional-providers`, outside the
+default scan.
 
-The key is HMAC namespace/recovery authority, not encryption-at-rest. Losing or rotating it with
-retained data makes startup fail. The provider-storage filesystem must support retained
+Directory names under the root are unkeyed SHA-256 derivations of the chat scope, and the store
+makes no encryption-at-rest claim. The provider-storage filesystem must support retained
 directory-descriptor-relative no-follow opens, advisory locks, same-directory rename, and
 file/directory sync. A stuck native syscall may exceed
 the configured shutdown grace, and malicious same-UID filesystem mutation is outside the claim.

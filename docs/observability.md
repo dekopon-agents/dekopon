@@ -561,15 +561,16 @@ Storage-backed invocations do not follow the ordinary provider span shape. The `
 `provider.invoke` storage spans omit provider, capability, agent, subject, transport scope, logical
 names, offsets, search terms, and exact bytes even when payload telemetry is enabled; `stores` and
 `instantiations` are the exception, and they count host work rather than describing the call.
-Storage evidence retains only invocation/operation/sync/quota counts and the largest powers-of-two
-read/write bucket; that evidence and the public ceilings never contain root/key paths or opaque
-tokens.
+`broker.execute` does carry `storage.namespace`, the base directory token under `namespaces/`, so a
+trace leads to the directory its conversation's bytes are in. Storage evidence retains only
+invocation/operation/sync/quota counts and the largest powers-of-two read/write bucket; that
+evidence and the public ceilings never contain root paths or opaque tokens.
 
 Storage audit decisions and outcomes omit principal, actor/agent, via/subject, provider, broker
-principal/policy revision, policy IDs/digest, and credential. A separate keyed audit-scope
-commitment is never equal to a physical namespace token. Storage decision/output/evidence values use
-separate `hmac-sha256:` domains, which removes the unkeyed low-entropy dictionary oracle.
-Non-storage records use `sha256:`.
+principal/policy revision, policy IDs/digest, and credential, carrying an audit-scope commitment in
+their place. *Committed direction:* removed; the blanking hides chat scope from the operator, which
+is a [non-goal](design.md#non-goals). Every storage name and commitment is an unkeyed,
+domain-separated SHA-256; commitments are written `sha256:` like non-storage records.
 
 A retained storage document that fails to decode emits `storage_document_decode_failed` at `WARN`
 under `category = "storage"`. It carries the static document kind plus the `serde_json` failure's
@@ -589,10 +590,8 @@ fresh generation. The previous generation stays on disk.
 scan — a symlink, a hard link, a wrong mode, or an unreadable directory under `namespaces/<base>`.
 It carries `storage.namespace`, `storage.path`, `storage.check`, and the rendered `error`. The broker
 starts without charging that base, and the conversation's next grant fails naming the same entry.
-`storage_quarantine_removed` at `INFO` is startup deleting the empty `quarantine/` directory an
-earlier release created in every root.
 
-These three records name opaque tokens and paths under the storage root. They are for the operator;
+Both records name opaque tokens and paths under the storage root. They are for the operator;
 nothing in them reaches a guest or a model.
 
 Entropy and wall/monotonic clock values from durable-files are never emitted as telemetry. A native

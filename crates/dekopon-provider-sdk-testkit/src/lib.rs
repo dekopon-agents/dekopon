@@ -82,15 +82,6 @@ pub mod prelude {
     };
 }
 
-/// Namespace key used for every temporary root this crate creates.
-///
-/// Fixed rather than random so a failing test reproduces byte for byte. It authenticates paths
-/// inside a `TempDir` that is deleted when the test ends, and protects nothing else.
-const TEST_NAMESPACE_KEY: &str = concat!(
-    "apiVersion: dekopon.dev/storage-key/v1alpha1\n",
-    "key: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
-);
-
 /// Anything that can stop a fake invocation, kept distinguishable so a test can assert on cause.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -116,7 +107,7 @@ pub enum FakeBrokerError {
     /// The configured external subject is malformed.
     #[error("invalid external subject: {0}")]
     Subject(#[from] SubjectError),
-    /// Creating the temporary root, or writing the namespace key, failed.
+    /// Creating the temporary root failed.
     #[error("preparing the temporary storage root failed: {0}")]
     Io(#[from] std::io::Error),
     /// The storage host refused to open the root or to mint a grant.
@@ -326,16 +317,12 @@ impl FakeBrokerBuilder {
         let provider: ProviderId = self.provider.ok_or(FakeBrokerError::NoProvider)?.parse()?;
 
         let temporary = tempfile::tempdir()?;
-        // Canonicalized because the storage host compares the key path against the root to refuse
-        // a key stored inside the tree it authenticates, and on macOS `/var` is a symlink.
-        let directory = temporary.path().canonicalize()?;
-        let root = directory.join("storage");
-        let key = directory.join("storage-key.yaml");
-        std::fs::write(&key, TEST_NAMESPACE_KEY)?;
-        set_key_permissions(&key)?;
+        // Canonicalized because the storage host refuses a root reached through a symlinked
+        // ancestor, and on macOS `/var` is a symlink.
+        let root = temporary.path().canonicalize()?.join("storage");
 
         let storage = match self.storage {
-            Some(_) => Some(StorageHost::open(&root, &key, self.storage_limits)?),
+            Some(_) => Some(StorageHost::open(&root, self.storage_limits)?),
             None => None,
         };
         let host_limits = self.host_limits;
@@ -515,8 +502,8 @@ impl FakeBroker {
     ///
     /// [`StorageEvidence`] reports byte counts only as coarse powers-of-two buckets, so a test
     /// asserting an exact size — that a write-ahead log was truncated to zero, say — has to look
-    /// at the tree. Note every path component is an HMAC token, so walk it rather than guessing
-    /// names.
+    /// at the tree. Note every path component is an opaque SHA-256 token, so walk it rather than
+    /// guessing names.
     #[must_use]
     pub fn storage_root(&self) -> &Path {
         &self.root
@@ -543,19 +530,4 @@ impl FakeBroker {
             secret_use: None,
         }
     }
-}
-
-#[cfg(unix)]
-fn set_key_permissions(path: &Path) -> Result<(), std::io::Error> {
-    use std::os::unix::fs::PermissionsExt as _;
-
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-}
-
-#[cfg(not(unix))]
-fn set_key_permissions(_path: &Path) -> Result<(), std::io::Error> {
-    // The storage host requires an owner-only key file and refuses to open a root without one, so
-    // this crate is effectively Unix-only. Failing at `StorageHost::open` with its own diagnostic
-    // is clearer than inventing one here.
-    Ok(())
 }

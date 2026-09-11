@@ -1,5 +1,4 @@
 use std::{
-    os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -1463,18 +1462,11 @@ async fn a_waiting_namespace_lease_never_stalls_timers_or_a_distinct_namespace()
         .canonicalize()
         .expect("canonical directory");
     let root = directory.join("root");
-    let key = directory.join("key.yaml");
-    std::fs::write(
-        &key,
-        "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
-    )
-    .expect("write key");
-    std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).expect("key mode");
     let limits = StorageLimits {
         lock_timeout_ms: 500,
         ..StorageLimits::default()
     };
-    let storage = StorageHost::open(&root, &key, limits).expect("storage host");
+    let storage = StorageHost::open(&root, limits).expect("storage host");
     let held = storage
         .grant(probe_storage_grant("lease-held", "slack.t0123abc.uone"))
         .expect("held grant");
@@ -1607,16 +1599,8 @@ async fn generated_wasm_storage_denials_are_sticky_and_commit_nothing() {
             .canonicalize()
             .expect("canonical storage directory");
         let root = directory.join("root");
-        let key = directory.join("key.yaml");
-        std::fs::write(
-            &key,
-            "apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
-        )
-        .expect("write key");
-        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o600)).expect("key mode");
         let storage = StorageHost::open(
             &root,
-            &key,
             StorageLimits {
                 max_host_calls_per_invocation: max_calls,
                 ..StorageLimits::default()

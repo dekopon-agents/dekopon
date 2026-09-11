@@ -58,8 +58,8 @@ loop.
 - **`StorageNamespace::Chat` is the only namespace the storage host will grant.** A provider with
   nothing to do with chat needs a transport, channel, and conversation anyway; those are
   pre-filled.
-- **The namespace key must live outside the root, owner-only.** Written for you at `0600`, in a
-  `TempDir` the `FakeBroker` owns.
+- **The storage root lives in a `TempDir` the `FakeBroker` owns.** It is deleted when the broker is
+  dropped.
 
 ## Requirements
 

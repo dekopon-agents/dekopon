@@ -88,9 +88,7 @@ expected={"config-source":"/dekopon-source", "config":"/etc/dekopon",
           "gateway-config":"/etc/dekopon-gateway", "runtime":"/run/dekopon",
           "state":"/var/lib/dekopon"}
 if "provider-storage" in bm:
-    expected.update({"provider-storage":"/var/lib/dekopon-provider-storage",
-                     "provider-storage-key":"/etc/dekopon-storage-key",
-                     "provider-storage-key-source":"/dekopon-storage-key-source"})
+    expected.update({"provider-storage":"/var/lib/dekopon-provider-storage"})
 assert {m["name"]:m["mountPath"] for m in ic["volumeMounts"]}==expected
 assert gm["gateway-config"]["mountPath"]==bm["config"]["mountPath"]=="/etc/dekopon"
 assert gm["runtime"]["mountPath"]==bm["runtime"]["mountPath"]=="/run/dekopon"
@@ -126,10 +124,10 @@ run_init() {
   docker run --rm --platform "$platform" \
     --user 0:0 --group-add=65534 --cap-drop=ALL --cap-add=CHOWN --cap-add=FOWNER \
     --security-opt=no-new-privileges --read-only \
-    -v "${resource}-src":/dekopon-source:ro -v "${resource}-src":/dekopon-storage-key-source:ro \
+    -v "${resource}-src":/dekopon-source:ro \
     -v "${resource}-etc":/etc/dekopon -v "${resource}-gateway-etc":/etc/dekopon-gateway \
     -v "${resource}-run":/run/dekopon -v "${resource}-state":/var/lib/dekopon \
-    -v "${resource}-storage":/var/lib/dekopon-provider-storage -v "${resource}-storage-key":/etc/dekopon-storage-key \
+    -v "${resource}-storage":/var/lib/dekopon-provider-storage \
     "$busybox" /bin/sh -c "$(cat "$1")"
 }
 
@@ -141,8 +139,8 @@ on_state() {
 
 reset_mounts() {
   docker run --rm --platform "$platform" -v "${resource}-etc":/a -v "${resource}-run":/b -v "${resource}-state":/c \
-    -v "${resource}-storage":/d -v "${resource}-storage-key":/e -v "${resource}-gateway-etc":/f "$busybox" \
-    sh -c 'chmod 0777 /a /b /c /d /e /f; chown 0:0 /a /b /c /d /e /f'
+    -v "${resource}-storage":/d -v "${resource}-gateway-etc":/f "$busybox" \
+    sh -c 'chmod 0777 /a /b /c /d /f; chown 0:0 /a /b /c /d /f'
 }
 
 credential_digest() {
@@ -194,7 +192,7 @@ assert_eq() {
   fi
 }
 
-for suffix in src etc gateway-etc run state storage storage-key; do
+for suffix in src etc gateway-etc run state storage; do
   v="$resource-$suffix"
   if docker volume inspect "$v" >/dev/null 2>&1; then
     echo "refusing preexisting test volume $v" >&2
@@ -218,10 +216,9 @@ printf 'apiVersion: dekopon.dev/broker-credentials/v1alpha1\ncredentials: []\n' 
 printf 'apiVersion: dekopon.dev/dekopond/v1alpha1\n' > "$stamp/dekopond.yaml"
 printf '{"refresh":"SEED-REFRESH-TOKEN","expires_at":0}\n' > "$stamp/chatgpt-auth.json"
 printf '{"refresh":"BROKER-SEED-REFRESH-TOKEN","expires_at":0}\n' > "$stamp/broker-chatgpt-auth.json"
-printf 'apiVersion: dekopon.dev/storage-key/v1alpha1\nkey: 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n' > "$stamp/storage-key.yaml"
 chmod 0400 "$stamp"/*
 ln -sfn "$stamp" ..data
-for k in broker.yaml policies.cedar broker-credentials.yaml dekopond.yaml chatgpt-auth.json broker-chatgpt-auth.json storage-key.yaml; do
+for k in broker.yaml policies.cedar broker-credentials.yaml dekopond.yaml chatgpt-auth.json broker-chatgpt-auth.json; do
   ln -sfn "..data/$k" "$k"
 done
 chmod 0755 /dekopon-source
@@ -386,37 +383,32 @@ assert_eq "reseed=true discarded the live credential and restored the seed" \
   "$after_reseed" "$source_digest"
 
 echo
-echo "==> (h) provider storage: retained separate claim and broker-only copied key"
+echo "==> (h) provider storage: retained separate claim, broker-only"
 render_init "$work/init-storage.sh" \
-  --set providerStorage.enabled=true \
-  --set providerStorage.existingKeySecret=dekopon-storage-key
+  --set providerStorage.enabled=true
 reset_mounts
 run_init "$work/init-storage.sh"
-key_perms=$(docker run --rm --platform "$platform" -v "${resource}-storage-key":/k "$busybox" \
-  sh -c "stat -c '%u:%g:%a:%h:%F' /k/storage-key.yaml")
-assert_eq "provider namespace key permissions" "$key_perms" "65532:65532:600:1:regular file"
 root_perms=$(docker run --rm --platform "$platform" -v "${resource}-storage":/s "$busybox" \
   sh -c "stat -c '%u:%g:%a:%F' /s")
 assert_eq "provider storage root permissions" "$root_perms" "65532:65532:700:directory"
-# The same key survives a restart copy with identical bytes; provider data is never cleared.
-key_before=$(docker run --rm --platform "$platform" -v "${resource}-storage-key":/k "$busybox" \
-  sh -c 'sha256sum /k/storage-key.yaml | cut -d" " -f1')
+# A restart copy never clears provider data.
+docker run --rm --platform "$platform" -v "${resource}-storage":/s "$busybox" \
+  sh -c 'printf retained > /s/sentinel'
 run_init "$work/init-storage.sh"
-key_after=$(docker run --rm --platform "$platform" -v "${resource}-storage-key":/k "$busybox" \
-  sh -c 'sha256sum /k/storage-key.yaml | cut -d" " -f1')
-assert_eq "provider namespace key restart copy is stable" "$key_after" "$key_before"
+retained=$(docker run --rm --platform "$platform" -v "${resource}-storage":/s "$busybox" \
+  sh -c 'cat /s/sentinel && rm /s/sentinel')
+assert_eq "provider storage survives a restart copy" "$retained" "retained"
 
-# Valid gateway render must mount neither privileged storage volume.
+# Valid gateway render must not mount privileged storage.
 helm template dekopon "$chart_dir" -f "$values" \
-  --set providerStorage.enabled=true \
-  --set providerStorage.existingKeySecret=dekopon-storage-key > "$work/storage-render.yaml"
+  --set providerStorage.enabled=true > "$work/storage-render.yaml"
 python_check='import yaml,sys
 for d in yaml.safe_load_all(sys.stdin):
   if not d or d.get("kind") != "Deployment": continue
   containers=d["spec"]["template"]["spec"].get("containers",[])
   gateway=next(c for c in containers if c["name"]=="gateway")
   names={m["name"] for m in gateway.get("volumeMounts",[])}
-  assert "provider-storage" not in names and "provider-storage-key" not in names, names'
+  assert "provider-storage" not in names, names'
 if python3 -c 'import yaml' 2>/dev/null; then
   python3 -c "$python_check" < "$work/storage-render.yaml"
 else
@@ -424,11 +416,10 @@ else
     sh -c 'pip install --quiet --disable-pip-version-check pyyaml >/dev/null 2>&1; exec python3 -c "$PROG"' \
     < "$work/storage-render.yaml"
 fi
-echo "PASS gateway mounts neither provider storage nor namespace key"
+echo "PASS gateway does not mount provider storage"
 
 if helm template collision "$chart_dir" \
   --set providerStorage.enabled=true \
-  --set providerStorage.existingKeySecret=dekopon-storage-key \
   --set providerStorage.existingClaim=shared \
   --set state.existingClaim=shared >/dev/null 2>&1; then
   echo "FAIL exact state/provider storage claim collision rendered" >&2
@@ -438,16 +429,14 @@ echo "PASS exact state/provider storage claim collision is rejected"
 
 if helm template overlap "$chart_dir" \
   --set providerStorage.enabled=true \
-  --set providerStorage.existingKeySecret=dekopon-storage-key \
-  --set providerStorage.keyDir=/etc/dekopon >/dev/null 2>&1; then
-  echo "FAIL provider namespace-key mount shadowed the copied configuration mount" >&2
+  --set providerStorage.rootPath=/etc/dekopon >/dev/null 2>&1; then
+  echo "FAIL provider storage mount shadowed the copied configuration mount" >&2
   exit 1
 fi
 echo "PASS provider storage mount paths cannot shadow chart-owned mounts"
 
 if helm template overlap-source "$chart_dir" \
   --set providerStorage.enabled=true \
-  --set providerStorage.existingKeySecret=dekopon-storage-key \
   --set providerStorage.rootPath=/dekopon-source >/dev/null 2>&1; then
   echo "FAIL provider storage root shadowed the projected configuration source" >&2
   exit 1
@@ -456,8 +445,7 @@ echo "PASS provider storage paths cannot shadow projected init sources"
 
 if helm template normalized-collision "$chart_dir" \
   --set providerStorage.enabled=true \
-  --set providerStorage.existingKeySecret=dekopon-storage-key \
-  --set-string 'paths.configDir=/etc//dekopon-storage-key' >/dev/null 2>&1; then
+  --set-string 'paths.configDir=/var/lib//dekopon-provider-storage' >/dev/null 2>&1; then
   echo "FAIL a non-canonical chart path bypassed provider-storage mount collision checks" >&2
   exit 1
 fi
@@ -465,25 +453,22 @@ echo "PASS all chart paths reject repeated-slash aliases before collision compar
 
 if helm template packaged-provider-collision "$chart_dir" \
   --set providerStorage.enabled=true \
-  --set providerStorage.existingKeySecret=dekopon-storage-key \
   --set providerStorage.rootPath=/opt/dekopon/optional-providers >/dev/null 2>&1; then
   echo "FAIL provider storage shadowed the packaged optional memory provider" >&2
   exit 1
 fi
 echo "PASS provider storage cannot shadow image-owned provider directories"
 
-if helm template dot-key "$chart_dir" \
+if helm template dot-root "$chart_dir" \
   --set providerStorage.enabled=true \
-  --set providerStorage.existingKeySecret=dekopon-storage-key \
-  --set providerStorage.keyFileName=.. >/dev/null 2>&1; then
-  echo "FAIL provider namespace-key destination accepted a parent segment" >&2
+  --set providerStorage.rootPath=/var/lib/dekopon/../provider-storage >/dev/null 2>&1; then
+  echo "FAIL provider storage root accepted a parent segment" >&2
   exit 1
 fi
-echo "PASS provider storage key names reject dot segments"
+echo "PASS provider storage root rejects dot segments"
 
 if helm template unsafe-storage-path "$chart_dir" \
   --set providerStorage.enabled=true \
-  --set providerStorage.existingKeySecret=dekopon-storage-key \
   --set-string 'providerStorage.rootPath=/var/lib/bad;touch-bad' >/dev/null 2>&1; then
   echo "FAIL provider storage root accepted shell-active path text" >&2
   exit 1
@@ -502,7 +487,6 @@ docker run --rm -i --platform "$platform" --user 0:0 \
   -v "${resource}-run":/run/dekopon \
   --mount "type=volume,src=${resource}-state,dst=/gateway-state,volume-subpath=chatgpt" \
   -v "${resource}-storage":/var/lib/dekopon-provider-storage \
-  -v "${resource}-storage-key":/etc/dekopon-storage-key \
   "$python_image" python3 - < "$chart_dir/ci/check-ipc-layout.py"
 
 # Missing/mismatched inline server pins cannot fall back to the gateway euid.
@@ -694,4 +678,4 @@ fi
 echo "PASS the two ChatGPT families cannot share a directory"
 
 echo
-echo "OK: every tier satisfied; both ChatGPT families are seed-once, separate, and reach only their own daemon; provider storage/key are retained, separate, and broker-only."
+echo "OK: every tier satisfied; both ChatGPT families are seed-once, separate, and reach only their own daemon; provider storage is retained, separate, and broker-only."
