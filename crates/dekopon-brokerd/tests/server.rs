@@ -23,7 +23,7 @@ use dekopon_capability::{
 };
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
-    RiskLevel, SecretUseProposal, TraceId,
+    RiskLevel, SecretUseProposal,
 };
 use dekopon_test_support::{provider_fixture, shutdown_on};
 use serde_json::{Value, json};
@@ -32,6 +32,12 @@ use tokio::{
     net::{UnixListener, UnixStream},
     sync::oneshot,
 };
+
+/// One fixture trace context for every request these tests build.
+///
+/// The trace is mandatory on the wire now; these cases read invocation identifiers and audit
+/// fields rather than the trace itself, so one shared value keeps the fixtures about their subject.
+const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
 
 fn context(principal: &str) -> AuthenticatedContext {
     AuthenticatedContext::new(
@@ -126,10 +132,7 @@ fn request(id: &str) -> InvocationRequest {
         capability: "echo.echo"
             .parse::<CapabilityId>()
             .expect("valid capability fixture"),
-        trace: "trace-brokerd"
-            .parse::<TraceId>()
-            .expect("valid trace fixture"),
-        trace_parent: None,
+        trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
         secret_use: None,
         input: json!({"message": "hello through broker"}),
     }
@@ -438,10 +441,7 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
                     .parse::<InvocationId>()
                     .expect("valid invocation fixture"),
                 capability,
-                trace: "trace-brokerd"
-                    .parse::<TraceId>()
-                    .expect("valid trace fixture"),
-                trace_parent: None,
+                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
                 secret_use: None,
                 input,
             },
@@ -863,8 +863,7 @@ when { context.capability == "http-probe.fetch"
     let mut invocation = InvocationRequest {
         id: "invoke-secret-service".parse().expect("invocation"),
         capability: "http-probe.fetch".parse().expect("capability"),
-        trace: "trace-secret-service".parse().expect("trace"),
-        trace_parent: None,
+        trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
         secret_use: Some(SecretUseProposal::HttpBearer {
             secret: "drn:com.xrl:secret:test:api/token".parse().expect("DRN"),
         }),

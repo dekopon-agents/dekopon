@@ -3318,7 +3318,6 @@ where
         let request = InvocationRequest {
             id: turn.id,
             capability,
-            trace: turn.trace,
             trace_parent: turn.trace_parent,
             secret_use: None,
             input: serde_json::json!({
@@ -3965,9 +3964,10 @@ where
         } = refusal;
         let decision_id = format!("deny-{}", request.id);
         let decision = self.decision_reference(&decision_id);
+        let trace = request.trace_parent.trace();
         let material = DecisionMaterial {
             invocation: &request.id,
-            trace: &request.trace,
+            trace,
             principal: context.principal(),
             actor: context.actor(),
             via: context.via(),
@@ -3999,7 +3999,7 @@ where
         self.audit
             .append(AuditEvent::Decision {
                 invocation: request.id.clone(),
-                trace: request.trace.clone(),
+                trace,
                 principal: (!storage_backed).then(|| context.principal().clone()),
                 actor: (!storage_backed).then(|| context.actor().clone()),
                 via: (!storage_backed).then(|| context.via().cloned()).flatten(),
@@ -4062,7 +4062,7 @@ where
         &self,
         context: &AuthenticatedContext,
         invocation: &InvocationId,
-        trace: &TraceId,
+        trace: TraceId,
         capability: &CapabilityId,
         decision_id: &str,
         decision: DecisionReference,
@@ -4185,14 +4185,14 @@ where
         let decision_id = format!("allow-{}", request.id);
         let decision = self.decision_reference(&decision_id);
         let invocation_id = request.id.clone();
-        let trace = request.trace.clone();
+        let trace = request.trace_parent.trace();
         let capability = request.capability.clone();
         let secret_use = request.secret_use.take();
         let proposal = ProposedInvocation::new(
             request.id,
             request.capability,
             context.actor().clone(),
-            request.trace,
+            trace,
             request.input,
         )
         .with_secret_use(secret_use);
@@ -4224,7 +4224,7 @@ where
         self.audit
             .append(AuditEvent::Decision {
                 invocation: invocation_id.clone(),
-                trace: trace.clone(),
+                trace,
                 principal: storage_scope_commitment
                     .is_none()
                     .then(|| context.principal().clone()),
@@ -4316,7 +4316,7 @@ where
                         .fail_authorized_before_provider(
                             context,
                             &invocation_id,
-                            &trace,
+                            trace,
                             &capability,
                             &decision_id,
                             decision,
@@ -4334,7 +4334,7 @@ where
                     .fail_authorized_before_provider(
                         context,
                         &invocation_id,
-                        &trace,
+                        trace,
                         &capability,
                         &decision_id,
                         decision,
@@ -4367,7 +4367,7 @@ where
                         .fail_authorized_before_provider(
                             context,
                             &invocation_id,
-                            &trace,
+                            trace,
                             &capability,
                             &decision_id,
                             decision,
@@ -4422,7 +4422,7 @@ where
                             .fail_authorized_before_provider(
                                 context,
                                 &invocation_id,
-                                &trace,
+                                trace,
                                 &capability,
                                 &decision_id,
                                 decision,
@@ -4484,7 +4484,7 @@ where
                 let event = execution_event(
                     context,
                     &invocation_id,
-                    &trace,
+                    trace,
                     &capability,
                     &decision_id,
                     &self.policy_revision,
@@ -4541,7 +4541,7 @@ where
                 let event = execution_event(
                     context,
                     &invocation_id,
-                    &trace,
+                    trace,
                     &capability,
                     &decision_id,
                     &self.policy_revision,
@@ -4989,7 +4989,7 @@ fn report_audit_failure(stage: &'static str, invocation: &InvocationId, source: 
 fn execution_event(
     context: &AuthenticatedContext,
     invocation: &InvocationId,
-    trace: &TraceId,
+    trace: TraceId,
     capability: &CapabilityId,
     decision_id: &str,
     policy_revision: &str,
@@ -5009,7 +5009,7 @@ fn execution_event(
     let storage_backed = storage_scope_commitment.is_some();
     AuditEvent::Execution {
         invocation: invocation.clone(),
-        trace: trace.clone(),
+        trace,
         principal: (!storage_backed).then(|| context.principal().clone()),
         actor: (!storage_backed).then(|| context.actor().clone()),
         via: (!storage_backed).then(|| context.via().cloned()).flatten(),
@@ -5057,7 +5057,7 @@ fn execution_event(
 #[serde(rename_all = "camelCase")]
 struct DecisionMaterial<'a> {
     invocation: &'a InvocationId,
-    trace: &'a TraceId,
+    trace: TraceId,
     principal: &'a PrincipalId,
     actor: &'a Actor,
     via: Option<&'a PrincipalId>,

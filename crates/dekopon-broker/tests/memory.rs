@@ -36,6 +36,12 @@ use dekopon_storage_host::{ContinuityPolicy, StorageGrantRequest, StorageHost, S
 use dekopon_test_support::provider_fixture;
 use serde_json::json;
 
+/// One fixture trace context for every request these tests build.
+///
+/// The trace is mandatory on the wire now; these cases read invocation identifiers and audit
+/// fields rather than the trace itself, so one shared value keeps the fixtures about their subject.
+const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
+
 fn memory_config() -> ChatMemoryConfig {
     ChatMemoryConfig {
         continuity_policy: ContinuityPolicy::AuthorityBound,
@@ -421,8 +427,7 @@ async fn authorization_audit_failure_precedes_every_storage_tree_mutation() {
             &session.bound_to(id.clone()),
             DeliveredTurnRequest {
                 id,
-                trace: "trace-audit-full-record".parse().expect("trace"),
-                trace_parent: None,
+                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
                 delivery: DeliveryIdentity::Slack {
                     channel: "c0123abc".to_owned(),
                     timestamp: "1712345678.000101".to_owned(),
@@ -629,10 +634,7 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
                         .parse()
                         .expect("invocation"),
                     capability: capability.parse().expect("capability"),
-                    trace: format!("trace-unrouted-direct-{index}")
-                        .parse()
-                        .expect("trace"),
-                    trace_parent: None,
+                    trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
                     input: json!({}),
                     secret_use: None,
                 },
@@ -682,8 +684,7 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
             InvocationRequest {
                 id: chat_id,
                 capability: "ordinary.escape".parse().expect("capability"),
-                trace: "trace-unrouted-chat".parse().expect("trace"),
-                trace_parent: None,
+                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
                 input: json!({}),
                 secret_use: None,
             },
@@ -707,8 +708,7 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
             InvocationRequest {
                 id,
                 capability: "ordinary.escape".parse().expect("capability"),
-                trace: "trace-unrouted-attested".parse().expect("trace"),
-                trace_parent: None,
+                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
                 input: json!({}),
                 secret_use: None,
             },
@@ -1030,8 +1030,7 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
             InvocationRequest {
                 id: direct,
                 capability: "storage-probe.run".parse().expect("capability"),
-                trace: "trace-renamed-direct".parse().expect("trace"),
-                trace_parent: None,
+                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
                 input: json!({}),
                 secret_use: None,
             },
@@ -1085,8 +1084,7 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
             InvocationRequest {
                 id: chat_id,
                 capability: "storage-probe.run".parse().expect("capability"),
-                trace: "trace-renamed-chat".parse().expect("trace"),
-                trace_parent: None,
+                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
                 input: json!({}),
                 secret_use: None,
             },
@@ -1114,8 +1112,7 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
             InvocationRequest {
                 id,
                 capability: "storage-probe.run".parse().expect("capability"),
-                trace: "trace-renamed-attested".parse().expect("trace"),
-                trace_parent: None,
+                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
                 input: json!({}),
                 secret_use: None,
             },
@@ -1225,10 +1222,7 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
         let request = InvocationRequest {
             id: id.clone(),
             capability: MEMORY_RECENT.parse().expect("capability"),
-            trace: format!("trace-reserved-route-{index}")
-                .parse()
-                .expect("trace"),
-            trace_parent: None,
+            trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
             input: json!({}),
             secret_use: None,
         };
@@ -1299,8 +1293,7 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
             InvocationRequest {
                 id: generic_id,
                 capability: "memory.chat.record".parse().expect("capability"),
-                trace: "trace-generic-record".parse().expect("trace"),
-                trace_parent: None,
+                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
                 input: json!({}),
                 secret_use: None,
             },
@@ -1321,8 +1314,7 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
             &claim.bound_to(record_id.clone()),
             DeliveredTurnRequest {
                 id: record_id,
-                trace: "trace-memory".parse().expect("trace"),
-                trace_parent: None,
+                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
                 delivery: DeliveryIdentity::Slack {
                     channel: "c0123abc".to_owned(),
                     timestamp: "1712345678.000100".to_owned(),
@@ -1362,8 +1354,7 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
             InvocationRequest {
                 id: recent_id,
                 capability: "memory.chat.recent".parse().expect("capability"),
-                trace: "trace-recent".parse().expect("trace"),
-                trace_parent: None,
+                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
                 input: json!({"last": 1}),
                 secret_use: None,
             },
@@ -2002,8 +1993,7 @@ async fn record_turn_in(
             &claim.bound_to(id.clone()),
             DeliveredTurnRequest {
                 id,
-                trace: format!("trace-{invocation}").parse().expect("trace"),
-                trace_parent: None,
+                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
                 delivery: DeliveryIdentity::Slack {
                     channel: "c0123abc".to_owned(),
                     timestamp: timestamp.to_owned(),
@@ -2057,8 +2047,7 @@ async fn query_memory_result_in(
             InvocationRequest {
                 id,
                 capability: capability.parse().expect("capability"),
-                trace: format!("trace-{invocation}").parse().expect("trace"),
-                trace_parent: None,
+                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
                 input,
                 secret_use: None,
             },
@@ -2463,8 +2452,7 @@ async fn invoke_generic_storage_denial(broker: &Broker<InMemoryAuditLog>, invoca
             InvocationRequest {
                 id,
                 capability: "storage-probe.run".parse().expect("capability"),
-                trace: format!("trace-{invocation}").parse().expect("trace"),
-                trace_parent: None,
+                trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
                 input: json!({"mode": "quota-denial"}),
                 secret_use: None,
             },

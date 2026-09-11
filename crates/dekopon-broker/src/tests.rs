@@ -26,7 +26,7 @@ fn execution(invocation: &str) -> AuditEvent {
         invocation: invocation
             .parse::<InvocationId>()
             .expect("valid invocation fixture"),
-        trace: "trace-test"
+        trace: "0000000000000000000000000000f1c7"
             .parse::<TraceId>()
             .expect("valid trace fixture"),
         principal: Some(
@@ -73,7 +73,7 @@ fn decision(invocation: &str, allowed: bool) -> AuditEvent {
         invocation: invocation
             .parse::<InvocationId>()
             .expect("valid invocation fixture"),
-        trace: "trace-test"
+        trace: "0000000000000000000000000000f1c7"
             .parse::<TraceId>()
             .expect("valid trace fixture"),
         principal: Some(

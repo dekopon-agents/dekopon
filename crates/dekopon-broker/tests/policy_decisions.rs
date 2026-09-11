@@ -20,10 +20,16 @@ use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency, InvocationOutcome};
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
-    RiskLevel, TraceId, TransportId,
+    RiskLevel, TransportId,
 };
 use dekopon_test_support::provider_fixture;
 use serde_json::json;
+
+/// One fixture trace context for every request these tests build.
+///
+/// The trace is mandatory on the wire now; these cases read invocation identifiers and audit
+/// fields rather than the trace itself, so one shared value keeps the fixtures about their subject.
+const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
 
 const SLACK_SUBJECT: &str = "slack.t0123abc.u9xyz";
 
@@ -209,10 +215,7 @@ fn request(index: usize, capability_id: &str) -> InvocationRequest {
             .parse::<InvocationId>()
             .expect("valid invocation fixture"),
         capability: capability(capability_id),
-        trace: "trace-table"
-            .parse::<TraceId>()
-            .expect("valid trace fixture"),
-        trace_parent: None,
+        trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
         input: json!({"message": "decision table"}),
         secret_use: None,
     }

@@ -24,6 +24,12 @@ use dekopon_test_support::{CaptureLayer, provider_fixture};
 use tokio::sync::{Notify, mpsc};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
+/// One fixture trace context for every request these tests build.
+///
+/// The trace is mandatory on the wire now; these cases read invocation identifiers and audit
+/// fields rather than the trace itself, so one shared value keeps the fixtures about their subject.
+const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
+
 const POLICIES: &str = r#"
 @id("allow-reverse")
 permit(principal == Dekopon::Principal::"caller",
@@ -145,8 +151,7 @@ async fn a_suspended_authorization_does_not_parent_another_task_s_events() {
                             .parse()
                             .expect("valid invocation fixture"),
                         capability: "echo.echo".parse().expect("valid capability fixture"),
-                        trace: "trace-suspended".parse().expect("valid trace fixture"),
-                        trace_parent: None,
+                        trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
                         input: serde_json::json!({"message": "denied"}),
                         secret_use: None,
                     },

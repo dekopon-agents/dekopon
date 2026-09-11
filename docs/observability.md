@@ -185,19 +185,28 @@ including disabled trace export, neither ID is fabricated.
 
 ## Trace context across the socket
 
-`InvocationRequest` carries an optional W3C `traceParent`. The shared broker leg fills it from the
-span that requested the capability, and the broker opens `broker.invocation` beneath it as a remote
-parent, so one trace spans both processes.
+`InvocationRequest` and `DeliveredTurnRequest` each carry a mandatory W3C `traceParent`. The shared
+broker leg fills it from the span that requested the capability, and the broker opens
+`broker.invocation` beneath it as a remote parent, so one trace spans both processes. The trace
+identifier inside it is the only correlation identifier the system has: the broker writes it into
+every audit record it appends and onto every span it opens for the call, and the invocation
+identifier extends it (`<trace>-<counter>`), so one session's calls are recoverable by prefix.
 
-This is separate from `TraceId`, which identifies a Dekopon session in the audit log and replay
-accounting. Two identifiers, two jobs: `TraceId` is audit correlation and `traceParent` is
-telemetry correlation. *Committed direction:* removed; the W3C trace id is the only correlation
-identifier ([goal 2](design.md#constitution)).
+It is mandatory because a record with no correlation identifier is the inverse of what the audit
+log is for. A client that exports no telemetry still sends one: `tracing-opentelemetry` attaches
+its layer only when an OTLP trace exporter is configured, so a non-exporting process has no span
+context to read at all — absent rather than invalid — and mints a session-local trace from OS
+entropy instead of omitting the field. Nothing off-box receives that minted trace; it still ties
+one session's audit records to each other. A minted context carries `sampled=1`, which is an
+instruction to the receiver rather than a claim about the sender: the broker adopts it as a remote
+parent, no Dekopon process configures a sampler, and the OpenTelemetry SDK's default
+`ParentBased(AlwaysOn)` makes every span beneath an unsampled parent non-recording — so a cleared
+bit would silence an exporting broker sitting behind a non-exporting gateway.
 
-`traceParent` is untrusted like every other request field. It reaches span parenting and nothing
-else — never policy, replay rejection, routing, or audit. A malformed value is a decode failure
-rather than a silent `None`, since attaching broker spans to a trace that does not exist is worse
-than sending none; an absent value means the client exports no telemetry.
+`traceParent` is untrusted like every other request field. It reaches span parenting and audit
+correlation and nothing else — never policy, replay rejection, or routing. A malformed value, an
+explicit `null`, and an omitted key are all decode failures, since attaching broker spans and audit
+records to a trace that does not exist is worse than refusing the frame.
 
 The broker span carries the invocation, capability, and trace identifiers. Provider input and output
 ride the payload-gated `input` fields below; URL paths and queries, headers, and bodies stay out of
@@ -242,7 +251,11 @@ fixed chat warning directs the sender to audit before retrying.
 Every transport reconnects on one jittered exponential backoff, and the jitter comes from the
 operating system. `gateway_transport_jitter_unavailable` is the warn-level record of an OS that
 refused entropy, carrying the `getrandom` failure and nothing else; that attempt's delay falls back
-to its unjittered step, which costs a fleet its de-synchronization rather than its reconnect.
+to its unjittered step, which costs a fleet its de-synchronization rather than its reconnect. Two
+other records name the same refusal at their own sites: `session_trace_entropy_unavailable` (warn)
+when a non-exporting session's minted trace falls back to the hasher construction, and
+`gateway_cache_key_entropy_unavailable` (warn) when a prompt cache key is dropped rather than
+minted from something predictable.
 
 In-flight presentation is metadata-minimal. `gateway_activity_failed` is debug-level and carries
 `operation` plus the stable transport-error category. A permanent Slack installation fallback emits
