@@ -166,36 +166,6 @@ async fn broker() -> (Arc<Broker<InMemoryAuditLog>>, Arc<InMemoryAuditLog>) {
     broker_with_audit_bound(8).await
 }
 
-/// A broker whose replay ledger holds `maximum` identifiers and whose audit is roomy, so the
-/// ledger is the only bound that can be reached.
-async fn broker_with_replay_bound(maximum: usize) -> Arc<Broker<InMemoryAuditLog>> {
-    let registry = BrokerProviderRegistry::load(
-        [provider_fixture("echo-provider.wasm")],
-        BrokerHostLimits::default(),
-    )
-    .await
-    .expect("load echo fixture");
-    Arc::new(
-        Broker::new(
-            registry,
-            "broker-test"
-                .parse::<PrincipalId>()
-                .expect("valid broker principal"),
-            "policy-test".to_owned(),
-            echo_engine(DIRECT_POLICY, ["caller"]),
-            echo_catalog(),
-            CredentialStore::empty(),
-            IdentityDirectory::empty(),
-            Arc::new(InMemoryAuditLog::new(64).expect("valid audit bound")),
-            BrokerLimits {
-                max_replay_ids: maximum,
-                ..BrokerLimits::default()
-            },
-        )
-        .expect("broker starts"),
-    )
-}
-
 async fn broker_with_audit_bound(
     maximum: usize,
 ) -> (Arc<Broker<InMemoryAuditLog>>, Arc<InMemoryAuditLog>) {
@@ -622,7 +592,7 @@ async fn unmapped_peer_receives_no_capability_information() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn full_service_appends_after_restart_without_replay_restoration() {
+async fn full_service_appends_after_a_restart() {
     let uid = current_uid();
     let directory = private_directory();
     let config_path = directory.path().join("broker.json");
@@ -692,12 +662,12 @@ async fn full_service_appends_after_restart_without_replay_restoration() {
     wait_for_socket(&socket_path, &mut second).await;
     let client = BrokerClient::new(&socket_path, uid, FrameLimits::default())
         .expect("create restarted service client");
-    let replay = client
-        .invoke(None, request("invoke-durable-service"))
+    let restarted = client
+        .invoke(None, request("invoke-durable-service-again"))
         .await
         .expect("restarted invocation receives an accounted result");
-    assert_eq!(replay.outcome, InvocationOutcome::Succeeded);
-    assert_eq!(replay.error, None);
+    assert_eq!(restarted.outcome, InvocationOutcome::Succeeded);
+    assert_eq!(restarted.error, None);
     stop.send(()).expect("stop second service");
     second
         .await
@@ -997,6 +967,10 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
     // Nothing executed, so this is safe to resubmit — and futile in this bounded in-memory log.
     // Every fresh identifier fails on the same append until the embedding addresses capacity.
     assert_eq!(unran_code, ERROR_CAPACITY_EXHAUSTED);
+    assert_ne!(
+        unran_code, ERROR_BROKER_UNAVAILABLE,
+        "a permanently capped broker must not be reported as briefly unavailable"
+    );
     assert!(
         unran_message.contains("operator action"),
         "a permanent exhaustion must not read as a transient outage: {unran_message}"
@@ -1010,70 +984,6 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
     task.await
         .expect("server task exits")
         .expect("server shuts down");
-}
-
-/// The other process-lifetime exhaustion: the replay ledger retains
-/// every reserved identifier until restart. Reporting it as `broker-unavailable` would invite
-/// a client to retry forever against that same exhausted process.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_exhausted_replay_ledger_is_not_reported_as_a_transient_outage() {
-    let uid = current_uid();
-    let directory = private_directory();
-    let socket_path = directory.path().join("broker.sock");
-    let listener = bind_fixture(&socket_path);
-    let broker = broker_with_replay_bound(1).await;
-    let mut identities = BTreeMap::new();
-    identities.insert(
-        uid,
-        MappedPeer {
-            context: context("caller"),
-            attestor: None,
-        },
-    );
-    let limits = server_limits();
-    let server = BrokerServer::new(broker, identities, limits).expect("server limits valid");
-    let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
-    let task = tokio::spawn(server.serve(listener, async move {
-        #[allow(
-            clippy::let_underscore_must_use,
-            reason = "this future's only job is to resolve; a signal and a dropped sender both \
-                      mean stop, and serve treats them identically"
-        )]
-        let _ = shutdown_receive.await;
-    }));
-
-    let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
-    let first = client
-        .invoke(None, request("invoke-fills-the-ledger"))
-        .await
-        .expect("the first invocation reserves the only slot");
-    assert_eq!(first.outcome, InvocationOutcome::Succeeded);
-
-    let full = client
-        .invoke(None, request("invoke-past-the-ledger"))
-        .await
-        .expect_err("a full replay ledger cannot reserve");
-    let ClientError::Remote { code, message } = full else {
-        panic!("expected a remote broker failure, got {full}");
-    };
-    assert_eq!(code, ERROR_CAPACITY_EXHAUSTED);
-    assert_ne!(
-        code, ERROR_BROKER_UNAVAILABLE,
-        "a permanently capped broker must not be reported as briefly unavailable"
-    );
-    assert!(
-        message.contains("operator action"),
-        "the message must name what has to change: {message}"
-    );
-
-    shutdown_send.send(()).expect("signal clean shutdown");
-    #[allow(
-        clippy::let_underscore_must_use,
-        reason = "the expect above is the assertion that the task joined; serve's own Result is \
-                  the shutdown it was just asked for, and every behavior under test was already \
-                  asserted through the client"
-    )]
-    let _ = task.await.expect("server task exits");
 }
 
 /// The whole attested path over a real socket: the peer names a canonical subject, the broker

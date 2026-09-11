@@ -464,7 +464,7 @@ async fn unix_client_authenticates_private_socket_and_response_variant() {
 ///
 /// A request that never left is safe to resubmit under a fresh invocation identifier; a request
 /// whose response was lost is not, because the broker may have finished a non-idempotent external
-/// effect and replay rejection keys on the identifier a retry would replace.
+/// effect and suppresses no duplicate.
 #[cfg(unix)]
 #[tokio::test]
 async fn framing_failures_keep_the_executed_or_not_distinction() {

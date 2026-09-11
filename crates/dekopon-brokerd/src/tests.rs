@@ -843,7 +843,7 @@ async fn a_partial_limits_block_takes_the_absent_block_defaults_and_is_still_val
     let defaults = dekopon_broker_host::BrokerHostLimits::default();
     let mut document = attested_document(uid);
     document["hostLimits"] = json!({"maxTotalMemoryBytes": 256 * 1024 * 1024});
-    document["brokerLimits"] = json!({"maxReplayIds": 200_000});
+    document["brokerLimits"] = json!({"maxConstraintSets": 2_048});
     write_config(&path, &document);
     let resolved = config::load(&path, uid)
         .await
@@ -853,11 +853,7 @@ async fn a_partial_limits_block_takes_the_absent_block_defaults_and_is_still_val
         resolved.host_options.max_total_memory_bytes,
         Some(256 * 1024 * 1024)
     );
-    assert_eq!(resolved.broker_limits.max_replay_ids, 200_000);
-    assert_eq!(
-        resolved.broker_limits.max_constraint_sets,
-        dekopon_broker::DEFAULT_MAX_CONSTRAINT_SETS
-    );
+    assert_eq!(resolved.broker_limits.max_constraint_sets, 2_048);
 
     // Defaulting the omitted fields must not defeat the checks that read them together: an
     // aggregate ceiling below the defaulted per-store ceiling still refuses.

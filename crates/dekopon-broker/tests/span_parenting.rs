@@ -1,7 +1,7 @@
 //! Which spans a suspended authorization leaves entered on its worker thread.
 //!
-//! `broker.authorize` covers work that awaits: the replay ledger, and on every denial an asynchronous
-//! audit append. A span guard held across those awaits stays entered in the
+//! `broker.authorize` covers work that awaits: on every denial an asynchronous audit append. A span
+//! guard held across that await stays entered in the
 //! thread's context while the task is suspended, so whatever the runtime polls next on that thread
 //! — another connection, another session — is recorded as a child of this request's authorization.
 //! With OTLP export on, that is cross-request misattribution in production traces rather than a

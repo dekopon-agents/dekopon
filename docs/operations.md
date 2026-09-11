@@ -6,7 +6,7 @@ broker is [`crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.
 gateway it is [`dekopond.md`](dekopond.md). This page exists so an operator can find them by the
 question they arrived with, rather than by guessing that a crate README is the operations manual.
 
-## Append-only audit and process-local replay
+## Append-only audit
 
 `dekopon-brokerd` appends metadata-only records to an owner-only JSONL file. Startup counts
 bounded newline-delimited records for the next ordinal without decoding or verifying history;
@@ -16,9 +16,9 @@ cancelled append can leave partial bytes and poisons the open handle.
 *Committed direction:* opt-in sink, off by default; audit is a log record in the trace
 ([non-goals](design.md#non-goals)).
 
-Replay rejection is bounded to the current broker process. Restart creates an empty replay
-ledger: persisted audit records do not restore invocation IDs or establish whether retrying an
-external effect is safe. Tamper-detection, rollback protection, and crash recovery are
+Persisted audit records do not establish whether retrying an external effect is safe: the broker
+suppresses no duplicate, so a resubmitted invocation identifier runs again. Tamper-detection,
+rollback protection, crash recovery, and duplicate-effect defence are
 [non-goals](design.md#non-goals). Preserve audit data when investigating an append failure; do
 not erase it to bypass a startup refusal.
 
@@ -86,8 +86,7 @@ most often come up while operating are:
   separates gateway and broker UIDs; the broker maps the real peer UID, not its group.
   Each mapped UID remains its own trust domain, not independent process attestation.
 - **Audit is append-only evidence, not tamper-proof or crash-durable storage.** A restart is not
-  permission to retry an effect. See [Append-only audit and process-local
-  replay](#append-only-audit-and-process-local-replay).
+  permission to retry an effect. See [Append-only audit](#append-only-audit).
 
 [`security-model.md`](security-model.md) is the full statement of what is trusted, what is not, and
 what is presently out of scope.

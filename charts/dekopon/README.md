@@ -423,14 +423,6 @@ record but not lifetime file growth. Existing lines are subject to the same per-
 `serverLimits` is all-or-nothing: when present every field is required. `brokerLimits` and
 `hostLimits` instead default each field independently.
 
-### Size `maxReplayIds` with it
-
-`brokerLimits.maxReplayIds` bounds process-local invocation identifiers, not file records.
-The chart keeps **200 000** entries (daemon default **100 000**); the ledger never evicts during
-that process lifetime. Exhaustion returns `capacity-exhausted` and logs `broker_capacity_exhausted`,
-so clients must not retry automatically. Restart starts an empty ledger, without reading IDs
-from audit history. Budget this resident memory separately from append-only disk growth.
-
 ## Storage, uninstall, and recovery
 
 The claim carries `helm.sh/resource-policy: keep`, so `helm uninstall` leaves the audit

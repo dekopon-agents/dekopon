@@ -71,9 +71,9 @@ pub const ERROR_STORAGE_IO: &str = "storage-io";
 
 /// Stable failure code: a bounded broker resource is exhausted and nothing executed.
 ///
-/// Distinct from [`ERROR_BROKER_UNAVAILABLE`]: the process-local replay ledger or an embedding's
-/// bounded in-memory audit log is full and does not evict. A new identifier cannot fix capacity
-/// within that lifetime. Nothing executed, but clients must not retry automatically.
+/// Distinct from [`ERROR_BROKER_UNAVAILABLE`]: an embedding's bounded in-memory audit log is full
+/// and does not evict. A new identifier cannot fix capacity within that lifetime. Nothing executed,
+/// but clients must not retry automatically.
 ///
 /// The broker's durable file audit is not one of those resources — it bounds each record, never the
 /// number of them — so a full audit filesystem arrives as [`ERROR_BROKER_UNAVAILABLE`] before
@@ -101,7 +101,7 @@ pub enum ProtocolVersion {
 /// telemetry half, which changes from call to call while the trace does not.
 ///
 /// Like every other request field this is untrusted. It reaches telemetry correlation and audit
-/// correlation and nothing else: never an authorization, routing, or replay input. A caller that
+/// correlation and nothing else: never an authorization or routing input. A caller that
 /// sends someone else's trace identifier joins their own records to that trace and gains no
 /// authority by it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -267,7 +267,7 @@ pub enum TraceParentError {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct InvocationRequest {
-    /// Client-selected identifier reserved for replay rejection.
+    /// Client-selected identifier that binds an attestation to this proposal and names it in audit.
     pub id: InvocationId,
     /// Requested exact capability.
     pub capability: CapabilityId,
@@ -1667,8 +1667,8 @@ pub enum ExchangePhase {
     ///
     /// The broker may have executed the request. Treat this exactly like
     /// [`ERROR_OUTCOME_UNAUDITED`]: the work must **not** be resubmitted under any identifier,
-    /// because replay rejection keys on the invocation identifier and a fresh one duplicates a
-    /// non-idempotent external effect. The broker's audit log is the only record of what happened.
+    /// because the broker suppresses no duplicate and a resubmission repeats a non-idempotent
+    /// external effect. The broker's audit log is the only record of what happened.
     Response,
 }
 

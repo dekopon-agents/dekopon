@@ -204,7 +204,7 @@ parent, no Dekopon process configures a sampler, and the OpenTelemetry SDK's def
 bit would silence an exporting broker sitting behind a non-exporting gateway.
 
 `traceParent` is untrusted like every other request field. It reaches span parenting and audit
-correlation and nothing else — never policy, replay rejection, or routing. A malformed value, an
+correlation and nothing else — never policy or routing. A malformed value, an
 explicit `null`, and an omitted key are all decode failures, since attaching broker spans and audit
 records to a trace that does not exist is worse than refusing the frame.
 
@@ -347,7 +347,7 @@ migration is implemented here.
 |---|---|---|
 | `provider.compile` | `dekopon-broker-host` | `path`, `artifact_bytes`, `elapsed_ms`; emitted once per provider at startup |
 | `provider.run_command` | `dekopon-broker-host` | provider, `word`, `command.export` (`run-command`, or the legacy `resolve-command`) |
-| `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `policy-error`, `secret-denied`, `unconstrained-capability`, `agent-denied`, `replayed-invocation`, `attestation-denied`, `unmapped-subject`, `chat-attestation-denied`, `chat-scope-required`, `record-operation-required`, `memory-unavailable`, `invalid-memory-input`, `invalid-turn`), `policy.errors_present`; `subject` and `via` on attested proposals |
+| `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `policy-error`, `secret-denied`, `unconstrained-capability`, `agent-denied`, `attestation-denied`, `unmapped-subject`, `chat-attestation-denied`, `chat-scope-required`, `record-operation-required`, `memory-unavailable`, `invalid-memory-input`, `invalid-turn`), `policy.errors_present`; `subject` and `via` on attested proposals |
 | `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one; `outcome` (`succeeded`, `failed`, `decision-unaudited`, `outcome-unaudited`) and `error` — the same classified reason the terminal audit record carries |
 | `broker.credential.refresh` | `dekopon-brokerd` | the symbolic `credential` name, and `outcome` (`current`, `adopted`, `rotated`, `rotated-unsaved`, `failed`); emitted once per invocation that selects a credential the broker renews per use, and never any token, account identifier, or file content. `chatgpt.refresh` from `dekopon-model` nests inside it |
 | `provider.invoke` | `dekopon-broker-host` | capability, provider |
@@ -459,8 +459,8 @@ lives one or two levels down, and these events render the whole chain as one `a:
 contents never join it: a decode failure names its kind, not the bytes that failed to decode.
 
 `broker_capacity_exhausted` and `broker_accept_retried` report a condition outside any one request.
-The first says a bounded broker resource — the process-local replay ledger, or an embedding's
-in-memory audit log — is full and does not evict; every caller receives `capacity-exhausted` and no
+The first says a bounded broker resource — an embedding's in-memory audit log — is full and does
+not evict; every caller receives `capacity-exhausted` and no
 retry clears it within that process lifetime. The durable file audit is not one of those bounds: it
 bounds each record, not their number, so a full audit filesystem arrives as
 `broker_audit_append_failed` with `category=io` — and, once execution has begun, as

@@ -594,14 +594,16 @@ fn pre_execution_storage_failures_keep_their_public_category() {
     }
 }
 
-/// A permanent exhaustion is not a momentary outage. The replay ledger never evicts and is
-/// process-local; the bounded in-memory audit does not evict either, so a client told
-/// to resubmit under a fresh identifier would loop against a broker that is capped forever.
+/// A permanent exhaustion is not a momentary outage. The bounded in-memory audit does not evict,
+/// so a client told to resubmit under a fresh identifier would loop against a broker that is
+/// capped forever.
 #[test]
 fn exhausted_bounds_are_terminal_rather_than_retriable() {
     for error in [
-        super::BrokerError::ReplayLedgerFull { maximum: 100_000 },
         super::BrokerError::DecisionAudit {
+            source: super::AuditError::Full { maximum: 200_000 },
+        },
+        super::BrokerError::AuthorizedFailureAudit {
             source: super::AuditError::Full { maximum: 200_000 },
         },
     ] {

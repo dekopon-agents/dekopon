@@ -37,10 +37,9 @@ peer credentials and trusted workload mapping, never from request payload fields
 is the deployment adapter that does, from Unix peer credentials and owner-controlled configuration
 alone.
 
-Invocation IDs are reserved in a bounded replay ledger before policy evaluation, so repeated denied
-requests cannot later be reused for execution. Exhaustion fails closed; transport-level quotas must
-prevent an authenticated peer from consuming the ledger. A restart starts an empty process-local
-ledger, and the audit file supplies no replay identities. Authorization is non-cloneable and
+An invocation identifier binds an attestation to the proposal it travels with and names the call in
+the audit record. The broker suppresses no duplicate: a resubmitted identifier is evaluated and
+executed again ([non-goals](../../docs/design.md#non-goals)). Authorization is non-cloneable and
 consumed by provider execution.
 
 Public results carry an inert decision ID, broker and policy reference, and digest evidence.
