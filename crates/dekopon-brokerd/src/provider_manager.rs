@@ -1429,11 +1429,14 @@ fn validate_manifest(
         ));
     }
     validate_digest(&layer.digest)?;
+    // A negative `size` reaches this arm, and reporting it as "0 bytes" hid what the registry
+    // actually sent. Report `layer.size` itself.
     let Ok(size) = u64::try_from(layer.size) else {
         return Err(ProviderManagerError::registry_detail(
             COMPONENT_SIZE,
             format!(
-                "provider component is 0 bytes; maximum is {HARD_MAX_PROVIDER_COMPONENT_BYTES}"
+                "provider component is {} bytes; maximum is {HARD_MAX_PROVIDER_COMPONENT_BYTES}",
+                layer.size
             ),
         ));
     };
@@ -2584,6 +2587,37 @@ mod tests {
             challenge.scope.as_deref(),
             Some("repository:org/provider:pull")
         );
+    }
+
+    /// A registry that answers with a negative layer `size` fails `u64::try_from`, and the arm
+    /// that catches it used to print a hardcoded "0 bytes" — the one number the descriptor did not
+    /// contain. The refusal has to name what actually arrived or it points at the wrong defect.
+    #[test]
+    fn a_negative_layer_size_is_reported_as_itself() {
+        let manifest: OciProviderManifest = serde_json::from_value(serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_MANIFEST_MEDIA_TYPE,
+            "artifactType": PROVIDER_ARTIFACT_TYPE,
+            "config": {
+                "mediaType": OCI_EMPTY_CONFIG_MEDIA_TYPE,
+                "digest": OCI_EMPTY_CONFIG_DIGEST,
+                "size": 2,
+                "data": OCI_EMPTY_CONFIG_DATA
+            },
+            "layers": [{
+                "mediaType": PROVIDER_LAYER_MEDIA_TYPE,
+                "digest": OCI_EMPTY_CONFIG_DIGEST,
+                "size": -4096
+            }]
+        }))
+        .expect("manifest fixture decodes");
+
+        let Err(error) = validate_manifest(&manifest) else {
+            panic!("a negative size is refused");
+        };
+        let rendered = error.to_string();
+        assert!(rendered.contains("-4096"), "{rendered}");
+        assert!(!rendered.contains("is 0 bytes"), "{rendered}");
     }
 
     #[test]
