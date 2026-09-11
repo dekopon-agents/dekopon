@@ -5,6 +5,9 @@
 //! owner-controlled configuration, the exact fetched echo provider component, an attestor grant,
 //! identity mappings, and `via`-scoped rules. The only mock is the model endpoint, because a
 //! model is the one participant whose answer must be deterministic for a test to assert on it.
+//!
+//! The audit records are read the way an operator's log pipeline reads them: as the
+//! `dekopon_broker::audit` events the in-process broker emits.
 
 #![cfg(unix)]
 
@@ -15,15 +18,17 @@ use std::{
     os::unix::{fs::PermissionsExt as _, net::UnixStream},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
     thread,
     time::Duration,
 };
 
+use dekopon_test_support::CaptureLayer;
 use serde_json::{Value, json};
-use tokio::sync::oneshot;
+use tokio::sync::{MutexGuard, oneshot};
+use tracing_subscriber::layer::SubscriberExt as _;
 
 /// The canonical subject the broker's owner-controlled configuration maps to a principal.
 const MAPPED_SUBJECT: &str = "tel.16034700182";
@@ -127,7 +132,6 @@ fn broker_config(directory: &Path, uid: u32) -> Value {
     json!({
         "apiVersion": dekopon_brokerd::CONFIG_API_VERSION,
         "socketPath": directory.join("broker.sock"),
-        "auditPath": directory.join("audit.jsonl"),
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-gateway",
         "policiesPath": directory.join("policies.cedar"),
@@ -428,14 +432,86 @@ fn ask_when_idle(socket: &Path, subject: &str, text: &str) -> String {
     panic!("the prior gateway session did not release admission within thirty seconds");
 }
 
-/// Every audit event the broker durably recorded, in order.
-fn audit_events(path: &Path) -> Vec<Value> {
-    fs::read_to_string(path)
-        .expect("durable audit reads")
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).expect("audit record is JSON"))
-        .map(|record| record["event"].clone())
-        .collect()
+/// The broker's audit records for one test.
+///
+/// The broker runs in this process, so each `broker.decision` and `broker.execution` record is a
+/// `dekopon_broker::audit` event on the one process-wide dispatcher. A test takes
+/// [`Audit::exclusive`] before it boots anything and holds it to its end, which is what makes every
+/// record in the capture its own.
+struct Audit {
+    capture: &'static CaptureLayer,
+    _exclusive: MutexGuard<'static, ()>,
+}
+
+impl Audit {
+    async fn exclusive() -> Self {
+        static EXCLUSIVE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        static CAPTURE: OnceLock<CaptureLayer> = OnceLock::new();
+        let exclusive = EXCLUSIVE.lock().await;
+        let capture = CAPTURE.get_or_init(|| {
+            let capture = CaptureLayer::with_target_prefix("dekopon_broker::audit");
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::registry().with(capture.clone()),
+            )
+            .expect("this test binary installs its dispatcher once");
+            capture
+        });
+        capture.clear();
+        Self {
+            capture,
+            _exclusive: exclusive,
+        }
+    }
+
+    /// Every audit record so far, in order, each rendered as ` field=value…`.
+    fn records(&self) -> Vec<String> {
+        self.capture
+            .events()
+            .into_iter()
+            .map(|(fields, _)| fields)
+            .collect()
+    }
+
+    /// The first record of `event` carrying every `(field, value)` pair, as its fields render.
+    fn find(&self, event: &str, fields: &[(&str, &str)]) -> Option<String> {
+        let event = format!("\"{event}\"");
+        self.records().into_iter().find(|record| {
+            has(record, "audit.event", &event)
+                && fields
+                    .iter()
+                    .all(|(field, value)| has(record, field, value))
+        })
+    }
+
+    async fn wait_for_memory_record(&self) {
+        for _ in 0..3_000 {
+            if self
+                .find(
+                    "broker.execution",
+                    &[
+                        ("capability.id", "memory.chat.record"),
+                        ("outcome", "Succeeded"),
+                    ],
+                )
+                .is_some()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the post-acceptance memory record did not complete within thirty seconds");
+    }
+}
+
+/// Whether a rendered record has `field` rendered exactly as `value`.
+fn has(record: &str, field: &str, value: &str) -> bool {
+    let rendered = format!(" {field}={value}");
+    record.match_indices(&rendered).any(|(start, _)| {
+        record[start + rendered.len()..]
+            .chars()
+            .next()
+            .is_none_or(|next| next == ' ')
+    })
 }
 
 struct Fixture {
@@ -472,35 +548,7 @@ impl Fixture {
             .collect()
     }
 
-    fn audit(&self) -> PathBuf {
-        self.directory.path().join("audit.jsonl")
-    }
-
-    async fn wait_for_memory_record(&self) {
-        for _ in 0..3_000 {
-            let audit = self.audit();
-            if fs::read_to_string(audit).is_ok_and(|contents| {
-                contents
-                    .lines()
-                    .filter_map(|line| {
-                        serde_json::from_str::<Value>(line)
-                            .ok()
-                            .map(|record| record["event"].clone())
-                    })
-                    .any(|event| {
-                        event["type"] == "execution"
-                            && event["capability"] == "memory.chat.record"
-                            && event["outcome"] == "Succeeded"
-                    })
-            }) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("the post-acceptance memory record did not complete within thirty seconds");
-    }
-
-    /// Stops both daemons and hands back the directory, which the audit file still lives in.
+    /// Stops both daemons and hands back the directory, which provider storage still lives in.
     #[allow(
         clippy::let_underscore_must_use,
         reason = "a shutdown oneshot fails only when the daemon already exited, and the join \
@@ -531,7 +579,7 @@ async fn boot_shared(responses: Vec<Value>) -> Fixture {
     boot_in_with_scope(temporary(), responses, Some("sharedConversation")).await
 }
 
-/// Reboots both real processes over the same audit and provider-storage directory.
+/// Reboots both real processes over the same provider-storage directory.
 async fn boot_in(directory: tempfile::TempDir, responses: Vec<Value>) -> Fixture {
     boot_in_with_scope(directory, responses, None).await
 }
@@ -609,8 +657,9 @@ async fn boot_in_with_scope(
 #[tokio::test(flavor = "multi_thread")]
 async fn a_chat_message_reaches_a_provider_under_the_senders_own_principal() {
     // The property this whole daemon exists to demonstrate: the gateway holds no authority, the
-    // broker maps the sender's subject to a principal, and the durable audit attributes the effect
+    // broker maps the sender's subject to a principal, and the audit record attributes the effect
     // to that person — not to the process that relayed their message.
+    let audit = Audit::exclusive().await;
     let fixture = boot(vec![
         bash_tool_call("call-1", "echo.echo --message hi | jq -r .message"),
         final_answer("The capability echoed hi."),
@@ -624,39 +673,53 @@ async fn a_chat_message_reaches_a_provider_under_the_senders_own_principal() {
     assert_eq!(reply, "The capability echoed hi.");
     assert_eq!(fixture.model_requests.load(Ordering::SeqCst), 2);
 
-    let audit = fixture.audit();
     let _directory = fixture.shutdown().await;
 
-    let events = audit_events(&audit);
-    let execution = events
-        .iter()
-        .find(|event| event["type"] == "execution")
-        .unwrap_or_else(|| panic!("an execution record exists: {events:#?}"));
-    assert_eq!(execution["principal"], MAPPED_PRINCIPAL);
-    assert_eq!(execution["via"], GATEWAY_PRINCIPAL);
-    // The audit log's own field naming: `AuditEvent` renames variants, not fields.
-    assert_eq!(execution["attested_subject"], MAPPED_SUBJECT);
-    assert_eq!(execution["actor"]["agent"], AGENT);
-    assert_eq!(execution["capability"], "echo.echo");
-    assert_eq!(execution["outcome"], "Succeeded");
+    let principal = format!("{MAPPED_PRINCIPAL:?}");
+    let via = format!("{GATEWAY_PRINCIPAL:?}");
+    let subject = format!("{MAPPED_SUBJECT:?}");
+    let agent = format!("{AGENT:?}");
+    audit
+        .find(
+            "broker.execution",
+            &[
+                ("capability.id", "echo.echo"),
+                ("principal", &principal),
+                ("via", &via),
+                ("subject", &subject),
+                ("actor.kind", "\"agent\""),
+                ("actor.id", &agent),
+                ("outcome", "Succeeded"),
+            ],
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "an execution record names the sender: {:#?}",
+                audit.records()
+            )
+        });
 
     // The decision that authorized it agrees, and the audit carries the subject rather than the
     // message that prompted it.
-    let decision = events
-        .iter()
-        .find(|event| event["type"] == "decision")
-        .expect("a decision record exists");
-    assert_eq!(decision["allowed"], true);
-    assert_eq!(decision["principal"], MAPPED_PRINCIPAL);
-    assert_eq!(decision["via"], GATEWAY_PRINCIPAL);
-    let serialized = serde_json::to_string(&events).expect("audit serializes");
-    assert!(!serialized.contains("say hi"), "{serialized}");
+    audit
+        .find(
+            "broker.decision",
+            &[
+                ("decision.allowed", "true"),
+                ("principal", &principal),
+                ("via", &via),
+            ],
+        )
+        .unwrap_or_else(|| panic!("a decision record exists: {:#?}", audit.records()));
+    let records = audit.records().concat();
+    assert!(!records.contains("say hi"), "{records}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_persistent_route_answers_a_follow_up_with_the_exchange_before_it() {
     // The daemon assembled from its own configuration, not a hand-built runner: a second message on
     // the same conversation reaches the model with the first exchange in front of the new question.
+    let audit = Audit::exclusive().await;
     let fixture = boot(vec![
         final_answer("Two things broke."),
         final_answer("The second one was the database."),
@@ -672,7 +735,7 @@ async fn a_persistent_route_answers_a_follow_up_with_the_exchange_before_it() {
     // Local write+flush acceptance reaches the caller just before the gateway's one bounded
     // post-acceptance record finishes. Wait for its exact audited success rather than sleeping and
     // racing a slow filesystem.
-    fixture.wait_for_memory_record().await;
+    audit.wait_for_memory_record().await;
     let second = tokio::task::spawn_blocking(move || {
         ask_when_idle(&socket, MAPPED_SUBJECT, "and the second one?")
     })
@@ -702,16 +765,16 @@ async fn a_persistent_route_answers_a_follow_up_with_the_exchange_before_it() {
         ]
     );
 
-    let audit = fixture.audit();
     let _directory = fixture.shutdown().await;
-    // Conversation text may now be in opaque provider storage, but the broker's durable audit
-    // chain still never contains a word of it.
-    let serialized = serde_json::to_string(&audit_events(&audit)).expect("audit serializes");
-    assert!(!serialized.contains("what broke"), "{serialized}");
+    // Conversation text may now be in opaque provider storage, but the broker's audit records
+    // still never contain a word of it.
+    let records = audit.records().concat();
+    assert!(!records.contains("what broke"), "{records}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn explicit_shared_scope_replays_attributed_history_across_two_principals() {
+    let audit = Audit::exclusive().await;
     let fixture = boot_shared(vec![
         final_answer("Two things broke."),
         bash_tool_call(
@@ -728,7 +791,7 @@ async fn explicit_shared_scope_replays_attributed_history_across_two_principals(
         .await
         .expect("the first participant's request completes");
     assert_eq!(first, "Two things broke.");
-    fixture.wait_for_memory_record().await;
+    audit.wait_for_memory_record().await;
 
     let second = tokio::task::spawn_blocking(move || {
         ask_when_idle(&socket, OTHER_MAPPED_SUBJECT, "and the second one?")
@@ -762,26 +825,29 @@ async fn explicit_shared_scope_replays_attributed_history_across_two_principals(
         "the second authenticated principal receives one shared, provenance-labelled transcript"
     );
 
-    let audit = fixture.audit();
     let _directory = fixture.shutdown().await;
-    let events = audit_events(&audit);
     assert!(
-        events.iter().any(|event| {
-            event["type"] == "decision" && event["principal"] == OTHER_MAPPED_PRINCIPAL
-        }),
-        "the second participant still receives an independent broker decision"
+        audit
+            .find(
+                "broker.decision",
+                &[("principal", &format!("{OTHER_MAPPED_PRINCIPAL:?}"))]
+            )
+            .is_some(),
+        "the second participant still receives an independent broker decision: {:#?}",
+        audit.records()
     );
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn durable_recent_retrieves_the_accepted_turn_after_broker_and_gateway_restart() {
+    let audit = Audit::exclusive().await;
     let fixture = boot(vec![final_answer("The retained answer.")]).await;
     let socket = fixture.socket();
     let first = tokio::task::spawn_blocking(move || ask(&socket, MAPPED_SUBJECT, "remember this"))
         .await
         .expect("first request completes");
     assert_eq!(first, "The retained answer.");
-    fixture.wait_for_memory_record().await;
+    audit.wait_for_memory_record().await;
     let directory = fixture.shutdown().await;
 
     let fixture = boot_in(
@@ -823,6 +889,7 @@ async fn durable_recent_retrieves_the_accepted_turn_after_broker_and_gateway_res
 async fn an_unmapped_subject_is_refused_before_a_model_is_ever_asked() {
     // A subject the owner never mapped reaches nothing, and finding that out costs one broker round
     // trip rather than a model session. The mock model would answer if asked; it is never asked.
+    let audit = Audit::exclusive().await;
     let fixture = boot(vec![final_answer("this must never be reached")]).await;
 
     let socket = fixture.socket();
@@ -836,9 +903,8 @@ async fn an_unmapped_subject_is_refused_before_a_model_is_ever_asked() {
         "an unauthorized subject must not cost a model call"
     );
 
-    let audit = fixture.audit();
     let _directory = fixture.shutdown().await;
     // A refused capability *listing* is not an invocation, so it produces no decision record; the
-    // durable chain stays empty because nothing was ever proposed.
-    assert!(audit_events(&audit).is_empty());
+    // audit stays empty because nothing was ever proposed.
+    assert!(audit.records().is_empty(), "{:#?}", audit.records());
 }

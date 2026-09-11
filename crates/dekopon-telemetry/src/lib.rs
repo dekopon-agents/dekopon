@@ -37,7 +37,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 pub use install::{
     Console, ConsoleFilter, ConsoleFormat, ConsoleWriter, Install, InstallError, ShutdownError,
-    TelemetryGuard, optional_tracer_provider,
+    TelemetryGuard, optional_logger_provider, optional_tracer_provider,
 };
 
 /// Wire transport used to reach an OTLP receiver.

@@ -1,7 +1,7 @@
 # Container image
 
 Read [`design.md`](design.md) before this document. Packaging changes distribution, not authority:
-the image ships no configuration, no policy, no credentials, and no audit state, and both daemons
+the image ships no configuration, no policy, no credentials, and no runtime state, and both daemons
 read owner-owned files that the deployment provides.
 
 [`../Dockerfile`](../Dockerfile) builds the image;
@@ -141,9 +141,9 @@ In Kubernetes the same selection is `command: ["dekopon-brokerd"]` or `command: 
 - No credentials. `dekopon-brokerd` reads an optional credentials file, an optional private
   secret map, and any source bootstrap files the deployment provides; `dekopond` reads environment
   variables the deployment sets. None is baked.
-- No socket or audit log. Those are runtime state on a writable volume, and `broker.yaml` requires
-  an `auditPath`. *Committed direction:* opt-in sink, off by default; audit is a log record in the
-  trace ([non-goals](design.md#non-goals)).
+- No socket. It is runtime state on a writable volume. Audit needs no volume: it is a log record on
+  the container's stdout, and an OTLP log record when `telemetry` is configured
+  ([the broker audit record](observability.md#the-broker-audit-record)).
 - No system CA store dependency. `reqwest` and `ureq` use rustls with compiled-in webpki roots, so
   outbound TLS does not consult `/etc/ssl`.
 

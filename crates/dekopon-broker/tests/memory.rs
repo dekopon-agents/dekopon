@@ -1380,7 +1380,7 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
     let records = audit.records().await;
     assert_eq!(records.len(), 5);
     for record in records {
-        match record.event {
+        match record {
             AuditEvent::Decision {
                 invocation,
                 principal,

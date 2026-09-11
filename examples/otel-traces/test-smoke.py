@@ -28,8 +28,11 @@ class SmokeControls(unittest.TestCase):
             self.write(row["daemon"] + ".log", "{}\n" + json.dumps(row) + "\n", raw=True)
         self.write("openobserve-auth-header", "Authorization: Basic fake-ingest-token", raw=True)
         self.write("shipped.json", self.rows)
+        # What the broker's own log exporter delivers, beside the rows this script ships.
+        self.audit = {"trace_id": "1" * 32, "span_id": "a" * 16,
+                      "audit.event": "broker.decision"}
         self.response("search.json", self.rows)
-        self.response("log-search.json", self.rows)
+        self.response("log-search.json", self.rows + [self.audit])
 
     def write(self, name, value, raw=False):
         (self.folder / name).write_text(value if raw else json.dumps(value))
@@ -63,6 +66,16 @@ class SmokeControls(unittest.TestCase):
     def test_gateway_only_delivery_with_same_count_fails(self):
         self.response("log-search.json", [self.rows[0], self.rows[0]])
         with self.assertRaisesRegex(AssertionError, "correlation missing for dekopon-brokerd"):
+            self.correlate()
+
+    def test_missing_exported_audit_record_fails(self):
+        self.response("log-search.json", self.rows)
+        with self.assertRaisesRegex(AssertionError, "broker.decision"):
+            self.correlate()
+
+    def test_shipped_audit_record_does_not_stand_for_an_exported_one(self):
+        self.response("log-search.json", self.rows + [dict(self.audit, daemon="dekopon-brokerd")])
+        with self.assertRaisesRegex(AssertionError, "broker.decision"):
             self.correlate()
 
     def test_wrong_exported_span_fails(self):

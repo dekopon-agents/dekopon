@@ -18,13 +18,13 @@ metadata:
   labels:
     {{- include "dekopon.labels" . | nindent 4 }}
 spec:
-  # Not configurable. dekopon-brokerd is a singleton: it holds an exclusive flock on the audit log
-  # and a second broker against the same volume cannot start.
+  # Not configurable. Each seed-once ChatGPT credential rotates its refresh token, and two holders
+  # of one family eventually revoke it for both.
   replicas: 1
   revisionHistoryLimit: 2
   strategy:
-    # Never RollingUpdate. A rollout that briefly runs two brokers cannot work — the new one fails
-    # to take the lock — and the RWO volume cannot be attached twice either.
+    # Never RollingUpdate. A rollout that briefly runs two pods runs two holders of each rotating
+    # credential, and the RWO volume cannot be attached twice either.
     type: Recreate
   selector:
     matchLabels:
@@ -108,16 +108,6 @@ spec:
                 chown 0:0 "$d"
                 chmod 0700 "$d"
               done
-              # A prior chart used the claim root for broker files. Refuse an unmigrated claim.
-              for f in audit.jsonl; do
-                if [ -e "{{ $state }}/$f" ]; then
-                  echo "move broker state into the claim's broker/ directory before upgrading" >&2
-                  exit 1
-                fi
-              done
-              mkdir -p "{{ $state }}/broker"
-              chown 0:0 "{{ $state }}/broker"
-              chmod 0700 "{{ $state }}/broker"
               rm -f {{ $cfg }}/* {{ $gcfg }}/*
 
               # Copy, never mount. Each of these becomes a fresh regular file: one link, mode
@@ -216,11 +206,11 @@ spec:
               fi
 {{- end }}
 
-              # Private config and audit parents must be 0700 and owned by
+              # Private config and provider-storage parents must be 0700 and owned by
               # the runtime UID, and every ancestor up to / must be a directory that is not
               # group- or world-writable unless it is sticky. An emptyDir arrives root-owned and
               # 0777 and a local-path volume arrives root-owned and 0777, so both need this.
-              for d in {{ $cfg }} {{ $state }}/broker{{ if .Values.providerStorage.enabled }} {{ $storageRoot }} {{ $storageKeyDir }}{{ end }}; do
+              for d in {{ $cfg }}{{ if .Values.providerStorage.enabled }} {{ $storageRoot }} {{ $storageKeyDir }}{{ end }}; do
                 chmod 0700 "$d"
                 chown "$uid:$gid" "$d"
                 got=$(stat -c '%u:%a:%F' "$d")
@@ -384,7 +374,7 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: {{ .Values.volumeSizes.tmp }}
-        # Retained audit and model-credential state on one real filesystem. The backing
+        # Retained model-credential state on one real filesystem. The backing
         # store has to honour no-follow opens, advisory exclusive locks, same-directory atomic
         # rename, and file and directory fsync. tmpfs does not qualify and neither does anything
         # networked; local-path on ext4 does.

@@ -28,9 +28,6 @@ thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 
-[target.'cfg(unix)'.dependencies]
-libc.workspace = true
-
 [dev-dependencies]
 dekopon-test-support = { path = "../dekopon-test-support" }
 tempfile.workspace = true

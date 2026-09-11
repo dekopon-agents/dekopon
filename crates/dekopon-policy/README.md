@@ -101,7 +101,7 @@ Everything is startup-fixed. There is no per-request parsing, compilation, or en
 ## Explaining a decision
 
 `PolicyDecision::determining_policy_ids` carries the identifiers of the policies that decided the
-answer, sorted, and the broker writes them into every audit record as `policy_ids`. Cedar names
+answer, sorted, and the broker writes them into every audit record as `policy.ids`. Cedar names
 text-parsed policies positionally (`policy0`, `policy1`, …); an optional `@id("…")` annotation
 replaces that with a stable name, which is what an audit trail wants:
 
@@ -119,7 +119,7 @@ would make an explanation ambiguous, so it refuses startup.
 `PolicyEngine::digest()` is a `sha256:` fingerprint over the canonicalized policy set plus the
 sorted entity and action identifiers, domain-separated with `dekopon-policy-v1\0`. Two brokers
 reporting the same digest evaluated the same authorization surface. It is recorded alongside
-`policy_ids` as `policy_digest`, and it is a correlation aid rather than a wire-format contract.
+`policy.ids` as `policy.digest`, and it is a correlation aid rather than a wire-format contract.
 
 Part of the [Dekopon](https://github.com/dekopon-agents/dekopon) workspace; see `docs/design.md` for
 the authority model and `docs/security-model.md` for the trust boundaries this adapter informs but

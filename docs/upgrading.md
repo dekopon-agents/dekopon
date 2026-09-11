@@ -93,12 +93,24 @@ the real credential rather than working around the refusal.
 
 ## Broker audit configuration (unreleased)
 
-Use only the current [broker configuration fields](../crates/dekopon-brokerd/README.md#configuration);
-obsolete audit settings are rejected as unknown fields. Keep the private audit file and its
-line-size bound. Startup counts bounded newline-delimited records without decoding history and
-refuses unterminated tails. Appends are flushed, not fsynced; there is no automatic repair,
-historical integrity check, or crash-durability guarantee. Library callers of `run` receive unit on
-clean shutdown.
+Delete `auditPath` and `serverLimits.auditMaxLineBytes` from `broker.yaml` before upgrading. Both
+are unknown fields, and `broker.yaml` rejects unknown fields, so a broker started on a file that
+still names either refuses to start and names the field. A configuration that still carries
+`checkpointPath`, `checkpointLockPath`, or `serverLimits.auditMaxRecords` from 0.12.0 is refused the
+same way; delete those too. `serverLimits` stays all-or-nothing, so every field it has left is still
+required when the section is present.
+
+There is no on-disk audit. Every broker decision is a `broker.decision` or `broker.execution` record
+on the daemon's stdout JSON, and an OTLP log record as well once `telemetry` names a receiver
+([the broker audit record](observability.md#the-broker-audit-record)). An existing `audit.jsonl` is
+read by nothing and may be deleted. To keep audit past a pod restart, configure `telemetry`; without
+it, audit lasts as long as whatever keeps the broker's stdout. Losing the log exporter loses audit.
+
+Under the Helm chart, the chart's default `broker.yaml` sets neither field. A `broker.yaml` you
+supply yourself — `broker.config.inline`, or the key `broker.config.existingSecret` names — must
+drop them too.
+
+Library callers of `run` receive unit on clean shutdown.
 
 ## Provider storage direct-write contract
 
@@ -132,13 +144,14 @@ mechanics. The container image and the chart ship both daemon executables from o
 `dekopond` asks the broker for capabilities once at startup and **exits non-zero** if the broker does
 not answer, so a gateway started against a stopped broker crash-loops rather than waiting. Shutdown
 runs the other way: the gateway drains first so no session is mid-invocation when the broker begins
-finishing its audit appends.
+draining.
 
 Dekopon ships no service units, so the order is yours to enforce whatever supervises the processes:
 
 1. Stop `dekopond`.
 2. Signal `dekopon-brokerd` with `SIGINT` or `SIGTERM` and let it finish. It stops accepting, drains
-   bounded in-flight connections, finishes audit appends, logs `broker_stopped`, and removes only the socket inode it created.
+   bounded in-flight connections, removes only the socket inode it created, logs `broker_stopped`,
+   and flushes any configured OTLP exporter, whose last batch carries the final audit records.
 3. Replace the binaries and make any configuration edits the release notes below call for.
 4. Start `dekopon-brokerd` and wait for it to be answering on its socket.
 5. Start `dekopond`.
@@ -147,9 +160,9 @@ Under the Helm chart this ordering is structural rather than procedural: the bro
 sidecar with a startup probe, so Kubernetes will not start `dekopond` until the broker answers a real
 request, and terminates them in the reverse order.
 
-Keep audit data when upgrading or investigating a refusal. Restarting does not make an uncertain
-external effect safe to retry.
-See [`operations.md`](operations.md#append-only-audit).
+Read the broker's audit records before restarting it to investigate a refusal: without `telemetry`,
+they exist only in its stdout. Restarting does not make an uncertain external effect safe to retry.
+See [`operations.md`](operations.md#audit).
 
 ## Release-by-release
 
@@ -543,12 +556,12 @@ defaults to, so a chart release and an application release are two separate upgr
 application under an existing chart, set `image.tag` (or better, `image.digest`) rather than waiting
 for a chart release. [`charts/dekopon/README.md`](../charts/dekopon/README.md#two-version-numbers)
 has the full account, including the retained-claim behavior that makes `helm uninstall` leave the
-audit log in place.
+state claim and the credentials it holds in place.
 
 ## Related documents
 
 - [`CHANGELOG.md`](../CHANGELOG.md) — the authoritative record of what each release contains.
-- [`operations.md`](operations.md) — the running-system runbook, including audit append failures.
+- [`operations.md`](operations.md) — the running-system runbook, including where broker audit lives.
 - [`dekopon-brokerd` contract](../crates/dekopon-broker-protocol/README.md#version-and-compatibility) — what a version mismatch actually
   does on the wire.
 - [`catalog.md`](catalog.md) — the catalog schema an upgrade may need you to re-read.

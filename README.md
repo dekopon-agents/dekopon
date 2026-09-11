@@ -19,7 +19,7 @@ Ordered by the goals it serves. Credentials stay inside the broker:
 One complete trace per message:
 
 - Correlated OpenTelemetry traces and logs across transport receipt, agent session, model turn, shell command, broker decision, provider invocation, and native HTTP egress. [`examples/otel-traces`](examples/otel-traces/README.md) runs an OpenObserve receiver and a real gateway/broker smoke test.
-- Append-only JSONL audit records carrying the decision and the outcome.
+- Broker audit as one structured log record per decision and per outcome, inside the same trace.
 
 Extensibility through Wasm providers:
 
@@ -108,7 +108,7 @@ A multi-architecture container image publishes to `ghcr.io/dekopon-agents/dekopo
 
 ### Before running the broker
 
-`dekopon-brokerd` requires an owner-controlled strict configuration, a protected socket directory and private audit directory, and pinned provider component paths:
+`dekopon-brokerd` requires an owner-controlled strict configuration, a protected socket directory, and pinned provider component paths:
 
 ```console
 dekopon-brokerd --config /path/to/broker.yaml
@@ -120,7 +120,7 @@ For Kubernetes, [`charts/dekopon`](charts/dekopon/README.md) runs both daemons a
 
 ## Run the flagship example
 
-[`examples/conditional-write`](examples/conditional-write/README.md) is the whole system in one deployment: a mapped sender asks in Slack for a record to be updated, the gateway attests to the sender and decides nothing, and the broker authorizes one bounded read and one etag-pinned conditional write. The delete the same component exposes is absent, and unreachable: no constraint set describes it. The broker injects a token bound to `api.example.com` and appends owner-only JSONL audit records naming the person who asked; the token is never visible to the model, shell session, or component. Catalog, broker configuration, Cedar policy, credentials template, gateway configuration, and the deny table are pinned against the real machinery by `crates/dekopon-brokerd/tests/examples.rs`.
+[`examples/conditional-write`](examples/conditional-write/README.md) is the whole system in one deployment: a mapped sender asks in Slack for a record to be updated, the gateway attests to the sender and decides nothing, and the broker authorizes one bounded read and one etag-pinned conditional write. The delete the same component exposes is absent, and unreachable: no constraint set describes it. The broker injects a token bound to `api.example.com` and emits audit records naming the person who asked; the token is never visible to the model, shell session, or component. Catalog, broker configuration, Cedar policy, credentials template, gateway configuration, and the deny table are pinned against the real machinery by `crates/dekopon-brokerd/tests/examples.rs`.
 
 The GitHub reviewer walkthrough ships with its provider: [`examples/pr-summarizer-linter`](https://github.com/dekopon-agents/dekopon-provider-gh/blob/main/examples/pr-summarizer-linter/README.md) in `dekopon-provider-gh`.
 

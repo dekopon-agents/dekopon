@@ -18,9 +18,8 @@ pub const MAX_ACCEPT_BACKOFF_MS: u64 = 1_000;
 /// Stable, low-cardinality name for an `accept` failure the loop can survive, or `None` if fatal.
 ///
 /// Exiting is the expensive answer for the caller that can: that is the privileged daemon, so the
-/// process ends, the container restarts, every provider recompiles under Cranelift before the
-/// socket rebinds, and durable audit state waits through all of it — minutes, against a
-/// five-minute startup probe. Process or system descriptor exhaustion, kernel buffer exhaustion,
+/// process ends, the container restarts, and every provider recompiles under Cranelift before the
+/// socket rebinds — minutes, against a five-minute startup probe. Process or system descriptor exhaustion, kernel buffer exhaustion,
 /// a client that vanished between its connect and this accept, and a signal interruption are all
 /// conditions the next accept can succeed through. None of them say the listener is broken,
 /// and none are worth a cold start.
@@ -58,8 +57,8 @@ mod tests {
     use super::retryable_accept_error;
 
     /// One transient `accept` failure used to end the privileged daemon, and ending it is the most
-    /// expensive answer available: the container restarts, every provider recompiles under
-    /// Cranelift before the socket rebinds, and durable audit state waits through all of it.
+    /// expensive answer available: the container restarts, and every provider recompiles under
+    /// Cranelift before the socket rebinds.
     /// Process or system descriptor exhaustion is not a broken listener and must remain retryable.
     /// Keep permanent listener faults on the fatal path.
     #[test]

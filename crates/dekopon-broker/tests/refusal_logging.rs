@@ -408,7 +408,7 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
         let records = audit.records().await;
         let decision = records
             .iter()
-            .find_map(|record| match &record.event {
+            .find_map(|record| match record {
                 AuditEvent::Decision {
                     invocation,
                     reason,

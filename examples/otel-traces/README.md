@@ -19,8 +19,8 @@ examples/otel-traces/smoke-test.sh
 
 The script builds both daemons, creates private temporary configuration and a `0600`
 local chat socket, sends one request, receives one JSON response line, and verifies two
-model calls and the broker's successful authorized echo audit event. The model first
-proposes a bash tool call and then answers from its actual provider result.
+model calls and the successful authorized echo's `broker.execution` audit record on the broker's
+stdout. The model first proposes a bash tool call and then answers from its actual provider result.
 
 Both daemons export traces over OTLP/HTTP and deliver logs as structured stdout. A
 smoke-only Python shipper submits all captured JSON stdout records to OpenObserve's

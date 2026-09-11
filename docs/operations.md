@@ -6,24 +6,21 @@ broker is [`crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.
 gateway it is [`dekopond.md`](dekopond.md). This page exists so an operator can find them by the
 question they arrived with, rather than by guessing that a crate README is the operations manual.
 
-## Append-only audit
+## Audit
 
-`dekopon-brokerd` appends metadata-only records to an owner-only JSONL file. Startup counts
-bounded newline-delimited records for the next ordinal without decoding or verifying history;
-unterminated tails are refused, not repaired. Appends are flushed, not fsynced. A failed or
-cancelled append can leave partial bytes and poisons the open handle.
+`dekopon-brokerd` records every decision as a metadata-only `broker.decision` or `broker.execution`
+log record inside the caller's trace: a JSON line on stdout always, and an OTLP log record when
+`broker.yaml` has a `telemetry` block. Without `telemetry`, audit lasts as long as whatever keeps
+the broker's stdout — `kubectl logs` for a pod — so a deployment that must keep audit past a pod
+restart configures `telemetry`. Losing the exporter loses audit.
 
-*Committed direction:* opt-in sink, off by default; audit is a log record in the trace
-([non-goals](design.md#non-goals)).
+Audit records do not establish whether retrying an external effect is safe: the broker suppresses
+no duplicate, so a resubmitted invocation identifier runs again. Tamper-detection, rollback
+protection, crash recovery, and duplicate-effect defence are [non-goals](design.md#non-goals).
 
-Persisted audit records do not establish whether retrying an external effect is safe: the broker
-suppresses no duplicate, so a resubmitted invocation identifier runs again. Tamper-detection,
-rollback protection, crash recovery, and duplicate-effect defence are
-[non-goals](design.md#non-goals). Preserve audit data when investigating an append failure; do
-not erase it to bypass a startup refusal.
-
-Full append mechanics, bounds, and private-file requirements:
-[`crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.md#audit).
+Record fields and correlation:
+[`observability.md` § The broker audit record](observability.md#the-broker-audit-record). Where the
+daemon sends them: [`crates/dekopon-brokerd/README.md`](../crates/dekopon-brokerd/README.md#audit).
 
 ## By the question you arrived with
 
@@ -85,8 +82,8 @@ most often come up while operating are:
 - **IPC group membership is not identity.** The [current local process boundary](security-model.md#current-local-process-boundary)
   separates gateway and broker UIDs; the broker maps the real peer UID, not its group.
   Each mapped UID remains its own trust domain, not independent process attestation.
-- **Audit is append-only evidence, not tamper-proof or crash-durable storage.** A restart is not
-  permission to retry an effect. See [Append-only audit](#append-only-audit).
+- **Audit is a log record, not tamper-proof or crash-durable storage.** A restart is not
+  permission to retry an effect. See [Audit](#audit).
 
 [`security-model.md`](security-model.md) is the full statement of what is trusted, what is not, and
 what is presently out of scope.

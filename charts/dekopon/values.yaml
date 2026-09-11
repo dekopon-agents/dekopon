@@ -85,7 +85,7 @@ initSecurityContext:
 #   <configDir>/broker-credentials.yaml   0600 65532  (Tier A: mode & 0o077, uid, nlink)
 #   <configDir>/dekopond.yaml             0600 65533  (gateway-only volume)
 #   <runtimeDir>/broker.sock              0710 dir, 65532:65534; broker binds the 0660 socket
-#   <stateDir>/audit.jsonl                0700 dir, 65532-owned; broker creates the 0600 file
+#   <stateDir>/<chatgpt.subdir>/          0700 dir owned by its daemon; seed-once ChatGPT credential
 #   <catalogDir>/<catalog key>            no checks at all; a plain ConfigMap mount
 paths:
   configDir: /etc/dekopon
@@ -111,7 +111,6 @@ broker:
     inline: |
       apiVersion: dekopon.dev/brokerd/v1alpha1
       socketPath: /run/dekopon/broker.sock
-      auditPath: /var/lib/dekopon/audit.jsonl
       brokerPrincipal: local-broker
       policyRevision: chart-default
       policiesPath: /etc/dekopon/policies.cedar
@@ -134,13 +133,10 @@ broker:
             timeoutMs: 30000
             maxOutputBytes: 1048576
       serverLimits:
-        # A present section requires every field. These are the daemon's own defaults except
-        # auditMaxLineBytes, which bounds each record, not lifetime file growth.
-        # Monitor disk space — see "Sizing the audit volume" in README.md.
+        # A present section requires every field. These are the daemon's own defaults.
         maxFrameBytes: 2097152
         ioTimeoutMs: 30000
         maxConnections: 64
-        auditMaxLineBytes: 8192
         shutdownGraceMs: 120000
       hostLimits:
         # Unlike serverLimits, hostLimits defaults field by field: everything omitted here keeps
@@ -390,26 +386,24 @@ gateway:
     annotations: {}
 
 # ---------------------------------------------------------------------------------------------
-# Audit state
+# Model-credential state
 # ---------------------------------------------------------------------------------------------
-# Persistent audit and model-credential state is retained across releases.
+# The seed-once ChatGPT credentials are retained across releases. Audit is not here: it is the
+# broker's log record, on stdout and on the OTLP receiver its telemetry block names.
 state:
   # local-path is the target cluster's only StorageClass. It is RWO and — this is the part that
   # matters — ALLOWVOLUMEEXPANSION is false. This claim CANNOT BE GROWN LATER. Replacing it means
-  # deliberately moving the retained audit and live model credential to the new volume.
+  # deliberately moving the live model credentials to the new volume.
   storageClassName: local-path
   accessModes: [ReadWriteOnce]
-  # Audit appends have no total record cap: size for expected traffic and retention, and monitor
-  # disk usage before this fixed-size volume fills. The per-record byte bound is not a disk budget.
-  # See README.md ("Sizing the audit volume").
   size: 2Gi
-  # Named annotation, not a comment: helm uninstall must not delete the audit log.
+  # Named annotation, not a comment: helm uninstall must not delete the live model credentials.
   keepOnUninstall: true
   # Bring your own claim instead. Init keeps its root 0:0/0700; each daemon mounts only
   # its own private subdirectory. See the offline layout migration in the chart README.
   existingClaim: ""
 
-# Optional provider storage is physically and lifecycle-separate from audit state. The generated
+# Optional provider storage is physically and lifecycle-separate from the state claim. The generated
 # claim is always retained. The namespace key is operator-managed and never chart-created, so an
 # uninstall cannot destroy the only key capable of reopening retained data.
 providerStorage:
@@ -439,10 +433,10 @@ volumeSizes:
 # for its own shutdownGraceMs and dekopon-brokerd only then drains connections for its
 # serverLimits.shutdownGraceMs; both default to 120000, so the default here is 120 + 120 +
 # drainBudget.bufferSeconds. Whichever daemon is still draining when this expires is SIGKILLed,
-# which for the broker is mid-invocation and mid-audit-append.
+# which for the broker is mid-invocation.
 #
 # The chart asserts this at template time, so lowering it without lowering a shutdownGraceMs is a
-# refused render rather than a kill nobody sees until an audit record is torn.
+# refused render rather than a kill nobody sees until an invocation is cut off.
 terminationGracePeriodSeconds: 270
 
 drainBudget:
