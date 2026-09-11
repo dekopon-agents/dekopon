@@ -425,6 +425,15 @@ All notable changes to Dekopon are documented here. The format is based on
   at the same read the compiler consumed. `identify_bytes` and the SDK's `item_kind` and
   `function_signature` stay.
 
+- Removed the SDK host module's effect gate, retired with `dekopon-provider-host`. A semver break in
+  the published `dekopon-provider-sdk`: `host::validate_manifest` takes only the manifest, and
+  `ManifestRejection` is a struct with a public `message` rather than an enum, because
+  `UnsupportedEffect` was its other variant. The only host left never gated on an effect — policy
+  authorizes one per invocation — so the parameter had one caller passing `None`. For the same
+  reason `host::ConflictWording`, `ProviderConflicts::wording`, and the argument to
+  `ConflictScan::new` are gone: one host means one wording, and the conflict report itself is
+  unchanged — every reserved-word and duplicate collision in a provider set, reported at once,
+  fatal at boot.
 - Retired the `dekopon`, `dekopon-webui`, `dekopon-run`, and `dekopon-provider-host` crates. Only `dekopond` and `dekopon-brokerd` ship as binaries; shared agent, shell, model, SDK, and broker libraries remain. Recorded-session listing, transcript reconstruction, and model replay went with the runner, out of `dekopon-agent` as well; live agent tools and telemetry are unaffected. Published versions are not recalled or yanked; publication and a later independent console repin remain follow-ups.
 - Broker audit-chain verification, replay restoration from disk, and the `audit verify` command.
   Audit records now append only `sequence` and `event`; existing bytes are not migrated or
