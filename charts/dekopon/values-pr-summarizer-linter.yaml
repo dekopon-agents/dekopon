@@ -1,6 +1,6 @@
 # A realistic override set: the pr-summarizer-linter deployment, moved onto the chart's paths.
-# Slack in, one agent, six narrow gh capabilities, one broker-injected GitHub token, and an owner-only
-# append-only JSONL audit log.
+# Slack in, one agent, six narrow gh capabilities, one broker-injected GitHub token, and every broker
+# decision exported as an audit log record.
 #
 # The walkthrough itself lives with the provider it exercises, in dekopon-agents/dekopon-provider-gh.
 # This file stays here because it is a test of *this* chart against the component the image ships:
@@ -16,7 +16,6 @@ broker:
     inline: |
       apiVersion: dekopon.dev/brokerd/v1alpha1
       socketPath: /run/dekopon/broker.sock
-      auditPath: /var/lib/dekopon/audit.jsonl
       brokerPrincipal: local-broker
       policyRevision: pr-summarizer-linter-2026-01
       credentialsPath: /etc/dekopon/broker-credentials.yaml
@@ -145,7 +144,6 @@ broker:
         maxFrameBytes: 2097152
         ioTimeoutMs: 30000
         maxConnections: 64
-        auditMaxLineBytes: 8192
         shutdownGraceMs: 120000
       telemetry:
         endpoint: http://rpi.localdomain

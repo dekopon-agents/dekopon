@@ -714,6 +714,27 @@ All notable changes to Dekopon are documented here. The format is based on
 - `docs/dekopond.md` cites the chart's real 270 s pod grace, and `docs/catalog.md` agrees with its
   own four-row reserved-fields table. (#33)
 
+## [dekopon-chart-0.5.0] - 2026-09-11
+
+### Removed
+
+- The chart's broker keeps no audit file. The default `broker.config.inline` and
+  `values-pr-summarizer-linter.yaml` no longer set `auditPath` or `serverLimits.auditMaxLineBytes`,
+  which the broker refuses as unknown fields; an inline or `existingSecret` `broker.yaml` has to
+  drop both before it runs an image with that broker. The broker container no longer mounts the
+  state claim's `broker/` subdirectory, so it sees the claim only through its own ChatGPT credential
+  subdirectory when `broker.chatgpt` is enabled; the init container no longer creates `broker/`,
+  refuses a root-level `audit.jsonl`, or reserves `broker` as a ChatGPT `subdir`. The state claim
+  stays for the two seed-once ChatGPT credentials. Audit is the broker's `broker.decision` and
+  `broker.execution` log records, on the pod's stdout and on the OTLP receiver `telemetry` names.
+  An `audit.jsonl` left on an existing claim is inert.
+
+### Changed
+
+- `ci/verify-init-permissions.sh` asserts that neither daemon mounts the claim root, and drops the
+  audit-parent tier, the unmigrated-layout refusal, and the reserved-subdirectory render checks with
+  the behaviour they covered.
+
 ## [dekopon-chart-0.4.0] - 2026-09-10
 
 ### Added

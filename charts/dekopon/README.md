@@ -45,7 +45,8 @@ both directions. `dekopond` probes the broker once at startup and exits non-zero
 does not answer, so a plain second container would crash-loop its way to a working state; a sidecar
 with a startup probe means Kubernetes does not start `dekopond` at all until the broker answers a
 real request. Termination runs the other way — the gateway drains first, the broker second — which
-is the order the audit log wants, and the reason the pod's grace is a sum rather than a maximum;
+lets the gateway's in-flight invocations finish against a broker that is still serving, and is the
+reason the pod's grace is a sum rather than a maximum;
 see [Draining takes both graces, in sequence](#draining-takes-both-graces-in-sequence). This needs
 Kubernetes 1.29 or newer, and `Chart.yaml` declares `kubeVersion: ">=1.29.0-0"` so an older cluster
 refuses the install instead of deadlocking on an init container that never exits.
@@ -57,9 +58,9 @@ wrong:
 
 | Tier | Applies to | Rule |
 |---|---|---|
-| A | `broker-credentials.yaml`, `secret-map.yaml`, the audit JSONL | rejected if `mode & 0o077 != 0` |
+| A | `broker-credentials.yaml`, `secret-map.yaml` | rejected if `mode & 0o077 != 0` |
 | B | `broker.yaml`, `policies.cedar`, `dekopond.yaml`, provider `.wasm` files and their parents | rejected if `mode & 0o022 != 0` |
-| C | audit parent directories | must be `0700` and owned by the runtime UID |
+| C | the parent of `compileCachePath` and of a `chatgptSubscription` `authFile` | must be `0700` and owned by the runtime UID |
 | D | every ancestor up to `/` | must be a directory that is not group- or world-writable unless sticky |
 | E | `catalogPath` | no checks at all |
 
@@ -142,20 +143,18 @@ files; it does not rewrite configuration.
 Both containers use `paths.configDir` at runtime, but these are **different tmpfs volumes**.
 Init mounts the gateway volume at `paths.gatewayConfigDir` (default `/etc/dekopon-gateway`)
 only to copy its `dekopond.yaml` as UID 65533. Broker copies remain UID 65532.
-The state claim root stays root-owned `0700`; the broker mounts only its `broker/`
-subdirectory at `paths.stateDir` plus, with `broker.chatgpt` enabled, its own credential
-subdirectory beside it, and the gateway mounts only the configured ChatGPT subdirectory.
-Neither ChatGPT subdirectory may be `broker`. Neither daemon can rename the other's directory.
+The state claim root stays root-owned `0700` and neither daemon mounts it. With `broker.chatgpt`
+enabled the broker mounts only its own credential subdirectory, and the gateway mounts only the
+configured ChatGPT subdirectory. Neither daemon can rename the other's directory.
 Private subdirectories are `0700`; files are `0600` with one link. Each daemon gets a separate
 `/tmp` volume. The broker alone mounts provider storage and its namespace key.
 
-**Upgrade with both daemons stopped:** move existing broker-owned files from the state
-claim root into a `broker/` directory owned by `65532:65532`, mode `0700`, preserving
-file bytes and private modes. The init container refuses the old root audit
-layout rather than silently starting elsewhere. Change an existing ChatGPT directory and
-its live credential to `65533:65533`, keeping directory `0700` and file `0600`; do not
-reseed a rotated token. Update the gateway peer mapping and explicit server pin in operator
-configuration. These are offline operator steps, not a live-cluster action performed by this chart.
+**Upgrade with both daemons stopped:** an `audit.jsonl` on the claim, at its root or under
+`broker/`, is inert; the broker keeps no audit file, so delete it once any records you want are
+copied off. Change an existing ChatGPT directory and its live credential to `65533:65533`, keeping
+directory `0700` and file `0600`; do not reseed a rotated token. Update the gateway peer mapping and
+explicit server pin in operator configuration. These are offline operator steps, not a live-cluster
+action performed by this chart.
 
 | File | Path | Tier | Written by |
 |---|---|---|---|
@@ -166,14 +165,13 @@ configuration. These are offline operator steps, not a live-cluster action perfo
 | optional secret source projection | operator-selected absolute path | source-specific | mounted read-only into broker only through `broker.secretSourceVolumes` |
 | `dekopond.yaml` | `/etc/dekopon/dekopond.yaml` | B | init container |
 | broker socket | `/run/dekopon/broker.sock` | protected IPC | the broker, at bind |
-| audit log | `/var/lib/dekopon/audit.jsonl` | A + C | the broker |
 | agent catalog | `/etc/dekopon-catalog/dekopon.yaml` | E | ConfigMap mount |
 | gateway ChatGPT credential | `/var/lib/dekopon/chatgpt/chatgpt-auth.json` | none | init container, **once**; then `dekopond` owns it |
 | broker ChatGPT credential | `/var/lib/dekopon/broker-chatgpt/chatgpt-auth.json` | A + writable parent | init container, **once**; then `dekopon-brokerd` owns it |
 | providers | `/opt/dekopon/providers/*.wasm` | B | baked into the image |
 
 `/etc/dekopon` and `/run/dekopon` are memory-backed `emptyDir`s, so the credentials file and the
-socket never reach the node's disk. `/var/lib/dekopon` is the retained audit and model-credential claim.
+socket never reach the node's disk. `/var/lib/dekopon` is the retained model-credential claim.
 
 ## Probes
 
@@ -181,15 +179,15 @@ There is no HTTP health endpoint, and the image is distroless with no shell, so 
 run `dekopon-brokerd probe --socket /run/dekopon/broker.sock`, which connects
 over the real socket, passes `SO_PEERCRED` in both directions, and gets back the capability list
 policy exposes to this peer. It is evaluated from the constraint catalog and the policy set and
-appends **no audit record**, so probing adds no audit-file growth.
+emits **no audit record**.
 
 - **`startupProbe`**, 5 s period, 60 failures — five minutes. The broker compiles every `.wasm`
   component through Cranelift before it binds the socket, so "the socket answers" is exactly "fully
   started". Components compile concurrently rather than one at a time, and `compileCachePath` makes
   a restart read compiled code back from disk instead of recompiling, but the cold path runs
   Cranelift and the probe budget has to cover it. The
-  margin is large because a startup probe that gives up restarts the container, and a restart loop
-  against audit state is the worst thing this chart can produce.
+  margin is large because a startup probe that gives up restarts the container, and every restart
+  starts the compile over.
 - **Broker `readinessProbe`**, 30 s period. It keeps pod readiness truthful and, when the optional
   webhook Service is enabled, prevents traffic while the broker is unavailable.
 - **Gateway `readinessProbe`**, only with `gateway.service.enabled`. A TCP probe gates the Service
@@ -213,13 +211,13 @@ larger of the two. `dekopond` drains in-flight sessions for its own `shutdownGra
 `120000`.
 
 Whatever is draining when the pod's grace expires is `SIGKILL`ed. For the gateway that
-abandons a model turn somebody is waiting on; for the broker it lands mid-invocation and
-mid-audit-append, which is the one place this chart cannot promise a clean failure.
+abandons a model turn somebody is waiting on; for the broker it lands mid-invocation, which is the
+one place this chart cannot promise a clean failure.
 
 `terminationGracePeriodSeconds` therefore defaults to **270** — 120 + 120 +
 `drainBudget.bufferSeconds` — and the chart asserts the arithmetic at template time. A grace shorter
 than the two configured graces plus the buffer is a refused `helm template` naming both numbers, not
-a kill nobody notices until a record is torn:
+a kill nobody notices until an invocation is cut off:
 
 ```console
 $ helm template dekopon charts/dekopon -f charts/dekopon/values-pr-summarizer-linter.yaml \
@@ -386,10 +384,9 @@ writes. Those annotations exist to push a changed file into a pod that only read
 is the one file whose entire purpose is *not* to be pushed in: the copy in the volume is
 authoritative, so an annotation would restart a working gateway to achieve nothing at all.
 
-### One replica, for two reasons
+### One replica
 
-`replicas: 1` and `strategy: Recreate` are forced by the broker's exclusive `flock` on the
-audit log. With this model kind they are load-bearing a second time:
+`replicas: 1` and `strategy: Recreate` are forced by the rotating credential:
 `CredentialFile` serializes refreshes behind a per-process snapshot and an advisory lock on a sibling
 `.lock` file, so two holders in one pod coordinate — the gateway's model client and the broker's
 credential kind both go through it — but two *pods* sharing one claim would race the rotation and the
@@ -406,27 +403,10 @@ The broker configuration's legacy `credential`/`credentialByAgent` selection is
 [planned to be replaced by public DRNs](../../docs/design.md#legacy-credential-bindings); that does not
 change seed-once behavior or turn the vault copy into the live token.
 
-## Sizing the audit volume
-
-*Committed direction:* opt-in sink, off by default; audit is a log record in the trace
-([non-goals](../../docs/design.md#non-goals)).
-
-`local-path` is the target cluster's only StorageClass, it is RWO, and **`ALLOWVOLUMEEXPANSION` is
-`false`**. `state.size` is final for the life of the volume.
-
-The audit log is append-only and does not rotate or have a total record/byte cap. Monitor disk
-space and provision the volume for expected traffic and retention. The default `state.size` is
-**2Gi**; filling it can fail an append with partial bytes left behind, not a clean capacity refusal.
-
-The chart sets `auditMaxLineBytes: 8192` (the daemon default is 64 KiB), bounding each serialized
-record but not lifetime file growth. Existing lines are subject to the same per-line ceiling.
-`serverLimits` is all-or-nothing: when present every field is required. `brokerLimits` and
-`hostLimits` instead default each field independently.
-
 ## Storage, uninstall, and recovery
 
-The claim carries `helm.sh/resource-policy: keep`, so `helm uninstall` leaves the audit
-and live model credential intact. Removing retained state is a separate operator action.
+The claim carries `helm.sh/resource-policy: keep`, so `helm uninstall` leaves the live model
+credentials intact. Removing retained state is a separate operator action.
 
 It carries `argocd.argoproj.io/sync-options: Prune=false,Delete=false` for the same reason, because
 Helm's annotation means nothing to a GitOps controller. Argo CD syncing with `prune: true` deletes
@@ -434,6 +414,9 @@ any live object the rendered desired state stops containing, and this claim stop
 moment somebody sets `state.existingClaim` or the chart source fails to resolve. `Prune=false`
 covers the sync, `Delete=false` covers the `Application` itself being deleted, and Argo reads both
 off the live object. Both annotations follow `state.keepOnUninstall`.
+
+`local-path` is the target cluster's only StorageClass, it is RWO, and **`ALLOWVOLUMEEXPANSION` is
+`false`**. `state.size` is final for the life of the volume.
 
 `state.existingClaim` points the pod at a claim you manage. Init keeps its root at `0:0:0700`
 and gives each daemon only its own private subdirectory, as in [Paths the chart owns](#paths-the-chart-owns).
@@ -584,7 +567,7 @@ stringData:
 
 No credential fields: the package is public and the pull is anonymous.
 
-`syncPolicy.automated.prune: true` cannot take the audit log: see
+`syncPolicy.automated.prune: true` cannot take the live model credentials: see
 [Storage, uninstall, and recovery](#storage-uninstall-and-recovery).
 
 ## Configuration values
@@ -623,7 +606,7 @@ an inline `broker.yaml`'s `identities` never map the broker's own UID, which the
 readiness probes connect as; `paths.catalogDir` is inside `paths.configDir`; or
 `terminationGracePeriodSeconds` is shorter than the two drains it has to cover in sequence. When
 provider storage is enabled, its root and key directory must also be absolute, disjoint from one
-another, and pairwise non-overlapping with every chart-owned mount (`config`, runtime, audit state,
+another, and pairwise non-overlapping with every chart-owned mount (`config`, runtime, the state claim,
 catalog, `/tmp`, and both projected configuration/key sources); a nested mount would otherwise
 shadow or destructively replace those files. Every one of those is a mistake whose only other
 symptom is a pod that starts and never becomes ready.
@@ -632,7 +615,8 @@ The chart's default `broker.config.inline` is the echo example from the broker's
 onto these paths: a real deny-by-default configuration that starts, loads the baked
 `echo-provider.wasm`, and authorizes exactly one read-only capability for the pod's own UID. It is
 there so you can install the chart and watch a broker become ready before you give it anything that
-matters. Replace it. `gateway.enabled` is `false` by default because a gateway needs a chat token, a
+matters. Replace it. Its `serverLimits` is all-or-nothing: when present every field is required.
+`brokerLimits` and `hostLimits` instead default each field independently. `gateway.enabled` is `false` by default because a gateway needs a chat token, a
 model endpoint, and an agent catalog, and the chart can invent none of them.
 
 `gateway.service` optionally creates a ClusterIP Service and matching named gateway container port.
@@ -666,8 +650,8 @@ helm upgrade --install dekopon charts/dekopon -n dekopon --create-namespace \
 
 [`values-pr-summarizer-linter.yaml`](values-pr-summarizer-linter.yaml) is the
 [PR summarizer and linter](https://github.com/dekopon-agents/dekopon-provider-gh/blob/main/examples/pr-summarizer-linter/README.md) deployment expressed as chart values: Slack Agent sessions with tangerine reaction degradation, one
-agent, six narrow `gh` capabilities, a broker-injected token by reference, and the audit log on its
-own volume. It may post one review comment and has no approval, request-changes, or merge capability.
+agent, six narrow `gh` capabilities, a broker-injected token by reference, and every broker decision
+exported as an audit log record over OTLP. It may post one review comment and has no approval, request-changes, or merge capability.
 
 ## What is not proven
 
@@ -705,7 +689,7 @@ own volume. It may post one review comment and has no approval, request-changes,
 into the broker at `/var/lib/dekopon-provider-storage`. A generated claim always carries
 `helm.sh/resource-policy: keep` and `argocd.argoproj.io/sync-options: Prune=false,Delete=false`, so
 neither an uninstall nor a GitOps prune takes durable provider data; an existing claim remains
-operator-owned. Rendering fails when the resolved audit and provider-storage claim names are equal.
+operator-owned. Rendering fails when the resolved state and provider-storage claim names are equal.
 
 The chart never creates the namespace key. `providerStorage.existingKeySecret` is required and is
 operator-managed, so uninstall cannot delete the key for retained data. The init container alone

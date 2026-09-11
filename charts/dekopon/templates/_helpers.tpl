@@ -355,8 +355,8 @@ answers every probe `unauthenticated`, and never becomes ready. */}}
 {{- if not (regexMatch "^[A-Za-z0-9._-]+$" .Values.gateway.chatgpt.subdir) -}}
 {{- fail (printf "gateway.chatgpt.subdir must be one path segment joined onto paths.stateDir, got %q; the credential has to live on the claim" .Values.gateway.chatgpt.subdir) -}}
 {{- end -}}
-{{- if or (eq .Values.gateway.chatgpt.subdir "broker") (eq .Values.gateway.chatgpt.subdir ".") (eq .Values.gateway.chatgpt.subdir "..") -}}
-{{- fail "gateway.chatgpt.subdir must not be broker, . or .." -}}
+{{- if or (eq .Values.gateway.chatgpt.subdir ".") (eq .Values.gateway.chatgpt.subdir "..") -}}
+{{- fail "gateway.chatgpt.subdir must not be . or .." -}}
 {{- end -}}
 {{- if not (regexMatch "^[A-Za-z0-9._-]+$" .Values.gateway.chatgpt.fileName) -}}
 {{- fail (printf "gateway.chatgpt.fileName must be one path segment, got %q" .Values.gateway.chatgpt.fileName) -}}
@@ -379,8 +379,8 @@ operator who fixes one only to be told about the next has to roll the release tw
 {{- if not (regexMatch "^[A-Za-z0-9._-]+$" .Values.broker.chatgpt.subdir) -}}
 {{- $problems = append $problems (printf "broker.chatgpt.subdir must be one path segment joined onto paths.stateDir, got %q; the credential has to live on the claim" .Values.broker.chatgpt.subdir) -}}
 {{- end -}}
-{{- if or (eq .Values.broker.chatgpt.subdir "broker") (eq .Values.broker.chatgpt.subdir ".") (eq .Values.broker.chatgpt.subdir "..") -}}
-{{- $problems = append $problems "broker.chatgpt.subdir must not be broker, . or .." -}}
+{{- if or (eq .Values.broker.chatgpt.subdir ".") (eq .Values.broker.chatgpt.subdir "..") -}}
+{{- $problems = append $problems "broker.chatgpt.subdir must not be . or .." -}}
 {{- end -}}
 {{- if not (regexMatch "^[A-Za-z0-9._-]+$" .Values.broker.chatgpt.fileName) -}}
 {{- $problems = append $problems (printf "broker.chatgpt.fileName must be one path segment, got %q" .Values.broker.chatgpt.fileName) -}}
@@ -400,7 +400,7 @@ operator who fixes one only to be told about the next has to roll the release tw
 
 {{/* The containers stop in SEQUENCE, so the pod's grace is the sum of both drains, not the larger
 of the two. Whichever daemon is still draining when the grace expires is SIGKILLed, and for the
-broker that lands mid-invocation and mid-audit-append. */}}
+broker that lands mid-invocation. */}}
 {{- $brokerGraceMs := include "dekopon.brokerShutdownGraceMs" . | int64 -}}
 {{- $gatewayGraceMs := int64 0 -}}
 {{- if .Values.gateway.enabled -}}
@@ -415,7 +415,7 @@ broker that lands mid-invocation and mid-audit-append. */}}
 {{- if .Values.gateway.enabled -}}
 {{- $drains = printf "dekopond drains for %d ms and then %s" $gatewayGraceMs $drains -}}
 {{- end -}}
-{{- fail (printf "terminationGracePeriodSeconds is %d, but the containers stop in sequence: %s, and drainBudget.bufferSeconds adds %d s for SIGTERM delivery, telemetry flush, and the sidecar stop that only begins once the gateway's container is gone. That needs %d seconds. At %d the kubelet SIGKILLs whichever daemon is still draining, which for the broker is mid-invocation and mid-audit-append. Raise terminationGracePeriodSeconds to %d, or lower a shutdownGraceMs." $budgetSeconds $drains $bufferSeconds $requiredSeconds $budgetSeconds $requiredSeconds) -}}
+{{- fail (printf "terminationGracePeriodSeconds is %d, but the containers stop in sequence: %s, and drainBudget.bufferSeconds adds %d s for SIGTERM delivery, telemetry flush, and the sidecar stop that only begins once the gateway's container is gone. That needs %d seconds. At %d the kubelet SIGKILLs whichever daemon is still draining, which for the broker is mid-invocation. Raise terminationGracePeriodSeconds to %d, or lower a shutdownGraceMs." $budgetSeconds $drains $bufferSeconds $requiredSeconds $budgetSeconds $requiredSeconds) -}}
 {{- end -}}
 
 {{- $chartPaths := dict "paths.gatewayConfigDir" .Values.paths.gatewayConfigDir "paths.configDir" .Values.paths.configDir "paths.runtimeDir" .Values.paths.runtimeDir "paths.stateDir" .Values.paths.stateDir "paths.catalogDir" .Values.paths.catalogDir -}}
@@ -501,7 +501,7 @@ broker that lands mid-invocation and mid-audit-append. */}}
 {{- fail "providerStorage.enabled requires operator-managed providerStorage.existingKeySecret; the chart never owns or deletes the namespace key" -}}
 {{- end -}}
 {{- if eq (include "dekopon.providerStorageClaimName" .) (include "dekopon.stateClaimName" .) -}}
-{{- fail "provider storage and audit state must use distinct PersistentVolumeClaims" -}}
+{{- fail "provider storage and the state claim must use distinct PersistentVolumeClaims" -}}
 {{- end -}}
 {{- range $name, $value := dict "providerStorage.keyFileName" .Values.providerStorage.keyFileName "providerStorage.existingKeySecretKey" .Values.providerStorage.existingKeySecretKey -}}
 {{- if or (not (regexMatch "^[A-Za-z0-9._-]+$" $value)) (eq $value ".") (eq $value "..") -}}
@@ -573,7 +573,7 @@ Arguments: dict "ctx" $ "sidecar" bool
     {{- toYaml . | nindent 4 }}
   {{- end }}
   # Both probes are a real broker client over the real socket. `capabilities` is evaluated from
-  # policy and the constraint catalog and appends no audit record.
+  # policy and the constraint catalog and emits no audit record.
   startupProbe:
     exec:
       command: ["dekopon-brokerd", "probe", "--socket", "{{ $.Values.paths.runtimeDir }}/broker.sock"]
@@ -590,13 +590,10 @@ Arguments: dict "ctx" $ "sidecar" bool
       readOnly: true
     - name: runtime
       mountPath: {{ $.Values.paths.runtimeDir }}
-    - name: state
-      mountPath: {{ $.Values.paths.stateDir }}
-      subPath: broker
 {{- if include "dekopon.brokerChatgptEnabled" $ }}
-    # Only the broker-owned credential subdirectory, writable for token rotation, and a sibling of
-    # the broker state subPath rather than a child of it — the same shape the gateway gets for its
-    # own family. The gateway mounts neither this directory nor the claim as a whole.
+    # Only the broker-owned credential subdirectory, writable for token rotation — the same shape
+    # the gateway gets for its own family. The gateway mounts neither this directory nor the claim
+    # as a whole.
     - name: state
       mountPath: {{ include "dekopon.brokerChatgptDir" $ }}
       subPath: {{ $.Values.broker.chatgpt.subdir }}
