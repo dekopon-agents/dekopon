@@ -30,14 +30,26 @@ Remove the broker listener flag and chart value when upgrading. The UI and its r
 are retired; see the [lockstep and refusal contract](../crates/dekopon-broker-protocol/README.md#version-and-compatibility).
 Provider HTTP, gateway webhooks, model accounting and daemon tracing remain.
 
+## Replay ledger removal (unreleased)
+
+`brokerLimits.maxReplayIds` is now an unknown field and refuses startup. Remove it from `broker.yaml`
+and from the chart's `broker.config.brokerLimits` before upgrading; `brokerLimits` itself is optional
+and may go with it.
+
+The broker no longer remembers invocation identifiers, so a resubmitted proposal is authorized and
+executed again, and a redelivered turn can be recorded into chat memory twice. Duplicate-effect
+defence is a [non-goal](design.md#non-goals): a caller that must not repeat an effect must not
+resubmit it. The identifier itself is unchanged — it still binds an attestation to its proposal and
+names the call in audit.
+
 ## Broker audit configuration (unreleased)
 
 Use only the current [broker configuration fields](../crates/dekopon-brokerd/README.md#configuration);
 obsolete audit settings are rejected as unknown fields. Keep the private audit file and its
 line-size bound. Startup counts bounded newline-delimited records without decoding history and
 refuses unterminated tails. Appends are flushed, not fsynced; there is no automatic repair,
-historical integrity check, or crash-durability guarantee. Replay rejection is process-local and
-starts empty after restart. Library callers of `run` receive unit on clean shutdown.
+historical integrity check, or crash-durability guarantee. Library callers of `run` receive unit on
+clean shutdown.
 
 ## Provider storage direct-write contract
 
@@ -86,9 +98,9 @@ Under the Helm chart this ordering is structural rather than procedural: the bro
 sidecar with a startup probe, so Kubernetes will not start `dekopond` until the broker answers a real
 request, and terminates them in the reverse order.
 
-Keep audit data when upgrading or investigating a refusal. A fresh process does not recover replay
-state from that file, and restarting does not make an uncertain external effect safe to retry.
-See [`operations.md`](operations.md#append-only-audit-and-process-local-replay).
+Keep audit data when upgrading or investigating a refusal. Restarting does not make an uncertain
+external effect safe to retry.
+See [`operations.md`](operations.md#append-only-audit).
 
 ## Release-by-release
 

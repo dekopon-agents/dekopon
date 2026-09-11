@@ -312,6 +312,17 @@ All notable changes to Dekopon are documented here. The format is based on
   `DeliveredTurnRequest`, `ProposedInvocation`, and `AuthorizedInvocation`'s serialized proposal now
   holds the request's W3C trace id instead of a second, independently chosen one, and nothing mints
   a Dekopon-native trace any more (goal 2, "one trace, complete").
+- Deleted the broker's replay ledger: `ReplayLedger`, `BrokerLimits::max_replay_ids`
+  (`brokerLimits.maxReplayIds` in `broker.yaml` and the chart, now rejected as an unknown field),
+  `DEFAULT_MAX_REPLAY_IDS`, `BrokerError::ReplayLedgerFull`, and the `replayed-invocation` refusal
+  reason. Duplicate-effect defence is a [non-goal](docs/design.md#non-goals). Two behaviours go with
+  it: a resubmitted invocation identifier is authorized and executed again instead of being denied,
+  and a redelivered turn can be recorded into chat memory twice, because `recordDeliveredTurn` was
+  gated by the same reservation. Decision identifiers `allow-{id}`/`deny-{id}` derive from the
+  invocation identifier and can now collide between a first call and its resubmission; the audit
+  record is still one row per decision. The invocation identifier itself is unchanged — it binds an
+  attestation to the proposal it travels with and names the call in audit. `capacity-exhausted`
+  survives for the bounded in-memory audit log.
 - Retired the `dekopon`, `dekopon-webui`, `dekopon-run`, and `dekopon-provider-host` crates. Only `dekopond` and `dekopon-brokerd` ship as binaries; shared agent, shell, model, SDK, and broker libraries remain. Recorded-session listing, transcript reconstruction, and model replay went with the runner, out of `dekopon-agent` as well; live agent tools and telemetry are unaffected. Published versions are not recalled or yanked; publication and a later independent console repin remain follow-ups.
 - Broker audit-chain verification, replay restoration from disk, and the `audit verify` command.
   Audit records now append only `sequence` and `event`; existing bytes are not migrated or

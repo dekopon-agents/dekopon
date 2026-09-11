@@ -16,7 +16,7 @@ const TRACE_ID_HEX_DIGITS: usize = 32;
 /// for one identifier rather than joining two namespaces. Dekopon used to mint a second,
 /// free-form trace identifier of its own beside the W3C one; there is one now.
 ///
-/// It is not an authorization, routing, or replay input, and it is chosen by whoever opened the
+/// It is not an authorization or routing input, and it is chosen by whoever opened the
 /// trace. Two runs that share one are correlated, not related by authority.
 #[cfg_attr(feature = "schemars", derive(schemars::JsonSchema))]
 #[cfg_attr(feature = "schemars", schemars(with = "String"))]

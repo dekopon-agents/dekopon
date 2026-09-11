@@ -98,7 +98,7 @@ this owner-only file and nowhere else.
 Host, broker, and server limits have conservative defaults, including a 2 MiB frame ceiling, when
 their entire sections are omitted. `hostLimits` and `brokerLimits` also default field by field, so a
 partial section keeps the absent-section value for everything it does not name — which is what lets
-a deployment set `maxTotalMemoryBytes` or `maxReplayIds` alone. `serverLimits` is all-or-nothing:
+a deployment set `maxTotalMemoryBytes` alone. `serverLimits` is all-or-nothing:
 when it is present every field is required. Unknown fields and unknown API versions are rejected.
 
 Startup also requires aggregate provider metadata, every mapped peer's capability response, and the
@@ -107,10 +107,7 @@ matters in a gateway deployment: the connecting peer is typically granted nothin
 principals its `identityMappings` name hold the capability sets that reach the wire through an
 attested `capabilities`.
 
-`brokerLimits.maxReplayIds` bounds the process-local invocation-ID ledger (default 100 000; chart
-default 200 000). The ledger never evicts during a process lifetime; exhaustion returns
-`capacity-exhausted`, not a retryable outage. Restart starts an empty ledger. Audit file growth is
-independent of this memory bound and requires operator disk monitoring.
+Audit file growth requires operator disk monitoring; no configured bound limits it.
 
 ```console
 chmod 0700 /home/dekopon/.local/run/dekopon /home/dekopon/.local/state/dekopon
@@ -644,7 +641,7 @@ failed terminal append reports that provider work may already have completed.
   the symbolic name of the `credential` the invocation selected. Its legacy selection binding
   [will be replaced by public DRNs](../../docs/design.md#legacy-credential-bindings); this is the current audit shape.
 - Generic WASI and ambient I/O imports are unavailable.
-- Audit appends contain metadata only; replay rejection is bounded process-local state.
+- Audit appends contain metadata only.
 - Credential resolution is destination-bound, capability-scoped, and optionally agent-scoped.
   *Committed direction:* legacy `credential`/`credentialByAgent` selection will be replaced by public
   DRNs without weakening those bounds ([migration requirements](../../docs/design.md#legacy-credential-bindings)).
