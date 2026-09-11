@@ -5,7 +5,8 @@ Broker-owned authorization and execution core for Dekopon.
 The crate binds an authenticated context supplied by a transport to an actor, asks a
 `dekopon-policy` Cedar engine whether that context may act, binds an allow to the capability's
 owner-authored constraint set, creates a single-use `AuthorizedInvocation`, executes it through
-`dekopon-broker-host`, returns bounded public evidence, and appends metadata-only audit records.
+`dekopon-broker-host`, returns bounded public evidence, and emits a metadata-only audit record for
+every decision.
 
 Authorization and execution are separate by construction. Cedar decides *who may do what*; a
 `ConstraintSet` decides *how narrowly the broker then does it* — provider route, trusted
@@ -51,11 +52,16 @@ determined the decision, and `policy_digest`, a fingerprint of the evaluated set
 timings, output digests, and sanitized HTTP call metadata. They never contain invocation input,
 provider output, paths, queries, headers, bodies, cookies, authorization values, or credentials.
 
-Two sinks implement the record: a bounded in-memory log for tests and embedding, and
-`FileAuditLog`, whose file rules, ordinal counting, and append durability are the
-[`dekopon-brokerd` audit contract](../dekopon-brokerd/README.md#audit). A failed or cancelled append
-poisons the handle. *Committed direction:* opt-in sink, off by default; audit is a log record in
-the trace ([non-goals](../../docs/design.md#non-goals)).
+The record is a structured `tracing` event on target `dekopon_broker::audit`, emitted inside the span
+that made the decision: `broker.decision` for an allow or deny, `broker.execution` for a terminal
+outcome, including an authorized failure before the provider ran
+([fields](../../docs/observability.md#the-broker-audit-record)). It is emitted before the `AuditLog`
+sink is offered the event, so a sink cannot suppress it. `TraceOnlyAuditLog` keeps nothing and is
+the sink [`dekopon-brokerd`](../dekopon-brokerd/README.md#audit) runs. `InMemoryAuditLog` is a
+bounded sink for tests and embedding: `records()` returns the events in append order, and a full log
+refuses with `AuditError::Full`, its only failure. A refusal before the provider ran — of the
+decision or of an authorized failure — means nothing executed; a refused terminal outcome is
+reported through `BrokerError::unaudited_outcome`, because the effect may already have happened.
 
 ## Optional durable chat memory
 

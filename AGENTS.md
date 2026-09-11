@@ -26,7 +26,7 @@ Then read the documents selected by the work:
 | Crate boundaries, dependencies, protocols, daemon/broker separation, async, Wasmtime, or Cedar | [`docs/architecture.md`](docs/architecture.md): design responsibilities mapped to implementation boundaries |
 | Operator auth parsing, output, or exit codes | [`docs/cli.md`](docs/cli.md): the current operator contract |
 | `AgentSpec` fields, skills directories, or what a catalog value is consumed by | [`docs/catalog.md`](docs/catalog.md): every `v1alpha1` field, its actual consumer, and the reserved fields read by nothing |
-| Operating a running deployment: startup refusals, audit append failures, draining, or socket and directory hygiene | [`docs/operations.md`](docs/operations.md): the index into `crates/*/README.md`, chiefly [`crates/dekopon-brokerd/README.md`](crates/dekopon-brokerd/README.md) |
+| Operating a running deployment: startup refusals, where broker audit lives, draining, or socket and directory hygiene | [`docs/operations.md`](docs/operations.md): the index into `crates/*/README.md`, chiefly [`crates/dekopon-brokerd/README.md`](crates/dekopon-brokerd/README.md) |
 | A breaking configuration change, a protocol change, or anything an operator must do between releases | [`docs/upgrading.md`](docs/upgrading.md): the migrations `CHANGELOG.md` only names, the lockstep rule, and the restart order |
 | Exporting, storing, or deploying a ChatGPT subscription credential | [`docs/chatgpt-credential.md`](docs/chatgpt-credential.md): the rotating-refresh-token constraints |
 | Model requests, prompt caching, cache retention, conversation memory, or long-lived agent memory | [`docs/inference.md`](docs/inference.md): current wire behavior versus provider guarantees and future memory design |

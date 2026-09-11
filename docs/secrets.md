@@ -426,7 +426,7 @@ path, a symlink, a group-readable file, a read-only parent, or a document that i
 Dekopon credential each refuse startup naming the cause.
 
 **Refresh and write-back.** Resolution happens once per authorized invocation, after the decision
-audit record is appended and before the component runs, through the one implementation of that protocol in
+audit record is emitted and before the component runs, through the one implementation of that protocol in
 `dekopon-model`: take an advisory lock on a sibling `.lock` file, adopt a newer record another process
 wrote, renew 60 s before expiry, and persist the rotated record atomically (same-directory temporary
 file, `fsync`, rename, directory `fsync`). A renewal that reached the authorization server but could
@@ -465,7 +465,7 @@ again. Everything else — transport, a 5xx, a malformed token response — fail
 ## Resolution and rotation
 
 Startup parses and validates the map, locators, scopes and bootstrap paths without contacting a
-remote source. After dual authorization and appending the decision audit record, the broker resolves exactly one
+remote source. After dual authorization and emitting the decision audit record, the broker resolves exactly one
 snapshot. There is no cross-invocation cache and no stale fallback:
 
 - a floating alias or projected generation rotates on the next invocation;

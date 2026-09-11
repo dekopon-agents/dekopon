@@ -2,8 +2,8 @@
 
 `dekopon-brokerd` is the separately deployed privileged Unix service for Dekopon provider
 components. It derives caller identity from Unix peer credentials, evaluates a deny-by-default Cedar
-policy set against owner-authored execution constraints, appends owner-only JSONL audit records at
-the required `auditPath`, and executes only statically linked Dekopon host interfaces.
+policy set against owner-authored execution constraints, records every decision as a structured log
+event inside the caller's trace, and executes only statically linked Dekopon host interfaces.
 
 Authorization and execution constraints are two separate files on purpose. `policiesPath` decides
 *who may do what*; `constraintSets` decides *how narrowly the broker then does it*. A policy edit
@@ -33,16 +33,15 @@ components or credentials, invokes nothing, and initializes no telemetry.
 ## Configuration
 
 The configuration must be a regular single-link file owned by the server UID and must not be
-group/world writable. Audit parent directories must be owner-only. The socket has the separate IPC
-directory contract below. Provider components must be regular single-link files owned by the server
-UID and must not be group/world writable; their canonical parent directories must also be
-server-owned and not group/world writable. Writable non-sticky path ancestors are rejected.
+group/world writable. The socket has the separate IPC directory contract below. Provider components
+must be regular single-link files owned by the server UID and must not be group/world writable;
+their canonical parent directories must also be server-owned and not group/world writable. Writable
+non-sticky path ancestors are rejected.
 
 ```yaml
 # broker.yaml
 apiVersion: dekopon.dev/brokerd/v1alpha1
 socketPath: /home/dekopon/.local/run/dekopon/broker.sock
-auditPath: /home/dekopon/.local/state/dekopon/audit.jsonl
 brokerPrincipal: local-broker
 policyRevision: policy-2026-01
 policiesPath: /home/dekopon/.config/dekopon/policies.cedar
@@ -107,19 +106,17 @@ matters in a gateway deployment: the connecting peer is typically granted nothin
 principals its `identityMappings` name hold the capability sets that reach the wire through an
 attested `capabilities`.
 
-Audit file growth requires operator disk monitoring; no configured bound limits it.
-
 ```console
-chmod 0700 /home/dekopon/.local/run/dekopon /home/dekopon/.local/state/dekopon
+chmod 0700 /home/dekopon/.local/run/dekopon
 chmod 0600 /path/to/broker.yaml
 dekopon-brokerd --config /path/to/broker.yaml
 ```
 
 SIGINT and SIGTERM stop Unix acceptance, drain bounded in-flight connections under one shutdown
-grace, finish audit appends, log `broker_stopped`, and remove only the Unix socket inode created by
-this process. Shutdown grace must cover one configured host deadline plus two complete frame
-deadlines, and it is one grace for the whole process: all Unix connections drain under that one
-deadline rather than each taking a fresh grace period.
+grace, log `broker_stopped`, and remove only the Unix socket inode created by this process.
+Shutdown grace must cover one configured host deadline plus two complete frame deadlines, and it is
+one grace for the whole process: all Unix connections drain under that one deadline rather than
+each taking a fresh grace period.
 
 ### Provider credentials
 
@@ -391,8 +388,8 @@ mode — the same rule this server binds under — and the live server peer UID 
 request. Unmapped peers receive no capabilities even if their group lets them connect. Owner-only
 clients remain valid.
 
-Keep broker config, credentials, provider files, audit, cache, and storage in their separate
-broker-owned protected paths; the IPC directory is not a credential or data directory. The gateway's
+Keep broker config, credentials, provider files, cache, and storage in their separate broker-owned
+protected paths; the IPC directory is not a credential or data directory. The gateway's
 local development **chat** socket is `0600` under its own private parent. The chart's distinct
 container identities and init layout are documented in the chart.
 
@@ -406,7 +403,8 @@ DEKOPON_REQUIRE_CROSS_UID=1 cargo test -p dekopon-brokerd --test ipc_process --l
 
 ### Telemetry
 
-An optional `telemetry` section enables OTLP export of broker spans:
+An optional `telemetry` section enables OTLP export of broker spans and log records, the
+[audit records](#audit) among them:
 
 ```yaml
 telemetry:
@@ -441,8 +439,8 @@ hostLimits:
 `compileCachePath` is optional. Absent, Cranelift compiles every component at every start and the
 socket binds only after that work finishes — the cost a startup probe has to cover. Present, the
 broker keeps Wasmtime's content-addressed cache there and a restart reads compiled code back. The
-directory holds code this privileged process executes, so its parent must be owner-only under the
-same rule as the audit paths; the broker creates the directory itself. Components compile
+directory holds code this privileged process executes, so its parent must be owner-only; the broker
+creates the directory itself. Components compile
 concurrently either way.
 
 `hostLimits.maxMemoryBytes` bounds one invocation; `hostLimits.maxTotalMemoryBytes` bounds all of
@@ -477,8 +475,8 @@ The context each action carries is `dekopon-policy`'s
 authenticated transport state or this configuration — never from a request payload, and never from
 message content or provider input.
 
-An optional `@id("…")` annotation names a policy. That name is what audit records carry as
-`policy_ids`, so it is worth writing; without it Cedar names policies positionally (`policy0`,
+An optional `@id("…")` annotation names a policy. That name is what audit records carry in
+`policy.ids`, so it is worth writing; without it Cedar names policies positionally (`policy0`,
 `policy1`, …) and inserting a policy renumbers the ones below it. Names must be unique.
 
 At decision time a capability with no constraint set is denied `unconstrained-capability` before
@@ -617,21 +615,18 @@ verifying provenance for each downloaded component.
 
 ## Audit
 
-The broker appends metadata-only JSONL records with `sequence` (one-based file line ordinal) and
-`event` at `auditPath`. Open counts bounded newline-delimited lines in fixed memory without decoding
-events, verifying integrity, or restoring invocation IDs. Old bytes remain untouched; existing
-sequence fields are not trusted as ordinals. A private readable nonempty file can start on its own.
-`run` returns `Result<(), BrokerdError>` after clean shutdown.
-*Committed direction:* opt-in sink, off by default; audit is a log record in the trace
-([non-goals](../../docs/design.md#non-goals)).
+Audit is the `broker.decision` and `broker.execution` log events the broker emits inside the span
+that made each decision: structured JSON on stdout always, and OTLP log records when `telemetry`
+names a receiver, over the same endpoint and headers as the spans. Their fields and correlation are
+documented in [observability](../../docs/observability.md#the-broker-audit-record).
 
-The file must be regular, single-link, owner-only, and exclusively writer-locked, without symlink
-following; its owner and private parent are checked before listening. `auditMaxLineBytes` bounds
-both existing lines and new serialized records, excluding the newline. An unterminated tail is
-refused without truncation or repair. Appends write and flush, not fsync; a failed or cancelled
-append can leave partial bytes and poisons the open handle. There is no rollback, crash recovery,
-file rotation, or total file-size bound. Monitor disk space; I/O failure remains explicit, and a
-failed terminal append reports that provider work may already have completed.
+Nothing else keeps a copy. `run` serves with `TraceOnlyAuditLog`, which accepts every record and
+stores none, so no audit failure can refuse an invocation. Without `telemetry`, audit lasts as long
+as whatever keeps this process's stdout; a deployment that needs audit past a restart configures
+`telemetry`. Losing the log exporter loses audit. `RUST_LOG` filters only the stdout copy, so a level
+stricter than `info` on the `dekopon_broker::audit` target drops the records from it.
+
+`run` returns `Result<(), BrokerdError>` after clean shutdown.
 
 ## Boundaries
 
@@ -643,11 +638,11 @@ failed terminal append reports that provider work may already have completed.
 - Authorization decisions come from the Cedar policy set; execution bounds come from
   `constraintSets` and are validated against loaded manifests, host ceilings, and the credential
   store at startup. Neither file can widen the other.
-- Audit records carry the determining `policy_ids`, the `policy_digest` of the evaluated set, and
+- Audit records carry the determining `policy.ids`, the `policy.digest` of the evaluated set, and
   the symbolic name of the `credential` the invocation selected. Its legacy selection binding
   [will be replaced by public DRNs](../../docs/design.md#legacy-credential-bindings); this is the current audit shape.
 - Generic WASI and ambient I/O imports are unavailable.
-- Audit appends contain metadata only.
+- Audit records contain metadata only.
 - Credential resolution is destination-bound, capability-scoped, and optionally agent-scoped.
   *Committed direction:* legacy `credential`/`credentialByAgent` selection will be replaced by public
   DRNs without weakening those bounds ([migration requirements](../../docs/design.md#legacy-credential-bindings)).
