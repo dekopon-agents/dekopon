@@ -24,7 +24,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::config::HARD_MAX_CONNECTIONS;
 
-pub(crate) fn storage_invocation_span(invocation: &InvocationId, trace: &TraceId) -> tracing::Span {
+pub(crate) fn storage_invocation_span(invocation: &InvocationId, trace: TraceId) -> tracing::Span {
     tracing::info_span!("broker.invocation", invocation = %invocation, trace = %trace)
 }
 
@@ -286,14 +286,14 @@ fn invocation_span(
     storage: bool,
 ) -> tracing::Span {
     if storage {
-        return storage_invocation_span(&request.id, &request.trace);
+        return storage_invocation_span(&request.id, request.trace_parent.trace());
     }
     match attestation {
         Some(claim) => tracing::info_span!(
             "broker.invocation",
             invocation = %request.id,
             capability = %request.capability,
-            trace = %request.trace,
+            trace = %request.trace_parent.trace(),
             subject = %claim.subject,
             agent = %claim.agent,
         ),
@@ -301,25 +301,23 @@ fn invocation_span(
             "broker.invocation",
             invocation = %request.id,
             capability = %request.capability,
-            trace = %request.trace,
+            trace = %request.trace_parent.trace(),
         ),
     }
 }
 
-/// Joins the span to the client's trace when it offered one.
+/// Joins the span to the trace the client sent.
 ///
-/// An untrusted client chooses this parent. It reaches telemetry correlation and nothing else:
-/// policy, replay rejection, and audit never read it. Losing the correlation is not losing the
-/// invocation either — the span still records, just as its own root — so a rejected `traceparent`
-/// is a debug event rather than a failure.
-fn adopt_trace_parent(span: &tracing::Span, parent: Option<TraceParent>) {
-    if let Some(parent) = parent
-        && let Err(error) = span.set_parent(dekopon_telemetry::remote_context(TraceContextParts {
-            trace_id: parent.trace_id(),
-            span_id: parent.parent_id(),
-            flags: parent.flags(),
-        }))
-    {
+/// An untrusted client chooses this parent. It reaches correlation and nothing else: policy and
+/// replay rejection never read it, and the audit record it lands on is correlated by the same
+/// trace whether or not this call succeeds — the span still records, just as its own root — so a
+/// parent the local SDK rejects is a debug event rather than a failure.
+fn adopt_trace_parent(span: &tracing::Span, parent: TraceParent) {
+    if let Err(error) = span.set_parent(dekopon_telemetry::remote_context(TraceContextParts {
+        trace_id: parent.trace_id(),
+        span_id: parent.parent_id(),
+        flags: parent.flags(),
+    })) {
         tracing::debug!(event = "broker_trace_parent_ignored", error = %error);
     }
 }
@@ -504,7 +502,7 @@ where
             {
                 return refuse_invalid_claim(&mut stream, limits).await;
             }
-            let span = storage_invocation_span(&turn.id, &turn.trace);
+            let span = storage_invocation_span(&turn.id, turn.trace_parent.trace());
             adopt_trace_parent(&span, turn.trace_parent);
             match broker
                 .record_delivered_turn(context, peer.attestor.as_ref(), &attestation, turn)

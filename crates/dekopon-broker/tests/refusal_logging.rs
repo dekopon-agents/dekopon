@@ -27,6 +27,12 @@ use dekopon_core::{
 use dekopon_test_support::{CaptureLayer, provider_fixture};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
+/// One fixture trace context for every request these tests build.
+///
+/// The trace is mandatory on the wire now; these cases read invocation identifiers and audit
+/// fields rather than the trace itself, so one shared value keeps the fixtures about their subject.
+const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
+
 const MAPPED_SUBJECT: &str = "slack.t0123abc.u9xyz";
 const UNMAPPED_SUBJECT: &str = "slack.t0123abc.unobody";
 
@@ -140,8 +146,7 @@ fn proposal(id: &str) -> InvocationRequest {
     InvocationRequest {
         id: id.parse().expect("valid invocation fixture"),
         capability: "echo.reverse".parse().expect("valid capability fixture"),
-        trace: "trace-refusal".parse().expect("valid trace fixture"),
-        trace_parent: None,
+        trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
         input: serde_json::json!({"message": "refused"}),
         secret_use: None,
     }

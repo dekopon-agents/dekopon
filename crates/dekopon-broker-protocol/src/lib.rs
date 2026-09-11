@@ -18,7 +18,7 @@ use std::{
 pub use dekopon_capability::{InvocationOutcome, InvocationResult};
 use dekopon_core::{
     AgentId, CapabilityId, ExternalSubject, InvocationId, ProviderId, SecretUseProposal, TraceId,
-    TransportId,
+    TraceIdError, TransportId,
 };
 use dekopon_provider_sdk::ProviderCapability;
 pub use dekopon_provider_sdk::{CommandRunOutcome, ComponentFailure};
@@ -94,17 +94,19 @@ pub enum ProtocolVersion {
     V1Alpha2,
 }
 
-/// W3C `traceparent`, carrying the client's OpenTelemetry span as a remote parent.
+/// W3C `traceparent`: the run's [`TraceId`] plus the client span that should parent broker work.
 ///
-/// This is distinct from [`TraceId`] and does not replace it. `TraceId` identifies a Dekopon
-/// session for the audit log and replay accounting; `TraceParent` exists only so broker spans
-/// join the client's trace instead of starting an unrelated one. Two identifiers, two jobs.
+/// The trace identifier inside it is the run's one correlation identifier — the value the broker
+/// writes into every audit record and every span it opens — and the parent span identifier is the
+/// telemetry half, which changes from call to call while the trace does not.
 ///
-/// Like every other request field this is untrusted: it influences telemetry correlation and
-/// nothing else. It is never an authorization, routing, or replay input.
+/// Like every other request field this is untrusted. It reaches telemetry correlation and audit
+/// correlation and nothing else: never an authorization, routing, or replay input. A caller that
+/// sends someone else's trace identifier joins their own records to that trace and gains no
+/// authority by it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TraceParent {
-    trace_id: [u8; 16],
+    trace: TraceId,
     parent_id: [u8; 8],
     flags: u8,
 }
@@ -121,23 +123,29 @@ impl TraceParent {
         parent_id: [u8; 8],
         flags: u8,
     ) -> Result<Self, TraceParentError> {
-        if u128::from_be_bytes(trace_id) == 0 {
+        let Ok(trace) = TraceId::new(trace_id) else {
             return Err(TraceParentError::ZeroTraceId);
-        }
+        };
         if u64::from_be_bytes(parent_id) == 0 {
             return Err(TraceParentError::ZeroParentId);
         }
         Ok(Self {
-            trace_id,
+            trace,
             parent_id,
             flags,
         })
     }
 
+    /// The run's trace identifier.
+    #[must_use]
+    pub const fn trace(&self) -> TraceId {
+        self.trace
+    }
+
     /// 16-byte trace identifier.
     #[must_use]
     pub const fn trace_id(&self) -> [u8; 16] {
-        self.trace_id
+        self.trace.to_bytes()
     }
 
     /// 8-byte identifier of the span that should parent the broker's work.
@@ -155,11 +163,7 @@ impl TraceParent {
 
 impl fmt::Display for TraceParent {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("00-")?;
-        for byte in self.trace_id {
-            write!(formatter, "{byte:02x}")?;
-        }
-        formatter.write_str("-")?;
+        write!(formatter, "00-{}-", self.trace)?;
         for byte in self.parent_id {
             write!(formatter, "{byte:02x}")?;
         }
@@ -188,13 +192,17 @@ impl std::str::FromStr for TraceParent {
                 version: version.to_owned(),
             });
         }
-        let mut trace_id = [0_u8; 16];
-        decode_hex(trace, &mut trace_id)?;
+        // The trace half is the run's own identifier, so it is read by the one type that owns
+        // that grammar rather than by a second copy of it here.
+        let trace = trace.parse::<TraceId>().map_err(|error| match error {
+            TraceIdError::Zero => TraceParentError::ZeroTraceId,
+            TraceIdError::Malformed => TraceParentError::Malformed,
+        })?;
         let mut parent_id = [0_u8; 8];
         decode_hex(parent, &mut parent_id)?;
         let mut flag_byte = [0_u8; 1];
         decode_hex(flags, &mut flag_byte)?;
-        Self::new(trace_id, parent_id, flag_byte[0])
+        Self::new(trace.to_bytes(), parent_id, flag_byte[0])
     }
 }
 
@@ -263,15 +271,27 @@ pub struct InvocationRequest {
     pub id: InvocationId,
     /// Requested exact capability.
     pub capability: CapabilityId,
-    /// End-to-end correlation identifier.
-    pub trace: TraceId,
-    /// Client span that should parent broker telemetry for this invocation.
+    /// The run's trace, and the client span that should parent broker telemetry for this call.
     ///
-    /// Always written by Dekopon's own client; `null` and an omitted key both mean the client
-    /// exports no telemetry. Correlation-only, and untrusted: never an authorization, routing, or
-    /// replay input. A malformed value is a decode failure rather than a silent `None`, because
-    /// attaching broker spans to a trace that does not exist is worse than sending none.
-    pub trace_parent: Option<TraceParent>,
+    /// Mandatory, because the broker's audit record for this invocation is correlated by the trace
+    /// identifier inside it and a record with no correlation identifier is the inverse of what the
+    /// audit log is for. A client that exports no telemetry still sends one: `tracing-opentelemetry`
+    /// installs its layer only when an OTLP exporter is configured, so a non-exporting process has
+    /// no span context to read at all — valid or otherwise — and mints a session-local trace
+    /// instead of omitting the field. Nothing off-box ever receives that minted trace from the
+    /// client; it still ties one session's audit records to each other, which is the whole job of
+    /// the identifier on a host that exports nothing.
+    ///
+    /// A minted context arrives with `sampled` set even though its author exports nothing. The
+    /// broker adopts this as a remote parent, and under the OpenTelemetry SDK's default
+    /// `ParentBased(AlwaysOn)` sampler an unsampled parent makes every span beneath it
+    /// non-recording — which would silence an exporting broker behind a non-exporting client. The
+    /// flag says what the receiver should do, not what the sender did.
+    ///
+    /// Untrusted like every other request field: it reaches telemetry and audit correlation and
+    /// nothing else. A malformed value is a decode failure rather than a silent default, because
+    /// attaching broker spans to a trace that does not exist is worse than refusing the frame.
+    pub trace_parent: TraceParent,
     /// Optional typed, untrusted intent to use a public DRN in a broker-native sink.
     ///
     /// The field is proposal data, not a credential or bearer grant. Providers never receive it.
@@ -741,8 +761,7 @@ fn canonical_signed_decimal(value: &str) -> bool {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct DeliveredTurnRequest {
     pub id: InvocationId,
-    pub trace: TraceId,
-    pub trace_parent: Option<TraceParent>,
+    pub trace_parent: TraceParent,
     pub delivery: DeliveryIdentity,
     #[serde(deserialize_with = "deserialize_turn_text")]
     pub user: String,

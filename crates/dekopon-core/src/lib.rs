@@ -15,6 +15,7 @@ mod diagnostics;
 mod redaction;
 mod skill;
 mod subject;
+mod trace;
 #[cfg(unix)]
 mod trusted_file;
 
@@ -28,6 +29,7 @@ pub use diagnostics::error_chain;
 pub use redaction::{Redacted, redaction_marker, serialize_exposed};
 pub use skill::{MAX_SKILL_NAME_LENGTH, SkillId, SkillIdError};
 pub use subject::{ExternalSubject, SubjectError, SubjectService};
+pub use trace::{TraceId, TraceIdError};
 #[cfg(unix)]
 pub use trusted_file::{FileHygieneError, FileTier, check_trusted_metadata, read_trusted_file};
 
@@ -266,7 +268,6 @@ identifier!(
     "invocation",
     "A validated capability invocation identifier."
 );
-identifier!(TraceId, "trace", "A validated end-to-end trace identifier.");
 identifier!(
     TransportId,
     "transport",

@@ -15,10 +15,16 @@ use dekopon_capability::{
 };
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId, Redacted,
-    RiskLevel, SecretDrn, SecretSinkKind, SecretUseProposal, TraceId,
+    RiskLevel, SecretDrn, SecretSinkKind, SecretUseProposal,
 };
 use dekopon_test_support::{LoopbackServer, provider_fixture};
 use serde_json::{Value, json};
+
+/// One fixture trace context for every request these tests build.
+///
+/// The trace is mandatory on the wire now; these cases read invocation identifiers and audit
+/// fields rather than the trace itself, so one shared value keeps the fixtures about their subject.
+const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
 
 /// The canonical subject every attestation fixture stands for.
 const SLACK_SUBJECT: &str = "slack.t0123abc.u9xyz";
@@ -76,10 +82,7 @@ fn request(id: &str, capability: &str, input: serde_json::Value) -> InvocationRe
         capability: capability
             .parse::<CapabilityId>()
             .expect("valid capability fixture"),
-        trace: "trace-test"
-            .parse::<TraceId>()
-            .expect("valid trace fixture"),
-        trace_parent: None,
+        trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
         input,
         secret_use: None,
     }
@@ -2555,7 +2558,7 @@ fn identity_directory_rejects_duplicates_and_resolves_exactly() {
 #[test]
 fn audit_events_written_before_attestation_serialize_unchanged() {
     let legacy = concat!(
-        r#"{"type":"decision","invocation":"invoke-legacy","trace":"trace-legacy","#,
+        r#"{"type":"decision","invocation":"invoke-legacy","trace":"0000000000000000000000000000f1c7","#,
         r#""principal":"caller","actor":{"type":"agent","agent":"provider-test"},"#,
         r#""capability":"echo.echo","provider":"echo","authorized_by":"broker-test","#,
         r#""decision_id":"allow-invoke-legacy","policy_revision":"policy-test","allowed":true,"#,
@@ -2589,7 +2592,7 @@ fn audit_events_written_before_attestation_serialize_unchanged() {
 #[test]
 fn execution_records_written_before_per_agent_credentials_serialize_unchanged() {
     let legacy = concat!(
-        r#"{"type":"execution","invocation":"invoke-legacy","trace":"trace-legacy","#,
+        r#"{"type":"execution","invocation":"invoke-legacy","trace":"0000000000000000000000000000f1c7","#,
         r#""principal":"caller","actor":{"type":"agent","agent":"provider-test"},"#,
         r#""capability":"echo.echo","provider":"echo","authorized_by":"broker-test","#,
         r#""decision_id":"allow-invoke-legacy","policy_revision":"policy-test","#,

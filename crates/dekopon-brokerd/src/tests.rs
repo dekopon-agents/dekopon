@@ -975,7 +975,7 @@ fn generic_durable_storage_outer_spans_have_no_identity_or_capability_fields() {
     tracing::subscriber::with_default(tracing_subscriber::registry(), || {
         let span = server::storage_invocation_span(
             &"generic-durable-sentinel".parse().expect("invocation"),
-            &"generic-durable-trace".parse().expect("trace"),
+            "0000000000000000000000000000f1c7".parse().expect("trace"),
         );
         let fields = span
             .metadata()

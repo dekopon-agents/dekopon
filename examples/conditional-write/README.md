@@ -215,8 +215,8 @@ tail -1 ~/.local/state/dekopon/audit.jsonl | jq .
   "sequence": 6,
   "event": {
     "type": "execution",
-    "invocation": "dekopond-session-9f1c4a7b0e35d268-3",
-    "trace": "dekopond-session-9f1c4a7b0e35d268",
+    "invocation": "4bf92f3577b34da6a3ce929d0e0e4736-3",
+    "trace": "4bf92f3577b34da6a3ce929d0e0e4736",
     "principal": "cpetersen",
     "actor": { "type": "agent", "agent": "xaviers-conditional-writer" },
     "via": "dekopond-gateway",
@@ -224,7 +224,7 @@ tail -1 ~/.local/state/dekopon/audit.jsonl | jq .
     "capability": "http-probe.conditional-write",
     "provider": "http-probe",
     "authorized_by": "local-broker",
-    "decision_id": "allow-dekopond-session-9f1c4a7b0e35d268-3",
+    "decision_id": "allow-4bf92f3577b34da6a3ce929d0e0e4736-3",
     "policy_revision": "conditional-write-2026-01",
     "policy_ids": ["conditional-writer-surface"],
     "policy_digest": "sha256:7c31…",
@@ -267,13 +267,11 @@ What each part is doing:
   log records that something happened and to what; provider output is a digest.
 
 Records 1 through 5 are the rest of the same session — among them a `decision` and an `execution`
-for the read, then the `decision` that allowed this write. Every identifier in the session shares
-the `trace`, and each invocation extends it with a counter, so `grep dekopond-session-9f1c4a7b0e35d268`
-recovers the whole conversation's effects. Each JSONL record carries its `sequence` ordinal and a
-metadata-only `event`.
-
-*Committed direction:* removed; the W3C trace id is the only correlation identifier
-([goal 2](../../docs/design.md#constitution)).
+for the read, then the `decision` that allowed this write. The `trace` is the session's W3C trace
+id, the same one the gateway's own spans carry, and each invocation extends it with a counter, so
+`grep 4bf92f3577b34da6a3ce929d0e0e4736` recovers the whole conversation's effects from the audit log
+and the same identifier pivots to its spans in the telemetry store. Each JSONL record carries its
+`sequence` ordinal and a metadata-only `event`.
 
 ## 8. When it does not work
 

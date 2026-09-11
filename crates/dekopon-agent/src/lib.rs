@@ -43,7 +43,7 @@ use dekopon_broker_protocol::{
     ERROR_UNAUTHENTICATED, InvocationOutcome, InvocationRequest,
 };
 #[cfg(unix)]
-use dekopon_core::{CapabilityId, IdentifierError, InvocationId, TraceId};
+use dekopon_core::{CapabilityId, InvocationId, TraceId};
 use dekopon_process::ProcessOutcome;
 #[cfg(unix)]
 use dekopon_process::{CancelSignal, ProcessMetadata, ProcessRun, process_fn};
@@ -205,10 +205,13 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
     }
 }
 
-/// Trace context to send with a broker proposal, if this process is exporting one.
+/// The live span's W3C context, when this process has one at all.
 ///
-/// `None` is the ordinary state when export is disabled: the broker then records its own root
-/// span rather than a child of a trace nothing will ever receive.
+/// `None` is the ordinary state on a process that exports no traces, and it is not a near miss:
+/// `dekopon_telemetry::install` adds the `tracing-opentelemetry` layer only when an OTLP trace
+/// exporter is configured, so without one there is no OpenTelemetry context behind the current
+/// span to read — the identifiers are absent rather than invalid. Every caller that has to put a
+/// trace on the wire therefore goes through [`session_trace_parent`] instead.
 #[must_use]
 pub fn current_trace_parent() -> Option<TraceParent> {
     let parts = dekopon_telemetry::current_trace_context()?;
@@ -216,6 +219,76 @@ pub fn current_trace_parent() -> Option<TraceParent> {
     // malformed parent is worse than none: it would attach broker spans to a trace that does not
     // exist. Dropping it degrades correlation instead of corrupting it.
     TraceParent::new(parts.trace_id, parts.span_id, parts.flags).ok()
+}
+
+/// The W3C context one session's broker calls are correlated by, exporting or not.
+///
+/// A broker request must carry a trace: the audit record it produces is correlated by that
+/// identifier and nothing else, so a session without one would write records an operator cannot
+/// reassemble — the inverse of what the audit log exists for. When the process exports traces this
+/// adopts the live span, which is how the broker's spans join the caller's trace. When it does not,
+/// [`current_trace_parent`] has nothing to offer and this mints a trace of its own from the OS
+/// entropy source.
+///
+/// A minted trace reaches no collector and no third party from *this* process. It correlates one
+/// session's records with each other, which is the entire job of the identifier on a host that
+/// ships nothing, and it costs 24 bytes of entropy per session to keep the "every record carries a
+/// trace" invariant true everywhere rather than only where an exporter happens to be configured.
+///
+/// It is minted `sampled`, because the process on the other side of the socket may export even
+/// when this one does not, and an unsampled parent would silence it.
+#[must_use]
+pub fn session_trace_parent() -> TraceParent {
+    current_trace_parent().unwrap_or_else(minted_trace_parent)
+}
+
+/// Mints a session-local W3C context for a process that exports nothing.
+///
+/// Drawn from the OS rather than from the clock or the process identifier, because the invocation
+/// identifiers derived from the trace are the broker's replay-rejection keys: a container runtime
+/// that starts two daemons in the same millisecond with the same PID must not hand them one key
+/// space. An OS that refuses entropy falls back to the hasher construction rather than failing the
+/// session — a degraded trace still correlates, and refusing to answer a chat message over the
+/// quality of a correlation identifier is the worse trade.
+fn minted_trace_parent() -> TraceParent {
+    let mut bytes = [0_u8; 24];
+    if let Err(error) = getrandom::fill(&mut bytes) {
+        // An OS that will not supply entropy still has to leave the session correlatable, so the
+        // draw degrades to the construction this crate used before: an OS-seeded `RandomState` key
+        // mixed with the process and a nanosecond reading. That is a weaker unguessability claim
+        // for the invocation identifiers derived from the trace, and it is said out loud once
+        // rather than passed off as a random draw.
+        tracing::warn!(event = "session_trace_entropy_unavailable", error = %error);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos())
+            .unwrap_or_default();
+        let seed = RandomState::new();
+        for (index, chunk) in bytes.chunks_mut(8).enumerate() {
+            let mut hasher = seed.build_hasher();
+            hasher.write_usize(index);
+            hasher.write_u32(std::process::id());
+            hasher.write_u128(nanos);
+            chunk.copy_from_slice(&hasher.finish().to_be_bytes());
+        }
+    }
+    let mut trace_id = [0_u8; 16];
+    trace_id.copy_from_slice(&bytes[..16]);
+    let mut parent_id = [0_u8; 8];
+    parent_id.copy_from_slice(&bytes[16..]);
+    // All-zero is the one value W3C forbids for either identifier, and one draw in 2^128 does not
+    // justify a failure every caller would have to handle: setting the low bit makes the forbidden
+    // draw legal and changes nothing else.
+    trace_id[15] |= 1;
+    parent_id[7] |= 1;
+    // `sampled` is set, and it is not a claim that this process exports anything — it does not,
+    // which is why the trace was minted at all. The flag is an instruction to whoever receives it:
+    // `dekopon-brokerd` adopts this context as a remote parent, and the OpenTelemetry SDK's default
+    // `ParentBased(AlwaysOn)` sampler makes every span beneath an unsampled parent non-recording.
+    // A cleared bit would therefore silence an exporting broker behind a non-exporting gateway —
+    // exactly the deployment where the broker's trace is the only one anybody gets.
+    TraceParent::new(trace_id, parent_id, 1)
+        .expect("the low bit of each identifier is set, so neither is all zeroes")
 }
 
 /// Maps a provider's own command-run outcome onto the shell's seam type.
@@ -336,9 +409,6 @@ pub enum BrokerLegError {
     /// The broker could not be reached or refused the capability snapshot.
     #[error(transparent)]
     Client(#[from] ClientError),
-    /// A unique session identifier could not be derived.
-    #[error("could not derive a unique identifier for this broker session")]
-    SessionIdentifier(#[source] IdentifierError),
     /// The broker's capability snapshot named the same capability more than once.
     #[error("the broker answered with duplicate capability identifiers: {capabilities}")]
     DuplicateCapabilities {
@@ -403,10 +473,6 @@ impl BrokerLeg {
     /// startup failure instead of a capability that inexplicably reports "command not found"
     /// halfway through a script a model already committed to.
     ///
-    /// `trace_prefix` names the embedding surface (for example `console-prompt`) and becomes
-    /// the leading component of the session's trace and invocation identifiers, so every call a
-    /// session made is recoverable from the broker's audit log by prefix.
-    ///
     /// `attestation` is `None` for a leg that speaks as its own connected peer, which is the
     /// original behavior. A chat gateway holds no broker authority of its own: it knows which
     /// subject sent a message and which agent is answering, and the broker decides everything
@@ -419,14 +485,12 @@ impl BrokerLeg {
     /// broker is unreachable"; deciding which of those to say is the caller's job.
     pub async fn connect(
         client: BrokerClient,
-        trace_prefix: &str,
         attestation: Option<Attestation>,
     ) -> Result<Self, BrokerLegError> {
         let (capabilities, command_words, chat_memory) =
             client.session_surface(attestation.clone()).await?;
         Self::build(
             client,
-            trace_prefix,
             capabilities,
             command_words,
             attestation,
@@ -436,7 +500,6 @@ impl BrokerLeg {
 
     fn build(
         client: BrokerClient,
-        trace_prefix: &str,
         available: Vec<dekopon_broker_protocol::AvailableCapability>,
         command_words: Vec<String>,
         attestation: Option<Attestation>,
@@ -451,8 +514,7 @@ impl BrokerLeg {
             effective_capabilities,
             command_words: command_words.into_iter().collect(),
             namespaces,
-            identifiers: IdSequence::new(trace_prefix)
-                .map_err(BrokerLegError::SessionIdentifier)?,
+            identifiers: IdSequence::for_session(),
             attestation,
             chat_memory,
             cancel: CancelSignal::never(),
@@ -514,7 +576,7 @@ impl BrokerLeg {
     /// It is the join key between an embedding surface's own telemetry and the broker's audit
     /// records for the same session.
     #[must_use]
-    pub fn session_trace(&self) -> &TraceId {
+    pub const fn session_trace(&self) -> TraceId {
         self.identifiers.trace()
     }
 
@@ -749,19 +811,13 @@ impl CapabilityInvoker for BrokerLeg {
                 };
             }
         };
-        let Ok(id) = self.identifiers.next_invocation() else {
-            return CapabilityCallResult::Failed {
-                error: "could not derive a unique invocation identifier".to_owned(),
-            };
-        };
         let request = InvocationRequest {
-            id,
+            id: self.identifiers.next_invocation(),
             capability: parsed,
-            trace: self.identifiers.trace().clone(),
             // Read on the blocking thread the session entered, so the broker parents its spans to
             // the script span that actually asked for this capability rather than to the session
             // root.
-            trace_parent: current_trace_parent(),
+            trace_parent: self.identifiers.trace_parent(),
             secret_use,
             input,
         };
@@ -823,59 +879,73 @@ impl CapabilityInvoker for BrokerLeg {
     }
 }
 
-/// Generates the trace and invocation identifiers one session needs.
+/// One session's W3C trace and the invocation identifiers derived from it.
 ///
 /// The broker treats an invocation identifier as a durable replay-rejection key, so two calls must
 /// never share one and a script that calls the same capability in a loop must not collide with
-/// itself. Nothing in this workspace generates randomness, and a dependency is not worth 64 bits
-/// of it, so the session prefix mixes an OS-seeded `RandomState` key with the process ID and a
-/// wall-clock reading, and a monotonic counter makes collisions *within* a session impossible
-/// rather than merely unlikely. Invocation identifiers extend the session trace, so every call a
-/// session made is recoverable from the broker's audit log by prefix.
+/// itself. Both properties come from the trace: it is 128 bits an attacker cannot guess, drawn
+/// from the OS or adopted from the exporting span that opened the session, and a monotonic counter
+/// beneath it makes collisions *within* a session impossible rather than merely unlikely.
+///
+/// Every identifier here is one identifier: an invocation is `<trace>-<counter>`, so every call a
+/// session made is recoverable from the broker's audit log by trace prefix, and the audit records
+/// the broker writes carry the same trace the gateway's own spans do.
 #[cfg(unix)]
 pub struct IdSequence {
-    trace: TraceId,
+    parent: TraceParent,
     next: AtomicU32,
 }
 
 #[cfg(unix)]
 impl IdSequence {
-    /// Derives one session's identifier space under `prefix`.
+    /// Opens one session's identifier space on the current trace.
     ///
-    /// The prefix must itself be a valid identifier component (lowercase, `.`/`-`/`_`), and short
-    /// enough that the longest identifier derived from it still validates, because a bad prefix
-    /// fails here rather than on the first invocation.
-    pub fn new(prefix: &str) -> Result<Self, IdentifierError> {
-        let mut hasher = RandomState::new().build_hasher();
-        hasher.write_u32(std::process::id());
-        hasher.write_u128(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_nanos())
-                .unwrap_or_default(),
-        );
-        let trace = format!("{prefix}-{:016x}", hasher.finish()).parse::<TraceId>()?;
-        // The longest invocation identifier this session could ever derive, checked now rather
-        // than on the first call. A prefix can be short enough for a valid trace and still push
-        // every identifier built from it past the length bound, which would leave a session that
-        // constructed cleanly and then failed every capability call a model committed to.
-        format!("{trace}-{}", u32::MAX).parse::<InvocationId>()?;
-        Ok(Self {
-            trace,
+    /// Adopts the exporting span's trace when there is one and mints a session-local trace when
+    /// there is not; see [`session_trace_parent`] for why there is never a third answer.
+    #[must_use]
+    pub fn for_session() -> Self {
+        Self {
+            parent: session_trace_parent(),
             next: AtomicU32::new(1),
-        })
+        }
     }
 
     /// The session's trace identifier, shared by every invocation it makes.
     #[must_use]
-    pub fn trace(&self) -> &TraceId {
-        &self.trace
+    pub const fn trace(&self) -> TraceId {
+        self.parent.trace()
+    }
+
+    /// The W3C context to send with the next call.
+    ///
+    /// The live span when it belongs to this session's trace, so the broker parents `broker.invocation`
+    /// on the script span that actually asked for the capability rather than on the session root, and
+    /// the session's own context otherwise. The filter is what keeps one promise true: the trace on
+    /// the wire is always the trace the invocation identifier extends, including for a leg built
+    /// outside the span its calls run under.
+    #[must_use]
+    pub fn trace_parent(&self) -> TraceParent {
+        current_trace_parent()
+            .filter(|live| live.trace() == self.parent.trace())
+            .unwrap_or(self.parent)
     }
 
     /// Derives the next invocation identifier in this session.
-    pub fn next_invocation(&self) -> Result<InvocationId, IdentifierError> {
+    #[must_use]
+    pub fn next_invocation(&self) -> InvocationId {
         let counter = self.next.fetch_add(1, Ordering::Relaxed);
-        format!("{}-{counter}", self.trace).parse()
+        // 32 hexadecimal digits, a separator, and at most 10 decimal ones: lowercase, no adjacent
+        // separators, and 210 characters inside the identifier bound however the trace was drawn.
+        format!("{}-{counter}", self.parent.trace())
+            .parse()
+            .expect("a trace and a counter are a valid invocation identifier")
+    }
+}
+
+#[cfg(unix)]
+impl Default for IdSequence {
+    fn default() -> Self {
+        Self::for_session()
     }
 }
 
@@ -1184,6 +1254,7 @@ mod tests {
                 AttachmentRefusal, ChatAssetInputs, ChatAssetRefusal, ChatAssetSource,
                 ReplyAttachments,
             },
+            current_trace_parent,
             meta::EffectiveCapabilityView,
         };
 
@@ -1489,7 +1560,7 @@ mod tests {
                 }],
                 command_words: BTreeSet::new(),
                 namespaces,
-                identifiers: IdSequence::new("dekopon-agent-test").expect("session identifiers"),
+                identifiers: IdSequence::for_session(),
                 attestation,
                 chat_memory: None,
                 cancel: CancelSignal::never(),
@@ -1875,46 +1946,58 @@ mod tests {
         async fn invocation_identifiers_are_unique_and_extend_the_session_trace() {
             // The broker treats an invocation ID as a durable replay-rejection key, so a script
             // calling one capability in a loop must not collide with itself.
-            let identifiers = IdSequence::new("dekopon-agent-test").expect("session identifiers");
-            let first = identifiers.next_invocation().expect("first identifier");
-            let second = identifiers.next_invocation().expect("second identifier");
+            let identifiers = IdSequence::for_session();
+            let first = identifiers.next_invocation();
+            let second = identifiers.next_invocation();
 
             assert_ne!(first, second);
-            let trace = identifiers.trace().as_str();
-            assert!(first.as_str().starts_with(trace), "{first} vs {trace}");
-            assert!(second.as_str().starts_with(trace), "{second} vs {trace}");
-            assert!(trace.starts_with("dekopon-agent-test-"), "{trace}");
+            let trace = identifiers.trace().to_string();
+            assert!(first.as_str().starts_with(&trace), "{first} vs {trace}");
+            assert!(second.as_str().starts_with(&trace), "{second} vs {trace}");
 
             // Two sessions in the same process must not share a key space either.
-            let other = IdSequence::new("dekopon-agent-test").expect("second session identifiers");
+            let other = IdSequence::for_session();
             assert_ne!(identifiers.trace(), other.trace());
         }
 
+        /// The precondition behind a mandatory `traceParent`.
+        ///
+        /// `dekopon_telemetry::install` attaches the `tracing-opentelemetry` layer only when an
+        /// OTLP trace exporter is configured, so a daemon that exports nothing has no span context
+        /// at all — [`current_trace_parent`] is `None` however many spans are open. The request
+        /// field is not optional, so the session mints its own trace rather than leaving the
+        /// broker's audit records with no correlation identifier.
         #[tokio::test]
-        async fn an_invalid_trace_prefix_fails_at_construction() {
-            // The prefix reaches identifier validation verbatim, so a bad one must fail here
-            // rather than on the first invocation a model already committed to.
-            assert!(IdSequence::new("Not A Prefix").is_err());
-        }
-
-        #[tokio::test]
-        async fn a_prefix_only_the_derived_invocations_outgrow_fails_at_construction_too() {
-            // A prefix can leave room for the trace and none for what the trace derives: 235
-            // characters plus the separator and 16 hexadecimal digits is a 252-character trace,
-            // one under the 253-byte identifier bound, while every invocation identifier built
-            // from it is 11 characters longer. Accepting this would hand back a session whose
-            // every capability call fails with "could not derive a unique invocation identifier".
-            let prefix = "a".repeat(235);
-            let trace = format!("{prefix}-{:016x}", 0_u64);
-            assert_eq!(trace.len(), 252, "the trace itself must still be valid");
-            assert!(trace.parse::<dekopon_core::TraceId>().is_ok());
-
-            let Err(error) = IdSequence::new(&prefix) else {
-                panic!("a prefix whose derived identifiers are too long must fail construction");
-            };
+        async fn a_session_that_exports_nothing_still_carries_one_trace() {
+            let span = tracing::info_span!("gateway.session");
+            let _entered = span.enter();
             assert!(
-                matches!(error, dekopon_core::IdentifierError::TooLong { .. }),
-                "{error}"
+                current_trace_parent().is_none(),
+                "no exporter is installed in this test process"
+            );
+
+            let identifiers = IdSequence::for_session();
+            let minted = identifiers.trace_parent();
+            assert_eq!(minted.trace(), identifiers.trace());
+            assert_eq!(
+                minted.to_string(),
+                format!(
+                    "00-{}-{:016x}-01",
+                    minted.trace(),
+                    u64::from_be_bytes(minted.parent_id())
+                ),
+                "the minted context is a well-formed traceparent"
+            );
+            // Set even though this process exports nothing: the broker adopts this as a remote
+            // parent and its default `ParentBased(AlwaysOn)` sampler drops everything beneath an
+            // unsampled one, so a cleared bit would silence an exporting broker behind a
+            // non-exporting gateway.
+            assert_eq!(minted.flags(), 1, "a minted parent instructs the receiver");
+            assert!(
+                identifiers
+                    .next_invocation()
+                    .as_str()
+                    .starts_with(&identifiers.trace().to_string())
             );
         }
 

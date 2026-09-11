@@ -25,13 +25,10 @@
 //! never accumulates into a durable pseudonym. Its lifetime is exactly the window over which a
 //! prefix is genuinely shared, which is also the only window in which it is useful.
 //!
-//! Entropy comes from [`IdSequence`], which is the workspace's existing answer to needing an
-//! unguessable identifier without adding a dependency: an OS-seeded `RandomState` hasher mixed with
-//! the process ID and a nanosecond wall-clock reading. The broker already trusts that construction
-//! for invocation identifiers, where a collision is a replay-rejection failure; here a collision
-//! costs a wasted cache lookup.
-
-use dekopon_agent::IdSequence;
+//! Entropy comes from the OS, the same source the transport nonces draw from. A collision here
+//! costs a wasted cache lookup rather than anything an operator has to reason about, but a key
+//! minted from the clock or the process would repeat across a fleet restarted together, and the
+//! whole point of the identifier is that it names one lane and nothing else.
 
 /// Prefix for a key naming one remembered conversation on one `persistent` route.
 const CONVERSATION_PREFIX: &str = "dekopond-conversation";
@@ -62,14 +59,14 @@ pub(crate) fn for_route() -> String {
 
 /// Derives one opaque identifier under `prefix`.
 ///
-/// [`IdSequence::new`] rejects only a malformed prefix, and both prefixes here are crate constants
-/// covered by a test, so the error branch is unreachable. It still degrades rather than panics: an
-/// empty key is dropped by `CompletionOptions::with_prompt_cache_key`, which leaves the request
-/// exactly as it would have been with no key at all. A message is the wrong place to abort over a
-/// routing hint.
+/// An OS that will not supply entropy yields an empty key rather than a predictable one, and
+/// `CompletionOptions::with_prompt_cache_key` drops an empty key — leaving the request exactly as
+/// it would have been with no key at all. A message is the wrong place to abort over a routing hint.
 fn mint(prefix: &str) -> String {
-    IdSequence::new(prefix).map_or_else(
-        |_| String::new(),
-        |identifiers| identifiers.trace().as_str().to_owned(),
-    )
+    let mut bytes = [0_u8; 16];
+    if let Err(error) = getrandom::fill(&mut bytes) {
+        tracing::warn!(event = "gateway_cache_key_entropy_unavailable", error = %error);
+        return String::new();
+    }
+    format!("{prefix}-{:032x}", u128::from_be_bytes(bytes))
 }

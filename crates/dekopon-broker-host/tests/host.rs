@@ -55,7 +55,7 @@ fn authorized_for(
                 .parse::<AgentId>()
                 .expect("valid agent fixture"),
         },
-        "trace-test"
+        "0000000000000000000000000000f1c7"
             .parse::<TraceId>()
             .expect("valid trace fixture"),
         input,

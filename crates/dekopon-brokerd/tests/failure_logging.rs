@@ -27,7 +27,7 @@ use dekopon_broker_protocol::{
 use dekopon_brokerd::{BrokerServer, MappedPeer, ServerLimits, current_uid};
 use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency};
 use dekopon_core::{
-    Actor, AgentId, CapabilityId, InvocationId, PrincipalId, ProviderId, RiskLevel, TraceId,
+    Actor, AgentId, CapabilityId, InvocationId, PrincipalId, ProviderId, RiskLevel,
 };
 use dekopon_test_support::{CaptureLayer, provider_fixture, shutdown_on};
 use serde_json::json;
@@ -37,6 +37,12 @@ use tokio::{
     sync::oneshot,
 };
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
+
+/// One fixture trace context for every request these tests build.
+///
+/// The trace is mandatory on the wire now; these cases read invocation identifiers and audit
+/// fields rather than the trace itself, so one shared value keeps the fixtures about their subject.
+const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
 
 const POLICY: &str = r#"
 @id("caller-echo")
@@ -256,8 +262,7 @@ async fn framing_audit_and_unmapped_peer_failures_name_their_cause() {
             .parse::<InvocationId>()
             .expect("valid invocation"),
         capability: "echo.echo".parse::<CapabilityId>().expect("capability"),
-        trace: "trace-brokerd".parse::<TraceId>().expect("valid trace"),
-        trace_parent: None,
+        trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
         secret_use: None,
         input: json!({"message": "hello through broker"}),
     };
