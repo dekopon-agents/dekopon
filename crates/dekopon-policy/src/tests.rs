@@ -1,5 +1,6 @@
 use dekopon_capability::{EffectKind, Idempotency};
 use dekopon_core::{RiskLevel, SecretSinkKind};
+use serde_json::json;
 
 use super::{
     AGENT_PROMPT_ACTION, MAX_POLICY_BYTES, PolicyBuildError, PolicyContext, PolicyDecision,
@@ -539,6 +540,100 @@ fn world_construction_rejects_duplicates_and_reserved_names() {
             PolicyBuildError::WorldConflicts { reserved, duplicates }
                 if duplicates.is_empty() && reserved == vec![action.parse().expect("valid id")]
         ));
+    }
+}
+
+/// The context record of every action, pinned.
+///
+/// Cedar's strict validator rejects a policy that reads an attribute the schema does not declare,
+/// so these records *are* the vocabulary a policy may use about a request — and the reason a
+/// `secret.use` policy can rely on `capability`, `provider` and `sink` being present rather than
+/// optional: goal 1's exact binding is only a gate if the schema requires all three.
+///
+/// Spelled out rather than generated from the renderer, deliberately. A golden that shares code
+/// with what it checks cannot notice the rendering moving; this one fails the moment an attribute
+/// is added, dropped, renamed, or made optional.
+#[test]
+fn every_action_declares_exactly_these_context_attributes() {
+    fn pretty(value: &serde_json::Value) -> String {
+        serde_json::to_string_pretty(value).expect("a context record serializes")
+    }
+
+    // A capability invocation: the routing attributes, plus the classification the broker will
+    // execute it under.
+    let capability_context = json!({
+        "type": "Record",
+        "attributes": {
+            "via": { "type": "String", "required": false },
+            "subject": { "type": "String", "required": false },
+            "agent": { "type": "String", "required": false },
+            "transportKind": { "type": "String", "required": false },
+            "transport": { "type": "String", "required": false },
+            "channel": { "type": "String", "required": false },
+            "conversation": { "type": "String", "required": false },
+            "effect": { "type": "String" },
+            "risk": { "type": "String" },
+            "idempotency": { "type": "String" },
+        }
+    });
+    // Driving an agent at all: the routing attributes and nothing else.
+    let prompt_context = json!({
+        "type": "Record",
+        "attributes": {
+            "via": { "type": "String", "required": false },
+            "subject": { "type": "String", "required": false },
+            "agent": { "type": "String", "required": false },
+            "transportKind": { "type": "String", "required": false },
+            "transport": { "type": "String", "required": false },
+            "channel": { "type": "String", "required": false },
+            "conversation": { "type": "String", "required": false },
+        }
+    });
+    // Using a secret: the routing attributes, plus the binding the credential is released against.
+    let secret_context = json!({
+        "type": "Record",
+        "attributes": {
+            "via": { "type": "String", "required": false },
+            "subject": { "type": "String", "required": false },
+            "agent": { "type": "String", "required": false },
+            "transportKind": { "type": "String", "required": false },
+            "transport": { "type": "String", "required": false },
+            "channel": { "type": "String", "required": false },
+            "conversation": { "type": "String", "required": false },
+            "capability": { "type": "String" },
+            "provider": { "type": "String" },
+            "sink": { "type": "String" },
+        }
+    });
+
+    let schema = world_with_secret().schema_json();
+    let actions = schema["Dekopon"]["actions"]
+        .as_object()
+        .expect("the schema renders an action map");
+    assert_eq!(
+        actions.keys().map(String::as_str).collect::<Vec<_>>(),
+        [
+            "echo.echo",
+            "echo.reverse",
+            AGENT_PROMPT_ACTION,
+            SECRET_USE_ACTION
+        ],
+        "the world's two capabilities and the two fixed actions each get a context record"
+    );
+    for (action, expected) in [
+        ("echo.echo", &capability_context),
+        ("echo.reverse", &capability_context),
+        (AGENT_PROMPT_ACTION, &prompt_context),
+        (SECRET_USE_ACTION, &secret_context),
+    ] {
+        let (rendered, expected) = (
+            pretty(&actions[action]["appliesTo"]["context"]),
+            pretty(expected),
+        );
+        assert!(
+            rendered == expected,
+            "the {action} context record moved\n--- rendered ---\n{rendered}\n--- pinned ---\n{expected}"
+        );
     }
 }
 
