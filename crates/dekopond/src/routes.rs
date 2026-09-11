@@ -135,17 +135,6 @@ impl RoutingTable {
                     continue;
                 }
             };
-            // Checked against the catalog for the reason the agent is: a misspelled capability in
-            // `chatAssetInputs` would otherwise silently never expand a marker, which looks exactly
-            // like a provider that refuses its own input. Every unknown identifier is named, and a
-            // catalog entry is not a grant — the broker still decides the invocation.
-            for capability in &route.chat_asset_inputs {
-                if catalog.capability(capability).is_none() {
-                    problems.push(RouteProblem::UnknownChatAssetCapability {
-                        capability: capability.to_string(),
-                    });
-                }
-            }
             routes.push(BoundRoute {
                 transport: route.transport.clone(),
                 r#match: route.r#match.clone(),
@@ -242,6 +231,4 @@ pub enum RouteProblem {
     NoModelClass { agent: String },
     #[error("agent {agent:?} needs model class {class:?}, which no configured model offers")]
     NoModelForClass { agent: String, class: String },
-    #[error("route lists chat-asset input capability {capability:?}, which is not in the catalog")]
-    UnknownChatAssetCapability { capability: String },
 }

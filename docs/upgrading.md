@@ -24,6 +24,27 @@ conversation the system has handled. The exclusions are unchanged and were never
 secret bytes and the gateway's own credentials never reach telemetry, and HTTP request and response
 headers and bodies stay out of spans.
 
+## Catalog `Capability` and `Provider` documents (unreleased)
+
+Delete every `kind: Capability` and `kind: Provider` document from every catalog before upgrading.
+A catalog carrying one refuses to load, naming the kind:
+
+```text
+dekopon.yaml: 1 validation problem found:
+  - document 2: kind Capability is no longer part of the catalog; remove the document. Capabilities and providers come from the broker, which builds them from provider manifests and its own constraint sets
+```
+
+Nothing else changes. The `Agent` documents are untouched, `dekopond` binds routes exactly as
+before, and no broker configuration moves: those documents were never consulted at run time, and
+the capability surface a session reaches has always been the broker's answer under that agent's
+attestation. An agent's own `capabilities:` and `providers:` lists stay valid to author and stay
+read by nothing.
+
+One check goes with them. A route's `chatAssetInputs` was held to the capabilities the catalog
+declared, so a misspelled identifier there refused startup; now it loads and the marker is passed
+to the provider verbatim, which reads as the provider rejecting its own input. Check those
+identifiers against the broker's `constraintSets` by hand.
+
 ## Broker dashboard retirement (unreleased)
 
 Remove the broker listener flag and chart value when upgrading. The UI and its reporting feed
@@ -192,8 +213,8 @@ routes:
 `providerAttachments.maxPerReply` is how many files one reply may carry; omitting the block means a
 capability's `attachments` key is stripped and refused, which is what every route does today.
 `chatAssetInputs` lists the capabilities whose input may name one of the conversation's own
-attachments as `chat-asset:<N>`, so a person's photo can reach a remix capability; every identifier in
-it must exist in the catalog, and a capability left out of the list receives such a string verbatim.
+attachments as `chat-asset:<N>`, so a person's photo can reach a remix capability; a capability left
+out of the list receives such a string verbatim.
 `maxPerReply: 0` is refused — omit the block instead — and pairing `providerAttachments` with a
 `whatsappCloudApi` transport is still a startup refusal. A model that calls `generate_image` now takes
 the ordinary unknown-tool path and ends the session.

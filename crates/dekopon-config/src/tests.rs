@@ -15,26 +15,6 @@ fn problems(error: &ConfigError) -> &[CatalogProblem] {
 fn valid_documents(agent_name: &str) -> String {
     format!(
         r#"apiVersion: dekopon.dev/v1alpha1
-kind: Provider
-metadata:
-  name: github
-spec:
-  description: Test provider
-  type: github
-  credentialRef: test-credential
----
-apiVersion: dekopon.dev/v1alpha1
-kind: Capability
-metadata:
-  name: github.pull-request.read
-spec:
-  description: Test capability
-  provider: github
-  effect: read-only
-  risk: Low
-  idempotency: idempotent
----
-apiVersion: dekopon.dev/v1alpha1
 kind: Agent
 metadata:
   name: {agent_name}
@@ -79,8 +59,6 @@ fn loads_multiple_documents_and_sorts_resources() {
         .collect::<Vec<_>>();
 
     assert_eq!(names, ["alpha", "zebra"]);
-    assert_eq!(catalog.capabilities().len(), 1);
-    assert_eq!(catalog.providers().len(), 1);
 }
 
 #[test]
@@ -100,18 +78,10 @@ fn accepts_json_as_a_yaml_subset() {
 
 #[test]
 fn rejects_duplicate_resources() {
-    let document = r#"apiVersion: dekopon.dev/v1alpha1
-kind: Provider
-metadata:
-  name: github
-spec:
-  description: Test provider
-  type: github
-  credentialRef: test-credential
-"#;
+    let document = standalone_agent("reviewer");
     let input = format!("{document}---\n{document}");
     let error =
-        LocalCatalog::from_str("duplicate.yaml", &input).expect_err("duplicate provider must fail");
+        LocalCatalog::from_str("duplicate.yaml", &input).expect_err("duplicate agent must fail");
 
     assert!(matches!(
         problems(&error),
@@ -120,29 +90,22 @@ spec:
     assert!(error.to_string().contains("first declared"));
 }
 
+/// The refusal an operator upgrading past these kinds actually reads.
+///
+/// A generic unknown-kind message would send them looking for a typo in a document that was
+/// correct when it was written, so the cause is named once, per document.
 #[test]
-fn rejects_missing_capability_references() {
+fn a_withdrawn_kind_names_the_upgrade_rather_than_reading_as_a_typo() {
     let input = r#"apiVersion: dekopon.dev/v1alpha1
-kind: Agent
+kind: Provider
 metadata:
-  name: reviewer
+  name: github
 spec:
-  description: Test agent
-  capabilities:
-    - github.pull-request.read
-"#;
-    let error =
-        LocalCatalog::from_str("missing.yaml", input).expect_err("missing capability must fail");
-
-    assert!(matches!(
-        problems(&error),
-        [CatalogProblem::MissingCapability { .. }]
-    ));
-}
-
-#[test]
-fn rejects_missing_provider_references() {
-    let input = r#"apiVersion: dekopon.dev/v1alpha1
+  description: Test provider
+  type: github
+  credentialRef: test-credential
+---
+apiVersion: dekopon.dev/v1alpha1
 kind: Capability
 metadata:
   name: github.pull-request.read
@@ -153,13 +116,29 @@ spec:
   risk: Low
   idempotency: idempotent
 "#;
-    let error =
-        LocalCatalog::from_str("missing.yaml", input).expect_err("missing provider must fail");
+    let error = LocalCatalog::from_str("withdrawn.yaml", input)
+        .expect_err("a catalog carrying the withdrawn kinds must fail");
 
-    assert!(matches!(
-        problems(&error),
-        [CatalogProblem::MissingProvider { .. }]
-    ));
+    assert!(
+        matches!(
+            problems(&error),
+            [
+                CatalogProblem::RemovedKind { .. },
+                CatalogProblem::RemovedKind { .. }
+            ]
+        ),
+        "{error}"
+    );
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("kind Provider is no longer part of the catalog"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("kind Capability is no longer part of the catalog"),
+        "{rendered}"
+    );
+    assert!(rendered.contains("come from the broker"), "{rendered}");
 }
 
 #[test]
@@ -180,85 +159,23 @@ fn rejects_unknown_fields() {
 #[test]
 fn every_problem_in_a_catalog_is_reported_at_once() {
     let input = r#"apiVersion: dekopon.dev/v1alpha1
-kind: Provider
+kind: Agent
 metadata:
-  name: github
+  name: reviewer
 spec:
-  description: Test provider
-  type: github
-  credentialRef: test-credential
----
-apiVersion: dekopon.dev/v1alpha1
-kind: Provider
-metadata:
-  name: github
-spec:
-  description: Duplicate provider
-  type: github
-  credentialRef: test-credential
----
-apiVersion: dekopon.dev/v1alpha1
-kind: Capability
-metadata:
-  name: github.pull-request.read
-spec:
-  description: Test capability
-  provider: elsewhere
-  effect: read-only
-  risk: Low
-  idempotency: idempotent
+  description: Test agent
 ---
 apiVersion: dekopon.dev/v1alpha1
 kind: Agent
 metadata:
   name: reviewer
 spec:
-  description: Test agent
-  capabilities:
-    - github.pull-request.read
-    - github.missing
-  providers:
-    - github
-status: Ready
-"#;
-    let error = LocalCatalog::from_str("many.yaml", input).expect_err("four problems must fail");
-    let rendered = error.to_string();
-
-    assert!(
-        rendered.contains("4 validation problems found:"),
-        "{rendered}"
-    );
-    assert!(
-        rendered
-            .contains(r#"duplicate Provider "github" at document 2; first declared at document 1"#),
-        "{rendered}"
-    );
-    assert!(
-        rendered.contains(r#"agent "reviewer" references missing capability "github.missing""#),
-        "{rendered}"
-    );
-    assert!(
-        rendered.contains(
-            r#"agent "reviewer" omits provider "elsewhere", required by capability "github.pull-request.read", from spec.providers"#
-        ),
-        "{rendered}"
-    );
-    assert!(
-        rendered.contains(
-            r#"capability "github.pull-request.read" references missing provider "elsewhere""#
-        ),
-        "{rendered}"
-    );
-}
-
-/// A resource that never entered the catalog would otherwise be blamed twice: once for the real
-/// failure, once as a reference nothing declares.
-#[test]
-fn a_dropped_resource_is_reported_without_downstream_reference_noise() {
-    let input = r#"apiVersion: dekopon.dev/v1alpha1
+  description: Duplicate agent
+---
+apiVersion: dekopon.dev/v1alpha1
 kind: Capability
 metadata:
-  name: Github.Pull-Request.Read
+  name: github.pull-request.read
 spec:
   description: Test capability
   provider: github
@@ -269,17 +186,29 @@ spec:
 apiVersion: dekopon.dev/v1alpha1
 kind: Agent
 metadata:
-  name: reviewer
+  name: Reviewer.Two
 spec:
   description: Test agent
-  capabilities:
-    - github.pull-request.read
 "#;
-    let error = LocalCatalog::from_str("dropped.yaml", input).expect_err("invalid name must fail");
+    let error = LocalCatalog::from_str("many.yaml", input).expect_err("three problems must fail");
+    let rendered = error.to_string();
 
     assert!(
-        matches!(problems(&error), [CatalogProblem::InvalidName { .. }]),
-        "{error}"
+        rendered.contains("3 validation problems found:"),
+        "{rendered}"
+    );
+    assert!(
+        rendered
+            .contains(r#"duplicate Agent "reviewer" at document 2; first declared at document 1"#),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("document 3: kind Capability is no longer part of the catalog"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains(r#"invalid Agent name "Reviewer.Two""#),
+        "{rendered}"
     );
 }
 
@@ -299,47 +228,6 @@ fn a_future_api_version_gets_the_dedicated_message() {
         problems(&error)
             .iter()
             .all(|problem| matches!(problem, CatalogProblem::UnsupportedApiVersion { .. })),
-        "{error}"
-    );
-}
-
-#[test]
-fn agent_providers_must_match_the_providers_its_capabilities_route_to() {
-    let unlisted = valid_documents("reviewer").replace("  providers:\n    - github\n", "");
-    let error = LocalCatalog::from_str("unlisted.yaml", &unlisted)
-        .expect_err("an omitted provider must fail");
-    assert!(
-        matches!(
-            problems(&error),
-            [CatalogProblem::UnlistedAgentProvider { .. }]
-        ),
-        "{error}"
-    );
-
-    let unreachable = format!(
-        "{}---\n{}",
-        valid_documents("reviewer"),
-        r#"apiVersion: dekopon.dev/v1alpha1
-kind: Provider
-metadata:
-  name: gitlab
-spec:
-  description: Unused provider
-  type: gitlab
-  credentialRef: test-credential
-"#
-    )
-    .replace(
-        "  providers:\n    - github\n",
-        "  providers:\n    - github\n    - gitlab\n",
-    );
-    let error = LocalCatalog::from_str("unreachable.yaml", &unreachable)
-        .expect_err("a provider no capability routes to must fail");
-    assert!(
-        matches!(
-            problems(&error),
-            [CatalogProblem::UnreachableAgentProvider { .. }]
-        ),
         "{error}"
     );
 }

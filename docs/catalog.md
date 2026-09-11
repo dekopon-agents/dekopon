@@ -1,52 +1,53 @@
 # Catalog resource reference
 
 **Status: current.** This is the field-by-field contract for the `dekopon.dev/v1alpha1` catalog —
-the `Agent`, `Capability`, and `Provider` documents in the file `dekopond`'s
-`catalogPath` points at. [`cli.md`](cli.md) covers the separate model-auth commands;
-this document covers the schema and, for every field, what actually consumes it today.
+the `Agent` documents in the file `dekopond`'s `catalogPath` points at. [`cli.md`](cli.md) covers
+the separate model-auth commands; this document covers the schema and, for every field, what
+actually consumes it today.
 
 That last part is the reason this document exists. The catalog looks like a permission system and is
-not one. Three of its fields decide how an agent behaves, several are validated cross-references,
-and four are reserved names that no shipped component reads. Authoring one correctly means knowing
-which is which.
+not one. Four of an agent's fields decide how it behaves and the rest are authored names that no
+shipped component reads. Authoring one correctly means knowing which is which.
 
 ## Who reads it
 
 | Process | Reads the catalog? | What it does with it |
 |---|---|---|
-| `dekopond` | Yes, at startup | Binds each route to an agent, resolves that agent's model, hands its `instructions` to the model as a system prompt, mounts its `skills` on every session the route serves, and checks that every capability a route's `chatAssetInputs` names exists here. |
+| `dekopond` | Yes, at startup | Binds each route to an agent, resolves that agent's model, hands its `instructions` to the model as a system prompt, and mounts its `skills` on every session the route serves. |
 | `dekopon-brokerd` | **No** | The broker does not link `dekopon-config` and never sees this file. It declares the `Dekopon::Agent` Cedar type and matches instances by name without enumerating them. |
 
 The consequence worth internalizing: **nothing an agent may actually do comes from this file.** The
-broker's `constraintSets` and Cedar policy decide that, and neither reads the catalog. An agent's
-`capabilities` list is a declaration of intent that grants nothing, and a name misspelled in a
+broker's `constraintSets` and Cedar policy decide that, and neither reads the catalog. The
+capabilities a session may reach come from the broker, which builds them from the provider
+manifests it loaded; an agent's `capabilities` list here is a declaration of intent that grants
+nothing and is compared against nothing, and a name misspelled in a
 policy's `Dekopon::Agent::"…"` literal cannot be caught by validating this file — see
 [`dekopon-brokerd` contract](../crates/dekopon-brokerd/README.md#catalog-ownership-at-policy-startup).
 
 ## The document envelope
 
-Every resource is one YAML or JSON document with the same four keys. The loader accepts JSON, a
-single YAML document, a YAML sequence, or a multi-document YAML stream, and it parses the file once.
+An agent is one YAML or JSON document with four keys. The loader accepts JSON, a single YAML
+document, a YAML sequence, or a multi-document YAML stream, and it parses the file once.
 
 ```yaml
 apiVersion: dekopon.dev/v1alpha1
-kind: Agent            # Agent | Capability | Provider
+kind: Agent
 metadata:
   name: reviewer
   labels:              # optional
     environment: local
-spec: { … }            # kind-specific; see below
+spec: { … }            # see below
 status: Ready          # optional
 ```
 
 | Field | Required | Notes |
 |---|---|---|
 | `apiVersion` | yes | Exactly `dekopon.dev/v1alpha1`. Any other value fails to decode. |
-| `kind` | yes | Must match the document's own shape; a `spec` for one kind under another kind's name is a load failure. |
-| `metadata.name` | yes | Validated as the kind's identifier type. |
+| `kind` | yes | Exactly `Agent`. Any other value is a load failure naming the document. |
+| `metadata.name` | yes | Validated as an agent identifier. |
 | `metadata.labels` | no | A string-to-string map with stable ordering. Stored by protocol `ObjectMeta` serde; no shipped selector, filter, or inventory reader consumes it (source map below). |
-| `spec` | yes | Kind-specific, below. |
-| `status` | no | Kind-specific. Authored, never observed — see [Reserved and inert fields](#reserved-and-inert-fields). |
+| `spec` | yes | The agent's desired state, below. |
+| `status` | no | Authored, never observed — see [Reserved and inert fields](#reserved-and-inert-fields). |
 
 Authored structures **reject unknown fields**. A misspelled key is a load failure naming the
 document, not a silently ignored setting: the catalog is security-adjacent configuration, and
@@ -54,7 +55,8 @@ quietly dropping `capabilties:` would be worse than refusing the file.
 
 ### Identifier grammar
 
-`metadata.name`, and every reference to one, is validated by the same rule for all three kinds:
+`metadata.name`, and every capability and provider identifier an agent names, is validated by the
+same rule:
 
 - at most 253 bytes;
 - lowercase ASCII letters and digits only, plus the separators `.`, `-`, and `_`;
@@ -93,11 +95,11 @@ status: Ready
 | `enabled` | bool | no, defaults `true` | **Load-bearing in `dekopond`.** A route naming a disabled agent is a startup failure. Authored status does not override it. |
 | `instructions` | string | no | **Load-bearing in `dekopond`.** Handed to the model verbatim as the session's system prompt. Absent means the agent runs with no standing orders. |
 | `skills` | list of directory paths | no | **Load-bearing in `dekopond`.** Each names a skill directory — relative paths resolve against the catalog file's own directory — that the loader reads whole at load time. `dekopond` mounts them on every session of a route bound to the agent. See [`skills` are directories the model reads on demand](#skills-are-directories-the-model-reads-on-demand). |
-| `capabilities` | list of capability IDs | no | Cross-checked at load: every entry must name a `Capability` in the same catalog or the file is rejected. **Grants nothing.** |
-| `providers` | list of provider IDs | no | Cross-checked at load: every entry must name a `Provider`, and the list must match exactly the providers the agent's `capabilities` route to. **Grants nothing.** |
+| `capabilities` | list of capability IDs | no | **Reserved.** Stored typed catalog metadata read by nothing; the capabilities a session reaches come from the broker. See [Reserved and inert fields](#reserved-and-inert-fields). |
+| `providers` | list of provider IDs | no | **Reserved.** Stored typed catalog metadata read by nothing. See [Reserved and inert fields](#reserved-and-inert-fields). |
 | `modelClass` | string | no, but see below | **Load-bearing in `dekopond`.** Selects which configured model serves the agent. |
 | `policyProfile` | string | no | **Reserved.** Nothing reads it. See [Reserved and inert fields](#reserved-and-inert-fields). |
-| `status` | `Ready` \| `Pending` \| `Disabled` \| `Error` | no | Stored typed authored metadata, never observed or reported; omission stays `None`, with no presentation fallback. |
+| `status` | `Ready` \| `Pending` \| `Disabled` \| `Error` | no | **Reserved.** Stored typed authored metadata, never observed or reported; omission stays `None`, with no presentation fallback. |
 
 ### `instructions` is untrusted model text, and it is readable
 
@@ -179,97 +181,30 @@ Failing at startup rather than per-session is the point: a catalog typo here is 
 an agent that appears configured and answers nobody. See
 [`dekopond.md`](dekopond.md#configuration) for the model list and route syntax.
 
-## `Capability`
-
-```yaml
-apiVersion: dekopon.dev/v1alpha1
-kind: Capability
-metadata:
-  name: gh.pull-request.comment
-spec:
-  description: Post a pull-request review comment as an explicit external write
-  provider: gh
-  effect: external-write
-  risk: High
-  idempotency: conditional
-  permissions:
-    - operation: pull_requests:write
-status: Unknown
-```
-
-| Field | Type | Required | What consumes it |
-|---|---|---|---|
-| `description` | string | yes | Stored typed catalog metadata; not an authorization input. |
-| `provider` | provider ID | yes | Cross-checked at load: must name a `Provider` in the same catalog. |
-| `effect` | `read-only` \| `local-write` \| `external-write` | yes | Stored typed catalog metadata; not used for gateway authorization. |
-| `risk` | `Low` \| `Medium` \| `High` \| `Critical` | yes | Stored typed catalog metadata. |
-| `idempotency` | `idempotent` \| `conditional` \| `non-idempotent` | yes | Stored typed catalog metadata. *Committed direction:* removed ([non-goals](design.md#non-goals)); the broker reads only its own `constraintSets` copy. |
-| `permissions` | list of `{ operation, resource? }` | no | Stored typed catalog metadata; no authority is granted. |
-| `status` | `Available` \| `Unavailable` \| `Unknown` | no | Stored typed authored metadata, never observed or reported; omission stays `None`, with no presentation fallback. |
-
-A capability's *existence* here is load-bearing in one more place: `dekopond` refuses to start when a
-route's `chatAssetInputs` names a capability this file does not define, because a misspelled
-identifier would otherwise silently never expand a `chat-asset:<N>` marker and look exactly like a
-provider rejecting its own input. Presence is still not a grant — the broker decides the invocation.
-
-**The broker does not read any of this.** The trusted `effect`, `risk`, and `idempotency` a policy
-decision sees come from the capability's `constraintSets` entry in `broker.yaml`, validated against
-the loaded provider manifest — as does its `route`, the field that decides whether a capability is
-ordinary or part of the reserved chat-memory surface. *Committed direction:* `idempotency` is
-removed from the constraint set and the policy context ([non-goals](design.md#non-goals)). The catalog's copy is operator
-documentation: what a reviewer reads to understand what the deployment intends. It can disagree with the broker without either
-process noticing, and the broker's copy is the one that decides.
-
-## `Provider`
-
-```yaml
-apiVersion: dekopon.dev/v1alpha1
-kind: Provider
-metadata:
-  name: gh
-spec:
-  description: GitHub provider for repository and pull-request operations
-  type: github
-  credentialRef: github-pat
-status: Unknown
-```
-
-| Field | Type | Required | What consumes it |
-|---|---|---|---|
-| `description` | string | yes | Stored typed catalog metadata. |
-| `type` | string | yes | Free-form implementation family, such as `github`. Stored typed metadata; matched against nothing. |
-| `credentialRef` | string | yes | **Reserved.** Nothing resolves it. See below. |
-| `status` | `Ready` \| `Unavailable` \| `Unknown` | no | Stored typed authored metadata, never observed or reported; omission stays `None`, with no presentation fallback. |
-
-A catalog `Provider` is not the Wasm component. The component is a `.wasm` file the broker loads by
-path from its own `providers:` list, and its manifest — not this document — declares the capability
-IDs, input schemas, and command words the broker trusts. This resource is the operator-facing
-declaration that such a provider is part of the deployment.
-
 ## Reserved and inert fields
 
-Four fields are decoded and retained as typed metadata with no shipped behavioral reader. Each one
+Five fields are decoded and retained as typed metadata with no shipped behavioral reader. Each one
 reads like it selects a behavior, so each is listed here rather than left to be discovered.
 
 | Field | Looks like | Actually |
 |---|---|---|
-| `spec.policyProfile` (Agent) | Selects a named policy for the agent | Not consumed by runtime authority. Broker authority comes from the owner-authored Cedar policy file and the per-capability `constraintSets` in `broker.yaml`; naming a profile here selects no policy and changes no decision. |
-| `spec.credentialRef` (Provider) | Names the credential the provider will present | Preserved in the typed catalog, read by no credential resolver. Credential binding is owned by `constraintSets` (`credential:` / `credentialByAgent:`) and the broker's `0600` credentials file; model-selected public DRNs are owned by the separate typed proposal/private-map/`secret.use` path. Neither consults this catalog field. *Committed direction:* `credential`/`credentialByAgent` bindings will be replaced by public DRNs ([migration requirements](design.md#legacy-credential-bindings)); this does not activate `credentialRef`. A `credentialRef` that matches nothing is not an error, and one that names a real credential binds nothing. |
-| `status` (all three kinds) | Observed availability | Authored. No probe, daemon, or reconciler ever writes it, so the catalog records the file, not the deployment. |
+| `spec.capabilities` | The operations the agent may propose | Authored intent, compared against nothing. What a session may reach is the broker's answer to `capabilities` under that agent's attestation, built from the loaded provider manifests and the `constraintSets` policy allows. Adding a name here reaches nothing new; removing one narrows nothing. |
+| `spec.providers` | The integrations the agent uses | Authored intent, compared against nothing. A capability's provider is fixed by the manifest that declares it, and the broker selects it. |
+| `spec.policyProfile` | Selects a named policy for the agent | Not consumed by runtime authority. Broker authority comes from the owner-authored Cedar policy file and the per-capability `constraintSets` in `broker.yaml`; naming a profile here selects no policy and changes no decision. |
+| `status` | Observed availability | Authored. No probe, daemon, or reconciler ever writes it, so the catalog records the file, not the deployment. |
 | `metadata.labels` | Selection or grouping | Retained by protocol serde. Nothing filters, selects, or reports on them. |
 
-`credentialRef` is required by the schema, so a `Provider` document must carry one even though the
-value is inert. `policyProfile`, `status`, and `labels` are optional and may simply be omitted.
+All five are optional and may simply be omitted. They are worth authoring only as documentation a
+reviewer reads to understand what the deployment intends, and a reviewer should know that the
+broker's configuration can disagree with every one of them without either process noticing.
 
 ### Source map for stored metadata and shipped readers
 
 - [`dekopon-protocol/src/lib.rs`](../crates/dekopon-protocol/src/lib.rs):
-  `ObjectMeta`, `AgentSpec`, `CapabilitySpec`, `ProviderSpec` and resource status fields own
-  the typed serde storage of labels, policyProfile, credentialRef, descriptions, classifications
-  and optional authored statuses. Storage and serialization are not a catalog display command.
+  `ObjectMeta`, `AgentSpec` and `AgentStatus` own the typed serde storage of labels,
+  policyProfile, capability and provider names, descriptions and the optional authored status.
+  Storage and serialization are not a catalog display command.
   Optional Schemars derives consume Rustdoc as schema description metadata, not validation rules.
-- [`dekopon-config/src/lib.rs`](../crates/dekopon-config/src/lib.rs), `validate_references`:
-  checks agent capabilities/providers and capability provider references; it grants no authority.
 - [`dekopond/src/routes.rs`](../crates/dekopond/src/routes.rs), `RoutingTable::bind`:
   checks enabled, resolves explicit model or modelClass, and binds instructions and loaded skills.
 - [`dekopon-config/src/skill.rs`](../crates/dekopon-config/src/skill.rs), `Skill` and `load_skill`:
@@ -288,15 +223,11 @@ naming the file and each offending document or skill directory:
 
 - the file is non-empty and parses as JSON or YAML;
 - every document carries a `kind`;
-- every document decodes into its kind with no unknown fields and an accepted `apiVersion`;
-- `metadata.name` is a valid identifier for that kind;
-- no two documents of one kind share a name;
-- every `agent.spec.capabilities` entry names a `Capability` in this catalog;
-- every `agent.spec.providers` entry and every `capability.spec.provider` names a `Provider` in this
-  catalog;
-- `agent.spec.providers` agrees with the agent's own capabilities: a provider that one of the
-  agent's capabilities routes to must be listed, and a listed provider that none of its capabilities
-  route to is refused (the second check runs only once every capability resolved);
+- every document's `kind` is `Agent`, and it decodes with no unknown fields and an accepted
+  `apiVersion`;
+- `metadata.name` is a valid agent identifier, and every capability and provider name the agent
+  lists is a valid identifier of its own type;
+- no two documents share a name;
 - every `agent.spec.skills` entry, resolved against the catalog file's directory when relative,
   loads as a skill directory as described above. Every skill that does not is reported — naming
   the agent, the authored path, and the file at fault — in the same refusal, so an operator with
@@ -306,6 +237,9 @@ naming the file and each offending document or skill directory:
 
 `dekopon-config` runs these checks whenever a catalog loads. A catalog is either wholly
 loadable or wholly refused — there is no partial mode where some resources are usable.
+
+What it does not check is whether any of it is true. The broker owns the capability surface, and
+a catalog that disagrees with it produces no error here and no error there.
 
 ## Related documents
 

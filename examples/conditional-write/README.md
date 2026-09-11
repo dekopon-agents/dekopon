@@ -14,7 +14,7 @@ been validated, and audit records `credentialInjected: true` and never a value.
 
 | File | What it is | Who reads it |
 |---|---|---|
-| [`dekopon.yaml`](dekopon.yaml) | The catalog: one agent, two capabilities, one provider | `dekopond` |
+| [`dekopon.yaml`](dekopon.yaml) | The catalog: one agent and its standing orders | `dekopond` |
 | [`broker.yaml`](broker.yaml) | Broker configuration: identities, mappings, constraint sets | `dekopon-brokerd` |
 | [`policies.cedar`](policies.cedar) | Who may do what, and through which gateway | `dekopon-brokerd` |
 | [`broker-credentials.yaml.example`](broker-credentials.yaml.example) | The API token, after you copy it | `dekopon-brokerd` |
@@ -97,7 +97,7 @@ chmod 600 broker.yaml policies.cedar dekopond.yaml
 
 The catalog half is checked before anything runs: the gateway loads and validates the complete
 typed catalog before starting transports, and `cargo test -p dekopon-config --test examples
---locked` pins this example's cross-references and its read/comment-without-approval boundary.
+--locked` pins this example's declared surface and its read/comment-without-approval boundary.
 
 ## 4. Run the broker
 

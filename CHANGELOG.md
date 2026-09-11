@@ -333,6 +333,26 @@ All notable changes to Dekopon are documented here. The format is based on
   record is still one row per decision. The invocation identifier itself is unchanged — it binds an
   attestation to the proposal it travels with and names the call in audit. `capacity-exhausted`
   survives for the bounded in-memory audit log.
+- **Breaking configuration and API change.** The catalog's `Capability` and `Provider` document kinds
+  are gone, and with them the load-time cross-reference validator between an agent's declared names
+  and those documents. Nothing ever consulted them at runtime: the capability surface a session
+  reaches is the broker's answer under that agent's attestation, built from the provider manifests
+  it loaded and the `constraintSets` policy allows, and the broker never links `dekopon-config`. A
+  catalog carrying either kind now refuses to load, naming the kind and the upgrade rather than
+  reading as an unknown-kind typo; delete both kinds of document, and nothing else changes. Removed
+  from `dekopon-protocol` (semver break): `Capability`, `CapabilitySpec`, `CapabilityStatus`,
+  `Provider`, `ProviderSpec`, `ProviderStatus`, `AgentList`, `CapabilityList`, `ProviderList`, the
+  shared `Kind` enum, and every `*ListKind`/`CapabilityKind`/`ProviderKind` discriminator; `AgentKind`
+  remains, and the crate no longer depends on `dekopon-capability`. Removed from `dekopon-config`
+  (semver break): `CatalogSnapshot`, `LocalCatalog::snapshot`/`capabilities`/`providers`/
+  `capability`/`provider`, and the `CatalogProblem` variants `MissingCapability`, `MissingProvider`,
+  `UnlistedAgentProvider`, and `UnreachableAgentProvider`, against one new `RemovedKind`. `dekopond`
+  loses its startup check that a route's `chatAssetInputs` names a capability the catalog declares —
+  the only in-tree reader of a `Capability` document — because the broker's startup listing is
+  filtered to the gateway's own peer context and would refuse names an agent can legitimately
+  propose. A misspelled `chatAssetInputs` entry now silently leaves the marker unexpanded. An
+  agent's own `capabilities`, `providers`, `policyProfile`, `status`, and `metadata.labels` are
+  still decoded and still read by nothing.
 - Retired the `dekopon`, `dekopon-webui`, `dekopon-run`, and `dekopon-provider-host` crates. Only `dekopond` and `dekopon-brokerd` ship as binaries; shared agent, shell, model, SDK, and broker libraries remain. Recorded-session listing, transcript reconstruction, and model replay went with the runner, out of `dekopon-agent` as well; live agent tools and telemetry are unaffected. Published versions are not recalled or yanked; publication and a later independent console repin remain follow-ups.
 - Broker audit-chain verification, replay restoration from disk, and the `audit verify` command.
   Audit records now append only `sequence` and `event`; existing bytes are not migrated or
@@ -564,6 +584,8 @@ All notable changes to Dekopon are documented here. The format is based on
   credential family, so the `[ -e ]` guard, the `stat` assertions, and the `0700` writable-directory
   handling have a single definition. Apart from the UID split and mount isolation above, rendered
   output for a release that enables only `gateway.chatgpt.*` is unchanged.
+- `values-pr-summarizer-linter.yaml` carries only the `Agent` document its catalog needs; the
+  withdrawn `Capability` and `Provider` kinds refuse to load.
 - `ci/verify-init-permissions.sh` additionally proves the broker's family across a cold start, a
   simulated rotation, two restart shapes, and the gated re-seed; that re-seeding one family leaves the
   other alone; that the two are separate documents; that the `authFile` satisfies

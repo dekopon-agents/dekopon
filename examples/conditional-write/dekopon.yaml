@@ -1,56 +1,10 @@
-# The gateway's catalog: which agent answers, and which capabilities it may propose.
+# The gateway's catalog: which agent answers, on whose standing orders.
 #
-# This file grants nothing. It is read by `dekopond` to decide which
-# agent a route names and which capability words its shell session may even spell. Every one of
-# those proposals still has to pass the broker's Cedar policy in `policies.cedar`, and the broker
-# reads this file never. Deleting a capability here narrows what the agent can attempt; it does
-# not narrow what the principal is authorized to do.
-#
-# Capability effect/risk/idempotency below match the http-probe provider manifest byte for byte
-# (examples/providers/http-probe/src/lib.rs). The broker refuses to start if its constraint sets
-# disagree with the manifest, and a catalog that disagrees with either is a lie an operator reads.
-apiVersion: dekopon.dev/v1alpha1
-kind: Provider
-metadata:
-  name: http-probe
-  labels:
-    environment: local
-spec:
-  description: One bounded read and one etag-pinned conditional write over broker HTTP
-  type: http
-  # Symbolic only. The value lives in the broker's credentials file and nothing else ever sees it.
-  credentialRef: api-token
-status: Unknown
----
-apiVersion: dekopon.dev/v1alpha1
-kind: Capability
-metadata:
-  name: http-probe.fetch
-spec:
-  description: Fetches one broker-authorized URI
-  provider: http-probe
-  effect: read-only
-  risk: Low
-  idempotency: idempotent
-  permissions:
-    - operation: resource:read
-status: Unknown
----
-apiVersion: dekopon.dev/v1alpha1
-kind: Capability
-metadata:
-  name: http-probe.conditional-write
-spec:
-  description: Reads a resource, then writes only if its observed etag still matches
-  provider: http-probe
-  effect: external-write
-  risk: High
-  idempotency: conditional
-  permissions:
-    - operation: resource:read
-    - operation: resource:write
-status: Unknown
----
+# This file grants nothing. `dekopond` reads it to decide which agent a route names, which model
+# serves it, and what its system prompt says. Every proposal the agent then makes still has to pass
+# the broker's Cedar policy in `policies.cedar`, against the constraint sets in `broker.yaml` and
+# the http-probe provider manifest (examples/providers/http-probe/src/lib.rs) — none of which read
+# this file. What the principal is authorized to do is settled there and only there.
 apiVersion: dekopon.dev/v1alpha1
 kind: Agent
 metadata:
