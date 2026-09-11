@@ -22,7 +22,10 @@ OTLP protobuf service definition, which suits a receiver reached through a path-
 proxy; HTTP appends `/v1/traces` and `/v1/logs` to the configured base endpoint. Both reach an
 `https://` endpoint using WebPKI roots. The HTTP client is the workspace's own reqwest build with
 redirects disabled, so an authorization header cannot be forwarded to a receiver-selected
-destination, and one client serves both signals rather than one per signal.
+destination, and with ambient proxies disabled, so an exported `HTTPS_PROXY` cannot put the
+`OTEL_EXPORTER_OTLP_HEADERS` ingest credential — or a span — on a host nobody named to Dekopon. A
+collector reachable only through a proxy must be addressed directly; one client serves both signals
+rather than one per signal.
 
 ## Export failures
 

@@ -20,8 +20,8 @@ use crate::{
     transport::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
         DeliveryReceipt, InboundMessage, OutboundReply, ReplyTarget, TextUnit, TransportError,
-        TransportEvent, TransportIdentity, bound_inbound, floor_boundary, receive_span,
-        reconnect_delay, retry_after_from_body, split_message,
+        TransportEvent, TransportIdentity, bound_inbound, credential_client, floor_boundary,
+        receive_span, reconnect_delay, retry_after_from_body, split_message,
     },
 };
 
@@ -65,9 +65,7 @@ impl TelegramTransport {
         token: String,
         activity: ActivityMode,
     ) -> Result<Self, TransportError> {
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(POLL_TIMEOUT)
+        let http = credential_client(POLL_TIMEOUT)
             .build()
             .map_err(|source| TransportError::Request(Box::new(source)))?;
         Ok(Self {

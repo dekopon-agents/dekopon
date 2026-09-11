@@ -8718,7 +8718,8 @@ async fn a_chat_asset_marker_expands_only_for_a_listed_capability() {
 
 #[test]
 fn a_redirect_away_from_slack_is_not_followed() {
-    // `client()` refuses redirects globally so a bearer token is never forwarded by policy. The
+    // `credential_client` refuses redirects globally so a bearer token is never forwarded by
+    // policy. The
     // one hop this transport follows by hand has to check the host itself, and a prefix comparison
     // would accept the lookalike below.
     assert!(crate::transport::slack::is_slack_file_url(
