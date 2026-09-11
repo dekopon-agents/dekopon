@@ -184,7 +184,7 @@ following start.
 
 A `bearerToken` `secret` must be at least 16 bytes of printable ASCII with no whitespace or control
 bytes. The value is also what the native HTTP host searches an authorized response for before
-returning it, and a short or phrase-shaped needle would deny answers that never carried the
+returning it, and a short or phrase-shaped value would deny answers that never carried the
 credential.
 
 ### `chatgptSubscription`: a credential the broker renews itself

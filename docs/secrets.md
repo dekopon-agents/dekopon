@@ -479,7 +479,7 @@ snapshot. There is no cross-invocation cache and no stale fallback:
   material;
 - a resolved secret shorter than 16 bytes fails the invocation as `invalid-material` before the
   provider runs, on either native sink. The resolved value is what the host searches responses for,
-  and a needle that short would deny answers that never carried it;
+  and a value that short would deny answers that never carried it;
 - no adapter retries automatically.
 
 A source timeout or malformed/oversized response produces a fixed broker failure. Response/error
