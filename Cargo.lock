@@ -1138,6 +1138,7 @@ dependencies = [
  "dekopon-storage-host",
  "dekopon-telemetry",
  "dekopon-test-support",
+ "form_urlencoded",
  "futures-util",
  "getrandom 0.4.3",
  "hmac",

@@ -26,6 +26,7 @@ dekopon-model.workspace = true
 dekopon-process.workspace = true
 dekopon-shell.workspace = true
 dekopon-telemetry.workspace = true
+form_urlencoded.workspace = true
 futures-util.workspace = true
 getrandom.workspace = true
 hmac.workspace = true
