@@ -26,7 +26,7 @@
 //! - a cumulative ceiling on the value bytes a script may materialize, which is what bounds memory
 //!   for a script that is cheap in steps and expensive in bytes.
 //!
-//! One bound is *not* in [`limits`], because it applies before any budget exists: [`parser`] caps
+//! One bound is *not* in [`limits`], because it applies before any budget exists: the parser caps
 //! grammar nesting depth at a fixed ceiling. Parsing is recursive and runs on the native stack, so
 //! without it a few kilobytes of nested `$( $( ... ) )` aborts the host process instead of
 //! returning a [`ScriptOutcome`].
@@ -98,13 +98,13 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-pub mod ast;
+mod ast;
 mod builtins;
 mod dispatch;
 mod interp;
-pub mod lexer;
+mod lexer;
 pub mod limits;
-pub mod parser;
+mod parser;
 pub mod value;
 
 pub use limits::{
@@ -112,7 +112,6 @@ pub use limits::{
     DEFAULT_MAX_OUTPUT_LINES, DEFAULT_MAX_RECURSION_DEPTH, DEFAULT_MAX_STEPS,
     DEFAULT_MAX_VALUE_BYTES, DEFAULT_TIMEOUT, Limits,
 };
-pub use parser::ParseError;
 
 use dekopon_core::SecretUseProposal;
 
