@@ -76,14 +76,6 @@ where
 {
     let uid = current_uid();
     let config = config::load(config_path, uid).await?;
-    // Span verbosity is process state rather than a parameter because it describes the deployment,
-    // not the call. Set before serving so no invocation is recorded under the wrong mode.
-    dekopon_core::set_telemetry_payloads(
-        config
-            .telemetry
-            .as_ref()
-            .is_some_and(|telemetry| telemetry.telemetry_payloads),
-    );
     let frame_limits = config.server_limits.frame_limits()?;
     let socket_parent = socket::validate_socket_parent(&config.socket_path, uid)?;
     // A private parent gets an owner-only socket, so any other configured UID could never open it:

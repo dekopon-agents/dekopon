@@ -35,7 +35,7 @@ Trusted inputs are expected to include:
 - secrets obtained by the broker from an approved secret store;
 - the telemetry store the operator selected.
 
-That last one carries goal 2 ([design.md](design.md#constitution)): access to the telemetry store is access to every conversation, prompt, and argument the system has handled. What rides the trace today and what the payload gate withholds is in [observability.md](observability.md#exclusions).
+That last one carries goal 2 ([design.md](design.md#constitution)): access to the telemetry store is access to every conversation, prompt, and argument the system has handled. What rides the trace, and the short list of what never does, is in [observability.md](observability.md#exclusions).
 
 Explicitly untrusted inputs include:
 
@@ -206,14 +206,14 @@ None of these is sufficient alone, and the design depends on all of them:
 - **Idle timeout.** An untouched conversation is evicted, 15 minutes by default. It bounds how long an injection or a stale tool result can persist without anyone continuing the conversation that produced it. The check is lazy — the eviction happens on the next lookup rather than on a timer — so an idle entry can outlive its timeout in memory until something asks for it or the ceiling displaces it. What it can never do is reach a prompt.
 - **The window.** `maxTurns` and `maxBytes` bound what is replayed regardless of how long the conversation lives, so a long-running conversation does not accumulate an unbounded prompt and old turns fall out of scope on their own.
 - **Compaction.** A stored turn is `(the user's message, the final answer)`; intermediate tool calls, model-authored scripts, and their output are dropped. Materially less untrusted repository and provider text is replayed than the session actually read, and the replayed prompt cannot grow with the size of a tool result — one script's output alone can reach 256 KiB.
-- **In gateway memory.** History lives in the gateway process, is never written to disk by the daemon, is never sent to the broker, and dies with the process. It also reaches the operator's telemetry store under `telemetryPayloads: true`, for as long as that store retains it.
+- **In gateway memory.** History lives in the gateway process, is never written to disk by the daemon, is never sent to the broker, and dies with the process. It also reaches the operator's telemetry store, for as long as that store retains it.
 - **Grant-set invalidation.** Described above: the granted capability set travels with the conversation, and a change drops it.
 
 ### Where the text goes
 
 Not into the broker. `dekopon-brokerd` holds provider credentials and a metadata-only append-only JSONL audit log in which a provider's output survives only as a digest, and its records exclude inputs, outputs, paths, queries, headers, and bodies. Putting conversation text in that process would place the most sensitive content in the system inside the most privileged one, next to a record built specifically not to contain it, and it would turn a log of what was *authorized* into a store of what was *said*.
 
-Telemetry is the other direction. `conversation.turns` and `conversation.bytes` are a count and a byte total, and the history rides `agent.model.prompt` under `telemetryPayloads: true`, inside the operator's trust boundary described under [Trust boundaries](#trust-boundaries). *Committed direction:* the gate is removed; payloads always on ([goal 2](design.md#constitution)).
+Telemetry is the other direction. `conversation.turns` and `conversation.bytes` are a count and a byte total because a span attribute is the wrong container for unbounded text, and the history itself rides `agent.model.prompt` on the log stream, inside the operator's trust boundary described under [Trust boundaries](#trust-boundaries). There is no mode in which it does not.
 
 And not into the [prompt cache key](dekopond.md#the-prompt-cache-key), which is minted from entropy rather than derived from the private subject or the shared conversation identifier. A canonical subject can be a phone number, and a hash of one is a stable pseudonym; either would tell a model provider that two conversations months apart belong to one person, which is a worse thing to hand a third party than to hand your own sink. The minted key rotates whenever the conversation generation it names is evicted and whenever the process restarts, so it accumulates into a durable identifier for nobody and no service-native conversation, and it confers nothing: a request carrying a key is authorized exactly as one without it, by the broker, per message.
 

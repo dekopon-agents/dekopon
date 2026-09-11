@@ -54,7 +54,7 @@ All notable changes to Dekopon are documented here. The format is based on
   changes, empty-grant removal, idle replacement, or capacity eviction, while retaining
   same-generation append/inventory reuse and cache-lane behavior. Shared scope still authorizes every
   participant and message independently; it is not global agent/team memory, and its canonical
-  participant identifiers reach the model provider even when telemetry payload export is disabled.
+  participant identifiers reach the model provider independently of what telemetry records.
 - Added cooperative cancellation to `dekopon-process`: `CancelSignal::pair` yields a cloneable
   `CancelHandle` whose idempotent `cancel` makes the supervisor abort a
   `ProcessMetadata::cancellable` node at its next await and then still join it, surfacing
@@ -173,6 +173,18 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Changed
 
+- Exported telemetry now always carries what `telemetryPayloads` used to gate: `input` on
+  `broker.authorize` and `provider.invoke`, `url.full` on `http.request`, and the
+  `agent.model.prompt`, `agent.model.answer`, `agent.tool.script`, `agent.tool.output`,
+  `gateway.message.received`, and `gateway.session.cache_key` log records. A storage-backed
+  authorization keeps its blind span for now.
+- `shell.command` spans record the command word a script actually ran — a model-authored shell
+  function's name and a word that resolved to nothing included — and every command word gets its
+  `INFO` span however many one run executes, so a runaway loop is exported in full rather than
+  truncated at 256. Both daemons' OTLP filters already admitted `dekopon_shell=trace`, so the cap
+  never reduced export volume; it only hid spans from the local console. Argument *values* are still
+  recorded as a count: a `curl -d` body is secret bytes wearing argv's clothes, and that exclusion is
+  goal 1's rather than the retired gate's.
 - Provider storage applies writes per host call through a direct invocation handle, with namespace, key, quota and private-file isolation retained. Failed invocations can leave completed writes; there is no invocation rollback, crash recovery or automatic generation collection.
 - OTLP smoke CI exercises a real broker/gateway local turn with a stub model and authorized provider. Daemon JSON stdout includes valid active native trace/span IDs; smoke-only shipping verifies independent remote correlation and redaction without a production log exporter.
 - `dekopon-brokerd probe --socket <path>` performs a bounded owner-authenticated health check; chart broker probes use it without loading credentials or telemetry.
@@ -266,6 +278,19 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Removed
 
+- **Breaking configuration change.** The `telemetryPayloads` gate and every metadata-only telemetry
+  mode are gone. `telemetry.telemetryPayloads` is removed from both daemons' configuration, and both
+  sections are `deny_unknown_fields`, so a daemon started on a file that still carries the key
+  refuses to start and names it — see [`docs/upgrading.md`](docs/upgrading.md).
+  `dekopon_core::telemetry_payloads`, `set_telemetry_payloads`, and the module behind them go with
+  it, as do the shell's `<withheld>` command-word placeholder, its 256-span INFO cap
+  (`MAX_TRACED_COMMANDS`, `SpanLevel`), the `shell.script.commands_traced` counter that measured that
+  cap, and the `capability.namespace` attribute that only repeated the prefix of a word now recorded
+  in full. Dekopon is the operator's agent system and a run has to be reconstructible from the
+  operator's telemetry store, so a mode that withheld half the trace served nobody
+  ([goal 2](docs/design.md#constitution)). What telemetry excludes is unchanged and was never gated:
+  secret bytes, the gateway's own credentials, and HTTP request and response headers and bodies
+  never reached a span and still do not.
 - Retired the `dekopon`, `dekopon-webui`, `dekopon-run`, and `dekopon-provider-host` crates. Only `dekopond` and `dekopon-brokerd` ship as binaries; shared agent, shell, model, SDK, and broker libraries remain. Recorded-session listing, transcript reconstruction, and model replay went with the runner, out of `dekopon-agent` as well; live agent tools and telemetry are unaffected. Published versions are not recalled or yanked; publication and a later independent console repin remain follow-ups.
 - Broker audit-chain verification, replay restoration from disk, and the `audit verify` command.
   Audit records now append only `sequence` and `event`; existing bytes are not migrated or

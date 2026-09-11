@@ -23,23 +23,7 @@ use tracing_subscriber::{
 
 use crate::{Interpreter, Limits, ScriptOutcome, interp::tests::Fixture};
 
-use super::{CONTROL_WORDS, MAX_TRACED_COMMANDS, SCRIPT_SPAN, WITHHELD};
-
-/// Serializes the tests whose expectations depend on the process-global payload switch.
-///
-/// `dekopon_core::telemetry_payloads` is one `AtomicBool` for the whole process, so a test that
-/// enables it would otherwise change what a concurrently running redaction test observes.
-static PAYLOADS: Mutex<()> = Mutex::new(());
-
-/// Takes the payload-switch lock, ignoring poisoning.
-///
-/// A test that fails while holding it has already reported its own failure; letting the poison
-/// cascade would turn one real failure into twelve misleading ones.
-fn serialized() -> std::sync::MutexGuard<'static, ()> {
-    PAYLOADS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
+use super::{CONTROL_WORDS, SCRIPT_SPAN};
 
 /// One span or event, flattened to the strings a remote collector would receive.
 #[derive(Clone, Debug)]
@@ -218,7 +202,6 @@ fn capture_with(script: &str, limits: Limits, enclose: bool) -> Telemetry {
 
 #[test]
 fn every_command_produces_exactly_one_span() {
-    let _serialized = serialized();
     let telemetry =
         capture("greet() { echo hi; }\ngreet\njq -n 1\necho.echo --message two\nnosuchcommand\n:");
 
@@ -231,10 +214,10 @@ fn every_command_produces_exactly_one_span() {
             // `echo` runs inside `greet`, so it closes first. Spans are captured on close, which
             // makes this completion order rather than start order.
             ("builtin", "echo"),
-            ("function", WITHHELD),
+            ("function", "greet"),
             ("builtin", "jq"),
             ("capability", "echo.echo"),
-            ("not-found", WITHHELD),
+            ("not-found", "nosuchcommand"),
             ("control", ":"),
         ]
     );
@@ -249,7 +232,6 @@ fn every_command_produces_exactly_one_span() {
 
 #[test]
 fn a_span_carries_the_outcome_exit_code_and_argument_count() {
-    let _serialized = serialized();
     let telemetry = capture("echo one two three");
     let span = telemetry
         .spans
@@ -266,7 +248,6 @@ fn a_span_carries_the_outcome_exit_code_and_argument_count() {
 
 #[test]
 fn a_denied_capability_is_not_flattened_into_a_generic_failure() {
-    let _serialized = serialized();
     // A refusal, a provider that ran and errored, and a capability that does not exist are three
     // different operational stories; `CapabilityCallResult` keeps them apart and so must this.
     for (script, outcome, exit_code) in [
@@ -294,7 +275,6 @@ fn a_denied_capability_is_not_flattened_into_a_generic_failure() {
 
 #[test]
 fn a_refused_word_reports_the_reason_it_aborted_the_script() {
-    let _serialized = serialized();
     let telemetry = capture("eval 'echo hi'");
     let completed = telemetry
         .spans
@@ -312,7 +292,6 @@ fn a_refused_word_reports_the_reason_it_aborted_the_script() {
 
 #[test]
 fn an_exhausted_budget_is_reported_as_a_limit_rather_than_a_failure() {
-    let _serialized = serialized();
     // The capability ceiling is the one a *command* trips. The step budget is charged between
     // statements, so it ends the script without any command span ever seeing it.
     let telemetry = capture_with(
@@ -333,11 +312,11 @@ fn an_exhausted_budget_is_reported_as_a_limit_rather_than_a_failure() {
 
 #[test]
 fn argument_values_never_reach_telemetry() {
-    let _serialized = serialized();
-    // The sentinels stand in for what argv really carries: a bearer token in a `curl -d` body, a
-    // capability input object, a URL with a signed query string. Asserting their *absence* is the
-    // test — asserting that the safe fields are present would pass just as happily while a
-    // `shell.command.arguments` field sat beside them leaking every one of these.
+    // Command *words* are exported in full; argument values are the one thing argv carries that
+    // this crate must not export, because a bearer token in a `curl -d` body and a capability input
+    // object are secret bytes. Asserting their *absence* is the test — asserting that the safe
+    // fields are present would pass just as happily while a `shell.command.arguments` field sat
+    // beside them leaking every one of these.
     const SECRET: &str = "DEKOPON_SHELL_SECRET_DO_NOT_EXPORT";
     let script = format!(
         "curl -d '{{\"apiKey\":\"{SECRET}\"}}' https://example.test/{SECRET}\n\
@@ -345,9 +324,6 @@ fn argument_values_never_reach_telemetry() {
          echo.echo --message {SECRET}\n\
          echo {SECRET} | grep {SECRET}\n\
          jq -n '\"{SECRET}\"'\n\
-         {SECRET}_command\n\
-         helper_{SECRET}() {{ echo inner; }}\n\
-         helper_{SECRET}\n\
          x={SECRET}\n\
          echo \"$x\"\n"
     );
@@ -371,31 +347,26 @@ fn argument_values_never_reach_telemetry() {
 }
 
 #[test]
-fn a_model_authored_command_word_is_withheld_but_its_kind_is_not() {
-    let _serialized = serialized();
-    // A shell function's name and an unresolved word are both whatever the script's author typed.
-    // The runner already refuses to copy a model-selected invalid tool name into a rejection
-    // event; a command word is the same class of text and gets the same treatment.
-    let telemetry = capture("secret_helper() { echo hi; }\nsecret_helper\nsecret_typo");
+fn a_model_authored_command_word_is_recorded_verbatim() {
+    // A shell function's name and an unresolved word are both whatever the script's author typed —
+    // and the author is usually the model, which is exactly why they belong in the trace. An
+    // operator reading a session has to see the word the model reached for, including the one that
+    // resolved to nothing.
+    let telemetry = capture("model_helper() { echo hi; }\nmodel_helper\nmodel_typo");
 
     assert_eq!(
         telemetry.commands(),
         vec![
-            // Completion order: the body of `greet` closes before `greet` itself.
+            // Completion order: the body of `model_helper` closes before the function itself.
             ("builtin", "echo"),
-            ("function", WITHHELD),
-            ("not-found", WITHHELD),
+            ("function", "model_helper"),
+            ("not-found", "model_typo"),
         ]
     );
-    for value in telemetry.all_values() {
-        assert!(!value.contains("secret_helper"), "{value:?}");
-        assert!(!value.contains("secret_typo"), "{value:?}");
-    }
 }
 
 #[test]
 fn xargs_records_every_command_it_actually_drove() {
-    let _serialized = serialized();
     // One script word that maps a command over three items really did run three commands, so a
     // trace that showed one would be describing a script nobody wrote.
     // The list is built through `jq` rather than `echo`, because `echo` produces one string and
@@ -428,7 +399,6 @@ fn xargs_records_every_command_it_actually_drove() {
 
 #[test]
 fn command_spans_nest_under_the_callers_active_span() {
-    let _serialized = serialized();
     // An embedder enters its parent span and calls the interpreter on the same thread;
     // nesting needs no propagation code. This pins that shared interpreter contract.
     let telemetry = capture_with("echo hi", Limits::default(), true);
@@ -448,7 +418,6 @@ fn command_spans_nest_under_the_callers_active_span() {
 
 #[test]
 fn one_script_span_carries_the_totals_for_the_whole_run() {
-    let _serialized = serialized();
     let telemetry = capture("greet() { echo hi; }\ngreet\nnosuchcommand\necho.echo --message two");
 
     let script = telemetry
@@ -458,7 +427,6 @@ fn one_script_span_carries_the_totals_for_the_whole_run() {
         .expect("one script span");
     // `greet`, the `echo` inside it, `nosuchcommand`, and the capability call.
     assert_eq!(script.field("shell.script.commands"), Some("4"));
-    assert_eq!(script.field("shell.script.commands_traced"), Some("4"));
     assert_eq!(script.field("shell.script.capability_commands"), Some("1"));
     assert_eq!(script.field("shell.script.failed_commands"), Some("1"));
 
@@ -471,13 +439,12 @@ fn one_script_span_carries_the_totals_for_the_whole_run() {
 }
 
 #[test]
-fn a_loop_heavy_script_stops_exporting_a_span_per_command() {
-    let _serialized = serialized();
-    // A model-authored `while` loop is bounded only by the step budget, so a span per command word
-    // is tens of thousands of exported spans from a single tool call. Past the cap the spans drop
-    // to DEBUG — the capture layer here is level-agnostic, so what it proves is the accounting: the
-    // script span still reports every command, and only the first `MAX_TRACED_COMMANDS` are traced.
-    let commands = MAX_TRACED_COMMANDS + 40;
+fn a_loop_heavy_script_still_spans_every_command_it_ran() {
+    // A model-authored `while` loop is bounded only by the step budget, and every command word it
+    // runs gets its span: an attribute may be truncated, a span is never dropped. A trace that
+    // thinned out after the first few hundred commands would answer "what did this agent do" with
+    // "up to here", which is the one answer the operator's trace may not give.
+    let commands = 300;
     let telemetry = capture(&format!(
         "i=0\nwhile [ $i -lt {commands} ]; do echo x; i=$(( i + 1 )); done"
     ));
@@ -487,27 +454,29 @@ fn a_loop_heavy_script_stops_exporting_a_span_per_command() {
         .iter()
         .find(|span| span.span.as_deref() == Some(SCRIPT_SPAN))
         .expect("one script span");
-    assert_eq!(
-        script.field("shell.script.commands_traced"),
-        Some(MAX_TRACED_COMMANDS.to_string().as_str())
-    );
     let total = script
         .field("shell.script.commands")
-        .and_then(|value| value.parse::<u64>().ok())
+        .and_then(|value| value.parse::<usize>().ok())
         .expect("a command total");
     assert!(
-        total > MAX_TRACED_COMMANDS,
-        "the loop must outrun the cap for this to prove anything: {total}"
+        total > commands,
+        "the loop must run more commands than any plausible cap for this to prove anything: {total}"
     );
-    // The totals survive the cap; the per-command detail past it does not have to. The one failure
-    // is the `[` that finally reports false and ends the loop, counted like any other non-zero
-    // status — the counters describe the whole run, including the part with no spans left.
+
+    let spans = telemetry
+        .spans
+        .iter()
+        .filter(|span| span.span.as_deref() == Some("shell.command"))
+        .count();
+    assert_eq!(spans, total, "one span per command word, all the way down");
+
+    // The one failure is the `[` that finally reports false and ends the loop, counted like any
+    // other non-zero status.
     assert_eq!(script.field("shell.script.failed_commands"), Some("1"));
 }
 
 #[test]
 fn control_words_and_their_dispatcher_agree() {
-    let _serialized = serialized();
     // `run_argv` classifies a control word from `CONTROL_WORDS` and only then lets
     // `run_control_word` execute it, so a word dropped from the list stops running and says
     // "command not found" instead. That is the direction this covers.
@@ -536,35 +505,20 @@ fn control_words_and_their_dispatcher_agree() {
 
 /// A word the session was not granted, in a namespace it holds, is a different fact from a typo.
 ///
-/// The namespace comes from the session's own granted set, so exporting it reveals nothing the
-/// deployment did not already choose. The word stays withheld: everything after the namespace is
-/// whatever the script typed.
+/// The kind is what separates them, and the word itself says which namespace was reached into — a
+/// separate `capability.namespace` attribute would only repeat the prefix of a word already on the
+/// span.
 #[test]
-fn an_ungranted_word_in_a_granted_namespace_reports_its_namespace() {
-    let _serialized = serialized();
+fn an_ungranted_word_and_an_unknown_word_are_distinct_kinds() {
     let telemetry = capture("echo.nonexistent\nnosuch.capability");
 
     assert_eq!(
         telemetry.commands(),
-        vec![("not-granted", WITHHELD), ("not-found", WITHHELD)]
+        vec![
+            ("not-granted", "echo.nonexistent"),
+            ("not-found", "nosuch.capability")
+        ]
     );
-
-    let namespaces = telemetry
-        .spans
-        .iter()
-        .filter(|span| span.span.as_deref() == Some("shell.command"))
-        .map(|span| span.field("capability.namespace"))
-        .collect::<Vec<_>>();
-    assert_eq!(
-        namespaces,
-        vec![Some("echo"), None],
-        "only a word inside a granted namespace carries one"
-    );
-
-    for value in telemetry.all_values() {
-        assert!(!value.contains("nonexistent"), "{value:?}");
-        assert!(!value.contains("nosuch"), "{value:?}");
-    }
 }
 
 /// The script must not be able to tell the two apart.
@@ -573,7 +527,6 @@ fn an_ungranted_word_in_a_granted_namespace_reports_its_namespace() {
 /// oracle for enumerating the deployment's capabilities one guess at a time.
 #[test]
 fn a_script_cannot_distinguish_ungranted_from_unknown() {
-    let _serialized = serialized();
     let ungranted =
         Interpreter::new(Limits::default()).run("echo.nonexistent", &Fixture::default());
     let unknown = Interpreter::new(Limits::default()).run("nosuch.capability", &Fixture::default());
@@ -582,19 +535,4 @@ fn a_script_cannot_distinguish_ungranted_from_unknown() {
         unknown.output.replace("nosuch.capability", "WORD")
     );
     assert_eq!(ungranted.exit_code, unknown.exit_code);
-}
-
-/// The exact word is available, but only where an operator has accepted retention for data the
-/// model influences — the same switch that already governs provider payloads and HTTP queries.
-#[test]
-fn enabling_payloads_exports_the_missed_word() {
-    let _serialized = serialized();
-    dekopon_core::set_telemetry_payloads(true);
-    let telemetry = capture("echo.nonexistent");
-    dekopon_core::set_telemetry_payloads(false);
-
-    assert_eq!(
-        telemetry.commands(),
-        vec![("not-granted", "echo.nonexistent")]
-    );
 }

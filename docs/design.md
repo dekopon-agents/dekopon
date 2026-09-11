@@ -37,10 +37,10 @@ that serves none of them is a deletion candidate, however well built.
    gateway's own credentials (chat tokens, model keys, OTLP headers); that is goal 1's job, not
    telemetry's. Completeness beats volume: an attribute may be truncated with a marker, a span
    is never dropped. No `traceparent` header is sent to a third-party endpoint. The telemetry
-   store is inside the operator's trust boundary. *Committed direction:* the `telemetryPayloads`
-   gate and every metadata-only mode are removed; the separate Dekopon `TraceId` is removed; the
-   `<withheld>` command word, the argument-count-only attribute, and the 256-span INFO cap are
-   removed — a command word and its arguments are recorded and no span is dropped.
+   store is inside the operator's trust boundary. The `telemetryPayloads` gate, every metadata-only
+   mode, the `<withheld>` command word, and the 256-span INFO cap are gone: a command word is
+   recorded and no span is dropped. *Committed direction:* the separate Dekopon `TraceId` is
+   removed, and the argument-count-only attribute gives way to the arguments themselves.
 3. **Extensible through Wasm providers.** New capability arrives as an out-of-tree component
    with a manifest and command words, executed under exact owner-authored constraints. Nothing
    in this tree grows to add a capability.

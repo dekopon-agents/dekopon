@@ -1567,9 +1567,10 @@ impl BrokerProviderRegistry {
                 )
             }
         };
-        // `proposal.input` is deliberately not a field here. It is the untrusted payload the whole
-        // authority boundary exists to contain, and a span is not a safer place for it than an
-        // audit record.
+        // `proposal.input` is a field on every non-storage span below. It is untrusted payload, and
+        // containing it is the authority boundary's job rather than telemetry's: the operator's
+        // trace is where the run is reconstructed from, so what a provider was actually asked to do
+        // belongs in it. A storage-backed invocation still opens the blind span.
         provider
             .invoke(
                 &proposal.capability,
@@ -1587,9 +1588,7 @@ impl BrokerProviderRegistry {
                     provider = %provider.manifest.id,
                     input = tracing::field::Empty,
                 );
-                if dekopon_core::telemetry_payloads() {
-                    span.record("input", tracing::field::display(&proposal.input));
-                }
+                span.record("input", tracing::field::display(&proposal.input));
                 span
             })
             .await

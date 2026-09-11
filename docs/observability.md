@@ -101,7 +101,6 @@ telemetry:
   transport: http
   serviceName: dekopond
   exportTimeoutMs: 5000
-  telemetryPayloads: false
 ```
 
 Supply authentication only through the standard header environment variables:
@@ -166,7 +165,6 @@ telemetry:
   transport: grpc            # grpc | http
   serviceName: dekopon-brokerd
   exportTimeoutMs: 5000
-  telemetryPayloads: false   # see "Span payloads" below
 ```
 
 There is no credential field. The broker reads `OTEL_EXPORTER_OTLP_HEADERS` like the gateway does,
@@ -299,13 +297,10 @@ private, a canonical subject; the key types do not implement `Debug`, so an inci
 put either into the eviction record.
 
 The history itself is not a new signal. It is chat text and model output, and it goes where those
-already go: with `telemetryPayloads` enabled, the session's first `agent.model.prompt` carries its
-opening message list, which on a seeded session includes the replayed window. Enabling payloads on a
-persistent route declares the sink in scope for a conversation rather than for a message. Shared
-scope adds canonical participant identifiers to those prompt payload events, and not to
-metadata-only spans, eviction events, or cache key events. Independently of telemetry, those labels
-are part of every shared prompt sent to the selected model provider; `telemetryPayloads: false` does
-not redact model input.
+already go: the session's first `agent.model.prompt` carries its opening message list, which on a
+seeded session includes the replayed window. Shared scope adds canonical participant identifiers to
+those prompt events, and not to spans, eviction events, or cache key events. Those labels are part
+of every shared prompt sent to the selected model provider independently of telemetry.
 
 ### Reading the prompt cache
 
@@ -321,11 +316,11 @@ conversation regardless of the key, and what the key buys is the burst inside a 
 window trim rewrites the front of the request and costs a miss by construction, so a run of misses
 on long conversations is `maxTurns` or `maxBytes` doing its job rather than a broken key.
 
-**The key itself is a payload field.** It rides `gateway.session.cache_key` with
-`telemetryPayloads` enabled, never a span attribute. It carries nothing about the audience by
-construction, but within one process it joins one private or shared conversation's turns, which is
-precisely the linkage the metadata-only default withholds. It is emitted on its own event so that a
-key and a canonical subject never share a record.
+**The key rides its own log event.** It lands on `gateway.session.cache_key`, never a span
+attribute. It carries nothing about the audience by construction, but within one process it joins
+one private or shared conversation's turns; it is emitted on its own event so that a key and a
+canonical subject never share a record, which keeps a reader who needs only one of them from seeing
+both.
 
 ## Broker execution spans
 
@@ -435,7 +430,7 @@ wrong — a distinguishable answer would tell an unauthorized gateway whether a 
 an unknown command word would disclose the surface the refusal withheld. The class, its determining
 policies, and the canonical subject land on the broker's own side of the socket, which is what makes
 bootstrapping an `identityMapping` for a new sender possible without reading the subject out of a
-payload-carrying gateway span. It marks refusals, not traffic: an honored session emits nothing.
+gateway span. It marks refusals, not traffic: an honored session emits nothing.
 
 A chat-scoped `invoke` and `recordDeliveredTurn` withhold the same fact for the same reason, but
 they are accounted decisions rather than unanswered inspections, so the peer receives a `Denied`
@@ -499,25 +494,26 @@ observation rather than a hard native-operation deadline.
 
 ## Span payloads
 
-Spans are metadata-only by default. An operator who has accepted their telemetry sink as in scope
-for the data a process handles opts in to payload-bearing fields through
-`telemetry.telemetryPayloads: true` in the daemon configuration. The opt-in is process state, not an
-OTLP setting: it applies to every sink the process writes, including native daemon logs, whether or
-not an OTLP endpoint is configured.
+Payloads are always recorded. There is no metadata-only mode and no `telemetryPayloads` key: a
+telemetry store an operator can read is a store that can reconstruct the run, and a mode that
+withholds half of it serves nobody the constitution recognizes ([goal
+2](design.md#constitution)).
 
-| Span | Field added |
+| Span | Payload field |
 |---|---|
 | `broker.authorize` | `input` — the untrusted proposal payload |
 | `provider.invoke` | `input` — the payload passed to the component |
-| `http.request` | `url.full` — path and query, which the default withholds |
+| `http.request` | `url.full` — the destination with its path and query |
 | model/tool log events | the verbatim transcript; see below |
 
-This widens **data**, not credentials. Request and response headers and HTTP bodies stay out in both
-modes, and a `Redacted` value renders its marker in either mode because that is a property of the
-value rather than of the mode. Append-only audit records are untouched by this setting.
+This is **data**, not credentials. Request and response headers and HTTP bodies stay out — a
+credential is injected into a header at the native HTTP boundary — and a `Redacted` value renders
+its marker wherever it is formatted, because that is a property of the value. Both exclusions are
+unconditional and neither ever had a switch. Append-only audit records carry their own metadata-only
+shape, unchanged by any of this.
 
-*Committed direction:* the gate is removed; payloads always on
-([goal 2](design.md#constitution)). The configuration examples above keep the key until that lands.
+A storage-backed `broker.authorize` and `provider.invoke` still open the blind span: identifiers and
+the decision only. *Committed direction:* that arm records its input like every other one.
 
 ## Model and tool transcript
 
@@ -527,7 +523,7 @@ would drag the payload along, and a backend indexes log bodies for full-text sea
 fields. Both signals carry the same `trace_id` and `span_id`, so a log result pivots to the turn it
 belongs to.
 
-With `telemetryPayloads` enabled, these events join the accounting and refusal ones:
+These events join the accounting and refusal ones:
 
 | Event | Carries |
 |---|---|
@@ -627,39 +623,31 @@ and log filters. Each command span carries:
 
 | Attribute | Value |
 |---|---|
-| `shell.command.name` | The command word, or `<withheld>`; see [Exclusions](#exclusions) |
+| `shell.command.name` | The command word, whoever wrote it |
 | `shell.command.kind` | `builtin`, `capability`, `function`, `control`, `rejected`, `not-granted`, or `not-found` |
-| `capability.namespace` | Present only on `not-granted`: the provider namespace, taken from the session's own granted set |
-| `shell.command.argument_count` | How many arguments the word received, never their values |
+| `shell.command.argument_count` | How many arguments the word received, never their values; see [Exclusions](#exclusions) |
 | `shell.command.exit_code` | The status the command reported |
 | `outcome` | `succeeded`, `failed`, `denied`, `not-found`, `usage-error`, `timed-out`, `limit-exceeded`, or `rejected` |
 
-Only the first 256 command words of a run get their span at `INFO`; the rest are emitted at `DEBUG`
-and are off wherever `RUST_LOG` is `info`. This is a volume bound, not a detail one: a model-authored
-`while` loop is bounded only by the step budget (default 100,000) and the script deadline, so one
-bash tool call can execute tens of thousands of command words. What survives the cap is the
-`shell.script` span, whose counters describe the whole run in constant size:
+Every command word gets its span, at `INFO`, however many a run executes. A model-authored `while`
+loop is bounded only by the step budget (default 100,000) and the script deadline, so one bash tool
+call can produce tens of thousands of them — and every one is exported: an attribute may be
+truncated with a marker, a span is never dropped ([goal 2](design.md#constitution)). The
+`shell.script` span carries the run's shape in constant size beside them:
 
 | Attribute | Value |
 |---|---|
 | `shell.script.commands` | Command words the script executed, loop iterations and `xargs` sub-invocations included |
-| `shell.script.commands_traced` | How many of those carried an `INFO` span |
 | `shell.script.capability_commands` | How many were a capability call or a provider command word |
 | `shell.script.failed_commands` | How many reported a non-zero exit code |
-
-*Committed direction:* removed; command words and arguments are recorded and no span is dropped
-([goal 2](design.md#constitution)).
 
 `not-granted` splits the swing-and-a-miss out of `not-found`. A word that parses as a capability
 identifier, in a namespace this session *does* hold but naming a capability it was not granted, is a
 different fact from a typo: it is a model repeatedly reaching for something an operator may want to
-grant. A trend of them in one namespace is the signal worth acting on. Only the **namespace** is
-exported, and it comes from the session's granted set rather than from the script — a string the
-deployment chose, never one the model composed. The word itself stays `<withheld>` unless payloads
-are enabled, because everything after the namespace is whatever the script typed. The script cannot
-tell the two apart: both print `command not found` and exit 127, since a model that could
-distinguish them would have an oracle for enumerating the deployment's capabilities one guess at a
-time.
+grant. A trend of them in one namespace is the signal worth acting on, and the word itself says
+which namespace was reached into. The script cannot tell the two apart: both print `command not
+found` and exit 127, since a model that could distinguish them would have an oracle for enumerating
+the deployment's capabilities one guess at a time.
 
 `outcome` keeps a policy refusal (`denied`) distinct from a capability that ran and errored
 (`failed`) and from one that is unreachable (`not-found`), mirroring the interpreter's own exit-code
@@ -669,7 +657,7 @@ shell excludes, and an exhausted sandbox budget.
 
 Structured log records use stable `audit.event` attributes and do not mirror spans: a command's
 start, end, duration, parent, and outcome all live on its `shell.command` span, so the log stream
-carries accounting, refusals, errors, and — when opted in — payloads. `agent.command.unobserved`
+carries accounting, refusals, errors, and payloads. `agent.command.unobserved`
 records a command-word run whose caller was dropped while the owning runtime remains alive; it
 carries `command.leg`, a low-cardinality outcome and error kind, never output or argv, and its
 complete failure cause is an ordinary error event beside the record. Logs inside the active trace
@@ -679,11 +667,8 @@ carry generated `trace_id` and `span_id`, so an OTLP log result pivots to the pe
 
 Telemetry is not minimized toward the operator: the telemetry store is inside the operator's trust
 boundary, and access to it is access to every conversation, prompt, and argument
-([the constitution](design.md#constitution)). The metadata-only default excludes more: under
-`telemetryPayloads: false`, provider input and output, prompts, chat text, and `url.full` stay out,
-along with the command words and argument values the paragraphs below describe.
-
-*Committed direction:* what telemetry excludes shrinks to ([goal 2](design.md#constitution)):
+([the constitution](design.md#constitution)). What telemetry excludes is goal 1's list and nothing
+else:
 
 - secret bytes;
 - chat bot tokens;
@@ -692,14 +677,12 @@ along with the command words and argument values the paragraphs below describe.
 - provider credentials; and
 - broker socket paths.
 
-Command arguments are recorded as a count rather than as values: a `curl -d '{"apiKey":...}'` body
-and a `cap some.id '{"token":...}'` object are capability input wearing argv's clothes, so
-`shell.command.argument_count` carries how many there were. The command word itself is recorded when
-it came from a fixed vocabulary the interpreter owns — a builtin name, a control word, a word the
-shell refuses by name, or a capability identifier; a shell function's name and a word that resolved
-to nothing are whatever the script's author typed, so both report the literal `<withheld>` and the
-resolution kind says what happened. *Committed direction:* removed; command words and arguments
-are recorded and no span is dropped ([goal 2](design.md#constitution)).
+Command arguments are still recorded as a count rather than as values, because a
+`curl -d '{"apiKey":...}'` body and a `cap some.id '{"token":...}'` object are secret bytes wearing
+argv's clothes, and `shell.command.argument_count` carries how many there were. The command *word*
+is recorded in full whatever wrote it. *Committed direction:* argument values are recorded too, with
+secret material excluded at the point it is identified rather than by withholding the whole vector
+([goal 2](design.md#constitution)).
 
 Model-selected invalid tool names are not copied into remote rejection events; a rejection records a
 stable category such as `unknown-tool`. Error telemetry records stable categories rather than raw

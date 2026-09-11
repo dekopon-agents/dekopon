@@ -586,21 +586,19 @@ async fn execute(
     message: InboundMessage,
     replier: Arc<dyn ChatReplier>,
 ) -> &'static str {
-    // Canonical subject identifiers and chat text are payload telemetry, never metadata. The
-    // default `gateway.message` span carries transport, agent, and outcome and nothing that
-    // identifies a person or repeats what they said.
-    if dekopon_core::telemetry_payloads() {
-        tracing::info!(
-            target: "dekopond::audit",
-            {
-                audit.event = "gateway.message.received",
-                subject = %message.subject,
-                channel = message.channel.as_str(),
-                text = message.text.as_str(),
-            },
-            "gateway message received"
-        );
-    }
+    // Who said it and what they said, on the log record rather than the span: chat text is
+    // unbounded and span attributes are the wrong container for it. A person talking to a Dekopon
+    // agent is talking to its operator, and the operator's trace records the inbound message.
+    tracing::info!(
+        target: "dekopond::audit",
+        {
+            audit.event = "gateway.message.received",
+            subject = %message.subject,
+            channel = message.channel.as_str(),
+            text = message.text.as_str(),
+        },
+        "gateway message received"
+    );
 
     let key = (
         message.transport.clone(),
@@ -616,8 +614,9 @@ async fn execute(
     };
 
     // Both conversation fields are zero on a `oneShot` route and on the first message of any
-    // conversation, which makes "was this session seeded" a filter rather than a guess. They are a
-    // count and a byte total: the history itself is chat text and stays behind the payload gate.
+    // conversation, which makes "was this session seeded" a filter rather than a guess. They stay a
+    // count and a byte total because a span attribute is the wrong container for unbounded text;
+    // the history itself rides `agent.model.prompt` on the log stream.
     let outcome = session(&runner, &route, &message, &replier)
         .instrument(tracing::info_span!(
             "gateway.session",
@@ -727,21 +726,18 @@ async fn session(
     let span = tracing::Span::current();
     span.record("conversation.turns", seeded.len());
     span.record("conversation.bytes", seeded.bytes());
-    // The key names nobody, but it still joins one private or shared conversation's turns, which is
-    // the linkage the metadata-only default exists to withhold. It rides the payload gate for that
-    // reason, and on a line of its own: canonical subjects are on `gateway.message.received`, and a
-    // cache key must never meet one in the same record.
-    if dekopon_core::telemetry_payloads() {
-        tracing::info!(
-            target: "dekopond::audit",
-            {
-                audit.event = "gateway.session.cache_key",
-                prompt.cache_key = cache_key.as_str(),
-                conversation.persistent = window.is_some(),
-            },
-            "gateway session prompt cache key"
-        );
-    }
+    // On a line of its own rather than beside the subject: the key names nobody, and keeping it off
+    // `gateway.message.received` means a cache key and a canonical subject never meet in one record
+    // for a reader who only needs one of them.
+    tracing::info!(
+        target: "dekopond::audit",
+        {
+            audit.event = "gateway.session.cache_key",
+            prompt.cache_key = cache_key.as_str(),
+            conversation.persistent = window.is_some(),
+        },
+        "gateway session prompt cache key"
+    );
 
     let memory_surface = leg.chat_memory_surface().cloned();
     let chat_claim = chat_claim(route, message).ok();

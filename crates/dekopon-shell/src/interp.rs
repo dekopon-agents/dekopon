@@ -1464,8 +1464,7 @@ impl Evaluator<'_> {
     /// them gets its own span nested inside the `xargs` one, which is exactly the syscall-by-
     /// syscall reading this instrumentation exists to give.
     ///
-    /// See [`telemetry`] for what these spans may and may not carry, and for the per-script cap
-    /// that decides which of them are emitted at INFO.
+    /// See [`telemetry`] for what these spans carry.
     fn run_argv(
         &mut self,
         argv: &[String],
@@ -1485,15 +1484,8 @@ impl Evaluator<'_> {
             let resolution = dispatch::resolve(command, &self.function_names, self.invoker);
             (CommandKind::of(&resolution), Some(resolution))
         };
-        let name = telemetry::traceable_name(kind, command);
-
-        let level = self.counters.charge(kind);
-        let span = telemetry::command_span(level, name, kind, arguments.len());
-        // Recorded only for `not-granted`, where it comes from the session's own granted set rather
-        // than from the script. See `telemetry::name_is_fixed_vocabulary`.
-        if let Some(Resolution::NotGranted { namespace }) = resolution.as_ref() {
-            span.record("capability.namespace", namespace.as_str());
-        }
+        self.counters.charge(kind);
+        let span = telemetry::command_span(command, kind, arguments.len());
         let _entered = span.enter();
 
         let executed = self.dispatch_command(
@@ -1689,7 +1681,7 @@ impl Evaluator<'_> {
             // tell "no such command" from "you were not granted that" would have an oracle for
             // enumerating the deployment's capabilities one guess at a time. The difference is
             // recorded in the span and nowhere the script can read.
-            Resolution::NotFound | Resolution::NotGranted { .. } => {
+            Resolution::NotFound | Resolution::NotGranted => {
                 self.write_line(&format!("dekopon-shell: {command}: command not found"));
                 Ok(Executed::Result(CommandResult::status(ExitCode::NOT_FOUND)))
             }

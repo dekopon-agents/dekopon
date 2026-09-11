@@ -3726,9 +3726,10 @@ where
         request: InvocationRequest,
         refusal: Option<Refusal>,
     ) -> Result<InvocationResult, BrokerError> {
-        // Identifiers and the decision only. Request input never reaches a span field, exactly as
-        // it never reaches an audit field — a refusal must be visible without the payload that
-        // was refused being visible with it.
+        // A storage-backed capability opens the blind span — identifiers and the decision only —
+        // because its input names storage keys the storage boundary exists to contain. Every other
+        // capability records its input: a decision a trace cannot attribute to a proposal is not a
+        // run anyone can reconstruct.
         let storage_candidate = self.capability_uses_storage(&request.capability);
         let authorize = if storage_candidate {
             tracing::info_span!(
@@ -3755,10 +3756,10 @@ where
         if !storage_candidate && let Some(via) = context.via() {
             authorize.record("via", tracing::field::display(via));
         }
-        // Opt-in only. Provider input is the payload the metadata-only default withholds; a
-        // `Redacted` value inside it still renders its marker, because that is a property of the
-        // value rather than of this mode.
-        if !storage_candidate && dekopon_core::telemetry_payloads() {
+        // Provider input is recorded unconditionally: a trace that omits what was proposed cannot
+        // reconstruct the run. A `Redacted` value inside it still renders its marker, because that
+        // is a property of the value rather than of this span.
+        if !storage_candidate {
             authorize.record("input", tracing::field::display(&request.input));
         }
         // Instrumented rather than entered with a guard: this section awaits the replay ledger and,

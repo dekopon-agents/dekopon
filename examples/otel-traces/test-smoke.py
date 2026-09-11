@@ -97,8 +97,7 @@ class SmokeControls(unittest.TestCase):
     def test_redaction_covers_full_remote_and_shipped_records(self):
         for name in ("search.json", "log-search.json", "shipped.json"):
             original = (self.folder / name).read_text()
-            for secret in ("DEKOPON_OTEL_SMOKE_INPUT_MUST_NOT_APPEAR",
-                           "DEKOPON_OTEL_SMOKE_CREDENTIAL_MUST_NOT_APPEAR",
+            for secret in ("DEKOPON_OTEL_SMOKE_CREDENTIAL_MUST_NOT_APPEAR",
                            "fake-ingest-token", "fake-password"):
                 self.write(name, [{"unrelated_record": secret}])
                 with patch.object(sys, "argv", ["control", str(self.folder)]), patch.dict(
@@ -107,9 +106,8 @@ class SmokeControls(unittest.TestCase):
                     exec(block("PYREDACT"), {})
             self.write(name, original, raw=True)
 
-    def test_payload_and_credentials_are_rejected_before_shipping(self):
-        for secret in ("DEKOPON_OTEL_SMOKE_INPUT_MUST_NOT_APPEAR",
-                       "DEKOPON_OTEL_SMOKE_CREDENTIAL_MUST_NOT_APPEAR",
+    def test_credentials_are_rejected_before_shipping(self):
+        for secret in ("DEKOPON_OTEL_SMOKE_CREDENTIAL_MUST_NOT_APPEAR",
                        "fake-ingest-token", "fake-password"):
             self.write("dekopond.stderr.log", secret, raw=True)
             with self.assertRaisesRegex(AssertionError, "redaction"):

@@ -412,13 +412,12 @@ telemetry:
   transport: grpc            # grpc | http
   serviceName: dekopon-brokerd
   exportTimeoutMs: 5000
-  telemetryPayloads: false
 ```
 
-`telemetryPayloads: true` adds provider input and HTTP URLs to spans. It never exposes a credential:
-`Redacted` values render their marker in either mode, and audit records are unaffected either way.
-*Committed direction:* the gate is removed; payloads always on
-([goal 2](../../docs/design.md#constitution)).
+Spans carry provider input and the full HTTP URL, always: there is no metadata-only mode
+([goal 2](../../docs/design.md#constitution)). They never carry a credential — `Redacted` values
+render their marker wherever they are formatted, and headers and bodies are excluded outright. Audit
+records are unaffected.
 
 The section has no credential field. Ingest authentication is read from the standard
 `OTEL_EXPORTER_OTLP_HEADERS` environment variable by the OpenTelemetry SDK, so a token never enters
