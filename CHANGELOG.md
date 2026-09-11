@@ -345,6 +345,14 @@ All notable changes to Dekopon are documented here. The format is based on
   is a record count and nothing more; the log queue is the tighter of the two because that is where
   the bytes are, and the span queue keeps four drains of headroom because the constitution says a
   span is never dropped.
+- `dekopon_core::Redacted` renders the constant `[REDACTED]` instead of a marker padded to the
+  replaced value's character width, and below ten characters it no longer degrades to a row of
+  asterisks. The padding kept a record's column alignment and paid for it by publishing how long
+  the secret was, which narrows down an issuer or a credential class — the one fact a redacted
+  field has no reason to carry. `redaction_marker(length)` keeps its signature and ignores its
+  argument, so `dekopon-console` builds unchanged; the new `dekopon_core::REDACTION_MARKER` is the
+  constant itself. Any log, span, or serialized record that quoted a marker's width now reads
+  `[REDACTED]`.
 
 ### Removed
 

@@ -6,34 +6,27 @@
 //! `Serialize` path that produces the secret, and reading it back requires the deliberately
 //! conspicuous [`Redacted::expose`].
 //!
-//! # Length is deliberately preserved
+//! # The marker is constant
 //!
-//! The marker is padded to the character length of the value it replaces, so a redacted field
-//! keeps the shape of the record it sits in. That is an explicit operator choice and it does leak
-//! one fact: how long the secret was. Token length can narrow down an issuer or credential class,
-//! so this is a readability-for-metadata trade rather than a free win.
+//! Every redacted value renders as `[REDACTED]`, whatever it replaced. A marker padded to the
+//! value's width leaked one fact for free — how long the secret was, which narrows down an issuer
+//! or a credential class — and bought only that a record kept its column alignment.
 
 use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// Renders the redaction marker for a value of `length` characters.
-///
-/// The marker is exactly `length` characters wide. Below the width of `[REDACTED]` there is no
-/// room for the word, so the marker degrades to asterisks rather than truncating into something
-/// that reads like a different token.
-#[must_use]
-pub fn redaction_marker(length: usize) -> String {
-    const WORD: &str = "REDACTED";
-    const MINIMUM: usize = WORD.len() + 2;
+/// The marker every redacted value renders as.
+pub const REDACTION_MARKER: &str = "[REDACTED]";
 
-    if length < MINIMUM {
-        return "*".repeat(length);
-    }
-    let padding = length - MINIMUM;
-    let left = padding.div_ceil(2);
-    let right = padding / 2;
-    format!("[{}{WORD}{}]", " ".repeat(left), " ".repeat(right))
+/// Renders the redaction marker.
+///
+/// `_length` is ignored: the marker is [`REDACTION_MARKER`] regardless of what it replaces. The
+/// parameter is kept because `dekopon-console` calls this function on a pinned `dekopon-core`, and
+/// dropping it would break that build for a signature nobody needs.
+#[must_use]
+pub fn redaction_marker(_length: usize) -> String {
+    REDACTION_MARKER.to_owned()
 }
 
 /// A value that must never reach a log, span, trace, or serialized record in the clear.
@@ -64,10 +57,10 @@ impl<T> Redacted<T> {
 }
 
 impl<T: AsRef<str>> Redacted<T> {
-    /// Returns the marker this value renders as.
+    /// Returns the marker this value renders as, which is [`REDACTION_MARKER`] for every value.
     #[must_use]
     pub fn marker(&self) -> String {
-        redaction_marker(self.0.as_ref().chars().count())
+        REDACTION_MARKER.to_owned()
     }
 }
 
@@ -123,29 +116,16 @@ impl<T> From<T> for Redacted<T> {
 mod tests {
     use super::{Redacted, redaction_marker};
 
-    /// The marker must be exactly as wide as what it replaced, including the example the design
-    /// was specified with.
+    /// The marker carries no trace of what it replaced, so no length reaches a record.
     #[test]
-    fn marker_matches_the_length_it_replaces() {
-        assert_eq!(redaction_marker(13), "[  REDACTED ]");
-        assert_eq!(redaction_marker(10), "[REDACTED]");
-        assert_eq!(redaction_marker(20), "[     REDACTED     ]");
-        for length in 0..64 {
+    fn the_marker_is_constant() {
+        for length in [0, 1, 9, 10, 13, 20, 64, 4096] {
             assert_eq!(
-                redaction_marker(length).chars().count(),
-                length,
-                "marker for {length} is the wrong width"
+                redaction_marker(length),
+                "[REDACTED]",
+                "marker for {length} is not the constant"
             );
         }
-    }
-
-    /// Below `[REDACTED]` the word cannot fit, and a truncated word would read as a different
-    /// token rather than as a redaction.
-    #[test]
-    fn short_values_degrade_to_asterisks() {
-        assert_eq!(redaction_marker(0), "");
-        assert_eq!(redaction_marker(9), "*********");
-        assert!(!redaction_marker(9).contains("REDACT"));
     }
 
     /// Every rendering path must be a marker. A single one of these regressing is the whole bug
@@ -169,7 +149,7 @@ mod tests {
 
         // The value itself is intact; only its renderings are replaced.
         assert_eq!(secret.expose(), "sk-live-abcdef0123456789");
-        assert_eq!(secret.marker().chars().count(), 24);
+        assert_eq!(secret.marker(), "[REDACTED]");
     }
 
     /// Round-tripping must not quietly turn a secret into its own marker.
@@ -180,12 +160,12 @@ mod tests {
         assert_eq!(secret.expose(), "sk-live-abcdef0123456789");
     }
 
-    /// Multi-byte secrets are measured in characters, so the marker stays the same visual width
-    /// rather than the same byte count.
+    /// A multi-byte secret renders the same marker as any other, so neither its byte count nor
+    /// its character count reaches the record.
     #[test]
-    fn length_is_measured_in_characters() {
+    fn multi_byte_secrets_render_the_same_marker() {
         let secret = Redacted::new("señor-señor-señor".to_owned());
         assert_eq!(secret.expose().len(), 20);
-        assert_eq!(secret.marker().chars().count(), 17);
+        assert_eq!(secret.marker(), "[REDACTED]");
     }
 }
