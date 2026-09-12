@@ -10,6 +10,7 @@
 {{- $run := .Values.paths.runtimeDir -}}
 {{- $state := .Values.paths.stateDir -}}
 {{- $storageRoot := .Values.providerStorage.rootPath -}}
+{{- $providerSetDir := include "dekopon.providerSetDir" . -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -188,6 +189,29 @@ spec:
               got=$(stat -c '%u:%a:%F' "{{ .dir }}")
               if [ "$got" != "{{ $seedUid }}:700:directory" ]; then
                 echo "{{ .dir }}: got $got, want {{ $seedUid }}:700:directory" >&2
+                rc=1
+              fi
+{{- end }}
+{{- if include "dekopon.providerSetEnabled" . }}
+
+              # The managed provider set's directory on the claim. The chart writes nothing into
+              # it: `dekopon-brokerd provider sync` — an operator-owned step outside this chart,
+              # which has to have run before this pod rolls — writes the lock and the blob store
+              # here, and the broker reads them at startup. What only the pod can do is ownership.
+              # The broker refuses a lock or a store that is not owned by its own UID, and refuses
+              # any ancestor that is group- or world-writable without the sticky bit; a fresh
+              # local-path volume arrives root-owned and 0777, so a first start without this
+              # refuses on an unreadable lock.
+              #
+              # Only this subtree, and not recursively. No other subdirectory of the claim is
+              # named: the gateway's credential directory keeps its own 65533, and the blobs the
+              # sync step wrote are already 65532.
+              [ -d "{{ $providerSetDir }}" ] || mkdir -p "{{ $providerSetDir }}"
+              chown "$uid:$gid" "{{ $providerSetDir }}"
+              chmod 0700 "{{ $providerSetDir }}"
+              got=$(stat -c '%u:%a:%F' "{{ $providerSetDir }}")
+              if [ "$got" != "$uid:700:directory" ]; then
+                echo "{{ $providerSetDir }}: got $got, want $uid:700:directory" >&2
                 rc=1
               fi
 {{- end }}

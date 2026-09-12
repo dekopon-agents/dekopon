@@ -143,6 +143,20 @@ which is always in the pod.
 {{- end -}}
 
 {{/*
+The managed provider set's directory as the INIT container sees it: a subdirectory of the claim,
+composed from paths.stateDir for the same reason the ChatGPT directories are. The broker sees the
+same subtree at broker.providerSet.mountPath, which is a separate value because the broker never
+mounts the claim root.
+*/}}
+{{- define "dekopon.providerSetDir" -}}
+{{- printf "%s/%s" .Values.paths.stateDir .Values.broker.providerSet.subdir -}}
+{{- end -}}
+
+{{- define "dekopon.providerSetEnabled" -}}
+{{- if .Values.broker.providerSet.enabled -}}true{{- end -}}
+{{- end -}}
+
+{{/*
 The seed-once files, as a YAML list of
 {label, owner, file, source, dir, value, reseed, secret, key}. Kept
 apart from managedFiles because the handling is the opposite: managedFiles are overwritten on every
@@ -403,6 +417,47 @@ operator who fixes one only to be told about the next has to roll the release tw
 {{- end -}}
 {{- end -}}
 
+{{/* The managed provider set. Collected the same way broker.chatgpt's problems are, and for the
+same reason: an operator who fixes one only to be told about the next has to roll twice. */}}
+{{- if include "dekopon.providerSetEnabled" . -}}
+{{- $problems := list -}}
+{{- $subdir := .Values.broker.providerSet.subdir -}}
+{{- if or (not (regexMatch "^[A-Za-z0-9._-]+$" $subdir)) (eq $subdir ".") (eq $subdir "..") -}}
+{{- $problems = append $problems (printf "broker.providerSet.subdir must be one non-dot path segment joined onto paths.stateDir, got %q; the lock and the store have to live on the claim" $subdir) -}}
+{{- end -}}
+{{- if and (include "dekopon.brokerChatgptEnabled" .) (eq $subdir .Values.broker.chatgpt.subdir) -}}
+{{- $problems = append $problems (printf "broker.providerSet.subdir and broker.chatgpt.subdir are both %q; they are separate subtrees of one claim and the broker would mount the same directory twice" $subdir) -}}
+{{- end -}}
+{{- if and (include "dekopon.chatgptEnabled" .) (eq $subdir .Values.gateway.chatgpt.subdir) -}}
+{{- $problems = append $problems (printf "broker.providerSet.subdir is %q, the gateway's ChatGPT subdirectory; the init container would hand the gateway's rotating credential to the broker's UID and the gateway could no longer write its own refreshed token" $subdir) -}}
+{{- end -}}
+{{- $mount := .Values.broker.providerSet.mountPath -}}
+{{- if or (not (regexMatch "^/([A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$" $mount)) (ne (clean $mount) $mount) -}}
+{{- $problems = append $problems (printf "broker.providerSet.mountPath must be a canonical absolute path of safe non-dot segments with no repeated or trailing slash, got %q" $mount) -}}
+{{- else -}}
+{{/* Only the broker's own mounts. paths.stateDir is deliberately absent: the broker does not mount
+the claim root, and the whole point of the default is a path underneath it. */}}
+{{- $brokerMounts := dict "paths.configDir" .Values.paths.configDir "paths.runtimeDir" .Values.paths.runtimeDir "temporary directory" "/tmp" "packaged default providers" "/opt/dekopon/providers" "packaged optional providers" "/opt/dekopon/optional-providers" "packaged executables" "/usr/local/bin" "packaged documentation" "/usr/share/doc/dekopon" -}}
+{{- if include "dekopon.brokerChatgptEnabled" . -}}
+{{- $_ := set $brokerMounts "the broker ChatGPT credential directory" (include "dekopon.brokerChatgptDir" .) -}}
+{{- end -}}
+{{- if .Values.providerStorage.enabled -}}
+{{- $_ := set $brokerMounts "providerStorage.rootPath" .Values.providerStorage.rootPath -}}
+{{- end -}}
+{{- range $source := .Values.broker.secretSourceVolumes -}}
+{{- $_ := set $brokerMounts (printf "broker secret source %s" $source.name) $source.mountPath -}}
+{{- end -}}
+{{- range $name, $path := $brokerMounts -}}
+{{- if or (eq (clean $mount) (clean $path)) (hasPrefix (printf "%s/" (clean $mount)) (clean $path)) (hasPrefix (printf "%s/" (clean $path)) (clean $mount)) -}}
+{{- $problems = append $problems (printf "broker.providerSet.mountPath (%s) must not equal, contain, or be contained by %s (%s); two overlapping mounts in one container shadow each other" $mount $name $path) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- if $problems -}}
+{{- fail (printf "broker.providerSet is misconfigured: %s" (join "; " $problems)) -}}
+{{- end -}}
+{{- end -}}
+
 {{/* The containers stop in SEQUENCE, so the pod's grace is the sum of both drains, not the larger
 of the two. Whichever daemon is still draining when the grace expires is SIGKILLed, and for the
 broker that lands mid-invocation. */}}
@@ -586,6 +641,17 @@ Arguments: dict "ctx" $ "sidecar" bool
     - name: state
       mountPath: {{ include "dekopon.brokerChatgptDir" $ }}
       subPath: {{ $.Values.broker.chatgpt.subdir }}
+{{- end }}
+{{- if include "dekopon.providerSetEnabled" $ }}
+    # The managed provider set, and only it: the generated lock and the content-addressed blob
+    # store an operator-owned `dekopon-brokerd provider sync` wrote onto the claim before this pod
+    # rolled. A second subPath view of the same claim, a sibling of the credential directory rather
+    # than a child of it, so the claim root stays unmounted here and unreachable from the gateway.
+    # The broker only reads these: it checks every blob's length and SHA-256 against the lock on the
+    # same read it hands to Wasmtime.
+    - name: state
+      mountPath: {{ $.Values.broker.providerSet.mountPath }}
+      subPath: {{ $.Values.broker.providerSet.subdir }}
 {{- end }}
 {{- range $.Values.broker.secretSourceVolumes }}
     - name: {{ .name }}

@@ -169,6 +169,7 @@ action performed by this chart.
 | gateway ChatGPT credential | `/var/lib/dekopon/chatgpt/chatgpt-auth.json` | none | init container, **once**; then `dekopond` owns it |
 | broker ChatGPT credential | `/var/lib/dekopon/broker-chatgpt/chatgpt-auth.json` | A + writable parent | init container, **once**; then `dekopon-brokerd` owns it |
 | providers | `/opt/dekopon/providers/*.wasm` | B | baked into the image |
+| managed provider set | `/var/lib/dekopon/providers/` | owned `0700` dir, broker-only | the directory by the init container; the lock and the store by the operator's sync step |
 
 `/etc/dekopon` and `/run/dekopon` are memory-backed `emptyDir`s, so the credentials file and the
 socket never reach the node's disk. `/var/lib/dekopon` is the retained model-credential claim.
@@ -402,6 +403,50 @@ then either delete the file in the volume and restart, or set `reseed` for one r
 The broker configuration's legacy `credential`/`credentialByAgent` selection is
 [planned to be replaced by public DRNs](../../docs/design.md#legacy-credential-bindings); that does not
 change seed-once behavior or turn the vault copy into the live token.
+
+## The managed provider set comes from the claim
+
+A `broker.yaml` names either `providers` — absolute paths to components baked into the image — or
+`providerSet`, a generated lock plus a content-addressed blob store. They are mutually exclusive in
+the daemon. `broker.providerSet.*` is what makes the second reachable:
+
+```yaml
+broker:
+  providerSet:
+    enabled: true
+    subdir: providers
+    mountPath: /var/lib/dekopon/providers
+```
+
+```yaml
+# broker.yaml
+providerSet:
+  lockPath: /var/lib/dekopon/providers/providers.lock.yaml
+  storePath: /var/lib/dekopon/providers/store
+```
+
+`subdir` is a single segment on the state claim, `mountPath` is where the broker container sees it,
+and they are separate values because the broker does not mount the claim root — the path on the
+claim is not the path the daemon reads. The broker mounts that subdirectory by `subPath`, a sibling
+of its ChatGPT credential mount rather than a child of it. The gateway gets no mount for it, which
+is the same boundary the two credential directories have.
+
+**The chart does not write the lock or the store, and does not run `provider sync`.** That is an
+operator-owned step outside this chart — on the Raspberry Pi deployment, an Argo `Sync` hook Job in
+an earlier wave running `dekopon-brokerd provider sync` against the same claim — and it has to have
+completed before the pod rolls. The chart does the one thing only the pod can do: the init container
+creates the subdirectory if it is absent and hands it to `65532` as `0700`. Both halves are
+load-bearing, because the broker refuses a lock or a store that is not owned by its own UID and
+refuses any ancestor that is group- or world-writable without the sticky bit, and a fresh
+`local-path` volume arrives root-owned and `0777`. The chown names that subtree only, and is not
+recursive: no other subdirectory of the claim is touched, the gateway's credential directory keeps
+its own `65533`, and the blobs the sync step wrote are already `65532`.
+
+Off by default. A release that leaves `broker.providerSet.enabled` false renders exactly what it
+rendered before, and a release that enables it must also stop naming `providers` in its
+`broker.yaml`. The chart refuses to render when `subdir` is not one non-dot path segment, when it
+collides with either ChatGPT subdirectory, or when `mountPath` is not canonical absolute or would
+overlap another of the broker's own mounts.
 
 ## Storage, uninstall, and recovery
 

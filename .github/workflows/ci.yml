@@ -549,6 +549,11 @@ jobs:
             --set gateway.chatgpt.existingSecret=dekopon-chatgpt-auth > "$RUNNER_TEMP/chatgpt.yaml"
           helm template dekopon charts/dekopon \
             --set providerStorage.enabled=true > "$RUNNER_TEMP/provider-storage.yaml"
+          # The managed provider set adds a second subPath view of the claim to the broker and an
+          # init container that hands that subtree to 65532; neither of the renders above reaches it.
+          helm template dekopon charts/dekopon \
+            -f charts/dekopon/values-pr-summarizer-linter.yaml \
+            --set broker.providerSet.enabled=true > "$RUNNER_TEMP/provider-set.yaml"
           helm template dekopon charts/dekopon \
             -f charts/dekopon/values-pr-summarizer-linter.yaml \
             --set gateway.service.enabled=true > "$RUNNER_TEMP/gateway-service.yaml"
@@ -651,6 +656,10 @@ jobs:
             ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e \
             -strict -summary -kubernetes-version 1.33.0 \
             < "$RUNNER_TEMP/gateway-service.yaml"
+          docker run --rm -i \
+            ghcr.io/yannh/kubeconform:v0.8.0@sha256:faffaf43f95aa6425306e1ab8d6fcad72acb9049158f38e574c085ea1ec0f64e \
+            -strict -summary -kubernetes-version 1.33.0 \
+            < "$RUNNER_TEMP/provider-set.yaml"
       # chart-publish.yml ships a tarball, not the working tree, and .helmignore decides what
       # goes in it. Package the chart and prove the archive renders byte-identically to the
       # source directory, so a file dropped from the package is a CI failure rather than a
