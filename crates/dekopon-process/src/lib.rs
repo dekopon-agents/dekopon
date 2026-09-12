@@ -118,6 +118,19 @@ impl CancelSignal {
         Self { receiver }
     }
 
+    /// Reports whether cancellation has already been requested.
+    ///
+    /// The point-in-time read for a caller that must decide now rather than await: a synchronous
+    /// boundary deciding whether to start work at all, where the supervisor's own await on this
+    /// signal has nothing yet to abort. Once requested it stays `true`, and a
+    /// [`CancelSignal::never`] signal is always `false`. A signal fired the instant after this
+    /// returns `false` is the ordinary race any cooperative check has: work started on that answer
+    /// is supervised, not lost.
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        *self.receiver.borrow()
+    }
+
     /// Resolves only once cancellation has been requested.
     async fn cancelled(&mut self) {
         loop {

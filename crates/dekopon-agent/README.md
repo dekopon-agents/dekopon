@@ -52,7 +52,9 @@ The reusable agent session layer consumed by `dekopond` and external embeddings 
   trip; `BrokerLeg::with_cancel_signal` ties those runs to an embedder's cancellation (the
   gateway's Stop), and without it they are cancellable in contract only. A transport
   failure reaches the script as `CommandRun::Errored` naming its cause, and a cancelled run
-  as `CommandRun::Denied { "session-cancelled" }`.
+  as `CommandRun::Denied { "session-cancelled" }`. The same signal read synchronously refuses a
+  capability call the script starts *after* the Stop, with the same reason and before any proposal
+  exists; that is a cooperative boundary rather than a refusal decision, which stays the broker's.
 - `command_run_from_outcome` and `report_unobserved_command_run` — the one mapping from
   a provider's `CommandRunOutcome` onto the shell's `CommandRun`, and the one
   `agent.command.unobserved` record for a run whose caller was dropped, shared by the

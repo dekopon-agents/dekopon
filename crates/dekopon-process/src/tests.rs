@@ -534,6 +534,21 @@ async fn dropping_every_cancel_handle_does_not_cancel() {
     ));
 }
 
+#[test]
+fn a_synchronous_boundary_reads_the_request_without_awaiting_it() {
+    // The read a caller makes when it has to decide *now* whether to start work at all: a
+    // cancelled signal must answer before there is a process to supervise, and stay answered.
+    let (handle, signal) = CancelSignal::pair();
+    assert!(!signal.is_cancelled());
+    handle.cancel();
+    assert!(signal.is_cancelled());
+    assert!(signal.is_cancelled(), "a request never lapses");
+    // Dropping every handle is "run to completion", so the answer is still no.
+    drop(handle);
+    assert!(signal.is_cancelled());
+    assert!(!CancelSignal::never().is_cancelled());
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn an_abandoned_cancelled_outcome_reaches_the_observer() {
     let (started_sender, started_receiver) = oneshot::channel();

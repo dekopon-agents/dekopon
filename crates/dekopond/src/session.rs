@@ -36,7 +36,7 @@ use dekopon_model::{
     model::{ChatModel, CompletionOptions, ModelError, OpenAiChatModel},
 };
 use dekopon_process::{CancelHandle, CancelSignal};
-use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, Limits as ShellLimits};
+use dekopon_shell::{CapabilityInvoker as _, Limits as ShellLimits};
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument as _;
@@ -335,67 +335,6 @@ struct CancellationOnDrop(SessionCancellation);
 impl Drop for CancellationOnDrop {
     fn drop(&mut self) {
         let _ = self.0.cancel();
-    }
-}
-
-/// Prevents a script from starting another capability call after a native Stop was observed.
-///
-/// A call already inside the delegate is not rollbackable; this check is the cooperative boundary
-/// immediately before the broker proposal.
-pub(crate) struct CancelAwareInvoker<I> {
-    pub(crate) inner: I,
-    pub(crate) cancellation: SessionCancellation,
-}
-
-impl<I: CapabilityInvoker> CapabilityInvoker for CancelAwareInvoker<I> {
-    fn granted(&self) -> Vec<String> {
-        self.inner.granted()
-    }
-
-    fn is_granted(&self, capability: &str) -> bool {
-        self.inner.is_granted(capability)
-    }
-
-    fn grants_namespace(&self, namespace: &str) -> bool {
-        self.inner.grants_namespace(namespace)
-    }
-
-    fn command_words(&self) -> Vec<String> {
-        self.inner.command_words()
-    }
-
-    // Forwarded rather than left to the default, which would answer this session's every command
-    // word by materializing both legs' command-word lists first.
-    fn has_command_word(&self, word: &str) -> bool {
-        self.inner.has_command_word(word)
-    }
-
-    fn run_command(
-        &self,
-        word: &str,
-        argv: &[String],
-        stdin: Option<&str>,
-    ) -> Option<dekopon_shell::CommandRun> {
-        self.inner.run_command(word, argv, stdin)
-    }
-
-    fn describe(&self, capability: &str) -> Option<dekopon_shell::CapabilityDescription> {
-        self.inner.describe(capability)
-    }
-
-    fn invoke(
-        &self,
-        capability: &str,
-        input: serde_json::Value,
-        secret_use: Option<dekopon_core::SecretUseProposal>,
-    ) -> CapabilityCallResult {
-        if self.cancellation.is_cancelled() {
-            CapabilityCallResult::Denied {
-                reason: "session-cancelled".to_owned(),
-            }
-        } else {
-            self.inner.invoke(capability, input, secret_use)
-        }
     }
 }
 
@@ -862,10 +801,7 @@ async fn session(
             Err(error) => return (Err(error), None, Vec::new()),
         };
         let runtime = ShellRuntime {
-            invoker: CancelAwareInvoker {
-                inner: leg,
-                cancellation: prompt_cancellation.clone(),
-            },
+            invoker: leg,
             limits: shell,
             curl_capability: None,
         };

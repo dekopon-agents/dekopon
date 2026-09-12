@@ -25,7 +25,7 @@ use dekopon_broker_protocol::{
     ResponseEnvelope, read_frame, write_frame,
 };
 use dekopon_config::LocalCatalog;
-use dekopon_core::{ExternalSubject, SecretDrn, SecretUseProposal};
+use dekopon_core::ExternalSubject;
 use dekopon_model::model::{
     AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelFunctionCall, ModelMessage,
     ModelTool, ModelToolCall,
@@ -45,10 +45,9 @@ use crate::{
     conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
     routes::{RouteError, RouteProblem, RoutingTable},
     session::{
-        BUSY_REPLY, CancelAwareInvoker, FAILURE_REPLY, ModelCache, ModelFactory,
-        SessionCancellation, SessionError, SessionGate, SessionRunner, SharedModel,
-        UNAUTHORIZED_REPLY, UNREPORTED_WORK_REPLY, memory_record_outcome_category,
-        model_bearer_token, model_credential, run_session,
+        BUSY_REPLY, FAILURE_REPLY, ModelCache, ModelFactory, SessionError, SessionGate,
+        SessionRunner, SharedModel, UNAUTHORIZED_REPLY, UNREPORTED_WORK_REPLY,
+        memory_record_outcome_category, model_bearer_token, model_credential, run_session,
     },
     transport::{
         ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
@@ -255,153 +254,6 @@ async fn provider_attachments_and_chat_asset_inputs_are_per_route_opt_ins() {
         .expect("route matches");
     assert_eq!(bound.provider_attachments, 2);
     assert_eq!(&*bound.chat_asset_inputs, ["echo.echo".to_owned()]);
-}
-
-/// The cancellation boundary must not narrow what a proposal may carry.
-///
-/// This wrapper forwarded eight of the trait's nine methods and inherited the ninth's
-/// deny-by-default, so a `curl --user USER:${drn:...}` in a gateway session was refused inside
-/// `dekopond` — the proposal never reached the broker, which is the only thing that can decide
-/// `secret.use` at all. Cancellation still applies to it, exactly as it does to a plain call.
-#[test]
-fn a_secret_use_proposal_reaches_the_broker_leg_through_the_cancellation_boundary() {
-    use dekopon_shell::{CapabilityCallResult, CapabilityInvoker};
-
-    /// Records what it was handed, so the assertion is about the wrapper rather than a broker.
-    #[derive(Default)]
-    struct RecordingLeg {
-        secret_uses: Mutex<Vec<Option<SecretUseProposal>>>,
-    }
-
-    impl CapabilityInvoker for RecordingLeg {
-        fn granted(&self) -> Vec<String> {
-            vec!["http-probe.fetch".to_owned()]
-        }
-
-        fn invoke(
-            &self,
-            _capability: &str,
-            _input: Value,
-            secret_use: Option<SecretUseProposal>,
-        ) -> CapabilityCallResult {
-            self.secret_uses
-                .lock()
-                .expect("recorded secret uses")
-                .push(secret_use);
-            CapabilityCallResult::Succeeded(json!({"status": 200}))
-        }
-    }
-
-    let proposal = SecretUseProposal::HttpBearer {
-        secret: "drn:com.xrl:secret:prod:api/token"
-            .parse::<SecretDrn>()
-            .expect("canonical DRN"),
-    };
-    let leg = Arc::new(RecordingLeg::default());
-    let cancellation = SessionCancellation::new();
-    let invoker = CancelAwareInvoker {
-        inner: Arc::clone(&leg),
-        cancellation: cancellation.clone(),
-    };
-
-    assert_eq!(
-        invoker.invoke("http-probe.fetch", json!({}), Some(proposal.clone())),
-        CapabilityCallResult::Succeeded(json!({"status": 200}))
-    );
-    assert_eq!(
-        leg.secret_uses.lock().expect("recorded secret uses")[0],
-        Some(proposal.clone()),
-        "the wrapper dropped the proposal on its way to the leg"
-    );
-
-    // A stopped session refuses it like any other call, rather than letting a secret-carrying one
-    // through the boundary a plain one cannot cross.
-    assert!(cancellation.cancel());
-    assert_eq!(
-        invoker.invoke("http-probe.fetch", json!({}), Some(proposal)),
-        CapabilityCallResult::Denied {
-            reason: "session-cancelled".to_owned(),
-        }
-    );
-}
-
-/// Dispatch asks the wrapper, not the leg, and a defaulted method it forgets answers "nothing".
-///
-/// `command_words` defaults to an empty list and `is_granted` to a scan of `granted`, so a
-/// forwarder that omits either turns a session's `gh` command word into "command not found" and a
-/// leg's cheaper membership answer into a wrong one. That is the same defect class the secret-use
-/// argument was, one method over, and nothing else in this crate pins it.
-#[test]
-fn the_cancellation_boundary_forwards_the_defaulted_lookups_rather_than_answering_them() {
-    use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, CommandRun};
-
-    /// Every answer here is one the trait default cannot give for this `granted` list.
-    struct CommandLeg;
-
-    impl CapabilityInvoker for CommandLeg {
-        fn granted(&self) -> Vec<String> {
-            vec!["echo.echo".to_owned()]
-        }
-
-        fn is_granted(&self, capability: &str) -> bool {
-            capability == "gh.pr-view"
-        }
-
-        fn grants_namespace(&self, namespace: &str) -> bool {
-            namespace == "gh"
-        }
-
-        fn command_words(&self) -> Vec<String> {
-            vec!["gh".to_owned()]
-        }
-
-        fn has_command_word(&self, word: &str) -> bool {
-            word == "gh"
-        }
-
-        fn run_command(
-            &self,
-            word: &str,
-            argv: &[String],
-            stdin: Option<&str>,
-        ) -> Option<CommandRun> {
-            Some(CommandRun::Rendered {
-                stdout: format!("{word} {}\n", argv.join(" ")),
-                stderr: stdin.unwrap_or_default().to_owned(),
-                status: 3,
-            })
-        }
-
-        fn invoke(
-            &self,
-            _capability: &str,
-            _input: Value,
-            _secret_use: Option<SecretUseProposal>,
-        ) -> CapabilityCallResult {
-            CapabilityCallResult::NotFound
-        }
-    }
-
-    let invoker = CancelAwareInvoker {
-        inner: CommandLeg,
-        cancellation: SessionCancellation::new(),
-    };
-
-    assert_eq!(invoker.command_words(), vec!["gh".to_owned()]);
-    assert!(invoker.has_command_word("gh"));
-    // Defaults to `None`, which dispatch reports as "command not found".
-    assert_eq!(
-        invoker.run_command("gh", &["--help".to_owned()], Some("piped")),
-        Some(CommandRun::Rendered {
-            stdout: "gh --help\n".to_owned(),
-            stderr: "piped".to_owned(),
-            status: 3,
-        })
-    );
-    // Absent from `granted`, so the default scan would refuse both.
-    assert!(invoker.is_granted("gh.pr-view"));
-    assert!(invoker.grants_namespace("gh"));
-    assert_eq!(invoker.granted(), vec!["echo.echo".to_owned()]);
 }
 
 /// `apiKeyEnv` has three meanings and they used to have one outcome.

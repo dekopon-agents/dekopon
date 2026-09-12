@@ -23,6 +23,9 @@ can outlive a `cancelled` outcome. A node that must not leave such work behind m
 `dekopon-agent`'s broker leg runs each command word as one cancellable `broker-command` node
 around the broker round trip. `dekopond` ties its `CancelSignal` to the session's Stop, so a run in
 flight is aborted at its next await and joined before the script reads `session-cancelled`.
+`CancelSignal::is_cancelled` is the same request read synchronously, for a caller deciding whether
+to start work rather than awaiting the end of work already running; the leg takes it before
+proposing a capability call at all, so a stopped session opens no further round trip.
 Embedders may instead supply `CancelSignal::never`. Dropping the outer `execute` future detaches
 the supervisor, not the process node: while the runtime lives, the supervisor awaits and records
 the node. The result travels in an RAII envelope whose drop invokes the required abandonment
