@@ -963,8 +963,12 @@ impl Default for IdSequence {
     }
 }
 
-pub(crate) fn milliseconds(duration: Duration) -> f64 {
-    duration.as_secs_f64() * 1000.0
+// Whole milliseconds, not fractional. `duration_ms` is emitted by the broker
+// (`duration_millis`) and the model client (`elapsed_ms`) as an integer, and one attribute key
+// carries one type across every record: a backend that infers a column type from the first record
+// it sees rejects the second one otherwise.
+pub(crate) fn milliseconds(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
