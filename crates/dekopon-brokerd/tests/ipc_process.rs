@@ -178,7 +178,7 @@ async fn ipc_process_boundary() {
         "apiVersion": "dekopon.dev/brokerd/v1alpha1", "socketPath": socket,
         "brokerPrincipal": "broker", "policyRevision": "ipc-test", "policiesPath": policy,
         "providers": [provider], "credentialsPath": credentials, "identities": identities,
-        "constraintSets": {"echo.echo": {"provider": "echo", "effect": "read-only", "risk": "Low", "idempotency": "idempotent", "constraints": {"timeoutMs": 30000, "maxOutputBytes": 1048576}}}
+        "constraintSets": {"echo.echo": {"provider": "echo", "effect": "read-only", "risk": "Low", "constraints": {"timeoutMs": 30000, "maxOutputBytes": 1048576}}}
     })).unwrap()).unwrap();
     for path in [&provider, &credentials, &policy, &config] {
         owned(path, server_uid, gid, 0o600, root);

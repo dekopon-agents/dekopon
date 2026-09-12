@@ -1,8 +1,8 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dekopon_provider_http::{Header, Request, method};
 use dekopon_provider_sdk::{
-    CapabilityId, EffectKind, Idempotency, Provider, ProviderApiVersion, ProviderCapability,
-    ProviderError, ProviderManifest, RiskLevel,
+    CapabilityId, EffectKind, Provider, ProviderApiVersion, ProviderCapability, ProviderError,
+    ProviderManifest, RiskLevel,
 };
 use serde_json::{Map, Value, json};
 
@@ -40,7 +40,6 @@ impl Provider for HttpProbe {
                     description: "Fetches one broker-authorized URI".to_owned(),
                     effect: EffectKind::ReadOnly,
                     risk: RiskLevel::Low,
-                    idempotency: Idempotency::Idempotent,
                     input_schema: json!({
                         "type": "object",
                         "properties": {
@@ -74,7 +73,6 @@ impl Provider for HttpProbe {
                             .to_owned(),
                     effect: EffectKind::ExternalWrite,
                     risk: RiskLevel::High,
-                    idempotency: Idempotency::Conditional,
                     input_schema: json!({
                         "type": "object",
                         "properties": {
@@ -92,7 +90,6 @@ impl Provider for HttpProbe {
                     description: "Deletes one broker-authorized resource".to_owned(),
                     effect: EffectKind::ExternalWrite,
                     risk: RiskLevel::High,
-                    idempotency: Idempotency::Idempotent,
                     input_schema: json!({
                         "type": "object",
                         "properties": {"uri": {"type": "string"}},
@@ -240,7 +237,7 @@ fn conditional_write(input: &Value) -> Result<Value, ProviderError> {
         .map(|header| String::from_utf8_lossy(&header.value).into_owned())
         .unwrap_or_default();
 
-    // Refusing here is what makes the capability `conditional` rather than idempotent, and it must
+    // Refusing here is what makes the write conditional rather than unconditional, and it must
     // happen before the write rather than being reported after it.
     if let Some(expected) = input.get("expectedEtag").and_then(Value::as_str)
         && expected != observed
@@ -293,7 +290,7 @@ mod tests {
     use dekopon_provider_sdk::Provider;
     use serde_json::json;
 
-    use dekopon_provider_sdk::{EffectKind, Idempotency};
+    use dekopon_provider_sdk::EffectKind;
 
     use super::{HttpProbe, MAX_RETURNED_BODY_BYTES, describe_response};
 
@@ -331,7 +328,6 @@ mod tests {
             .find(|capability| capability.id.as_str() == "http-probe.purge")
             .expect("the manifest declares a delete");
         assert_eq!(purge.effect, EffectKind::ExternalWrite);
-        assert_eq!(purge.idempotency, Idempotency::Idempotent);
     }
 
     #[test]

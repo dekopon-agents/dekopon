@@ -20,7 +20,7 @@ use dekopon_broker::{
     PolicyWorld,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
-use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency, InvocationOutcome};
+use dekopon_capability::{EffectKind, ExecutionConstraints, InvocationOutcome};
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, PrincipalId, ProviderId, RiskLevel, TransportId,
 };
@@ -85,7 +85,6 @@ fn constraint_set() -> (CapabilityId, ConstraintSet) {
                 .expect("valid provider fixture"),
             effect: EffectKind::ReadOnly,
             risk: RiskLevel::Low,
-            idempotency: Idempotency::Idempotent,
             credential: None,
             credential_by_agent: BTreeMap::new(),
             constraints: ExecutionConstraints::default(),

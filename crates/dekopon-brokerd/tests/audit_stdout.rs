@@ -85,7 +85,6 @@ permit(principal == Dekopon::Principal::"caller",
                     "provider": "echo",
                     "effect": "read-only",
                     "risk": "Low",
-                    "idempotency": "idempotent",
                     "constraints": {"timeoutMs": 30000, "maxOutputBytes": 1048576},
                 }
             },

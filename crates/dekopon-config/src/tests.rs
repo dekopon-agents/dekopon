@@ -114,7 +114,6 @@ spec:
   provider: github
   effect: read-only
   risk: Low
-  idempotency: idempotent
 "#;
     let error = LocalCatalog::from_str("withdrawn.yaml", input)
         .expect_err("a catalog carrying the withdrawn kinds must fail");
@@ -181,7 +180,6 @@ spec:
   provider: github
   effect: read-only
   risk: Low
-  idempotency: idempotent
 ---
 apiVersion: dekopon.dev/v1alpha1
 kind: Agent

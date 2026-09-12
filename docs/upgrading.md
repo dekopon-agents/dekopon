@@ -45,6 +45,31 @@ declared, so a misspelled identifier there refused startup; now it loads and the
 to the provider verbatim, which reads as the provider rejecting its own input. Check those
 identifiers against the broker's `constraintSets` by hand.
 
+## The `idempotency` classification is gone (unreleased)
+
+Delete every `idempotency:` line from `broker.yaml` (`constraintSets`) and from the chart values
+that render them (`broker.constraintSets`). `ConstraintSet` decodes with `deny_unknown_fields`, so
+a retained line is a **startup refusal**, not an ignored field. A catalog cannot carry one at all:
+`kind: Capability` documents are gone
+[as above](#catalog-capability-and-provider-documents-unreleased).
+
+Drop `context.idempotency` from every Cedar policy. The attribute is no longer declared on the
+capability action, and strict validation refuses a policy set that reads an attribute the schema
+does not declare, so a retained clause is also a startup refusal. Idempotency, exactly-once and
+duplicate-effect defense are [named non-goals](design.md#non-goals); `effect` and `risk` are
+unchanged and still matched byte for byte against the provider manifest.
+
+A provider **component** is the exception. `dekopon-provider-sdk` accepts and drops an
+`idempotency` field in the manifest a component returns from `describe`, for one release, so an
+already-built out-of-tree `.wasm` keeps loading across this upgrade. Rebuild providers against the
+new SDK before the release after this one; every other unknown manifest field is still refused. A
+provider's Rust source does change: `ProviderCapability` no longer has the field, and
+`dekopon_provider_sdk::Idempotency` no longer exists.
+
+The field was also one byte of the authority surface every storage namespace generation is keyed
+by. [Provider storage starts empty](#provider-storage-starts-empty-unreleased) covers that
+rotation; it needs no separate step.
+
 ## Broker dashboard retirement (unreleased)
 
 Remove the broker listener flag and chart value when upgrading. The UI and its reporting feed
@@ -477,7 +502,6 @@ rules:
     provider: echo
     effect: read-only
     risk: Low
-    idempotency: idempotent
     constraints:
       timeoutMs: 30000
       maxOutputBytes: 1048576
@@ -492,7 +516,6 @@ constraintSets:
     provider: echo
     effect: read-only
     risk: Low
-    idempotency: idempotent
     constraints:
       timeoutMs: 30000
       maxOutputBytes: 1048576
@@ -511,7 +534,7 @@ unless { context has via };
 Mechanical steps:
 
 1. For each old rule, write a `constraintSets` entry keyed by its `capability`, carrying `provider`,
-   `effect`, `risk`, `idempotency`, and `constraints` verbatim.
+   `effect`, `risk`, and `constraints` verbatim.
 2. For each old rule, write one `permit` naming its `principal` and capability action. Rules that
    differed only by principal collapse into one policy with several principals or an `in` set.
 3. Add `policiesPath`. It is **required** once any `constraintSets` entry exists.

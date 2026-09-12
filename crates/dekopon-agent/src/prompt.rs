@@ -1787,7 +1787,6 @@ mod tests {
                 description: "Reads one pull request".to_owned(),
                 effect: "read-only".to_owned(),
                 risk: "Low".to_owned(),
-                idempotency: "idempotent".to_owned(),
             }],
         )
     }

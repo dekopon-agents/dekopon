@@ -144,7 +144,7 @@ permit(principal == Dekopon::Principal::"smoke-user",
                     "channel": "dev", "conversation": "dev", "localSubjectService": "tel"}]}}],
             "identityMappings": [{"subject": "tel.16034700182", "principal": "smoke-user"}],
             "constraintSets": {"echo.echo": {"provider": "echo", "effect": "read-only",
-                "risk": "Low", "idempotency": "idempotent",
+                "risk": "Low",
                 "constraints": {"timeoutMs": 30000, "maxOutputBytes": 1048576}}},
             "telemetry": telemetry})
         broker = start("dekopon-brokerd", broker_config)

@@ -26,7 +26,7 @@ use dekopon_broker_host::{
 };
 use dekopon_broker_protocol::{ChatScopeClaim, InvocationRequest};
 use dekopon_capability::{
-    EffectKind, HttpConstraints, Idempotency, StorageAccess, StorageConstraints, StorageInterface,
+    EffectKind, HttpConstraints, StorageAccess, StorageConstraints, StorageInterface,
     StorageNamespace,
 };
 use dekopon_core::{
@@ -67,7 +67,6 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
             CapabilityRoute::ChatMemoryRecord,
             EffectKind::LocalWrite,
             RiskLevel::Medium,
-            Idempotency::Conditional,
             StorageAccess::ReadWrite,
         ),
         (
@@ -75,7 +74,6 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
             CapabilityRoute::ChatMemoryRecent,
             EffectKind::ReadOnly,
             RiskLevel::High,
-            Idempotency::Idempotent,
             StorageAccess::ReadOnly,
         ),
         (
@@ -83,12 +81,11 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
             CapabilityRoute::ChatMemorySearch,
             EffectKind::ReadOnly,
             RiskLevel::High,
-            Idempotency::Idempotent,
             StorageAccess::ReadOnly,
         ),
     ]
     .into_iter()
-    .map(|(id, route, effect, risk, idempotency, access)| {
+    .map(|(id, route, effect, risk, access)| {
         let capability = id.parse().expect("capability");
         (
             capability,
@@ -97,7 +94,6 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
                 provider: "memory-chat".parse().expect("provider"),
                 effect,
                 risk,
-                idempotency,
                 credential: None,
                 credential_by_agent: Default::default(),
                 constraints: dekopon_capability::ExecutionConstraints {
@@ -122,7 +118,6 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
             provider: "storage-probe".parse().expect("provider"),
             effect: EffectKind::LocalWrite,
             risk: RiskLevel::Medium,
-            idempotency: Idempotency::Conditional,
             credential: None,
             credential_by_agent: Default::default(),
             constraints: dekopon_capability::ExecutionConstraints {
@@ -146,7 +141,6 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
                 provider: "http-probe".parse().expect("provider"),
                 effect: EffectKind::ReadOnly,
                 risk: RiskLevel::Low,
-                idempotency: Idempotency::Idempotent,
                 credential: Some(credential.to_owned()),
                 credential_by_agent: Default::default(),
                 constraints: dekopon_capability::ExecutionConstraints {
@@ -736,7 +730,6 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
                 CapabilityRoute::ChatMemoryRecord,
                 EffectKind::LocalWrite,
                 RiskLevel::Medium,
-                Idempotency::Conditional,
                 StorageAccess::ReadWrite,
             ),
         ),
@@ -746,7 +739,6 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
                 CapabilityRoute::ChatMemoryRecent,
                 EffectKind::ReadOnly,
                 RiskLevel::High,
-                Idempotency::Idempotent,
                 StorageAccess::ReadOnly,
             ),
         ),
@@ -756,7 +748,6 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
                 CapabilityRoute::ChatMemorySearch,
                 EffectKind::ReadOnly,
                 RiskLevel::High,
-                Idempotency::Idempotent,
                 StorageAccess::ReadOnly,
             ),
         ),
@@ -832,7 +823,6 @@ async fn a_rendered_page_never_reaches_a_reserved_memory_route() {
             provider: "memory-chat".parse().expect("provider"),
             effect: EffectKind::ReadOnly,
             risk: RiskLevel::Low,
-            idempotency: Idempotency::Idempotent,
             credential: None,
             credential_by_agent: Default::default(),
             constraints: dekopon_capability::ExecutionConstraints {
@@ -941,7 +931,6 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
             provider: "storage-probe".parse().expect("provider"),
             effect: EffectKind::LocalWrite,
             risk: RiskLevel::Medium,
-            idempotency: Idempotency::Conditional,
             credential: None,
             credential_by_agent: Default::default(),
             constraints: dekopon_capability::ExecutionConstraints {
@@ -1102,7 +1091,6 @@ fn memory_constraint(
     route: CapabilityRoute,
     effect: EffectKind,
     risk: RiskLevel,
-    idempotency: Idempotency,
     access: StorageAccess,
 ) -> ConstraintSet {
     ConstraintSet {
@@ -1110,7 +1098,6 @@ fn memory_constraint(
         provider: "memory-chat".parse().expect("provider"),
         effect,
         risk,
-        idempotency,
         credential: None,
         credential_by_agent: Default::default(),
         constraints: dekopon_capability::ExecutionConstraints {
@@ -1133,7 +1120,6 @@ fn reserved_read_constraint() -> ConstraintSet {
         provider: "memory-chat".parse().expect("provider"),
         effect: EffectKind::ReadOnly,
         risk: RiskLevel::Low,
-        idempotency: Idempotency::Idempotent,
         credential: None,
         credential_by_agent: Default::default(),
         constraints: dekopon_capability::ExecutionConstraints::default(),
@@ -2806,14 +2792,8 @@ async fn chat_memory_without_routes_names_every_missing_role() {
     .expect("world");
     // Exactly the pre-upgrade catalog: the right three capabilities, the right storage authority,
     // and no `route:` anywhere. `route` defaults to `generic`, so this is what omitting it means.
-    let unrouted = |effect, risk, idempotency, access| {
-        let mut set = memory_constraint(
-            CapabilityRoute::ChatMemoryRecord,
-            effect,
-            risk,
-            idempotency,
-            access,
-        );
+    let unrouted = |effect, risk, access| {
+        let mut set = memory_constraint(CapabilityRoute::ChatMemoryRecord, effect, risk, access);
         set.route = CapabilityRoute::Generic;
         set
     };
@@ -2823,7 +2803,6 @@ async fn chat_memory_without_routes_names_every_missing_role() {
             unrouted(
                 EffectKind::LocalWrite,
                 RiskLevel::Medium,
-                Idempotency::Conditional,
                 StorageAccess::ReadWrite,
             ),
         ),
@@ -2832,7 +2811,6 @@ async fn chat_memory_without_routes_names_every_missing_role() {
             unrouted(
                 EffectKind::ReadOnly,
                 RiskLevel::High,
-                Idempotency::Idempotent,
                 StorageAccess::ReadOnly,
             ),
         ),
@@ -2841,7 +2819,6 @@ async fn chat_memory_without_routes_names_every_missing_role() {
             unrouted(
                 EffectKind::ReadOnly,
                 RiskLevel::High,
-                Idempotency::Idempotent,
                 StorageAccess::ReadOnly,
             ),
         ),
@@ -2911,7 +2888,6 @@ async fn every_declared_route_conflict_is_reported_at_startup() {
         provider: provider.parse().expect("provider"),
         effect: EffectKind::ReadOnly,
         risk: RiskLevel::Low,
-        idempotency: Idempotency::Idempotent,
         credential: None,
         credential_by_agent: Default::default(),
         constraints: dekopon_capability::ExecutionConstraints {

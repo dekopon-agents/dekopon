@@ -22,7 +22,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 use dekopon_broker::{PolicyEngine, PolicyWorld};
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_brokerd::BrokerdConfig;
-use dekopon_capability::{EffectKind, Idempotency};
+use dekopon_capability::EffectKind;
 use dekopon_core::{AgentId, CapabilityId, PrincipalId, ProviderId, RiskLevel};
 use dekopon_policy::{PolicyContext, PolicyRequest, PolicyTarget};
 use serde::Deserialize;
@@ -116,7 +116,6 @@ fn capability_request(
             provider: set.provider.clone(),
             effect: set.effect,
             risk: set.risk,
-            idempotency: set.idempotency,
         },
         context,
     }
@@ -247,7 +246,6 @@ async fn the_sender_may_write_through_the_gateway_and_nothing_else_may() {
                 provider: "http-probe".parse::<ProviderId>().expect("valid provider"),
                 effect: EffectKind::ExternalWrite,
                 risk: RiskLevel::High,
-                idempotency: Idempotency::Idempotent,
             },
             context: attested(Some(GATEWAY), Some(AGENT)),
         });
@@ -283,11 +281,10 @@ async fn every_example_constraint_set_matches_the_manifest_it_will_be_checked_ag
         let (provider, capability) = manifest
             .get(id)
             .unwrap_or_else(|| panic!("{id} exists in the loaded http-probe manifest"));
-        // These three are what `Broker::new` compares byte for byte against the manifest; a
+        // These two are what `Broker::new` compares byte for byte against the manifest; a
         // mismatch is a startup refusal, so an example carrying one would never run.
         assert_eq!(set.effect, capability.effect, "{id} effect");
         assert_eq!(set.risk, capability.risk, "{id} risk");
-        assert_eq!(set.idempotency, capability.idempotency, "{id} idempotency");
         assert_eq!(&set.provider, provider, "{id} provider route");
 
         let http = set

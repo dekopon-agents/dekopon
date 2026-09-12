@@ -9,8 +9,8 @@
 //! broker host must trap.
 
 use dekopon_provider_sdk::{
-    CapabilityId, CommandRun, EffectKind, Idempotency, Provider, ProviderApiVersion,
-    ProviderCapability, ProviderError, ProviderManifest, RiskLevel,
+    CapabilityId, CommandRun, EffectKind, Provider, ProviderApiVersion, ProviderCapability,
+    ProviderError, ProviderManifest, RiskLevel,
 };
 use serde_json::{Value, json};
 
@@ -54,7 +54,6 @@ impl Provider for ClockProbe {
                 description: "Reads the broker host's wall clock in UTC".to_owned(),
                 effect: EffectKind::ReadOnly,
                 risk: RiskLevel::Low,
-                idempotency: Idempotency::Idempotent,
                 input_schema: json!({"type": "object", "additionalProperties": false}),
             }],
         }

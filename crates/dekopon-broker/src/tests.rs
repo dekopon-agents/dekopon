@@ -11,8 +11,8 @@ use super::{
     AttestorGrant, AuditConfigurationError, AuditError, AuditEvent, AuditLog, AuthenticatedContext,
     AuthorityEncoder, BrokerBuildError, CapabilityRoute, ChatMemoryConfig, ChatScopeClaim,
     ChatScopeGrant, ChatTransportKind, ConstraintSet, ContextError, InMemoryAuditLog,
-    canonical_chat_scope, encode_execution_constraints, encode_host_limits, encode_memory_config,
-    encode_storage_limits,
+    canonical_chat_scope, encode_capability_authority, encode_execution_constraints,
+    encode_host_limits, encode_memory_config, encode_storage_limits,
 };
 
 fn decision(invocation: &str, allowed: bool) -> AuditEvent {
@@ -64,7 +64,6 @@ fn the_declared_route_is_what_reserves_a_capability_not_its_spelling() {
         "provider": "memory-chat",
         "effect": "read-only",
         "risk": "Low",
-        "idempotency": "idempotent",
         "constraints": {"timeoutMs": 1000, "maxOutputBytes": 1024},
     });
     let generic: ConstraintSet =
@@ -438,6 +437,68 @@ fn every_authority_ceiling_is_canonical_and_semantic() {
     assert_eq!(encoded_memory(&memory), encoded_memory(&unrelated_agent));
 }
 
+/// The exact list of inputs one capability commits to its storage namespace generation.
+///
+/// A storage namespace is keyed by this surface: adding or removing a field here mints a fresh
+/// random generation for every retained namespace on upgrade, and nothing recovers the old one by
+/// accident. Pinning the labels is what makes that cost deliberate — a field cannot enter or leave
+/// the digest without this list, and a reviewer, changing with it.
+#[test]
+fn capability_authority_commits_exactly_these_fields() {
+    fn labels(bytes: &[u8]) -> Vec<String> {
+        let mut labels = Vec::new();
+        let mut rest = bytes;
+        while !rest.is_empty() {
+            let (length, tail) = rest.split_at(8);
+            let length =
+                u64::from_be_bytes(length.try_into().expect("eight length bytes")) as usize;
+            let (label, tail) = tail.split_at(length);
+            labels.push(String::from_utf8(label.to_vec()).expect("labels are UTF-8"));
+            let (length, tail) = tail.split_at(8);
+            let length =
+                u64::from_be_bytes(length.try_into().expect("eight length bytes")) as usize;
+            rest = &tail[length..];
+        }
+        labels
+    }
+
+    let set = ConstraintSet {
+        route: CapabilityRoute::Generic,
+        provider: "echo".parse().expect("valid provider fixture"),
+        effect: dekopon_capability::EffectKind::ReadOnly,
+        risk: dekopon_core::RiskLevel::Low,
+        credential: Some("echo-token".to_owned()),
+        credential_by_agent: Default::default(),
+        constraints: ExecutionConstraints::default(),
+    };
+    let mut encoded = AuthorityEncoder::new();
+    encode_capability_authority(
+        &mut encoded,
+        &"echo.echo".parse::<CapabilityId>().expect("valid fixture"),
+        &set,
+        Some("echo-token"),
+        "sha256:artifact",
+    );
+
+    assert_eq!(
+        labels(&encoded.finish()),
+        vec![
+            "capability",
+            "provider",
+            "effect",
+            "risk",
+            "credential.present",
+            "credential",
+            "execution.timeoutMs",
+            "execution.maxOutputBytes",
+            "execution.http.present",
+            "execution.storage.present",
+            "providerArtifactSha256",
+        ],
+        "the storage authority surface gained or lost a field"
+    );
+}
+
 #[test]
 fn execution_authority_normalizes_sets_but_commits_every_constraint() {
     fn bytes(constraints: &ExecutionConstraints) -> Vec<u8> {
@@ -786,7 +847,6 @@ fn policy_http_scope_values_are_bounded() {
             provider: "echo".parse().expect("provider"),
             effect: dekopon_capability::EffectKind::ReadOnly,
             risk: dekopon_core::RiskLevel::Low,
-            idempotency: dekopon_capability::Idempotency::Idempotent,
             credential: None,
             credential_by_agent: Default::default(),
             constraints: ExecutionConstraints {
@@ -897,7 +957,6 @@ fn per_agent_credentials_decode_validate_their_keys_and_select_by_actor() {
         "provider": "gh",
         "effect": "external-write",
         "risk": "Medium",
-        "idempotency": "non-idempotent",
         "credential": "github-pat",
         "credentialByAgent": { "nestedset-github": "github-pat-scientist-hq" },
         "constraints": { "timeoutMs": 1000, "maxOutputBytes": 1024 }

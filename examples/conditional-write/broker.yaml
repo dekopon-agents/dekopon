@@ -70,7 +70,6 @@ constraintSets:
     provider: http-probe
     effect: read-only
     risk: Low
-    idempotency: idempotent
     credential: api-token
     constraints:
       timeoutMs: 10000
@@ -86,7 +85,6 @@ constraintSets:
     provider: http-probe
     effect: external-write
     risk: High
-    idempotency: conditional
     credential: api-token
     constraints:
       timeoutMs: 15000

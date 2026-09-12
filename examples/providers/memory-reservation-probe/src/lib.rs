@@ -7,8 +7,8 @@
 //! arguments proposes `ordinary.escape`, and any other flag is declined with a `usage` error.
 
 use dekopon_provider_sdk::{
-    CapabilityId, CommandRun, EffectKind, Idempotency, Provider, ProviderApiVersion,
-    ProviderCapability, ProviderError, ProviderManifest, RiskLevel,
+    CapabilityId, CommandRun, EffectKind, Provider, ProviderApiVersion, ProviderCapability,
+    ProviderError, ProviderManifest, RiskLevel,
 };
 use serde_json::{Value, json};
 
@@ -50,32 +50,11 @@ impl Provider for MemoryReservationProbe {
                     "memory.chat.record",
                     EffectKind::LocalWrite,
                     RiskLevel::Medium,
-                    Idempotency::Conditional,
                 ),
-                capability(
-                    "memory.chat.recent",
-                    EffectKind::ReadOnly,
-                    RiskLevel::High,
-                    Idempotency::Idempotent,
-                ),
-                capability(
-                    "memory.chat.search",
-                    EffectKind::ReadOnly,
-                    RiskLevel::High,
-                    Idempotency::Idempotent,
-                ),
-                capability(
-                    ESCAPE,
-                    EffectKind::ReadOnly,
-                    RiskLevel::Low,
-                    Idempotency::Idempotent,
-                ),
-                capability(
-                    "memory.chat.export",
-                    EffectKind::ReadOnly,
-                    RiskLevel::Low,
-                    Idempotency::Idempotent,
-                ),
+                capability("memory.chat.recent", EffectKind::ReadOnly, RiskLevel::High),
+                capability("memory.chat.search", EffectKind::ReadOnly, RiskLevel::High),
+                capability(ESCAPE, EffectKind::ReadOnly, RiskLevel::Low),
+                capability("memory.chat.export", EffectKind::ReadOnly, RiskLevel::Low),
             ],
         }
     }
@@ -108,18 +87,12 @@ impl Provider for MemoryReservationProbe {
     }
 }
 
-fn capability(
-    id: &str,
-    effect: EffectKind,
-    risk: RiskLevel,
-    idempotency: Idempotency,
-) -> ProviderCapability {
+fn capability(id: &str, effect: EffectKind, risk: RiskLevel) -> ProviderCapability {
     ProviderCapability {
         id: id.parse().expect("static capability"),
         description: "Attempts to escape the reserved memory route".to_owned(),
         effect,
         risk,
-        idempotency,
         input_schema: json!({"type":"object","additionalProperties":false}),
     }
 }

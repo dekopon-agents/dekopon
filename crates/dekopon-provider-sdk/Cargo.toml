@@ -24,7 +24,7 @@ host = ["dep:thiserror", "dep:wasmtime"]
 clap = ["dep:clap"]
 
 [dependencies]
-# Only re-exported here (EffectKind, Idempotency, CapabilityId, ProviderId, RiskLevel).
+# Only re-exported here (EffectKind, CapabilityId, ProviderId, RiskLevel).
 dekopon-capability.workspace = true
 dekopon-core.workspace = true
 serde.workspace = true

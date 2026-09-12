@@ -10,7 +10,7 @@ every decision.
 
 Authorization and execution are separate by construction. Cedar decides *who may do what*; a
 `ConstraintSet` decides *how narrowly the broker then does it* — provider route, trusted
-effect/risk/idempotency classification, optional symbolic credential, timeout, output ceiling, and
+effect/risk classification, optional symbolic credential, timeout, output ceiling, and
 exact HTTP authority. Constraint sets are validated at startup against the loaded provider manifest,
 the component host's independent ceilings, and the credential store, and no policy edit reaches
 them. A capability with no constraint set is denied `unconstrained-capability` before Cedar is

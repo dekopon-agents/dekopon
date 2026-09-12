@@ -431,6 +431,24 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Removed
 
+- **Breaking.** Removed the `idempotency` classification end to end: the
+  `dekopon_capability::Idempotency` enum, the `idempotency` field on a provider manifest capability
+  (`dekopon-provider-sdk`) and on a broker `constraintSets` entry, the `context.idempotency` Cedar
+  attribute and its schema declaration, the `idempotency` field on the `broker.execution` audit
+  record, and the field in `inspect_agent_config`'s effective capability view. Idempotency,
+  exactly-once, and duplicate-effect defense are [non-goals](docs/design.md#non-goals); `effect` and
+  `risk` are untouched and still matched byte for byte against the loaded manifest.
+  `outcome-unaudited` — "this may have executed and was not recorded" — is an outcome class, not
+  retry machinery, and stays. Constraint sets decode with `deny_unknown_fields`, so a retained
+  `idempotency:` line is a startup refusal, and a Cedar policy reading the retired attribute no
+  longer validates; strip both from `broker.yaml`, `policies.cedar`, and chart values before
+  upgrading. For one release `dekopon-provider-sdk` accepts and drops the field in the manifest a
+  component returns, so an already-built out-of-tree component keeps loading; its Rust source still
+  changes, which makes this a semver-breaking change for the published SDK. Removing the field also
+  removes one byte from the canonical authority surface, so every retained storage namespace under
+  the default `authority-bound` continuity re-keys to a fresh generation exactly once on upgrade —
+  durable files and chat memory recorded before it are no longer addressed. See
+  [`docs/upgrading.md`](docs/upgrading.md).
 - **Breaking configuration change.** The on-disk audit sink is gone. The audit record is the
   `broker.decision` or `broker.execution` log record the broker emits inside the caller's trace: on
   stdout as JSON always, and as an OTLP log record when `telemetry` names a receiver. Losing the
