@@ -25,6 +25,7 @@ CATEGORIES = (
 )
 
 FULL_CI_INPUTS = {
+    ".github/dependabot.yml",
     ".github/workflows/ci.yml",
     ".github/workflows/cache-warm.yml",
     ".github/scripts/classify_ci_changes.py",

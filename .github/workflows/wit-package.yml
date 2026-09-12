@@ -6,27 +6,13 @@ on:
     paths:
       - ".github/workflows/wit-package.yml"
       - "ci/fetch-external-provider-components.sh"
-      - "crates/dekopon-provider-clock/**"
-      - "crates/dekopon-provider-http/src/**"
-      - "crates/dekopon-provider-http/wit/**"
-      - "crates/dekopon-provider-sdk/src/**"
-      - "crates/dekopon-provider-sdk/wit/**"
-      - "crates/dekopon-provider-storage/**"
-      - "crates/dekopon-broker-host/wit/**"
-      - "examples/providers/cli-probe/**"
-      - "examples/providers/cli-probe-provider.wasm"
-      - "examples/providers/clock-probe/**"
-      - "examples/providers/clock-probe-provider.wasm"
-      - "examples/providers/memory-reservation-probe/**"
-      - "examples/providers/memory-reservation-probe-provider.wasm"
-      - "examples/providers/provider-v0-1-compat/**"
-      - "examples/providers/provider-v0-1-compat-provider.wasm"
-      - "examples/providers/provider-v0-2-compat/**"
-      - "examples/providers/provider-v0-2-compat-provider.wasm"
-      - "examples/providers/storage-probe/**"
-      - "examples/providers/storage-probe-provider.wasm"
-      - "examples/providers/http-probe/**"
-      - "examples/providers/http-probe-provider.wasm"
+      - "ci/toolchain.env"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
+      - "crates/**"
+      - "examples/providers/**"
       - "wit/**"
       - "wkg.toml"
       - "wkg.lock"
@@ -35,27 +21,13 @@ on:
     paths:
       - ".github/workflows/wit-package.yml"
       - "ci/fetch-external-provider-components.sh"
-      - "crates/dekopon-provider-clock/**"
-      - "crates/dekopon-provider-http/src/**"
-      - "crates/dekopon-provider-http/wit/**"
-      - "crates/dekopon-provider-sdk/src/**"
-      - "crates/dekopon-provider-sdk/wit/**"
-      - "crates/dekopon-provider-storage/**"
-      - "crates/dekopon-broker-host/wit/**"
-      - "examples/providers/cli-probe/**"
-      - "examples/providers/cli-probe-provider.wasm"
-      - "examples/providers/clock-probe/**"
-      - "examples/providers/clock-probe-provider.wasm"
-      - "examples/providers/memory-reservation-probe/**"
-      - "examples/providers/memory-reservation-probe-provider.wasm"
-      - "examples/providers/provider-v0-1-compat/**"
-      - "examples/providers/provider-v0-1-compat-provider.wasm"
-      - "examples/providers/provider-v0-2-compat/**"
-      - "examples/providers/provider-v0-2-compat-provider.wasm"
-      - "examples/providers/storage-probe/**"
-      - "examples/providers/storage-probe-provider.wasm"
-      - "examples/providers/http-probe/**"
-      - "examples/providers/http-probe-provider.wasm"
+      - "ci/toolchain.env"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
+      - "crates/**"
+      - "examples/providers/**"
       - "wit/**"
       - "wkg.toml"
       - "wkg.lock"
@@ -70,11 +42,6 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  WKG_VERSION: 0.16.0
-  WKG_SHA256: 8ab0f7138e1a84616cb0c87c2bd7b7d00a356b63d458be92bad3fbd463aa3e2a
-  WASM_TOOLS_VERSION: 1.236.1
-  WASM_TOOLS_SHA256: 2ea92231826976cb001c6c6d8708ff54e1ef1ea7229968a75a2119ff26c4cd6f
-  PROVIDER_RUST_TOOLCHAIN: 1.97.0
   PROVIDER_WIT_PACKAGE: dekopon:provider@0.3.0
   HTTP_WIT_PACKAGE: dekopon:http@1.0.0
   STORAGE_WIT_PACKAGE: dekopon:storage@0.1.0
@@ -95,6 +62,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          source ci/toolchain.env
           tools="$RUNNER_TEMP/component-tools"
           mkdir -p "$tools/bin" "$tools/wasm-tools"
 
@@ -118,8 +86,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          rustup toolchain install "$PROVIDER_RUST_TOOLCHAIN" --profile minimal
-          rustup override set "$PROVIDER_RUST_TOOLCHAIN"
+          rustup toolchain install
           mkdir -p "$RUNNER_TEMP/checked-components" target/wit-package/provider-inspection
           # Derived from the tree, never a list: a provider added without touching this workflow
           # still has its repository-owned checked component rebuilt and compared.
@@ -703,6 +670,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          source ci/toolchain.env
           tools="$RUNNER_TEMP/component-tools"
           mkdir -p "$tools/bin"
           curl --fail --location --proto '=https' --tlsv1.2 \

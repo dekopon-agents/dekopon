@@ -28,6 +28,8 @@ tokio.workspace = true
 wasmtime = { workspace = true, features = ["async"] }
 
 [dev-dependencies]
+# Inline adversarial components exercise post-return traps and fuel cancellation, not guest builds.
+wasmtime = { workspace = true, features = ["wat"] }
 dekopon-test-support = { path = "../dekopon-test-support" }
 # Path-only, deliberately: the testkit depends on this crate, so a version requirement here would
 # be a package cycle crates.io cannot order. Cargo strips a dev-dependency carrying no version at

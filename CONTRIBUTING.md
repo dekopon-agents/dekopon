@@ -6,7 +6,7 @@ Read [`docs/design.md`](docs/design.md) before changing behavior or architecture
 
 ## Development setup
 
-Install stable Rust with `rustfmt` and Clippy. The workspace MSRV is 1.89.0.
+Install `rustup`. [`rust-toolchain.toml`](rust-toolchain.toml) selects the pinned compiler with `rustfmt` and Clippy, and that compiler is also the workspace MSRV.
 
 ```console
 rustup component add rustfmt clippy
@@ -28,7 +28,7 @@ cargo install cargo-deny --locked
 cargo deny --all-features check
 ```
 
-For MSRV-sensitive changes run the two `cargo +1.89.0` commands in [Root workspace](docs/development.md#root-workspace) (`--no-run`, then `--doc`), which is what the required `test (Rust 1.89.0)` check runs. Run `cargo package --workspace --locked` from a clean tree when changing package metadata, crate dependencies, or include lists. Validate workflow and shell-script edits with `actionlint .github/workflows/*.yml` and `shellcheck <SCRIPT>`; the exact file list CI shellchecks is the `shellcheck` line in [Root workspace](docs/development.md#root-workspace).
+The pinned compiler is the MSRV, so the required `test (Rust)` check is the ordinary `cargo test` pair in [Root workspace](docs/development.md#root-workspace) and there is no second MSRV run. Run `cargo package --workspace --locked` from a clean tree when changing package metadata, crate dependencies, or include lists. Validate workflow and shell-script edits with `actionlint .github/workflows/*.yml` and `shellcheck <SCRIPT>`; the exact file list CI shellchecks is the `shellcheck` line in [Root workspace](docs/development.md#root-workspace).
 
 Documentation edits are gated too: run the duplicate-entry check below, and add every new `audit.event` name, backticked, to [`docs/observability.md`](docs/observability.md) in the same change ([details](docs/development.md#documentation-gates)).
 

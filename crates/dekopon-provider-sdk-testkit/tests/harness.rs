@@ -417,8 +417,8 @@ async fn authority_bound_continuity_is_selectable_and_holds_one_generation_here(
 }
 
 /// `host_limits` narrows the Wasmtime ceilings the same way `storage_limits` narrows storage, and
-/// the fuel ceiling is real enough that one unit cannot carry a component through its own
-/// `describe` — the ceiling bites at load, before any invocation exists to refuse.
+/// the fuel ceiling is real enough that one unit cannot load the component — the ceiling bites
+/// during instantiation or `describe`, before any invocation exists to refuse.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_narrowed_fuel_ceiling_stops_the_guest() {
     // The control: the same component, the same builder, the default ceilings.
@@ -439,14 +439,18 @@ async fn a_narrowed_fuel_ceiling_stops_the_guest() {
         })
         .build()
         .await
-        .expect_err("one unit of fuel cannot describe the component");
+        .expect_err("one unit of fuel cannot load the component");
 
-    assert!(
-        matches!(
-            error,
-            FakeBrokerError::Host(BrokerHostError::Describe { .. })
-        ),
-        "{error:?}"
+    let source = match &error {
+        FakeBrokerError::Host(
+            BrokerHostError::Instantiate { source, .. } | BrokerHostError::Describe { source, .. },
+        ) => source,
+        _ => panic!("expected load-time fuel exhaustion, got {error:?}"),
+    };
+    assert_eq!(
+        source.root_cause().to_string(),
+        "wasm trap: all fuel consumed by WebAssembly",
+        "expected an out-of-fuel root cause, got {error:?}"
     );
 }
 

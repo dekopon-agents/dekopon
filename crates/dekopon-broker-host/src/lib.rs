@@ -57,7 +57,7 @@ pub(crate) mod bindings {
         imports: { default: async | trappable },
         exports: { default: async },
         with: {
-            "dekopon:storage/durable-files/file": crate::storage::FileResource,
+            "dekopon:storage/durable-files.file": crate::storage::FileResource,
         },
     });
 }
@@ -433,10 +433,7 @@ impl Runtime {
                 name: "max_total_memory_bytes",
             });
         }
-        let mut config = host::config();
-        // Asynchronous execution: the guest yields on a fuel interval so a Tokio deadline can
-        // cancel it without a process-wide epoch interrupt.
-        config.async_support(true);
+        let config = host::config();
         let engine = host::engine(config, options.compile_cache_dir.as_deref()).map_err(
             |error| match error {
                 EngineError::CompileCache { path, source } => {
@@ -881,10 +878,6 @@ impl BrokerWasmProvider {
                     .call_async(&mut store, (argv, stdin))
                     .await
                     .map_err(failed)?;
-                function
-                    .post_return_async(&mut store)
-                    .await
-                    .map_err(failed)?;
                 output
             } else {
                 let function = instance
@@ -892,10 +885,6 @@ impl BrokerWasmProvider {
                     .map_err(signature)?;
                 let (output,) = function
                     .call_async(&mut store, (argv,))
-                    .await
-                    .map_err(failed)?;
-                function
-                    .post_return_async(&mut store)
                     .await
                     .map_err(failed)?;
                 output

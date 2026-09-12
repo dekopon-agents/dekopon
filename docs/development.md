@@ -152,7 +152,7 @@ The repository-owned checked components are generated:
 | `examples/providers/provider-v0-2-compat/src/lib.rs` | `examples/providers/provider-v0-2-compat/build.sh` | `examples/providers/provider-v0-2-compat-provider.wasm` |
 | `examples/providers/storage-probe/src/lib.rs` | `examples/providers/storage-probe/build.sh` | `examples/providers/storage-probe-provider.wasm` |
 
-Never edit `.wasm` files directly. Each in-tree source directory is a separate Cargo workspace with its own lockfile, so root workspace format, lint, and test commands do **not** cover it. Echo, JSONPlaceholder, and memory-chat source and Wasm are not tracked here: `ci/fetch-external-provider-components.sh examples/providers` installs their exact ignored v0.1.0 fixtures after verifying core-pinned release checksums. Publication CI rebuilds every repository-owned checked component with the pinned provider artifact toolchain (`rustc 1.97.0`, `wasm-tools 1.236.1`) and byte-compares it before inspection; it separately fetches and inspects the standalone releases. `http-probe` and fetched JSONPlaceholder each decode to exactly one HTTP import. `clock-probe` (a hand-rolled `run-command` guest) decodes to exactly the wall clock import and three provider exports. Fetched memory-chat decodes to JSONL only and three provider exports; `cli-probe` (the `clap`-layer guest: three provider exports including `run-command`), `memory-reservation-probe` (the hand-rolled `run-command` guest, same three exports), and the provider-v0.1 and v0.2 compatibility fixtures are import-free; `storage-probe` (the legacy `resolve-command` guest at the current package) decodes to durable-files only and three provider exports. None may import WASI. Broker-host tests enforce the exact supported imports and reject WASI.
+Never edit `.wasm` files directly. Each in-tree source directory is a separate Cargo workspace with its own lockfile, so root workspace format, lint, and test commands do **not** cover it. Echo, JSONPlaceholder, and memory-chat source and Wasm are not tracked here: `ci/fetch-external-provider-components.sh examples/providers` installs their exact ignored v0.1.0 fixtures after verifying core-pinned release checksums. Publication CI rebuilds every repository-owned checked component with the pinned provider artifact toolchain (the [`rust-toolchain.toml`](../rust-toolchain.toml) compiler and the [`ci/toolchain.env`](../ci/toolchain.env) wasm-tools) and byte-compares it before inspection; it separately fetches and inspects the standalone releases. `http-probe` and fetched JSONPlaceholder each decode to exactly one HTTP import. `clock-probe` (a hand-rolled `run-command` guest) decodes to exactly the wall clock import and three provider exports. Fetched memory-chat decodes to JSONL only and three provider exports; `cli-probe` (the `clap`-layer guest: three provider exports including `run-command`), `memory-reservation-probe` (the hand-rolled `run-command` guest, same three exports), and the provider-v0.1 and v0.2 compatibility fixtures are import-free; `storage-probe` (the legacy `resolve-command` guest at the current package) decodes to durable-files only and three provider exports. None may import WASI. Broker-host tests enforce the exact supported imports and reject WASI.
 
 ### Dependencies, crates, CI, or releases
 
@@ -160,9 +160,9 @@ Declare shared versions and path dependencies in the root `Cargo.toml`; commit `
 
 [`../CHANGELOG.md`](../CHANGELOG.md) is required release metadata. Keep pending work under `[Unreleased]`; an application release must promote completed bullets into a dated `[VERSION]` section, while an independently versioned chart release uses `[dekopon-chart-<VERSION>]`. `.github/scripts/verify_changelog.py` requires exactly one Unreleased heading and a non-placeholder bullet under a Keep a Changelog category. Pull-request CI compares both the workspace and chart versions with those headings, and the corresponding tag workflow repeats the check before publication.
 
-GitHub Actions are pinned by full commit SHA. Required check names such as `test (Rust 1.89.0)` are branch-protection contexts: renaming a job without coordinating the repository setting leaves a permanently pending required check. Validate workflow and shell-script edits with `actionlint .github/workflows/*.yml` and `shellcheck <SCRIPT>` when those tools are available. Do not change branch protection, publish crates, create a release, or add credentials without explicit maintainer authorization.
+GitHub Actions are pinned by full commit SHA. Required check names such as `test (Rust)` are branch-protection contexts: renaming a job without coordinating the repository setting leaves a permanently pending required check. Validate workflow and shell-script edits with `actionlint .github/workflows/*.yml` and `shellcheck <SCRIPT>` when those tools are available. Do not change branch protection, publish crates, create a release, or add credentials without explicit maintainer authorization.
 
-Expensive validation runs on pull requests only. The classifier selects Rust, OTLP smoke-test, documentation, dependency, release-metadata, chart, package-archive, and CLI-install lanes independently; missing classifier output runs every lane. Stable workspace tests run in their own Cargo lane concurrently with formatting, linting, rustdoc, provider-workspace, shell, release-profile, and privilege-boundary checks, while the toolchain-free documentation lane runs the duplicate-entry and audit-event gates beside them; the required `quality (stable)` context aggregates all three lanes and requires each only under the gate that selected it. Any Markdown change selects the documentation lane, and so does any Rust change, because its audit-event gate reads `crates/**/*.rs`. The required `test (Rust 1.89.0)` context compiles and links every binary test target on the MSRV with `--no-run` without executing that suite; its small doctest set executes because Cargo cannot compile doctests under `--no-run`. Full `cargo package --workspace` verification runs when manifests, build scripts, explicit package inputs, WIT, or publication machinery change, while release metadata validation runs for ordinary Rust and changelog changes.
+Expensive validation runs on pull requests only. The classifier selects Rust, OTLP smoke-test, documentation, dependency, release-metadata, chart, package-archive, and CLI-install lanes independently; missing classifier output runs every lane. Workspace tests run in their own Cargo lane concurrently with formatting, linting, rustdoc, provider-workspace, shell, release-profile, and privilege-boundary checks, while the toolchain-free documentation lane runs the duplicate-entry and audit-event gates beside them and a native `ubuntu-24.04-arm` lane runs only `cargo test -p dekopon-broker-host --test host`; the required `quality (stable)` context aggregates all four lanes and requires each only under the gate that selected it. Any Markdown change selects the documentation lane, and so does any Rust change, because its audit-event gate reads `crates/**/*.rs`. The workspace-test lane is also the required `test (Rust)` context: `rust-toolchain.toml` pins the MSRV, so no second compiler runs the suite. Full `cargo package --workspace` verification runs when manifests, build scripts, explicit package inputs, WIT, or publication machinery change, while release metadata validation runs for ordinary Rust and changelog changes.
 
 Pull-request compiler and Cargo-registry caches are restore-only. `.github/workflows/cache-warm.yml` writes a default-branch registry cache capped at 512 MiB plus granular sccache compiler objects after relevant changes reach `main`; its independent warmer jobs compile lint/test targets but execute no tests and are not a second validation gate. CI job summaries record cache selection, network byte deltas, and target/registry growth so cache usefulness is measured rather than inferred from lookup hits. The tag-triggered release performs only the release-specific tag/version, changelog, and publication-plan checks before building and attesting three platform archives, creating the GitHub release, and publishing every public crate in dependency order. The authorized tag push is the single publication gate: the `crates-io` environment remains part of the short-lived trusted-publisher OIDC identity but has no required-reviewer rule. A manual dispatch against an existing tag is only recovery; it packages and publishes crates while skipping platform builds, the existing GitHub release, and immutable crate versions already present. Every public crate needs a crates.io GitHub trusted-publisher entry for `dekopon-agents/dekopon`, `release.yml`, and that environment; bootstrap a brand-new crate name only under explicit authorization, then register it and revoke the bootstrap credential. Published versions and tags remain immutable. The complete operator checklist lives in the root [`README.md`](../README.md#maintainer-release-process).
 
@@ -248,22 +248,19 @@ shellcheck ci/fetch-external-provider-components.sh \
   examples/otel-traces/smoke-test.sh examples/providers/build-component.sh examples/providers/*/build.sh
 # Rustdoc with warnings denied.
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps --locked
-# workspace tests (stable): the exact standalone fixtures the tests read, then the suite, then its doctests.
+# test (Rust): the exact standalone fixtures the tests read, then the suite, then its doctests.
 ci/fetch-external-provider-components.sh examples/providers
 cargo test --workspace --all-features --locked
 cargo test --workspace --all-features --locked --doc
+# broker-host components (Linux ARM64): on an aarch64 Linux host only, the component host's own tests.
+cargo test -p dekopon-broker-host --test host --all-features --locked
 # dependency policy: advisories, licenses, bans, and sources over the full feature graph.
 cargo deny --all-features check
 ```
 
 The same quality lane also runs the [Provider example workspaces](#provider-example-workspaces) commands for every `examples/providers/*/Cargo.toml`, and the context also requires the toolchain-free [Documentation gates](#documentation-gates).
 
-For MSRV-sensitive code or dependency changes, compile and link the binary test targets without executing the stable suite twice, then retain compile-fail and ordinary doctest coverage on the minimum toolchain:
-
-```console
-cargo +1.89.0 test --workspace --all-features --locked --no-run
-cargo +1.89.0 test --workspace --all-features --locked --doc
-```
+`rust-toolchain.toml` is also the MSRV, so the test commands above are the MSRV check. Moving it, or anything else in the component toolchain, is the lockstep its leading comment lists.
 
 For package metadata, include lists, or dependency-boundary changes, run from a clean tree:
 
@@ -336,7 +333,8 @@ wasm-tools component wit --json examples/providers/memory-chat-provider.wasm
 If in-tree fixture source, SDK exports, WIT, or tool manifests change, install the pinned component tool, regenerate repository-owned fixtures, fetch standalone fixtures, and exercise each affected artifact:
 
 ```console
-cargo install wasm-tools --version 1.236.1 --locked
+. ci/toolchain.env
+cargo install wasm-tools --version "$WASM_TOOLS_VERSION" --locked
 examples/providers/http-probe/build.sh
 wasm-tools validate examples/providers/http-probe-provider.wasm
 wasm-tools component wit examples/providers/http-probe-provider.wasm
@@ -357,8 +355,9 @@ A deterministic rebuild should leave the artifact unchanged when the source and 
 Install the pinned package and component tools, then build and inspect the package from the repository root:
 
 ```console
-cargo install wkg --version 0.16.0 --locked
-cargo install wasm-tools --version 1.236.1 --locked
+. ci/toolchain.env
+cargo install wkg --version "$WKG_VERSION" --locked
+cargo install wasm-tools --version "$WASM_TOOLS_VERSION" --locked
 mkdir -p target/wit-package
 wkg build \
   --wit-dir crates/dekopon-provider-sdk/wit \
@@ -447,7 +446,7 @@ cargo clippy -p dekopon-broker-host -p dekopon-broker -p dekopon-brokerd \
   --all-targets --all-features --locked -- -D warnings
 ```
 
-For dependency or MSRV changes, also run the workspace MSRV command and `cargo deny --all-features check`. A manual
+For dependency changes, also run `cargo deny --all-features check`. A manual
 public-GHCR smoke test is useful but is not a substitute for the loopback tests and must not be made
 a CI dependency. The container staging path is independent of the provider manager:
 `ci/stage-image-context.sh` fetches release archives and runs its `gh attestation verify`

@@ -368,7 +368,7 @@ pub fn command_export(engine: &Engine, component: &Component) -> CommandExport {
         component_type
             .exports(engine)
             .find(|(name, _)| *name == wanted)
-            .map(|(_, item)| item)
+            .map(|(_, item)| item.ty)
     };
     if let Some(item) = find(RUN_COMMAND_EXPORT) {
         return classify_export(
@@ -580,8 +580,8 @@ pub enum EngineError {
 
 /// Base Wasmtime configuration for the broker host and external embeddings.
 ///
-/// The caller configures how it interrupts a guest running too long. The broker host enables async
-/// support and yields on a fuel interval so a Tokio deadline can cancel the call. External
+/// The caller configures how it interrupts a guest running too long. The broker host calls exports
+/// asynchronously and yields on a fuel interval so a Tokio deadline can cancel the call. External
 /// embeddings must choose their own interruption policy; this shared configuration does not
 /// require Wasmtime's `async` feature.
 #[must_use]

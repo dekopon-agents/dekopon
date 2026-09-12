@@ -59,10 +59,8 @@ jobs:
         with:
           ref: ${{ env.RELEASE_TAG }}
           persist-credentials: false
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
-        with:
-          toolchain: stable
+      - name: Install Rust
+        run: rustup toolchain install
       - name: Verify release metadata
         shell: bash
         run: |
@@ -103,10 +101,9 @@ jobs:
           ref: ${{ env.RELEASE_TAG }}
           persist-credentials: false
       - name: Install target toolchain
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
-        with:
-          toolchain: stable
-          targets: ${{ matrix.target }}
+        run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
       # GitHub scopes caches created on a tag to that tag, so this cannot warm a later release.
       # Keep workspace outputs to make a retry of this immutable release fast instead.
       - name: Cache Cargo artifacts
@@ -264,10 +261,8 @@ jobs:
         with:
           ref: ${{ env.RELEASE_TAG }}
           persist-credentials: false
-      - name: Install stable Rust
-        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # stable toolchain action
-        with:
-          toolchain: stable
+      - name: Install Rust
+        run: rustup toolchain install
       # Share the package-cache shape with the pull-request gate and manual recovery runs. GitHub
       # still applies its normal ref-scoping rules to caches created by a release tag.
       - name: Cache Cargo artifacts
