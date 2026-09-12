@@ -6,6 +6,7 @@ use std::{
 };
 
 use dekopon_broker_protocol::{ipc_socket_mode, secure_socket, secure_socket_parent};
+use dekopon_core::{AncestorPolicy, FileHygieneError, check_trusted_ancestors};
 use thiserror::Error;
 use tokio::{
     net::{UnixListener, UnixStream},
@@ -100,20 +101,19 @@ pub fn validate_owned_file(path: &Path, expected_uid: u32) -> Result<(), SocketE
     Ok(())
 }
 
+/// Walks as written from `path` inclusive; every caller canonicalized already, because it needs
+/// the resolved parent for its own check and its own error — one `canonicalize`, not two.
 fn validate_ancestors(path: &Path) -> Result<(), SocketError> {
-    for ancestor in path.ancestors() {
-        let metadata = fs::symlink_metadata(ancestor).map_err(|source| SocketError::Metadata {
-            path: ancestor.to_path_buf(),
-            source,
-        })?;
-        let mode = metadata.permissions().mode();
-        if !metadata.file_type().is_dir() || (mode & 0o022 != 0 && mode & 0o1000 == 0) {
-            return Err(SocketError::InsecureAncestor {
-                path: ancestor.to_path_buf(),
-            });
-        }
-    }
-    Ok(())
+    let policy = AncestorPolicy {
+        canonicalize: false,
+        include_self: true,
+    };
+    check_trusted_ancestors(path, policy).map_err(|error| match error {
+        FileHygieneError::Io { path, source } => SocketError::Metadata { path, source },
+        refusal => SocketError::InsecureAncestor {
+            path: refusal.path().to_path_buf(),
+        },
+    })
 }
 
 #[allow(

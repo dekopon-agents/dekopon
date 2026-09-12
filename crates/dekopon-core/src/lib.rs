@@ -31,7 +31,10 @@ pub use skill::{MAX_SKILL_NAME_LENGTH, SkillId, SkillIdError};
 pub use subject::{ExternalSubject, SubjectError, SubjectService};
 pub use trace::{TraceId, TraceIdError};
 #[cfg(unix)]
-pub use trusted_file::{FileHygieneError, FileTier, check_trusted_metadata, read_trusted_file};
+pub use trusted_file::{
+    AncestorPolicy, FileHygieneError, FileTier, check_trusted_ancestors, check_trusted_metadata,
+    read_trusted_file,
+};
 
 pub(crate) const MAX_IDENTIFIER_LENGTH: usize = 253;
 /// Maximum canonical bytes in one public Dekopon resource name for secret material.

@@ -8,6 +8,7 @@ use std::{
     sync::Arc,
 };
 
+use dekopon_core::{AncestorPolicy, FileHygieneError, check_trusted_ancestors};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use serde::{Deserialize, Serialize};
 
@@ -632,24 +633,19 @@ fn validate_component(name: &str) -> Result<(), StorageHostError> {
     Ok(())
 }
 
+/// Walks as written, parent and above, because the root may not exist yet and
+/// `a_configured_root_ancestor_symlink_is_rejected_before_canonicalization` pins it.
 fn validate_ancestors(path: &Path) -> Result<(), StorageHostError> {
-    let mut current = path.parent();
-    while let Some(ancestor) = current {
-        let metadata =
-            fs::symlink_metadata(ancestor).map_err(|source| StorageHostError::RootIo {
-                path: ancestor.to_path_buf(),
-                source,
-            })?;
-        let mode = metadata.permissions().mode();
-        let sticky = mode & 0o1000 != 0;
-        if !metadata.is_dir() || (mode & 0o022 != 0 && !sticky) {
-            return Err(StorageHostError::UnsafeRoot {
-                path: ancestor.to_path_buf(),
-            });
-        }
-        current = ancestor.parent();
-    }
-    Ok(())
+    let policy = AncestorPolicy {
+        canonicalize: false,
+        include_self: false,
+    };
+    check_trusted_ancestors(path, policy).map_err(|error| match error {
+        FileHygieneError::Io { path, source } => StorageHostError::RootIo { path, source },
+        refusal => StorageHostError::UnsafeRoot {
+            path: refusal.path().to_path_buf(),
+        },
+    })
 }
 
 #[cfg(test)]

@@ -21,7 +21,8 @@ use dekopon_broker_host::{
     LoadedProviderMetadata, LockedProviderSource,
 };
 use dekopon_core::{
-    FileHygieneError, FileTier, ProviderId, check_trusted_metadata, read_trusted_file,
+    AncestorPolicy, FileHygieneError, FileTier, ProviderId, check_trusted_ancestors,
+    check_trusted_metadata, read_trusted_file,
 };
 use futures_util::StreamExt as _;
 use http_auth::parser::ChallengeParser;
@@ -1817,23 +1818,22 @@ fn validate_directory(
     Ok(())
 }
 
+/// Walks canonically from `path` inclusive, so aliases such as macOS's `/var -> /private/var`
+/// resolve first; the final entry is still inspected with `symlink_metadata` by the caller.
 fn validate_ancestors(path: &Path) -> Result<(), ProviderManagerError> {
-    // Intermediate aliases such as macOS's `/var -> /private/var` are resolved before the walk;
-    // the final entry itself is still inspected with `symlink_metadata` by the caller.
-    let canonical = fs::canonicalize(path)
-        .map_err(|source| ProviderManagerError::io_at(INSPECT_STORE_PATH, path, source))?;
-    for ancestor in canonical.ancestors() {
-        let metadata = fs::symlink_metadata(ancestor)
-            .map_err(|source| ProviderManagerError::io_at(INSPECT_STORE_PATH, ancestor, source))?;
-        let mode = metadata.permissions().mode();
-        if !metadata.file_type().is_dir() || (mode & 0o022 != 0 && mode & 0o1000 == 0) {
-            return Err(ProviderManagerError::insecure(
-                "provider path ancestor permits unprotected group/world writes",
-                ancestor,
-            ));
+    let policy = AncestorPolicy {
+        canonicalize: true,
+        include_self: true,
+    };
+    check_trusted_ancestors(path, policy).map_err(|error| match error {
+        FileHygieneError::Io { path, source } => {
+            ProviderManagerError::io_at(INSPECT_STORE_PATH, path, source)
         }
-    }
-    Ok(())
+        refusal => ProviderManagerError::insecure(
+            "provider path ancestor permits unprotected group/world writes",
+            refusal.path(),
+        ),
+    })
 }
 
 fn ensure_private_directory(path: &Path, expected_uid: u32) -> Result<(), ProviderManagerError> {
