@@ -93,6 +93,33 @@ is. An empty directory is an error, not a silent zero providers.
 There is no implicit provider search path: every directory the broker loads code from is named in
 this owner-only file and nowhere else.
 
+### Plaintext HTTP destinations
+
+The native HTTP host refuses `http://` to anything but a loopback destination: a credential
+injected into a request that crosses a network in the clear is a credential on that network. A
+broker owner who runs a service that speaks only plaintext on a network they control opts that
+exact host out, and only that host:
+
+```yaml
+# broker.yaml
+http:
+  plaintextHosts:
+    - rpi.lan
+    - openobserve.openobserve.svc
+```
+
+Entries are exact hostnames matched case-insensitively. No wildcards, so a listed host widens
+nothing beyond itself; no ports, because what this relaxes is the scheme rather than the socket;
+no scheme, path, or IPv6 literal. An entry that is none of those refuses startup naming the entry,
+and a non-empty list is logged once at INFO as `http plaintext hosts allowed: [...]`, so the trace
+log carries the decision rather than only the consequence.
+
+The list reaches nothing on its own. A request still needs the capability's constraint set to name
+its destination in `allowedHosts` — for `http://` that means the `host:port` form, since the bare
+form matches only HTTPS on 443 — and still needs that set's `allowPlaintextLoopback`. What this
+decides is whether the host will speak plaintext to a destination the authorization already
+permits. Empty, the default, is the loopback-only rule unchanged.
+
 Host, broker, and server limits have conservative defaults, including a 2 MiB frame ceiling, when
 their entire sections are omitted. `hostLimits` and `brokerLimits` also default field by field, so a
 partial section keeps the absent-section value for everything it does not name — which is what lets

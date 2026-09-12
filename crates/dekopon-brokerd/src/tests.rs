@@ -449,6 +449,94 @@ async fn strict_configuration_resolves_paths_and_rejects_unknown_fields() {
     assert!(config::load(&path, uid).await.is_err());
 }
 
+/// The plaintext opt-out is broker-level owner configuration, so it is validated at boot: an entry
+/// that could never match a host is a refusal here rather than a denied request weeks later.
+#[tokio::test]
+async fn plaintext_hosts_are_validated_at_startup() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().expect("create configuration fixture");
+    let path = directory.path().join("broker.yaml");
+    let document = json!({
+        "apiVersion": config::CONFIG_API_VERSION,
+        "socketPath": "broker.sock",
+        "brokerPrincipal": "broker-test",
+        "policyRevision": "policy-test",
+        "providers": ["echo.wasm"],
+        "identities": [{
+            "uid": uid,
+            "principal": "caller",
+            "actor": {"type": "agent", "agent": "brokerd-test"}
+        }],
+        "policiesPath": "policies.cedar",
+        "constraintSets": {"echo.echo": constraint_set()}
+    });
+    fs::write(directory.path().join("echo.wasm"), b"component fixture")
+        .expect("write provider path fixture");
+    write_owner_only(
+        &directory.path().join("policies.cedar"),
+        POLICIES.as_bytes(),
+    );
+
+    // Absent section: the loopback-only default, and nothing for an operator to have written.
+    write_config(&path, &document);
+    let resolved = config::load(&path, uid)
+        .await
+        .expect("a config without an http section loads");
+    assert!(resolved.plaintext_hosts.is_empty());
+    assert!(resolved.host_options.plaintext_hosts.is_empty());
+
+    let mut allowed = document.clone();
+    allowed["http"] = json!({"plaintextHosts": ["RPi.LAN", "openobserve.openobserve.svc"]});
+    write_config(&path, &allowed);
+    let resolved = config::load(&path, uid)
+        .await
+        .expect("a config naming plaintext hosts loads");
+    assert_eq!(
+        resolved.plaintext_hosts.iter().collect::<Vec<_>>(),
+        ["openobserve.openobserve.svc", "rpi.lan"]
+    );
+    // The host that enforces the rule gets the same list; nothing else has to agree with it.
+    assert!(resolved.host_options.plaintext_hosts.contains("rpi.lan"));
+
+    // Each of these is a refusal at boot, naming the entry the operator has to fix.
+    for entry in [
+        "http://rpi.lan",
+        "rpi.lan:5080",
+        "rpi.lan/ingest",
+        "*.lan",
+        "",
+    ] {
+        let mut invalid = document.clone();
+        invalid["http"] = json!({"plaintextHosts": [entry]});
+        write_config(&path, &invalid);
+        let error = config::load(&path, uid)
+            .await
+            .expect_err("an entry that is not a bare hostname must refuse startup");
+        assert!(
+            matches!(error, config::ConfigError::InvalidPlaintextHost { .. }),
+            "{entry}: {error}"
+        );
+        assert!(
+            error.to_string().contains("http.plaintextHosts"),
+            "the refusal names the field: {error}"
+        );
+    }
+
+    // `deny_unknown_fields` still holds inside the new section: a typo is not a silent empty list.
+    let mut typo = document;
+    typo["http"] = json!({"plainTextHosts": ["rpi.lan"]});
+    write_config(&path, &typo);
+    let error = config::load(&path, uid)
+        .await
+        .expect_err("a misspelled field inside http is unknown");
+    assert!(
+        matches!(&error, config::ConfigError::Decode { source }
+            if source.to_string().contains("unknown field")
+                && source.to_string().contains("plainTextHosts")),
+        "unexpected error: {error}"
+    );
+}
+
 /// There is no on-disk audit sink, so its two fields refuse startup and the refusal names each one.
 #[tokio::test]
 async fn an_audit_path_in_config_is_refused() {

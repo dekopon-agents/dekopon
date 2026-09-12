@@ -10,7 +10,7 @@ use crate::bindings::dekopon::http::client::{ErrorCode, Header, HttpError, Reque
 
 pub use dekopon_http_host::{
     BoundCredential, ConfigurationError as HttpConfigurationError, HttpCallEvidence,
-    destinations_cover,
+    PlaintextHostError, PlaintextHosts, destinations_cover,
 };
 
 pub(crate) type HttpCeilings = HttpHostCeilings;

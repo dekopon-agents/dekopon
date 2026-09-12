@@ -7,6 +7,25 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- `http.plaintextHosts` in `broker.yaml` opts exact hostnames out of the native HTTP host's
+  loopback-only plaintext rule. Plaintext `http://` is still refused to everything else, because a
+  credential injected into a request that crosses a network in the clear is a credential on that
+  network; a broker owner who runs a service that speaks only plaintext on a network they control
+  — an OpenObserve ingest at `rpi.lan`, an in-cluster service address — now names it rather than
+  choosing between no telemetry and no rule.
+
+  Entries are exact hostnames matched case-insensitively: no wildcards, no ports, no schemes, no
+  paths. One that is none of those refuses startup naming the entry, and a non-empty list is logged
+  once at INFO as `http plaintext hosts allowed: [...]`. The field is broker-level rather than
+  per constraint set because "this hostname may be spoken to in the clear" is a fact about the
+  network the broker runs on, not about one capability.
+
+  The list widens nothing by itself: a request still needs the constraint set to name its
+  destination in `allowedHosts` and still needs that set's `allowPlaintextLoopback`. Default empty,
+  which is the previous behavior exactly.
+
 ## [dekopon-chart-0.6.0] - 2026-09-12
 
 ### Added

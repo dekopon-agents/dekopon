@@ -45,7 +45,10 @@ mod http;
 mod metadata;
 mod storage;
 use clock::ClockState;
-pub use http::{BoundCredential, HttpCallEvidence, HttpConfigurationError, destinations_cover};
+pub use http::{
+    BoundCredential, HttpCallEvidence, HttpConfigurationError, PlaintextHostError, PlaintextHosts,
+    destinations_cover,
+};
 use http::{HttpCeilings, HttpState};
 pub use metadata::LoadedProviderMetadata;
 use metadata::identify_bytes;
@@ -160,6 +163,10 @@ impl Default for BrokerHostLimits {
 /// Nothing here narrows or widens what an authorization may do, which is why it is separate from
 /// [`BrokerHostLimits`]: the broker commits its host ceilings into the effective-authority
 /// generation, and pointing a compilation cache at a different directory must not rotate that.
+/// [`Self::plaintext_hosts`] sits here for that same reason from the other side: it decides which
+/// destinations the native HTTP host will speak plaintext to, which is a transport rule rather
+/// than a bound an authorization could narrow, and an owner adding a LAN host to it must not
+/// rotate every stored chat-memory namespace.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrokerHostOptions {
     /// Absolute directory for Wasmtime's content-addressed compilation cache.
@@ -176,6 +183,10 @@ pub struct BrokerHostOptions {
     /// is only safe when the connection ceiling multiplied by the per-store ceiling still fits the
     /// container.
     pub max_total_memory_bytes: Option<usize>,
+    /// Exact hostnames plaintext HTTP is permitted to besides loopback.
+    ///
+    /// Empty — the default — is the loopback-only rule every deployment starts with.
+    pub plaintext_hosts: PlaintextHosts,
 }
 
 impl Default for BrokerHostOptions {
@@ -183,6 +194,7 @@ impl Default for BrokerHostOptions {
         Self {
             compile_cache_dir: None,
             max_total_memory_bytes: Some(DEFAULT_MAX_TOTAL_MEMORY_BYTES),
+            plaintext_hosts: PlaintextHosts::default(),
         }
     }
 }
@@ -420,6 +432,7 @@ struct Runtime {
     linker: Linker<StoreState>,
     limits: BrokerHostLimits,
     memory_budget: Option<Arc<MemoryBudget>>,
+    plaintext_hosts: PlaintextHosts,
 }
 
 impl Runtime {
@@ -455,6 +468,7 @@ impl Runtime {
                     reserved: AtomicUsize::new(0),
                 })
             }),
+            plaintext_hosts: options.plaintext_hosts.clone(),
         })
     }
 
@@ -506,6 +520,7 @@ impl Runtime {
             max_response_bytes: self.limits.max_http_response_bytes,
             max_headers: self.limits.max_http_headers,
             max_header_bytes: self.limits.max_http_header_bytes,
+            plaintext_hosts: self.plaintext_hosts.clone(),
         }
     }
 }
