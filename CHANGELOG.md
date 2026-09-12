@@ -7,6 +7,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-09-12
+
 ### Added
 
 - `dekopond` opens a message's trace where the transport received it. `transport.receive` is entered
@@ -860,7 +862,7 @@ All notable changes to Dekopon are documented here. The format is based on
   `existingKeySecretKey`, `keyDir` and `keyFileName` are refused at render, and the key's projected
   Secret, its init copy, its tmpfs and its broker mount are gone. A storage root from an earlier
   release is refused at broker startup; move it aside first, as
-  [`docs/upgrading.md`](docs/upgrading.md#provider-storage-starts-empty-unreleased) describes.
+  [`docs/upgrading.md`](docs/upgrading.md#provider-storage-starts-empty-0130) describes.
 
 ### Changed
 

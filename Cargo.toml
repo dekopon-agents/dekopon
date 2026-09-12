@@ -27,7 +27,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 # The one deliberate copy of rust-toolchain.toml's channel, kept for crates.io metadata. It moves
 # with the component toolchain pin; see the comment above `wasmtime` below.
@@ -97,28 +97,28 @@ url = "2.5.8"
 wasmtime ={ version = "48.0.2", default-features = false, features = ["cache", "component-model", "cranelift", "parallel-compilation", "runtime", "std"] }
 wit-bindgen = { version = "0.62.0", default-features = false, features = ["bitflags", "macros", "realloc"] }
 
-dekopon-agent = { version = "0.12.0", path = "crates/dekopon-agent" }
-dekopon-broker = { version = "0.12.0", path = "crates/dekopon-broker" }
-dekopon-broker-host = { version = "0.12.0", path = "crates/dekopon-broker-host" }
-dekopon-broker-protocol = { version = "0.12.0", path = "crates/dekopon-broker-protocol" }
-dekopon-brokerd = { version = "0.12.0", path = "crates/dekopon-brokerd" }
-dekopon-capability = { version = "0.12.0", path = "crates/dekopon-capability", default-features = false }
-dekopon-config = { version = "0.12.0", path = "crates/dekopon-config" }
-dekopon-core = { version = "0.12.0", path = "crates/dekopon-core", default-features = false }
-dekopon-http-host = { version = "0.12.0", path = "crates/dekopon-http-host" }
-dekopon-model = { version = "0.12.0", path = "crates/dekopon-model" }
-dekopon-policy = { version = "0.12.0", path = "crates/dekopon-policy" }
-dekopon-provider-clock = { version = "0.12.0", path = "crates/dekopon-provider-clock" }
-dekopon-provider-http = { version = "0.12.0", path = "crates/dekopon-provider-http" }
-dekopon-provider-sdk = { version = "0.12.0", path = "crates/dekopon-provider-sdk" }
-dekopon-provider-sdk-testkit = { version = "0.12.0", path = "crates/dekopon-provider-sdk-testkit" }
-dekopon-provider-storage = { version = "0.12.0", path = "crates/dekopon-provider-storage" }
-dekopon-process = { version = "0.12.0", path = "crates/dekopon-process" }
-dekopon-protocol = { version = "0.12.0", path = "crates/dekopon-protocol", default-features = false }
-dekopon-shell = { version = "0.12.0", path = "crates/dekopon-shell" }
-dekopon-storage-host = { version = "0.12.0", path = "crates/dekopon-storage-host" }
-dekopon-telemetry = { version = "0.12.0", path = "crates/dekopon-telemetry" }
-dekopond = { version = "0.12.0", path = "crates/dekopond" }
+dekopon-agent = { version = "0.13.0", path = "crates/dekopon-agent" }
+dekopon-broker = { version = "0.13.0", path = "crates/dekopon-broker" }
+dekopon-broker-host = { version = "0.13.0", path = "crates/dekopon-broker-host" }
+dekopon-broker-protocol = { version = "0.13.0", path = "crates/dekopon-broker-protocol" }
+dekopon-brokerd = { version = "0.13.0", path = "crates/dekopon-brokerd" }
+dekopon-capability = { version = "0.13.0", path = "crates/dekopon-capability", default-features = false }
+dekopon-config = { version = "0.13.0", path = "crates/dekopon-config" }
+dekopon-core = { version = "0.13.0", path = "crates/dekopon-core", default-features = false }
+dekopon-http-host = { version = "0.13.0", path = "crates/dekopon-http-host" }
+dekopon-model = { version = "0.13.0", path = "crates/dekopon-model" }
+dekopon-policy = { version = "0.13.0", path = "crates/dekopon-policy" }
+dekopon-provider-clock = { version = "0.13.0", path = "crates/dekopon-provider-clock" }
+dekopon-provider-http = { version = "0.13.0", path = "crates/dekopon-provider-http" }
+dekopon-provider-sdk = { version = "0.13.0", path = "crates/dekopon-provider-sdk" }
+dekopon-provider-sdk-testkit = { version = "0.13.0", path = "crates/dekopon-provider-sdk-testkit" }
+dekopon-provider-storage = { version = "0.13.0", path = "crates/dekopon-provider-storage" }
+dekopon-process = { version = "0.13.0", path = "crates/dekopon-process" }
+dekopon-protocol = { version = "0.13.0", path = "crates/dekopon-protocol", default-features = false }
+dekopon-shell = { version = "0.13.0", path = "crates/dekopon-shell" }
+dekopon-storage-host = { version = "0.13.0", path = "crates/dekopon-storage-host" }
+dekopon-telemetry = { version = "0.13.0", path = "crates/dekopon-telemetry" }
+dekopond = { version = "0.13.0", path = "crates/dekopond" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

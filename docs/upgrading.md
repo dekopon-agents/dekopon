@@ -8,7 +8,7 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
-## Telemetry payloads (unreleased)
+## Telemetry payloads (0.13.0)
 
 Remove `telemetryPayloads` from the `telemetry:` block of both `broker.yaml` and the gateway
 configuration before upgrading. Both sections reject unknown fields, so a daemon started on a file
@@ -24,7 +24,7 @@ conversation the system has handled. The exclusions are unchanged and were never
 secret bytes and the gateway's own credentials never reach telemetry, and HTTP request and response
 headers and bodies stay out of spans.
 
-## Catalog `Capability` and `Provider` documents (unreleased)
+## Catalog `Capability` and `Provider` documents (0.13.0)
 
 Delete every `kind: Capability` and `kind: Provider` document from every catalog before upgrading.
 A catalog carrying one refuses to load, naming the kind:
@@ -45,13 +45,13 @@ declared, so a misspelled identifier there refused startup; now it loads and the
 to the provider verbatim, which reads as the provider rejecting its own input. Check those
 identifiers against the broker's `constraintSets` by hand.
 
-## The `idempotency` classification is gone (unreleased)
+## The `idempotency` classification is gone (0.13.0)
 
 Delete every `idempotency:` line from `broker.yaml` (`constraintSets`) and from the chart values
 that render them (`broker.constraintSets`). `ConstraintSet` decodes with `deny_unknown_fields`, so
 a retained line is a **startup refusal**, not an ignored field. A catalog cannot carry one at all:
 `kind: Capability` documents are gone
-[as above](#catalog-capability-and-provider-documents-unreleased).
+[as above](#catalog-capability-and-provider-documents-0130).
 
 Drop `context.idempotency` from every Cedar policy. The attribute is no longer declared on the
 capability action, and strict validation refuses a policy set that reads an attribute the schema
@@ -67,16 +67,16 @@ provider's Rust source does change: `ProviderCapability` no longer has the field
 `dekopon_provider_sdk::Idempotency` no longer exists.
 
 The field was also one byte of the authority surface every storage namespace generation is keyed
-by. [Provider storage starts empty](#provider-storage-starts-empty-unreleased) covers that
+by. [Provider storage starts empty](#provider-storage-starts-empty-0130) covers that
 rotation; it needs no separate step.
 
-## Broker dashboard retirement (unreleased)
+## Broker dashboard retirement (0.13.0)
 
 Remove the broker listener flag and chart value when upgrading. The UI and its reporting feed
 are retired; see the [lockstep and refusal contract](../crates/dekopon-broker-protocol/README.md#version-and-compatibility).
 Provider HTTP, gateway webhooks, model accounting and daemon tracing remain.
 
-## Replay ledger removal (unreleased)
+## Replay ledger removal (0.13.0)
 
 `brokerLimits.maxReplayIds` is now an unknown field and refuses startup. Remove it from `broker.yaml`
 and from the chart's `broker.config.brokerLimits` before upgrading; `brokerLimits` itself is optional
@@ -88,7 +88,7 @@ defence is a [non-goal](design.md#non-goals): a caller that must not repeat an e
 resubmit it. The identifier itself is unchanged — it still binds an attestation to its proposal and
 names the call in audit.
 
-## Aggregate guest memory ceiling (unreleased)
+## Aggregate guest memory ceiling (0.13.0)
 
 `hostLimits.maxTotalMemoryBytes` now defaults to **256 MiB** — four concurrent provider stores at
 the default 64 MiB per store — where it was previously unset and the aggregate unbounded. A broker
@@ -105,7 +105,7 @@ hostLimits:
 `maxTotalMemoryBytes: null` restores the unbounded behavior. A deployment that already sets the
 field — including the Helm chart's own `268435456` — is unaffected.
 
-## Legacy bearer credential shape (unreleased)
+## Legacy bearer credential shape (0.13.0)
 
 Read every `kind: bearerToken` entry in `broker-credentials.yaml` before upgrading. Its `secret` must
 now be at least 16 bytes of printable ASCII with no whitespace, control or non-ASCII bytes — the
@@ -116,7 +116,7 @@ phrase-shaped value would deny answers that never carried it. A real issued toke
 rules already; a hand-written placeholder or a development stub may not. Replace such a value with
 the real credential rather than working around the refusal.
 
-## Broker audit configuration (unreleased)
+## Broker audit configuration (0.13.0)
 
 Delete `auditPath` and `serverLimits.auditMaxLineBytes` from `broker.yaml` before upgrading. Both
 are unknown fields, and `broker.yaml` rejects unknown fields, so a broker started on a file that
@@ -137,7 +137,7 @@ drop them too.
 
 Library callers of `run` receive unit on clean shutdown.
 
-## Provider wall clock import (unreleased)
+## Provider wall clock import (0.13.0)
 
 A provider component that imports `dekopon:clock/wall@1.0.0` requires a broker built with this
 release or newer. An older broker refuses it when it loads the component, before it binds its
@@ -167,7 +167,7 @@ recursive cleanup or trusted import of legacy layout bytes. Preserve such data o
 than deleting entries to bypass a refusal. A separately provisioned private storage root starts
 empty and does not restore previous data.
 
-## Provider storage starts empty (unreleased)
+## Provider storage starts empty (0.13.0)
 
 Provider storage starts empty at this release. Before upgrading a broker that has `storage:`
 configured:
@@ -238,10 +238,10 @@ See [`operations.md`](operations.md#audit).
 Only releases that need an operator action appear here. A release absent from this list is a binary
 swap in the order above.
 
-### 0.12.0 → next (unreleased) — command words run over `runCommand`, and `imageGenerator:` is removed
+### 0.12.0 → 0.13.0 — command words run over `runCommand`, and `imageGenerator:` is removed
 
-Not yet released; the version that carries it is named when it is cut. One item here — the removed
-`imageGenerator:` — **does** need a configuration edit; nothing else does.
+One item here — the removed `imageGenerator:` — **does** need a configuration edit; nothing else
+does.
 
 - **Building the crates needs Rust 1.98.1.** Every published crate now declares
   `rust-version = "1.98.1"` (was 1.89.0), the same compiler the repository pins, so `cargo install`
@@ -639,7 +639,7 @@ state claim and the credentials it holds in place.
 - [`catalog.md`](catalog.md) — the catalog schema an upgrade may need you to re-read.
 - [`container-image.md`](container-image.md) — how the image is assembled and what it pins.
 
-## Unreleased: standalone catalog CLI retirement
+## 0.13.0: standalone catalog CLI retirement
 
 The standalone `dekopon` package/executable and its get/describe/validate/config commands are
 removed. Install the matching `dekopond` from this source revision and use
