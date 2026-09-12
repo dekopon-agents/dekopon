@@ -218,6 +218,33 @@ broker:
     # container's arguments.
     reseed: false
 
+  # A managed provider set on the state claim, for a `broker.yaml` that names `providerSet` instead
+  # of `providers`. The two are mutually exclusive in the daemon: either the components baked into
+  # the image, or a generated lock plus a content-addressed blob store that
+  # `dekopon-brokerd provider sync` resolved from digest-pinned OCI artifacts.
+  #
+  # The chart neither runs that sync nor writes anything into this directory. It does the two things
+  # only the pod can do: the claim's `subdir` is mounted into the BROKER container at `mountPath`,
+  # and the init container creates that subdirectory and hands it to 65532 as `0700`. Both are
+  # load-bearing. The broker refuses a lock or a store it does not own, and refuses any ancestor
+  # that is group- or world-writable without the sticky bit; a fresh `local-path` volume arrives
+  # root-owned and `0777`, so a first start without the chown refuses.
+  #
+  # Writing the lock and the store is an operator-owned step outside this chart, and it has to have
+  # run before the pod rolls — on a Raspberry Pi deployment, an Argo `Sync` hook Job in an earlier
+  # wave that runs `dekopon-brokerd provider sync`. The gateway never receives this mount.
+  providerSet:
+    enabled: false
+    # Single path segment, joined onto paths.stateDir. It is not a free path for the same reason the
+    # ChatGPT subdirs are not: the set has to live on the claim, and the init container must chown
+    # its own subtree and nothing else on it.
+    subdir: providers
+    # Where the broker container sees that subdirectory. Separate from `subdir` because the broker
+    # never mounts the claim root, so the path it reads is not the path on the claim. Your
+    # broker.yaml's `providerSet.lockPath` and `providerSet.storePath` must be under this prefix;
+    # the chart places the directory, it does not rewrite configuration.
+    mountPath: /var/lib/dekopon/providers
+
   # Optional owner-only public-DRN/private-source map. The map contains no values but does contain
   # sensitive physical inventory. Prefer an existing Secret. The init container copies it into the
   # broker-only 0600 config directory; it is never mounted into the gateway.

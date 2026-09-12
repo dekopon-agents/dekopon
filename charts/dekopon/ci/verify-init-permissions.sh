@@ -77,10 +77,16 @@ for c,uid in ((gateway,65533),(broker,65532)):
     assert not c["securityContext"]["allowPrivilegeEscalation"]
 gm={m["name"]:m for m in gateway["volumeMounts"]}
 bm={m["name"]:m for m in broker["volumeMounts"]}
-# Neither daemon mounts the claim root. Each reaches only its own credential subdirectory, and only
-# when that family is enabled.
-assert "state" not in bm or bm["state"]["subPath"]=="broker-chatgpt", bm.get("state")
-assert "state" not in gm or gm["state"]["subPath"]=="chatgpt", gm.get("state")
+# Neither daemon mounts the claim root. Each reaches only its own subPath views of it: a credential
+# subdirectory when that family is enabled, and for the broker the managed provider set when that is
+# enabled. A mount of the claim itself has no subPath and fails here.
+claim_views={"broker-chatgpt":"/var/lib/dekopon/broker-chatgpt","providers":"/var/lib/dekopon/providers"}
+broker_state=[m for m in broker["volumeMounts"] if m["name"]=="state"]
+gateway_state=[m for m in gateway["volumeMounts"] if m["name"]=="state"]
+for m in broker_state:
+    assert claim_views.get(m.get("subPath"))==m["mountPath"], m
+for m in gateway_state:
+    assert m.get("subPath")=="chatgpt" and m["mountPath"]=="/var/lib/dekopon/chatgpt", m
 assert "config" not in gm and "gateway-config" not in bm
 assert "tmp" not in gm and "gateway-tmp" not in bm
 assert "config-source" not in gm and "config-source" not in bm
@@ -92,8 +98,6 @@ if "provider-storage" in bm:
 assert {m["name"]:m["mountPath"] for m in ic["volumeMounts"]}==expected
 assert gm["gateway-config"]["mountPath"]==bm["config"]["mountPath"]=="/etc/dekopon"
 assert gm["runtime"]["mountPath"]==bm["runtime"]["mountPath"]=="/run/dekopon"
-assert "state" not in bm or bm["state"]["mountPath"]=="/var/lib/dekopon/broker-chatgpt"
-assert "state" not in gm or gm["state"]["mountPath"]=="/var/lib/dekopon/chatgpt"
 config=next(d["stringData"] for d in docs if d["kind"]=="Secret" and "broker.yaml" in d.get("stringData",{}))
 broker_config=yaml.safe_load(config["broker.yaml"])
 gateway_config=yaml.safe_load(config["dekopond.yaml"])
@@ -677,5 +681,130 @@ if helm template shared-subdir "$chart_dir" -f "$values" \
 fi
 echo "PASS the two ChatGPT families cannot share a directory"
 
+# --------------------------------------------------------------------------------------------
+# Part 4: the managed provider set — a broker-only subPath view of the claim
+# --------------------------------------------------------------------------------------------
 echo
-echo "OK: every tier satisfied; both ChatGPT families are seed-once, separate, and reach only their own daemon; provider storage is retained, separate, and broker-only."
+echo "==> (n) the init container creates the provider-set subtree and hands it to the broker UID"
+render_init "$work/init-provider-set.sh" --set broker.providerSet.enabled=true
+reset_mounts
+run_init "$work/init-provider-set.sh"
+set_perms=$(docker run --rm --platform "$platform" -v "${resource}-state":/var/lib/dekopon "$busybox" \
+  sh -c "stat -c '%u:%g:%a:%F' /var/lib/dekopon/providers")
+assert_eq "provider-set directory permissions" "$set_perms" "65532:65532:700:directory"
+
+# What the operator's `dekopon-brokerd provider sync` leaves behind, written as the UID that Job
+# runs as. The chart must never clear it and must never have to touch it again.
+on_state <<'EOF'
+set -eu
+umask 077
+mkdir -p /var/lib/dekopon/providers/store/blobs/sha256
+printf 'apiVersion: dekopon.dev/provider-lock/v1alpha1\nproviders: []\n' > /var/lib/dekopon/providers/providers.lock.yaml
+printf 'component\n' > /var/lib/dekopon/providers/store/blobs/sha256/deadbeef.wasm
+chown -R 65532:65532 /var/lib/dekopon/providers
+chmod 0600 /var/lib/dekopon/providers/providers.lock.yaml /var/lib/dekopon/providers/store/blobs/sha256/deadbeef.wasm
+EOF
+run_init "$work/init-provider-set.sh"
+survived=$(docker run --rm --platform "$platform" -v "${resource}-state":/var/lib/dekopon "$busybox" \
+  sh -c 'cat /var/lib/dekopon/providers/store/blobs/sha256/deadbeef.wasm')
+assert_eq "a synced blob survives a restart copy" "$survived" "component"
+set_perms=$(docker run --rm --platform "$platform" -v "${resource}-state":/var/lib/dekopon "$busybox" \
+  sh -c "stat -c '%u:%g:%a:%F' /var/lib/dekopon/providers/store")
+assert_eq "the chown is not recursive and leaves the store alone" "$set_perms" "65532:65532:700:directory"
+
+echo
+echo "==> (o) UID 65532 reads the lock and the store through the broker's own subPath mount"
+cat > "$work/provider-set-check.py" <<'SETCHECK'
+import os, stat, sys
+root = "/var/lib/dekopon/providers"
+euid = os.geteuid()
+fail = []
+def ok(c, m):
+    print(("PASS " if c else "FAIL ") + m)
+    if not c:
+        fail.append(m)
+
+# load_lock: a regular file this UID owns, opened O_NOFOLLOW.
+fd = os.open(f"{root}/providers.lock.yaml", os.O_RDONLY | os.O_NOFOLLOW)
+st = os.fstat(fd)
+os.close(fd)
+ok(stat.S_ISREG(st.st_mode) and st.st_uid == euid and (st.st_mode & 0o077) == 0,
+   f"lock uid={st.st_uid} mode={oct(st.st_mode & 0o7777)}")
+
+# ProviderStore::open -> validate_directory(.., private): the store and both blob directories.
+for relative in ("store", "store/blobs", "store/blobs/sha256"):
+    dst = os.lstat(f"{root}/{relative}")
+    ok(stat.S_ISDIR(dst.st_mode) and dst.st_uid == euid and (dst.st_mode & 0o077) == 0,
+       f"{relative} uid={dst.st_uid} mode={oct(dst.st_mode & 0o7777)}")
+
+# validate_ancestors: every ancestor is a directory that is not group- or world-writable unless it
+# is sticky. This is what a fresh root-owned 0777 local-path volume fails.
+path = root
+while True:
+    ast = os.lstat(path)
+    ok(stat.S_ISDIR(ast.st_mode) and ((ast.st_mode & 0o022) == 0 or (ast.st_mode & 0o1000) != 0),
+       f"ancestor {path} mode={oct(ast.st_mode & 0o7777)}")
+    if path == "/":
+        break
+    path = os.path.dirname(path) or "/"
+print()
+print("FAILURES:", len(fail))
+sys.exit(1 if fail else 0)
+SETCHECK
+docker run --rm -i --platform "$platform" --user 65532:65532 --cap-drop=ALL \
+  --security-opt=no-new-privileges \
+  --mount "type=volume,src=${resource}-state,dst=/var/lib/dekopon/providers,volume-subpath=providers" \
+  "$python_image" python3 - < "$work/provider-set-check.py"
+
+echo
+echo "==> (p) the broker reaches it through its own subPath mount; the gateway has neither it nor the claim"
+render "$work/provider-set-render.yaml" \
+  --set broker.providerSet.enabled=true \
+  --set gateway.chatgpt.enabled=true \
+  --set gateway.chatgpt.existingSecret=dekopon-chatgpt-auth
+cat > "$work/provider-set-mounts.py" <<'SETMOUNTS'
+import yaml, sys
+SET = "/var/lib/dekopon/providers"
+STATE = "/var/lib/dekopon"
+for document in yaml.safe_load_all(sys.stdin):
+    if not document or document.get("kind") != "Deployment":
+        continue
+    spec = document["spec"]["template"]["spec"]
+    gateway = next(c for c in spec["containers"] if c["name"] == "gateway")
+    gateway_paths = {m["mountPath"] for m in gateway.get("volumeMounts", [])}
+    assert SET not in gateway_paths, gateway_paths
+    assert STATE not in gateway_paths, ("the gateway must never mount the whole claim", gateway_paths)
+    broker = next(c for c in spec["initContainers"] if c["name"] == "broker")
+    broker_paths = {m["mountPath"] for m in broker["volumeMounts"]}
+    assert STATE not in broker_paths, ("the broker must never mount the whole claim", broker_paths)
+    mount = next(m for m in broker["volumeMounts"] if m["mountPath"] == SET)
+    assert mount["name"] == "state" and mount["subPath"] == "providers", mount
+    # The directory is the init container's to create and own; nothing else may write it.
+    init = spec["initContainers"][0]
+    assert init["name"] == "prepare-files", init["name"]
+    assert 'chown "$uid:$gid" "' + SET + '"' in init["args"][0]
+    assert 'chmod 0700 "' + SET + '"' in init["args"][0]
+SETMOUNTS
+python_yaml "$(cat "$work/provider-set-mounts.py")" "$work/provider-set-render.yaml"
+echo "PASS the provider set is broker-only and the init container owns it"
+
+if helm template shared-set "$chart_dir" -f "$values" \
+  --set gateway.chatgpt.enabled=true \
+  --set gateway.chatgpt.existingSecret=dekopon-chatgpt-auth \
+  --set broker.providerSet.enabled=true \
+  --set broker.providerSet.subdir=chatgpt >/dev/null 2>&1; then
+  echo "FAIL the provider set rendered into the gateway's credential directory" >&2
+  exit 1
+fi
+echo "PASS the provider set cannot claim the gateway's credential directory"
+
+if helm template shadow-set "$chart_dir" -f "$values" \
+  --set broker.providerSet.enabled=true \
+  --set broker.providerSet.mountPath=/etc/dekopon >/dev/null 2>&1; then
+  echo "FAIL the provider-set mount shadowed the copied configuration mount" >&2
+  exit 1
+fi
+echo "PASS the provider-set mount cannot shadow another of the broker's mounts"
+
+echo
+echo "OK: every tier satisfied; both ChatGPT families are seed-once, separate, and reach only their own daemon; provider storage is retained, separate, and broker-only; the managed provider set is broker-only, owned by 65532, and survives a restart."

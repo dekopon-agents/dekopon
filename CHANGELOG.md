@@ -7,6 +7,37 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [dekopon-chart-0.6.0] - 2026-09-12
+
+### Added
+
+- `broker.providerSet.*` makes a managed provider set reachable by the broker: `enabled`, `subdir`
+  (a single segment on the state claim, default `providers`) and `mountPath` (where the broker
+  container sees it, default `/var/lib/dekopon/providers`). It is off by default and changes nothing
+  in a release that leaves it off. Enabled, the init container creates that subdirectory and hands
+  it to 65532 as `0700` — and only it, not recursively, never the claim root's other subtrees and
+  never the gateway's credential directory — and the broker container mounts it by `subPath`, a
+  sibling of its ChatGPT credential mount rather than a child of it. The gateway receives no mount
+  for it and the claim root stays unmounted in both daemons, so the two-UID isolation is unchanged.
+  Writing the lock and the blob store there is an operator-owned step outside this chart —
+  `dekopon-brokerd provider sync`, on a Raspberry Pi deployment an Argo `Sync` hook Job in an
+  earlier wave — and it has to have run before the pod rolls.
+
+  Without this a `broker.yaml` whose `providerSet` names paths under `paths.stateDir` could not
+  start on chart 0.5.0: the two-UID split stopped mounting the state claim into the broker at all,
+  so the lock was not there to read. Chart 0.2.0 only resolved those paths because the broker
+  mounted the whole claim, which 0.5.0 deliberately withdrew.
+
+  The chart refuses to render when `subdir` is not one non-dot path segment, when it collides with
+  `broker.chatgpt.subdir` or `gateway.chatgpt.subdir` — the second would hand the gateway's rotating
+  credential to the broker's UID — or when `mountPath` is not canonical absolute or would overlap
+  another of the broker's own mounts.
+- `ci/verify-init-permissions.sh` proves the set: the init container's real command creates and
+  claims the subtree, a store written there survives a restart copy, UID 65532 reads a lock through
+  the same `subPath` mount the broker container renders while every ancestor satisfies the
+  group/world-writable check the broker applies, and the rendered gateway mounts neither that
+  directory nor the claim.
+
 ## [0.13.0] - 2026-09-12
 
 ### Added
