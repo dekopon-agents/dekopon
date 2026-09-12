@@ -143,6 +143,18 @@ where
             .map(|path| path.display().to_string()),
         "broker provider guest-memory budget"
     );
+    // Only when the owner listed something: an empty list is the default rule rather than a
+    // decision, and a line every boot saying "nothing" would be the kind of noise that trains an
+    // operator to skip the one boot where it says something. A plaintext destination is a
+    // deliberate relaxation of the rule that keeps injected credentials off the wire, so the trace
+    // log carries the exact set the broker started with.
+    if !config.plaintext_hosts.is_empty() {
+        let hosts = config.plaintext_hosts.iter().collect::<Vec<_>>().join(", ");
+        tracing::info!(
+            event = "broker_plaintext_hosts",
+            "http plaintext hosts allowed: [{hosts}]"
+        );
+    }
     let registry = match config.locked_providers {
         Some(sources) => {
             BrokerProviderRegistry::load_locked_with_options(

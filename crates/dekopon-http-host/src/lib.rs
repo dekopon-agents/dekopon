@@ -16,6 +16,7 @@ use std::{
     error::Error as _,
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
     time::Duration,
 };
 
@@ -153,7 +154,130 @@ impl fmt::Display for HttpError {
 
 impl std::error::Error for HttpError {}
 
-/// Independent native ceilings that authorization cannot widen.
+/// Exact hostnames the broker owner has opted out of the plaintext-HTTP restriction.
+///
+/// Plaintext is refused to anything but loopback because a credential injected over `http://`
+/// travels in the clear, and that is goal 1's whole subject. The default set is empty, which is
+/// exactly that rule. An owner who runs a service that speaks only plaintext on a network they
+/// control — an OpenObserve ingest at `rpi.lan`, an in-cluster service address — names that host
+/// here, and only that host.
+///
+/// Entries are exact hostnames compared case-insensitively. No wildcards, so a listed host widens
+/// nothing beyond itself; no ports, because what this relaxes is the scheme rather than the
+/// socket; and no IPv6 literal, because a bare `:` reads as a port in this grammar — name the host.
+/// The list reaches nothing on its own: a constraint set's `allowedHosts` still has to name the
+/// destination and its `allowPlaintextLoopback` still has to be set, so this widens the *how*
+/// of a request the authorization already permits.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PlaintextHosts {
+    hosts: Arc<BTreeSet<String>>,
+}
+
+impl PlaintextHosts {
+    /// Validates one owner-authored list and lowercases every entry.
+    ///
+    /// Every refusal names the offending entry, because this runs at broker startup and the
+    /// operator's next act is editing that line.
+    pub fn new<I>(entries: I) -> Result<Self, PlaintextHostError>
+    where
+        I: IntoIterator,
+        I::Item: AsRef<str>,
+    {
+        let mut hosts = BTreeSet::new();
+        for entry in entries {
+            let entry = entry.as_ref().trim();
+            if entry.is_empty() {
+                return Err(PlaintextHostError::Empty);
+            }
+            let owned = || entry.to_owned();
+            if entry.contains("://") {
+                return Err(PlaintextHostError::Scheme { entry: owned() });
+            }
+            if entry.contains('*') {
+                return Err(PlaintextHostError::Wildcard { entry: owned() });
+            }
+            if entry.contains('/') {
+                return Err(PlaintextHostError::Path { entry: owned() });
+            }
+            if entry.contains(':') {
+                return Err(PlaintextHostError::Port { entry: owned() });
+            }
+            if !is_bare_hostname(entry) {
+                return Err(PlaintextHostError::InvalidHost { entry: owned() });
+            }
+            hosts.insert(entry.to_ascii_lowercase());
+        }
+        Ok(Self {
+            hosts: Arc::new(hosts),
+        })
+    }
+
+    /// Whether the owner listed this host, ignoring case.
+    #[must_use]
+    pub fn contains(&self, host: &str) -> bool {
+        self.hosts.contains(host.to_ascii_lowercase().as_str())
+    }
+
+    /// Whether the owner listed nothing, which is the loopback-only default.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.hosts.is_empty()
+    }
+
+    /// Listed hosts in deterministic order, for the one line startup logs.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.hosts.iter().map(String::as_str)
+    }
+}
+
+/// An owner-authored plaintext-host entry that is not a bare hostname.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum PlaintextHostError {
+    /// An entry was empty or only whitespace.
+    #[error("a plaintext host entry is empty")]
+    Empty,
+    /// An entry carried a URL scheme.
+    #[error("plaintext host `{entry}` must be a bare hostname, without a scheme")]
+    Scheme {
+        /// The refused entry.
+        entry: String,
+    },
+    /// An entry carried a path.
+    #[error("plaintext host `{entry}` must be a bare hostname, without a path")]
+    Path {
+        /// The refused entry.
+        entry: String,
+    },
+    /// An entry carried a port, or was an IPv6 literal.
+    #[error("plaintext host `{entry}` must carry no port: the port is irrelevant to this rule")]
+    Port {
+        /// The refused entry.
+        entry: String,
+    },
+    /// An entry used a wildcard.
+    #[error("plaintext host `{entry}` must be an exact hostname: wildcards are not accepted")]
+    Wildcard {
+        /// The refused entry.
+        entry: String,
+    },
+    /// An entry held characters a hostname may not.
+    #[error("plaintext host `{entry}` is not a hostname")]
+    InvalidHost {
+        /// The refused entry.
+        entry: String,
+    },
+}
+
+/// Whether this is a bare DNS name or IPv4 literal, in the shape `Url::host_str` would return.
+fn is_bare_hostname(entry: &str) -> bool {
+    entry
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.')
+        && !entry.starts_with(['-', '.'])
+        && !entry.ends_with(['-', '.'])
+}
+
+/// Independent native host settings that authorization cannot widen.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpHostCeilings {
     /// Maximum calls in one execution context.
@@ -166,6 +290,12 @@ pub struct HttpHostCeilings {
     pub max_headers: usize,
     /// Maximum aggregate header bytes in a request or response.
     pub max_header_bytes: usize,
+    /// Exact hostnames the broker owner permits plaintext HTTP to besides loopback.
+    ///
+    /// The one setting here that relaxes rather than bounds, and it sits beside the ceilings for
+    /// the same reason they do: it is the broker owner's file, and no authorization can add an
+    /// entry to it. Empty is the loopback-only rule.
+    pub plaintext_hosts: PlaintextHosts,
 }
 
 impl Default for HttpHostCeilings {
@@ -176,6 +306,7 @@ impl Default for HttpHostCeilings {
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             max_headers: DEFAULT_MAX_HEADERS,
             max_header_bytes: DEFAULT_MAX_HEADER_BYTES,
+            plaintext_hosts: PlaintextHosts::default(),
         }
     }
 }
@@ -1192,11 +1323,21 @@ impl BufferedHttpClient {
             self.resolved.insert(authority.clone(), addresses.clone());
             addresses
         };
-        let all_loopback = addresses.iter().all(|address| address.ip().is_loopback());
-        if url.scheme() == "http" && !all_loopback {
+        // The list is named in the refusal because the destination is otherwise reachable — the
+        // grant already allowed it — and the only thing between the operator and a working
+        // request is one line in their own file.
+        if !plaintext_permitted(
+            url.scheme(),
+            &host,
+            &addresses,
+            &self.ceilings.plaintext_hosts,
+        ) {
             return Err(http_error(
                 ErrorCode::Denied,
-                "plaintext HTTP is restricted to loopback destinations",
+                format!(
+                    "plaintext HTTP to {host} is refused: not a loopback destination, and not \
+                     listed in the broker's http.plaintextHosts"
+                ),
             ));
         }
         if url.scheme() == "https"
@@ -1477,6 +1618,24 @@ fn canonical_authority(host: &str, port: u16) -> String {
     format!("{}:{port}", canonical_host(host))
 }
 
+/// Whether this request may cross the network in the clear.
+///
+/// `https` is never this rule's business. `http` reaches a loopback destination — *every* resolved
+/// address, so a name that answers with one loopback address and one routable address is refused —
+/// or an exact hostname the broker owner listed. The listed host is matched by name and not by the
+/// addresses it resolved to, which is the whole point: `rpi.lan` answers with a LAN address that
+/// no address rule could distinguish from an address a DNS answer chose for itself.
+fn plaintext_permitted(
+    scheme: &str,
+    host: &str,
+    addresses: &[SocketAddr],
+    allowed: &PlaintextHosts,
+) -> bool {
+    scheme != "http"
+        || addresses.iter().all(|address| address.ip().is_loopback())
+        || allowed.contains(host)
+}
+
 fn authority_matches(allowed: &str, host: &str, port: u16, scheme: &str) -> bool {
     let allowed = allowed.trim().to_ascii_lowercase();
     allowed == canonical_authority(host, port)
@@ -1683,9 +1842,9 @@ mod tests {
 
     use super::{
         BoundCredential, BufferedHttpClient, ConfigurationError, ErrorCode, Header,
-        HttpCallEvidence, HttpHostCeilings, MAX_RESOLVED_ADDRESSES, MIN_CREDENTIAL_BYTES, Request,
-        authority_matches, bounded_addresses, bounded_message, is_forbidden_public_destination,
-        map_reqwest_error,
+        HttpCallEvidence, HttpHostCeilings, MAX_RESOLVED_ADDRESSES, MIN_CREDENTIAL_BYTES,
+        PlaintextHostError, PlaintextHosts, Request, authority_matches, bounded_addresses,
+        bounded_message, is_forbidden_public_destination, map_reqwest_error, plaintext_permitted,
     };
 
     fn grant(authority: String, method: &str) -> HttpConstraints {
@@ -1697,6 +1856,173 @@ mod tests {
             max_response_bytes: 64 * 1024,
             allow_plaintext_loopback: true,
         }
+    }
+
+    fn address(ip: &str, port: u16) -> SocketAddr {
+        SocketAddr::new(ip.parse().expect("valid fixture address"), port)
+    }
+
+    fn plaintext_hosts(entries: &[&str]) -> PlaintextHosts {
+        PlaintextHosts::new(entries).expect("valid fixture host list")
+    }
+
+    #[test]
+    fn plaintext_reaches_loopback_with_an_empty_allow_list() {
+        // The default set is empty, and an empty set must leave today's rule exactly as it was.
+        let empty = PlaintextHosts::default();
+        assert!(empty.is_empty());
+        assert!(plaintext_permitted(
+            "http",
+            "localhost",
+            &[address("127.0.0.1", 8080)],
+            &empty
+        ));
+        assert!(plaintext_permitted(
+            "http",
+            "::1",
+            &[address("::1", 8080)],
+            &empty
+        ));
+        assert!(!plaintext_permitted(
+            "http",
+            "rpi.lan",
+            &[address("192.168.1.20", 5080)],
+            &empty
+        ));
+    }
+
+    #[test]
+    fn plaintext_reaches_a_listed_host_and_nothing_else() {
+        let allowed = plaintext_hosts(&["rpi.lan", "openobserve.openobserve.svc"]);
+        assert!(plaintext_permitted(
+            "http",
+            "rpi.lan",
+            &[address("192.168.1.20", 5080)],
+            &allowed
+        ));
+        assert!(plaintext_permitted(
+            "http",
+            "openobserve.openobserve.svc",
+            &[address("10.43.7.9", 5080)],
+            &allowed
+        ));
+        // A neighbour of a listed host is not a listed host: the entries are exact, so nothing
+        // about `rpi.lan` says anything about `evil.rpi.lan` or about the bare suffix.
+        for refused in ["evil.rpi.lan", "rpi.lan.evil.test", "lan", "rpi"] {
+            assert!(
+                !plaintext_permitted("http", refused, &[address("192.168.1.20", 5080)], &allowed),
+                "{refused} is not listed"
+            );
+        }
+    }
+
+    #[test]
+    fn listed_plaintext_hosts_match_case_insensitively() {
+        // DNS names are case-insensitive, and the host this rule compares was lowercased out of
+        // the guest's URL; an entry authored in mixed case must not become a silent deny.
+        let allowed = plaintext_hosts(&["RPi.LAN"]);
+        assert!(plaintext_permitted(
+            "http",
+            "rpi.lan",
+            &[address("192.168.1.20", 5080)],
+            &allowed
+        ));
+        assert!(allowed.contains("RPI.LAN"));
+        assert_eq!(allowed.iter().collect::<Vec<_>>(), vec!["rpi.lan"]);
+    }
+
+    #[test]
+    fn a_listed_host_does_not_relax_https_or_mixed_loopback_answers() {
+        let allowed = plaintext_hosts(&["rpi.lan"]);
+        // HTTPS never consults this rule, listed or not.
+        assert!(plaintext_permitted(
+            "https",
+            "api.example.test",
+            &[address("93.184.216.34", 443)],
+            &allowed
+        ));
+        // An unlisted name that answers with a loopback address *and* a routable one stays
+        // refused: the loopback branch is all-or-nothing, and the list is the only other way in.
+        assert!(!plaintext_permitted(
+            "http",
+            "split.example.test",
+            &[address("127.0.0.1", 80), address("93.184.216.34", 80)],
+            &allowed
+        ));
+    }
+
+    #[test]
+    fn plaintext_host_entries_must_be_bare_hostnames() {
+        // Each of these is a plausible thing to write in broker.yaml, and each would otherwise
+        // become a host the operator believes is allowed and that never matches anything.
+        for (entry, expected) in [
+            ("", PlaintextHostError::Empty),
+            ("   ", PlaintextHostError::Empty),
+            (
+                "http://rpi.lan",
+                PlaintextHostError::Scheme {
+                    entry: "http://rpi.lan".to_owned(),
+                },
+            ),
+            (
+                "rpi.lan/ingest",
+                PlaintextHostError::Path {
+                    entry: "rpi.lan/ingest".to_owned(),
+                },
+            ),
+            (
+                "rpi.lan:5080",
+                PlaintextHostError::Port {
+                    entry: "rpi.lan:5080".to_owned(),
+                },
+            ),
+            (
+                "::1",
+                PlaintextHostError::Port {
+                    entry: "::1".to_owned(),
+                },
+            ),
+            (
+                "*.lan",
+                PlaintextHostError::Wildcard {
+                    entry: "*.lan".to_owned(),
+                },
+            ),
+            (
+                "rpi lan",
+                PlaintextHostError::InvalidHost {
+                    entry: "rpi lan".to_owned(),
+                },
+            ),
+            (
+                "user@rpi.lan",
+                PlaintextHostError::InvalidHost {
+                    entry: "user@rpi.lan".to_owned(),
+                },
+            ),
+            (
+                ".rpi.lan",
+                PlaintextHostError::InvalidHost {
+                    entry: ".rpi.lan".to_owned(),
+                },
+            ),
+            (
+                "rpi.lan.",
+                PlaintextHostError::InvalidHost {
+                    entry: "rpi.lan.".to_owned(),
+                },
+            ),
+        ] {
+            let error = PlaintextHosts::new([entry]).expect_err("{entry} must be refused");
+            assert_eq!(error, expected, "{entry}");
+        }
+        // One bad entry refuses the whole list rather than being dropped from it.
+        PlaintextHosts::new(["rpi.lan", "http://other.lan"])
+            .expect_err("a single invalid entry must refuse the list");
+        // Surrounding whitespace is authored noise, not a different hostname.
+        assert!(plaintext_hosts(&["  rpi.lan  "]).contains("rpi.lan"));
+        // A bare IPv4 literal is a host the same way `allowedHosts` treats one.
+        assert!(plaintext_hosts(&["192.168.1.20"]).contains("192.168.1.20"));
     }
 
     #[test]
@@ -1915,6 +2241,58 @@ mod tests {
         assert_eq!(evidence.len(), 1);
         assert_eq!(evidence[0].authority, authority);
         server.join();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_listed_plaintext_host_still_needs_the_authorization_to_allow_it() {
+        // The opt-out reaches nothing on its own. Both refusals below happen before the
+        // destination is even resolved, which is the order that makes the list a relaxation of one
+        // transport rule rather than a second way to authorize a host.
+        let ceilings = HttpHostCeilings {
+            plaintext_hosts: plaintext_hosts(&["api.example.test"]),
+            ..HttpHostCeilings::default()
+        };
+        let mut client = BufferedHttpClient::authorized(
+            HttpConstraints {
+                allow_plaintext_loopback: false,
+                ..grant("api.example.test:80".to_owned(), "GET")
+            },
+            ceilings.clone(),
+            Duration::from_secs(1),
+        )
+        .expect("valid fixture authorization");
+        let error = client
+            .send(Request {
+                method: "GET".to_owned(),
+                uri: "http://api.example.test/".to_owned(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+            .await
+            .expect_err("a constraint set that forbids plaintext still forbids it");
+        assert_eq!(error.code, ErrorCode::Denied);
+        assert_eq!(error.message, "plaintext HTTP is not authorized");
+
+        let mut client = BufferedHttpClient::authorized(
+            grant("other.example.test:80".to_owned(), "GET"),
+            ceilings,
+            Duration::from_secs(1),
+        )
+        .expect("valid fixture authorization");
+        let error = client
+            .send(Request {
+                method: "GET".to_owned(),
+                uri: "http://api.example.test/".to_owned(),
+                headers: Vec::new(),
+                body: Vec::new(),
+            })
+            .await
+            .expect_err("a listed host the grant does not name is still not a destination");
+        assert_eq!(error.code, ErrorCode::Denied);
+        assert_eq!(
+            error.message,
+            "HTTP destination is not authorized for this invocation"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

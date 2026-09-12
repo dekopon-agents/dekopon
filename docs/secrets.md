@@ -36,6 +36,27 @@ host rejects a response containing the raw secret or complete rendered Authoriza
 endpoint can transform or semantically encode it; destination trust and narrow upstream credentials
 remain part of the boundary, and [`design.md`](design.md#non-goals) rules out defending that case.
 
+Plaintext is the one part of destination trust the broker does enforce for itself. The native HTTP
+host refuses `http://` to anything but a loopback destination, because a credential injected into a
+request that crosses a network in the clear is a credential on that network, and that is goal 1's
+whole subject. A broker owner who runs a service that speaks only plaintext on a network they
+control names that exact host in `broker.yaml`:
+
+```yaml
+http:
+  plaintextHosts:
+    - rpi.lan
+    - openobserve.openobserve.svc
+```
+
+Entries are exact hostnames matched case-insensitively: no wildcards, no ports — the rule is about
+the scheme rather than the socket — and no scheme or path. The list is validated at startup, so an
+entry that could never match a host refuses the broker instead of denying a request weeks later,
+and it is logged once at INFO so the trace log carries the decision. It reaches nothing on its own:
+the capability's constraint set still has to name the destination in `allowedHosts` and still has
+to set `allowPlaintextLoopback`, which keeps its name and now reads as "this capability may use
+plaintext wherever the broker permits it". Empty, the default, is exactly the loopback-only rule.
+
 ## Public DRNs
 
 The canonical grammar is:

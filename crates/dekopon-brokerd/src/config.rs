@@ -11,6 +11,7 @@ use dekopon_broker::{
 };
 use dekopon_broker_host::{
     BrokerHostLimits, BrokerHostOptions, DEFAULT_MAX_TOTAL_MEMORY_BYTES, LockedProviderSource,
+    PlaintextHostError, PlaintextHosts,
 };
 use dekopon_broker_protocol::{
     DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, ProtocolError,
@@ -106,6 +107,9 @@ pub struct BrokerdConfig {
     /// policy, and refuses to start if policy could ever permit it.
     #[serde(default)]
     pub constraint_sets: BTreeMap<CapabilityId, ConstraintSet>,
+    /// Broker-owner decisions about the native HTTP host's transport rules.
+    #[serde(default)]
+    pub http: HttpConfig,
     #[serde(default)]
     pub host_limits: HostLimitsConfig,
     #[serde(default)]
@@ -121,6 +125,24 @@ pub struct BrokerdConfig {
     /// Optional OTLP export. Absent means the broker exports no telemetry.
     #[serde(default)]
     pub telemetry: Option<TelemetryConfig>,
+}
+
+/// Broker-level HTTP transport settings the native host enforces for every provider.
+///
+/// Separate from a constraint set on purpose: "this hostname may be spoken to in the clear" is a
+/// fact about the network the broker runs on, not about one capability, and an owner who had to
+/// repeat it per constraint set would eventually forget one and widen the wrong thing.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields, rename_all = "camelCase")]
+pub struct HttpConfig {
+    /// Exact hostnames plaintext `http://` is permitted to, besides loopback.
+    ///
+    /// Empty — the default — keeps the loopback-only rule. Entries are exact hostnames matched
+    /// case-insensitively: no wildcards, no ports, no schemes, no paths. A listed host still has
+    /// to be named by the constraint set's `allowedHosts` and still needs its
+    /// `allowPlaintextLoopback`; this only decides whether the native host will speak plaintext
+    /// to it once the authorization already allows the destination.
+    pub plaintext_hosts: Vec<String>,
 }
 
 /// Paths for one generated provider lock and its immutable blob store.
@@ -344,6 +366,8 @@ pub struct ResolvedConfig {
     pub constraint_sets: BTreeMap<CapabilityId, ConstraintSet>,
     pub host_limits: BrokerHostLimits,
     pub host_options: BrokerHostOptions,
+    /// Hostnames the owner opted out of the loopback-only plaintext rule, logged once at startup.
+    pub plaintext_hosts: PlaintextHosts,
     /// Worst-case concurrent guest memory: `maxConnections` times `maxMemoryBytes`.
     pub worst_case_guest_memory_bytes: usize,
     pub broker_limits: BrokerLimits,
@@ -732,6 +756,11 @@ async fn resolve(
         return Err(ConfigError::InvalidServerLimits);
     }
     let frame_limits = config.server_limits.frame_limits()?;
+    // Validated here rather than at the first refused request: an entry with a port or a scheme in
+    // it is a host the operator believes they allowed, and a broker that starts with one is a
+    // broker that will deny a request the operator is sure they permitted.
+    let plaintext_hosts = PlaintextHosts::new(&config.http.plaintext_hosts)
+        .map_err(|source| ConfigError::InvalidPlaintextHost { source })?;
     let host_limits = config.host_limits.runtime();
     if host_limits.max_timeout.is_zero() {
         return Err(ConfigError::InvalidHostLimits);
@@ -827,7 +856,9 @@ async fn resolve(
         host_options: BrokerHostOptions {
             compile_cache_dir: compile_cache_path,
             max_total_memory_bytes: config.host_limits.max_total_memory_bytes,
+            plaintext_hosts: plaintext_hosts.clone(),
         },
+        plaintext_hosts,
         worst_case_guest_memory_bytes,
         broker_limits: config.broker_limits,
         server_limits: config.server_limits,
@@ -945,6 +976,13 @@ pub enum ConfigError {
     },
     #[error("host timeout must be positive")]
     InvalidHostLimits,
+    /// An `http.plaintextHosts` entry was not a bare hostname.
+    #[error("http.plaintextHosts is invalid: {source}")]
+    InvalidPlaintextHost {
+        /// Which entry was refused and why.
+        #[source]
+        source: PlaintextHostError,
+    },
     #[error("could not safely resolve a configured provider storage path")]
     StoragePath {
         /// The offending path and the reason it was refused.
