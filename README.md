@@ -71,12 +71,12 @@ From there, [`examples/conditional-write`](examples/conditional-write/README.md)
 Three provenance-attested archives — macOS on ARM64, and Linux on ARM64 and x86-64 — are attached to each [GitHub release](https://github.com/dekopon-agents/dekopon/releases). Each carries the daemon executables, the example component, and the broker and gateway configuration contracts, with a `.sha256` sidecar beside it:
 
 ```console
-gh release download v0.12.0 --repo dekopon-agents/dekopon \
-  --pattern 'dekopon-0.12.0-aarch64-apple-darwin.tar.gz*'
-shasum -a 256 -c dekopon-0.12.0-aarch64-apple-darwin.tar.gz.sha256
+gh release download v0.13.0 --repo dekopon-agents/dekopon \
+  --pattern 'dekopon-0.13.0-aarch64-apple-darwin.tar.gz*'
+shasum -a 256 -c dekopon-0.13.0-aarch64-apple-darwin.tar.gz.sha256
 gh attestation verify --repo dekopon-agents/dekopon \
-  dekopon-0.12.0-aarch64-apple-darwin.tar.gz
-tar xzf dekopon-0.12.0-aarch64-apple-darwin.tar.gz
+  dekopon-0.13.0-aarch64-apple-darwin.tar.gz
+tar xzf dekopon-0.13.0-aarch64-apple-darwin.tar.gz
 ```
 
 ### crates.io
