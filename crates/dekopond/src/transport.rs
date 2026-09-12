@@ -374,38 +374,16 @@ impl OutboundReply {
 }
 
 /// The answering half of a transport, shared by every in-flight session on it.
+///
+/// `Ok` means one complete bounded answer — every chunk and every attachment — reached
+/// service or kernel acceptance. It does not claim human receipt. A reply that arrived in
+/// part is [`TransportError::PartialDelivery`], not success.
 pub(crate) trait ChatReplier: Send + Sync {
     fn reply(
         &self,
         target: ReplyTarget,
         reply: OutboundReply,
-    ) -> BoxFuture<'_, Result<DeliveryReceipt, TransportError>>;
-}
-
-/// Opaque proof that one complete bounded answer reached service/kernel transport acceptance.
-///
-/// It is intentionally non-serializable and fully redacted. It does not claim human receipt.
-pub(crate) struct DeliveryReceipt {
-    acceptance: String,
-}
-
-impl DeliveryReceipt {
-    pub(crate) fn new(acceptance: impl Into<String>) -> Self {
-        Self {
-            acceptance: acceptance.into(),
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn accepted(&self) -> bool {
-        !self.acceptance.is_empty()
-    }
-}
-
-impl std::fmt::Debug for DeliveryReceipt {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("DeliveryReceipt([REDACTED])")
-    }
+    ) -> BoxFuture<'_, Result<(), TransportError>>;
 }
 
 /// Resolves an attachment reference back into the bytes a model can look at.

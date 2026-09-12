@@ -251,8 +251,8 @@ reply. Filenames are gateway-owned and carry the attachment's position, so two f
 not arrive under one name. WhatsApp has no path here — the Cloud API transport is text-only, and
 sending an image through it would need Meta's separate media upload — so a route that names
 `providerAttachments` on a `whatsappCloudApi` transport is a startup failure. Discovering that at
-reply time would mean authorizing and paying for a PNG and then dropping it. `DeliveryReceipt` covers
-the complete text/attachment reply. If Slack, Telegram, or a split Discord reply accepts only part,
+reply time would mean authorizing and paying for a PNG and then dropping it. A successful `reply`
+covers the complete text/attachment reply. If Slack, Telegram, or a split Discord reply accepts only part,
 the session is `reply-failed` and performs no durable record. Persistent history remembers only final
 text; referring to prior pixels requires a fresh invocation.
 
