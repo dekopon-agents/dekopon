@@ -605,6 +605,11 @@ All notable changes to Dekopon are documented here. The format is based on
   way its platform blocks already derive from `OFFERED`; the header sentence says one archive
   carries every executable, so no count ages there at all, and a count with no spelled word is
   a hard error rather than a digit pushed to the tap.
+- An OCI provider manifest whose layer descriptor carries a negative `size` is refused with the
+  size the registry actually sent. `u64::try_from` fails on a negative value and the arm that
+  caught it printed a hardcoded "provider component is 0 bytes" — the one number the descriptor
+  did not contain, pointing an operator at an empty-artifact push instead of the malformed
+  manifest in front of them. The refusal itself is unchanged.
 
 ### Security
 
