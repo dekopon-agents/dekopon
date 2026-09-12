@@ -38,7 +38,7 @@
 //!
 //! # Context
 //!
-//! Capability actions carry `{ via?, subject?, agent?, effect, risk, idempotency }`;
+//! Capability actions carry `{ via?, subject?, agent?, effect, risk }`;
 //! `agent.prompt` carries routing fields only. `secret.use` adds exact capability/provider/sink
 //! fields beside the authenticated routing context. The public DRN is strongly typed untrusted
 //! proposal data and remains inert without an owner binding; message content and arbitrary provider
@@ -47,7 +47,7 @@
 //! ```
 //! use dekopon_core::{CapabilityId, PrincipalId, ProviderId};
 //! use dekopon_policy::{PolicyContext, PolicyEngine, PolicyRequest, PolicyTarget, PolicyWorld};
-//! use dekopon_capability::{EffectKind, Idempotency};
+//! use dekopon_capability::EffectKind;
 //! use dekopon_core::RiskLevel;
 //!
 //! let world = PolicyWorld::new(
@@ -70,7 +70,6 @@
 //!         provider: "echo".parse()?,
 //!         effect: EffectKind::ReadOnly,
 //!         risk: RiskLevel::Low,
-//!         idempotency: Idempotency::Idempotent,
 //!     },
 //!     context: PolicyContext::default(),
 //! });
@@ -90,7 +89,7 @@ use cedar_policy::{
     Authorizer, Context, Decision, Entities, Entity, EntityId, EntityTypeName, EntityUid, PolicyId,
     PolicySet, RestrictedExpression, Schema, ValidationMode, Validator,
 };
-use dekopon_capability::{EffectKind, Idempotency};
+use dekopon_capability::EffectKind;
 use dekopon_core::{
     AgentId, CapabilityId, IdentifierError, PrincipalId, ProviderId, RiskLevel, SecretDrn,
     SecretSinkKind,
@@ -281,7 +280,7 @@ impl PolicyWorld {
         };
 
         let entity_shape = json!({ "shape": { "type": "Record", "attributes": {} } });
-        let capability_context = context(&["effect", "risk", "idempotency"]);
+        let capability_context = context(&["effect", "risk"]);
         let prompt_context = context(&[]);
         // Named rather than folded in with the rest because this trio is goal 1's exact-binding
         // gate: a `secret.use` policy names the capability, provider and sink a credential may be
@@ -368,8 +367,6 @@ pub enum PolicyTarget {
         effect: EffectKind,
         /// Trusted risk classification, rendered into `context.risk`.
         risk: RiskLevel,
-        /// Trusted retry classification, rendered into `context.idempotency`.
-        idempotency: Idempotency,
     },
     /// Permission for the principal to drive one agent's session at all.
     AgentPrompt {
@@ -749,7 +746,6 @@ impl PolicyEngine {
                 provider,
                 effect,
                 risk,
-                idempotency,
                 ..
             } => (
                 entity_uid(&self.entity_types.provider, provider.as_str()),
@@ -761,10 +757,6 @@ impl PolicyEngine {
                     (
                         "risk".to_owned(),
                         RestrictedExpression::new_string(risk.to_string()),
-                    ),
-                    (
-                        "idempotency".to_owned(),
-                        RestrictedExpression::new_string(idempotency.to_string()),
                     ),
                 ],
             ),

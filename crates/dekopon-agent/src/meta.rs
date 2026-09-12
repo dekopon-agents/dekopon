@@ -18,7 +18,7 @@ pub const MAX_AGENT_CONFIG_TOOL_BYTES: usize = 128 * 1024;
 
 /// Trusted effective metadata for one capability Cedar currently exposes to this session.
 ///
-/// The broker overwrites effect, risk, and idempotency from the owner-authored constraint set
+/// The broker overwrites effect and risk from the owner-authored constraint set
 /// before returning its capability snapshot. Provider input schemas stay discoverable through
 /// `cap --describe` and are omitted here to keep introspection compact.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -34,8 +34,6 @@ pub struct EffectiveCapabilityView {
     pub effect: String,
     /// Trusted risk classification.
     pub risk: String,
-    /// Trusted retry classification.
-    pub idempotency: String,
 }
 
 /// Effective audience of a persistent replay window.
@@ -247,7 +245,6 @@ mod tests {
                 description: "Reads one pull request".to_owned(),
                 effect: "read-only".to_owned(),
                 risk: "Low".to_owned(),
-                idempotency: "idempotent".to_owned(),
             }],
         )
     }

@@ -10,8 +10,8 @@
 
 use dekopon_provider_sdk::clap::{self, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use dekopon_provider_sdk::{
-    CapabilityId, CommandInvocation, CommandRun, EffectKind, Idempotency, Provider,
-    ProviderApiVersion, ProviderCapability, ProviderError, ProviderManifest, RiskLevel, cli,
+    CapabilityId, CommandInvocation, CommandRun, EffectKind, Provider, ProviderApiVersion,
+    ProviderCapability, ProviderError, ProviderManifest, RiskLevel, cli,
 };
 use serde_json::{Value, json};
 
@@ -126,7 +126,6 @@ impl Provider for CliProbe {
                         description: description.to_owned(),
                         effect: EffectKind::ReadOnly,
                         risk: RiskLevel::Low,
-                        idempotency: Idempotency::Idempotent,
                         input_schema: json!({
                             "type": "object",
                             "required": ["text"],

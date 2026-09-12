@@ -45,9 +45,8 @@ The reusable agent session layer consumed by `dekopond` and external embeddings 
   takes an optional `Attestation`: `None` speaks as the connected peer, and a claim
   proposes on behalf of a transport-authenticated external subject, which the broker
   honors only under an owner-configured attestor grant. Its fresh capability
-  snapshot also supplies trusted effect, risk, and idempotency metadata for self-inspection,
-  never policy source, identity, constraints, or credentials. *Committed direction:* removed
-  ([non-goals](../../docs/design.md#non-goals)). Each provider command word
+  snapshot also supplies trusted effect and risk metadata for self-inspection,
+  never policy source, identity, constraints, or credentials. Each provider command word
   it runs is one cancellable `broker-command` process node around the `runCommand` round
   trip; `BrokerLeg::with_cancel_signal` ties those runs to an embedder's cancellation (the
   gateway's Stop), and without it they are cancellable in contract only. A transport

@@ -51,8 +51,8 @@ Decided 2026-09-06 and 2026-09-10. An argument for keeping or adding code on any
 grounds is rejected on sight.
 
 - **Idempotency, exactly-once, duplicate-effect defense, automatic retries.** If a call fails
-  the model re-assesses and retries. *Committed direction:* the `idempotency` capability field
-  is removed.
+  the model re-assesses and retries. The `idempotency` capability classification is gone: manifest
+  field, constraint set, Cedar context, and audit record.
 - **Crash durability, reconcilable state, audit tamper-detection.** Audit is one structured log
   record per broker decision, `broker.decision` or `broker.execution`, emitted inside the trace:
   stdout JSON always, OTLP logs when `telemetry` is configured. There is no on-disk audit sink;

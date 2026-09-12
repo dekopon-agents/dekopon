@@ -20,7 +20,7 @@
 
 use std::fmt;
 
-pub use dekopon_capability::{EffectKind, Idempotency};
+pub use dekopon_capability::EffectKind;
 pub use dekopon_core::{CapabilityId, ProviderId, RiskLevel};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -73,7 +73,7 @@ pub struct ProviderManifest {
 
 /// One prompt-visible capability exported by a provider component.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", from = "CompatCapability")]
 pub struct ProviderCapability {
     /// Stable capability identity.
     pub id: CapabilityId,
@@ -83,10 +83,45 @@ pub struct ProviderCapability {
     pub effect: EffectKind,
     /// Coarse risk classification available to callers.
     pub risk: RiskLevel,
-    /// Declared retry behavior.
-    pub idempotency: Idempotency,
     /// Object-shaped JSON Schema supplied to a model as function parameters.
     pub input_schema: Value,
+}
+
+/// The manifest shape a host decodes, which is the current one plus the retired `idempotency`
+/// string.
+///
+/// Every component released before the classification was deleted emits `idempotency`, and a
+/// component is a signed artifact rather than a source file an upgrade can edit: decoding
+/// [`ProviderCapability`] through this type is what keeps those artifacts loading for one release
+/// instead of failing at `describe`. The value is read and dropped — nothing in the tree acts on
+/// it. Every other unknown field is still refused, because `deny_unknown_fields` lives here now.
+/// Delete this type and the `from` attribute above in the release after the one that removes the
+/// field.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CompatCapability {
+    id: CapabilityId,
+    description: String,
+    effect: EffectKind,
+    risk: RiskLevel,
+    #[serde(default)]
+    idempotency: Option<serde::de::IgnoredAny>,
+    input_schema: Value,
+}
+
+impl From<CompatCapability> for ProviderCapability {
+    fn from(value: CompatCapability) -> Self {
+        // Read once and discarded. The field exists so `deny_unknown_fields` accepts a component
+        // released before the classification was deleted; no decision anywhere consults it.
+        let _retired: Option<serde::de::IgnoredAny> = value.idempotency;
+        Self {
+            id: value.id,
+            description: value.description,
+            effect: value.effect,
+            risk: value.risk,
+            input_schema: value.input_schema,
+        }
+    }
 }
 
 /// Rust implementation contract for a provider component.
@@ -588,8 +623,8 @@ mod tests {
     use super::{
         __describe, __invoke, __run_command, CapabilityId, CommandInvocation, CommandResolution,
         CommandRun, CommandRunOutcome, ComponentFailure, ComponentResponse, EffectKind,
-        INVOKE_SERIALIZATION_FALLBACK, Idempotency, Provider, ProviderApiVersion,
-        ProviderCapability, ProviderError, ProviderManifest, RESOLVE_SERIALIZATION_FALLBACK,
+        INVOKE_SERIALIZATION_FALLBACK, Provider, ProviderApiVersion, ProviderCapability,
+        ProviderError, ProviderManifest, RESOLVE_SERIALIZATION_FALLBACK,
         RUN_SERIALIZATION_FALLBACK, RiskLevel, describe_fallback,
     };
 
@@ -607,7 +642,6 @@ mod tests {
                     description: "Echoes input".to_owned(),
                     effect: EffectKind::ReadOnly,
                     risk: RiskLevel::Low,
-                    idempotency: Idempotency::Idempotent,
                     input_schema: json!({"type": "object"}),
                 }],
             }
@@ -683,6 +717,56 @@ mod tests {
         let manifest: ProviderManifest =
             serde_json::from_str(&__describe::<Echo>()).expect("manifest parses");
         assert_eq!(manifest.id.as_str(), "echo");
+    }
+
+    /// A component built before the classification was deleted still describes itself.
+    ///
+    /// This is the whole reason [`CompatCapability`] exists: the `.wasm` is a signed artifact an
+    /// upgrade cannot edit, so the field is read and dropped for one release. The pinned
+    /// out-of-tree fixtures CI fetches exercise the same path end to end.
+    #[test]
+    fn a_manifest_carrying_the_retired_idempotency_field_decodes_without_it() {
+        let capability: ProviderCapability = serde_json::from_value(json!({
+            "id": "echo.echo",
+            "description": "Echoes input",
+            "effect": "read-only",
+            "risk": "Low",
+            "idempotency": "idempotent",
+            "inputSchema": {"type": "object"},
+        }))
+        .expect("a component released before the removal still loads");
+
+        assert_eq!(capability.effect, EffectKind::ReadOnly);
+        assert_eq!(capability.risk, RiskLevel::Low);
+        assert!(
+            !serde_json::to_value(&capability)
+                .expect("capability serializes")
+                .as_object()
+                .expect("a capability is an object")
+                .contains_key("idempotency"),
+            "the retired field must not survive a decode/encode round trip"
+        );
+    }
+
+    /// One retired field is accepted; nothing else is. The refusal names the field.
+    #[test]
+    fn a_manifest_carrying_any_other_unknown_field_is_still_refused() {
+        for unknown in ["retries", "idempotencyKey"] {
+            let error = serde_json::from_value::<ProviderCapability>(json!({
+                "id": "echo.echo",
+                "description": "Echoes input",
+                "effect": "read-only",
+                "risk": "Low",
+                unknown: "whatever",
+                "inputSchema": {"type": "object"},
+            }))
+            .expect_err("an unknown manifest field must be refused");
+
+            assert!(
+                error.to_string().contains(unknown),
+                "the refusal must name {unknown}, got {error}"
+            );
+        }
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use dekopon_provider_sdk::{
-    CapabilityId, CommandInvocation, EffectKind, Idempotency, Provider, ProviderApiVersion,
-    ProviderCapability, ProviderError, ProviderManifest, RiskLevel,
+    CapabilityId, CommandInvocation, EffectKind, Provider, ProviderApiVersion, ProviderCapability,
+    ProviderError, ProviderManifest, RiskLevel,
 };
 use serde_json::{Value, json};
 
@@ -30,7 +30,6 @@ impl Provider for HistoricalCommandProvider {
                 description: "Returns its bounded object unchanged".to_owned(),
                 effect: EffectKind::ReadOnly,
                 risk: RiskLevel::Low,
-                idempotency: Idempotency::Idempotent,
                 input_schema: json!({"type":"object","additionalProperties":true}),
             }],
         }

@@ -684,7 +684,6 @@ fn snapshot(
             description: available.capability.description.clone(),
             effect: available.capability.effect.to_string(),
             risk: available.capability.risk.to_string(),
-            idempotency: available.capability.idempotency.to_string(),
         });
         descriptions.insert(
             id.clone(),
@@ -1571,7 +1570,6 @@ mod tests {
                     description: "Fetches one broker-authorized URI".to_owned(),
                     effect: "read-only".to_owned(),
                     risk: "Low".to_owned(),
-                    idempotency: "idempotent".to_owned(),
                 }],
                 command_words: BTreeSet::new(),
                 namespaces,
@@ -2085,7 +2083,6 @@ mod tests {
                     "description": "Fetches one broker-authorized URI",
                     "effect": "read-only",
                     "risk": "Low",
-                    "idempotency": "idempotent",
                     "inputSchema": {"type": "object"}
                 }
             }))

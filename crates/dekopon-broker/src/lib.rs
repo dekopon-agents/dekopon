@@ -47,8 +47,8 @@ pub use dekopon_broker_protocol::{
 };
 use dekopon_capability::{
     AuthorizationError, DecisionReference, EffectKind, Evidence, ExecutionConstraints,
-    HttpConstraintsError, Idempotency, InvocationOutcome, InvocationResult, ProposedInvocation,
-    SecretUseGrant, StorageAccess, StorageInterface, StorageNamespace, broker::AuthorizationGate,
+    HttpConstraintsError, InvocationOutcome, InvocationResult, ProposedInvocation, SecretUseGrant,
+    StorageAccess, StorageInterface, StorageNamespace, broker::AuthorizationGate,
 };
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
@@ -541,8 +541,6 @@ pub struct ConstraintSet {
     pub effect: EffectKind,
     /// Trusted risk classification, which must match the loaded manifest byte for byte.
     pub risk: RiskLevel,
-    /// Trusted retry classification, which must match the loaded manifest byte for byte.
-    pub idempotency: Idempotency,
     /// Symbolic name of the broker-held credential presented for this capability's HTTP calls.
     ///
     /// Binding is per capability rather than per provider on purpose: the confused-deputy scenario
@@ -1589,7 +1587,6 @@ fn validate_trusted_metadata(
     for (field, matches) in [
         ("effect", set.effect == capability.effect),
         ("risk", set.risk == capability.risk),
-        ("idempotency", set.idempotency == capability.idempotency),
     ] {
         if !matches {
             return Err(BrokerBuildError::CapabilityMetadataMismatch {
@@ -1825,7 +1822,7 @@ pub enum BrokerBuildError {
         /// Loaded route provider.
         actual: ProviderId,
     },
-    /// Trusted effect/risk/idempotency did not match the component manifest.
+    /// Trusted effect/risk did not match the component manifest.
     #[error("constraint set metadata {field} does not match loaded capability {capability}")]
     CapabilityMetadataMismatch {
         /// Capability.
@@ -2086,8 +2083,6 @@ pub enum AuditEvent {
         effect: EffectKind,
         /// Trusted risk classification.
         risk: RiskLevel,
-        /// Trusted retry classification.
-        idempotency: Idempotency,
         /// Symbolic name of the credential this invocation selected; absent when it had none.
         ///
         /// The name is owner-authored configuration that already sits in `broker.yaml`, not
@@ -2378,19 +2373,16 @@ where
                 CapabilityRoute::ChatMemoryRecord,
                 EffectKind::LocalWrite,
                 RiskLevel::Medium,
-                Idempotency::Conditional,
             ),
             (
                 CapabilityRoute::ChatMemoryRecent,
                 EffectKind::ReadOnly,
                 RiskLevel::High,
-                Idempotency::Idempotent,
             ),
             (
                 CapabilityRoute::ChatMemorySearch,
                 EffectKind::ReadOnly,
                 RiskLevel::High,
-                Idempotency::Idempotent,
             ),
         ];
         // Every unrouted role at once, and before the shape checks. A deployment upgrading with
@@ -2406,7 +2398,7 @@ where
             return Err(BrokerBuildError::UnroutedChatMemory { roles: unrouted });
         }
         let mut routed = BTreeSet::new();
-        for (route, effect, risk, idempotency) in expected {
+        for (route, effect, risk) in expected {
             let (capability, set) = self
                 .constraints
                 .routed(route)
@@ -2414,7 +2406,6 @@ where
             routed.insert(capability.as_str());
             if set.effect != effect
                 || set.risk != risk
-                || set.idempotency != idempotency
                 || set.credential.is_some()
                 || !set.credential_by_agent.is_empty()
                 || set.constraints.http.is_some()
@@ -2482,7 +2473,6 @@ where
                 provider: set.provider.clone(),
                 effect: set.effect,
                 risk: set.risk,
-                idempotency: set.idempotency,
             },
             context: policy_context(context),
         })
@@ -2706,7 +2696,6 @@ where
                 let mut capability = manifest_capability.clone();
                 capability.effect = set.effect;
                 capability.risk = set.risk;
-                capability.idempotency = set.idempotency;
                 AvailableCapability {
                     provider: set.provider.clone(),
                     capability,
@@ -3082,7 +3071,6 @@ where
         let mut capability = manifest.clone();
         capability.effect = set.effect;
         capability.risk = set.risk;
-        capability.idempotency = set.idempotency;
         Some(AvailableCapability {
             provider: set.provider.clone(),
             capability,
@@ -3141,17 +3129,16 @@ where
             .collect::<BTreeSet<_>>();
         encoded.number("capabilityCount", effective.len() as u128);
         for (capability, set) in effective {
-            encoded.text("capability", capability.as_str());
-            encoded.text("provider", set.provider.as_str());
-            encoded.byte("effect", effect_tag(set.effect));
-            encoded.byte("risk", risk_tag(set.risk));
-            encoded.byte("idempotency", idempotency_tag(set.idempotency));
-            encoded.optional_text("credential", set.credential_for(context.actor()));
-            encode_execution_constraints(&mut encoded, &set.constraints);
             let digest = artifacts
                 .get(&set.provider)
                 .ok_or(BrokerError::MemoryUnavailable)?;
-            encoded.text("providerArtifactSha256", digest);
+            encode_capability_authority(
+                &mut encoded,
+                capability,
+                set,
+                set.credential_for(context.actor()),
+                digest,
+            );
         }
 
         let secret_bindings = self
@@ -4307,12 +4294,26 @@ fn risk_tag(value: RiskLevel) -> u8 {
     }
 }
 
-fn idempotency_tag(value: Idempotency) -> u8 {
-    match value {
-        Idempotency::Idempotent => 0,
-        Idempotency::Conditional => 1,
-        Idempotency::NonIdempotent => 2,
-    }
+/// The authority one capability contributes to a storage namespace generation.
+///
+/// Every field here is a semantic authority input: changing one re-keys retained storage under a
+/// fresh random generation. The set is deliberately small and deliberately complete — which
+/// capability, through which provider component bytes, at which effect and risk, presenting which
+/// symbolic credential, under which execution constraints.
+fn encode_capability_authority(
+    encoded: &mut AuthorityEncoder,
+    capability: &CapabilityId,
+    set: &ConstraintSet,
+    credential: Option<&str>,
+    provider_artifact_sha256: &str,
+) {
+    encoded.text("capability", capability.as_str());
+    encoded.text("provider", set.provider.as_str());
+    encoded.byte("effect", effect_tag(set.effect));
+    encoded.byte("risk", risk_tag(set.risk));
+    encoded.optional_text("credential", credential);
+    encode_execution_constraints(encoded, &set.constraints);
+    encoded.text("providerArtifactSha256", provider_artifact_sha256);
 }
 
 fn encode_execution_constraints(
@@ -4679,7 +4680,6 @@ fn emit_audit_event(event: &AuditEvent) {
             policy_digest,
             effect,
             risk,
-            idempotency,
             credential,
             outcome,
             duration_ms,
@@ -4711,7 +4711,6 @@ fn emit_audit_event(event: &AuditEvent) {
                 secret.sink = secret_sink.as_ref().map(ToString::to_string),
                 effect = ?effect,
                 risk = ?risk,
-                idempotency = ?idempotency,
                 credential = credential.as_deref(),
                 outcome = ?outcome,
                 duration_ms = duration_ms,
@@ -4830,7 +4829,6 @@ fn execution_event(
         policy_digest: (!storage_backed).then(|| policy_digest.to_owned()),
         effect: set.effect,
         risk: set.risk,
-        idempotency: set.idempotency,
         credential: (!storage_backed)
             .then(|| credential.map(str::to_owned))
             .flatten(),

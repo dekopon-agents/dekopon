@@ -59,7 +59,6 @@ constraintSets:
     provider: echo
     effect: read-only
     risk: Low
-    idempotency: idempotent
     constraints:
       timeoutMs: 30000
       maxOutputBytes: 1048576
@@ -74,7 +73,7 @@ permit(principal == Dekopon::Principal::"local-user",
 unless { context has via };
 ```
 
-`effect`, `risk`, and `idempotency` reach a decision as `dekopon-policy`'s
+`effect` and `risk` reach a decision as `dekopon-policy`'s
 [context](../dekopon-policy/README.md#context).
 
 `policiesPath` is read under the configuration's own rules: the path is canonicalized, then opened
@@ -140,7 +139,6 @@ constraintSets:
     provider: gh
     effect: external-write
     risk: High
-    idempotency: conditional
     credential: github-pat
     constraints:
       timeoutMs: 15000
@@ -261,7 +259,6 @@ constraintSets:
     provider: gh
     effect: external-write
     risk: Medium
-    idempotency: non-idempotent
     credential: github-pat                     # every agent that has no entry below
     credentialByAgent:
       nestedset-github: github-pat-scientist-hq
@@ -323,7 +320,6 @@ constraintSets:
     provider: gh
     effect: external-write
     risk: Medium
-    idempotency: conditional
     credential: github-pat
     constraints:
       timeoutMs: 15000
@@ -715,7 +711,6 @@ constraintSets:
     provider: memory-chat
     effect: local-write
     risk: Medium
-    idempotency: conditional
     constraints:
       timeoutMs: 30000
       maxOutputBytes: 131072
@@ -725,7 +720,6 @@ constraintSets:
     provider: memory-chat
     effect: read-only
     risk: High
-    idempotency: idempotent
     constraints:
       timeoutMs: 30000
       maxOutputBytes: 131072
@@ -735,7 +729,6 @@ constraintSets:
     provider: memory-chat
     effect: read-only
     risk: High
-    idempotency: idempotent
     constraints:
       timeoutMs: 30000
       maxOutputBytes: 131072

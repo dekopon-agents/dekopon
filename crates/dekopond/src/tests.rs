@@ -2527,7 +2527,6 @@ fn capability(id: &str) -> AvailableCapability {
             "description": "Echoes its input",
             "effect": "read-only",
             "risk": "Low",
-            "idempotency": "idempotent",
             "inputSchema": {"type": "object"}
         }
     }))

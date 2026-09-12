@@ -1,7 +1,7 @@
 use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt as _, path::Path};
 
 use dekopon_broker::{CapabilityRoute, ConstraintSet};
-use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency};
+use dekopon_capability::{EffectKind, ExecutionConstraints};
 use dekopon_core::{ProviderId, RiskLevel};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
@@ -33,7 +33,6 @@ fn constraint_set() -> serde_json::Value {
             .expect("valid provider fixture"),
         effect: EffectKind::ReadOnly,
         risk: RiskLevel::Low,
-        idempotency: Idempotency::Idempotent,
         credential: None,
         credential_by_agent: BTreeMap::new(),
         constraints: ExecutionConstraints::default(),

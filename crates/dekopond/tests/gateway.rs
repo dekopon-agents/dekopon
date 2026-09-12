@@ -155,13 +155,11 @@ fn broker_config(directory: &Path, uid: u32) -> Value {
         "constraintSets": {
             "echo.echo": {
                 "provider": "echo", "effect": "read-only", "risk": "Low",
-                "idempotency": "idempotent",
                 "constraints": {"timeoutMs": 30_000, "maxOutputBytes": 1_048_576}
             },
             "memory.chat.record": {
                 "route": "chatMemoryRecord",
                 "provider": "memory-chat", "effect": "local-write", "risk": "Medium",
-                "idempotency": "conditional",
                 "constraints": {
                     "timeoutMs": 30_000, "maxOutputBytes": 131_072,
                     "storage": {"interface":"jsonl","access":"read-write","namespace":"chat"}
@@ -170,7 +168,6 @@ fn broker_config(directory: &Path, uid: u32) -> Value {
             "memory.chat.recent": {
                 "route": "chatMemoryRecent",
                 "provider": "memory-chat", "effect": "read-only", "risk": "High",
-                "idempotency": "idempotent",
                 "constraints": {
                     "timeoutMs": 30_000, "maxOutputBytes": 131_072,
                     "storage": {"interface":"jsonl","access":"read-only","namespace":"chat"}
@@ -179,7 +176,6 @@ fn broker_config(directory: &Path, uid: u32) -> Value {
             "memory.chat.search": {
                 "route": "chatMemorySearch",
                 "provider": "memory-chat", "effect": "read-only", "risk": "High",
-                "idempotency": "idempotent",
                 "constraints": {
                     "timeoutMs": 30_000, "maxOutputBytes": 131_072,
                     "storage": {"interface":"jsonl","access":"read-only","namespace":"chat"}

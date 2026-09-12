@@ -193,12 +193,9 @@ component:
 | `http-failed` | the pre-read itself failed, so there is nothing to pin a write to |
 | `invalid-input` | no `uri`, which is refused without any host call at all |
 
-The capability is classified `conditional` rather than `idempotent`, and its constraint set allows
-two requests and two methods: one `GET`, then one `POST` carrying an etag that was true a moment
-ago. A retry against an unchanged record converges; a retry after someone else's edit refuses
-instead of overwriting work nobody read.
-
-*Committed direction:* removed ([non-goals](../../docs/design.md#non-goals)).
+The capability's constraint set allows two requests and two methods: one `GET`, then one `POST`
+carrying an etag that was true a moment ago. A retry against an unchanged record converges; a retry
+after someone else's edit refuses instead of overwriting work nobody read.
 
 ## 7. What the audit record holds
 
@@ -228,7 +225,6 @@ one is the write's, pretty-printed and trimmed to the record's fields and its in
   "policy.digest": "sha256:7c31…",
   "effect": "ExternalWrite",
   "risk": "High",
-  "idempotency": "Conditional",
   "credential": "api-token",
   "outcome": "Succeeded",
   "duration_ms": 812,

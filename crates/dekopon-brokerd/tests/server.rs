@@ -18,9 +18,7 @@ use dekopon_broker_protocol::{
 use dekopon_brokerd::{
     BrokerServer, BrokerdError, CONFIG_API_VERSION, MappedPeer, ServerLimits, current_uid, run,
 };
-use dekopon_capability::{
-    EffectKind, ExecutionConstraints, HttpConstraints, Idempotency, InvocationOutcome,
-};
+use dekopon_capability::{EffectKind, ExecutionConstraints, HttpConstraints, InvocationOutcome};
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
     RiskLevel, SecretUseProposal,
@@ -88,7 +86,6 @@ fn echo_constraint_set() -> ConstraintSet {
             .expect("valid provider fixture"),
         effect: EffectKind::ReadOnly,
         risk: RiskLevel::Low,
-        idempotency: Idempotency::Idempotent,
         credential: None,
         credential_by_agent: BTreeMap::new(),
         constraints: ExecutionConstraints::default(),
@@ -660,7 +657,6 @@ when { context.capability == "http-probe.fetch"
         provider: "http-probe".parse().expect("provider"),
         effect: EffectKind::ReadOnly,
         risk: RiskLevel::Low,
-        idempotency: Idempotency::Idempotent,
         credential: None,
         credential_by_agent: BTreeMap::new(),
         constraints: ExecutionConstraints {

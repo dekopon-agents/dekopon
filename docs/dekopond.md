@@ -177,9 +177,8 @@ render as concise Markdown tables:
   mounted;
 - route step/capability limits and one-shot or persistent conversation bounds, including the effective persistent scope; and
 - the capability metadata in this sender's fresh `capabilities(subject, agent, scope)` result:
-  identifier, selected provider, description, effect, risk, and idempotency, as the provider
-  manifest and the broker's `constraintSets` define them. *Committed direction:* removed
-  ([non-goals](design.md#non-goals)).
+  identifier, selected provider, description, effect, and risk, as the provider manifest and the
+  broker's `constraintSets` define them.
 
 That last section is an **effective Cedar view**, not Cedar source. Raw policy, policy IDs and
 digests, denied or merely declared capabilities, execution constraints, credential bindings,

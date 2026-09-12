@@ -25,7 +25,7 @@ use dekopon_broker_protocol::{
     ResponseEnvelope, read_frame,
 };
 use dekopon_brokerd::{BrokerServer, MappedPeer, ServerLimits, current_uid};
-use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency};
+use dekopon_capability::{EffectKind, ExecutionConstraints};
 use dekopon_core::{
     Actor, AgentId, CapabilityId, InvocationId, PrincipalId, ProviderId, RiskLevel,
 };
@@ -130,7 +130,6 @@ async fn broker(audit_bound: usize) -> Arc<Broker<InMemoryAuditLog>> {
             provider: "echo".parse::<ProviderId>().expect("provider"),
             effect: EffectKind::ReadOnly,
             risk: RiskLevel::Low,
-            idempotency: Idempotency::Idempotent,
             credential: None,
             credential_by_agent: BTreeMap::new(),
             constraints: ExecutionConstraints::default(),

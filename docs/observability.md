@@ -101,7 +101,7 @@ therefore inside the caller's trace. Two events carry the whole record:
 | Event | Level | Emitted by | Carries |
 |---|---|---|---|
 | `broker.decision` | info | `dekopon-broker` | `invocation.id`, `capability.id`, `decision.id`, `decision.allowed`, `decision.reason` on a denial, `principal`, `actor.kind`/`actor.id`, `via`, `subject`, `provider`, `authorized.by`, `policy.revision`, `policy.ids`, `policy.digest`, `secret`/`secret.sink` when a public DRN was proposed, and `storage.scope_commitment`/`storage.evidence` on a storage-routed decision |
-| `broker.execution` | info | `dekopon-broker` | everything `broker.decision` carries except the decision verdict, plus `effect`, `risk`, `idempotency`, `credential` — the symbolic name only — `outcome`, `duration_ms`, `error` and `output.digest` when there is one, and `http.calls`: the sanitized `HttpCallEvidence` array, method, authority, status, accounted bytes, and `credentialInjected` |
+| `broker.execution` | info | `dekopon-broker` | everything `broker.decision` carries except the decision verdict, plus `effect`, `risk`, `credential` — the symbolic name only — `outcome`, `duration_ms`, `error` and `output.digest` when there is one, and `http.calls`: the sanitized `HttpCallEvidence` array, method, authority, status, accounted bytes, and `credentialInjected` |
 
 Both ride the `dekopon_broker::audit` target. An optional field is absent rather than null when the
 record does not carry it: a storage-routed decision names no principal, actor, provider, or policy

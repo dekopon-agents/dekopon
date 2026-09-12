@@ -1,6 +1,6 @@
 use dekopon_provider_sdk::{
-    CapabilityId, CommandInvocation, EffectKind, Idempotency, Provider, ProviderApiVersion,
-    ProviderCapability, ProviderError, ProviderManifest, RiskLevel,
+    CapabilityId, CommandInvocation, EffectKind, Provider, ProviderApiVersion, ProviderCapability,
+    ProviderError, ProviderManifest, RiskLevel,
 };
 use dekopon_provider_storage::durable_files::{
     self as storage, Durability, LockLevel, OpenOptions, StorageError,
@@ -30,7 +30,6 @@ impl Provider for StorageProbe {
                 description: "Runs the durable-file conformance sequence".to_owned(),
                 effect: EffectKind::LocalWrite,
                 risk: RiskLevel::Medium,
-                idempotency: Idempotency::Conditional,
                 input_schema: json!({
                     "type":"object",
                     "properties": {

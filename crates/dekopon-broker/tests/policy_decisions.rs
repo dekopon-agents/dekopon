@@ -17,7 +17,7 @@ use dekopon_broker::{
     IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine, PolicyWorld,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
-use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency, InvocationOutcome};
+use dekopon_capability::{EffectKind, ExecutionConstraints, InvocationOutcome};
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
     RiskLevel, TransportId,
@@ -161,7 +161,6 @@ fn constraint_set(capability_id: &str) -> (CapabilityId, ConstraintSet) {
             provider: provider(),
             effect: EffectKind::ReadOnly,
             risk: RiskLevel::Low,
-            idempotency: Idempotency::Idempotent,
             credential: None,
             credential_by_agent: BTreeMap::new(),
             constraints: ExecutionConstraints::default(),

@@ -83,29 +83,6 @@ impl fmt::Display for EffectKind {
     }
 }
 
-/// Declared retry behavior for an invocation.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Idempotency {
-    /// Repeating an identical invocation has no additional effect.
-    Idempotent,
-    /// Repetition is safe only when a provider-enforced key or condition is present.
-    Conditional,
-    /// Repeating the invocation can create an additional effect.
-    NonIdempotent,
-}
-
-impl fmt::Display for Idempotency {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value = match self {
-            Self::Idempotent => "idempotent",
-            Self::Conditional => "conditional",
-            Self::NonIdempotent => "non-idempotent",
-        };
-        formatter.write_str(value)
-    }
-}
-
 /// A provider permission needed to execute a capability.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -822,7 +799,7 @@ mod tests {
 
     use super::{
         AuthorizationError, EffectKind, ExecutionConstraints, HttpConstraints,
-        HttpConstraintsError, Idempotency, MAX_HTTP_SCOPE_ENTRIES, ProposedInvocation, broker,
+        HttpConstraintsError, MAX_HTTP_SCOPE_ENTRIES, ProposedInvocation, broker,
     };
 
     fn proposal() -> ProposedInvocation {
@@ -854,17 +831,6 @@ mod tests {
             assert_eq!(
                 serde_json::to_value(effect).expect("effect serializes"),
                 json!(effect.to_string()),
-            );
-        }
-
-        for idempotency in [
-            Idempotency::Idempotent,
-            Idempotency::Conditional,
-            Idempotency::NonIdempotent,
-        ] {
-            assert_eq!(
-                serde_json::to_value(idempotency).expect("idempotency serializes"),
-                json!(idempotency.to_string()),
             );
         }
     }

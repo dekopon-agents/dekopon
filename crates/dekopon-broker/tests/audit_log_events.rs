@@ -19,9 +19,7 @@ use dekopon_broker::{
     TraceOnlyAuditLog,
 };
 use dekopon_broker_host::{BoundCredential, BrokerHostLimits, BrokerProviderRegistry};
-use dekopon_capability::{
-    EffectKind, ExecutionConstraints, HttpConstraints, Idempotency, InvocationOutcome,
-};
+use dekopon_capability::{EffectKind, ExecutionConstraints, HttpConstraints, InvocationOutcome};
 use dekopon_core::{
     Actor, AgentId, CapabilityId, InvocationId, PrincipalId, ProviderId, Redacted, RiskLevel,
 };
@@ -161,7 +159,6 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
                 provider: "http-probe".parse::<ProviderId>().expect("provider"),
                 effect: EffectKind::ReadOnly,
                 risk: RiskLevel::Low,
-                idempotency: Idempotency::Idempotent,
                 credential: Some("fetch-token".to_owned()),
                 credential_by_agent: BTreeMap::new(),
                 constraints: loopback_constraints(&authority),

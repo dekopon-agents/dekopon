@@ -1,4 +1,4 @@
-use dekopon_capability::{EffectKind, Idempotency};
+use dekopon_capability::EffectKind;
 use dekopon_core::{RiskLevel, SecretSinkKind};
 use serde_json::json;
 
@@ -42,7 +42,6 @@ fn capability_request(principal: &str, capability: &str, context: PolicyContext)
             provider: "echo".parse().expect("valid provider fixture"),
             effect: EffectKind::ReadOnly,
             risk: RiskLevel::Low,
-            idempotency: Idempotency::Idempotent,
         },
         context,
     }
@@ -573,7 +572,6 @@ fn every_action_declares_exactly_these_context_attributes() {
             "conversation": { "type": "String", "required": false },
             "effect": { "type": "String" },
             "risk": { "type": "String" },
-            "idempotency": { "type": "String" },
         }
     });
     // Driving an agent at all: the routing attributes and nothing else.

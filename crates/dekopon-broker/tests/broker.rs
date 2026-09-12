@@ -10,9 +10,7 @@ use dekopon_broker::{
 };
 use dekopon_broker_host::BoundCredential;
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry, CommandRunOutcome};
-use dekopon_capability::{
-    EffectKind, ExecutionConstraints, HttpConstraints, HttpPathRule, Idempotency,
-};
+use dekopon_capability::{EffectKind, ExecutionConstraints, HttpConstraints, HttpPathRule};
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId, Redacted,
     RiskLevel, SecretDrn, SecretSinkKind, SecretUseProposal,
@@ -90,20 +88,13 @@ fn request(id: &str, capability: &str, input: serde_json::Value) -> InvocationRe
 
 /// One constraint set with the classification the echo provider actually declares.
 fn set(provider: &str, constraints: ExecutionConstraints) -> ConstraintSet {
-    set_with_metadata(
-        provider,
-        EffectKind::ReadOnly,
-        RiskLevel::Low,
-        Idempotency::Idempotent,
-        constraints,
-    )
+    set_with_metadata(provider, EffectKind::ReadOnly, RiskLevel::Low, constraints)
 }
 
 fn set_with_metadata(
     provider: &str,
     effect: EffectKind,
     risk: RiskLevel,
-    idempotency: Idempotency,
     constraints: ExecutionConstraints,
 ) -> ConstraintSet {
     ConstraintSet {
@@ -113,7 +104,6 @@ fn set_with_metadata(
             .expect("valid provider fixture"),
         effect,
         risk,
-        idempotency,
         credential: None,
         credential_by_agent: BTreeMap::new(),
         constraints,
@@ -728,7 +718,6 @@ async fn jsonplaceholder_write_requires_external_write_policy_and_redacts_conten
                     "jsonplaceholder",
                     EffectKind::ExternalWrite,
                     RiskLevel::Medium,
-                    Idempotency::NonIdempotent,
                     constraints,
                 ),
             ),
@@ -743,10 +732,6 @@ async fn jsonplaceholder_write_requires_external_write_policy_and_redacts_conten
     assert_eq!(available.len(), 1);
     assert_eq!(available[0].capability.effect, EffectKind::ExternalWrite);
     assert_eq!(available[0].capability.risk, RiskLevel::Medium);
-    assert_eq!(
-        available[0].capability.idempotency,
-        Idempotency::NonIdempotent
-    );
     let read = broker
         .invoke(
             &context("caller"),
@@ -863,7 +848,6 @@ async fn failed_execution_audits_the_external_write_that_already_landed() {
                 "jsonplaceholder",
                 EffectKind::ExternalWrite,
                 RiskLevel::Medium,
-                Idempotency::NonIdempotent,
                 constraints,
             ),
         )]),
@@ -2445,7 +2429,7 @@ fn execution_records_written_before_per_agent_credentials_serialize_unchanged() 
         r#""principal":"caller","actor":{"type":"agent","agent":"provider-test"},"#,
         r#""capability":"echo.echo","provider":"echo","authorized_by":"broker-test","#,
         r#""decision_id":"allow-invoke-legacy","policy_revision":"policy-test","#,
-        r#""effect":"read-only","risk":"Low","idempotency":"idempotent","outcome":"Succeeded","#,
+        r#""effect":"read-only","risk":"Low","outcome":"Succeeded","#,
         r#""duration_ms":3,"output_digest":"sha256-legacy"}"#,
     );
     let event =

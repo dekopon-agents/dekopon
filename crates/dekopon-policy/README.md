@@ -62,7 +62,7 @@ one list is nonempty; no conflicting world is returned.
 
 ## Context
 
-Capability actions carry `{ via?, subject?, agent?, effect, risk, idempotency }`. `agent.prompt`
+Capability actions carry `{ via?, subject?, agent?, effect, risk }`. `agent.prompt`
 carries `{ via?, subject?, agent? }`. `secret.use` carries those routing fields plus the exact
 capability, provider, and native sink the public DRN was proposed for. Strict validation prevents a
 field from being read on an action that never carries it.
@@ -74,9 +74,8 @@ configuration:
   is the hinge that keeps attested and direct authority disjoint.
 - `subject` — the canonical external subject an attested context stands for.
 - `agent` — the agent identity of an agent actor; absent for human and service actors.
-- `effect` / `risk` / `idempotency` — the trusted classification the broker will execute under,
-  matched byte for byte against the loaded manifest at startup. *Committed direction:* removed
-  ([non-goals](../../docs/design.md#non-goals)).
+- `effect` / `risk` — the trusted classification the broker will execute under,
+  matched byte for byte against the loaded manifest at startup.
 
 Message content and arbitrary provider input are **not** context. A public DRN is the one narrow
 caller-supplied exception: it is a strongly validated resource on a separate action and remains

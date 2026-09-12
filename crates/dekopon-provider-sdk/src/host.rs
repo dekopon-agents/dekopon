@@ -619,7 +619,7 @@ pub fn engine(mut config: Config, compile_cache_dir: Option<&Path>) -> Result<En
 
 #[cfg(test)]
 mod tests {
-    use dekopon_capability::{EffectKind, Idempotency};
+    use dekopon_capability::EffectKind;
     use dekopon_core::RiskLevel;
     use serde_json::json;
 
@@ -645,7 +645,6 @@ mod tests {
                 description: "Runs a fixture".to_owned(),
                 effect,
                 risk: RiskLevel::Low,
-                idempotency: Idempotency::Idempotent,
                 input_schema: json!({"type": "object"}),
             }],
         }

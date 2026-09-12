@@ -31,7 +31,7 @@ use dekopon_broker_protocol::{
     DeliveryIdentity, FrameLimits, TraceParent,
 };
 use dekopon_brokerd::{BrokerServer, MappedPeer, ServerLimits, current_uid};
-use dekopon_capability::{EffectKind, ExecutionConstraints, Idempotency, InvocationOutcome};
+use dekopon_capability::{EffectKind, ExecutionConstraints, InvocationOutcome};
 use dekopon_core::{
     Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
     RiskLevel, TransportId,
@@ -169,7 +169,6 @@ async fn broker() -> Arc<Broker<TraceOnlyAuditLog>> {
                     provider: "echo".parse::<ProviderId>().expect("provider"),
                     effect: EffectKind::ReadOnly,
                     risk: RiskLevel::Low,
-                    idempotency: Idempotency::Idempotent,
                     credential: None,
                     credential_by_agent: BTreeMap::new(),
                     constraints: ExecutionConstraints::default(),
