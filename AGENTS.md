@@ -2,7 +2,7 @@
 
 ## What this repository is
 
-Dekopon is an extensible runtime for self-hosted AI agents: providers are WebAssembly components, the model proposes while a separate broker authorizes and executes, a model may reference a secret but can read none, and one complete trace covers every run. Read [`docs/design.md#constitution`](docs/design.md#constitution) first; it decides what belongs in this tree. It is one Rust workspace (`Cargo.toml`, edition 2024, shared version `0.13.0`) of 23 crates under `crates/`, 22 of them published, with two binaries: `dekopon-brokerd` (the broker) and `dekopond` (the unprivileged chat gateway).
+Dekopon is an extensible runtime for self-hosted AI agents: providers are WebAssembly components, the model proposes while a separate broker authorizes and executes, a model may reference a secret but can read none, and one complete trace covers every run. Read [`docs/design.md#constitution`](docs/design.md#constitution) first; it decides what belongs in this tree. It is one Rust workspace (`Cargo.toml`, edition 2024, shared version `0.14.0`) of 23 crates under `crates/`, 22 of them published, with two binaries: `dekopon-brokerd` (the broker) and `dekopond` (the unprivileged chat gateway).
 
 ## Required reading
 

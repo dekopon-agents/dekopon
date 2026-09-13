@@ -495,7 +495,7 @@ They move for different reasons. A templating fix ships as a `dekopon-chart-*` t
 publish only the chart. That is the whole reason for two tag namespaces — a chart bug must not
 force an application release, and an application release must not republish an unchanged chart.
 
-`appVersion` is `0.13.0`. It is not decorative: `dekopon.labels` renders it as
+`appVersion` is `0.14.0`. It is not decorative: `dekopon.labels` renders it as
 `app.kubernetes.io/version` on every object, so an `appVersion` behind the image is a cluster
 answering `kubectl get pods -l app.kubernetes.io/version` with a version nothing is running, and
 every dashboard and alert built on that label reporting the same wrong number. It has to move in
@@ -506,7 +506,7 @@ The image workflow publishes under the Git tag, so the tag carries a `v`. An emp
 therefore renders `v` + `appVersion`:
 
 ```
-ghcr.io/dekopon-agents/dekopon:v0.13.0
+ghcr.io/dekopon-agents/dekopon:v0.14.0
 ```
 
 There is no `latest`. Prefer `image.digest`; it pins across the

@@ -15,10 +15,10 @@ invocation failure, without invocation-wide rollback.
 
 ```toml
 # JSONL-only: exactly one storage interface import.
-dekopon-provider-storage = { version = "0.13", default-features = false, features = ["jsonl"] }
+dekopon-provider-storage = { version = "0.14", default-features = false, features = ["jsonl"] }
 ```
 
-When crates.io does not carry `0.13`, take the tap or the archives
+When crates.io does not carry `0.14`, take the tap or the archives
 ([crates.io](../../README.md#cratesio)).
 
 The in-tree [`storage-probe`](../../examples/providers/storage-probe/README.md) fixture depends on
