@@ -5,13 +5,19 @@
 //! offer credential-free agent configuration and chat-asset tools. Provider work still happens
 //! only inside the script instead of across many small capability-shaped model tools.
 
-use std::{fmt, time::Instant};
+use std::{
+    fmt,
+    ops::ControlFlow,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use dekopon_config::Skill;
 use dekopon_model::model::{
     ChatModel, CompletionOptions, ContentPart, ModelError, ModelMessage, ModelTool, ModelToolCall,
     ModelUsage, assistant_message,
 };
+use dekopon_model::{ModelText, TurnEvent};
 use dekopon_shell::ScriptOutcome;
 use serde_json::{Value, json};
 use thiserror::Error;
@@ -20,6 +26,10 @@ use crate::{
     improvement::{self, ImprovementSuggestion},
     meta::AgentConfigView,
     milliseconds,
+    progress::{
+        CancelSource, FailureClass, ProgressEvent, ProgressSink, STREAMED_TEXT_BOUND_BYTES,
+        SessionOutcome,
+    },
     skills::{self, SkillReads},
 };
 
@@ -163,6 +173,17 @@ pub trait ModelUsageObserver: Send + Sync {
 pub trait CancellationProbe: Send + Sync {
     /// Whether the session should stop at its next cooperative boundary.
     fn is_cancelled(&self) -> bool;
+
+    /// What asked for the stop, for an embedder that tracks it.
+    ///
+    /// The loop cannot know: a person's Stop, a shutdown, and a wall-clock budget all arrive as
+    /// the same `true`. An embedder that distinguishes them overrides this and the difference
+    /// reaches [`ProgressEvent::Cancelled`]; the default `None` is reported as
+    /// [`CancelSource::Operator`], which is what "the embedder stopped it and named no origin"
+    /// means.
+    fn cancel_source(&self) -> Option<CancelSource> {
+        None
+    }
 }
 
 /// Bounds on one prompt session.
@@ -275,7 +296,7 @@ where
 /// The same conversation continuation, carrying request-scoped routing metadata to every model
 /// call this session makes.
 ///
-/// `options` is the [`CompletionOptions`] the loop hands to [`ChatModel::complete_with`], and it is
+/// `options` is the [`CompletionOptions`] the loop hands to [`ChatModel::complete`], and it is
 /// deliberately a *request* input rather than session state: nothing in it changes what the model
 /// is asked, only how the provider routes the request that carries it. A caller passing
 /// [`CompletionOptions::default`] gets the byte-identical requests
@@ -286,9 +307,8 @@ where
 /// tool-calling turns within one session share the longest prefix of all, and they are exactly the
 /// requests a per-session key routes to one cache lane.
 ///
-/// A model that implements only [`ChatModel::complete`] still answers, because `complete_with` is a
-/// provided method that discards what it does not understand. The cost of that is a cache lookup,
-/// never an answer.
+/// A model that routes on none of it still answers: every field is optional and an implementation
+/// that ignores one costs the request a cache lookup, never an answer.
 pub fn run_prompt_with_history_and_options<M, R>(
     model: &M,
     runtime: &R,
@@ -326,6 +346,7 @@ pub struct SessionInputs<'a> {
     usage_observer: Option<&'a dyn ModelUsageObserver>,
     agent_config: Option<&'a AgentConfigView>,
     cancellation: Option<&'a dyn CancellationProbe>,
+    progress: Option<Arc<dyn ProgressSink>>,
     optional_reply: bool,
     skills: &'a [Skill],
     improvement_suggestions: bool,
@@ -344,6 +365,7 @@ impl<'a> SessionInputs<'a> {
             usage_observer: None,
             agent_config: None,
             cancellation: None,
+            progress: None,
             optional_reply: false,
             skills: &[],
             improvement_suggestions: false,
@@ -413,6 +435,23 @@ impl<'a> SessionInputs<'a> {
         self
     }
 
+    /// Reports what this session is doing to a surface a person is watching.
+    ///
+    /// The third synchronous observer, beside [`Self::with_usage_observer`] and
+    /// [`Self::with_cancellation`], and the only one whose output a person sees. An absent sink is
+    /// a no-op at every seam: the loop builds no event and spends nothing, which is what an
+    /// embedder with nowhere to render gets.
+    ///
+    /// Shared rather than borrowed because the same sink outlives one session's inputs in a
+    /// gateway — it is the endpoint a per-session rendering task reads — and it is
+    /// [`Sync`] because the broker leg emits from the same blocking thread this
+    /// loop runs on.
+    #[must_use]
+    pub fn with_progress(mut self, sink: Arc<dyn ProgressSink>) -> Self {
+        self.progress = Some(sink);
+        self
+    }
+
     /// Lets the model decline one unaddressed, transport-owned chat continuation.
     ///
     /// This is deliberately request-scoped rather than an agent default: explicit mentions and
@@ -426,6 +465,10 @@ impl<'a> SessionInputs<'a> {
 }
 
 /// Optional, request-scoped surfaces handed to the inner model loop.
+///
+/// The progress sink is borrowed rather than shared here: [`SessionInputs`] owns the `Arc` for the
+/// length of the call, and keeping these extensions [`Copy`] is what lets every turn pass them on
+/// without a clone per seam.
 #[derive(Clone, Copy)]
 struct SessionExtensions<'a> {
     options: &'a CompletionOptions,
@@ -433,6 +476,7 @@ struct SessionExtensions<'a> {
     usage_observer: Option<&'a dyn ModelUsageObserver>,
     agent_config: Option<&'a AgentConfigView>,
     cancellation: Option<&'a dyn CancellationProbe>,
+    progress: Option<&'a dyn ProgressSink>,
     optional_reply: bool,
     skills: &'a [Skill],
     improvement_suggestions: bool,
@@ -461,16 +505,21 @@ where
         usage_observer,
         agent_config,
         cancellation,
+        progress,
         optional_reply,
         skills,
         improvement_suggestions,
     } = inputs;
     let fallback = CompletionOptions::default();
     let options = options.unwrap_or(&fallback);
+    let progress = progress.as_deref();
     if limits.max_steps == 0 {
         // Nothing is recorded here: a zero-step session builds no request, so the prompt never
-        // reached a model and the conversation must not claim otherwise.
-        return Err(PromptError::ZeroSteps);
+        // reached a model and the conversation must not claim otherwise. A surface waiting on this
+        // session is still told it ended, through the same classification every other exit takes.
+        let error = PromptError::ZeroSteps;
+        report_end(progress, cancellation, &error);
+        return Err(error);
     }
 
     // Order matters and is fixed here rather than left to callers: instructions first, then the
@@ -501,6 +550,7 @@ where
             usage_observer,
             agent_config,
             cancellation,
+            progress,
             optional_reply,
             skills,
             improvement_suggestions,
@@ -515,11 +565,64 @@ where
     result
 }
 
+/// Drives the model turns for one session and tells a progress surface how it ended.
+///
+/// The two successful exits report [`ProgressEvent::Finished`] where they know what was spent;
+/// every broken one funnels through here, so a surface learns of a stop or a failure exactly once
+/// however deep in the loop it happened.
+fn run_session<M, R>(
+    model: &M,
+    runtime: &R,
+    messages: Vec<ModelMessage>,
+    limits: PromptLimits,
+    extensions: SessionExtensions<'_>,
+) -> Result<PromptOutcome, PromptError>
+where
+    M: ChatModel + ?Sized,
+    R: ScriptRuntime + ?Sized,
+{
+    let result = run_turns(model, runtime, messages, limits, extensions);
+    if let Err(error) = &result {
+        report_end(extensions.progress, extensions.cancellation, error);
+    }
+    result
+}
+
+/// Reports one broken session as the stop or the failure it was.
+///
+/// Cancellation is an outcome rather than a failure class, so it is the one exit that names who
+/// asked; the probe is the only thing that can know, and an embedder that does not track it leaves
+/// [`CancelSource::Operator`], which is what stopping a session yourself is.
+fn report_end(
+    progress: Option<&dyn ProgressSink>,
+    cancellation: Option<&dyn CancellationProbe>,
+    error: &PromptError,
+) {
+    let Some(sink) = progress else {
+        return;
+    };
+    sink.emit(match FailureClass::of(error) {
+        Some(class) => ProgressEvent::Failed { class },
+        None => ProgressEvent::Cancelled {
+            by: cancellation
+                .and_then(CancellationProbe::cancel_source)
+                .unwrap_or(CancelSource::Operator),
+        },
+    });
+}
+
+/// Reports one event to the sink an embedder supplied, or does nothing.
+fn emit(progress: Option<&dyn ProgressSink>, event: ProgressEvent) {
+    if let Some(sink) = progress {
+        sink.emit(event);
+    }
+}
+
 /// Drives the model turns for one session over an already-seeded message vector.
 ///
 /// Split out so that every exit path — answer, budget exhaustion, refused tool call, transport
 /// failure — funnels back through one caller that records the exchange.
-fn run_session<M, R>(
+fn run_turns<M, R>(
     model: &M,
     runtime: &R,
     mut messages: Vec<ModelMessage>,
@@ -536,6 +639,7 @@ where
         usage_observer,
         agent_config,
         cancellation,
+        progress,
         optional_reply,
         skills,
         improvement_suggestions,
@@ -566,8 +670,13 @@ where
         prompt.max_capability_calls = limits.max_capability_calls
     );
     let _session = session_span.enter();
+    // Wall clock for the person waiting, not for a bound: nothing in this loop is timed out by it.
+    let session_started = Instant::now();
     let mut script_calls = 0_u32;
     let mut capability_invocations = 0_u32;
+    // Tool calls the model requested across every turn, which is what a finished session reports;
+    // scripts and capability invocations are separate counts and stay separate.
+    let mut tool_calls = 0_u32;
     // How much of the message vector the transcript log has already shipped, so later turns log
     // what was appended rather than the whole conversation again.
     let mut transcribed = 0_usize;
@@ -592,6 +701,10 @@ where
             usage.output_tokens = tracing::field::Empty,
             usage.reasoning_output_tokens = tracing::field::Empty,
             usage.total_tokens = tracing::field::Empty,
+            // Counted rather than recorded one by one: a record per token would put a log line on
+            // the trace for every fragment and say nothing the complete answer does not.
+            stream.deltas = tracing::field::Empty,
+            stream.first_delta_ms = tracing::field::Empty,
         );
         let model_entered = model_span.enter();
         // Verbatim transcript rides the log stream rather than span attributes: a conversation is
@@ -618,8 +731,54 @@ where
         );
         transcribed = messages.len();
         let model_started = Instant::now();
-        let turn = match model.complete_with(&messages, &model_tools, options) {
+        emit(
+            progress,
+            ProgressEvent::ModelTurn {
+                turn: model_turns,
+                of: limits.max_steps,
+            },
+        );
+        // The request is streamed and the fragments are watched here rather than inside the model
+        // client: this is the only place that knows the session's cancellation and its progress
+        // surface, and a turn is interruptible exactly as often as it emits an event.
+        let mut stream = TurnStream::new(model_turns, model_started, progress, cancellation);
+        let completion = {
+            let mut on_event = |event| stream.observe(event);
+            model.complete(&messages, &model_tools, options, &mut on_event)
+        };
+        stream.record_on(&model_span);
+        let turn = match completion {
             Ok(turn) => turn,
+            // The callback asked to stop and the client dropped the body. No `AssistantTurn`
+            // exists, so the text the person already read is the only account of the turn there
+            // will ever be, and it is written here rather than lost with the connection. Usage is
+            // absent by construction: the provider reports it in the final event that never came.
+            Err(ModelError::Interrupted) => {
+                tracing::info!(
+                    target: "dekopon_agent::audit",
+                    {
+                        audit.event = "accounting.model.turn",
+                        model.turn = model_turns,
+                        duration_ms = milliseconds(model_started.elapsed()),
+                        message.count = messages.len(),
+                        outcome = "interrupted",
+                    },
+                    "model turn interrupted"
+                );
+                tracing::info!(
+                    target: "dekopon_agent::audit",
+                    {
+                        audit.event = "agent.model.answer",
+                        model.turn = model_turns,
+                        answer = stream.text().as_str(),
+                        tool_calls = %tool_calls_json(&[]),
+                        stream.interrupted = true,
+                    },
+                    "model turn answer"
+                );
+                drop(model_entered);
+                return Err(PromptError::Cancelled);
+            }
             Err(error) => {
                 tracing::error!(
                     target: "dekopon_agent::audit",
@@ -675,6 +834,17 @@ where
             },
             "model turn answer"
         );
+        let requested = u32::try_from(turn.tool_calls.len()).unwrap_or(u32::MAX);
+        tool_calls = tool_calls.saturating_add(requested);
+        emit(
+            progress,
+            ProgressEvent::Answered {
+                turn: model_turns,
+                tool_calls: requested,
+                duration: model_started.elapsed(),
+                first_delta: stream.first_delta(),
+            },
+        );
         drop(model_entered);
         check_cancelled(cancellation)?;
         messages.push(assistant_message(&turn));
@@ -685,6 +855,15 @@ where
                 .content
                 .filter(|content| !content.trim().is_empty())
                 .ok_or(PromptError::EmptyAnswer)?;
+            emit(
+                progress,
+                ProgressEvent::Finished {
+                    outcome: SessionOutcome::Answered,
+                    elapsed: session_started.elapsed(),
+                    turns: model_turns,
+                    tool_calls,
+                },
+            );
             return Ok(PromptOutcome {
                 answer,
                 disposition: ReplyDisposition::Send,
@@ -737,6 +916,15 @@ where
                         model.turn = model_turns,
                     },
                     "optional chat reply declined"
+                );
+                emit(
+                    progress,
+                    ProgressEvent::Finished {
+                        outcome: SessionOutcome::Declined,
+                        elapsed: session_started.elapsed(),
+                        turns: model_turns,
+                        tool_calls,
+                    },
                 );
                 return Ok(PromptOutcome {
                     answer: String::new(),
@@ -887,6 +1075,112 @@ fn check_cancelled(cancellation: Option<&dyn CancellationProbe>) -> Result<(), P
         Err(PromptError::Cancelled)
     } else {
         Ok(())
+    }
+}
+
+/// What one model turn reported while it was still arriving.
+///
+/// Three things outlive the call. The cumulative text, because an interrupted turn returns no
+/// [`AssistantTurn`](dekopon_model::model::AssistantTurn) and this is then the only account of
+/// what the person read. The fragment count and the time to the first one, because they belong on
+/// the turn span. And the decision to stop: the cancellation probe is read between fragments here,
+/// which is what moves a Stop's effect from "after this turn" to "after this event".
+struct TurnStream<'a> {
+    turn: u32,
+    started: Instant,
+    progress: Option<&'a dyn ProgressSink>,
+    cancellation: Option<&'a dyn CancellationProbe>,
+    /// Everything the model has written this turn, in arrival order.
+    text: ModelText,
+    /// Characters of that text, counted as it grows rather than recounted per fragment.
+    chars: usize,
+    deltas: u64,
+    first_delta: Option<Duration>,
+    /// Whether the text passed the bound past which no further fragment is forwarded.
+    bound_passed: bool,
+}
+
+impl<'a> TurnStream<'a> {
+    fn new(
+        turn: u32,
+        started: Instant,
+        progress: Option<&'a dyn ProgressSink>,
+        cancellation: Option<&'a dyn CancellationProbe>,
+    ) -> Self {
+        Self {
+            turn,
+            started,
+            progress,
+            cancellation,
+            text: ModelText::default(),
+            chars: 0,
+            deltas: 0,
+            first_delta: None,
+            bound_passed: false,
+        }
+    }
+
+    /// Takes one event and answers whether the session still wants the rest of the turn.
+    fn observe(&mut self, event: TurnEvent) -> ControlFlow<()> {
+        match event {
+            TurnEvent::TextDelta(delta) => self.append(delta),
+            // Nothing to show: an index is not a name, and the arguments that would name it are
+            // model-authored and arrive with the completed turn, which is where they are read.
+            TurnEvent::ToolCallStarted { .. } => {}
+        }
+        if self
+            .cancellation
+            .is_some_and(CancellationProbe::is_cancelled)
+        {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
+    }
+
+    /// Accumulates one fragment and forwards it while a surface can still use it.
+    fn append(&mut self, delta: ModelText) {
+        self.deltas = self.deltas.saturating_add(1);
+        if self.first_delta.is_none() {
+            self.first_delta = Some(self.started.elapsed());
+        }
+        self.chars = self.chars.saturating_add(delta.as_str().chars().count());
+        self.text.push(&delta);
+        if self.bound_passed {
+            return;
+        }
+        if self.text.len() > STREAMED_TEXT_BOUND_BYTES {
+            // Past the bound the surface stops growing and stays at what it had: it cannot show
+            // more than the answer will carry, and the whole answer still arrives with the turn.
+            self.bound_passed = true;
+            return;
+        }
+        emit(
+            self.progress,
+            ProgressEvent::TextDelta {
+                turn: self.turn,
+                text: delta,
+                cumulative_chars: self.chars,
+            },
+        );
+    }
+
+    /// Everything the model wrote this turn, which is all an interrupted turn leaves behind.
+    const fn text(&self) -> &ModelText {
+        &self.text
+    }
+
+    /// Time to the first fragment, absent when the response did not stream.
+    const fn first_delta(&self) -> Option<Duration> {
+        self.first_delta
+    }
+
+    /// Puts the two stream counters on the turn span, leaving the absent one empty.
+    fn record_on(&self, span: &tracing::Span) {
+        span.record("stream.deltas", self.deltas);
+        if let Some(first) = self.first_delta {
+            span.record("stream.first_delta_ms", milliseconds(first));
+        }
     }
 }
 
@@ -1544,8 +1838,15 @@ fn tool_calls_json(tool_calls: &[ModelToolCall]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, sync::Arc, sync::Mutex};
+    use std::{
+        collections::VecDeque,
+        ops::ControlFlow,
+        sync::Arc,
+        sync::Mutex,
+        sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    };
 
+    use dekopon_model::TurnEvent;
     use dekopon_model::model::{
         AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelFunctionCall, ModelMessage,
         ModelTool, ModelToolCall, ModelUsage,
@@ -1555,6 +1856,9 @@ mod tests {
 
     use crate::meta::{
         AgentConfigView, ConversationConfigView, EffectiveCapabilityView, SessionConfigView,
+    };
+    use crate::progress::{
+        CancelSource, CancelVia, ProgressEvent, ProgressSink, STREAMED_TEXT_BOUND_BYTES,
     };
 
     use super::{
@@ -1628,10 +1932,14 @@ mod tests {
     }
 
     impl ChatModel for ScriptedModel {
+        /// Answers whole, calling `on_event` zero times, which is the contract for an
+        /// implementation that does not stream.
         fn complete(
             &self,
             messages: &[ModelMessage],
             tools: &[ModelTool],
+            _options: &CompletionOptions,
+            _on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
         ) -> Result<AssistantTurn, ModelError> {
             self.observed_tools
                 .lock()
@@ -1767,6 +2075,422 @@ mod tests {
             history.len(),
             1,
             "the prompt loop records an unanswered turn"
+        );
+    }
+
+    /// Keeps what one session reported, in order.
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Mutex<Vec<ProgressEvent>>,
+    }
+
+    impl ProgressSink for RecordingSink {
+        fn emit(&self, event: ProgressEvent) {
+            self.events.lock().expect("progress lock").push(event);
+        }
+    }
+
+    /// One recorder, twice: the handle the assertions read and the trait object a session takes.
+    fn recording_sink() -> (Arc<RecordingSink>, Arc<dyn ProgressSink>) {
+        let recorder = Arc::new(RecordingSink::default());
+        let installed: Arc<dyn ProgressSink> = recorder.clone();
+        (recorder, installed)
+    }
+
+    impl RecordingSink {
+        fn labels(&self) -> Vec<String> {
+            self.events
+                .lock()
+                .expect("progress lock")
+                .iter()
+                .map(progress_label)
+                .collect()
+        }
+
+        /// The running character count of each fragment that reached the surface.
+        fn forwarded_chars(&self) -> Vec<usize> {
+            self.events
+                .lock()
+                .expect("progress lock")
+                .iter()
+                .filter_map(|event| match event {
+                    ProgressEvent::TextDelta {
+                        cumulative_chars, ..
+                    } => Some(*cumulative_chars),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    /// One line per event, carrying the fields these assertions are about and no clock.
+    ///
+    /// Every variant is named rather than swept up by a catch-all: a new one has to be given a
+    /// rendering here, which is the question "what would a person be told" asked at compile time.
+    fn progress_label(event: &ProgressEvent) -> String {
+        match event {
+            ProgressEvent::Started { agent, max_steps } => {
+                format!("started {agent} of {max_steps}")
+            }
+            ProgressEvent::ModelTurn { turn, of } => format!("model-turn {turn}/{of}"),
+            ProgressEvent::TextDelta {
+                turn,
+                text,
+                cumulative_chars,
+            } => format!("text-delta {turn} {:?} {cumulative_chars}", text.as_str()),
+            ProgressEvent::Answered {
+                turn, tool_calls, ..
+            } => format!("answered {turn} calls={tool_calls}"),
+            ProgressEvent::ToolStarted { word, .. } => format!("tool-started {}", word.as_str()),
+            ProgressEvent::ToolFinished { word, outcome, .. } => {
+                format!("tool-finished {} {outcome:?}", word.as_str())
+            }
+            ProgressEvent::Attachment {
+                index,
+                media_type,
+                bytes,
+            } => format!("attachment {index} {media_type} {bytes}"),
+            ProgressEvent::KeepAlive { count, .. } => format!("keep-alive {count}"),
+            ProgressEvent::Cancelled { by } => format!("cancelled {by:?}"),
+            ProgressEvent::Failed { class } => format!("failed {class:?}"),
+            ProgressEvent::Finished {
+                outcome,
+                turns,
+                tool_calls,
+                ..
+            } => format!("finished {outcome:?} turns={turns} calls={tool_calls}"),
+        }
+    }
+
+    /// A model that reports one event before it answers.
+    ///
+    /// The event carries no text, which is the point: what makes a turn interruptible is that the
+    /// callback runs between reads at all, not what any particular read contained.
+    struct EventingModel {
+        turns: Mutex<VecDeque<AssistantTurn>>,
+    }
+
+    impl ChatModel for EventingModel {
+        fn complete(
+            &self,
+            _messages: &[ModelMessage],
+            _tools: &[ModelTool],
+            _options: &CompletionOptions,
+            on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
+        ) -> Result<AssistantTurn, ModelError> {
+            if on_event(TurnEvent::ToolCallStarted { index: 0 }).is_break() {
+                // What the real clients do with the same answer: drop the body, which closes the
+                // connection, and report that no turn will arrive.
+                return Err(ModelError::Interrupted);
+            }
+            self.turns
+                .lock()
+                .expect("turn lock")
+                .pop_front()
+                .ok_or(ModelError::NoChoices)
+        }
+    }
+
+    /// A model that replays the events of a recorded stream and then answers.
+    ///
+    /// The events come from the model client's own parser rather than from anything this module
+    /// builds: [`dekopon_model::ModelText`] is constructed from bytes only inside that crate, so a
+    /// fixture can neither invent visible text nor drift from what a backend really sends.
+    struct TranscriptModel {
+        events: Mutex<VecDeque<TurnEvent>>,
+        turn: Mutex<Option<AssistantTurn>>,
+    }
+
+    impl TranscriptModel {
+        fn new(body: &str, turn: AssistantTurn) -> Self {
+            let events = dekopon_model::events_from_transcript(body)
+                .expect("the recorded transcript parses");
+            Self {
+                events: Mutex::new(events.into()),
+                turn: Mutex::new(Some(turn)),
+            }
+        }
+    }
+
+    impl ChatModel for TranscriptModel {
+        fn complete(
+            &self,
+            _messages: &[ModelMessage],
+            _tools: &[ModelTool],
+            _options: &CompletionOptions,
+            on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
+        ) -> Result<AssistantTurn, ModelError> {
+            let events = std::mem::take(&mut *self.events.lock().expect("event lock"));
+            for event in events {
+                if on_event(event).is_break() {
+                    return Err(ModelError::Interrupted);
+                }
+            }
+            self.turn
+                .lock()
+                .expect("turn lock")
+                .take()
+                .ok_or(ModelError::NoChoices)
+        }
+    }
+
+    /// A chat-completions stream body carrying one visible-text fragment per chunk.
+    fn text_transcript(fragments: &[&str]) -> String {
+        let mut body = String::new();
+        for fragment in fragments {
+            body.push_str(&format!(
+                "data: {}\n\n",
+                json!({"choices": [{"delta": {"content": fragment}}]})
+            ));
+        }
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    /// A probe that reports a stop only once the turn it is watching is under way.
+    ///
+    /// `after` is how many reads pass before it answers `true`: the loop reads once at the top of
+    /// a turn, so `1` is a person pressing Stop while the answer is arriving rather than before
+    /// the request was built.
+    struct StopsDuringTheTurn {
+        reads: AtomicUsize,
+        after: usize,
+    }
+
+    impl CancellationProbe for StopsDuringTheTurn {
+        fn is_cancelled(&self) -> bool {
+            self.reads.fetch_add(1, AtomicOrdering::Relaxed) >= self.after
+        }
+
+        fn cancel_source(&self) -> Option<CancelSource> {
+            Some(CancelSource::User {
+                via: CancelVia::NativeStop,
+            })
+        }
+    }
+
+    #[test]
+    fn a_two_turn_tool_session_reports_every_seam_in_order() {
+        let model = ScriptedModel::new([script_call("call-1", "echo one"), answer("done")]);
+        let runtime = RecordingRuntime::new(1);
+        let (sink, progress) = recording_sink();
+
+        let outcome = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("go", limits(4, 8)).with_progress(progress),
+            &mut History::default(),
+        )
+        .expect("the scripted session answers");
+
+        assert_eq!(outcome.answer, "done");
+        assert_eq!(
+            sink.labels(),
+            vec![
+                "model-turn 1/4",
+                "answered 1 calls=1",
+                "model-turn 2/4",
+                "answered 2 calls=0",
+                "finished Answered turns=2 calls=1",
+            ],
+            "the whole session, in the order a person watching it happened"
+        );
+    }
+
+    #[test]
+    fn a_session_without_a_sink_answers_exactly_as_one_with_it() {
+        // The no-op is the case every embedder that renders nothing takes, so it is the one that
+        // must not diverge: same turns, same answer, same counts.
+        let watched = ScriptedModel::new([script_call("call-1", "echo one"), answer("done")]);
+        let unwatched = ScriptedModel::new([script_call("call-1", "echo one"), answer("done")]);
+        let runtime = RecordingRuntime::new(1);
+        let (_recorder, progress) = recording_sink();
+
+        let with_sink = run_prompt_session(
+            &watched,
+            &runtime,
+            SessionInputs::new("go", limits(4, 8)).with_progress(progress),
+            &mut History::default(),
+        )
+        .expect("the watched session answers");
+        let without_sink = run_prompt_session(
+            &unwatched,
+            &runtime,
+            SessionInputs::new("go", limits(4, 8)),
+            &mut History::default(),
+        )
+        .expect("the unwatched session answers");
+
+        assert_eq!(with_sink, without_sink);
+    }
+
+    #[test]
+    fn an_interrupted_turn_stops_the_session_and_names_who_asked() {
+        // The stop lands between two reads of one model request rather than between turns, which
+        // is the whole reason the callback exists; the loop reports it as the outcome it is.
+        let model = EventingModel {
+            turns: Mutex::new([answer("never delivered")].into_iter().collect()),
+        };
+        let runtime = RecordingRuntime::new(0);
+        let (sink, progress) = recording_sink();
+        let probe = StopsDuringTheTurn {
+            reads: AtomicUsize::new(0),
+            after: 1,
+        };
+
+        let error = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("go", limits(2, 4))
+                .with_cancellation(&probe)
+                .with_progress(progress),
+            &mut History::default(),
+        )
+        .expect_err("an interrupted turn ends the session");
+
+        assert!(
+            matches!(error, PromptError::Cancelled),
+            "an interrupted stream is the session being stopped, not the model failing: {error}"
+        );
+        assert_eq!(error.telemetry_kind(), "cancelled");
+        assert_eq!(
+            sink.labels(),
+            vec!["model-turn 1/2", "cancelled User { via: NativeStop }",],
+            "no answer was ever reported for the turn that was cut off"
+        );
+    }
+
+    #[test]
+    fn every_streamed_fragment_reaches_the_surface_with_its_running_character_count() {
+        let model = TranscriptModel::new(
+            &text_transcript(&["Hel", "lo there"]),
+            answer("Hello there"),
+        );
+        let runtime = RecordingRuntime::new(0);
+        let (sink, progress) = recording_sink();
+
+        let outcome = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("go", limits(2, 4)).with_progress(progress),
+            &mut History::default(),
+        )
+        .expect("a streamed turn answers like any other");
+
+        assert_eq!(outcome.answer, "Hello there");
+        assert_eq!(
+            sink.labels(),
+            vec![
+                "model-turn 1/2",
+                "text-delta 1 \"Hel\" 3",
+                "text-delta 1 \"lo there\" 11",
+                "answered 1 calls=0",
+                "finished Answered turns=1 calls=0",
+            ],
+            "each fragment as it arrived, with the turn's running count"
+        );
+    }
+
+    #[test]
+    fn fragments_stop_at_the_outbound_bound_and_the_turn_still_answers() {
+        // A surface cannot show more than the answer will carry, so forwarding stops at the bound
+        // while the turn keeps arriving: the complete answer is delivered by the reply path.
+        let half = STREAMED_TEXT_BOUND_BYTES / 2;
+        let fragment = "x".repeat(half);
+        let model = TranscriptModel::new(
+            &text_transcript(&[&fragment, &fragment, &fragment]),
+            answer("delivered whole"),
+        );
+        let runtime = RecordingRuntime::new(0);
+        let (sink, progress) = recording_sink();
+
+        let outcome = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("go", limits(2, 4)).with_progress(progress),
+            &mut History::default(),
+        )
+        .expect("passing the bound is not a failure");
+
+        assert_eq!(
+            sink.forwarded_chars(),
+            vec![half, half * 2],
+            "the fragment that would carry the text past the bound is not forwarded"
+        );
+        assert_eq!(
+            outcome.answer, "delivered whole",
+            "the answer is the turn's, not what the surface was shown"
+        );
+    }
+
+    #[test]
+    fn a_session_that_runs_out_of_turns_reports_the_budget_it_spent() {
+        let model = ScriptedModel::new([script_call("call-1", "echo one")]);
+        let runtime = RecordingRuntime::new(1);
+        let (sink, progress) = recording_sink();
+
+        let error = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("go", limits(1, 4)).with_progress(progress),
+            &mut History::default(),
+        )
+        .expect_err("one turn that asks for a tool cannot answer");
+
+        assert!(
+            matches!(error, PromptError::MaxSteps { maximum: 1 }),
+            "{error}"
+        );
+        assert_eq!(
+            sink.labels(),
+            vec!["model-turn 1/1", "answered 1 calls=1", "failed StepBudget",]
+        );
+    }
+
+    #[test]
+    fn a_zero_step_session_still_tells_a_waiting_surface_that_it_ended() {
+        // Nothing reached a model, so there is nothing to report but the ending — and a surface
+        // that was never told would keep saying "working on it" forever.
+        let model = ScriptedModel::new([answer("unreachable")]);
+        let runtime = RecordingRuntime::new(0);
+        let (sink, progress) = recording_sink();
+
+        let error = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("go", limits(0, 4)).with_progress(progress),
+            &mut History::default(),
+        )
+        .expect_err("a zero-step session is refused");
+
+        assert!(matches!(error, PromptError::ZeroSteps), "{error}");
+        assert_eq!(sink.labels(), vec!["failed Internal"]);
+    }
+
+    #[test]
+    fn a_declined_continuation_finishes_with_nothing_to_deliver() {
+        let model = ScriptedModel::new([decline(json!({}))]);
+        let runtime = RecordingRuntime::new(0);
+        let (sink, progress) = recording_sink();
+
+        let outcome = run_prompt_session(
+            &model,
+            &runtime,
+            SessionInputs::new("go", limits(2, 4))
+                .with_optional_reply()
+                .with_progress(progress),
+            &mut History::default(),
+        )
+        .expect("a decline is a completed session");
+
+        assert_eq!(outcome.disposition, ReplyDisposition::Suppress);
+        assert_eq!(
+            sink.labels(),
+            vec![
+                "model-turn 1/2",
+                "answered 1 calls=1",
+                "finished Declined turns=1 calls=1",
+            ]
         );
     }
 
@@ -2286,10 +3010,9 @@ mod tests {
 
     /// A model that answers once per request and records the options each request carried.
     ///
-    /// Deliberately overrides `complete_with` and leaves `complete` panicking: every other double
-    /// in this module implements only `complete`, which is what proves the provided-method default
-    /// still works, so this one exists to prove the other half — that the loop really does take the
-    /// `complete_with` path when it has options to pass.
+    /// Separate from [`ScriptedModel`] because the question is different: that one is about what
+    /// the conversation looked like, this one is about the routing metadata riding beside it on
+    /// every turn of a session.
     struct OptionsObserver {
         turns: Mutex<VecDeque<AssistantTurn>>,
         observed: Mutex<Vec<Option<String>>>,
@@ -2300,15 +3023,8 @@ mod tests {
             &self,
             _messages: &[ModelMessage],
             _tools: &[ModelTool],
-        ) -> Result<AssistantTurn, ModelError> {
-            panic!("the loop must reach a model through complete_with");
-        }
-
-        fn complete_with(
-            &self,
-            _messages: &[ModelMessage],
-            _tools: &[ModelTool],
             options: &CompletionOptions,
+            _on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
         ) -> Result<AssistantTurn, ModelError> {
             self.observed
                 .lock()

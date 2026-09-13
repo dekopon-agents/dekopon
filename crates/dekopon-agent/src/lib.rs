@@ -33,7 +33,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     hash::{BuildHasher as _, Hasher as _},
     sync::atomic::{AtomicU32, Ordering},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use dekopon_broker_protocol::TraceParent;
@@ -66,8 +66,14 @@ use crate::{meta::EffectiveCapabilityView, prompt::ScriptRuntime};
 pub mod attachment;
 pub mod improvement;
 pub mod meta;
+pub mod progress;
 pub mod prompt;
 pub mod skills;
+
+pub use crate::progress::{
+    BudgetLimit, CancelSource, CancelVia, CommandWord, FailureClass, ProgressEvent, ProgressSink,
+    SessionOutcome, ToolOutcome,
+};
 
 /// Runs each model-authored script on the interpreter under this session's dispatch.
 pub struct ShellRuntime<I> {
@@ -463,6 +469,23 @@ pub struct BrokerLeg {
     /// Which capabilities may receive expanded `chat-asset:<N>` inputs, and where their bytes come
     /// from. `None` expands nothing, leaving every marker as the ordinary string it is.
     asset_inputs: Option<ChatAssetInputs>,
+    /// Where this leg reports the work a person is waiting on, when an embedder wants to show it.
+    ///
+    /// `None` for an embedder that renders nothing, which is every caller that has not asked: the
+    /// leg then builds no [`CommandWord`] and spends nothing on progress.
+    progress: Option<Arc<dyn ProgressSink>>,
+    /// The session's capability-call ceiling, as the embedder's route configured it.
+    ///
+    /// The leg cannot derive it: the budget is spent across every script of the session and only
+    /// the caller of the prompt loop knows it. `0` until an embedder supplies both it and a sink.
+    calls_max: u32,
+    /// Capability invocations this leg has proposed, which is what the ceiling above counts.
+    ///
+    /// A provider command word is not itself one of them — its *proposal* is, and arrives here as
+    /// an ordinary invocation — so a word that renders its own help spends nothing.
+    calls_used: AtomicU32,
+    /// Attachments this session has accepted into the reply, which numbers each one for a surface.
+    attachments_accepted: AtomicU32,
 }
 
 #[cfg(unix)]
@@ -521,6 +544,10 @@ impl BrokerLeg {
             cancel: CancelSignal::never(),
             attachments: None,
             asset_inputs: None,
+            progress: None,
+            calls_max: 0,
+            calls_used: AtomicU32::new(0),
+            attachments_accepted: AtomicU32::new(0),
         })
     }
 
@@ -558,6 +585,30 @@ impl BrokerLeg {
     pub fn with_chat_asset_inputs(mut self, inputs: ChatAssetInputs) -> Self {
         self.asset_inputs = Some(inputs);
         self
+    }
+
+    /// Reports every command word, capability call, and accepted attachment to `sink`.
+    ///
+    /// `max_capability_calls` is the session's ceiling, and it is required here rather than
+    /// optional because [`ProgressEvent::ToolStarted`] says "3 of 16 calls": a count with no
+    /// ceiling is not a thing to show a person. The leg cannot read it from anywhere else — the
+    /// budget is spent across every script of one session, and only the caller of the prompt loop
+    /// knows how much of it this session was given.
+    ///
+    /// Emission is synchronous on the session's own blocking thread, so `sink` must not block; it
+    /// is cosmetic, and no [`ProgressSink`] answer can fail a call.
+    #[must_use]
+    pub fn with_progress(mut self, sink: Arc<dyn ProgressSink>, max_capability_calls: u32) -> Self {
+        self.progress = Some(sink);
+        self.calls_max = max_capability_calls;
+        self
+    }
+
+    /// Reports one event, or does nothing for an embedder that renders no progress.
+    fn emit(&self, event: ProgressEvent) {
+        if let Some(sink) = &self.progress {
+            sink.emit(event);
+        }
     }
 
     /// Returns this session's trusted, subject-specific effective capability classification.
@@ -628,8 +679,19 @@ impl BrokerLeg {
     /// A refusal never fails the call. The invocation already happened and may already have cost the
     /// account money, so turning undeliverable bytes into a failed capability would make the model
     /// retry an effect that succeeded.
+    ///
+    /// Acceptance is where a progress surface learns a file is coming: the reply that carries it is
+    /// posted whole minutes later, and until then the only thing to say is that the picture exists.
     fn deliver_attachments(&self, output: &mut Value) {
-        for refusal in strip_attachments(output, self.attachments.as_deref()) {
+        let (accepted, refusals) = strip_attachments(output, self.attachments.as_deref());
+        for bytes in accepted {
+            self.emit(ProgressEvent::Attachment {
+                index: self.attachments_accepted.fetch_add(1, Ordering::Relaxed),
+                media_type: crate::attachment::ATTACHMENT_MEDIA_TYPE.to_owned(),
+                bytes,
+            });
+        }
+        for refusal in refusals {
             tracing::warn!(
                 target: "dekopon_agent::audit",
                 {
@@ -651,6 +713,43 @@ fn namespace_of(capability: &str) -> String {
         .split_once('.')
         .map_or(capability, |(namespace, _)| namespace)
         .to_owned()
+}
+
+/// Reports a count to a progress surface without letting a model-sized argv overflow the field.
+#[cfg(unix)]
+fn bounded_count(count: usize) -> u32 {
+    u32::try_from(count).unwrap_or(u32::MAX)
+}
+
+/// How one provider command word's run reads on a progress surface.
+///
+/// Rendered text at a non-zero status is the provider reporting a usage error, which is a failed
+/// run for the person watching even though the word answered.
+#[cfg(unix)]
+fn command_outcome(run: &CommandRun) -> ToolOutcome {
+    match run {
+        CommandRun::Proposed { .. } => ToolOutcome::Succeeded,
+        CommandRun::Rendered { status, .. } if *status == 0 => ToolOutcome::Succeeded,
+        CommandRun::Rendered { .. } | CommandRun::Failed { .. } | CommandRun::Errored { .. } => {
+            ToolOutcome::Failed
+        }
+        // The only refusal this leg builds for a word is its own cancellation: the broker answers
+        // a word with a proposal, its own text, or a failure, never with a denial.
+        CommandRun::Denied { .. } => ToolOutcome::Cancelled,
+    }
+}
+
+/// How one capability call reads on a progress surface.
+///
+/// A capability nothing reaches is a failure rather than a refusal here: policy never saw it, so
+/// saying "denied" would credit a decision no one made.
+#[cfg(unix)]
+fn call_outcome(result: &CapabilityCallResult) -> ToolOutcome {
+    match result {
+        CapabilityCallResult::Succeeded(_) => ToolOutcome::Succeeded,
+        CapabilityCallResult::Denied { .. } => ToolOutcome::Denied,
+        CapabilityCallResult::Failed { .. } | CapabilityCallResult::NotFound => ToolOutcome::Failed,
+    }
 }
 
 /// Indexes a capability snapshot for shell dispatch and its credential-free meta view.
@@ -735,6 +834,19 @@ impl CapabilityInvoker for BrokerLeg {
         if !self.command_words.contains(word) {
             return None;
         }
+        // The word a person would have typed themselves, and the one moment it is known before
+        // the provider turns it into a capability identifier. The argument count travels; the
+        // arguments themselves are model-authored and stay on the trace.
+        let reported = CommandWord::new(word);
+        let started = Instant::now();
+        self.emit(ProgressEvent::ToolStarted {
+            word: reported.clone(),
+            argument_count: bounded_count(argv.len()),
+            // Running a word is not itself a capability call: the proposal it returns is, and
+            // arrives here as an ordinary invocation that spends one.
+            calls_used: self.calls_used.load(Ordering::Relaxed),
+            calls_max: self.calls_max,
+        });
         // The round trip is one cancellable process node: a gateway Stop aborts it at its next
         // await and the supervisor still joins it before this returns, so the leg never answers
         // while the request could still be in flight. The node owns its inputs for the whole run,
@@ -757,7 +869,7 @@ impl CapabilityInvoker for BrokerLeg {
             .block_on(ProcessRun::execute(operation, |outcome| {
                 report_unobserved_command_run("broker", outcome, client_error_kind);
             }));
-        Some(match outcome {
+        let run = match outcome {
             ProcessOutcome::Completed(Ok(run)) => run,
             // A transport failure is not the provider declining: the model reads it as the broker
             // being unreachable rather than as a bad argv, and the cause travels with it; the
@@ -772,7 +884,13 @@ impl CapabilityInvoker for BrokerLeg {
             ProcessOutcome::TaskFailed(error) => CommandRun::Errored {
                 message: error.to_string(),
             },
-        })
+        };
+        self.emit(ProgressEvent::ToolFinished {
+            word: reported,
+            outcome: command_outcome(&run),
+            duration: started.elapsed(),
+        });
+        Some(run)
     }
 
     fn invoke(
@@ -781,16 +899,69 @@ impl CapabilityInvoker for BrokerLeg {
         input: Value,
         secret_use: Option<dekopon_core::SecretUseProposal>,
     ) -> CapabilityCallResult {
+        // One started/finished pair around every way the call below can end, which is why the
+        // proposal is its own function: a capability call is the unit of work a person actually
+        // waits on, and a surface told that one started has to be told how it ended.
+        let reported = CommandWord::new(capability);
+        let started = Instant::now();
         // Prevents a script from starting another capability call after the embedder's Stop was
         // observed. A call already inside the client is not rollbackable; this check is the
         // cooperative boundary immediately before the broker proposal. It is not a refusal
         // decision either: no proposal was built, so there is nothing for the broker to have
-        // decided about, and a leg with no signal (`CancelSignal::never`) never takes it.
-        if self.cancel.is_cancelled() {
-            return CapabilityCallResult::Denied {
-                reason: "session-cancelled".to_owned(),
-            };
-        }
+        // decided about, and a leg with no signal (`CancelSignal::never`) never takes it. It is
+        // also why a stopped call reads as `Cancelled` rather than `Denied` on a progress
+        // surface: nothing refused it, the session ended underneath it.
+        let cancelled = self.cancel.is_cancelled();
+        // The budget as this call leaves it. A stopped call spends nothing, so it reports the
+        // count unchanged; anything else would show a person a call against a budget that was
+        // never charged.
+        let calls_used = if cancelled {
+            self.calls_used.load(Ordering::Relaxed)
+        } else {
+            self.calls_used
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1)
+        };
+        self.emit(ProgressEvent::ToolStarted {
+            word: reported.clone(),
+            // The count, never the arguments: they are model-authored and already on the trace.
+            argument_count: bounded_count(input.as_object().map_or(0, serde_json::Map::len)),
+            calls_used,
+            calls_max: self.calls_max,
+        });
+        let (result, outcome) = if cancelled {
+            (
+                CapabilityCallResult::Denied {
+                    reason: "session-cancelled".to_owned(),
+                },
+                ToolOutcome::Cancelled,
+            )
+        } else {
+            let result = self.submit(capability, input, secret_use);
+            let outcome = call_outcome(&result);
+            (result, outcome)
+        };
+        self.emit(ProgressEvent::ToolFinished {
+            word: reported,
+            outcome,
+            duration: started.elapsed(),
+        });
+        result
+    }
+}
+
+#[cfg(unix)]
+impl BrokerLeg {
+    /// Builds one proposal and reports whatever the broker decided about it.
+    ///
+    /// Split from [`CapabilityInvoker::invoke`] so that the progress pair wrapping it has one
+    /// entry and one exit while this keeps the early returns each refusal wants.
+    fn submit(
+        &self,
+        capability: &str,
+        input: Value,
+        secret_use: Option<dekopon_core::SecretUseProposal>,
+    ) -> CapabilityCallResult {
         let Ok(parsed) = capability.parse::<CapabilityId>() else {
             return CapabilityCallResult::NotFound;
         };
@@ -1245,7 +1416,7 @@ mod tests {
             collections::{BTreeMap, BTreeSet},
             os::unix::fs::PermissionsExt as _,
             path::Path,
-            sync::Arc,
+            sync::{Arc, Mutex, atomic::AtomicU32},
         };
 
         use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -1267,7 +1438,7 @@ mod tests {
         };
 
         use crate::{
-            Attestation, BrokerLeg, IdSequence,
+            Attestation, BrokerLeg, IdSequence, ProgressEvent, ProgressSink,
             attachment::{
                 AttachmentRefusal, ChatAssetInputs, ChatAssetRefusal, ChatAssetSource,
                 ReplyAttachments,
@@ -1583,6 +1754,10 @@ mod tests {
                 cancel: CancelSignal::never(),
                 attachments: None,
                 asset_inputs: None,
+                progress: None,
+                calls_max: 0,
+                calls_used: AtomicU32::new(0),
+                attachments_accepted: AtomicU32::new(0),
             }
         }
 
@@ -2130,6 +2305,189 @@ mod tests {
                     .map(|view| view.id.as_str())
                     .collect::<Vec<_>>(),
                 vec!["echo.echo", "http-probe.fetch"]
+            );
+        }
+
+        /// Keeps what one leg reported, in order.
+        #[derive(Default)]
+        struct RecordingSink {
+            events: Mutex<Vec<ProgressEvent>>,
+        }
+
+        impl ProgressSink for RecordingSink {
+            fn emit(&self, event: ProgressEvent) {
+                self.events.lock().expect("progress lock").push(event);
+            }
+        }
+
+        /// One recorder, twice: the handle the assertions read and the trait object a leg takes.
+        fn recording_sink() -> (Arc<RecordingSink>, Arc<dyn ProgressSink>) {
+            let recorder = Arc::new(RecordingSink::default());
+            let installed: Arc<dyn ProgressSink> = recorder.clone();
+            (recorder, installed)
+        }
+
+        impl RecordingSink {
+            fn labels(&self) -> Vec<String> {
+                self.events
+                    .lock()
+                    .expect("progress lock")
+                    .iter()
+                    .map(label)
+                    .collect()
+            }
+        }
+
+        /// One line per event, carrying only what these assertions are about.
+        ///
+        /// The final arm renders anything else rather than matching it away, so an event the leg
+        /// should not have emitted fails the comparison by name.
+        fn label(event: &ProgressEvent) -> String {
+            match event {
+                ProgressEvent::ToolStarted {
+                    word,
+                    argument_count,
+                    calls_used,
+                    calls_max,
+                } => format!(
+                    "started {} arguments={argument_count} calls={calls_used}/{calls_max}",
+                    word.as_str()
+                ),
+                ProgressEvent::ToolFinished { word, outcome, .. } => {
+                    format!("finished {} {outcome:?}", word.as_str())
+                }
+                ProgressEvent::Attachment {
+                    index,
+                    media_type,
+                    bytes,
+                } => format!("attachment {index} {media_type} {bytes}"),
+                other => format!("unexpected {other:?}"),
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_capability_call_is_reported_started_and_finished_with_the_brokers_answer() {
+            let directory = private_broker_directory();
+            let leg = stub_leg(
+                directory.path(),
+                vec![ResponseEnvelope::invocation(result(
+                    InvocationOutcome::Denied,
+                    Some("authorization refused this invocation"),
+                ))],
+            )
+            .await;
+            let (sink, progress) = recording_sink();
+            let leg = leg.with_progress(progress, 4);
+
+            assert_eq!(
+                invoke(leg, CAPABILITY).await,
+                CapabilityCallResult::Denied {
+                    reason: "authorization refused this invocation".to_owned(),
+                }
+            );
+
+            // The count, not the argument: the one field of the fixture's input is model-authored
+            // and only its arity travels.
+            assert_eq!(
+                sink.labels(),
+                vec![
+                    format!("started {CAPABILITY} arguments=1 calls=1/4"),
+                    format!("finished {CAPABILITY} Denied"),
+                ]
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_call_proposed_after_a_stop_reads_as_cancelled_rather_than_refused() {
+            // Nothing decided this call: the session ended underneath it. A surface that showed
+            // "denied" would credit a refusal to a broker that never saw a proposal.
+            let directory = private_broker_directory();
+            let leg = leg_for(&directory.path().join("absent.sock"));
+            let (handle, signal) = CancelSignal::pair();
+            let (sink, progress) = recording_sink();
+            let leg = leg.with_cancel_signal(signal).with_progress(progress, 4);
+            handle.cancel();
+
+            assert_eq!(
+                invoke(leg, CAPABILITY).await,
+                CapabilityCallResult::Denied {
+                    reason: "session-cancelled".to_owned(),
+                }
+            );
+            // Nothing was charged either: the budget reads as it stood before the call, because a
+            // surface saying "1 of 4" for a proposal that never reached the broker tells a person
+            // their session spent something it did not.
+            assert_eq!(
+                sink.labels(),
+                vec![
+                    format!("started {CAPABILITY} arguments=1 calls=0/4"),
+                    format!("finished {CAPABILITY} Cancelled"),
+                ]
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn an_accepted_attachment_is_reported_where_it_is_accepted() {
+            // The reply carrying the bytes is posted when the whole session ends; the only thing
+            // there is to say in between is that a picture exists and how big it is.
+            let directory = private_broker_directory();
+            let leg = stub_leg(
+                directory.path(),
+                vec![ResponseEnvelope::invocation(offered_attachment())],
+            )
+            .await;
+            let (sink, progress) = recording_sink();
+            let leg = leg
+                .with_provider_attachments(Arc::new(ReplyAttachments::new(1)))
+                .with_progress(progress, 4);
+
+            assert!(matches!(
+                invoke(leg, CAPABILITY).await,
+                CapabilityCallResult::Succeeded(_)
+            ));
+            assert_eq!(
+                sink.labels(),
+                vec![
+                    format!("started {CAPABILITY} arguments=1 calls=1/4"),
+                    "attachment 0 image/png 23".to_owned(),
+                    format!("finished {CAPABILITY} Succeeded"),
+                ]
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_command_word_is_reported_by_the_word_rather_than_the_capability_it_proposes() {
+            // `probe --help` spends no capability call and reaches no capability: the word is the
+            // only name for this round trip, and a provider's usage error is a failed run for the
+            // person watching even though the word answered.
+            let directory = private_broker_directory();
+            let rendered = CommandRunOutcome::Rendered {
+                stdout: String::new(),
+                stderr: "probe: unknown flag
+"
+                .to_owned(),
+                status: 2,
+            };
+            let (mut leg, _observed) = stub_leg_observing(
+                directory.path(),
+                vec![ResponseEnvelope::command_run(rendered)],
+                None,
+            )
+            .await;
+            leg.command_words.insert("probe".to_owned());
+            let (sink, progress) = recording_sink();
+            let leg = leg.with_progress(progress, 4);
+
+            assert!(matches!(
+                run_word(leg, &["--nonsense"], None).await,
+                Some(CommandRun::Rendered { status: 2, .. })
+            ));
+            assert_eq!(
+                sink.labels(),
+                vec![
+                    "started probe arguments=1 calls=0/4".to_owned(),
+                    "finished probe Failed".to_owned(),
+                ]
             );
         }
     }

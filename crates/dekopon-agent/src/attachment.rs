@@ -26,7 +26,12 @@ use thiserror::Error;
 pub const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 
 /// The one media type a delivered attachment may declare.
-const ATTACHMENT_MEDIA_TYPE: &str = "image/png";
+///
+/// Public because a progress surface names what it accepted
+/// ([`ProgressEvent::Attachment`](crate::progress::ProgressEvent::Attachment)), and validation —
+/// not the provider's claim — is what fixes it; [`GeneratedImage::media_type`] answers with this
+/// same constant for one image.
+pub const ATTACHMENT_MEDIA_TYPE: &str = "image/png";
 
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 
@@ -270,23 +275,27 @@ impl ReplyAttachments {
     }
 }
 
-/// Replaces a capability result's `attachments` key with metadata, reporting every refusal.
+/// Replaces a capability result's `attachments` key with metadata, reporting what it accepted and
+/// every refusal.
 ///
-/// Returns the refusals in the order they happened; the caller audits each one. `slot` is `None` for
-/// a session whose route delivers no attachments, which still strips the key: the bytes must not
-/// reach the shell just because nowhere can accept them.
+/// The first answer is the decoded size of each accepted attachment, in offer order — the caller
+/// tells a waiting person what arrived, and [`ATTACHMENT_MEDIA_TYPE`] is what all of them are. The
+/// second is the refusals in the order they happened; the caller audits each one. `slot` is `None`
+/// for a session whose route delivers no attachments, which still strips the key: the bytes must
+/// not reach the shell just because nowhere can accept them.
 pub fn strip_attachments(
     output: &mut Value,
     slot: Option<&ReplyAttachments>,
-) -> Vec<AttachmentRefusal> {
+) -> (Vec<u64>, Vec<AttachmentRefusal>) {
     let Some(object) = output.as_object_mut() else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let Some(offered) = object.remove(ATTACHMENTS_KEY) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let mut refusals = Vec::new();
     let mut accepted = Vec::new();
+    let mut delivered = Vec::new();
     match slot {
         None => refusals.push(AttachmentRefusal::RouteDisabled),
         Some(slot) => {
@@ -297,10 +306,13 @@ pub fn strip_attachments(
                 Ok(attachments) => {
                     for attachment in attachments {
                         match accept(slot, &attachment) {
-                            Ok(bytes) => accepted.push(serde_json::json!({
-                                "mediaType": ATTACHMENT_MEDIA_TYPE,
-                                "bytes": bytes,
-                            })),
+                            Ok(bytes) => {
+                                delivered.push(bytes as u64);
+                                accepted.push(serde_json::json!({
+                                    "mediaType": ATTACHMENT_MEDIA_TYPE,
+                                    "bytes": bytes,
+                                }));
+                            }
                             Err(refusal) => refusals.push(refusal),
                         }
                     }
@@ -315,7 +327,7 @@ pub fn strip_attachments(
             Value::String(first.note().to_owned()),
         );
     }
-    refusals
+    (delivered, refusals)
 }
 
 /// Validates one offered attachment and stores it, answering with its delivered byte count.
@@ -801,7 +813,9 @@ mod tests {
             "attachments": [{"mediaType": "image/png", "base64": STANDARD.encode(png())}],
             "image": {"generationId": "gen-1"}
         });
-        assert!(strip_attachments(&mut output, Some(&slot)).is_empty());
+        let (accepted, refusals) = strip_attachments(&mut output, Some(&slot));
+        assert_eq!(accepted, vec![30], "the decoded size the caller reports");
+        assert!(refusals.is_empty());
         assert_eq!(
             output["attached"],
             json!([{"mediaType": "image/png", "bytes": 30}])
@@ -817,7 +831,7 @@ mod tests {
         let mut output = json!({"attachments": [{"mediaType": "image/png", "base64": "UE5H"}]});
         assert_eq!(
             strip_attachments(&mut output, None),
-            vec![AttachmentRefusal::RouteDisabled]
+            (Vec::new(), vec![AttachmentRefusal::RouteDisabled])
         );
         assert_eq!(output["attached"], json!([]));
         assert_eq!(
@@ -852,7 +866,7 @@ mod tests {
             let mut output = json!({"attachments": offered});
             assert_eq!(
                 strip_attachments(&mut output, Some(&slot)),
-                vec![expected],
+                (Vec::new(), vec![expected]),
                 "{expected:?}"
             );
             assert_eq!(output["attached"], json!([]), "{expected:?}");
@@ -867,11 +881,14 @@ mod tests {
         let slot = ReplyAttachments::new(1);
         let encoded = STANDARD.encode(png());
         let mut first = json!({"attachments": [{"mediaType": "image/png", "base64": encoded}]});
-        assert!(strip_attachments(&mut first, Some(&slot)).is_empty());
+        assert_eq!(
+            strip_attachments(&mut first, Some(&slot)),
+            (vec![30], Vec::new())
+        );
         let mut second = json!({"attachments": [{"mediaType": "image/png", "base64": encoded}]});
         assert_eq!(
             strip_attachments(&mut second, Some(&slot)),
-            vec![AttachmentRefusal::PerReplyLimit]
+            (Vec::new(), vec![AttachmentRefusal::PerReplyLimit])
         );
         assert_eq!(second["attached"], json!([]));
         assert_eq!(slot.take().len(), 1);
@@ -883,7 +900,10 @@ mod tests {
         let slot = ReplyAttachments::new(1);
         for mut output in [json!({"ok": true}), json!("plain text"), json!([1, 2])] {
             let before = output.clone();
-            assert!(strip_attachments(&mut output, Some(&slot)).is_empty());
+            assert_eq!(
+                strip_attachments(&mut output, Some(&slot)),
+                (Vec::new(), Vec::new())
+            );
             assert_eq!(output, before);
         }
     }
