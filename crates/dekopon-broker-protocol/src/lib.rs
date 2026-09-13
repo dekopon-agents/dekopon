@@ -799,18 +799,21 @@ impl RequestEnvelope {
         }
     }
 
-    /// Creates a command-word run request carrying the value piped into the word, if any.
+    /// Creates a command-word run request carrying the value piped into the word, if any, under the
+    /// run's trace.
     #[must_use]
     pub const fn run_command(
         attestation: Option<Attestation>,
         word: String,
         argv: Vec<String>,
         stdin: Option<String>,
+        trace_parent: TraceParent,
     ) -> Self {
         Self {
             api_version: ProtocolVersion::V1Alpha2,
             request: BrokerRequest::RunCommand {
                 attestation,
+                trace_parent,
                 word,
                 argv,
                 stdin,
@@ -879,6 +882,19 @@ pub enum BrokerRequest {
         /// The on-behalf-of claim, or `None` to speak as the connected peer.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
+        /// The run's trace, and the client span that should parent the broker's `broker.command_run`
+        /// span.
+        ///
+        /// Mandatory and validated exactly as [`InvocationRequest::trace_parent`] is: the word, its
+        /// arguments, and what the guest answered belong to the same trace as the proposal that
+        /// follows, and a frame that omits the parent or sends a malformed one fails to decode
+        /// rather than landing the run in a trace of its own. Untrusted, and read only for
+        /// correlation.
+        ///
+        /// Renamed by hand because an enum's `rename_all` names its variants, not their fields, and
+        /// this key must read exactly as it does on an invocation.
+        #[serde(rename = "traceParent")]
+        trace_parent: TraceParent,
         /// The command word, which must belong to a loaded provider.
         word: String,
         /// Arguments as the script supplied them, **without** the word itself.
@@ -1360,15 +1376,25 @@ impl BrokerClient {
     /// The piped value is bounded on this side by [`FrameLimits::max_frame_bytes`]: an oversized
     /// one fails as [`ClientError::Protocol`] in the request phase before a byte reaches the
     /// socket, and by the broker host's own input bound on the other side.
+    ///
+    /// `trace_parent` is the run's trace and the client span the broker's `broker.command_run`
+    /// span adopts as its parent, so the word lands in the same trace as the invocation it proposes.
     pub async fn run_command(
         &self,
         attestation: Option<Attestation>,
         word: String,
         argv: Vec<String>,
         stdin: Option<String>,
+        trace_parent: TraceParent,
     ) -> Result<CommandRunOutcome, ClientError> {
         match self
-            .exchange(RequestEnvelope::run_command(attestation, word, argv, stdin))
+            .exchange(RequestEnvelope::run_command(
+                attestation,
+                word,
+                argv,
+                stdin,
+                trace_parent,
+            ))
             .await?
         {
             BrokerResponse::CommandRun { result } => Ok(result),

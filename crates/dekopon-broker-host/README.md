@@ -132,6 +132,7 @@ limits. Description and command runs get a disabled sticky context. Wrong-interf
 quota, budget, corruption, and timeout errors stay terminal after a guest catches the WIT enum.
 Writes take effect per host call, and a completed write is not undone by invocation failure. A
 successful provider result requires storage resource finalization, whose deadline starts before
-already-dispatched blocking jobs drain; no later filesystem step starts after expiry. Storage spans
-and evidence omit identity, scope, provider, capability, and exact provider byte totals, retaining
-only content-free operation/sync/quota counts and coarse byte buckets.
+already-dispatched blocking jobs drain; no later filesystem step starts after expiry. A
+storage-backed `provider.invoke` span records the capability, provider, and input every other
+invocation span records, plus `storage = true`; storage evidence carries operation, sync, and quota
+counts and the exact bytes read and written.

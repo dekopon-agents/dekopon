@@ -71,18 +71,22 @@ fn invocation() -> InvocationRequest {
         id: "invoke-test"
             .parse::<InvocationId>()
             .expect("valid invocation fixture"),
-        capability: "echo.echo"
+        capability: "cli-probe.upper"
             .parse::<CapabilityId>()
             .expect("valid capability fixture"),
-        trace_parent: SAMPLE_TRACE_PARENT
-            .parse::<TraceParent>()
-            .expect("valid traceparent fixture"),
+        trace_parent: sample_trace_parent(),
         secret_use: None,
-        input: json!({"message": "hello"}),
+        input: json!({"text": "hello"}),
     }
 }
 
 const SAMPLE_TRACE_PARENT: &str = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+
+fn sample_trace_parent() -> TraceParent {
+    SAMPLE_TRACE_PARENT
+        .parse::<TraceParent>()
+        .expect("valid traceparent fixture")
+}
 
 #[test]
 fn trace_parent_round_trips_through_its_wire_form() {
@@ -393,7 +397,7 @@ fn wire_invocation_contains_no_identity_or_authority_fields() {
                 "operation": "invoke",
                 "invocation": {
                     "id": "invoke-test",
-                    "capability": "echo.echo",
+                    "capability": "cli-probe.upper",
                     "traceParent": SAMPLE_TRACE_PARENT,
                     "input": {},
                     "actor": {"type": "service", "principal": "forged"}
@@ -419,7 +423,7 @@ fn public_drn_is_typed_optional_proposal_data_and_never_provider_input() {
         "drn:com.xrl:secret:test:api/password"
     );
     assert_eq!(value["secretUse"]["kind"], "httpBasic");
-    assert_eq!(value["input"], json!({"message": "hello"}));
+    assert_eq!(value["input"], json!({"text": "hello"}));
     assert!(!value["input"].to_string().contains("drn:"));
     let encoded = value.to_string();
     assert!(
@@ -1517,7 +1521,13 @@ fn every_verb_is_one_operation_whatever_attestation_accompanies_it() {
         ),
         (
             "runCommand",
-            RequestEnvelope::run_command(None, "memory".to_owned(), Vec::new(), None),
+            RequestEnvelope::run_command(
+                None,
+                "memory".to_owned(),
+                Vec::new(),
+                None,
+                sample_trace_parent(),
+            ),
         ),
         (
             "runCommand",
@@ -1526,6 +1536,7 @@ fn every_verb_is_one_operation_whatever_attestation_accompanies_it() {
                 "memory".to_owned(),
                 vec!["search".to_owned(), "-".to_owned()],
                 Some("piped".to_owned()),
+                sample_trace_parent(),
             ),
         ),
         ("invoke", RequestEnvelope::invoke(None, invocation())),
@@ -1650,11 +1661,16 @@ fn recording_is_reachable_only_through_its_own_operation() {
         "user": "hello",
         "assistant": "hi",
     });
+    // Each frame is otherwise well-formed, so the smuggled turn is the only reason it is refused.
     for smuggled in [
         json!({"operation": "invoke", "invocation": {
-            "id": "invoke-chat", "capability": "echo.echo", "trace": "trace-chat", "input": {},
+            "id": "invoke-chat", "capability": "cli-probe.upper",
+            "traceParent": SAMPLE_TRACE_PARENT, "input": {},
         }, "turn": turn.clone()}),
-        json!({"operation": "runCommand", "word": "memory", "argv": [], "turn": turn.clone()}),
+        json!({
+            "operation": "runCommand", "traceParent": SAMPLE_TRACE_PARENT, "word": "memory",
+            "argv": [], "turn": turn.clone(),
+        }),
         json!({"operation": "capabilities", "turn": turn}),
     ] {
         assert!(
@@ -1672,8 +1688,13 @@ fn recording_is_reachable_only_through_its_own_operation() {
 /// bare run is the same frame with or without a `stdin` key and a piped one carries the text.
 #[test]
 fn a_run_command_frame_omits_an_absent_piped_value() {
-    let bare =
-        RequestEnvelope::run_command(None, "probe".to_owned(), vec!["--help".to_owned()], None);
+    let bare = RequestEnvelope::run_command(
+        None,
+        "probe".to_owned(),
+        vec!["--help".to_owned()],
+        None,
+        sample_trace_parent(),
+    );
     let encoded = serde_json::to_value(&bare).expect("envelope serializes");
     assert_eq!(encoded["request"]["operation"], json!("runCommand"));
     assert!(encoded["request"].get("stdin").is_none(), "{encoded}");
@@ -1687,12 +1708,80 @@ fn a_run_command_frame_omits_an_absent_piped_value() {
         "probe".to_owned(),
         vec!["upper".to_owned(), "-".to_owned()],
         Some("hello".to_owned()),
+        sample_trace_parent(),
     );
     let encoded = serde_json::to_value(&piped).expect("envelope serializes");
     assert_eq!(encoded["request"]["stdin"], json!("hello"), "{encoded}");
     assert_eq!(
         serde_json::from_value::<RequestEnvelope>(encoded).expect("envelope decodes"),
         piped
+    );
+}
+
+/// A run frame names the trace its word belongs to, exactly as an invocation does.
+///
+/// The word, its arguments, and the guest's answer are the first half of the proposal that
+/// follows, so a frame without a parent — or with one the broker would have to guess at — is
+/// refused at decode rather than landing the run in a trace of its own.
+#[test]
+fn a_run_command_frame_requires_one_well_formed_trace_parent() {
+    let complete = serde_json::to_value(RequestEnvelope::run_command(
+        None,
+        "probe".to_owned(),
+        vec!["upper".to_owned(), "--text".to_owned(), "hello".to_owned()],
+        None,
+        sample_trace_parent(),
+    ))
+    .expect("envelope serializes");
+    assert_eq!(
+        complete["request"]["traceParent"],
+        json!(SAMPLE_TRACE_PARENT),
+        "{complete}"
+    );
+    let decoded =
+        serde_json::from_value::<RequestEnvelope>(complete.clone()).expect("envelope decodes");
+    let BrokerRequest::RunCommand { trace_parent, .. } = decoded.request else {
+        panic!("decoded a different operation: {decoded:?}");
+    };
+    assert_eq!(
+        trace_parent.trace().to_string(),
+        "4bf92f3577b34da6a3ce929d0e0e4736"
+    );
+
+    for (rejected, cause) in [
+        (json!(null), "invalid type: null"),
+        (
+            json!("not-a-traceparent"),
+            "traceparent must be `00-<32 hex>-<16 hex>-<2 hex>`",
+        ),
+        (
+            json!("00-00000000000000000000000000000000-00f067aa0ba902b7-01"),
+            "traceparent trace identifier must not be all zeroes",
+        ),
+    ] {
+        let mut frame = complete.clone();
+        frame["request"]
+            .as_object_mut()
+            .expect("request object")
+            .insert("traceParent".to_owned(), rejected.clone());
+        let error = serde_json::from_value::<RequestEnvelope>(frame)
+            .expect_err("a malformed trace parent must not decode");
+        assert!(
+            error.to_string().contains(cause),
+            "{rejected} was refused for the wrong reason: {error}"
+        );
+    }
+
+    let mut omitted = complete;
+    omitted["request"]
+        .as_object_mut()
+        .expect("request object")
+        .remove("traceParent");
+    let error = serde_json::from_value::<RequestEnvelope>(omitted)
+        .expect_err("a run frame without a trace parent must not decode");
+    assert!(
+        error.to_string().contains("missing field `traceParent`"),
+        "refused for the wrong reason: {error}"
     );
 }
 
@@ -1708,6 +1797,24 @@ fn a_command_run_response_round_trips_each_outcome() {
                     .parse::<CapabilityId>()
                     .expect("valid capability fixture"),
                 input: json!({"text": "hello"}),
+                secret_use: None,
+            },
+        ),
+        // A provider command may name a public DRN beside its proposal; the broker authorizes that
+        // use like any other, so the proposal has to reach the agent carrying it.
+        (
+            "proposed",
+            CommandRunOutcome::Proposed {
+                capability: "cli-probe.upper"
+                    .parse::<CapabilityId>()
+                    .expect("valid capability fixture"),
+                input: json!({"text": "hello"}),
+                secret_use: Some(SecretUseProposal::HttpBasic {
+                    secret: "drn:com.xrl:secret:test:api/password"
+                        .parse()
+                        .expect("canonical DRN"),
+                    username: "userA".to_owned(),
+                }),
             },
         ),
         (
@@ -1728,6 +1835,10 @@ fn a_command_run_response_round_trips_each_outcome() {
             },
         ),
     ] {
+        let secret_use = match &result {
+            CommandRunOutcome::Proposed { secret_use, .. } => secret_use.clone(),
+            CommandRunOutcome::Rendered { .. } | CommandRunOutcome::Failed { .. } => None,
+        };
         let envelope = ResponseEnvelope::command_run(result);
         let encoded = serde_json::to_value(&envelope).expect("envelope serializes");
         assert_eq!(
@@ -1740,6 +1851,21 @@ fn a_command_run_response_round_trips_each_outcome() {
             json!(expected),
             "{encoded}"
         );
+        match secret_use {
+            Some(_) => assert_eq!(
+                encoded["response"]["result"]["secretUse"],
+                json!({
+                    "kind": "httpBasic",
+                    "secret": "drn:com.xrl:secret:test:api/password",
+                    "username": "userA",
+                }),
+                "{encoded}"
+            ),
+            None => assert!(
+                encoded["response"]["result"].get("secretUse").is_none(),
+                "an outcome without a DRN carries no secretUse key: {encoded}"
+            ),
+        }
         assert_eq!(
             serde_json::from_value::<ResponseEnvelope>(encoded.clone()).expect("envelope decodes"),
             envelope,
@@ -1784,6 +1910,7 @@ async fn a_run_command_exchange_decodes_a_rendered_answer() {
             request.request,
             BrokerRequest::RunCommand {
                 attestation: None,
+                trace_parent: sample_trace_parent(),
                 word: "probe".to_owned(),
                 argv: vec!["--help".to_owned()],
                 stdin: None,
@@ -1796,7 +1923,13 @@ async fn a_run_command_exchange_decodes_a_rendered_answer() {
 
     let client = BrokerClient::new(&socket, uid, limits).expect("valid client limits");
     let outcome = client
-        .run_command(None, "probe".to_owned(), vec!["--help".to_owned()], None)
+        .run_command(
+            None,
+            "probe".to_owned(),
+            vec!["--help".to_owned()],
+            None,
+            sample_trace_parent(),
+        )
         .await
         .expect("authenticated exchange succeeds");
     assert_eq!(outcome, rendered);
@@ -1831,6 +1964,7 @@ async fn an_oversized_piped_value_is_refused_before_it_leaves_the_client() {
             "probe".to_owned(),
             vec!["upper".to_owned(), "-".to_owned()],
             Some("x".repeat(256)),
+            sample_trace_parent(),
         )
         .await
         .expect_err("an oversized piped value must fail");

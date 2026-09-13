@@ -1299,23 +1299,41 @@ impl BrokerProviderRegistry {
             .ok_or_else(|| BrokerHostError::UnknownCommandWord {
                 word: word.to_owned(),
             })?;
-        // Parsed here rather than handed onward as JSON: guest output is this crate's concern, and
-        // a daemon that never sees the raw string cannot accidentally forward it to a caller.
-        //
-        // `argv` and `stdin` are deliberately not span fields for the same reason the invoke span
-        // omits input: they are model-authored text.
+        // What the script ran, what it piped, and what the guest answered are the run, so all three
+        // are on the span: each bounded to one attribute's cap, with its full length beside it.
+        let span = tracing::info_span!(
+            "provider.run_command",
+            provider = %provider.manifest.id,
+            word,
+            command.export = command_export_name(&provider.command_export),
+            command.arguments = tracing::field::Empty,
+            command.arguments.bytes = tracing::field::Empty,
+            command.stdin = tracing::field::Empty,
+            command.stdin.bytes = tracing::field::Empty,
+            command.output = tracing::field::Empty,
+            command.output.bytes = tracing::field::Empty,
+            stores = tracing::field::Empty,
+            instantiations = tracing::field::Empty,
+            fuel.consumed = tracing::field::Empty,
+        );
+        let arguments = Value::Array(argv.iter().cloned().map(Value::String).collect()).to_string();
+        span.record(
+            "command.arguments",
+            &*dekopon_core::bounded_attribute(&arguments),
+        );
+        span.record("command.arguments.bytes", arguments.len());
+        if let Some(stdin) = stdin {
+            span.record("command.stdin", &*dekopon_core::bounded_attribute(stdin));
+            span.record("command.stdin.bytes", stdin.len());
+        }
         let json = provider
             .run_command(argv, stdin)
-            .instrument(tracing::info_span!(
-                "provider.run_command",
-                provider = %provider.manifest.id,
-                word,
-                command.export = command_export_name(&provider.command_export),
-                stores = tracing::field::Empty,
-                instantiations = tracing::field::Empty,
-                fuel.consumed = tracing::field::Empty,
-            ))
+            .instrument(span.clone())
             .await?;
+        span.record("command.output", &*dekopon_core::bounded_attribute(&json));
+        span.record("command.output.bytes", json.len());
+        // Parsed here rather than handed onward as JSON: guest output is this crate's concern, and
+        // a daemon that never sees the raw string cannot accidentally forward it to a caller.
         serde_json::from_str::<CommandRunOutcome>(&json).map_err(|source| {
             BrokerHostError::InvalidCommandRun {
                 provider: provider.manifest.id.clone(),
@@ -1492,10 +1510,24 @@ impl BrokerProviderRegistry {
                 )
             }
         };
-        // `proposal.input` is a field on every non-storage span below. It is untrusted payload, and
-        // containing it is the authority boundary's job rather than telemetry's: the operator's
-        // trace is where the run is reconstructed from, so what a provider was actually asked to do
-        // belongs in it. A storage-backed invocation still opens the blind span.
+        // `proposal.input` is a field on this span whether or not the capability is storage-backed.
+        // It is untrusted payload, and containing it is the authority boundary's job rather than
+        // telemetry's: the operator's trace is where the run is reconstructed from, so what a
+        // provider was actually asked to do belongs in it.
+        let span = tracing::info_span!(
+            "provider.invoke",
+            capability = %proposal.capability,
+            provider = %provider.manifest.id,
+            input = tracing::field::Empty,
+            storage = tracing::field::Empty,
+            stores = tracing::field::Empty,
+            instantiations = tracing::field::Empty,
+            fuel.consumed = tracing::field::Empty,
+        );
+        span.record("input", tracing::field::display(&proposal.input));
+        if storage_backed {
+            span.record("storage", true);
+        }
         provider
             .invoke(
                 &proposal.capability,
@@ -1504,27 +1536,7 @@ impl BrokerProviderRegistry {
                 credential,
                 storage_transaction,
             )
-            .instrument(if storage_backed {
-                tracing::info_span!(
-                    "provider.invoke",
-                    storage = true,
-                    stores = tracing::field::Empty,
-                    instantiations = tracing::field::Empty,
-                    fuel.consumed = tracing::field::Empty,
-                )
-            } else {
-                let span = tracing::info_span!(
-                    "provider.invoke",
-                    capability = %proposal.capability,
-                    provider = %provider.manifest.id,
-                    input = tracing::field::Empty,
-                    stores = tracing::field::Empty,
-                    instantiations = tracing::field::Empty,
-                    fuel.consumed = tracing::field::Empty,
-                );
-                span.record("input", tracing::field::display(&proposal.input));
-                span
-            })
+            .instrument(span)
             .await
     }
 }
