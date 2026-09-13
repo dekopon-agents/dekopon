@@ -10,11 +10,11 @@ do not understand rather than guessing.
 
 ## Rebuild every provider component on the 0.13.0 SDK (0.14.0, unreleased)
 
-**Breaking.** Every pre-0.13 provider compatibility path is gone. Rebuild and re-release every
-out-of-tree provider component on `dekopon-provider-sdk` 0.13.0 or later, then re-pin the artifacts
-your broker loads, *before* upgrading the broker. There is no deprecation window and no flag: a
-component that has not moved fails at load, and the broker refuses to start with it in its provider
-set.
+**Breaking.** Every pre-0.13 provider compatibility path is gone. Re-pin every provider artifact
+your broker loads to a build on `dekopon-provider-sdk` 0.13.0 or later — and rebuild and re-release
+any provider you own yourself — *before* upgrading the broker. There is no deprecation window and no
+flag: a component that has not moved fails at load, and the broker refuses to start with it in its
+provider set.
 
 Two things stop working:
 
@@ -33,11 +33,11 @@ Two things stop working:
 A component that exports only `describe` and `invoke`, including every one built against
 `dekopon:provider@0.1.0`, is unaffected: that world is unchanged and those components keep loading.
 
-Released provider versions that already satisfy this, at the time of writing: `gh` 0.3.0, `curl`
-0.2.0, `turso-sql` 0.2.0, `memory-chat` 0.2.0, `mediawiki` 0.2.0, `echo` 0.2.0, `jsonplaceholder`
-0.2.0, `gpt-image` 0.1.0, and `openobserve` 0.1.0. Any other out-of-tree provider must be rebuilt
-and re-released before this upgrade — `python`, `ripgrep`, and `skylight-private` are still
-published on a pre-0.13 SDK and will not load.
+Every provider released from the `dekopon-agents` organization already satisfies this: `gh` 0.3.0,
+`curl` 0.2.0, `turso-sql` 0.2.0, `memory-chat` 0.2.0, `mediawiki` 0.2.0, `echo` 0.2.0,
+`jsonplaceholder` 0.2.0, `ripgrep` 0.2.0, `python` 0.2.0, `skylight-private` 0.2.0, `gpt-image`
+0.1.0, and `openobserve` 0.1.0. Pin those versions, or later ones. A provider you build yourself
+must be rebuilt on the 0.13.0 SDK the same way.
 
 Embedders lose the machinery with it:
 
