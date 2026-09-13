@@ -27,8 +27,9 @@ use tokio::{
 };
 
 use crate::{
-    config::{LivenessMode, ProgressSurface, ResolvedLiveness},
+    config::{LivenessMode, LivenessSettings, ProgressSurface, ResolvedLiveness},
     progress::{
+        KeepAlive,
         adapter::{EVENT_QUEUE, ProgressAdapter, ProgressCounters, record},
         cancel_label,
         text::{ProgressDetail, ProgressText, RenderState},
@@ -158,7 +159,14 @@ pub(crate) struct ProgressInputs {
     pub reply: ReplyTarget,
     pub transport: String,
     pub detail: ProgressDetail,
+    /// The transport's block, for the operator wording it owns.
     pub liveness: Arc<ResolvedLiveness>,
+    /// What this conversation kind actually renders, and how often it says it is alive.
+    ///
+    /// Resolved by the session from `ResolvedLiveness::for_kind`, because a direct message with
+    /// one reader and a channel with a hundred are worth different budgets from one block.
+    pub settings: LivenessSettings,
+    pub keep_alive: KeepAlive,
     pub cancellation: SessionCancellation,
     /// Wall-clock bound counted from `Started`, which is agent time rather than admission time.
     pub max_duration: Option<Duration>,
@@ -302,6 +310,8 @@ struct Surface {
     transport: String,
     detail: ProgressDetail,
     liveness: Arc<ResolvedLiveness>,
+    settings: LivenessSettings,
+    keep_alive: KeepAlive,
     coordination: Arc<Coordination>,
     counters: Arc<ProgressCounters>,
     cancellation: SessionCancellation,
@@ -342,6 +352,8 @@ impl Surface {
             transport: inputs.transport,
             detail: inputs.detail,
             liveness: inputs.liveness,
+            settings: inputs.settings,
+            keep_alive: inputs.keep_alive,
             coordination,
             counters,
             cancellation: inputs.cancellation,
@@ -368,7 +380,7 @@ impl Surface {
 
     /// Whether the transport publishes anything at all while a session runs.
     fn native(&self) -> bool {
-        self.liveness.settings.mode == LivenessMode::Native && self.target.is_some()
+        self.settings.mode == LivenessMode::Native && self.target.is_some()
     }
 
     /// Whether the streamed answer is this session's surface.
@@ -379,7 +391,7 @@ impl Surface {
     fn streams(&self) -> bool {
         self.native()
             && self.detail != ProgressDetail::Off
-            && self.liveness.settings.stream
+            && self.settings.stream
             && self.driver.stream().is_some()
     }
 
@@ -387,13 +399,13 @@ impl Surface {
     fn writes_progress(&self) -> bool {
         self.native()
             && self.detail != ProgressDetail::Off
-            && self.liveness.settings.progress == ProgressSurface::Message
+            && self.settings.progress == ProgressSurface::Message
             && !self.streams()
     }
 
     /// Whether the surface carries the transport's own stop control.
     fn cancel_control(&self) -> bool {
-        self.liveness.settings.cancel_button && self.driver.cancel_button().is_some()
+        self.settings.cancel_button && self.driver.cancel_button().is_some()
     }
 
     /// The next instant this task has something to do.
@@ -592,7 +604,7 @@ impl Surface {
     /// each line still reads its elapsed seconds off the clock, so a late tick tells the truth
     /// about how long the person has been waiting.
     fn schedule_keep_alive(&mut self, from: Instant) {
-        let keep_alive = &self.liveness.keep_alive;
+        let keep_alive = &self.keep_alive;
         if self.keep_alives >= keep_alive.max {
             self.next_keep_alive = None;
             return;

@@ -178,7 +178,7 @@ The session:
    which is what makes a follow-up like "and 4712?" answerable. Only the question and the answer
    are kept: the `http-probe.fetch` output above is dropped at write-back and never replayed.
    Nothing is written to disk, nothing reaches the broker, and fifteen idle minutes or a narrowed
-   grant drops it. Set the route to `mode: oneShot` — or leave the `conversation:` block out, which
+   grant drops it. Set the route to `mode: oneShot` — or leave the `memory:` block out, which
    means the same thing — and every message starts from an empty prompt again.
 
 ### The refusals worth knowing

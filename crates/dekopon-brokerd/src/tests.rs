@@ -363,24 +363,38 @@ async fn attestor_grants_and_subject_mappings_are_strictly_validated() {
     }
 
     for scope in [
-        json!({
-            "breadth": "exactConversation", "kind": "slack", "transport": "slack",
-            "channel": "c0123abc", "conversation": "c0123abc:01712345678.1"
-        }),
-        json!({
-            "breadth": "exactChannel", "kind": "discord", "transport": "discord",
-            "channel": "00123"
-        }),
-        json!({
-            "breadth": "exactConversation", "kind": "telegram", "transport": "telegram",
-            "channel": "-1001", "conversation": "-1001:topic:00"
-        }),
-        json!({
-            "breadth": "transportWide", "kind": "local", "transport": "dev"
-        }),
+        // The retired 0.13 tag: refused by name so the fix is one sentence.
         json!({
             "breadth": "exactChannel", "kind": "slack", "transport": "slack",
-            "channel": format!("c{}", "x".repeat(256))
+            "conversation": {"kind": "any"}
+        }),
+        json!({
+            "kind": "discord", "transport": "discord",
+            "conversation": {"kind": ["channel"], "ids": ["00123"]}
+        }),
+        json!({
+            "kind": "discord", "transport": "discord",
+            "conversation": {"kind": ["groupDirectMessage"]}
+        }),
+        json!({
+            "kind": "telegram", "transport": "telegram",
+            "conversation": {"kind": ["channel"], "container": "t0123abc"}
+        }),
+        // A bare kind word decodes to a narrower rule than it reads as, so it never decodes.
+        json!({
+            "kind": "slack", "transport": "slack", "conversation": {"kind": "channel"}
+        }),
+        json!({
+            "kind": "local", "transport": "dev", "conversation": {"kind": "any"}
+        }),
+        json!({
+            "kind": "slack", "transport": "slack",
+            "conversation": {"kind": ["channel"], "ids": [format!("c{}", "x".repeat(256))]}
+        }),
+        // Grants never name a thread; `kind: [channel, thread]` is how threads are claimed.
+        json!({
+            "kind": "discord", "transport": "discord",
+            "conversation": {"kind": ["thread"], "ids": ["123:456"]}
         }),
     ] {
         let mut invalid = document.clone();
@@ -388,9 +402,12 @@ async fn attestor_grants_and_subject_mappings_are_strictly_validated() {
         write_config(&path, &invalid);
         let error = config::load(&path, uid)
             .await
-            .expect_err("noncanonical exact chat scope must fail at startup");
+            .expect_err("a chat scope that can never name a conversation fails at startup");
         assert!(
-            matches!(error, config::ConfigError::Attestor { .. }),
+            matches!(
+                error,
+                config::ConfigError::Attestor { .. } | config::ConfigError::Decode { .. }
+            ),
             "scope {scope} produced {error}"
         );
     }

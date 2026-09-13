@@ -10,9 +10,9 @@ use dekopon_core::{
 use super::{
     AttestorGrant, AuditConfigurationError, AuditError, AuditEvent, AuditLog, AuthenticatedContext,
     AuthorityEncoder, BrokerBuildError, CapabilityRoute, ChatMemoryConfig, ChatScopeClaim,
-    ChatScopeGrant, ChatTransportKind, ConstraintSet, ContextError, InMemoryAuditLog,
-    canonical_chat_scope, encode_capability_authority, encode_execution_constraints,
-    encode_host_limits, encode_memory_config, encode_storage_limits,
+    ChatScopeGrant, ChatTransportKind, ConstraintSet, ContextError, Conversation, ConversationKind,
+    ConversationKindMatch, ConversationMatch, InMemoryAuditLog, encode_capability_authority,
+    encode_execution_constraints, encode_host_limits, encode_memory_config, encode_storage_limits,
 };
 
 fn decision(invocation: &str, allowed: bool) -> AuditEvent {
@@ -676,10 +676,12 @@ async fn a_panicking_storage_materialization_keeps_its_panic_and_its_public_cate
 fn an_unknown_local_subject_service_names_itself_in_the_refusal() {
     let grant = |service: &str| AttestorGrant {
         namespaces: vec!["slack".to_owned()],
-        chat_scopes: vec![ChatScopeGrant::TransportWide {
+        chat_scopes: vec![ChatScopeGrant {
             kind: ChatTransportKind::Local,
             transport: "local".parse().expect("transport"),
+            conversation: any_conversation(),
             local_subject_service: Some(service.to_owned()),
+            breadth: None,
         }],
     };
 
@@ -701,103 +703,273 @@ fn an_unknown_local_subject_service_names_itself_in_the_refusal() {
         .expect("a canonical local subject service is accepted");
 }
 
+/// Every selector fixture in this module names every conversation on its transport.
+fn any_conversation() -> ConversationMatch {
+    ConversationMatch {
+        kind: ConversationKindMatch::Any,
+        container: None,
+        ids: None,
+    }
+}
+
+fn grant(
+    kind: ChatTransportKind,
+    transport: &str,
+    conversation: ConversationMatch,
+) -> ChatScopeGrant {
+    ChatScopeGrant {
+        kind,
+        transport: transport.parse().expect("transport"),
+        conversation,
+        local_subject_service: None,
+        breadth: None,
+    }
+}
+
+fn kinds(kinds: &[ConversationKind]) -> ConversationKindMatch {
+    ConversationKindMatch::Kinds(kinds.to_vec())
+}
+
 #[test]
-fn exact_chat_scope_configuration_requires_service_canonical_forms() {
-    for scope in [
-        ChatScopeGrant::ExactChannel {
-            kind: ChatTransportKind::Discord,
-            transport: "discord".parse().expect("transport"),
-            channel: "00123".to_owned(),
-            local_subject_service: None,
-        },
-        ChatScopeGrant::ExactConversation {
-            kind: ChatTransportKind::Discord,
-            transport: "discord".parse().expect("transport"),
-            channel: "123".to_owned(),
-            conversation: "456".to_owned(),
-            local_subject_service: None,
-        },
-        ChatScopeGrant::ExactConversation {
-            kind: ChatTransportKind::Slack,
-            transport: "slack".parse().expect("transport"),
-            channel: "c0123abc".to_owned(),
-            conversation: "c0123abc:01712345678.1".to_owned(),
-            local_subject_service: None,
-        },
-        ChatScopeGrant::ExactConversation {
-            kind: ChatTransportKind::Telegram,
-            transport: "telegram".parse().expect("transport"),
-            channel: "-1001".to_owned(),
-            conversation: "-1001:topic:00".to_owned(),
-            local_subject_service: None,
-        },
-        ChatScopeGrant::ExactConversation {
-            kind: ChatTransportKind::Telegram,
-            transport: "telegram".parse().expect("transport"),
-            channel: "-1001".to_owned(),
-            conversation: "-1001:topic:9223372036854775808".to_owned(),
-            local_subject_service: None,
-        },
-        ChatScopeGrant::ExactChannel {
-            kind: ChatTransportKind::Slack,
-            transport: "slack".parse().expect("transport"),
-            channel: format!("c{}", "x".repeat(256)),
-            local_subject_service: None,
-        },
+fn chat_scope_configuration_requires_service_canonical_forms_and_refuses_the_retired_breadth() {
+    for (scope, why) in [
+        (
+            grant(
+                ChatTransportKind::Discord,
+                "discord",
+                ConversationMatch {
+                    kind: kinds(&[ConversationKind::Channel]),
+                    container: None,
+                    ids: Some(vec!["00123".to_owned()]),
+                },
+            ),
+            "a snowflake carries no leading zero",
+        ),
+        (
+            grant(
+                ChatTransportKind::Discord,
+                "discord",
+                ConversationMatch {
+                    kind: kinds(&[ConversationKind::GroupDirectMessage]),
+                    container: None,
+                    ids: None,
+                },
+            ),
+            "Discord never produces a group direct message",
+        ),
+        (
+            grant(
+                ChatTransportKind::Slack,
+                "slack",
+                ConversationMatch {
+                    kind: kinds(&[ConversationKind::Channel]),
+                    container: None,
+                    ids: Some(vec![format!("c{}", "x".repeat(256))]),
+                },
+            ),
+            "an unbounded id fails closed",
+        ),
+        (
+            grant(
+                ChatTransportKind::Telegram,
+                "telegram",
+                ConversationMatch {
+                    kind: ConversationKindMatch::Any,
+                    container: Some("t0123abc".to_owned()),
+                    ids: None,
+                },
+            ),
+            "Telegram has no container",
+        ),
+        (
+            // S31: a grant names a parent, never one thread.
+            grant(
+                ChatTransportKind::Discord,
+                "discord",
+                ConversationMatch {
+                    kind: kinds(&[ConversationKind::Thread]),
+                    container: None,
+                    ids: Some(vec!["123:456".to_owned()]),
+                },
+            ),
+            "a grant never names a thread",
+        ),
     ] {
+        let error = AttestorGrant {
+            namespaces: vec!["slack".to_owned()],
+            chat_scopes: vec![scope],
+        }
+        .validate()
+        .expect_err(why);
         assert!(
-            AttestorGrant {
-                namespaces: vec!["slack".to_owned()],
-                chat_scopes: vec![scope],
-            }
-            .validate()
-            .is_err()
+            matches!(error, BrokerBuildError::InvalidChatScopeConversation { .. }),
+            "{why}: {error}"
         );
     }
 
     AttestorGrant {
         namespaces: vec!["telegram".to_owned()],
-        chat_scopes: vec![ChatScopeGrant::ExactConversation {
-            kind: ChatTransportKind::Telegram,
-            transport: "telegram".parse().expect("transport"),
-            channel: i64::MIN.to_string(),
-            conversation: format!("{}:topic:{}", i64::MIN, i64::MAX),
-            local_subject_service: None,
-        }],
+        chat_scopes: vec![grant(
+            ChatTransportKind::Telegram,
+            "telegram",
+            ConversationMatch {
+                kind: kinds(&[ConversationKind::Channel, ConversationKind::Thread]),
+                container: None,
+                ids: Some(vec![i64::MIN.to_string()]),
+            },
+        )],
     }
     .validate()
     .expect("signed Telegram service limits are accepted exactly");
 
-    AttestorGrant {
-        namespaces: vec!["whatsapp".to_owned()],
-        chat_scopes: vec![ChatScopeGrant::ExactConversation {
-            kind: ChatTransportKind::Whatsapp,
-            transport: "whatsapp".parse().expect("transport"),
-            channel: "123:456:16034700182".to_owned(),
-            conversation: "123:456:16034700182".to_owned(),
-            local_subject_service: None,
+    let retired = AttestorGrant {
+        namespaces: vec!["slack".to_owned()],
+        chat_scopes: vec![ChatScopeGrant {
+            breadth: Some(super::RetiredKey),
+            ..grant(ChatTransportKind::Slack, "slack", any_conversation())
         }],
     }
     .validate()
-    .expect("exact WhatsApp WABA, phone, and sender scope is accepted");
+    .expect_err("`breadth` is gone");
+    assert!(
+        matches!(retired, BrokerBuildError::RetiredChatScopeBreadth),
+        "{retired}"
+    );
+    assert!(
+        retired.to_string().contains("conversation: { kind:"),
+        "the refusal names its replacement: {retired}"
+    );
+}
 
-    let scope = ChatScopeClaim {
+/// The two single-sender transports correlate the conversation with the attested subject.
+#[test]
+fn a_whatsapp_or_telegram_direct_message_must_be_the_attested_senders_own() {
+    let attestor = AttestorGrant {
+        namespaces: vec!["whatsapp".to_owned(), "telegram".to_owned()],
+        chat_scopes: vec![
+            grant(ChatTransportKind::Whatsapp, "whatsapp", any_conversation()),
+            grant(ChatTransportKind::Telegram, "telegram", any_conversation()),
+        ],
+    };
+    attestor.validate().expect("both grants are canonical");
+
+    let whatsapp = ChatScopeClaim {
         transport: "whatsapp".parse().expect("transport"),
         kind: ChatTransportKind::Whatsapp,
-        channel: "123:456:16034700182".to_owned(),
-        conversation: "123:456:16034700182".to_owned(),
+        conversation: Conversation {
+            kind: ConversationKind::DirectMessage,
+            container: Some("123:456".to_owned()),
+            id: "16034700182".to_owned(),
+            thread: None,
+        },
     };
-    assert!(canonical_chat_scope(
+    assert!(attestor.permits_chat(
         &ExternalSubject::whatsapp("16034700182").expect("subject"),
-        &scope,
+        &whatsapp,
     ));
     assert!(
-        !canonical_chat_scope(
+        !attestor.permits_chat(
             &ExternalSubject::whatsapp("16034700999").expect("subject"),
-            &scope,
+            &whatsapp,
         ),
-        "the signed sender in scope cannot be detached from the attested subject"
+        "the signed sender in the conversation cannot be detached from the attested subject"
     );
+
+    let telegram = ChatScopeClaim {
+        transport: "telegram".parse().expect("transport"),
+        kind: ChatTransportKind::Telegram,
+        conversation: Conversation {
+            kind: ConversationKind::DirectMessage,
+            container: None,
+            id: "5551234".to_owned(),
+            thread: None,
+        },
+    };
+    assert!(attestor.permits_chat(
+        &ExternalSubject::telegram("5551234").expect("subject"),
+        &telegram,
+    ));
+    assert!(
+        !attestor.permits_chat(
+            &ExternalSubject::telegram("5559999").expect("subject"),
+            &telegram,
+        ),
+        "a Telegram private chat is the sender's own chat id"
+    );
+}
+
+/// A grant on a parent channel authorizes the threads under it exactly when it lists `thread`.
+#[test]
+fn a_thread_claim_is_authorized_by_its_parents_grant_and_only_with_thread_in_the_list() {
+    let discord_claim = |kind, id: &str, thread: Option<&str>| ChatScopeClaim {
+        transport: "elote-logs".parse().expect("transport"),
+        kind: ChatTransportKind::Discord,
+        conversation: Conversation {
+            kind,
+            container: Some("1153119165809434697".to_owned()),
+            id: id.to_owned(),
+            thread: thread.map(str::to_owned),
+        },
+    };
+    let subject = ExternalSubject::discord("578258790881951745").expect("subject");
+    let with = |kind: ConversationKindMatch| AttestorGrant {
+        namespaces: vec!["discord".to_owned()],
+        chat_scopes: vec![grant(
+            ChatTransportKind::Discord,
+            "elote-logs",
+            ConversationMatch {
+                kind,
+                container: None,
+                ids: Some(vec!["1153119166446981193".to_owned()]),
+            },
+        )],
+    };
+
+    let both = with(kinds(&[
+        ConversationKind::Channel,
+        ConversationKind::Thread,
+    ]));
+    assert!(both.permits_chat(
+        &subject,
+        &discord_claim(ConversationKind::Channel, "1153119166446981193", None)
+    ));
+    assert!(both.permits_chat(
+        &subject,
+        &discord_claim(ConversationKind::Thread, "1153119166446981193", Some("999"))
+    ));
+    assert!(
+        !both.permits_chat(
+            &subject,
+            &discord_claim(ConversationKind::Thread, "1338356895504793623", Some("999"))
+        ),
+        "a thread under an ungranted parent is not granted"
+    );
+    assert!(
+        !both.permits_chat(
+            &subject,
+            &discord_claim(ConversationKind::DirectMessage, "1153119166446981193", None)
+        ),
+        "a direct message is not one of the listed kinds"
+    );
+
+    let channels_only = with(kinds(&[ConversationKind::Channel]));
+    assert!(
+        !channels_only.permits_chat(
+            &subject,
+            &discord_claim(ConversationKind::Thread, "1153119166446981193", Some("999"))
+        ),
+        "`[channel]` excludes the threads under it"
+    );
+
+    // A non-canonical conversation is refused before any grant is consulted.
+    assert!(!both.permits_chat(
+        &subject,
+        &discord_claim(
+            ConversationKind::Channel,
+            "1153119166446981193",
+            Some("999")
+        )
+    ));
 }
 
 #[test]

@@ -17,10 +17,7 @@ use std::{
 use dekopon_agent::{
     BrokerLeg, BrokerLegError, CancelSource, IdSequence, ProgressEvent, ProgressSink, ShellRuntime,
     attachment::{ChatAssetInputs, ReplyAttachments},
-    meta::{
-        AgentConfigView, ConversationConfigView, ConversationScopeView, SessionConfigView,
-        SkillView,
-    },
+    meta::{AgentConfigView, MemoryConfigView, MemoryScopeView, SessionConfigView, SkillView},
     prompt::{
         CancellationProbe, History, PromptError, ReplyDisposition, SessionInputs,
         run_prompt_session,
@@ -44,8 +41,7 @@ use tracing::Instrument as _;
 use crate::{
     asset::{self, AssetAccess, AssetStore, SessionAssets},
     config::{
-        ConversationPolicy, ConversationScope, ConversationWindow, ModelConfig, ResolvedBroker,
-        ResolvedLiveness,
+        MemoryPolicy, MemoryScope, MemoryWindow, ModelConfig, ResolvedBroker, ResolvedLiveness,
     },
     conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
     progress::{ProgressInputs, ProgressPolicy, Terminal},
@@ -82,7 +78,11 @@ const SESSION_COMPLETING: u8 = 2;
 /// Deliberately subject-free, and deliberately not the state key. Two people talking at once in one
 /// thread are one thing to serialize; `ConversationKey` in [`crate::conversation`] is the other
 /// question and either includes the subject (private scope) or deliberately omits it (shared).
-type AdmissionKey = (String, String, Option<String>);
+///
+/// `(transport, Conversation::key())` — the same pair the active-session registry uses, so the
+/// slot a message holds and the session a stop reaches are one key rather than two that used to
+/// split on a Slack thread-starting message.
+type AdmissionKey = (String, String);
 
 /// One model client, shared by every session that routes to the same configured model.
 pub(crate) type SharedModel = Arc<dyn ChatModel + Send + Sync>;
@@ -386,6 +386,16 @@ impl CancellationProbe for SessionCancellation {
     fn is_cancelled(&self) -> bool {
         self.state.load(Ordering::Acquire) == SESSION_CANCELLED
     }
+
+    /// Who won the race, rather than the trait's "somebody stopped it".
+    ///
+    /// The origin is already known at the cancel site — a Stop control, a button, a stop word, a
+    /// shutdown, or a budget — and the prompt loop reports whatever this answers as
+    /// [`dekopon_agent::ProgressEvent::Cancelled`]. Without it every ending on the trace reads
+    /// `Operator`, which is the one origin that tells an operator nothing.
+    fn cancel_source(&self) -> Option<CancelSource> {
+        self.source()
+    }
 }
 
 /// Cancels synchronous work when its owning async session is aborted during shutdown.
@@ -458,7 +468,7 @@ impl ActiveSessions {
         message: &InboundMessage,
         cancellation: SessionCancellation,
     ) -> ActiveRegistration {
-        let key = (message.transport.clone(), message.conversation_id.clone());
+        let key = (message.transport.clone(), message.conversation.key());
         let session = ActiveSession {
             subject: message.subject.clone(),
             cancellation: cancellation.clone(),
@@ -559,19 +569,20 @@ pub(crate) struct SessionRunner {
 
 /// Selects the state audience solely from trusted bound-route configuration.
 fn conversation_key(route: &BoundRoute, message: &InboundMessage) -> ConversationKey {
-    match route.conversation {
-        ConversationPolicy::Persistent(ConversationWindow {
-            scope: ConversationScope::SharedConversation,
+    let conversation = message.conversation.key();
+    match route.memory {
+        MemoryPolicy::Persistent(MemoryWindow {
+            scope: MemoryScope::SharedConversation,
             ..
-        }) => ConversationKey::shared(&route.agent, &route.transport, &message.conversation_id),
-        ConversationPolicy::OneShot
-        | ConversationPolicy::Persistent(ConversationWindow {
-            scope: ConversationScope::PrivateConversation,
+        }) => ConversationKey::shared(&route.agent, &route.transport, &conversation),
+        MemoryPolicy::OneShot
+        | MemoryPolicy::Persistent(MemoryWindow {
+            scope: MemoryScope::PrivateConversation,
             ..
         }) => ConversationKey::private(
             &route.agent,
             &route.transport,
-            &message.conversation_id,
+            &conversation,
             &message.subject,
         ),
     }
@@ -633,17 +644,16 @@ async fn execute(
         {
             audit.event = "gateway.message.received",
             subject = %message.subject,
-            channel = message.channel.as_str(),
+            channel = message.conversation.id.as_str(),
             text = message.text.as_str(),
         },
         "gateway message received"
     );
 
-    let key = (
-        message.transport.clone(),
-        message.channel.clone(),
-        message.thread.clone(),
-    );
+    // One admission slot per conversation, keyed on the same value everything else keys on: the
+    // registry, the cancel request, and the memory key are all `Conversation::key()`, so a stop
+    // and the session it names can never be filed apart.
+    let key = (message.transport.clone(), message.conversation.key());
     let Some(admission) = runner.gate.admit(key) else {
         tracing::info!(event = "gateway_session_rejected", reason = "busy");
         if runner.reply_on_busy {
@@ -660,6 +670,10 @@ async fn execute(
         .instrument(tracing::info_span!(
             "gateway.session",
             agent = %route.agent,
+            conversation.kind = message.conversation.kind.as_str(),
+            conversation.container = message.conversation.container.as_deref().unwrap_or_default(),
+            conversation.id = message.conversation.id.as_str(),
+            conversation.thread = message.conversation.thread.as_deref().unwrap_or_default(),
             conversation.turns = tracing::field::Empty,
             conversation.bytes = tracing::field::Empty,
         ))
@@ -744,14 +758,14 @@ async fn session(
         route.instructions.as_deref(),
         &route.skills,
         route.limits,
-        route.conversation,
+        route.memory,
         &leg,
     );
 
     // The lookup happens *after* the authorization gate because the grant comparison needs a fresh
     // grant to compare against. `Instant` is supplied by the caller rather than read inside the
     // store so eviction has a clock a test can drive.
-    let window = route.conversation.window();
+    let window = route.memory.window();
     let (seeded, cache_key, conversation_lease, asset_access) = match window {
         Some(window) => {
             let ConversationSeed {
@@ -824,8 +838,8 @@ async fn session(
     // subject. The prefix is rendered only after the ordinary private prompt has been assembled,
     // leaving one-shot and private persistent prompt bytes unchanged.
     let text = match window.map(|window| window.scope) {
-        Some(ConversationScope::SharedConversation) => attributed_prompt(&message.subject, &text),
-        Some(ConversationScope::PrivateConversation) | None => text,
+        Some(MemoryScope::SharedConversation) => attributed_prompt(&message.subject, &text),
+        Some(MemoryScope::PrivateConversation) | None => text,
     };
     // Shared rather than owned by the prompt loop alone: the same reader serves the model's own
     // attachment tool and, on a route that lists capabilities, the broker leg's marker expansion.
@@ -877,6 +891,10 @@ async fn session(
             route.chat_asset_inputs.to_vec(),
         ))
     };
+    // The kind decides the budget: what is worth streaming to one reader in a direct message is
+    // not what a channel with a hundred of them wants. The route keeps `progressDetail`, which is
+    // how much the surface says rather than whether there is one.
+    let (settings, keep_alive) = liveness.for_kind(message.conversation.kind);
     let (mut progress, sink) = ProgressPolicy::start(ProgressInputs {
         driver: Arc::clone(driver),
         target: message.liveness.clone(),
@@ -884,6 +902,8 @@ async fn session(
         transport: message.transport.clone(),
         detail: route.progress_detail,
         liveness: Arc::clone(&liveness),
+        settings,
+        keep_alive,
         cancellation: cancellation.clone(),
         max_duration: route.max_duration,
     });
@@ -910,6 +930,7 @@ async fn session(
     // Shared with the route rather than cloned: the skill text is read once at startup.
     let skills = Arc::clone(&route.skills);
     let improvement_suggestions = route.improvement_suggestions;
+    let inspect_agent_config = route.inspect_agent_config;
     let session_attachments = Arc::clone(&attachments);
     let progress_sink = Arc::clone(&sink) as Arc<dyn ProgressSink>;
     // The same sink on the broker leg, because the two halves of a run are reported by two
@@ -944,9 +965,15 @@ async fn session(
             .with_skills(&skills)
             .with_options(&options)
             .with_assets(assets.as_ref())
-            .with_agent_config(&agent_config)
             .with_cancellation(&prompt_cancellation)
             .with_progress(Arc::clone(&progress_sink));
+        // The one gate `inspectAgentConfig: false` is. The view is still built above — it reads
+        // the leg this session already holds and costs no I/O — and withholding it here removes
+        // the structured dump, including the agent's standing orders verbatim. The instructions
+        // are still the system prompt, so this is not secrecy from a determined user.
+        if inspect_agent_config {
+            inputs = inputs.with_agent_config(&agent_config);
+        }
         if improvement_suggestions {
             inputs = inputs.with_improvement_suggestions();
         }
@@ -1136,17 +1163,15 @@ fn agent_config_view(
     instructions: Option<&str>,
     skills: &[dekopon_config::Skill],
     limits: dekopon_agent::prompt::PromptLimits,
-    conversation: ConversationPolicy,
+    memory: MemoryPolicy,
     leg: &BrokerLeg,
 ) -> AgentConfigView {
-    let conversation = match conversation {
-        ConversationPolicy::OneShot => ConversationConfigView::OneShot,
-        ConversationPolicy::Persistent(window) => ConversationConfigView::Persistent {
+    let memory = match memory {
+        MemoryPolicy::OneShot => MemoryConfigView::OneShot,
+        MemoryPolicy::Persistent(window) => MemoryConfigView::Persistent {
             scope: match window.scope {
-                ConversationScope::PrivateConversation => {
-                    ConversationScopeView::PrivateConversation
-                }
-                ConversationScope::SharedConversation => ConversationScopeView::SharedConversation,
+                MemoryScope::PrivateConversation => MemoryScopeView::PrivateConversation,
+                MemoryScope::SharedConversation => MemoryScopeView::SharedConversation,
             },
             idle_timeout_ms: u64::try_from(window.idle_timeout.as_millis()).unwrap_or(u64::MAX),
             max_turns: window.limits.max_turns,
@@ -1161,7 +1186,7 @@ fn agent_config_view(
         SessionConfigView {
             max_steps: limits.max_steps,
             max_capability_calls: limits.max_capability_calls,
-            conversation,
+            memory,
         },
         leg.effective_capabilities(),
     )
@@ -1201,26 +1226,23 @@ async fn connect(
         .map_err(SessionError::from)
 }
 
+/// The claim this session opens its broker leg with.
+///
+/// No normalization step: the transport minted the conversation in the canonical form the grant,
+/// the claim check and Cedar all compare against, so a second lowercasing here would be a second
+/// definition of the same fact.
 fn chat_claim(route: &BoundRoute, message: &InboundMessage) -> Result<Attestation, SessionError> {
     let transport = message
         .transport
         .parse()
         .map_err(SessionError::TransportId)?;
-    let (channel, conversation) = match message.transport_kind {
-        dekopon_broker_protocol::ChatTransportKind::Slack => (
-            message.channel.to_ascii_lowercase(),
-            message.conversation_id.to_ascii_lowercase(),
-        ),
-        _ => (message.channel.clone(), message.conversation_id.clone()),
-    };
     Ok(Attestation::for_chat(
         message.subject.clone(),
         route.agent.clone(),
         ChatScopeClaim {
             transport,
             kind: message.transport_kind,
-            channel,
-            conversation,
+            conversation: message.conversation.clone(),
         },
     ))
 }
@@ -1279,37 +1301,34 @@ pub(crate) fn delivery_identity(
     claim: &Attestation,
 ) -> Option<DeliveryIdentity> {
     let scope = claim.scope.as_ref()?;
+    let conversation = &scope.conversation;
     match message.transport_kind {
         dekopon_broker_protocol::ChatTransportKind::Slack => Some(DeliveryIdentity::Slack {
-            channel: scope.channel.clone(),
+            channel: conversation.id.clone(),
             timestamp: message.message_id.clone(),
         }),
+        // A Discord thread is itself the channel its messages live in, which is what
+        // `api_channel` answers; the conversation's `id` is the parent a route pinned.
         dekopon_broker_protocol::ChatTransportKind::Discord => Some(DeliveryIdentity::Discord {
-            channel: scope.channel.clone(),
+            channel: conversation
+                .api_channel(dekopon_broker_protocol::ChatTransportKind::Discord)
+                .to_owned(),
             message: message.message_id.clone(),
         }),
-        dekopon_broker_protocol::ChatTransportKind::Telegram => {
-            let topic = scope
-                .conversation
-                .strip_prefix(&format!("{}:topic:", scope.channel))
-                .map(str::to_owned);
-            Some(DeliveryIdentity::Telegram {
-                chat: scope.channel.clone(),
-                topic,
-                message: message.message_id.clone(),
-            })
-        }
+        dekopon_broker_protocol::ChatTransportKind::Telegram => Some(DeliveryIdentity::Telegram {
+            chat: conversation.id.clone(),
+            topic: conversation.thread.clone(),
+            message: message.message_id.clone(),
+        }),
         dekopon_broker_protocol::ChatTransportKind::Whatsapp => {
-            let mut parts = scope.channel.split(':');
-            let waba = parts.next()?.to_owned();
-            let phone_number = parts.next()?.to_owned();
-            let _sender = parts.next()?;
-            if parts.next().is_some() {
+            let container = conversation.container.as_deref()?;
+            let (waba, phone_number) = container.split_once(':')?;
+            if phone_number.contains(':') {
                 return None;
             }
             Some(DeliveryIdentity::Whatsapp {
-                waba,
-                phone_number,
+                waba: waba.to_owned(),
+                phone_number: phone_number.to_owned(),
                 message: message.message_id.clone(),
             })
         }
@@ -1320,7 +1339,7 @@ pub(crate) fn delivery_identity(
             let boot_nonce = fields.next()?.to_owned();
             Some(DeliveryIdentity::Local {
                 transport: scope.transport.clone(),
-                conversation: scope.conversation.clone(),
+                conversation: conversation.key(),
                 boot_nonce,
                 connection,
                 sequence,

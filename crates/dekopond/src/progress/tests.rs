@@ -25,6 +25,7 @@ use crate::{
     progress::{
         KeepAlive, ProgressDetail, ProgressInputs, ProgressPolicy, Templates, Terminal,
         adapter::ProgressAdapter,
+        cancel_label,
         text::{RenderState, TemplateField},
     },
     session::{FAILURE_REPLY, STOPPED_REPLY, SessionCancellation},
@@ -371,6 +372,7 @@ fn liveness_with(stream: bool, keep_alive: KeepAlive) -> Arc<ResolvedLiveness> {
         },
         keep_alive,
         templates: templates(),
+        conversations: std::collections::BTreeMap::new(),
     })
 }
 
@@ -410,6 +412,8 @@ fn start_with(
         reply: ReplyTarget::Local { connection: 1 },
         transport: "local".to_owned(),
         detail,
+        settings: liveness.settings,
+        keep_alive: liveness.keep_alive.clone(),
         liveness,
         cancellation: cancellation.clone(),
         max_duration,
@@ -854,6 +858,50 @@ async fn two_consecutive_failures_stop_the_surface_for_the_session() {
         harness.recorder.refuse_progress.load(Ordering::Relaxed),
         1,
         "one injected refusal was left unspent, which is the call that was not attempted"
+    );
+}
+
+/// A stop reports who won the CAS, not "somebody".
+///
+/// The loop cannot tell a person's Stop from a shutdown from a wall-clock budget: all three reach
+/// it as the same `true`. The gateway knows, because it wrote the origin under the lock that
+/// decided the race, so `cancel_source` is what puts `user:stop-reply` on the trace instead of the
+/// trait default's `Operator`.
+#[test]
+fn a_stop_word_cancel_reports_the_affordance_that_won_the_race() {
+    let cancellation = SessionCancellation::new();
+    assert_eq!(
+        dekopon_agent::prompt::CancellationProbe::cancel_source(&cancellation),
+        None,
+        "a running session has no origin yet"
+    );
+    assert!(cancellation.cancel(CancelSource::User {
+        via: CancelVia::StopReply
+    }));
+    assert_eq!(
+        dekopon_agent::prompt::CancellationProbe::cancel_source(&cancellation),
+        Some(CancelSource::User {
+            via: CancelVia::StopReply
+        })
+    );
+    assert_eq!(
+        cancel_label(CancelSource::User {
+            via: CancelVia::StopReply
+        }),
+        "user:stop-reply"
+    );
+
+    // The loser of the race does not rewrite the origin.
+    let shutdown = SessionCancellation::new();
+    assert!(shutdown.cancel(CancelSource::Budget {
+        limit: BudgetLimit::WallClock
+    }));
+    assert!(!shutdown.cancel(CancelSource::Operator));
+    assert_eq!(
+        dekopon_agent::prompt::CancellationProbe::cancel_source(&shutdown),
+        Some(CancelSource::Budget {
+            limit: BudgetLimit::WallClock
+        })
     );
 }
 

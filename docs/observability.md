@@ -269,9 +269,9 @@ two further spans of its own:
 
 | Span | Fields |
 |---|---|
-| `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`, `drop.reason`; the trace root |
+| `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`, `drop.reason`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`; the trace root |
 | `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `busy`, `failed`, `cancelled`, `reply-failed`) |
-| `gateway.session` | `agent`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
+| `gateway.session` | `agent`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 
 `transport.receive` is one span per receipt, opened before the payload is parsed, so Slack's
 envelope acknowledgment, WhatsApp's HMAC signature check and its 200, Telegram's `offset` advance,
@@ -288,9 +288,19 @@ WhatsApp delivery. A WhatsApp delivery carrying more than one message leaves it 
 every message's `gateway.message` under the one delivery. Neither the sender nor the message text
 goes on this span: those stay on the `gateway.message.received` log event below.
 
+The four `conversation.*` attributes say *where* an accepted message was posted: its kind
+(`directMessage`, `groupDirectMessage`, `channel`, `thread`), the container above it (a Slack team,
+a Discord guild, a WhatsApp `waba:phoneNumberId`; absent on Telegram and on Discord direct
+messages), the conversation the service names — the *parent* for a thread — and the thread the
+answer joins. Service identifiers only, on both spans and on the `gateway_message_ignored` record,
+and never a byte of the message. A receipt the transport drops records none of them.
+
 `drop.reason` is the other half of that question: a receipt the transport declines to route records
 one low-cardinality word for why — `self-authored`, `bot-authored`, `content-withheld`, `duplicate`,
-`conversation-mismatch` and `malformed-envelope` among them — and a receipt that routes normally
+`conversation-mismatch`, `malformed-envelope`, `conversation-unresolved` (a Discord guild channel
+whose one bounded `GET /channels/{id}` did not answer, so the message cannot be placed and is never
+guessed at), `broadcast-channel` (a Telegram broadcast, where nobody can reply) and
+`group-unsupported` (a WhatsApp group payload) among them — and a receipt that routes normally
 leaves it unset. It is declared once,
 where the span is opened, because recording a field a span never declared is silently dropped. The
 word is the transport's own classification and never a fragment of the payload it read.
@@ -382,7 +392,7 @@ nothing here.
 `accounting.model.turn` record, and it counts one exchange: the system prompt, the message a person
 sent, and whatever the model and its tool have said back within this session. A session seeded with
 history counts the replayed window *plus* this exchange, so the same field on the same span means
-something different depending on a route's `conversation.mode`. A panel plotting it across the
+something different depending on a route's `memory.mode`. A panel plotting it across the
 switchover shows a step change that is not a regression, and averaging across both averages two
 different quantities. `usage.input_tokens` rises for the same reason, and for real money.
 
@@ -391,6 +401,10 @@ different quantities. `usage.input_tokens` rises for the same reason, and for re
 occupied; on `sharedConversation` the byte count includes each retained gateway-authored
 canonical-participant label. Both are zero on a `oneShot` route and on the first message of any
 conversation, which makes "seeded or not" a filter rather than a guess.
+`gateway_conversation_unresolved` is the debug-level record of why a Discord guild channel could
+not be placed — `cause` is `rest-cooldown`, `request`, `status`, `timeout`, `body`, or
+`channel-type` — and is the cause behind `drop.reason = conversation-unresolved`.
+
 `gateway_conversation_evicted` carries a reason of `idle`, `capacity`, or `grant-changed` and
 nothing else, so a `maxConversations` ceiling set too low reads as eviction churn instead of as a
 bot that intermittently forgets. A conversation key carries a conversation identifier and, when

@@ -13,7 +13,7 @@ use std::{
 
 use async_trait::async_trait;
 use dekopon_agent::attachment::GeneratedImage;
-use dekopon_broker_protocol::ChatTransportKind;
+use dekopon_broker_protocol::{ChatTransportKind, Conversation};
 use dekopon_core::ExternalSubject;
 use dekopon_model::ModelText;
 use serde_json::Value;
@@ -61,26 +61,20 @@ pub(crate) struct InboundMessage {
     pub transport_kind: ChatTransportKind,
     /// The sender, taken from the authenticated transport payload and nowhere else.
     pub subject: ExternalSubject,
-    /// Service-native conversation identifier.
-    pub channel: String,
-    /// Service-native thread identifier, when the conversation has threads.
-    pub thread: Option<String>,
-    /// Stable identity of the conversation this message belongs to, unique within its transport.
+    /// Where this message was posted, minted canonical by the transport that authenticated it.
     ///
-    /// Deliberately not `(channel, thread)`. On Slack a message that *starts* a thread carries no
-    /// `thread_ts`, while the bot's answer to it opens a thread rooted at that message — so every
-    /// later turn does carry one. Anything keyed on [`Self::thread`] therefore files the opening
-    /// question under a different key than the replies inside the thread it started, orphaning the
-    /// first turn of every threaded conversation. This field is the thread the *answer* joins, which
-    /// is the same value for all of them.
+    /// Kind, container, id, and thread together: what a route matches, what the attestor grant is
+    /// checked against, and what Cedar reads as `context.conversation`. The thread coordinate is
+    /// the thread the *answer* joins, never the raw `thread_ts`: Slack omits `thread_ts` on the
+    /// message that *starts* a thread and sends it on every reply inside one, so keying on the raw
+    /// value files the opening question apart from the answers to it. Deriving it from the value
+    /// the bot actually replies into is what keeps turn one attached to the thread it opened; do
+    /// not "simplify" that back to `thread_ts`.
     ///
-    /// Each transport derives it, because only a transport holds the service-native pieces it takes
-    /// — Slack's per-message `ts` is one of them, and it is gone by the time a message is routed.
-    ///
-    /// This is not the admission key. Admission serializes a conversation against itself on
-    /// `(transport, channel, thread)` and is unchanged; this identity exists for per-conversation
-    /// state that has to survive across turns.
-    pub conversation_id: String,
+    /// [`Conversation::key`] is the stable identity of the exchange, and it fills the admission
+    /// key, the active-session registry, the cancel request, and the memory key — one value rather
+    /// than four derivations that have to agree.
+    pub conversation: Conversation,
     /// Service-native message identifier of the turn being answered.
     ///
     /// Read by [`crate::session::delivery_identity`], which is the only downstream consumer: it
@@ -97,8 +91,6 @@ pub(crate) struct InboundMessage {
     pub text: String,
     /// What the sender attached, described but not yet numbered or fetched.
     pub assets: Vec<PendingAsset>,
-    /// Whether this is a one-to-one conversation or a shared channel.
-    pub conversation: ConversationKind,
     /// Whether authenticated structured transport metadata says the bot was addressed.
     ///
     /// Discord supplies `Some` from its `mentions` array, including `Some(false)` so presentation
@@ -153,7 +145,27 @@ pub(crate) fn receive_span(kind: ChatTransportKind) -> tracing::Span {
         transport.kind = %kind,
         message.id = tracing::field::Empty,
         drop.reason = tracing::field::Empty,
+        conversation.kind = tracing::field::Empty,
+        conversation.container = tracing::field::Empty,
+        conversation.id = tracing::field::Empty,
+        conversation.thread = tracing::field::Empty,
     )
+}
+
+/// Records the four conversation coordinates on a span that declared them.
+///
+/// Service identifiers only — where the message was posted — and never a byte of its text. One
+/// helper rather than four `record` calls per transport, because a reader comparing Slack's
+/// `transport.receive` with Discord's must be reading the same four attribute names.
+pub(crate) fn record_conversation(span: &tracing::Span, conversation: &Conversation) {
+    span.record("conversation.kind", conversation.kind.as_str());
+    span.record("conversation.id", conversation.id.as_str());
+    if let Some(container) = &conversation.container {
+        span.record("conversation.container", container.as_str());
+    }
+    if let Some(thread) = &conversation.thread {
+        span.record("conversation.thread", thread.as_str());
+    }
 }
 
 /// One event produced by a chat transport.
@@ -306,15 +318,6 @@ pub(crate) struct CancelPress {
     pub target: LivenessTarget,
     pub subject: String,
     pub ack: AckToken,
-}
-
-/// Whether a message arrived in a private conversation or a shared one.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ConversationKind {
-    /// A one-to-one conversation; every message is addressed to the bot.
-    DirectMessage,
-    /// A shared channel, where an unaddressed message is ambient traffic.
-    Channel(String),
 }
 
 /// Everything a transport needs to answer one message.

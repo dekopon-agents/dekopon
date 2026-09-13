@@ -24,8 +24,9 @@ use dekopon_agent::{
 };
 use dekopon_broker_protocol::{
     Attestation, AvailableCapability, BrokerRequest, BrokerSocketDiscovery, ChatMemorySurface,
-    CommandRunOutcome, FrameLimits, InvocationOutcome, InvocationResult, RequestEnvelope,
-    ResponseEnvelope, read_frame, write_frame,
+    CommandRunOutcome, Conversation, ConversationKind, ConversationKindMatch, ConversationMatch,
+    FrameLimits, InvocationOutcome, InvocationResult, RequestEnvelope, ResponseEnvelope,
+    read_frame, write_frame,
 };
 use dekopon_config::LocalCatalog;
 use dekopon_core::ExternalSubject;
@@ -48,10 +49,9 @@ use crate::{
     asset::{self, AssetAccess, AssetSourceRef, AssetStore, PendingAsset, SessionAssets},
     cache_key,
     config::{
-        self, ConfigError, ConfigProblem, ConversationPolicy, ConversationScope,
-        ConversationWindow, LivenessConfig, LivenessMode, LivenessSettings, ModelConfig,
-        ProgressSurface, ResolvedBroker, ResolvedLiveness, RouteMatch, SlackExperience,
-        SlackLivenessFallback,
+        self, ConfigError, ConfigProblem, LivenessConfig, LivenessMode, LivenessOverride,
+        LivenessSettings, MemoryPolicy, MemoryScope, MemoryWindow, ModelConfig, ProgressSurface,
+        ResolvedBroker, ResolvedLiveness, SlackExperience, SlackLivenessFallback,
     },
     conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
     progress::{KeepAlive, ProgressDetail, ProgressText},
@@ -62,12 +62,12 @@ use crate::{
         memory_record_outcome_category, model_bearer_token, model_credential, run_session,
     },
     transport::{
-        AssetFetcher, CancelButton, CancelPress, ChatDriver, ChatTransport, ConversationKind,
-        InboundMessage, InboundReaction, LivenessTarget, MAX_INBOUND_TEXT_BYTES,
-        MAX_OUTBOUND_TEXT_BYTES, MessageRef, NativeStatus, OutboundReply, ProgressLimits,
-        ProgressMessage, ReplyTarget, Status, StreamLimits, StreamedText, TextStream, ThreadClaim,
-        ThreadContinuation, ThreadOwnership, TransportError, TransportEvent, TransportIdentity,
-        TypingLease, bound_inbound, bound_outbound, credential_value,
+        AssetFetcher, CancelButton, CancelPress, ChatDriver, ChatTransport, InboundMessage,
+        InboundReaction, LivenessTarget, MAX_INBOUND_TEXT_BYTES, MAX_OUTBOUND_TEXT_BYTES,
+        MessageRef, NativeStatus, OutboundReply, ProgressLimits, ProgressMessage, ReplyTarget,
+        Status, StreamLimits, StreamedText, TextStream, ThreadClaim, ThreadContinuation,
+        ThreadOwnership, TransportError, TransportEvent, TransportIdentity, TypingLease,
+        bound_inbound, bound_outbound, credential_value,
     },
 };
 
@@ -123,7 +123,7 @@ fn document(directory: &Path) -> Value {
         "routes": [
             {
                 "transport": "dev",
-                "match": { "kind": "directMessage" },
+                "conversation": { "kind": ["directMessage"] },
                 "agent": "reviewer"
             }
         ]
@@ -204,14 +204,19 @@ async fn a_complete_configuration_resolves_with_documented_defaults() {
     // A route remembers nothing unless an operator says so, which is exactly the behavior every
     // route had before conversations existed.
     assert_eq!(resolved.sessions.max_conversations, 1024);
-    assert_eq!(resolved.routes[0].conversation, ConversationPolicy::OneShot);
+    assert_eq!(resolved.routes[0].memory, MemoryPolicy::OneShot);
 }
 
 #[tokio::test]
 async fn an_explicit_shared_scope_survives_resolution_and_route_binding() {
     let directory = temporary();
     let mut document = document(directory.path());
-    document["routes"][0]["conversation"] = json!({
+    // Not a `[directMessage]`-only route: sharing a window there is the startup refusal
+    // `SharedMemoryOnDmRoute` (the direct message already is the subject), which the
+    // invalid-configuration table covers. `kind: any` is a route that also serves channels and
+    // group DMs, where a shared audience is a real choice an operator makes.
+    document["routes"][0]["conversation"] = json!({"kind": "any"});
+    document["routes"][0]["memory"] = json!({
         "mode": "persistent",
         "scope": "sharedConversation"
     });
@@ -219,23 +224,23 @@ async fn an_explicit_shared_scope_survives_resolution_and_route_binding() {
         .await
         .expect("the camel-case shared scope resolves");
 
-    let expected = ConversationPolicy::Persistent(ConversationWindow {
-        scope: ConversationScope::SharedConversation,
+    let expected = MemoryPolicy::Persistent(MemoryWindow {
+        scope: MemoryScope::SharedConversation,
         idle_timeout: Duration::from_secs(900),
         limits: HistoryLimits {
             max_turns: 12,
             max_bytes: 64 * 1024,
         },
     });
-    assert_eq!(resolved.routes[0].conversation, expected);
+    assert_eq!(resolved.routes[0].memory, expected);
 
     let routes = RoutingTable::bind(&resolved, &catalog(true, Some("reasoning")))
         .expect("the explicitly shared route binds");
     assert_eq!(
         routes
-            .route("dev", &ConversationKind::DirectMessage)
+            .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
             .expect("route matches")
-            .conversation,
+            .memory,
         expected,
         "effective scope must survive into bound route state"
     );
@@ -264,7 +269,7 @@ async fn provider_attachments_and_chat_asset_inputs_are_per_route_opt_ins() {
     let routes = RoutingTable::bind(&resolved, &catalog(true, Some("reasoning")))
         .expect("the route binds both opt-ins");
     let bound = routes
-        .route("dev", &ConversationKind::DirectMessage)
+        .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
         .expect("route matches");
     assert_eq!(bound.provider_attachments, 2);
     assert_eq!(&*bound.chat_asset_inputs, ["echo.echo".to_owned()]);
@@ -524,27 +529,27 @@ async fn native_liveness_is_off_unless_a_transport_opts_in() {
 async fn a_persistent_route_resolves_its_documented_window_defaults() {
     let directory = temporary();
     let mut document = document(directory.path());
-    document["routes"][0]["conversation"] = json!({"mode": "persistent"});
+    document["routes"][0]["memory"] = json!({"mode": "persistent"});
     let resolved = load(directory.path(), &document)
         .await
         .expect("a persistent route with no bounds resolves");
 
-    let expected = ConversationPolicy::Persistent(ConversationWindow {
-        scope: ConversationScope::PrivateConversation,
+    let expected = MemoryPolicy::Persistent(MemoryWindow {
+        scope: MemoryScope::PrivateConversation,
         idle_timeout: Duration::from_secs(900),
         limits: HistoryLimits {
             max_turns: 12,
             max_bytes: 64 * 1024,
         },
     });
-    assert_eq!(resolved.routes[0].conversation, expected);
+    assert_eq!(resolved.routes[0].memory, expected);
 
-    document["routes"][0]["conversation"]["scope"] = json!("privateConversation");
+    document["routes"][0]["memory"]["scope"] = json!("privateConversation");
     let explicit = load(directory.path(), &document)
         .await
         .expect("the explicit private scope resolves");
     assert_eq!(
-        explicit.routes[0].conversation, expected,
+        explicit.routes[0].memory, expected,
         "omission and explicit private scope have exactly the same effective policy"
     );
 }
@@ -645,7 +650,7 @@ async fn invalid_configurations_fail_closed_at_startup() {
         (
             "unknown route match kind",
             mutate(|document| {
-                document["routes"][0]["match"] = json!({"kind": "semaphore"});
+                document["routes"][0]["conversation"] = json!({"kind": ["semaphore"]});
             }),
             |error| matches!(error, ConfigError::Decode { .. }),
         ),
@@ -656,8 +661,8 @@ async fn invalid_configurations_fail_closed_at_startup() {
             // fact claimed every direct message on the transport.
             "a channel on a directMessage route",
             mutate(|document| {
-                document["routes"][0]["match"] =
-                    json!({"kind": "directMessage", "channel": "c0123abc"});
+                document["routes"][0]["conversation"] =
+                    json!({"kind": ["directMessage"], "channel": "c0123abc"});
             }),
             |error| matches!(error, ConfigError::Decode { .. }),
         ),
@@ -736,16 +741,96 @@ async fn invalid_configurations_fail_closed_at_startup() {
             },
         ),
         (
+            // The 0.13 spelling: `match:` is the route field that became `conversation:`.
+            "a retired route match block",
+            mutate(|document| {
+                document["routes"][0]["match"] = json!({"kind": "directMessage"});
+            }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::RetiredRouteMatch { .. })
+                })
+            },
+        ),
+        (
+            // The other half of the rename: the window that used to live under this name.
+            "a memory window written under the match block",
+            mutate(|document| {
+                document["routes"][0]["conversation"] =
+                    json!({"kind": ["directMessage"], "mode": "persistent"});
+            }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::RetiredMemoryBlock { .. })
+                })
+            },
+        ),
+        (
+            "a bare kind word instead of a list",
+            mutate(|document| {
+                document["routes"][0]["conversation"] = json!({"kind": "channel"});
+            }),
+            |error| matches!(error, ConfigError::Decode { .. }),
+        ),
+        (
+            "an empty ids list and an empty kind list together",
+            mutate(|document| {
+                document["routes"][0]["conversation"] = json!({"kind": [], "ids": []});
+            }),
+            |error| {
+                let problems: Vec<_> = match error {
+                    ConfigError::Invalid { problems, .. } => problems.iter().collect(),
+                    _ => Vec::new(),
+                };
+                problems.len() >= 2
+                    && problems.iter().all(|problem| {
+                        matches!(problem, ConfigProblem::InvalidRouteConversation { .. })
+                    })
+            },
+        ),
+        (
+            "subjects beside a channel route",
+            mutate(|document| {
+                document["routes"][0]["conversation"] = json!({"kind": ["channel"]});
+                document["routes"][0]["subjects"] = json!(["tel.16034700182"]);
+            }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::SubjectsOnNonDmRoute { .. })
+                })
+            },
+        ),
+        (
+            "a shared memory window on a direct-message-only route",
+            mutate(|document| {
+                document["routes"][0]["memory"] =
+                    json!({"mode": "persistent", "scope": "sharedConversation"});
+            }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::SharedMemoryOnDmRoute { .. })
+                })
+            },
+        ),
+        (
+            "a liveness override keyed on a kind that does not exist",
+            mutate(|document| {
+                document["transports"][0]["liveness"] =
+                    json!({"conversations": {"channelish": {"stream": true}}});
+            }),
+            |error| matches!(error, ConfigError::Decode { .. }),
+        ),
+        (
             "unknown conversation mode",
             mutate(|document| {
-                document["routes"][0]["conversation"] = json!({"mode": "amnesiac"});
+                document["routes"][0]["memory"] = json!({"mode": "amnesiac"});
             }),
             |error| matches!(error, ConfigError::Decode { .. }),
         ),
         (
             "wrong-case private conversation scope",
             mutate(|document| {
-                document["routes"][0]["conversation"] =
+                document["routes"][0]["memory"] =
                     json!({"mode": "persistent", "scope": "private_conversation"});
             }),
             |error| matches!(error, ConfigError::Decode { .. }),
@@ -753,7 +838,7 @@ async fn invalid_configurations_fail_closed_at_startup() {
         (
             "unknown conversation scope",
             mutate(|document| {
-                document["routes"][0]["conversation"] =
+                document["routes"][0]["memory"] =
                     json!({"mode": "persistent", "scope": "teamMemory"});
             }),
             |error| matches!(error, ConfigError::Decode { .. }),
@@ -761,44 +846,40 @@ async fn invalid_configurations_fail_closed_at_startup() {
         (
             "null conversation scope",
             mutate(|document| {
-                document["routes"][0]["conversation"] =
-                    json!({"mode": "persistent", "scope": null});
+                document["routes"][0]["memory"] = json!({"mode": "persistent", "scope": null});
             }),
             |error| matches!(error, ConfigError::Decode { .. }),
         ),
         (
             "zero idle timeout on a persistent route",
             mutate(|document| {
-                document["routes"][0]["conversation"] =
-                    json!({"mode": "persistent", "idleTimeoutMs": 0});
+                document["routes"][0]["memory"] = json!({"mode": "persistent", "idleTimeoutMs": 0});
             }),
             |error| {
                 reports(error, |problem| {
-                    matches!(problem, ConfigProblem::InvalidConversationBounds { .. })
+                    matches!(problem, ConfigProblem::InvalidMemoryBounds { .. })
                 })
             },
         ),
         (
             "zero turn window on a persistent route",
             mutate(|document| {
-                document["routes"][0]["conversation"] =
-                    json!({"mode": "persistent", "maxTurns": 0});
+                document["routes"][0]["memory"] = json!({"mode": "persistent", "maxTurns": 0});
             }),
             |error| {
                 reports(error, |problem| {
-                    matches!(problem, ConfigProblem::InvalidConversationBounds { .. })
+                    matches!(problem, ConfigProblem::InvalidMemoryBounds { .. })
                 })
             },
         ),
         (
             "zero byte window on a persistent route",
             mutate(|document| {
-                document["routes"][0]["conversation"] =
-                    json!({"mode": "persistent", "maxBytes": 0});
+                document["routes"][0]["memory"] = json!({"mode": "persistent", "maxBytes": 0});
             }),
             |error| {
                 reports(error, |problem| {
-                    matches!(problem, ConfigProblem::InvalidConversationBounds { .. })
+                    matches!(problem, ConfigProblem::InvalidMemoryBounds { .. })
                 })
             },
         ),
@@ -808,14 +889,14 @@ async fn invalid_configurations_fail_closed_at_startup() {
             // while its configuration says otherwise.
             "a window bound on a oneShot route",
             mutate(|document| {
-                document["routes"][0]["conversation"] = json!({"mode": "oneShot", "maxTurns": 12});
+                document["routes"][0]["memory"] = json!({"mode": "oneShot", "maxTurns": 12});
             }),
             |error| matches!(error, ConfigError::Decode { .. }),
         ),
         (
             "a scope on a oneShot route",
             mutate(|document| {
-                document["routes"][0]["conversation"] =
+                document["routes"][0]["memory"] =
                     json!({"mode": "oneShot", "scope": "privateConversation"});
             }),
             |error| matches!(error, ConfigError::Decode { .. }),
@@ -823,7 +904,7 @@ async fn invalid_configurations_fail_closed_at_startup() {
         (
             "an idle timeout on a oneShot route",
             mutate(|document| {
-                document["routes"][0]["conversation"] =
+                document["routes"][0]["memory"] =
                     json!({"mode": "oneShot", "idleTimeoutMs": 900_000});
             }),
             |error| matches!(error, ConfigError::Decode { .. }),
@@ -1081,7 +1162,7 @@ async fn routes_are_not_blamed_for_a_transport_list_that_failed_itself() {
         .expect("routes array")
         .push(json!({
             "transport": "typo",
-            "match": {"kind": "channel"},
+            "conversation": {"kind": ["channel"]},
             "agent": "reviewer"
         }));
     let error = load(directory.path(), &duplicate)
@@ -1671,7 +1752,7 @@ async fn routes_bind_to_a_catalog_agent_and_a_class_matched_model() {
 
     assert_eq!(table.len(), 1);
     let route = table
-        .route("dev", &ConversationKind::DirectMessage)
+        .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
         .expect("the direct-message route matches");
     assert_eq!(route.agent.as_str(), "reviewer");
     assert_eq!(route.description, "Reviews things");
@@ -1696,7 +1777,7 @@ async fn every_bound_route_gets_its_own_prompt_cache_lane() {
         .expect("routes array")
         .push(json!({
             "transport": "dev",
-            "match": {"kind": "channel", "channel": "ops"},
+            "conversation": {"kind": ["channel"], "ids": ["ops"]},
             "agent": "reviewer"
         }));
     let config = resolved(directory.path(), &document).await;
@@ -1704,10 +1785,10 @@ async fn every_bound_route_gets_its_own_prompt_cache_lane() {
 
     let table = RoutingTable::bind(&config, &catalog).expect("both routes bind");
     let direct = table
-        .route("dev", &ConversationKind::DirectMessage)
+        .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
         .expect("the direct-message route matches");
     let channel = table
-        .route("dev", &ConversationKind::Channel("ops".to_owned()))
+        .route(&routed("dev", ConversationKind::Channel, "ops"))
         .expect("the channel route matches");
 
     assert!(!direct.cache_key.trim().is_empty());
@@ -1717,7 +1798,7 @@ async fn every_bound_route_gets_its_own_prompt_cache_lane() {
     let rebound = RoutingTable::bind(&config, &catalog).expect("both routes bind again");
     assert_ne!(
         rebound
-            .route("dev", &ConversationKind::DirectMessage)
+            .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
             .expect("the direct-message route matches")
             .cache_key,
         direct.cache_key
@@ -1775,7 +1856,7 @@ async fn every_unsatisfiable_route_is_reported_in_one_refusal() {
         .expect("routes array")
         .push(json!({
             "transport": "dev",
-            "match": {"kind": "channel", "channel": "ops"},
+            "conversation": {"kind": ["channel"], "ids": ["ops"]},
             "agent": "nobody"
         }));
     let config = resolved(directory.path(), &document).await;
@@ -1828,7 +1909,7 @@ async fn an_explicit_route_model_outranks_class_matching() {
         .expect("an explicit model binds");
     assert_eq!(
         table
-            .route("dev", &ConversationKind::DirectMessage)
+            .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
             .expect("route matches")
             .model
             .name(),
@@ -1840,29 +1921,29 @@ async fn an_explicit_route_model_outranks_class_matching() {
 async fn channel_routes_match_only_their_own_channel() {
     let directory = temporary();
     let mut document = document(directory.path());
-    document["routes"][0]["match"] = json!({"kind": "channel", "channel": "c0123abc"});
+    document["routes"][0]["conversation"] = json!({"kind": ["channel"], "ids": ["c0123abc"]});
     let config = resolved(directory.path(), &document).await;
     let table =
         RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("route binds");
 
     assert!(
         table
-            .route("dev", &ConversationKind::Channel("c0123abc".to_owned()))
+            .route(&routed("dev", ConversationKind::Channel, "c0123abc"))
             .is_some()
     );
     assert!(
         table
-            .route("dev", &ConversationKind::Channel("c9999zzz".to_owned()))
+            .route(&routed("dev", ConversationKind::Channel, "c9999zzz"))
             .is_none()
     );
     assert!(
         table
-            .route("dev", &ConversationKind::DirectMessage)
+            .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
             .is_none()
     );
     assert!(
         table
-            .route("other", &ConversationKind::Channel("c0123abc".to_owned()))
+            .route(&routed("other", ConversationKind::Channel, "c0123abc"))
             .is_none()
     );
 }
@@ -1871,7 +1952,7 @@ async fn channel_routes_match_only_their_own_channel() {
 async fn a_channel_route_with_no_channel_matches_every_channel() {
     let directory = temporary();
     let mut document = document(directory.path());
-    document["routes"][0]["match"] = json!({"kind": "channel"});
+    document["routes"][0]["conversation"] = json!({"kind": ["channel"]});
     let config = resolved(directory.path(), &document).await;
     let table =
         RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("route binds");
@@ -1880,24 +1961,24 @@ async fn a_channel_route_with_no_channel_matches_every_channel() {
     // would be a third. Enumerating them is exactly what leaving `channel` out avoids.
     assert!(
         table
-            .route("dev", &ConversationKind::Channel("c0123abc".to_owned()))
+            .route(&routed("dev", ConversationKind::Channel, "c0123abc"))
             .is_some()
     );
     assert!(
         table
-            .route("dev", &ConversationKind::Channel("c9999zzz".to_owned()))
+            .route(&routed("dev", ConversationKind::Channel, "c9999zzz"))
             .is_some()
     );
     // Wide, not indiscriminate. A direct message is not a channel, so no catch-all swallows one,
     // and the transport name still bounds the whole thing.
     assert!(
         table
-            .route("dev", &ConversationKind::DirectMessage)
+            .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
             .is_none()
     );
     assert!(
         table
-            .route("other", &ConversationKind::Channel("c0123abc".to_owned()))
+            .route(&routed("other", ConversationKind::Channel, "c0123abc"))
             .is_none()
     );
 }
@@ -1909,15 +1990,15 @@ async fn a_named_channel_route_declared_before_a_catch_all_keeps_its_own_channel
     let directory = temporary();
     let mut document = document(directory.path());
     let routes = document["routes"].as_array_mut().expect("routes array");
-    routes[0]["match"] = json!({"kind": "channel", "channel": "c0123abc"});
+    routes[0]["conversation"] = json!({"kind": ["channel"], "ids": ["c0123abc"]});
     routes.push(json!({
         "transport": "dev",
-        "match": {"kind": "channel"},
+        "conversation": {"kind": ["channel"]},
         "agent": "reviewer"
     }));
     routes.push(json!({
         "transport": "dev",
-        "match": {"kind": "directMessage"},
+        "conversation": {"kind": ["directMessage"]},
         "agent": "reviewer"
     }));
     let config = resolved(directory.path(), &document).await;
@@ -1926,27 +2007,29 @@ async fn a_named_channel_route_declared_before_a_catch_all_keeps_its_own_channel
 
     assert_eq!(
         table
-            .route("dev", &ConversationKind::Channel("c0123abc".to_owned()))
+            .route(&routed("dev", ConversationKind::Channel, "c0123abc"))
             .expect("the named channel is routed")
-            .r#match,
-        RouteMatch::Channel {
-            channel: Some("c0123abc".to_owned())
-        }
+            .conversation
+            .ids
+            .as_deref(),
+        Some(["c0123abc".to_owned()].as_slice())
     );
     assert_eq!(
         table
-            .route("dev", &ConversationKind::Channel("c9999zzz".to_owned()))
+            .route(&routed("dev", ConversationKind::Channel, "c9999zzz"))
             .expect("every other channel is routed")
-            .r#match,
-        RouteMatch::Channel { channel: None }
+            .conversation
+            .ids,
+        None
     );
     // And the catch-all sitting above it takes nothing away from the direct-message route.
     assert_eq!(
         table
-            .route("dev", &ConversationKind::DirectMessage)
+            .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
             .expect("direct messages are routed")
-            .r#match,
-        RouteMatch::DirectMessage {}
+            .conversation
+            .kind,
+        ConversationKindMatch::Kinds(vec![ConversationKind::DirectMessage])
     );
 }
 
@@ -2782,7 +2865,12 @@ async fn stub_broker(
 fn route(model: ModelConfig) -> crate::routes::BoundRoute {
     crate::routes::BoundRoute {
         transport: "dev".to_owned(),
-        r#match: RouteMatch::DirectMessage {},
+        conversation: ConversationMatch {
+            kind: ConversationKindMatch::Kinds(vec![ConversationKind::DirectMessage]),
+            container: None,
+            ids: None,
+        },
+        subjects: None,
         agent: "reviewer".parse().expect("valid agent fixture"),
         description: "Reviews things".to_owned(),
         model_class: Some("reasoning".to_owned()),
@@ -2792,6 +2880,7 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         provider_attachments: 0,
         chat_asset_inputs: Arc::from(Vec::new()),
         improvement_suggestions: false,
+        inspect_agent_config: true,
         limits: PromptLimits {
             max_steps: 4,
             max_capability_calls: 8,
@@ -2800,7 +2889,7 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         // budget test says its own number rather than inheriting a fixture's.
         max_duration: None,
         progress_detail: ProgressDetail::Plain,
-        conversation: ConversationPolicy::OneShot,
+        memory: MemoryPolicy::OneShot,
         // Minted the way `RoutingTable::bind` mints it, so a test that reuses one bound route
         // across messages reuses one lane exactly as the daemon does.
         cache_key: cache_key::for_route(),
@@ -2816,17 +2905,17 @@ fn timed_route(model: ModelConfig, max_duration: Duration) -> crate::routes::Bou
 }
 
 /// The same route, remembering what it was told.
-fn persistent_route(model: ModelConfig, window: ConversationWindow) -> crate::routes::BoundRoute {
+fn persistent_route(model: ModelConfig, window: MemoryWindow) -> crate::routes::BoundRoute {
     crate::routes::BoundRoute {
-        conversation: ConversationPolicy::Persistent(window),
+        memory: MemoryPolicy::Persistent(window),
         ..route(model)
     }
 }
 
 /// Bounds generous enough that only the property under test can drop anything.
-fn window() -> ConversationWindow {
-    ConversationWindow {
-        scope: ConversationScope::PrivateConversation,
+fn window() -> MemoryWindow {
+    MemoryWindow {
+        scope: MemoryScope::PrivateConversation,
         idle_timeout: Duration::from_secs(900),
         limits: HistoryLimits {
             max_turns: 12,
@@ -2835,9 +2924,9 @@ fn window() -> ConversationWindow {
     }
 }
 
-fn shared_window() -> ConversationWindow {
-    ConversationWindow {
-        scope: ConversationScope::SharedConversation,
+fn shared_window() -> MemoryWindow {
+    MemoryWindow {
+        scope: MemoryScope::SharedConversation,
         ..window()
     }
 }
@@ -2861,13 +2950,15 @@ fn message(text: &str) -> InboundMessage {
         transport: "dev".to_owned(),
         transport_kind: dekopon_broker_protocol::ChatTransportKind::Local,
         subject: subject(),
-        channel: "dev".to_owned(),
-        thread: None,
-        conversation_id: "dev".to_owned(),
+        conversation: Conversation {
+            kind: ConversationKind::DirectMessage,
+            container: None,
+            id: "dev".to_owned(),
+            thread: None,
+        },
         message_id: "0123456789abcdef0123456789abcdef-1-1".to_owned(),
         text: text.to_owned(),
         assets: Vec::new(),
-        conversation: ConversationKind::DirectMessage,
         // Direct messages ignore addressing. Channel tests opt into structured addressing where
         // that is the behavior under test.
         addressed: None,
@@ -2886,8 +2977,12 @@ fn whatsapp_delivery_identity_is_typed_and_bound_to_its_attested_scope() {
     inbound.transport = "support-whatsapp".to_owned();
     inbound.transport_kind = dekopon_broker_protocol::ChatTransportKind::Whatsapp;
     inbound.subject = ExternalSubject::whatsapp("16034700182").expect("subject");
-    inbound.channel = "123:456:16034700182".to_owned();
-    inbound.conversation_id = inbound.channel.clone();
+    inbound.conversation = Conversation {
+        kind: ConversationKind::DirectMessage,
+        container: Some("123:456".to_owned()),
+        id: "16034700182".to_owned(),
+        thread: None,
+    };
     inbound.message_id = "wamid.delivery".to_owned();
     inbound.reply = ReplyTarget::WhatsApp {
         recipient: "16034700182".to_owned(),
@@ -2898,8 +2993,7 @@ fn whatsapp_delivery_identity_is_typed_and_bound_to_its_attested_scope() {
         dekopon_broker_protocol::ChatScopeClaim {
             transport: "support-whatsapp".parse().expect("transport"),
             kind: dekopon_broker_protocol::ChatTransportKind::Whatsapp,
-            channel: inbound.channel.clone(),
-            conversation: inbound.conversation_id.clone(),
+            conversation: inbound.conversation.clone(),
         },
     );
     let delivery = crate::session::delivery_identity(&inbound, &claim)
@@ -2934,13 +3028,15 @@ fn owned_slack_message(text: &str, inherited: bool) -> InboundMessage {
         subject: "slack.t0123abc.u9xyz"
             .parse()
             .expect("Slack subject fixture"),
-        channel: "c0123abc".to_owned(),
-        thread: Some("1700000000.000001".to_owned()),
-        conversation_id: "c0123abc:1700000000.000001".to_owned(),
+        conversation: Conversation {
+            kind: ConversationKind::Thread,
+            container: Some("t0123abc".to_owned()),
+            id: "c0123abc".to_owned(),
+            thread: Some("1700000000.000001".to_owned()),
+        },
         message_id: "1700000000.000002".to_owned(),
         text: text.to_owned(),
         assets: Vec::new(),
-        conversation: ConversationKind::Channel("c0123abc".to_owned()),
         addressed: Some(!inherited),
         thread_continuation: Some(slack_thread_continuation(inherited)),
         reply: ReplyTarget::Slack {
@@ -3439,7 +3535,7 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
     let key = ConversationKey::private(
         &route.agent,
         &route.transport,
-        &message.conversation_id,
+        &message.conversation.key(),
         &message.subject,
     );
 
@@ -4168,7 +4264,7 @@ async fn a_bound_route_carries_the_skills_its_agent_mounts() {
 
     let routes = RoutingTable::bind(&resolved, &catalog).expect("route binds");
     let route = routes
-        .route("dev", &ConversationKind::DirectMessage)
+        .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
         .expect("route matches");
 
     assert_eq!(route.skills.len(), 1);
@@ -4305,7 +4401,7 @@ async fn improvement_suggestions_are_a_per_route_opt_in() {
         RoutingTable::bind(&resolved, &catalog(true, Some("reasoning"))).expect("the route binds");
     assert!(
         routes
-            .route("dev", &ConversationKind::DirectMessage)
+            .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
             .expect("route matches")
             .improvement_suggestions
     );
@@ -4360,7 +4456,7 @@ async fn an_authorized_agent_can_inspect_its_credential_free_effective_configura
     assert_eq!(result["session"]["maxSteps"], 4);
     assert_eq!(result["session"]["maxCapabilityCalls"], 8);
     assert_eq!(
-        result["session"]["conversation"],
+        result["session"]["memory"],
         json!({"mode": "oneShot"}),
         "one-shot inspection stays exactly mode-only"
     );
@@ -4427,7 +4523,7 @@ async fn shared_scope_is_visible_in_effective_configuration_without_identity() {
         .expect("second request carries the meta result");
     let result: Value = serde_json::from_str(&encoded).expect("meta result is JSON");
     assert_eq!(
-        result["session"]["conversation"],
+        result["session"]["memory"],
         json!({
             "mode": "persistent",
             "scope": "sharedConversation",
@@ -4544,7 +4640,7 @@ async fn a_saturated_gateway_says_so_rather_than_queueing_work() {
     // Hold the only permit, exactly as an in-flight session would.
     let _held = runner
         .gate
-        .admit(("other".to_owned(), "other".to_owned(), None))
+        .admit(("other".to_owned(), "other".to_owned()))
         .expect("the first session is admitted");
     let driver = Arc::new(RecordingDriver::default());
 
@@ -4565,11 +4661,10 @@ async fn one_conversation_runs_one_session_at_a_time() {
     // A person who thinks a bot is stuck sends the same thing again. Without this, the second copy
     // becomes a second billed session racing the first in the same thread.
     let gate = SessionGate::new(8);
-    let key = (
-        "slack".to_owned(),
-        "c0123abc".to_owned(),
-        Some("1.0".to_owned()),
-    );
+    // The conversation key, which is what the registry and the memory key use too: a Slack thread
+    // is `channel:thread`, so the message that opened a thread and the replies inside it hold one
+    // slot rather than two.
+    let key = ("slack".to_owned(), "c0123abc:1.0".to_owned());
 
     let first = gate
         .admit(key.clone())
@@ -4577,12 +4672,8 @@ async fn one_conversation_runs_one_session_at_a_time() {
     assert!(gate.admit(key.clone()).is_none());
     // A different thread in the same channel is a different conversation.
     assert!(
-        gate.admit((
-            "slack".to_owned(),
-            "c0123abc".to_owned(),
-            Some("2.0".to_owned())
-        ))
-        .is_some()
+        gate.admit(("slack".to_owned(), "c0123abc:2.0".to_owned()))
+            .is_some()
     );
 
     drop(first);
@@ -4595,16 +4686,14 @@ async fn one_conversation_runs_one_session_at_a_time() {
 #[tokio::test]
 async fn concurrency_is_bounded_across_every_conversation() {
     let gate = SessionGate::new(2);
-    let first = gate
-        .admit(("a".to_owned(), "a".to_owned(), None))
-        .expect("first");
+    let first = gate.admit(("a".to_owned(), "a".to_owned())).expect("first");
     let second = gate
-        .admit(("b".to_owned(), "b".to_owned(), None))
+        .admit(("b".to_owned(), "b".to_owned()))
         .expect("second");
-    assert!(gate.admit(("c".to_owned(), "c".to_owned(), None)).is_none());
+    assert!(gate.admit(("c".to_owned(), "c".to_owned())).is_none());
 
     drop(first);
-    assert!(gate.admit(("c".to_owned(), "c".to_owned(), None)).is_some());
+    assert!(gate.admit(("c".to_owned(), "c".to_owned())).is_some());
     drop(second);
 }
 
@@ -4763,7 +4852,7 @@ fn commit(
     store: &ConversationStore,
     key: &ConversationKey,
     granted: &[String],
-    window: ConversationWindow,
+    window: MemoryWindow,
     turn: ConversationTurn,
     now: Instant,
 ) {
@@ -5076,7 +5165,7 @@ async fn shared_participant_attribution_counts_against_the_history_byte_window()
     let runner = runner(broker, Arc::clone(&models), 4);
     let route = persistent_route(
         model_config(),
-        ConversationWindow {
+        MemoryWindow {
             limits: HistoryLimits {
                 max_turns: 12,
                 // The raw `x`/`ok` exchange fits; its authoritative participant label does not.
@@ -5388,8 +5477,8 @@ fn each_window_bound_drops_the_oldest_exchange_on_its_own() {
     // paragraph-length ones are the same number of turns and very different prompts.
     let allowed = granted(&["echo.echo"]);
     let now = Instant::now();
-    let by_turns = ConversationWindow {
-        scope: ConversationScope::PrivateConversation,
+    let by_turns = MemoryWindow {
+        scope: MemoryScope::PrivateConversation,
         idle_timeout: Duration::from_secs(900),
         limits: HistoryLimits {
             max_turns: 2,
@@ -5398,8 +5487,8 @@ fn each_window_bound_drops_the_oldest_exchange_on_its_own() {
     };
     // Each exchange below is a ten-byte question and a nine-byte answer, so two fit under this
     // ceiling and three do not, while the turn count stays well inside `max_turns`.
-    let by_bytes = ConversationWindow {
-        scope: ConversationScope::PrivateConversation,
+    let by_bytes = MemoryWindow {
+        scope: MemoryScope::PrivateConversation,
         idle_timeout: Duration::from_secs(900),
         limits: HistoryLimits {
             max_turns: 12,
@@ -5779,8 +5868,27 @@ fn the_store_prints_counts_rather_than_conversations() {
 /// The same message, in a different conversation on the same transport.
 fn message_in(conversation: &str, text: &str) -> InboundMessage {
     InboundMessage {
-        conversation_id: conversation.to_owned(),
+        conversation: Conversation {
+            kind: ConversationKind::DirectMessage,
+            container: None,
+            id: conversation.to_owned(),
+            thread: None,
+        },
         ..message(text)
+    }
+}
+
+/// One message on a named transport in a named conversation, for route-table tests.
+fn routed(transport: &str, kind: ConversationKind, id: &str) -> InboundMessage {
+    InboundMessage {
+        transport: transport.to_owned(),
+        conversation: Conversation {
+            kind,
+            container: None,
+            id: id.to_owned(),
+            thread: None,
+        },
+        ..message("hello")
     }
 }
 
@@ -6252,7 +6360,7 @@ async fn a_requested_shutdown_ends_the_daemon_successfully() {
 async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
     let directory = temporary();
     let mut document = document(directory.path());
-    document["routes"][0]["match"] = json!({"kind": "channel", "channel": "c0123abc"});
+    document["routes"][0]["conversation"] = json!({"kind": ["channel"], "ids": ["c0123abc"]});
     let config = resolved(directory.path(), &document).await;
     let routes = Arc::new(
         RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("route binds"),
@@ -6275,7 +6383,12 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
     let mut sessions = tokio::task::JoinSet::new();
 
     let mut ambient = message("just chatting with my colleagues");
-    ambient.conversation = ConversationKind::Channel("c0123abc".to_owned());
+    ambient.conversation = Conversation {
+        kind: ConversationKind::Channel,
+        container: None,
+        id: "c0123abc".to_owned(),
+        thread: None,
+    };
     crate::dispatch(
         &runner,
         &routes,
@@ -6294,7 +6407,12 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
     // Discord's structured mentions are authoritative. Presentation text cannot turn an explicit
     // `mentions` miss into a wakeup.
     let mut structurally_unaddressed = message("<@U0BOTBOT> presentation text");
-    structurally_unaddressed.conversation = ConversationKind::Channel("c0123abc".to_owned());
+    structurally_unaddressed.conversation = Conversation {
+        kind: ConversationKind::Channel,
+        container: None,
+        id: "c0123abc".to_owned(),
+        thread: None,
+    };
     structurally_unaddressed.addressed = Some(false);
     crate::dispatch(
         &runner,
@@ -6309,7 +6427,12 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
 
     // A message on a channel with no route is ignored just as quietly.
     let mut elsewhere = message("<@U0BOTBOT> hello");
-    elsewhere.conversation = ConversationKind::Channel("c9999zzz".to_owned());
+    elsewhere.conversation = Conversation {
+        kind: ConversationKind::Channel,
+        container: None,
+        id: "c9999zzz".to_owned(),
+        thread: None,
+    };
     crate::dispatch(
         &runner,
         &routes,
@@ -6326,7 +6449,12 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
     );
 
     let mut addressed = message("<@U0BOTBOT> what is the status?");
-    addressed.conversation = ConversationKind::Channel("c0123abc".to_owned());
+    addressed.conversation = Conversation {
+        kind: ConversationKind::Channel,
+        container: None,
+        id: "c0123abc".to_owned(),
+        thread: None,
+    };
     crate::dispatch(
         &runner,
         &routes,
@@ -6345,7 +6473,7 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
 async fn a_transport_owned_thread_continuation_bypasses_only_the_repeat_mention() {
     let directory = temporary();
     let mut document = document(directory.path());
-    document["routes"][0]["match"] = json!({"kind": "channel", "channel": "c0123abc"});
+    document["routes"][0]["conversation"] = json!({"kind": ["channel"], "ids": ["c0123abc"]});
     let config = resolved(directory.path(), &document).await;
     let routes = Arc::new(
         RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("route binds"),
@@ -6364,7 +6492,12 @@ async fn a_transport_owned_thread_continuation_bypasses_only_the_repeat_mention(
     let repliers = BTreeMap::from([("dev".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
     let mut sessions = tokio::task::JoinSet::new();
     let mut continuation = message("and then?");
-    continuation.conversation = ConversationKind::Channel("c0123abc".to_owned());
+    continuation.conversation = Conversation {
+        kind: ConversationKind::Channel,
+        container: None,
+        id: "c0123abc".to_owned(),
+        thread: None,
+    };
     continuation.addressed = Some(false);
     continuation.thread_continuation = Some(slack_thread_continuation(true));
 
@@ -6398,7 +6531,7 @@ async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
     // every channel it sits in.
     let directory = temporary();
     let mut document = document(directory.path());
-    document["routes"][0]["match"] = json!({"kind": "channel"});
+    document["routes"][0]["conversation"] = json!({"kind": ["channel"]});
     let config = resolved(directory.path(), &document).await;
     let routes = Arc::new(
         RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("route binds"),
@@ -6419,7 +6552,12 @@ async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
 
     // A channel this configuration never names, which is the whole point of the catch-all.
     let mut ambient = message("just chatting with my colleagues");
-    ambient.conversation = ConversationKind::Channel("c9999zzz".to_owned());
+    ambient.conversation = Conversation {
+        kind: ConversationKind::Channel,
+        container: None,
+        id: "c9999zzz".to_owned(),
+        thread: None,
+    };
     crate::dispatch(
         &runner,
         &routes,
@@ -6436,7 +6574,12 @@ async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
     );
 
     let mut addressed = message("what is the status?");
-    addressed.conversation = ConversationKind::Channel("c9999zzz".to_owned());
+    addressed.conversation = Conversation {
+        kind: ConversationKind::Channel,
+        container: None,
+        id: "c9999zzz".to_owned(),
+        thread: None,
+    };
     // Discord supplies this from its authenticated `mentions` array rather than presentation text.
     addressed.addressed = Some(true);
     crate::dispatch(
@@ -7307,16 +7450,18 @@ async fn a_slack_thread_and_the_message_that_opened_it_are_one_conversation() {
     let elsewhere = next_message(&mut transport).await;
 
     // The asymmetry itself, so the derivation below has something to be right about.
-    assert_eq!(opening.thread, None);
-    assert_eq!(reply.thread.as_deref(), Some("1700000000.000001"));
+    assert_eq!(opening.conversation.kind, ConversationKind::Channel);
+    assert_eq!(reply.conversation.kind, ConversationKind::Thread);
 
     assert_eq!(
-        opening.conversation_id, reply.conversation_id,
+        opening.conversation.key(),
+        reply.conversation.key(),
         "the message that opened a thread and a reply inside it are one conversation"
     );
-    assert_eq!(opening.conversation_id, "c0123abc:1700000000.000001");
+    assert_eq!(opening.conversation.key(), "c0123abc:1700000000.000001");
     assert_ne!(
-        opening.conversation_id, elsewhere.conversation_id,
+        opening.conversation.key(),
+        elsewhere.conversation.key(),
         "two threads in one channel are two conversations"
     );
     // The identity is the thread the *answer* joins, which is why it survives the first turn.
@@ -7350,9 +7495,10 @@ async fn a_slack_direct_message_is_one_conversation_across_its_messages() {
     let first = next_message(&mut transport).await;
     let second = next_message(&mut transport).await;
 
-    assert_eq!(first.conversation_id, "d0123abc");
+    assert_eq!(first.conversation.key(), "d0123abc");
     assert_eq!(
-        first.conversation_id, second.conversation_id,
+        first.conversation.key(),
+        second.conversation.key(),
         "a direct message is one conversation across its messages"
     );
     assert_eq!(
@@ -7475,8 +7621,11 @@ async fn slack_agent_status_uses_thread_sessions_and_explicit_lifecycle_states()
     transport.connect().await.expect("Slack Agent connects");
     let message = next_message(&mut transport).await;
 
-    assert_eq!(message.thread.as_deref(), Some("1700000000.000001"));
-    assert_eq!(message.conversation_id, "d0123abc:1700000000.000001");
+    assert_eq!(
+        message.conversation.thread.as_deref(),
+        Some("1700000000.000001")
+    );
+    assert_eq!(message.conversation.key(), "d0123abc:1700000000.000001");
     assert_eq!(
         message.reply,
         ReplyTarget::Slack {
@@ -9033,6 +9182,7 @@ fn a_redirect_away_from_slack_is_not_followed() {
 const DISCORD_BOT: &str = "111111111111111111";
 const DISCORD_USER: &str = "999999999999999999";
 const DISCORD_CHANNEL: &str = "222222222222222222";
+const DISCORD_GUILD: &str = "777777777777777777";
 const DISCORD_MESSAGE: &str = "333333333333333333";
 
 /// One loopback Discord Gateway, including the control payload the bot sent after Hello.
@@ -9178,6 +9328,15 @@ fn discord_handler(gateway_url: String) -> impl Fn(&str, &str) -> Value + Send +
                 "max_concurrency": 1
             }
         }),
+        // `GET /channels/{id}` is how a guild message learns whether its channel is a channel, a
+        // thread, or a forum post. It is the bare channel path; everything deeper under
+        // `/channels/` is Create Message and friends, which answer with a posted message.
+        path if path
+            .strip_prefix("/api/v10/channels/")
+            .is_some_and(|rest| !rest.trim_end_matches('/').contains('/')) =>
+        {
+            json!({ "id": DISCORD_CHANNEL, "type": 0, "guild_id": DISCORD_GUILD })
+        }
         path if path.starts_with("/api/v10/channels/") => json!({
             "id": "444444444444444444",
             "channel_id": DISCORD_CHANNEL,
@@ -9208,7 +9367,7 @@ async fn discord_routes_photos_and_files_and_posts_a_no_ping_reply() {
     let mut event = discord_message(
         DISCORD_MESSAGE,
         DISCORD_CHANNEL,
-        Some("777777777777777777"),
+        Some(DISCORD_GUILD),
         DISCORD_USER,
         false,
         "please inspect both attachments",
@@ -9742,7 +9901,7 @@ async fn discord_drops_bots_webhooks_and_system_messages_before_routing_a_dm() {
     let bot = discord_message(
         "300000000000000001",
         DISCORD_CHANNEL,
-        Some("777777777777777777"),
+        Some(DISCORD_GUILD),
         "888888888888888888",
         true,
         "another bot",
@@ -9750,7 +9909,7 @@ async fn discord_drops_bots_webhooks_and_system_messages_before_routing_a_dm() {
     let mut webhook = discord_message(
         "300000000000000002",
         DISCORD_CHANNEL,
-        Some("777777777777777777"),
+        Some(DISCORD_GUILD),
         DISCORD_USER,
         false,
         "a webhook",
@@ -9759,7 +9918,7 @@ async fn discord_drops_bots_webhooks_and_system_messages_before_routing_a_dm() {
     let mut system = discord_message(
         "300000000000000003",
         DISCORD_CHANNEL,
-        Some("777777777777777777"),
+        Some(DISCORD_GUILD),
         DISCORD_USER,
         false,
         "joined",
@@ -9788,13 +9947,13 @@ async fn discord_drops_bots_webhooks_and_system_messages_before_routing_a_dm() {
 
     let message = next_message(&mut transport).await;
     assert_eq!(message.text, "a private question");
-    assert_eq!(message.conversation, ConversationKind::DirectMessage);
+    assert_eq!(message.conversation.kind, ConversationKind::DirectMessage);
     assert_eq!(
         message.addressed,
         Some(true),
         "a direct message is addressed by definition"
     );
-    assert_eq!(message.conversation_id, "200000000000000004");
+    assert_eq!(message.conversation.key(), "200000000000000004");
     assert_eq!(
         message.reply,
         ReplyTarget::Discord {
@@ -10131,8 +10290,8 @@ async fn telegram_liveness_and_replies_stay_inside_the_inbound_topic() {
     transport.connect().await.expect("Telegram connects");
     let message = next_message(&mut transport).await;
 
-    assert_eq!(message.thread.as_deref(), Some("99"));
-    assert_eq!(message.conversation_id, "-1001:topic:99");
+    assert_eq!(message.conversation.thread.as_deref(), Some("99"));
+    assert_eq!(message.conversation.key(), "-1001:99");
     assert_eq!(
         message.reply.clone(),
         ReplyTarget::Telegram {
@@ -10294,13 +10453,14 @@ async fn a_telegram_chat_is_one_conversation_and_another_chat_is_another() {
     let second = next_message(&mut transport).await;
     let group = next_message(&mut transport).await;
 
-    assert_eq!(first.conversation_id, "42");
+    assert_eq!(first.conversation.key(), "42");
     assert_eq!(
-        first.conversation_id, second.conversation_id,
+        first.conversation.key(),
+        second.conversation.key(),
         "two messages in one chat are one conversation"
     );
-    assert_eq!(group.conversation_id, "-1001");
-    assert_ne!(first.conversation_id, group.conversation_id);
+    assert_eq!(group.conversation.key(), "-1001");
+    assert_ne!(first.conversation.key(), group.conversation.key());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -10336,8 +10496,8 @@ async fn telegram_topics_have_distinct_scopes_and_replies_stay_in_the_topic() {
     let mut transport = telegram(&http.base);
     transport.connect().await.expect("telegram connects");
     let message = next_message(&mut transport).await;
-    assert_eq!(message.conversation_id, "-1001:topic:77");
-    assert_eq!(message.thread.as_deref(), Some("77"));
+    assert_eq!(message.conversation.key(), "-1001:77");
+    assert_eq!(message.conversation.thread.as_deref(), Some("77"));
     transport
         .driver()
         .reply(&message.reply, OutboundReply::text("inside topic"))
@@ -10560,7 +10720,7 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
     for request in [
         json!({"subject": SUBJECT, "text": "first"}),
         json!({"subject": SUBJECT, "text": "second"}),
-        json!({"subject": SUBJECT, "channel": "session-7", "text": "over here"}),
+        json!({"subject": SUBJECT, "conversation": {"kind": "directMessage", "id": "session-7"}, "text": "over here"}),
     ] {
         client
             .write_all(format!("{request}\n").as_bytes())
@@ -10573,9 +10733,10 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
     let named = next_message(&mut transport).await;
 
     assert_eq!(first.text, "first");
-    assert_eq!(first.conversation_id, "dev");
+    assert_eq!(first.conversation.key(), "dev");
     assert_eq!(
-        first.conversation_id, second.conversation_id,
+        first.conversation.key(),
+        second.conversation.key(),
         "two requests on one connection continue one conversation"
     );
     assert_eq!(
@@ -10590,7 +10751,7 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     );
-    assert_eq!(named.conversation_id, "session-7");
+    assert_eq!(named.conversation.key(), "session-7");
 
     // The reply resolves only after the transport writer has completed both `write_all` and
     // `flush`; reading the exact line from the peer proves the kernel-acceptance crossing.
@@ -10795,7 +10956,7 @@ async fn a_discord_gateway_event_opens_its_trace_before_the_payload_is_read() {
     let mut event = discord_message(
         DISCORD_MESSAGE,
         DISCORD_CHANNEL,
-        Some("777777777777777777"),
+        Some(DISCORD_GUILD),
         DISCORD_USER,
         false,
         "a real question",
@@ -11703,4 +11864,179 @@ async fn a_session_with_no_liveness_surface_is_still_registered_and_stoppable() 
     session.await.expect("the cancelled session exits");
 
     assert_eq!(driver.replies(), [crate::session::STOPPED_REPLY]);
+}
+
+// ---------------------------------------------------------------------------
+// Conversations: liveness overrides, the route table, and withheld self-inspection
+// ---------------------------------------------------------------------------
+
+/// `for_kind` overlays one kind's block on the transport's base and changes nothing else.
+#[test]
+fn a_liveness_override_replaces_only_the_fields_it_names_and_the_whole_keep_alive() {
+    let base = ResolvedLiveness {
+        settings: LivenessSettings {
+            mode: LivenessMode::Native,
+            classic_fallback: SlackLivenessFallback::None,
+            progress: ProgressSurface::Message,
+            stream: false,
+            cancel_button: true,
+        },
+        keep_alive: KeepAlive {
+            at: vec![Duration::from_secs(15), Duration::from_secs(45)],
+            every: Duration::from_secs(60),
+            max: 10,
+        },
+        conversations: [
+            (
+                ConversationKind::DirectMessage,
+                LivenessOverride {
+                    stream: Some(true),
+                    ..LivenessOverride::default()
+                },
+            ),
+            (
+                ConversationKind::Thread,
+                LivenessOverride {
+                    keep_alive: Some(crate::config::KeepAliveConfig {
+                        at_seconds: vec![30],
+                        every_seconds: 120,
+                        max: 5,
+                    }),
+                    ..LivenessOverride::default()
+                },
+            ),
+        ]
+        .into_iter()
+        .collect(),
+        ..ResolvedLiveness::default()
+    };
+
+    // An absent key is the base, byte for byte.
+    let (settings, keep_alive) = base.for_kind(ConversationKind::Channel);
+    assert_eq!(settings, base.settings);
+    assert_eq!(keep_alive, base.keep_alive);
+
+    // A present key overlays only what it names.
+    let (settings, keep_alive) = base.for_kind(ConversationKind::DirectMessage);
+    assert!(settings.stream, "one reader in a direct message: stream");
+    assert_eq!(settings.progress, ProgressSurface::Message);
+    assert!(settings.cancel_button);
+    assert_eq!(settings.mode, LivenessMode::Native);
+    assert_eq!(keep_alive, base.keep_alive, "no cadence was overridden");
+
+    // `keepAlive` replaces the whole block rather than merging field by field: three offsets, a
+    // period, and a ceiling are one cadence, and a merged one is a cadence nobody authored.
+    let (settings, keep_alive) = base.for_kind(ConversationKind::Thread);
+    assert_eq!(settings, base.settings);
+    assert_eq!(
+        keep_alive,
+        KeepAlive {
+            at: vec![Duration::from_secs(30)],
+            every: Duration::from_secs(120),
+            max: 5,
+        }
+    );
+}
+
+/// Declaration order is precedence, `[channel]` excludes threads, and `subjects` restricts.
+#[tokio::test]
+async fn the_route_table_matches_on_kind_container_id_and_subjects_in_declaration_order() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    let routes = document["routes"].as_array_mut().expect("routes array");
+    routes[0]["conversation"] = json!({"kind": ["channel"], "ids": ["ops"]});
+    routes.push(json!({
+        "transport": "dev",
+        "conversation": {"kind": ["channel", "thread"]},
+        "agent": "reviewer"
+    }));
+    routes.push(json!({
+        "transport": "dev",
+        "conversation": {"kind": ["directMessage"]},
+        "subjects": [SUBJECT],
+        "agent": "reviewer"
+    }));
+    let config = resolved(directory.path(), &document).await;
+    let table =
+        RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("every route binds");
+
+    // `[channel]` on the named id excludes the threads under it; the catch-all below takes them.
+    let named = routed("dev", ConversationKind::Channel, "ops");
+    assert_eq!(
+        table
+            .route(&named)
+            .expect("the named channel is routed")
+            .conversation
+            .ids
+            .as_deref(),
+        Some(["ops".to_owned()].as_slice())
+    );
+    let thread_under_it = InboundMessage {
+        conversation: Conversation {
+            kind: ConversationKind::Thread,
+            container: None,
+            id: "ops".to_owned(),
+            thread: Some("7".to_owned()),
+        },
+        ..routed("dev", ConversationKind::Thread, "ops")
+    };
+    assert_eq!(
+        table
+            .route(&thread_under_it)
+            .expect("the catch-all takes the thread")
+            .conversation
+            .ids,
+        None,
+        "`kind: [channel]` excludes the threads under the channel it names"
+    );
+
+    // `subjects` restricts and never widens.
+    assert!(
+        table
+            .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
+            .is_some()
+    );
+    let stranger = InboundMessage {
+        subject: "tel.15558675309".parse().expect("subject"),
+        ..routed("dev", ConversationKind::DirectMessage, "dev")
+    };
+    assert!(
+        table.route(&stranger).is_none(),
+        "a subject the route does not list is unrouted, not answered"
+    );
+}
+
+/// A route with `inspectAgentConfig: false` never offers the tool.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_that_withholds_self_inspection_offers_no_such_tool() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("echo.echo")],
+            Vec::new(),
+        )],
+    )
+    .await;
+    let models = ModelScript::new([answer("Nothing to show.")]);
+    let driver = Arc::new(RecordingDriver::default());
+    let route = crate::routes::BoundRoute {
+        inspect_agent_config: false,
+        ..route(model_config())
+    };
+
+    run_session(
+        runner(broker, Arc::clone(&models), 4),
+        route,
+        message("what is this agent's configuration?"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+
+    let tools = models.tool_names(0);
+    assert!(
+        !tools.contains(&dekopon_agent::prompt::AGENT_CONFIG_TOOL_NAME.to_owned()),
+        "the withheld tool is absent from the model's list: {tools:?}"
+    );
+    assert_eq!(driver.replies(), vec!["Nothing to show.".to_owned()]);
 }

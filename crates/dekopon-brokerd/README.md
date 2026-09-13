@@ -335,9 +335,9 @@ identities:
     attestor:
       namespaces: [slack.t0123abc]     # segment-boundary prefixes, service name first
       chatScopes:                      # required by chat-scoped gateway operations
-        - breadth: transportWide
-          kind: slack
+        - kind: slack
           transport: scientist-slack
+          conversation: { kind: any }   # or a kind list with `container`/`ids`
 identityMappings:
   - subject: slack.t0123abc.u9xyz      # canonical: lowercase dotted segments
     principal: maintainer              # the only place a subject becomes a principal
@@ -795,11 +795,9 @@ identities:
     attestor:
       namespaces: [slack.t0123abc]
       chatScopes:
-        - breadth: exactConversation
-          kind: slack
+        - kind: slack
           transport: scientist-slack
-          channel: c0123abc
-          conversation: c0123abc:1712345678.000100
+          conversation: { kind: [channel, thread], ids: [c0123abc] }
 ```
 
 Filesystem cancellation cannot guarantee a stuck native `fsync` returns by a hard deadline. The

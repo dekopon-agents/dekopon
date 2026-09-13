@@ -210,7 +210,7 @@ One long-lived optimization is in place: `dekopond` shares one model client per 
 
 ## How scoped conversation memory works
 
-A route opts in with a `conversation:` block, and [`dekopond.md`](dekopond.md#conversations) owns its
+A route opts in with a `memory:` block, and [`dekopond.md`](dekopond.md#conversations) owns its
 keys, bounds, and eviction. What matters at the wire is what enters the prompt.
 
 `oneShot` is the route default and sends no history at all. A persistent route seeds the prompt with

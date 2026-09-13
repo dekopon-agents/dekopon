@@ -29,7 +29,7 @@ use std::{
 use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dekopon_agent::CancelVia;
-use dekopon_broker_protocol::ChatTransportKind;
+use dekopon_broker_protocol::{ChatTransportKind, Conversation, ConversationKind};
 use dekopon_core::ExternalSubject;
 use futures_util::future::BoxFuture;
 use serde::Deserialize;
@@ -45,10 +45,10 @@ use crate::{
     progress::ProgressText,
     transport::{
         AckToken, CancelButton, CancelPress, CancelRequest, ChatDriver, ChatTransport,
-        ConversationKind, InboundMessage, InboundReaction, LivenessTarget, MAX_OUTBOUND_TEXT_BYTES,
-        MessageRef, NativeStatus, OutboundReply, ProgressLimits, ProgressMessage, ReplyTarget,
-        Status, StreamLimits, StreamedText, TextStream, TransportError, TransportEvent,
-        TransportIdentity, TypingLease, bound_inbound, receive_span,
+        InboundMessage, InboundReaction, LivenessTarget, MAX_OUTBOUND_TEXT_BYTES, MessageRef,
+        NativeStatus, OutboundReply, ProgressLimits, ProgressMessage, ReplyTarget, Status,
+        StreamLimits, StreamedText, TextStream, TransportError, TransportEvent, TransportIdentity,
+        TypingLease, bound_inbound, receive_span, record_conversation,
     },
 };
 
@@ -72,8 +72,13 @@ const TRUNCATION_MARKER: char = '…';
 struct LocalRequest {
     /// A canonical external subject the caller claims to be.
     subject: ExternalSubject,
-    #[serde(default = "default_channel")]
-    channel: String,
+    /// Where this line was posted, defaulting to a direct message in `dev`.
+    ///
+    /// The local line is the only source of every conversation kind, which is what makes this
+    /// transport the one that can exercise a route table, a liveness override, and a memory key
+    /// for a kind no other transport in a test harness produces.
+    #[serde(default = "default_conversation")]
+    conversation: Conversation,
     /// The message to route. Absent only on a stop line.
     text: Option<String>,
     /// Asks the gateway to cancel whatever this conversation has in flight.
@@ -84,8 +89,13 @@ struct LocalRequest {
     stop: bool,
 }
 
-fn default_channel() -> String {
-    "dev".to_owned()
+fn default_conversation() -> Conversation {
+    Conversation {
+        kind: ConversationKind::DirectMessage,
+        container: None,
+        id: "dev".to_owned(),
+        thread: None,
+    }
 }
 
 pub(crate) struct LocalTransport {
@@ -228,7 +238,7 @@ impl LocalTransport {
                     }
                     let cancelled = TransportEvent::CancelRequested(CancelRequest {
                         transport: name.clone(),
-                        conversation_id: request.channel,
+                        conversation_id: request.conversation.key(),
                         subject,
                         // A line in the conversation rather than a component press: the local
                         // socket has no interaction to acknowledge, which is what separates this
@@ -253,26 +263,24 @@ impl LocalTransport {
                 sequence += 1;
                 let message_id = format!("{boot_nonce}-{connection}-{sequence}");
                 received.record("message.id", message_id.as_str());
+                // The caller names its own conversation, and it defaults to a direct message in
+                // `dev`. There is nothing else here to derive one from — the connection number
+                // would restart the conversation every time a developer reconnected.
+                let conversation = request.conversation;
+                record_conversation(&received, &conversation);
+                let addressed = conversation.kind == ConversationKind::DirectMessage;
                 let message = InboundMessage {
                     transport: name.clone(),
                     transport_kind: ChatTransportKind::Local,
                     subject: request.subject,
-                    channel: request.channel.clone(),
-                    thread: None,
-                    // The caller names its own conversation, and `channel` defaults to `dev` when
-                    // it does not. There is nothing else here to derive one from — a local session
-                    // has no threads, and the connection number would restart the conversation
-                    // every time a developer reconnected.
-                    conversation_id: request.channel,
+                    conversation,
                     message_id,
                     text: bound_inbound(&text),
                     // The development transport speaks line-delimited JSON and carries no files.
                     assets: Vec::new(),
-                    // Always a direct message: a local caller is talking to the daemon
-                    // one-to-one, so there is no ambient traffic to filter and no mention to
-                    // require. Channel routes are a chat-service concept.
-                    conversation: ConversationKind::DirectMessage,
-                    addressed: Some(true),
+                    // A direct-message line is addressed by definition; anything else is ambient
+                    // traffic the routing loop applies the same addressing rule to as a channel.
+                    addressed: addressed.then_some(true),
                     thread_continuation: None,
                     reply: ReplyTarget::Local { connection },
                     liveness: native.then_some(LivenessTarget::Local { connection }),
@@ -1016,7 +1024,11 @@ mod unit_tests {
         for request in [
             json!({ "subject": SUBJECT, "text": "stop", "stop": true }),
             json!({ "subject": SUBJECT }),
-            json!({ "subject": SUBJECT, "channel": "session-7", "stop": true }),
+            json!({
+                "subject": SUBJECT,
+                "conversation": { "kind": "directMessage", "id": "session-7" },
+                "stop": true
+            }),
         ] {
             writer
                 .write_all(format!("{request}\n").as_bytes())

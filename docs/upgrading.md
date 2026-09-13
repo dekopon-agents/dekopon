@@ -285,6 +285,31 @@ See [`operations.md`](operations.md#audit).
 Only releases that need an operator action appear here. A release absent from this list is a binary
 swap in the order above.
 
+### Conversations replace route matches and chat-scope breadths; `memory:` replaces the route's `conversation:` (0.14.0)
+
+Every route's `match:` becomes `conversation:`, and `kind` is a list or the word `any`.
+`{ kind: directMessage }` becomes `conversation: { kind: [directMessage] }`; `{ kind: channel, channel: X }`
+becomes `conversation: { kind: [channel, thread], ids: [X] }` if threads under X should answer
+(they were silent before; this is the one behavior change) or `[channel]` if not;
+`{ kind: channel }` becomes `conversation: { kind: [channel, thread] }`. Slack multi-person DMs
+were `channel`; they are now `groupDirectMessage`, so a Slack route that should keep answering them writes
+`kind: any` or adds `groupDirectMessage` to the list. The route's memory window, which was also called
+`conversation:`, is `memory:` with the same fields; a file with a `mode:` under `conversation:`
+refuses to start and names the rename. In `broker.yaml`, every `chatScopes` entry drops `breadth`:
+`transportWide` becomes `conversation: { kind: any }`, `exactChannel` becomes
+`conversation: { kind: [channel, thread], ids: [channel] }` (`[directMessage]` for a Slack `D…` id), and
+`exactConversation` is gone — grants no longer name a thread, so a grant on one exact thread
+becomes a grant on its parent. In Cedar, read `context.conversation.id` and, guarded by
+`context.conversation has thread`, `context.conversation.thread`. **Grep your policy file for
+`context.channel` rather than relying on the validator.** An unguarded `context.channel == "…"`
+refuses to load, and so does comparing `context.conversation` to a string — but the guarded form
+every 0.13 example used, `context has channel && context.channel == "…"`, still loads: Cedar types
+the guard on an attribute the schema no longer declares as false and short-circuits, so the
+statement quietly stops matching instead of failing. A capability pin written that way becomes a
+capability nobody has. Durable chat-memory
+namespaces on WhatsApp, Telegram topics, and Discord threads change shape and start empty;
+Slack and Discord channels keep theirs. Restart the broker first, then the gateway.
+
 ### 0.12.0 → 0.13.0 — command words run over `runCommand`, and `imageGenerator:` is removed
 
 One item here — the removed `imageGenerator:` — **does** need a configuration edit; nothing else

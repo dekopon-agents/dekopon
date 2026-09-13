@@ -17,7 +17,7 @@ use std::{
 
 use async_trait::async_trait;
 use dekopon_agent::{CancelVia, attachment::GeneratedImage};
-use dekopon_broker_protocol::ChatTransportKind;
+use dekopon_broker_protocol::{ChatTransportKind, Conversation, ConversationKind};
 use dekopon_core::{ExternalSubject, Redacted};
 use futures_util::{SinkExt as _, StreamExt as _, future::BoxFuture};
 use serde_json::{Value, json};
@@ -34,11 +34,11 @@ use crate::{
     progress::ProgressText,
     transport::{
         AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver,
-        ChatTransport, ConversationKind, InboundMessage, InboundReaction, LivenessTarget,
-        MessageRef, NativeStatus, OutboundReply, ProgressLimits, ProgressMessage, ReplyTarget,
-        SeenIds, Status, StreamLimits, StreamedText, TextStream, ThreadClaim, ThreadContinuation,
-        ThreadOwnership, TransportError, TransportEvent, TransportIdentity, bound_inbound,
-        credential_client, floor_boundary, receive_span, reconnect_delay,
+        ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageRef, NativeStatus,
+        OutboundReply, ProgressLimits, ProgressMessage, ReplyTarget, SeenIds, Status, StreamLimits,
+        StreamedText, TextStream, ThreadClaim, ThreadContinuation, ThreadOwnership, TransportError,
+        TransportEvent, TransportIdentity, bound_inbound, credential_client, floor_boundary,
+        receive_span, reconnect_delay, record_conversation,
     },
 };
 
@@ -448,10 +448,16 @@ impl SlackTransport {
         }
         let thread_ts = event["thread_ts"].as_str().map(str::to_owned);
         let root_ts = thread_ts.clone().unwrap_or_else(|| ts.to_owned());
-        let conversation = if event["channel_type"].as_str() == Some("im") {
-            ConversationKind::DirectMessage
-        } else {
-            ConversationKind::Channel(channel.to_owned())
+        // Kind is where the message was posted. `im` stays a direct message however it threads —
+        // Slack's Agent experience roots a thread on every DM turn, so a `thread` kind there would
+        // make direct messages unmatchable. A multi-person DM is its own kind because it has no
+        // container membership behind it, and a message already inside a thread is a thread under
+        // its parent.
+        let kind = match (event["channel_type"].as_str(), &thread_ts) {
+            (Some("im"), _) => ConversationKind::DirectMessage,
+            (Some("mpim"), None) => ConversationKind::GroupDirectMessage,
+            (_, None) => ConversationKind::Channel,
+            (_, Some(_)) => ConversationKind::Thread,
         };
         // `message.channels`/`message.groups` expose ambient traffic to an Agent installation so
         // an owned thread can continue without another mention. Drop everything else here, before
@@ -460,8 +466,10 @@ impl SlackTransport {
         // because the parallel message event may win the dedup race.
         let explicitly_addressed =
             event["type"].as_str() == Some("app_mention") || self.identity.is_addressed(&text);
-        let thread_continuation = match (&conversation, self.experience) {
-            (ConversationKind::Channel(_), SlackExperience::Agent) => {
+        // F13: every kind but a direct message is ambient traffic here, group DMs included.
+        let is_shared = kind != ConversationKind::DirectMessage;
+        let thread_continuation = match (is_shared, self.experience) {
+            (true, SlackExperience::Agent) => {
                 let claim = ThreadClaim::Slack {
                     team_id: team.to_owned(),
                     channel_id: channel.to_owned(),
@@ -474,7 +482,7 @@ impl SlackTransport {
                 }
                 Some(ThreadContinuation { claim, inherited })
             }
-            (ConversationKind::Channel(_), SlackExperience::Classic) if !explicitly_addressed => {
+            (true, SlackExperience::Classic) if !explicitly_addressed => {
                 return Ok(None);
             }
             _ => None,
@@ -485,44 +493,36 @@ impl SlackTransport {
         // Agent sessions are thread-scoped even in DMs. Classic DMs deliberately retain today's
         // top-level reply and whole-DM conversation behavior; a cosmetic API result never decides
         // which model the installed app exposes.
-        let is_channel = matches!(&conversation, ConversationKind::Channel(_));
-        let reply_thread = match (&conversation, self.experience) {
+        let reply_thread = match (kind, self.experience) {
             (ConversationKind::DirectMessage, SlackExperience::Classic) => None,
-            (ConversationKind::DirectMessage | ConversationKind::Channel(_), _) => {
-                Some(root_ts.clone())
-            }
+            _ => Some(root_ts.clone()),
         };
-        // The conversation is the thread the answer joins, never `thread_ts`. Slack omits
+        // The thread coordinate is the thread the answer joins, never `thread_ts`. Slack omits
         // `thread_ts` on the message that *starts* a thread and sends it on every reply inside one,
-        // so the first turn and the answers to it disagree about `thread` even though they are the
-        // same exchange. Deriving the identity from `reply_thread` — the value the bot actually
+        // so the first turn and the answers to it would disagree about the thread even though they
+        // are the same exchange. Deriving it from `reply_thread` — the value the bot actually
         // replies into — is what keeps turn one attached to the thread it opened. Do not
         // "simplify" this back to `thread_ts`; that is the bug.
         //
-        // Prefixed with the channel because a Slack `ts` is only unique within its channel, and
-        // this identity has to stand on its own once it leaves the transport. A classic direct
-        // message has no thread to join and uses the DM channel; Agent mode intentionally uses the
-        // root thread for one Slack session per task.
-        let conversation_id = match &reply_thread {
-            Some(thread) => format!("{channel}:{thread}"),
-            None => channel.to_owned(),
+        // Lowercased here, once, because the transport mints the canonical form: a Slack id is
+        // case-insensitive on the wire and the grant, the claim and Cedar all compare the token.
+        let conversation = Conversation {
+            kind,
+            container: Some(team.to_ascii_lowercase()),
+            id: channel.to_ascii_lowercase(),
+            thread: reply_thread.clone(),
         };
+        record_conversation(received, &conversation);
 
         Ok(Some(InboundMessage {
             transport: self.name.clone(),
             transport_kind: ChatTransportKind::Slack,
             subject: ExternalSubject::slack(team, user).map_err(TransportError::Subject)?,
-            channel: channel.to_owned(),
-            thread: match self.experience {
-                SlackExperience::Agent => Some(root_ts.clone()),
-                SlackExperience::Classic => thread_ts,
-            },
-            conversation_id,
+            conversation,
             message_id: ts.to_owned(),
             text,
             assets,
-            conversation,
-            addressed: is_channel.then_some(explicitly_addressed),
+            addressed: is_shared.then_some(explicitly_addressed),
             thread_continuation,
             reply: ReplyTarget::Slack {
                 channel: channel.to_owned(),
@@ -1883,8 +1883,8 @@ mod driver_tests {
     use tracing::Span;
 
     use super::{
-        CANCEL_ACTION_ID, MAX_TRACKED_REACTIONS, MAX_TRACKED_STREAMS, PROGRESS_MAX_CHARS,
-        SLACK_REQUEST_TIMEOUT, SlackReplier, SlackTransport, Tracked,
+        CANCEL_ACTION_ID, ConversationKind, MAX_TRACKED_REACTIONS, MAX_TRACKED_STREAMS,
+        PROGRESS_MAX_CHARS, SLACK_REQUEST_TIMEOUT, SlackReplier, SlackTransport, Tracked,
     };
     use crate::{
         config::{LivenessSettings, SlackExperience, SlackLivenessFallback, TemplateOverrides},
@@ -2733,22 +2733,27 @@ mod driver_tests {
         // The identity in the button and the identity the session is registered under are one rule,
         // in one place: a press that named anything else would stop nothing.
         assert_eq!(
-            in_channel.conversation_id,
+            in_channel.conversation.key(),
             transport.replier.conversation_id(CHANNEL, INBOUND_TS)
         );
+        assert_eq!(in_channel.conversation.kind, ConversationKind::Channel);
         assert_eq!(
-            in_direct_message.conversation_id,
+            in_direct_message.conversation.key(),
             transport
                 .replier
                 .conversation_id(DIRECT_CHANNEL, "1700000000.000002"),
             "a classic direct message is answered at the top level and named by its channel"
+        );
+        assert_eq!(
+            in_direct_message.conversation.kind,
+            ConversationKind::DirectMessage
         );
         let blocks = transport
             .replier
             .progress_blocks("Working on it…", true, CHANNEL, INBOUND_TS);
         assert_eq!(
             blocks[1]["elements"][0]["value"],
-            json!(in_channel.conversation_id)
+            json!(in_channel.conversation.key())
         );
     }
 

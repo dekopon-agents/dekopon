@@ -32,9 +32,9 @@ broker:
           attestor:
             namespaces: [slack.t0123abcd]
             chatScopes:
-              - breadth: transportWide
-                kind: slack
+              - kind: slack
                 transport: workspace-slack
+                conversation: { kind: any }
         - uid: 65532
           principal: dekopond-gateway
           actor:
@@ -211,12 +211,12 @@ gateway:
           classes: [reasoning]
       routes:
         - transport: workspace-slack
-          match: { kind: directMessage }
+          conversation: { kind: [directMessage] }
           agent: pr-summarizer-linter
           limits:
             maxSteps: 8
             maxCapabilityCalls: 16
-          conversation:
+          memory:
             mode: persistent
             # Never broaden the deployment example's replay audience implicitly.
             scope: privateConversation

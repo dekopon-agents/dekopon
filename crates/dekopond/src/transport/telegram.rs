@@ -9,7 +9,7 @@ use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use dekopon_agent::{CancelVia, attachment::GeneratedImage};
-use dekopon_broker_protocol::ChatTransportKind;
+use dekopon_broker_protocol::{ChatTransportKind, Conversation, ConversationKind};
 use dekopon_core::{ExternalSubject, Redacted};
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
@@ -21,11 +21,11 @@ use crate::{
     progress::ProgressText,
     transport::{
         AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver,
-        ChatTransport, ConversationKind, InboundMessage, InboundReaction, LivenessTarget,
-        MessageRef, OutboundReply, ProgressLimits, ProgressMessage, ReplyTarget, StreamLimits,
-        StreamedText, TextStream, TextUnit, TransportError, TransportEvent, TransportIdentity,
-        TypingLease, bound_inbound, credential_client, floor_boundary, receive_span,
-        reconnect_delay, retry_after_from_body, split_message,
+        ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageRef, OutboundReply,
+        ProgressLimits, ProgressMessage, ReplyTarget, StreamLimits, StreamedText, TextStream,
+        TextUnit, TransportError, TransportEvent, TransportIdentity, TypingLease, bound_inbound,
+        credential_client, floor_boundary, receive_span, reconnect_delay, record_conversation,
+        retry_after_from_body, split_message,
     },
 };
 
@@ -128,12 +128,20 @@ struct StopPress {
 ///
 /// One definition because three callers have to agree or turns are misfiled: the inbound message,
 /// the cancel button's `callback_data`, and the press that checks that untrusted payload against
-/// the envelope it arrived in.
+/// the envelope it arrived in. It is [`Conversation::key`] for a Telegram conversation, and it is
+/// derived through one rather than spelled a second time here.
 fn conversation_id(chat_id: i64, message_thread_id: Option<i64>) -> String {
-    message_thread_id.map_or_else(
-        || chat_id.to_string(),
-        |topic| format!("{chat_id}:topic:{topic}"),
-    )
+    Conversation {
+        kind: if message_thread_id.is_some() {
+            ConversationKind::Thread
+        } else {
+            ConversationKind::Channel
+        },
+        container: None,
+        id: chat_id.to_string(),
+        thread: message_thread_id.map(|topic| topic.to_string()),
+    }
+    .key()
 }
 
 impl TelegramTransport {
@@ -262,16 +270,6 @@ impl TelegramTransport {
         let Some(chat_id) = chat.get("id").and_then(Value::as_i64) else {
             return Ok(None);
         };
-        // Every private chat is a direct message; a group is a channel, and the daemon separately
-        // requires the bot to be addressed there.
-        let conversation = match chat.get("type").and_then(Value::as_str) {
-            Some("private") => ConversationKind::DirectMessage,
-            _ => ConversationKind::Channel(chat_id.to_string()),
-        };
-        let reply_to = match conversation {
-            ConversationKind::DirectMessage => None,
-            ConversationKind::Channel(_) => Some(message_id),
-        };
         // Plain chats remain one conversation. Forum topics and private-chat topic mode carry a
         // positive service-native thread identifier, which must scope history, admission, replies,
         // durable memory, and transient liveness together.
@@ -279,20 +277,42 @@ impl TelegramTransport {
         if message_thread_id.is_some_and(|id| id <= 0) {
             return Err(TransportError::Response);
         }
-        let conversation_id = conversation_id(chat_id, message_thread_id);
+        // Every private chat is a direct message however it threads; a group or supergroup is a
+        // channel, or a thread when the message is in a forum topic, and the daemon separately
+        // requires the bot to be addressed in both. A broadcast channel is not a conversation this
+        // gateway answers: nobody can reply in one, so a message there is dropped by name.
+        let chat_type = chat.get("type").and_then(Value::as_str);
+        let kind = match (chat_type, message_thread_id) {
+            (Some("private"), _) => ConversationKind::DirectMessage,
+            (Some("channel"), _) => {
+                received.record("drop.reason", "broadcast-channel");
+                return Ok(None);
+            }
+            (_, None) => ConversationKind::Channel,
+            (_, Some(_)) => ConversationKind::Thread,
+        };
+        let reply_to = match kind {
+            ConversationKind::DirectMessage => None,
+            _ => Some(message_id),
+        };
+        let conversation = Conversation {
+            kind,
+            // Telegram has nothing above a chat: no workspace, no guild, no business account.
+            container: None,
+            id: chat_id.to_string(),
+            thread: message_thread_id.map(|topic| topic.to_string()),
+        };
+        record_conversation(received, &conversation);
 
         Ok(Some(InboundMessage {
             transport: self.name.clone(),
             transport_kind: ChatTransportKind::Telegram,
             subject: ExternalSubject::telegram(&user.to_string())
                 .map_err(TransportError::Subject)?,
-            channel: chat_id.to_string(),
-            thread: message_thread_id.map(|id| id.to_string()),
-            conversation_id,
+            conversation,
             message_id: message_id.to_string(),
             text: bound_inbound(text),
             assets,
-            conversation,
             // Telegram's message text carries `@handle`, so the shared fallback checks it.
             addressed: None,
             thread_continuation: None,
@@ -1749,7 +1769,7 @@ mod tests {
         assert_eq!(
             api.body("sendMessage")["reply_markup"],
             json!({
-                "inline_keyboard": [[{ "text": "Stop", "callback_data": "stop:42:topic:11" }]]
+                "inline_keyboard": [[{ "text": "Stop", "callback_data": "stop:42:11" }]]
             })
         );
         driver

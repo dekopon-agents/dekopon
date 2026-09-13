@@ -84,9 +84,9 @@ fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
     // The walkthrough demonstrates a remembered conversation, which is the mode a reader has to
     // opt into: writing a window bound next to `mode: oneShot` would not decode at all.
     assert_eq!(
-        route.conversation,
-        dekopond::ConversationConfig::Persistent {
-            scope: dekopond::ConversationScope::PrivateConversation,
+        route.memory,
+        dekopond::MemoryConfig::Persistent {
+            scope: dekopond::MemoryScope::PrivateConversation,
             idle_timeout_ms: 900_000,
             max_turns: 12,
             max_bytes: 65_536,

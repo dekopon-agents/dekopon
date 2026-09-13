@@ -27,8 +27,8 @@ use dekopon_broker::{
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
-    Attestation, BrokerClient, ChatScopeClaim, ChatTransportKind, DeliveredTurnRequest,
-    DeliveryIdentity, FrameLimits, TraceParent,
+    Attestation, BrokerClient, ChatScopeClaim, ChatTransportKind, Conversation, ConversationKind,
+    DeliveredTurnRequest, DeliveryIdentity, FrameLimits, TraceParent,
 };
 use dekopon_brokerd::{BrokerServer, MappedPeer, ServerLimits, current_uid};
 use dekopon_capability::{EffectKind, ExecutionConstraints, InvocationOutcome};
@@ -128,8 +128,12 @@ fn chat_claim() -> Attestation {
                 .parse::<TransportId>()
                 .expect("valid transport fixture"),
             kind: ChatTransportKind::Slack,
-            channel: "c0123abc".to_owned(),
-            conversation: "c0123abc:1712345678.000100".to_owned(),
+            conversation: Conversation {
+                kind: ConversationKind::Thread,
+                container: Some("t0123abc".to_owned()),
+                id: "c0123abc".to_owned(),
+                thread: Some("1712345678.000100".to_owned()),
+            },
         },
     )
 }

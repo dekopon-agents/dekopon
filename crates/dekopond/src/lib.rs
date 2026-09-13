@@ -42,17 +42,18 @@ use std::{
     time::Duration,
 };
 
-use dekopon_broker_protocol::BrokerClient;
+use dekopon_broker_protocol::{BrokerClient, ConversationKind};
 use dekopon_config::LocalCatalog;
 use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinSet, time::timeout};
 
 pub use config::{
-    CONFIG_API_VERSION, ConfigApiVersion, ConfigError, ConfigProblem, ConversationConfig,
-    ConversationPolicy, ConversationScope, ConversationWindow, DEFAULT_STOP_WORDS, DekopondConfig,
-    HARD_MAX_CONFIG_BYTES, KeepAliveConfig, LivenessConfig, LivenessMode, LivenessSettings,
-    ProgressSurface, ProviderAttachmentsConfig, ResolvedConfig, ResolvedRoute, ResolvedTelemetry,
-    SlackExperience, SlackLivenessFallback, TelemetryConfig, TemplateOverrides, TransportConfig,
+    CONFIG_API_VERSION, ConfigApiVersion, ConfigError, ConfigProblem, ConversationMatchConfig,
+    DEFAULT_STOP_WORDS, DekopondConfig, HARD_MAX_CONFIG_BYTES, KeepAliveConfig, LivenessConfig,
+    LivenessMode, LivenessOverride, LivenessSettings, MemoryConfig, MemoryPolicy, MemoryScope,
+    MemoryWindow, ProgressSurface, ProviderAttachmentsConfig, ResolvedConfig, ResolvedRoute,
+    ResolvedTelemetry, SlackExperience, SlackLivenessFallback, TelemetryConfig, TemplateOverrides,
+    TransportConfig,
 };
 pub use routes::{RouteError, RouteProblem};
 pub use session::SessionError;
@@ -68,10 +69,9 @@ use crate::{
         SessionRunner, model_bearer_token,
     },
     transport::{
-        AssetFetcher, CancelRequest, ChatDriver, ChatTransport, ConversationKind, InboundMessage,
-        ThreadOwnership, TransportEvent, TransportIdentity, discord::DiscordTransport,
-        local::LocalTransport, slack::SlackTransport, telegram::TelegramTransport,
-        whatsapp::WhatsappTransport,
+        AssetFetcher, CancelRequest, ChatDriver, ChatTransport, InboundMessage, ThreadOwnership,
+        TransportEvent, TransportIdentity, discord::DiscordTransport, local::LocalTransport,
+        slack::SlackTransport, telegram::TelegramTransport, whatsapp::WhatsappTransport,
     },
 };
 
@@ -366,13 +366,17 @@ fn dispatch(
     sessions: &mut JoinSet<()>,
     message: InboundMessage,
 ) {
-    let Some(route) = routes.route(&message.transport, &message.conversation) else {
+    let Some(route) = routes.route(&message) else {
         // Bots see ambient traffic. Silence is the correct answer, and debug level keeps a busy
-        // channel from becoming the daemon's log volume.
+        // channel from becoming the daemon's log volume. The conversation rides along because
+        // "why did the bot not answer in here" is answered by which kind and which container the
+        // route table did not claim — service identifiers, never the message.
         tracing::debug!(
             event = "gateway_message_ignored",
             transport = %message.transport,
-            reason = "unrouted"
+            reason = "unrouted",
+            conversation.kind = message.conversation.kind.as_str(),
+            conversation.container = message.conversation.container.as_deref().unwrap_or_default()
         );
         return;
     };
@@ -387,7 +391,7 @@ fn dispatch(
     ) {
         let request = CancelRequest {
             transport: message.transport.clone(),
-            conversation_id: message.conversation_id.clone(),
+            conversation_id: message.conversation.key(),
             subject: message.subject.canonical(),
             via: dekopon_agent::CancelVia::StopReply,
         };
@@ -426,7 +430,9 @@ fn dispatch(
         .thread_continuation
         .as_ref()
         .is_some_and(|continuation| continuation.inherited);
-    if matches!(message.conversation, ConversationKind::Channel(_))
+    // Every kind but a direct message is a shared conversation: a group DM, a channel, and a
+    // thread under either all carry ambient traffic the bot must be summoned into.
+    if message.conversation.kind != ConversationKind::DirectMessage
         && !addressed
         && !inherited_thread
     {

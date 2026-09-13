@@ -1855,7 +1855,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use crate::meta::{
-        AgentConfigView, ConversationConfigView, EffectiveCapabilityView, SessionConfigView,
+        AgentConfigView, EffectiveCapabilityView, MemoryConfigView, SessionConfigView,
     };
     use crate::progress::{
         CancelSource, CancelVia, ProgressEvent, ProgressSink, STREAMED_TEXT_BOUND_BYTES,
@@ -2503,7 +2503,7 @@ mod tests {
             SessionConfigView {
                 max_steps: 8,
                 max_capability_calls: 16,
-                conversation: ConversationConfigView::OneShot,
+                memory: MemoryConfigView::OneShot,
             },
             vec![EffectiveCapabilityView {
                 id: "gh.pull-request.read".to_owned(),

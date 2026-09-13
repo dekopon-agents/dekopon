@@ -109,8 +109,7 @@ when {{ context has via && context.via == "{GATEWAY_PRINCIPAL}"
      && context has agent && context.agent == "{AGENT}"
      && context has transportKind && context.transportKind == "local"
      && context has transport && context.transport == "dev"
-     && context has channel && context.channel == "dev"
-     && context has conversation && context.conversation == "dev" }};
+     && context has conversation && context.conversation.id == "dev" }};
 "#
         )
     })
@@ -139,11 +138,9 @@ fn broker_config(directory: &Path, uid: u32) -> Value {
             "attestor": {
                 "namespaces": ["tel"],
                 "chatScopes": [{
-                    "breadth": "exactConversation",
                     "kind": "local",
                     "transport": "dev",
-                    "channel": "dev",
-                    "conversation": "dev",
+                    "conversation": {"kind": "any", "ids": ["dev"]},
                     "localSubjectService": "tel"
                 }]
             }
@@ -260,20 +257,25 @@ fn gateway_config_with(
         }],
         "routes": [{
             "transport": "dev",
-            "match": {"kind": "directMessage"},
+            "conversation": {"kind": ["directMessage"]},
             "agent": AGENT,
             "limits": {"maxSteps": 4, "maxCapabilityCalls": 4},
             "progressDetail": progress_detail,
             // Persistent so one fixture covers both properties: an unauthorized subject is still
             // refused before a model call, and a follow-up still reaches the model with the
             // exchange before it in front of the question.
-            "conversation": {"mode": "persistent"}
+            "memory": {"mode": "persistent"}
         }],
         "sessions": {"maxConcurrent": 2},
         "shutdownGraceMs": 30_000
     });
     if let Some(scope) = conversation_scope {
-        config["routes"][0]["conversation"]["scope"] = json!(scope);
+        // The scope lives under `memory:`; `conversation:` is the match. A shared window is
+        // refused on a route whose kind list is exactly `[directMessage]` — the direct message
+        // already is the subject — so a shared fixture widens the route to every kind, which is
+        // what an operator choosing a shared audience has to write.
+        config["routes"][0]["conversation"] = json!({"kind": "any"});
+        config["routes"][0]["memory"]["scope"] = json!(scope);
     }
     config
 }
@@ -1260,7 +1262,7 @@ fn ask_lines(socket: &Path, subject: &str, text: &str) -> Vec<Value> {
     stream
         .set_read_timeout(Some(Duration::from_secs(60)))
         .expect("read timeout configures");
-    let request = json!({"subject": subject, "channel": "dev", "text": text}).to_string();
+    let request = json!({"subject": subject, "text": text}).to_string();
     writeln!(stream, "{request}").expect("request writes");
     stream.flush().expect("request flushes");
     read_lines(stream)
@@ -1269,7 +1271,7 @@ fn ask_lines(socket: &Path, subject: &str, text: &str) -> Vec<Value> {
 /// The same, on a connection a second caller can send a stop word into while it is open.
 fn ask_lines_on(stream: UnixStream, subject: &str, text: &str) -> Vec<Value> {
     let mut writer = stream.try_clone().expect("the connection clones");
-    let request = json!({"subject": subject, "channel": "dev", "text": text}).to_string();
+    let request = json!({"subject": subject, "text": text}).to_string();
     writeln!(writer, "{request}").expect("request writes");
     writer.flush().expect("request flushes");
     read_lines(stream)
@@ -1605,8 +1607,7 @@ async fn a_stop_word_cancels_the_session_running_in_that_conversation() {
         let socket = socket.clone();
         tokio::task::spawn_blocking(move || {
             let mut stream = UnixStream::connect(&socket).expect("second caller connects");
-            let request =
-                json!({"subject": MAPPED_SUBJECT, "channel": "dev", "text": "stop"}).to_string();
+            let request = json!({"subject": MAPPED_SUBJECT, "text": "stop"}).to_string();
             writeln!(stream, "{request}").expect("stop word writes");
             stream.flush().expect("stop word flushes");
         })

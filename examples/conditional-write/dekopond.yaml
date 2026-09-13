@@ -47,7 +47,7 @@ models:
 
 routes:
   - transport: workspace-slack
-    match: { kind: directMessage }
+    conversation: { kind: [directMessage] }
     agent: xaviers-conditional-writer
     # Let this route deliver the files an authorized capability produced. A capability result may
     # carry a top-level `attachments: [{mediaType, base64}]`; the gateway strips it, validates each
@@ -64,7 +64,7 @@ routes:
       # A budget that cannot finish the job is a bug; a budget that can loop is a bill.
       maxSteps: 8
       maxCapabilityCalls: 16
-    conversation:
+    memory:
       # Remembered, so "and the second one?" is a question this bot can answer. Omit this block
       # entirely for `mode: oneShot`, where every message starts from an empty prompt. The window
       # is what bounds the bill: it applies however long a conversation has been alive.

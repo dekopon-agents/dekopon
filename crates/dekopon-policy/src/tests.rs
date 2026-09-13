@@ -542,6 +542,204 @@ fn world_construction_rejects_duplicates_and_reserved_names() {
     }
 }
 
+/// A chat leg's conversation reaches every action; a direct peer carries none.
+///
+/// The record is the whole vocabulary a policy has about *where* a message was posted, and the two
+/// halves of S30 are here: a statement guarded with `has` decides, and a statement reading an
+/// optional attribute without one never loads at all.
+#[test]
+fn the_conversation_record_gates_every_action_and_is_absent_for_a_direct_peer() {
+    fn chat(kind: &str, container: Option<&str>, id: &str, thread: Option<&str>) -> PolicyContext {
+        PolicyContext {
+            via: Some("dekopond-gateway".to_owned()),
+            transport_kind: Some("discord".to_owned()),
+            transport: Some("elote-logs".to_owned()),
+            conversation: Some(super::PolicyConversation {
+                kind: kind.to_owned(),
+                container: container.map(str::to_owned),
+                id: id.to_owned(),
+                thread: thread.map(str::to_owned),
+            }),
+            ..PolicyContext::default()
+        }
+    }
+
+    let source = r#"
+@id("images-in-the-routed-channel")
+permit(
+  principal == Dekopon::Principal::"cpetersen",
+  action == Dekopon::Action::"echo.echo",
+  resource == Dekopon::Provider::"echo"
+) when {
+  context has via && context.via == "dekopond-gateway"
+  && context has conversation && ["channel", "thread"].contains(context.conversation.kind)
+  && context.conversation.id == "1338356895504793623"
+};
+
+@id("prompting-inside-the-lange-guild")
+permit(
+  principal == Dekopon::Principal::"cpetersen",
+  action == Dekopon::Action::"agent.prompt",
+  resource == Dekopon::Agent::"lange-family"
+) when {
+  context has conversation
+  && context.conversation has container
+  && context.conversation.container == "1153119165809434697"
+};
+"#;
+    let engine = PolicyEngine::new(source, &world()).expect("the guarded statements validate");
+
+    for (context, allowed, why) in [
+        (
+            chat(
+                "channel",
+                Some("1153119165809434697"),
+                "1338356895504793623",
+                None,
+            ),
+            true,
+            "a routed channel message",
+        ),
+        (
+            chat(
+                "thread",
+                Some("1153119165809434697"),
+                "1338356895504793623",
+                Some("456"),
+            ),
+            true,
+            "a thread under it",
+        ),
+        (
+            chat("directMessage", None, "1338356895504793623", None),
+            false,
+            "the same id in a direct message is not the channel",
+        ),
+        (
+            chat("channel", Some("1153119165809434697"), "999", None),
+            false,
+            "another channel",
+        ),
+        (
+            PolicyContext::default(),
+            false,
+            "a direct peer has no conversation",
+        ),
+    ] {
+        let decision = engine.authorize(capability_request("cpetersen", "echo.echo", context));
+        assert_eq!(decision.allowed, allowed, "{why}");
+        if allowed {
+            assert_eq!(
+                decision.determining_policy_ids,
+                vec!["images-in-the-routed-channel".to_owned()]
+            );
+        }
+    }
+
+    // The container is optional in the schema, so the `has` guard is what makes reading it legal.
+    assert!(
+        engine
+            .authorize(prompt_request(
+                "cpetersen",
+                "lange-family",
+                chat(
+                    "channel",
+                    Some("1153119165809434697"),
+                    "1153119166446981193",
+                    None
+                ),
+            ))
+            .allowed
+    );
+    assert!(
+        !engine
+            .authorize(prompt_request(
+                "cpetersen",
+                "lange-family",
+                chat("channel", None, "1153119166446981193", None),
+            ))
+            .allowed,
+        "a conversation with no container cannot satisfy a container gate"
+    );
+}
+
+/// The three ways an operator writes a conversation gate that can never load.
+#[test]
+fn a_retired_or_unguarded_context_attribute_fails_validation() {
+    for (source, why) in [
+        (
+            r#"permit(principal, action == Dekopon::Action::"echo.echo", resource) when {
+                 context has conversation
+                 && context.conversation.container == "1153119165809434697"
+               };"#,
+            "`container` is optional, so it needs `context.conversation has container`",
+        ),
+        (
+            r#"permit(principal, action == Dekopon::Action::"echo.echo", resource) when {
+                 context.channel == "1338356895504793623"
+               };"#,
+            "`context.channel` is gone; the id lives at `context.conversation.id`",
+        ),
+        (
+            r#"permit(principal, action == Dekopon::Action::"echo.echo", resource) when {
+                 context has conversation && context.conversation == "1338356895504793623"
+               };"#,
+            "the conversation is a record, never a string",
+        ),
+    ] {
+        let error = PolicyEngine::new(source, &world()).expect_err(why);
+        assert!(
+            matches!(error, PolicyBuildError::Validation { .. }),
+            "{why}: {error}"
+        );
+    }
+}
+
+/// The retired attribute's quiet failure mode, which is the one worth knowing about.
+///
+/// Cedar types `context has channel` against a closed record with no `channel` as the singleton
+/// `False` and then short-circuits the `&&` *without* typechecking the right-hand side. So an 0.13
+/// statement that guarded its read — as every one in this repository's own fixtures did — keeps
+/// loading after the attribute is gone and simply never fires again. That is not something the
+/// validator will tell an operator, so `upgrading.md` tells them to grep instead.
+#[test]
+fn a_has_guarded_read_of_the_retired_channel_attribute_loads_and_then_never_fires() {
+    let source = r#"
+@id("stale-channel-pin")
+permit(
+  principal == Dekopon::Principal::"cpetersen",
+  action == Dekopon::Action::"echo.echo",
+  resource == Dekopon::Provider::"echo"
+) when {
+  context has via && context.via == "dekopond-gateway"
+  && context has channel && context.channel == "1338356895504793623"
+};
+"#;
+    let engine = PolicyEngine::new(source, &world())
+        .expect("a guarded read of an absent attribute is not a validation error");
+    assert_eq!(engine.policy_count(), 1);
+
+    let context = PolicyContext {
+        via: Some("dekopond-gateway".to_owned()),
+        conversation: Some(super::PolicyConversation {
+            kind: "channel".to_owned(),
+            container: None,
+            id: "1338356895504793623".to_owned(),
+            thread: None,
+        }),
+        ..PolicyContext::default()
+    };
+    let decision = engine.authorize(capability_request("cpetersen", "echo.echo", context));
+    assert!(
+        !decision.allowed,
+        "the statement still names an attribute nothing stamps, so it can never permit"
+    );
+    assert!(
+        !decision.errors_present,
+        "a short-circuited `has` is a false condition rather than an evaluation failure"
+    );
+}
+
 /// The context record of every action, pinned.
 ///
 /// Cedar's strict validator rejects a policy that reads an attribute the schema does not declare,
@@ -568,8 +766,16 @@ fn every_action_declares_exactly_these_context_attributes() {
             "agent": { "type": "String", "required": false },
             "transportKind": { "type": "String", "required": false },
             "transport": { "type": "String", "required": false },
-            "channel": { "type": "String", "required": false },
-            "conversation": { "type": "String", "required": false },
+            "conversation": {
+                "type": "Record",
+                "required": false,
+                "attributes": {
+                    "kind": { "type": "String" },
+                    "container": { "type": "String", "required": false },
+                    "id": { "type": "String" },
+                    "thread": { "type": "String", "required": false },
+                },
+            },
             "effect": { "type": "String" },
             "risk": { "type": "String" },
         }
@@ -583,8 +789,16 @@ fn every_action_declares_exactly_these_context_attributes() {
             "agent": { "type": "String", "required": false },
             "transportKind": { "type": "String", "required": false },
             "transport": { "type": "String", "required": false },
-            "channel": { "type": "String", "required": false },
-            "conversation": { "type": "String", "required": false },
+            "conversation": {
+                "type": "Record",
+                "required": false,
+                "attributes": {
+                    "kind": { "type": "String" },
+                    "container": { "type": "String", "required": false },
+                    "id": { "type": "String" },
+                    "thread": { "type": "String", "required": false },
+                },
+            },
         }
     });
     // Using a secret: the routing attributes, plus the binding the credential is released against.
@@ -596,8 +810,16 @@ fn every_action_declares_exactly_these_context_attributes() {
             "agent": { "type": "String", "required": false },
             "transportKind": { "type": "String", "required": false },
             "transport": { "type": "String", "required": false },
-            "channel": { "type": "String", "required": false },
-            "conversation": { "type": "String", "required": false },
+            "conversation": {
+                "type": "Record",
+                "required": false,
+                "attributes": {
+                    "kind": { "type": "String" },
+                    "container": { "type": "String", "required": false },
+                    "id": { "type": "String" },
+                    "thread": { "type": "String", "required": false },
+                },
+            },
             "capability": { "type": "String" },
             "provider": { "type": "String" },
             "sink": { "type": "String" },

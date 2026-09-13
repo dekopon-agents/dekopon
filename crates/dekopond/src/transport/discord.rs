@@ -6,16 +6,24 @@
 //! structured `mentions` array decides whether a guild message is addressed; model-visible text is
 //! never trusted to make that decision.
 
-use std::{collections::VecDeque, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use dekopon_agent::CancelVia;
 use dekopon_agent::attachment::GeneratedImage;
-use dekopon_broker_protocol::ChatTransportKind;
+use dekopon_broker_protocol::{ChatTransportKind, Conversation, ConversationKind};
 use dekopon_core::{ExternalSubject, Redacted};
 use futures_util::{SinkExt as _, StreamExt as _, future::BoxFuture};
 use serde_json::{Value, json};
-use tokio::{net::TcpStream, sync::Mutex, time::Instant};
+use tokio::{
+    net::TcpStream,
+    sync::Mutex,
+    time::{Instant, timeout},
+};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, tungstenite::Message};
 use tracing::{Instrument as _, Span};
 
@@ -25,11 +33,11 @@ use crate::{
     progress::ProgressText,
     transport::{
         AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver,
-        ChatTransport, ConversationKind, InboundMessage, InboundReaction, LivenessTarget,
-        MessageRef, OutboundReply, ProgressLimits, ProgressMessage, ReplyTarget, SeenIds,
-        StreamLimits, StreamedText, TextStream, TextUnit, TransportError, TransportEvent,
-        TransportIdentity, TypingLease, bound_inbound, credential_client, floor_boundary,
-        jitter_below, receive_span, reconnect_delay, retry_after_from_body, split_message,
+        ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageRef, OutboundReply,
+        ProgressLimits, ProgressMessage, ReplyTarget, SeenIds, StreamLimits, StreamedText,
+        TextStream, TextUnit, TransportError, TransportEvent, TransportIdentity, TypingLease,
+        bound_inbound, credential_client, floor_boundary, jitter_below, receive_span,
+        reconnect_delay, record_conversation, retry_after_from_body, split_message,
     },
 };
 
@@ -39,6 +47,13 @@ const API_VERSION: u8 = 10;
 const INTENTS: u64 = (1 << 9) | (1 << 12);
 /// Recent message identifiers retained across reconnect/resume redelivery.
 const DEDUP_CAPACITY: usize = 1024;
+/// Channel shapes this process remembers, which bounds one `GET /channels/{id}` per channel.
+///
+/// A channel's type and parent never change, so a hit is never stale; a restart pays one lookup
+/// per channel the bot is spoken to in, and a thread created mid-session is simply a new id.
+const CHANNEL_SHAPE_CAPACITY: usize = 512;
+/// Bound on the channel lookup, the same two seconds every cosmetic Discord call takes.
+const CHANNEL_LOOKUP_TIMEOUT: Duration = Duration::from_secs(2);
 /// Discord permits at most ten attachments on one message.
 const MAX_ATTACHMENTS: usize = 10;
 /// Ceiling on one sender-controlled attachment filename.
@@ -103,6 +118,8 @@ pub(crate) struct DiscordTransport {
     heartbeat_acked: bool,
     last_identify: Option<Instant>,
     seen: SeenIds,
+    /// What each guild channel this bot has been spoken to in actually is.
+    channels: ChannelShapes,
     pending: VecDeque<TransportEvent>,
     failures: u32,
     /// `liveness.mode: native` — an inbound message carries coordinates for transient signals.
@@ -162,6 +179,7 @@ impl DiscordTransport {
             heartbeat_acked: true,
             last_identify: None,
             seen: SeenIds::new(DEDUP_CAPACITY),
+            channels: ChannelShapes::new(CHANNEL_SHAPE_CAPACITY),
             pending: VecDeque::new(),
             failures: 0,
             native: liveness.mode == LivenessMode::Native,
@@ -441,7 +459,10 @@ impl DiscordTransport {
                     // none: they carry no message and route nothing.
                     "MESSAGE_CREATE" => {
                         let received = receive_span(ChatTransportKind::Discord);
-                        let routed = received.in_scope(|| self.routable(&frame["d"], &received))?;
+                        let routed = self
+                            .routable(&frame["d"], &received)
+                            .instrument(received.clone())
+                            .await?;
                         Ok(match routed {
                             Some(message) => {
                                 received.record("message.id", message.message_id.as_str());
@@ -529,7 +550,14 @@ impl DiscordTransport {
             .map_err(|source| TransportError::Request(Box::new(source)))
     }
 
-    fn routable(
+    /// Turns one Discord message event into a routable message, or `None` when it is not ours.
+    ///
+    /// Async for one reason: a guild message needs to know whether its channel is a channel, a
+    /// thread, or a forum post, and only `GET /channels/{id}` says so. That call is deliberately
+    /// the *last* thing this does — after the message-type, bot-authored, malformed, self-authored,
+    /// empty-content and redelivery drops — because `GUILD_MESSAGES` delivers every message in
+    /// every channel of every guild the bot is in, and ambient traffic must not cost a request.
+    async fn routable(
         &mut self,
         message: &Value,
         received: &Span,
@@ -576,6 +604,7 @@ impl DiscordTransport {
             return Ok(None);
         }
 
+        let guild = message["guild_id"].as_str().filter(|id| is_snowflake(id));
         let direct = message["guild_id"].is_null();
         let addressed = direct
             || message["mentions"].as_array().is_some_and(|mentions| {
@@ -583,25 +612,55 @@ impl DiscordTransport {
                     .iter()
                     .any(|mention| mention["id"].as_str() == self.identity.user_id.as_deref())
             });
-        let conversation = if direct {
-            ConversationKind::DirectMessage
-        } else {
-            // A Discord thread is itself a channel. Its channel id therefore remains both the route
-            // key and the conversation id; a catch-all route naturally covers transient threads.
-            ConversationKind::Channel(channel_id.to_owned())
+        let conversation = match (direct, guild) {
+            // A Discord direct message has no guild above it, and the channel is the conversation.
+            (true, _) => Conversation {
+                kind: ConversationKind::DirectMessage,
+                container: None,
+                id: channel_id.to_owned(),
+                thread: None,
+            },
+            (false, Some(guild)) => {
+                let Some(shape) = self.channel_shape(channel_id).await else {
+                    // Never a guessed channel: a route or a grant pinned to a parent would be
+                    // decided against the wrong id, so the message is dropped with a reason.
+                    received.record("drop.reason", "conversation-unresolved");
+                    return Ok(None);
+                };
+                match shape {
+                    ChannelShape::Channel => Conversation {
+                        kind: ConversationKind::Channel,
+                        container: Some(guild.to_owned()),
+                        id: channel_id.to_owned(),
+                        thread: None,
+                    },
+                    // A thread *is* a channel on Discord, so the thread coordinate is its own id
+                    // and the conversation id is the parent every route and grant names.
+                    ChannelShape::Thread { parent } => Conversation {
+                        kind: ConversationKind::Thread,
+                        container: Some(guild.to_owned()),
+                        id: parent,
+                        thread: Some(channel_id.to_owned()),
+                    },
+                }
+            }
+            // A guild message whose `guild_id` is not a snowflake is an envelope this gateway
+            // cannot place, and the container is required for every guild conversation.
+            (false, None) => {
+                received.record("drop.reason", "conversation-unresolved");
+                return Ok(None);
+            }
         };
+        record_conversation(received, &conversation);
 
         Ok(Some(InboundMessage {
             transport: self.name.clone(),
             transport_kind: ChatTransportKind::Discord,
             subject: ExternalSubject::discord(user_id).map_err(TransportError::Subject)?,
-            channel: channel_id.to_owned(),
-            thread: None,
-            conversation_id: channel_id.to_owned(),
+            conversation,
             message_id: message_id.to_owned(),
             text,
             assets,
-            conversation,
             addressed: Some(addressed),
             thread_continuation: None,
             reply: ReplyTarget::Discord {
@@ -617,6 +676,106 @@ impl DiscordTransport {
             }),
             receive_span: received.clone(),
         }))
+    }
+
+    /// What one guild channel is, from cache or from one bounded `GET /channels/{id}`.
+    ///
+    /// Never takes the driver's `rest_lock`: that lock serializes reply delivery, and a 429 on
+    /// Create Message must not stall the reader that also sends heartbeats. It honors the published
+    /// REST cooldown by staying quiet rather than waiting it out — a message the bot cannot place
+    /// is dropped with a reason, which is better than a reader parked behind a rate limit.
+    ///
+    /// `None` is "this gateway could not place the message": a transport failure, a non-2xx answer,
+    /// an unreadable body, or a channel type no route can name.
+    async fn channel_shape(&mut self, channel_id: &str) -> Option<ChannelShape> {
+        if let Some(shape) = self.channels.get(channel_id) {
+            return Some(shape);
+        }
+        if self.driver.rest_cooldown().is_some() {
+            tracing::debug!(
+                event = "gateway_conversation_unresolved",
+                transport = %self.name,
+                cause = "rest-cooldown"
+            );
+            return None;
+        }
+        let response = timeout(
+            CHANNEL_LOOKUP_TIMEOUT,
+            self.http
+                .get(format!(
+                    "{}/api/v{API_VERSION}/channels/{channel_id}",
+                    self.endpoint
+                ))
+                .header(
+                    reqwest::header::AUTHORIZATION,
+                    format!("Bot {}", self.token.expose()),
+                )
+                .send(),
+        )
+        .await;
+        let bytes = match response {
+            Ok(Ok(response)) if response.status().is_success() => response.bytes().await,
+            Ok(Ok(response)) => {
+                tracing::debug!(
+                    event = "gateway_conversation_unresolved",
+                    transport = %self.name,
+                    cause = "status",
+                    status = response.status().as_u16()
+                );
+                return None;
+            }
+            Ok(Err(source)) => {
+                tracing::debug!(
+                    event = "gateway_conversation_unresolved",
+                    transport = %self.name,
+                    cause = "request",
+                    cause_type = %source
+                );
+                return None;
+            }
+            Err(_elapsed) => {
+                tracing::debug!(
+                    event = "gateway_conversation_unresolved",
+                    transport = %self.name,
+                    cause = "timeout"
+                );
+                return None;
+            }
+        };
+        let bytes = match bytes {
+            Ok(bytes) => bytes,
+            Err(source) => {
+                tracing::debug!(
+                    event = "gateway_conversation_unresolved",
+                    transport = %self.name,
+                    cause = "body",
+                    cause_type = %source
+                );
+                return None;
+            }
+        };
+        let body = match serde_json::from_slice::<Value>(&bytes) {
+            Ok(body) => body,
+            Err(source) => {
+                tracing::debug!(
+                    event = "gateway_conversation_unresolved",
+                    transport = %self.name,
+                    cause = "body",
+                    cause_type = %source
+                );
+                return None;
+            }
+        };
+        let Some(shape) = ChannelShape::of(&body) else {
+            tracing::debug!(
+                event = "gateway_conversation_unresolved",
+                transport = %self.name,
+                cause = "channel-type"
+            );
+            return None;
+        };
+        self.channels.insert(channel_id.to_owned(), shape.clone());
+        Some(shape)
     }
 
     /// Reads one component interaction as a press of this gateway's own cancel button.
@@ -783,6 +942,72 @@ impl ChatTransport for DiscordTransport {
 
     fn asset_fetcher(&self) -> Option<Arc<dyn AssetFetcher>> {
         Some(Arc::clone(&self.driver) as Arc<dyn AssetFetcher>)
+    }
+}
+
+/// What one guild channel turned out to be, which is all a conversation needs from Discord.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ChannelShape {
+    /// A guild text, voice, or announcement channel: the conversation is the channel itself.
+    Channel,
+    /// A thread, a forum post, or an announcement thread; the parent is the routed conversation.
+    Thread {
+        /// The channel the thread hangs under.
+        parent: String,
+    },
+}
+
+impl ChannelShape {
+    /// Reads one `GET /channels/{id}` body, or `None` for a shape no route can name.
+    ///
+    /// A forum or media channel (15, 16) is never the channel a message is posted in — a post
+    /// inside one is its own thread, which arrives here as type 11 with the forum as its parent.
+    fn of(channel: &Value) -> Option<Self> {
+        match channel["type"].as_u64()? {
+            0 | 2 | 5 => Some(Self::Channel),
+            10..=12 => channel["parent_id"]
+                .as_str()
+                .filter(|parent| is_snowflake(parent))
+                .map(|parent| Self::Thread {
+                    parent: parent.to_owned(),
+                }),
+            _ => None,
+        }
+    }
+}
+
+/// Bounded per-process memory of what each channel is.
+///
+/// Bounded rather than unbounded because a bot in a busy guild meets an unbounded number of
+/// transient threads; oldest-first eviction costs one repeat lookup and nothing else.
+struct ChannelShapes {
+    order: VecDeque<String>,
+    shapes: HashMap<String, ChannelShape>,
+    capacity: usize,
+}
+
+impl ChannelShapes {
+    fn new(capacity: usize) -> Self {
+        Self {
+            order: VecDeque::with_capacity(capacity),
+            shapes: HashMap::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn get(&self, channel_id: &str) -> Option<ChannelShape> {
+        self.shapes.get(channel_id).cloned()
+    }
+
+    fn insert(&mut self, channel_id: String, shape: ChannelShape) {
+        if self.shapes.insert(channel_id.clone(), shape).is_none() {
+            self.order.push_back(channel_id);
+            if self.order.len() > self.capacity
+                && let Some(evicted) = self.order.pop_front()
+            {
+                self.shapes.remove(&evicted);
+            }
+        }
     }
 }
 
@@ -1850,12 +2075,13 @@ mod unit_tests {
         sync::Mutex,
         time::Instant,
     };
-    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing::Instrument as _;
+    use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
     use super::{
-        CANCEL_CUSTOM_ID_PREFIX, DiscordDriver, DiscordTransport, MAX_MESSAGE_CHARS, SessionStarts,
-        TextUnit, allowed_asset_url, cancel_components, client, gateway_url, is_fatal,
-        is_interaction_token, percent_encoded, split_message,
+        CANCEL_CUSTOM_ID_PREFIX, ChannelShape, ConversationKind, DiscordDriver, DiscordTransport,
+        MAX_MESSAGE_CHARS, SessionStarts, TextUnit, allowed_asset_url, cancel_components, client,
+        gateway_url, is_fatal, is_interaction_token, percent_encoded, split_message,
     };
     use crate::{
         config::{LivenessMode, LivenessSettings},
@@ -2463,52 +2689,125 @@ mod unit_tests {
     /// Every message this transport drops says why on its own receive span, because a silent drop
     /// is a triage with nothing to read: the answer to "why did the bot not reply" has to be in
     /// the trace the receipt already opened.
-    #[test]
-    fn every_dropped_message_records_why_on_its_receive_span() {
+    #[tokio::test]
+    async fn every_dropped_message_records_why_on_its_receive_span() {
         let mut transport = transport("elote");
         transport.identity = TransportIdentity {
             user_id: Some("999".to_owned()),
             handle: None,
         };
         let capture = CaptureLayer::workspace();
+        let _subscriber = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
 
-        tracing::subscriber::with_default(
-            tracing_subscriber::registry().with(capture.clone()),
-            || {
-                let mut routable = |message: &Value| {
-                    let span = receive_span(ChatTransportKind::Discord);
-                    span.in_scope(|| transport.routable(message, &span))
-                        .expect("a drop is not a transport failure")
-                };
-                for (dropped, reason) in [
-                    (message(json!({ "type": 6 })), "message-type"),
-                    (
-                        message(json!({ "author": { "id": "7", "bot": true } })),
-                        "bot-authored",
-                    ),
-                    (message(json!({ "channel_id": null })), "malformed-envelope"),
-                    (
-                        message(json!({ "author": { "id": "999" } })),
-                        "self-authored",
-                    ),
-                    (message(json!({ "content": "  " })), "content-withheld"),
-                ] {
-                    capture.clear();
-                    assert!(routable(&dropped).is_none(), "{dropped} routed");
-                    assert_reason(&capture, reason);
-                }
-                assert!(
-                    routable(&message(json!({}))).is_some(),
-                    "an ordinary message routes"
-                );
-                capture.clear();
-                assert!(
-                    routable(&message(json!({}))).is_none(),
-                    "the same identifier twice is the redelivery a resume replays"
-                );
-                assert_reason(&capture, "duplicate");
+        for (dropped, reason) in [
+            (message(json!({ "type": 6 })), "message-type"),
+            (
+                message(json!({ "author": { "id": "7", "bot": true } })),
+                "bot-authored",
+            ),
+            (message(json!({ "channel_id": null })), "malformed-envelope"),
+            (
+                message(json!({ "author": { "id": "999" } })),
+                "self-authored",
+            ),
+            (message(json!({ "content": "  " })), "content-withheld"),
+        ] {
+            capture.clear();
+            let span = receive_span(ChatTransportKind::Discord);
+            let routed = transport
+                .routable(&dropped, &span)
+                .instrument(span.clone())
+                .await
+                .expect("a drop is not a transport failure");
+            assert!(routed.is_none(), "{dropped} routed");
+            drop(span);
+            assert_reason(&capture, reason);
+        }
+        // A direct message needs no channel lookup, so this whole test stays off the network.
+        let span = receive_span(ChatTransportKind::Discord);
+        assert!(
+            transport
+                .routable(&message(json!({})), &span)
+                .instrument(span.clone())
+                .await
+                .expect("a routable message")
+                .is_some(),
+            "an ordinary message routes"
+        );
+        drop(span);
+        capture.clear();
+        let span = receive_span(ChatTransportKind::Discord);
+        assert!(
+            transport
+                .routable(&message(json!({})), &span)
+                .instrument(span.clone())
+                .await
+                .expect("a routable message")
+                .is_none(),
+            "the same identifier twice is the redelivery a resume replays"
+        );
+        drop(span);
+        assert_reason(&capture, "duplicate");
+    }
+
+    /// A guild message is placed by one bounded lookup, and an unplaceable one is dropped by name.
+    #[tokio::test]
+    async fn a_guild_message_that_cannot_be_placed_is_dropped_as_conversation_unresolved() {
+        let mut transport = transport("elote");
+        transport.identity = TransportIdentity {
+            user_id: Some("999".to_owned()),
+            handle: None,
+        };
+        let capture = CaptureLayer::workspace();
+        let _subscriber = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
+
+        // `UNREACHABLE` is a closed loopback port, so the lookup fails rather than guessing.
+        let span = receive_span(ChatTransportKind::Discord);
+        let routed = transport
+            .routable(
+                &message(json!({ "guild_id": "300", "mentions": [{ "id": "999" }] })),
+                &span,
+            )
+            .instrument(span.clone())
+            .await
+            .expect("a drop is not a transport failure");
+        assert!(
+            routed.is_none(),
+            "a guild message was placed without a lookup"
+        );
+        drop(span);
+        assert_reason(&capture, "conversation-unresolved");
+
+        // The cache is what bounds the lookup to one per channel, and a hit needs no request.
+        transport.channels.insert(
+            "100".to_owned(),
+            ChannelShape::Thread {
+                parent: "50".to_owned(),
             },
         );
+        let span = receive_span(ChatTransportKind::Discord);
+        let routed = transport
+            .routable(
+                &message(json!({
+                    "id": "201",
+                    "guild_id": "300",
+                    "mentions": [{ "id": "999" }]
+                })),
+                &span,
+            )
+            .instrument(span.clone())
+            .await
+            .expect("a routable message")
+            .expect("the cached shape places the message");
+        assert_eq!(routed.conversation.kind, ConversationKind::Thread);
+        assert_eq!(routed.conversation.container.as_deref(), Some("300"));
+        assert_eq!(routed.conversation.id, "50");
+        assert_eq!(routed.conversation.thread.as_deref(), Some("100"));
+        assert_eq!(routed.conversation.key(), "50:100");
     }
 
     /// One Discord message event, with the fields a test varies overridden.
@@ -2538,8 +2837,8 @@ mod unit_tests {
     /// A routed message carries the coordinates every liveness surface needs: the channel to post
     /// in and the message to react to. `liveness.mode: off` withholds them, which is how this
     /// transport stays exactly as reply-only as it was.
-    #[test]
-    fn a_routed_message_carries_its_liveness_coordinates() {
+    #[tokio::test]
+    async fn a_routed_message_carries_its_liveness_coordinates() {
         let identity = TransportIdentity {
             user_id: Some("999".to_owned()),
             handle: None,
@@ -2556,8 +2855,10 @@ mod unit_tests {
         quiet.identity = identity;
 
         let span = receive_span(ChatTransportKind::Discord);
-        let routed = span
-            .in_scope(|| publishing.routable(&message(json!({})), &span))
+        let routed = publishing
+            .routable(&message(json!({})), &span)
+            .instrument(span.clone())
+            .await
             .expect("a routable message")
             .expect("the message routes");
         assert_eq!(
@@ -2569,8 +2870,10 @@ mod unit_tests {
         );
 
         let span = receive_span(ChatTransportKind::Discord);
-        let routed = span
-            .in_scope(|| quiet.routable(&message(json!({})), &span))
+        let routed = quiet
+            .routable(&message(json!({})), &span)
+            .instrument(span.clone())
+            .await
             .expect("a routable message")
             .expect("the message still routes");
         assert!(

@@ -20,7 +20,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use dekopon_broker_protocol::ChatTransportKind;
+use dekopon_broker_protocol::{ChatTransportKind, Conversation, ConversationKind};
 use dekopon_core::{ExternalSubject, Redacted};
 use futures_util::{StreamExt as _, future::BoxFuture};
 use hmac::{Hmac, KeyInit as _, Mac as _};
@@ -33,9 +33,9 @@ use tracing::{Instrument as _, Span};
 use crate::{
     config::{LivenessMode, LivenessSettings},
     transport::{
-        ChatDriver, ChatTransport, ConversationKind, InboundMessage, LivenessTarget, OutboundReply,
-        ReplyTarget, SeenIds, TextUnit, TransportError, TransportEvent, TransportIdentity,
-        TypingLease, bound_inbound, credential_client, receive_span, split_message,
+        ChatDriver, ChatTransport, InboundMessage, LivenessTarget, OutboundReply, ReplyTarget,
+        SeenIds, TextUnit, TransportError, TransportEvent, TransportIdentity, TypingLease,
+        bound_inbound, credential_client, receive_span, record_conversation, split_message,
     },
 };
 
@@ -648,6 +648,13 @@ fn parse_delivery(
                 continue;
             };
             for message in messages {
+                // A group payload names the group in `from` and the human in `group_id`/
+                // `participant`; the Cloud API's individual-message path cannot answer one, so it
+                // is dropped by name rather than answered as if the group were a person.
+                if message.get("group_id").is_some() || message.get("participant").is_some() {
+                    received.record("drop.reason", "group-unsupported");
+                    continue;
+                }
                 if message.get("type").and_then(Value::as_str) != Some("text") {
                     continue;
                 }
@@ -674,19 +681,24 @@ fn parse_delivery(
                 if accepted.len() == MAX_MESSAGES_PER_DELIVERY {
                     return Err(());
                 }
-                let conversation =
-                    format!("{}:{}:{}", state.waba_id, state.phone_number_id, sender);
+                // The business account and phone number Meta signed this delivery under are the
+                // container; the sender is the conversation, because an individual message has
+                // nothing else it could be addressed to.
+                let conversation = Conversation {
+                    kind: ConversationKind::DirectMessage,
+                    container: Some(format!("{}:{}", state.waba_id, state.phone_number_id)),
+                    id: sender.to_owned(),
+                    thread: None,
+                };
+                record_conversation(received, &conversation);
                 accepted.push(InboundMessage {
                     transport: state.name.clone(),
                     transport_kind: ChatTransportKind::Whatsapp,
                     subject,
-                    channel: conversation.clone(),
-                    thread: None,
-                    conversation_id: conversation,
+                    conversation,
                     message_id: id.to_owned(),
                     text: bound_inbound(text),
                     assets: Vec::new(),
-                    conversation: ConversationKind::DirectMessage,
                     addressed: None,
                     thread_continuation: None,
                     reply: ReplyTarget::WhatsApp {
@@ -1306,7 +1318,12 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].message_id, "two");
         assert_eq!(messages[0].subject.canonical(), "whatsapp.1603");
-        assert_eq!(messages[0].channel, "123:456:1603");
+        assert_eq!(
+            messages[0].conversation.container.as_deref(),
+            Some("123:456")
+        );
+        assert_eq!(messages[0].conversation.id, "1603");
+        assert_eq!(messages[0].conversation.key(), "1603");
         assert_eq!(
             messages[0].liveness,
             Some(LivenessTarget::WhatsApp {
@@ -1314,6 +1331,26 @@ mod tests {
                 inbound_message_id: "two".to_owned(),
             }),
             "the typing indicator is addressed to the message it answers"
+        );
+    }
+
+    /// A group payload is dropped by name rather than answered as though the group were a person.
+    #[test]
+    fn a_group_payload_is_dropped_as_group_unsupported() {
+        let payload = json!({
+            "object": "whatsapp_business_account",
+            "entry": [{"id":"123","changes":[{"field":"messages","value":{
+                "messaging_product":"whatsapp","metadata":{"phone_number_id":"456"},
+                "messages":[{
+                    "id":"group-one","from":"120363000000000000","group_id":"120363000000000000",
+                    "participant":"1603","type":"text","text":{"body":"hello everyone"}
+                }]
+            }}]}]
+        });
+        let messages = parse_delivery(&state(), &payload, &received()).expect("delivery");
+        assert!(
+            messages.is_empty(),
+            "the Cloud API's individual-message path cannot answer a group"
         );
     }
 

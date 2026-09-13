@@ -22,5 +22,5 @@ models:
     classes: [reasoning]
 routes:
   - transport: support-whatsapp
-    match: { kind: directMessage }
+    conversation: { kind: [directMessage] }
     agent: reviewer

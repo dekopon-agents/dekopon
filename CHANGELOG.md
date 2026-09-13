@@ -81,6 +81,27 @@ All notable changes to Dekopon are documented here. The format is based on
   true` and `stream_options.include_usage`; `stream: false` omits both fields and reports no
   events, for an endpoint or proxy that gets event streams wrong. `kind: chatgptSubscription`
   always streams and has no such field.
+- `inspectAgentConfig: false` on a route withholds `inspect_agent_config` from that route's
+  sessions: the tool is absent from the model's list and a scripted call to it is an unknown tool.
+  Default `true` keeps today's behavior. It removes the structured dump — description, model class,
+  limits, and the agent's standing orders verbatim — and nothing else; the instructions are still
+  the system prompt, so secrecy from a determined user is the model's obedience rather than a gate.
+- A Cedar `context.conversation` record — `kind`, optional `container`, `id`, optional `thread` —
+  replaces the `context.channel` and `context.conversation` strings on every action. `container`
+  and `thread` are optional in the schema, so a policy reading either without a
+  `context.conversation has …` guard fails strict validation when the broker loads it. A stale
+  `context has channel && context.channel == …` does *not* fail: Cedar types the guard as false and
+  short-circuits, so the statement loads and silently stops matching — grep for it.
+- Per-conversation-kind liveness overrides: `liveness.conversations.<kind>` overlays `progress`,
+  `stream`, `cancelButton`, and `keepAlive` (which replaces the base block whole) on the transport's
+  own settings. `mode`, `classicFallback`, and `templates` are transport facts rather than budget
+  knobs and are not overridable, and `progressDetail` stays the route's axis. A key naming a kind
+  the transport never produces, or an override a transport cannot honor, is a startup refusal with
+  the base block's own wording.
+- Durable-memory namespaces now derive from the conversation: `channel := conversation.id` and
+  `conversation := conversation.key()`. Slack and non-thread Discord namespaces are byte-identical
+  to 0.13; WhatsApp, Telegram topics, and Discord threads rotate and start empty, with no migration
+  ([`docs/upgrading.md`](docs/upgrading.md) names the three).
 - `http.plaintextHosts` in `broker.yaml` opts exact hostnames out of the native HTTP host's
   loopback-only plaintext rule. Plaintext `http://` is still refused to everything else, because a
   credential injected into a request that crosses a network in the clear is a credential on that
@@ -100,6 +121,19 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Changed
 
+- **Breaking (configuration).** Routes match a `conversation` — a kind list or the word `any`, an
+  optional `container`, and optional `ids` — and `chatScopes` grants in `broker.yaml` use the same
+  selector. `match:` and `breadth:` are gone, and a file still carrying either refuses to start
+  naming `conversation:`. Threads under a routed channel now answer: a route or a grant naming a
+  parent claims the threads under it when its kind list includes `thread`, where before a Discord
+  thread was a separate channel id that matched nothing. Slack multi-person DMs, which used to
+  arrive as `channel`, are `groupDirectMessage`, so a Slack route that should keep answering them
+  writes `kind: any` or lists the kind. `exactConversation` has no replacement: a grant names a
+  parent conversation, never one thread. [`docs/upgrading.md`](docs/upgrading.md) has the migration.
+- **Breaking (configuration).** The route's memory window, which was also spelled `conversation:`,
+  is `memory:` with the same fields. A `mode:`, `scope:`, `idleTimeoutMs:`, `maxTurns:`, or
+  `maxBytes:` key under `conversation:` is a startup refusal naming the rename rather than an
+  unknown-field message about the match block it landed in.
 - **Breaking (configuration).** `activity:` is replaced by `liveness:`. No transport has an
   `activity` field any more, so a configuration that still carries one no longer decodes, and the
   refusal names `liveness:` and where `classicFallback` goes instead of listing the keys a transport

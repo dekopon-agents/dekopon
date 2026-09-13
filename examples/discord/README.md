@@ -62,13 +62,14 @@ transports:
 
 routes:
   - transport: community-discord
-    match: { kind: directMessage }
+    conversation: { kind: [directMessage] }
     agent: reviewer
   - transport: community-discord
-    match: { kind: channel, channel: "123456789012345678" }
+    # `thread` claims the threads and forum posts under that channel; drop it to keep them silent.
+    conversation: { kind: [channel, thread], ids: ["123456789012345678"] }
     agent: reviewer
   - transport: community-discord
-    match: { kind: channel } # any other channel where the bot is mentioned
+    conversation: { kind: [channel, thread] } # anywhere else the bot is mentioned
     agent: reviewer
 ```
 

@@ -191,8 +191,6 @@ pub enum ToolOutcome {
 pub enum FailureClass {
     /// The model turn ceiling was reached without a final answer.
     StepBudget,
-    /// The session's capability-call ceiling was reached.
-    CallBudget,
     /// A wall-clock bound elapsed.
     WallClock,
     /// The model failed, or produced something the loop cannot run.

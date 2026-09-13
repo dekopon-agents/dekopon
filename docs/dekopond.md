@@ -104,25 +104,27 @@ models:
 
 routes:                                       # first match wins; order matters
   - transport: scientist-slack
-    match: { kind: channel, channel: c0123abc }
-    agent: incident-responder                 # one named channel, its own agent
+    conversation: { kind: [channel, thread], ids: [c0123abc] }
+    agent: incident-responder                 # one named channel and the threads under it
   - transport: scientist-slack
-    match: { kind: channel }                  # any other channel the bot is invited to
+    conversation: { kind: [channel, thread] } # any other channel the bot is invited to
     agent: xaviers-conditional-writer
   - transport: community-discord
-    match: { kind: channel }                  # Discord channels and native thread channels
+    conversation: { kind: any }               # every kind, including group DMs and forum posts
     agent: xaviers-conditional-writer
   - transport: scientist-slack
-    match: { kind: directMessage }
+    conversation: { kind: [directMessage] }
+    subjects: [slack.t0123abc.u9xyz]          # optional, and only beside kind: [directMessage]
     agent: xaviers-conditional-writer
     model: local-qwen                         # optional; else the first model offering the agent's modelClass
     providerAttachments:                      # optional; absent means this route delivers none
       maxPerReply: 1                          # required, 1-255 attachments per reply
     chatAssetInputs: [gpt-image.edit]         # optional; capabilities whose input may name a chat asset
     improvementSuggestions: true              # optional; offers suggest_improvement, recorded to telemetry
+    inspectAgentConfig: false                 # optional, default true; withholds inspect_agent_config
     progressDetail: plain                     # optional: off | plain (default) | detailed
     limits: { maxSteps: 8, maxCapabilityCalls: 16, maxDurationMs: 300000 }   # maxDurationMs optional; 0 refused
-    conversation:                             # optional; default { mode: oneShot }
+    memory:                                   # optional; default { mode: oneShot }
       mode: persistent                        # oneShot | persistent
       scope: privateConversation              # privateConversation (default) | sharedConversation
       idleTimeoutMs: 900000                   # optional, default 900000 (15 minutes)
@@ -143,7 +145,11 @@ telemetry:                                    # optional, identical in shape to 
   exportTimeoutMs: 10000
 ```
 
-The `conversation:` block is tagged on `mode`, and both halves are strict: an unknown mode, an unknown or wrong-case `scope`, and any persistent-only field written next to `mode: oneShot` are decode failures. `scope` is strict camelCase, accepts only `privateConversation` and `sharedConversation`, and is valid only beside `mode: persistent`; omission defaults to `privateConversation`. A setting that can never take effect is far more likely a mode typo than an intention, and a decoder that ignored it would leave a configuration file claiming a memory or audience the daemon does not have.
+The route's `conversation:` block is the **match**: `kind` is the word `any` or a list of `directMessage`, `groupDirectMessage`, `channel`, and `thread`, with an optional `container` (Slack team, Discord guild, WhatsApp `waba:phoneNumberId`) and an optional `ids` list. A bare `kind: channel` is a decode failure naming the list form, because it reads as though it claimed the threads under the channel too. `subjects:` restricts a route to named canonical subjects and is accepted only beside `kind: [directMessage]`; it is routing, never authority, and a per-person channel route would read as an access-control list and be trusted as one.
+
+`inspectAgentConfig: false` withholds the `inspect_agent_config` tool from that route's sessions. It removes the structured dump — the description, model class, limits, and the agent's `instructions` verbatim — and nothing else: the instructions are still the system prompt, so this is not secrecy from a determined user, only the removal of a one-call transcript of them.
+
+The `memory:` block — which was called `conversation:` before 0.14.0 — is tagged on `mode`, and both halves are strict: an unknown mode, an unknown or wrong-case `scope`, and any persistent-only field written next to `mode: oneShot` are decode failures. `scope` is strict camelCase, accepts only `privateConversation` and `sharedConversation`, and is valid only beside `mode: persistent`; omission defaults to `privateConversation`. A setting that can never take effect is far more likely a mode typo than an intention, and a decoder that ignored it would leave a configuration file claiming a memory or audience the daemon does not have.
 
 `improvementSuggestions: true` offers that route's sessions the `suggest_improvement` tool: a bounded channel for the model to tell the operator how the agent could be improved — an instruction that was wrong, a skill or capability it lacked, a limit it hit — at most three times per session. It is off by default because each recorded suggestion is model-authored text written to the telemetry sink as `agent.improvement.suggested`; setting the flag is the consent that puts it there. A suggestion is advisory by construction: no instruction, skill, limit, or grant moves because a model asked, and nothing it records is relayed to chat.
 
@@ -160,7 +166,10 @@ A gateway that starts and then refuses everything is worse than one that does no
 - duplicate transport names, duplicate model names, a route naming an unknown transport or an unknown model;
 - a zero step budget, a zero capability budget, or zero concurrency;
 - a transport `endpoint` override (`graphEndpoint` on `whatsappCloudApi`) that is neither its pinned production origin (Slack, Discord, Telegram, or the Meta Graph API) nor a literal loopback `http://` URL. Literal means `127.0.0.1` or `::1`: the name `localhost` is resolved by whatever the host's resolver says today, which is not the same promise;
-- a `channel` written beside `kind: directMessage`. The field belongs to the other kind, and a decoder that shrugged at it would leave an operator convinced they had scoped a route to one channel while it claimed every direct message on the transport;
+- a route still carrying `match:`, or a `mode`/`scope`/`idleTimeoutMs`/`maxTurns`/`maxBytes` key under `conversation:`. Both name their replacement: `match:` became `conversation:`, and the memory window became `memory:`;
+- a selector that can never name a conversation: an empty or duplicated `kind` list, an empty `ids` list, an id or `container` the transport would never mint, a `container` on Telegram (which has nothing above a chat), a kind the transport never produces (`groupDirectMessage` on Discord, `channel` on WhatsApp), or an `ids` entry in `id:thread` form — a selector names the parent, and the kind list decides whether its threads come with it;
+- `subjects:` beside anything but `kind: [directMessage]`, an empty `subjects:` list, or `memory.scope: sharedConversation` on a `[directMessage]`-only route, where the direct message already is the subject;
+- a `liveness.conversations.<kind>` key for a kind the transport never produces;
 - a missing or blank chat or bound-route model credential environment variable. A model's `apiKeyEnv` is optional and absent means "this endpoint needs no key", which a loopback llama.cpp genuinely does not; naming a variable that is unset or exported blank is the opposite claim, and this process cannot see one exported after it started;
 - a route naming `providerAttachments` on a text-only transport, which today means `whatsappCloudApi`, or one whose `providerAttachments.maxPerReply` is `0` (omit the block instead);
 - an unknown Slack experience, liveness mode/fallback, or field inside those strict blocks; an off
@@ -186,7 +195,7 @@ A gateway that starts and then refuses everything is worse than one that does no
 - a `whatsappCloudApi` transport whose `bind` port is 0, whose `wabaId` or `phoneNumberId` is not a canonical positive decimal, whose `callbackPath` is not lowercase literal segments, or whose `graphApiVersion` is not `v<major>.0`;
 - broker frame bounds the protocol rejects (`maxFrameBytes` zero or above its hard ceiling, `ioTimeoutMs` zero), a broker socket that neither `broker.socketPath` nor the discovery order starting at `DEKOPON_BROKER_SOCKET` resolves, or a `telemetry:` block `dekopon-telemetry` refuses.
 
-The `conversation:` block adds three more:
+The `memory:` block adds three more:
 
 - a `persistent` route with a zero idle timeout, a zero turn window, or a zero byte window — the same rule a zero step budget already follows, because a bound of zero is a bound nobody meant to write;
 - an idle timeout, window bound, or `scope` on a `oneShot` route; an unknown, null, or wrong-case persistent `scope`. Those settings cannot take effect as written, and silently accepting them could turn an intended private route into some other behavior;
@@ -198,7 +207,8 @@ The `conversation:` block adds three more:
 
 ## Agent configuration self-inspection
 
-Every authorized session is offered `inspect_agent_config`. When someone asks “what is this
+Every authorized session on a route that has not written `inspectAgentConfig: false` is offered
+`inspect_agent_config`. When someone asks “what is this
 agent's configuration?”, the model can call it and receive one bounded JSON snapshot designed to
 render as concise Markdown tables:
 
@@ -207,7 +217,7 @@ render as concise Markdown tables:
 - the skills mounted for the agent, each as its name, description, and resource file paths —
   never the skill text, which `read_skill` discloses on demand — and absent when nothing is
   mounted;
-- route step/capability limits and one-shot or persistent conversation bounds, including the effective persistent scope; and
+- route step/capability limits and the one-shot or persistent `memory:` window, including the effective persistent scope; and
 - the capability metadata in this sender's fresh `capabilities(subject, agent, scope)` result:
   identifier, selected provider, description, effect, and risk, as the provider manifest and the
   broker's `constraintSets` define them.
@@ -218,7 +228,7 @@ private secret-map source/selector/use inventory, principal/subject/channel/tran
 model endpoints and auth paths, broker paths, and all credential values are absent. Exact standing
 instructions remain visible and may intentionally contain a public inert DRN. The gateway never receives provider credentials or raw
 policy, and the typed view has no field for the chat/model credentials it does hold. Each serialized
-result has a 128 KiB hard ceiling. Calls are repeatable under the prompt loop's shared per-turn tool
+result has a 128 KiB hard ceiling. A route with `inspectAgentConfig: false` offers the tool at all: the model's tool list does not carry it and a scripted call is an unknown tool. What that buys is flat: the structured dump is gone, and the `instructions` are still this session's system prompt, so secrecy from a determined user is the model's obedience rather than a gate. Calls are repeatable under the prompt loop's shared per-turn tool
 call and model-step bounds; there is no inspection-specific call limit. What a repeat does not do is
 append a second copy: a tool result stays in the session's message vector and is re-sent to the
 provider on every remaining turn, so the configuration is serialized once and every later call is
@@ -484,7 +494,7 @@ An owner-only (`0600`) Unix socket under a private parent directory, with `dekop
 
 ```console
 $ nc -U /path/to/dekopond-dev.sock
-{"subject": "tel.16034700182", "channel": "dev", "text": "what changed today?"}
+{"subject": "tel.16034700182", "conversation": {"kind": "channel", "id": "ops"}, "text": "what changed today?"}
 {"reply": "Nothing external. Two read-only capability calls."}
 ```
 
@@ -497,17 +507,21 @@ development protocol rather than a compact production transport.
 
 On the default private scope, a declared subject also selects history **inside that configured local transport**. A caller can replay compacted exchanges previously created under the same local transport, agent, direct-message identity, and declared subject, but cannot alias Slack, Discord, or another configured transport because the transport component differs. On explicit shared scope the subject is intentionally absent from the state key, so every authorized caller of that local route shares its one local direct-message conversation. No authority moves — the broker decides every invocation for itself — but text does, which is a second reason this socket is `0600` and a development tool.
 
-The shared-prompt label says `authenticated participant` uniformly across transports. Here it means the canonical participant claim accepted on a fresh broker leg from the owner-UID-authenticated local caller; it does **not** mean the development socket independently authenticated the declared person. Every local message is a direct message; channel routes are a chat-service concept.
+The shared-prompt label says `authenticated participant` uniformly across transports. Here it means the canonical participant claim accepted on a fresh broker leg from the owner-UID-authenticated local caller; it does **not** mean the development socket independently authenticated the declared person. The line names its own `conversation` — `{ kind, container?, id, thread? }`, defaulting to `{ kind: directMessage, id: dev }` — which makes this the one transport that can produce every kind, and therefore the one a route table, a liveness override, or a memory key can be exercised against without a chat service.
 
 ## Routing
 
-First match wins on (transport name, direct message or channel). The channel is optional: `{ kind: channel, channel: c0123abc }` claims that one channel, and `{ kind: channel }` claims **any** channel the bot is in. Unmatched messages are ignored with a debug-level event — bots see ambient traffic, and silence is the correct answer.
+First match wins on (transport name, conversation, subjects). A conversation is where the message was posted: its `kind` — `directMessage`, `groupDirectMessage`, `channel`, or `thread` — plus the `container` above it (Slack team, Discord guild, WhatsApp `waba:phoneNumberId`; Telegram has none) and the `id` the service names. For a `thread`, the `id` is its **parent**, so `kind: [channel]` claims a channel and excludes the threads under it while `kind: [channel, thread]` claims both, and `kind: any` claims every kind the transport produces. A private Discord thread inherits its parent's grants: the grant direction is safe, because a thread's audience is a subset of its parent's.
 
-Leaving `channel` out exists because naming them does not scale. One route per channel means enumerating service-native identifiers and editing this file again every time somebody creates a channel, and until an operator notices and redeploys, the bot is silent in the new one while appearing to be deployed workspace-wide. An absent `channel` says "wherever I am invited", which is membership the chat service already controls.
+`ids` is optional. Naming channels does not scale: one route per channel means enumerating service-native identifiers and editing this file again every time somebody creates a channel, and until an operator notices and redeploys, the bot is silent in the new one while appearing to be deployed workspace-wide. An absent `ids` says "wherever I am invited", which is membership the chat service already controls.
+
+`subjects:` restricts a direct-message route to named canonical subjects and never widens one. It is accepted only beside `kind: [directMessage]`, because a per-person *channel* route — "in #general, Simon gets agent X" — is an access-control list by another name and the first thing somebody will trust as one; authority stays the broker's subject mapping and Cedar. A DM route **without** `subjects:` answers strangers: an unmapped sender gets a broker round trip and the fixed unauthorized refusal line rather than silence, which is a deliberate choice to make rather than one to inherit.
+
+Unmatched messages are ignored with a debug-level `gateway_message_ignored { reason: unrouted, conversation.kind, conversation.container }` — bots see ambient traffic, and silence is the correct answer, but which kind and which container went unclaimed is what answers "why did the bot not reply in here".
 
 **Declaration order is the whole precedence rule.** Routes are consulted top to bottom, so a named-channel route written above a catch-all keeps that channel for itself while the catch-all takes everything else — special handling in `#incidents`, the default everywhere else. Nothing sorts by specificity: a hidden ranking is how an operator ends up unable to say which route answered.
 
-A channel initially requires the bot to be addressed: `<@BOT_USER_ID>` on Slack, a structured `mentions[].id` match on Discord, or `@botname` on Telegram. **A route decides which agent answers; an explicit address decides whether a new channel conversation starts**, and widening the first leaves the second exactly where it stood. Discord and Telegram retain that rule on every message. Slack classic does too. Slack Agent has one bounded exception: after an explicitly addressed message is freshly authorized, the same authenticated sender may continue without another mention inside that exact owned root thread. Every continuation is authorized again and may decline to post; all non-owned channel history is dropped before routing. The Agent manifest therefore receives ambient public/private channel events, while the classic manifest remains mention-only.
+Every kind but `directMessage` — a group DM and a thread included — initially requires the bot to be addressed: `<@BOT_USER_ID>` on Slack, a structured `mentions[].id` match on Discord, or `@botname` on Telegram. **A route decides which agent answers; an explicit address decides whether a new channel conversation starts**, and widening the first leaves the second exactly where it stood. Discord and Telegram retain that rule on every message. Slack classic does too. Slack Agent has one bounded exception: after an explicitly addressed message is freshly authorized, the same authenticated sender may continue without another mention inside that exact owned root thread. Every continuation is authorized again and may decline to post; all non-owned channel history is dropped before routing. The Agent manifest therefore receives ambient public/private channel events, while the classic manifest remains mention-only.
 
 ### Being available in a channel is not authority
 
@@ -605,12 +619,12 @@ answer the person is already reading.
 
 ## Sessions
 
-Each routed message runs one session. On a `oneShot` route — the default, and every route in a configuration that never writes a `conversation:` block — that session is entirely independent, and the `persistent` clauses in steps 4 and 5 are the whole difference the other mode makes:
+Each routed message runs one session. On a `oneShot` route — the default, and every route in a configuration that never writes a `memory:` block — that session is entirely independent, and the `persistent` clauses in steps 4 and 5 are the whole difference the other mode makes:
 
-1. **Admission.** A process-wide semaphore bounds what the daemon costs at once, and a per-`(transport, channel, thread)` in-flight set stops one conversation from queueing work on itself — what a person does when a bot seems slow and they send the same thing again. A rejected message gets `I'm busy — try again shortly.` when `replyOnBusy` is set, and silence otherwise.
+1. **Admission.** A process-wide semaphore bounds what the daemon costs at once, and a per-`(transport, conversation)` in-flight set, keyed on the same conversation identity the session registry and the memory key use, stops one conversation from queueing work on itself — what a person does when a bot seems slow and they send the same thing again. A rejected message gets `I'm busy — try again shortly.` when `replyOnBusy` is set, and silence otherwise.
 2. **Authorization.** The session opens an attested broker leg with `capabilities(subject, agent, scope)`. If the answer is empty — or the broker refuses, because the attestation was not honored or because policy does not permit this principal to drive this agent — the sender gets `You're not authorized to use this agent.` and **no model call or liveness write is made**. That is the cheapest possible refusal, and one the message text cannot argue with.
 3. **Liveness.** When the transport opted in, one session-owned policy task starts immediately after the fresh grant. The service renders everything; the model supplies no target, wording, emoji, cadence, or timing. The policy owns one message, spends the session's edit budget, seals synchronously before terminal delivery, and returns the service's own indicators to rest afterwards, so cosmetic I/O never delays the reply or holds admission. Two consecutive failures stop that surface for the session; permanent Slack installation failures additionally trip a transport-wide fallback breaker. What it shows is [Liveness, progress, and stopping a run](#liveness-progress-and-stopping-a-run).
-4. **Execution.** On a `persistent` route the session first looks up its conversation under the key in [Scope selects the replay audience](#scope-selects-the-replay-audience). An entry idle past the route's timeout, or built under a granted capability set that differs from the one this message's leg just reported, is dropped rather than used; whatever survives is seeded into the prompt ahead of the new message as compacted `(question, answer)` pairs, oldest dropped first until the window's turn and byte bounds both hold. A shared turn's user text starts with a gateway-authored canonical-participant label, for both the current message and later replay. The lookup happens *after* step 2 because the grant comparison needs a fresh grant to compare against. Then the model client is built from the route's model, the shell runtime is given the attested leg as its only capability dispatch, the credential-free `inspect_agent_config` view is built from the same fresh leg, the route's `providerAttachments` slot and `chatAssetInputs` expansion are attached to that leg, and the prompt loop runs on a blocking task with the agent's `instructions` as the system prompt. The agent's catalog skills ride the bound route — read whole into memory when the catalog loaded and shared by every session rather than re-read, so a session never touches the filesystem — and are mounted on every session on that route: a second system message after the instructions lists each by name and description, and the `read_skill` tool loads one skill's instructions, or one of its resource files, on demand. A route with `improvementSuggestions: true` additionally offers `suggest_improvement`; what it records is written to telemetry as `agent.improvement.suggested` and is never relayed to chat, so the sender sees only the answer. Instructions are supplied fresh on every message and never stored, so editing an agent's standing orders takes effect on the next message without rewriting a single remembered conversation. Shell bounds are `dekopon-shell`'s defaults except `maxCapabilityCalls`, which comes from the route. Every model request the session then makes declares a [prompt cache key](#the-prompt-cache-key) — the conversation's on a `persistent` route, the route's on a `oneShot` one.
+4. **Execution.** On a `persistent` route the session first looks up its conversation under the key in [Scope selects the replay audience](#scope-selects-the-replay-audience). An entry idle past the route's timeout, or built under a granted capability set that differs from the one this message's leg just reported, is dropped rather than used; whatever survives is seeded into the prompt ahead of the new message as compacted `(question, answer)` pairs, oldest dropped first until the window's turn and byte bounds both hold. A shared turn's user text starts with a gateway-authored canonical-participant label, for both the current message and later replay. The lookup happens *after* step 2 because the grant comparison needs a fresh grant to compare against. Then the model client is built from the route's model, the shell runtime is given the attested leg as its only capability dispatch, the credential-free `inspect_agent_config` view is built from the same fresh leg and offered unless the route wrote `inspectAgentConfig: false`, the route's `providerAttachments` slot and `chatAssetInputs` expansion are attached to that leg, and the prompt loop runs on a blocking task with the agent's `instructions` as the system prompt. The agent's catalog skills ride the bound route — read whole into memory when the catalog loaded and shared by every session rather than re-read, so a session never touches the filesystem — and are mounted on every session on that route: a second system message after the instructions lists each by name and description, and the `read_skill` tool loads one skill's instructions, or one of its resource files, on demand. A route with `improvementSuggestions: true` additionally offers `suggest_improvement`; what it records is written to telemetry as `agent.improvement.suggested` and is never relayed to chat, so the sender sees only the answer. Instructions are supplied fresh on every message and never stored, so editing an agent's standing orders takes effect on the next message without rewriting a single remembered conversation. Shell bounds are `dekopon-shell`'s defaults except `maxCapabilityCalls`, which comes from the route. Every model request the session then makes declares a [prompt cache key](#the-prompt-cache-key) — the conversation's on a `persistent` route, the route's on a `oneShot` one.
 5. **Answer, silence, and optional durable recording.** A required session's final bounded text and accepted provider attachments go back to chat. An inherited Slack Agent continuation may instead call `decline_chat_reply` before capability work, which commits its user-only in-process turn, removes the progress message, and sends no reply request. On failure the sender gets one fixed line, `The agent could not complete this request.` — a `PromptError` can carry model-chosen text, a provider message, or a transport diagnostic, and chat is the last place any of those belong. The operator reads the category from telemetry. A `persistent` route writes only the textual exchange back as one more in-process remembered turn, trims the window, and restarts the idle clock. A generation lease makes a commit from older in-flight work inert after grant invalidation, empty-grant removal, idle replacement, or capacity eviction, while concurrent work in the same generation appends in completion order. **The fixed failure line and attachment bytes are never stored.** A declined or failed model session records its question with nothing in the in-process answer's place, which is truthful and is what makes a later follow-up answerable; a session refused at step 2 records nothing at all. Optional durable recording happens under the conditions in [Durable memory after transport acceptance](#durable-memory-after-transport-acceptance).
 
 Text is bounded in both directions: inbound to 16 KiB keeping the head (a chat message states its request first), outbound to 8 KiB keeping head and tail (an answer's conclusion is usually its last line). Both truncations say so in the text.
@@ -642,7 +656,16 @@ The effective keys are intentionally exact:
 
 The agent boundary means two agents never share transcript or attachment state even when they are routed on the same transport conversation. The configured transport boundary prevents lookalike identities from different installations or services from aliasing. Private scope adds the canonical subject from the transport envelope accepted for the fresh broker leg, so one participant claim never receives another's history. Shared scope removes **only** that subject component; it is not agent memory, team memory, a namespace shared by routes, or any replay beyond this exact conversation.
 
-The conversation identity is transport-derived, not mechanically `(channel, thread)`. Slack omits `thread_ts` on the message that *starts* a thread and sends it on every reply inside one, while the bot answers that first message in a thread rooted at it. Slack shared history is therefore normally root-thread scoped (and a direct message has its direct-message identity). A Discord guild message has the channel as its conversation identity: on a shared route, **the whole guild channel identity shares one replay window** until Discord creates a distinct native thread channel. Choosing shared scope on a broad Discord channel can disclose one participant's prior prompt and the agent's answer to every other mapped participant who can invoke that route there. Treat that as an explicit audience expansion, not as a convenience toggle.
+The conversation identity is the transport-minted conversation's own key — `id`, or `id:thread` when the answer lands in a thread — not mechanically `(channel, thread)`. Slack omits `thread_ts` on the message that *starts* a thread and sends it on every reply inside one, while the bot answers that first message in a thread rooted at it, so the key is the thread the answer joins rather than the raw field. What each kind keys on, and who a shared key lets in:
+
+| kind | `privateConversation` | `sharedConversation` | audience the shared key implies |
+|---|---|---|---|
+| `directMessage` | (agent, transport, key, subject) | refused at startup on a `[directMessage]`-only route | none: the direct message already is the subject |
+| `groupDirectMessage` | (agent, transport, key, subject) | (agent, transport, key) | every mapped member of the group |
+| `channel` | (agent, transport, key, subject) | (agent, transport, key) | every mapped member who can invoke the route there; a Discord guild channel whole |
+| `thread` | (agent, transport, key, subject) | (agent, transport, key) | the thread's participants; a private Discord thread inherits its parent's grants |
+
+Choosing shared scope on a broad Discord channel can disclose one participant's prior prompt and the agent's answer to every other mapped participant who can invoke that route there. Treat that as an explicit audience expansion, not as a convenience toggle.
 
 Shared user turns are sent to the model as exactly:
 
@@ -655,7 +678,7 @@ The gateway writes the first line from the transport envelope accepted for the f
 
 **The canonical participant identifier reaches the model provider on every shared turn.** The telemetry gate controls exports to the configured telemetry sink, not the prompt sent to the selected model endpoint. A canonical subject may be a phone number or service user ID. Enable shared scope only when sending those identifiers, earlier participant text, and agent answers to that model provider is acceptable for the whole conversation audience.
 
-The state key is *not* the admission key from step 1, which is `(transport, channel, thread)` and has no agent, scope, or subject. The two keys answer different questions. Serialization asks "is this bot already busy on this thread"; state asks "which exact route audience owns this transcript and attachment inventory". Admission therefore does not serialize every possible shared-state race. The store gives each session a generation lease and attachment-access fence: sessions in one live generation append in completion order and reuse its inventory, while removal, replacement, or eviction makes every older lease inert and closes its asset fence. Stale in-flight work can therefore neither recreate forgotten history, rename its cache lane, publish into a replacement inventory, nor start a metadata/byte fetch through a retired one. A transport read already started while the generation was live may finish concurrently, but a final fence check discards those bytes instead of sending them to the model after retirement.
+The state key is *not* the admission key from step 1, which is `(transport, conversation key)` and has no agent, scope, or subject. The two keys answer different questions. Serialization asks "is this bot already busy on this thread"; state asks "which exact route audience owns this transcript and attachment inventory". Admission therefore does not serialize every possible shared-state race. The store gives each session a generation lease and attachment-access fence: sessions in one live generation append in completion order and reuse its inventory, while removal, replacement, or eviction makes every older lease inert and closes its asset fence. Stale in-flight work can therefore neither recreate forgotten history, rename its cache lane, publish into a replacement inventory, nor start a metadata/byte fetch through a retired one. A transport read already started while the generation was live may finish concurrently, but a final fence check discards those bytes instead of sending them to the model after retirement.
 
 ### Prior turns are compacted
 
@@ -669,7 +692,7 @@ The loss is real and worth naming: the model cannot re-read a command it ran thr
 
 | Setting | Where | Bounds |
 |---|---|---|
-| `mode` | route | `oneShot` (default) or `persistent` |
+| `mode` | route `memory:` | `oneShot` (default) or `persistent` |
 | `scope` | persistent route | `privateConversation` (default) or explicit `sharedConversation` |
 | `idleTimeoutMs` | persistent route | How long an untouched conversation survives; default 900000 |
 | `maxTurns` | persistent route | Exchanges the window replays; default 12 |
@@ -708,7 +731,7 @@ Where it comes from, and how long it lives:
 
 | Route mode | Key names | Minted | Rotates when |
 |---|---|---|---|
-| `persistent` | one scoped conversation: private `(agent, transport, conversation, subject)` or shared `(agent, transport, conversation)` | with the conversation entry | the entry is evicted — idle, capacity, changed grant, or empty-grant removal — or the process restarts |
+| `persistent` | one scoped conversation: private `(agent, transport, conversation key, subject)` or shared `(agent, transport, conversation key)` | with the conversation entry | the entry is evicted — idle, capacity, changed grant, or empty-grant removal — or the process restarts |
 | `oneShot` | one bound route | once, at startup, when routes bind | the process restarts |
 
 Rotation keeps it from becoming a durable identifier for a person or service-native shared conversation, and it is also just correct: an evicted conversation rebuilds a prompt that shares no prefix with the one it replaced, so continuing to name the old lane would be a guaranteed miss.
@@ -725,8 +748,12 @@ On a `persistent` route, chat text sits in `dekopond`'s memory for at least the 
 
 The gateway receives an optional `ChatMemorySurface` only when the agent is enabled and the broker
 freshly permits all three exact memory capabilities under a matching subject namespace,
-owner-authored `chatScopes` grant, canonical transport/channel/conversation claim, storage
-constraint, and Cedar context. Otherwise recent/search, the `memory` word, the prompt note, durable
+owner-authored `chatScopes` grant whose `conversation:` selector claims it, a canonical transport
+and conversation claim, a storage constraint, and Cedar context. The storage namespace's two
+conversation-derived scope values are `channel := conversation.id` and
+`conversation := conversation.key()`, so a Slack channel and a non-thread Discord channel keep the
+namespaces they had in 0.13, while WhatsApp, Telegram topics, and Discord threads change shape and
+start empty ([upgrading.md](upgrading.md)). Otherwise recent/search, the `memory` word, the prompt note, durable
 recording, and namespace creation are all absent.
 
 When present, the model may retrieve on demand:

@@ -39,23 +39,23 @@ pub struct EffectiveCapabilityView {
 /// Effective audience of a persistent replay window.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub enum ConversationScopeView {
+pub enum MemoryScopeView {
     /// One authenticated transport subject sees only its own transcript.
     PrivateConversation,
     /// Authenticated subjects in one exact routed conversation share a transcript.
     SharedConversation,
 }
 
-/// Conversation behavior of the route serving this session.
+/// What the route serving this session remembers between messages.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "mode", rename_all = "camelCase")]
-pub enum ConversationConfigView {
+pub enum MemoryConfigView {
     /// Every message starts with no remembered conversation.
     OneShot,
     /// A bounded private or intentionally shared history is replayed.
     Persistent {
         /// Effective audience selected by trusted route configuration.
-        scope: ConversationScopeView,
+        scope: MemoryScopeView,
         /// Milliseconds after which an idle conversation is no longer replayed.
         idle_timeout_ms: u64,
         /// Maximum remembered exchanges.
@@ -73,8 +73,8 @@ pub struct SessionConfigView {
     pub max_steps: u32,
     /// Maximum broker capability calls across all scripts for one message.
     pub max_capability_calls: u32,
-    /// Route conversation behavior.
-    pub conversation: ConversationConfigView,
+    /// What the route remembers between messages.
+    pub memory: MemoryConfigView,
 }
 
 /// One mounted skill as the model may see it described: its name and trigger, never its text.
@@ -219,8 +219,8 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        AgentConfigView, ConversationConfigView, ConversationScopeView, EffectiveCapabilityView,
-        MAX_AGENT_CONFIG_TOOL_BYTES, SessionConfigView, SkillView,
+        AgentConfigView, EffectiveCapabilityView, MAX_AGENT_CONFIG_TOOL_BYTES, MemoryConfigView,
+        MemoryScopeView, SessionConfigView, SkillView,
     };
 
     fn view(instructions: String) -> AgentConfigView {
@@ -232,8 +232,8 @@ mod tests {
             SessionConfigView {
                 max_steps: 8,
                 max_capability_calls: 16,
-                conversation: ConversationConfigView::Persistent {
-                    scope: ConversationScopeView::PrivateConversation,
+                memory: MemoryConfigView::Persistent {
+                    scope: MemoryScopeView::PrivateConversation,
                     idle_timeout_ms: 900_000,
                     max_turns: 12,
                     max_bytes: 65_536,
@@ -258,7 +258,7 @@ mod tests {
         assert_eq!(value["prompt"]["instructions"], "Be concise.");
         assert_eq!(value["session"]["maxSteps"], 8);
         assert_eq!(
-            value["session"]["conversation"],
+            value["session"]["memory"],
             serde_json::json!({
                 "mode": "persistent",
                 "scope": "privateConversation",
@@ -277,13 +277,13 @@ mod tests {
     #[test]
     fn conversation_inspection_is_mode_only_for_one_shot_and_names_shared_scope() {
         assert_eq!(
-            serde_json::to_value(ConversationConfigView::OneShot).expect("view serializes"),
+            serde_json::to_value(MemoryConfigView::OneShot).expect("view serializes"),
             serde_json::json!({"mode": "oneShot"}),
             "persistent-only fields stay absent from one-shot inspection"
         );
         assert_eq!(
-            serde_json::to_value(ConversationConfigView::Persistent {
-                scope: ConversationScopeView::SharedConversation,
+            serde_json::to_value(MemoryConfigView::Persistent {
+                scope: MemoryScopeView::SharedConversation,
                 idle_timeout_ms: 1,
                 max_turns: 2,
                 max_bytes: 3,

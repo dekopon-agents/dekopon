@@ -13,8 +13,9 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use dekopon_broker::{
     Attestation, AttestorGrant, AuthenticatedContext, Broker, BrokerLimits, CapabilityRoute,
-    ChatScopeClaim, ChatTransportKind, ConstraintCatalog, ConstraintSet, CredentialStore,
-    IdentityDirectory, InMemoryAuditLog, InvocationRequest, PolicyEngine, PolicyWorld,
+    ChatScopeClaim, ChatTransportKind, ConstraintCatalog, ConstraintSet, Conversation,
+    ConversationKind, CredentialStore, IdentityDirectory, InMemoryAuditLog, InvocationRequest,
+    PolicyEngine, PolicyWorld,
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_capability::{EffectKind, ExecutionConstraints, InvocationOutcome};
@@ -311,8 +312,12 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
                 ChatScopeClaim {
                     transport: "scientist-slack".parse::<TransportId>().expect("transport"),
                     kind: ChatTransportKind::Slack,
-                    channel: "c0123abc".to_owned(),
-                    conversation: "c0123abc:1712345678.000100".to_owned(),
+                    conversation: Conversation {
+                        kind: ConversationKind::Thread,
+                        container: Some("t0123abc".to_owned()),
+                        id: "c0123abc".to_owned(),
+                        thread: Some("1712345678.000100".to_owned()),
+                    },
                 },
             )),
         )
@@ -335,8 +340,12 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
                     ChatScopeClaim {
                         transport: "scientist-slack".parse::<TransportId>().expect("transport"),
                         kind: ChatTransportKind::Slack,
-                        channel: "c0123abc".to_owned(),
-                        conversation: "c0123abc:1712345678.000100".to_owned(),
+                        conversation: Conversation {
+                            kind: ConversationKind::Thread,
+                            container: Some("t0123abc".to_owned()),
+                            id: "c0123abc".to_owned(),
+                            thread: Some("1712345678.000100".to_owned()),
+                        },
                     },
                 )
                 .bound_to(ordinary.id.clone()),
