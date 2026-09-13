@@ -956,7 +956,6 @@ async fn session(
         let runtime = ShellRuntime {
             invoker: leg,
             limits: shell,
-            curl_capability: None,
         };
         // `history` is the accumulator rather than a return value, so this session's exchange is
         // recorded into it whichever way the loop ends.

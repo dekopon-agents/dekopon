@@ -19,8 +19,8 @@ pub const MAX_AGENT_CONFIG_TOOL_BYTES: usize = 128 * 1024;
 /// Trusted effective metadata for one capability Cedar currently exposes to this session.
 ///
 /// The broker overwrites effect and risk from the owner-authored constraint set
-/// before returning its capability snapshot. Provider input schemas stay discoverable through
-/// `cap --describe` and are omitted here to keep introspection compact.
+/// before returning its capability snapshot. Provider input schemas are not part of it: a model
+/// learns how to call a provider from its command word's `--help`, never from a schema.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EffectiveCapabilityView {
