@@ -9,7 +9,8 @@ use std::{
     ffi::OsString,
     fmt,
     fs::{self, File, OpenOptions},
-    io::{self, BufRead, BufReader, Read, Write},
+    io::{self, Read, Write},
+    ops::ControlFlow,
     path::{Path, PathBuf},
     sync::Mutex,
     thread,
@@ -23,10 +24,14 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use ureq::Agent;
 
-use crate::model::{
-    AssistantTurn, ChatModel, CompletionOptions, ContentPart, ModelError, ModelFunctionCall,
-    ModelMessage, ModelTool, ModelToolCall, ModelUsage, data_url, read_error_body,
-    sanitize_diagnostic,
+use crate::{
+    model::{
+        AssistantTurn, ChatModel, CompletionOptions, ContentPart, ModelError, ModelFunctionCall,
+        ModelMessage, ModelTool, ModelToolCall, ModelUsage, data_url, read_error_body,
+        sanitize_diagnostic,
+    },
+    sse::{MAX_STREAM_BYTES, SseError, SseEvent, SseReader},
+    stream::{ModelText, TurnEvent},
 };
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -35,7 +40,6 @@ const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 const DEVICE_LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const REFRESH_MARGIN: Duration = Duration::from_secs(60);
-const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 const AUTH_VERSION: u32 = 1;
 const JWT_AUTH_CLAIM: &str = "https://api.openai.com/auth";
 
@@ -346,6 +350,7 @@ impl ChatGptCodexModel {
         messages: &[ModelMessage],
         tools: &[ModelTool],
         options: &CompletionOptions,
+        on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
     ) -> Result<AssistantTurn, ChatGptRequestError> {
         let body = build_request_body(&self.model, messages, tools, options);
         let response = self
@@ -376,8 +381,10 @@ impl ChatGptCodexModel {
             return Err(ChatGptRequestError::Status { status, detail });
         }
 
-        parse_sse(response.into_parts().1.into_reader())
-            .map_err(|error| ChatGptRequestError::Protocol(error.to_string()))
+        parse_sse(response.into_parts().1.into_reader(), on_event).map_err(|error| match error {
+            ChatGptError::Interrupted => ChatGptRequestError::Interrupted,
+            other => ChatGptRequestError::Protocol(other.to_string()),
+        })
     }
 }
 
@@ -386,15 +393,8 @@ impl ChatModel for ChatGptCodexModel {
         &self,
         messages: &[ModelMessage],
         tools: &[ModelTool],
-    ) -> Result<AssistantTurn, ModelError> {
-        self.complete_with(messages, tools, &CompletionOptions::default())
-    }
-
-    fn complete_with(
-        &self,
-        messages: &[ModelMessage],
-        tools: &[ModelTool],
         options: &CompletionOptions,
+        on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
     ) -> Result<AssistantTurn, ModelError> {
         let span = tracing::info_span!(
             "model.complete",
@@ -414,7 +414,7 @@ impl ChatModel for ChatGptCodexModel {
             self.credential.install(&credentials);
         }
 
-        match self.request_turn(&credentials, messages, tools, options) {
+        match self.request_turn(&credentials, messages, tools, options, &mut *on_event) {
             Ok(turn) => Ok(turn),
             Err(ChatGptRequestError::Unauthorized) => {
                 if self
@@ -425,11 +425,22 @@ impl ChatModel for ChatGptCodexModel {
                 {
                     self.credential.install(&credentials);
                 }
-                self.request_turn(&credentials, messages, tools, options)
-                    .map_err(|error| ModelError::Request(error.to_string()))
+                self.request_turn(&credentials, messages, tools, options, on_event)
+                    .map_err(turn_failure)
             }
-            Err(error) => Err(ModelError::Request(error.to_string())),
+            Err(error) => Err(turn_failure(error)),
         }
+    }
+}
+
+/// Renders a failed turn as the caller's error.
+///
+/// An interruption keeps its own identity all the way out: the caller asked for it, and reporting
+/// it as a request failure would put a cancelled turn in the same bucket as a dead endpoint.
+fn turn_failure(error: ChatGptRequestError) -> ModelError {
+    match error {
+        ChatGptRequestError::Interrupted => ModelError::Interrupted,
+        other => ModelError::Request(other.to_string()),
     }
 }
 
@@ -1049,38 +1060,23 @@ struct PendingCall {
     replayed: bool,
 }
 
-fn parse_sse(reader: impl Read) -> Result<AssistantTurn, ChatGptError> {
-    let mut reader = BufReader::new(reader.take(MAX_RESPONSE_BYTES.saturating_add(1)));
+/// Reads one Responses stream into a turn, reporting visible text as it arrives.
+///
+/// The framing is [`SseReader`]'s; what the events mean is this function's. `on_event` returning
+/// [`ControlFlow::Break`] abandons the stream: returning drops the reader, which drops the body
+/// and closes the connection instead of leaving a half-read response in the pool.
+pub(crate) fn parse_sse(
+    reader: impl Read,
+    on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
+) -> Result<AssistantTurn, ChatGptError> {
+    let mut events = SseReader::new(reader);
     let mut state = StreamState::default();
-    let mut event_data = String::new();
-    let mut bytes_read = 0_u64;
-    // One buffer for the whole stream. A long answer is thousands of small `data:` lines, one per
-    // output-text delta, and a fresh `String` per line is a heap allocation per token.
-    let mut line = String::new();
-    loop {
-        line.clear();
-        let length = reader
-            .read_line(&mut line)
-            .map_err(|source| ChatGptError::Stream { source })?;
-        if length == 0 {
-            process_sse_data(&event_data, &mut state)?;
+    while let Some(event) = events.next_event().map_err(stream_failure)? {
+        let SseEvent::Data(data) = event else {
             break;
-        }
-        bytes_read = bytes_read.saturating_add(length as u64);
-        if bytes_read > MAX_RESPONSE_BYTES {
-            return Err(ChatGptError::Protocol(format!(
-                "ChatGPT response exceeded {MAX_RESPONSE_BYTES} bytes"
-            )));
-        }
-        let line = line.trim_end_matches(['\r', '\n']);
-        if line.is_empty() {
-            process_sse_data(&event_data, &mut state)?;
-            event_data.clear();
-        } else if let Some(data) = line.strip_prefix("data:") {
-            if !event_data.is_empty() {
-                event_data.push('\n');
-            }
-            event_data.push_str(data.trim_start());
+        };
+        if process_sse_data(data, &mut state, on_event)?.is_break() {
+            return Err(ChatGptError::Interrupted);
         }
     }
     if !state.completed {
@@ -1128,10 +1124,21 @@ fn parse_sse(reader: impl Read) -> Result<AssistantTurn, ChatGptError> {
     })
 }
 
-fn process_sse_data(data: &str, state: &mut StreamState) -> Result<(), ChatGptError> {
-    if data.trim().is_empty() || data.trim() == "[DONE]" {
-        return Ok(());
+/// Maps a framing failure onto the errors this transport has always reported for them.
+fn stream_failure(error: SseError) -> ChatGptError {
+    match error {
+        SseError::TooLarge => ChatGptError::Protocol(format!(
+            "ChatGPT response exceeded {MAX_STREAM_BYTES} bytes"
+        )),
+        SseError::Read { source } => ChatGptError::Stream { source },
     }
+}
+
+fn process_sse_data(
+    data: &str,
+    state: &mut StreamState,
+    on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
+) -> Result<ControlFlow<()>, ChatGptError> {
     let event = serde_json::from_str::<Value>(data)
         .map_err(|source| ChatGptError::Protocol(format!("invalid SSE event: {source}")))?;
     let kind = event
@@ -1141,12 +1148,32 @@ fn process_sse_data(data: &str, state: &mut StreamState) -> Result<(), ChatGptEr
     match kind {
         "response.output_item.added" => {
             if let Some(item) = event.get("item") {
+                // The wire numbers output items, not calls; the position this call takes in the
+                // finished turn is the number both backends can answer.
+                let started = state.call_order.len();
                 remember_call(item, state);
+                if state.call_order.len() > started {
+                    let index = u32::try_from(started).unwrap_or(u32::MAX);
+                    if on_event(TurnEvent::ToolCallStarted { index }).is_break() {
+                        return Ok(ControlFlow::Break(()));
+                    }
+                }
             }
         }
         "response.output_text.delta" => {
-            if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+            if let Some(delta) = event
+                .get("delta")
+                .and_then(Value::as_str)
+                .filter(|delta| !delta.is_empty())
+            {
                 state.text.push_str(delta);
+                if on_event(TurnEvent::TextDelta(ModelText::from_model(
+                    delta.to_owned(),
+                )))
+                .is_break()
+                {
+                    return Ok(ControlFlow::Break(()));
+                }
             }
         }
         "response.function_call_arguments.delta" => {
@@ -1201,7 +1228,7 @@ fn process_sse_data(data: &str, state: &mut StreamState) -> Result<(), ChatGptEr
         }
         _ => {}
     }
-    Ok(())
+    Ok(ControlFlow::Continue(()))
 }
 
 fn remember_call(item: &Value, state: &mut StreamState) {
@@ -1746,6 +1773,9 @@ enum ChatGptRequestError {
     Status { status: u16, detail: String },
     #[error("invalid ChatGPT response: {0}")]
     Protocol(String),
+    /// The caller's event callback asked to stop, and the response body was dropped.
+    #[error("ChatGPT turn interrupted by its caller")]
+    Interrupted,
 }
 
 /// Failure while authenticating or using a ChatGPT subscription.
@@ -1846,6 +1876,12 @@ pub enum ChatGptError {
         #[source]
         source: io::Error,
     },
+    /// The caller's event callback asked to stop, and the response body was dropped.
+    ///
+    /// A cancellation rather than a failure, and the one turn outcome that is neither an answer
+    /// nor a problem with the endpoint.
+    #[error("ChatGPT turn interrupted by its caller")]
+    Interrupted,
 }
 
 #[cfg(test)]
@@ -1860,15 +1896,32 @@ mod tests {
 
     use super::{
         AUTH_VERSION, AuthPathEnvironment, ChatGptCodexModel, ChatGptCredentials, ChatGptEndpoints,
-        ChatGptError, CredentialFile, DEFAULT_AUTH_FILE_NAME, OsString, PathBuf, RefreshOutcome,
-        build_request_body, credential_lock_path, export_credentials, exported_path,
-        extract_account_id, load_credentials, login_with_endpoints, logout, parse_sse,
-        save_credentials, status,
+        ChatGptError, ControlFlow, CredentialFile, DEFAULT_AUTH_FILE_NAME, OsString, PathBuf,
+        RefreshOutcome, build_request_body, credential_lock_path, export_credentials,
+        exported_path, extract_account_id, load_credentials, login_with_endpoints, logout,
+        parse_sse, save_credentials, status,
     };
     use crate::{
         mock::{MockResponse, MockServer},
         model::{ChatModel as _, CompletionOptions, ContentPart, ModelMessage, ModelTool},
+        stream::TurnEvent,
     };
+
+    /// The callback for a turn whose deltas are not what the test is about.
+    fn ignored(_event: TurnEvent) -> ControlFlow<()> {
+        ControlFlow::Continue(())
+    }
+
+    /// Every event a turn reported, in order, rendered so a test can assert on them.
+    fn recorded(events: &[TurnEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| match event {
+                TurnEvent::TextDelta(text) => format!("text:{}", text.as_str()),
+                TurnEvent::ToolCallStarted { index } => format!("call:{index}"),
+            })
+            .collect()
+    }
 
     /// Builds the tier set the process would have captured from these exports.
     fn exports(
@@ -2465,12 +2518,15 @@ mod tests {
         .expect("model client");
         let messages = vec![ModelMessage::user("hello")];
 
-        model.complete(&messages, &[]).expect("keyless turn");
         model
-            .complete_with(
+            .complete(&messages, &[], &CompletionOptions::default(), &mut ignored)
+            .expect("keyless turn");
+        model
+            .complete(
                 &messages,
                 &[],
                 &CompletionOptions::default().with_prompt_cache_key("session-7"),
+                &mut ignored,
             )
             .expect("keyed turn");
 
@@ -2496,7 +2552,7 @@ mod tests {
             "data: [DONE]\n\n"
         );
 
-        let turn = parse_sse(stream.as_bytes()).expect("valid response stream");
+        let turn = parse_sse(stream.as_bytes(), &mut ignored).expect("valid response stream");
 
         assert_eq!(turn.tool_calls.len(), 1);
         assert_eq!(turn.tool_calls[0].function.name, "echo_echo");
@@ -2519,13 +2575,104 @@ mod tests {
     }
 
     #[test]
+    fn visible_text_and_tool_calls_are_reported_while_the_turn_is_still_arriving() {
+        // The whole point of streaming: the same turn, with its parts announced as they land.
+        // Reasoning replay items and function-call *arguments* are deliberately absent from the
+        // event stream — they have no variant to travel in.
+        let stream = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Looking\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\" it up\"}\n\n",
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"echo_echo\",\"arguments\":\"\"}}\n\n",
+            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{\\\"message\\\":\\\"hello\\\"}\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"echo_echo\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        let mut events = Vec::new();
+        let mut sink = |event: TurnEvent| -> ControlFlow<()> {
+            events.push(event);
+            ControlFlow::Continue(())
+        };
+
+        let turn = parse_sse(stream.as_bytes(), &mut sink).expect("valid response stream");
+
+        assert_eq!(turn.content.as_deref(), Some("Looking it up"));
+        assert_eq!(
+            turn.tool_calls[0].function.arguments,
+            r#"{"message":"hello"}"#
+        );
+        assert_eq!(
+            recorded(&events),
+            vec!["text:Looking", "text: it up", "call:0"]
+        );
+    }
+
+    #[test]
+    fn a_callback_that_breaks_abandons_the_turn_and_reports_the_interruption() {
+        // Failure path: the caller stopped the turn, so the surfaced cause must say so rather than
+        // reading as a dead endpoint, and nothing after the break may be parsed — the body is
+        // dropped, which is what closes the connection on a live one.
+        let stream = concat!(
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"half an\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\" answer\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+        let mut events = Vec::new();
+        let mut sink = |event: TurnEvent| -> ControlFlow<()> {
+            events.push(event);
+            ControlFlow::Break(())
+        };
+
+        let error = parse_sse(stream.as_bytes(), &mut sink).expect_err("the caller said stop");
+
+        assert!(matches!(error, ChatGptError::Interrupted), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "ChatGPT turn interrupted by its caller",
+            "an interrupted turn must not read as an endpoint failure"
+        );
+        assert_eq!(
+            recorded(&events),
+            vec!["text:half an"],
+            "reading continued past the break"
+        );
+    }
+
+    #[test]
+    fn a_stopped_subscription_turn_is_an_interruption_rather_than_a_request_failure() {
+        let server = MockServer::start(vec![MockResponse::sse(&completion_stream("stopped"))]);
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("auth.json");
+        save_credentials(&path, &credential_fixture("acct-test", "refresh", u64::MAX))
+            .expect("save credentials");
+        let model = ChatGptCodexModel::with_endpoints(
+            "gpt-test",
+            Some(&path),
+            Duration::from_secs(2),
+            ChatGptEndpoints::local(&server.base_url()),
+        )
+        .expect("model client");
+
+        let error = model
+            .complete(
+                &[ModelMessage::user("hello")],
+                &[],
+                &CompletionOptions::default(),
+                &mut |_event: TurnEvent| -> ControlFlow<()> { ControlFlow::Break(()) },
+            )
+            .expect_err("the caller said stop");
+
+        assert_eq!(error, crate::model::ModelError::Interrupted);
+    }
+
+    #[test]
     fn a_usage_free_completion_leaves_usage_absent() {
         let stream = concat!(
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
         );
 
-        let turn = parse_sse(stream.as_bytes()).expect("valid response stream");
+        let turn = parse_sse(stream.as_bytes(), &mut ignored).expect("valid response stream");
 
         assert_eq!(turn.usage, None);
     }
@@ -2611,11 +2758,25 @@ mod tests {
         }];
         let mut messages = vec![ModelMessage::user("echo hello")];
 
-        let tool_turn = model.complete(&messages, &tools).expect("tool turn");
+        let tool_turn = model
+            .complete(
+                &messages,
+                &tools,
+                &CompletionOptions::default(),
+                &mut ignored,
+            )
+            .expect("tool turn");
         assert_eq!(tool_turn.tool_calls[0].id, "call_1");
         messages.push(crate::model::assistant_message(&tool_turn));
         messages.push(ModelMessage::tool("call_1", r#"{"message":"hello"}"#));
-        let answer = model.complete(&messages, &tools).expect("answer turn");
+        let answer = model
+            .complete(
+                &messages,
+                &tools,
+                &CompletionOptions::default(),
+                &mut ignored,
+            )
+            .expect("answer turn");
 
         assert_eq!(answer.content.as_deref(), Some("Echoed hello."));
         let requests = server.requests.lock().expect("request lock");
@@ -2660,7 +2821,12 @@ mod tests {
         .expect("model client");
 
         let turn = model
-            .complete(&[ModelMessage::user("hello")], &[])
+            .complete(
+                &[ModelMessage::user("hello")],
+                &[],
+                &CompletionOptions::default(),
+                &mut ignored,
+            )
             .expect("model turn");
 
         assert_eq!(turn.content.as_deref(), Some("refreshed"));
@@ -2722,7 +2888,12 @@ mod tests {
         .expect("another process completes its refresh");
 
         let turn = model
-            .complete(&[ModelMessage::user("hello")], &[])
+            .complete(
+                &[ModelMessage::user("hello")],
+                &[],
+                &CompletionOptions::default(),
+                &mut ignored,
+            )
             .expect("the adopted credential must serve the turn");
 
         assert_eq!(turn.content.as_deref(), Some("adopted"));
@@ -2779,7 +2950,12 @@ mod tests {
         .expect("another process completes its refresh");
 
         let turn = model
-            .complete(&[ModelMessage::user("hello")], &[])
+            .complete(
+                &[ModelMessage::user("hello")],
+                &[],
+                &CompletionOptions::default(),
+                &mut ignored,
+            )
             .expect("the retry must use the adopted credential");
 
         assert_eq!(turn.content.as_deref(), Some("retried"));
@@ -2822,7 +2998,12 @@ mod tests {
 
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o500))
             .expect("make the credential directory unwritable");
-        let turn = model.complete(&[ModelMessage::user("hello")], &[]);
+        let turn = model.complete(
+            &[ModelMessage::user("hello")],
+            &[],
+            &CompletionOptions::default(),
+            &mut ignored,
+        );
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
             .expect("restore the credential directory");
 
@@ -2915,7 +3096,12 @@ mod tests {
         .expect("model client");
 
         let error = model
-            .complete(&[ModelMessage::user("hello")], &[])
+            .complete(
+                &[ModelMessage::user("hello")],
+                &[],
+                &CompletionOptions::default(),
+                &mut ignored,
+            )
             .expect_err("a rejected refresh must fail the turn");
 
         let message = error.to_string();
@@ -3000,7 +3186,12 @@ mod tests {
         .expect("model client");
 
         let turn = model
-            .complete(&[ModelMessage::user("hello")], &[])
+            .complete(
+                &[ModelMessage::user("hello")],
+                &[],
+                &CompletionOptions::default(),
+                &mut ignored,
+            )
             .expect("model turn");
 
         assert_eq!(turn.content.as_deref(), Some("hello"));

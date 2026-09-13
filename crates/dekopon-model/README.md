@@ -2,8 +2,14 @@
 
 `dekopon-model` contains Dekopon's bounded model-client boundary:
 
-- the generic `ChatModel` request/response contract;
-- an OpenAI-compatible Chat Completions client;
+- the generic `ChatModel` request/response contract, whose one method reports a turn's visible text
+  through a caller-supplied callback while the turn is still arriving, and stops the turn when that
+  callback says to;
+- `ModelText`, the only container model-authored visible text travels in, which nothing outside this
+  crate can fill;
+- one Server-Sent Events reader, bounded at 16 MiB, shared by both transports;
+- an OpenAI-compatible Chat Completions client, streaming by default and tolerant of what
+  "compatible" endpoints actually send;
 - native ChatGPT/Codex subscription device authentication, token refresh, and Responses streaming;
 - `chatgpt::CredentialFile`, the one implementation of "use the credential at this path": the
   cross-process advisory lock, the adoption of a newer record another process wrote, the refresh
