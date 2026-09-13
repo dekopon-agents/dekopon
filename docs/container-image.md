@@ -26,7 +26,7 @@ that one image with two `command`s does not.
 |---|---|
 | `/usr/local/bin/dekopon-brokerd` | Authenticated local capability broker |
 | `/usr/local/bin/dekopond` | Unprivileged chat gateway |
-| `/opt/dekopon/providers/*.wasm` | One in-tree conformance fixture plus exact pinned standalone Echo, JSONPlaceholder, and GitHub releases |
+| `/opt/dekopon/providers/*.wasm` | The in-tree `cli-probe` and `http-probe` fixtures plus exact pinned standalone JSONPlaceholder and GitHub releases |
 | `/opt/dekopon/optional-providers/memory-chat-provider.wasm` | Exact pinned standalone durable-memory release; never in the default scan |
 | `/usr/share/doc/dekopon/` | `LICENSE-APACHE`, `LICENSE-MIT` |
 
@@ -80,10 +80,10 @@ updating.
 
 ## Baked provider components
 
-Core retains `http-probe` as a checked conformance fixture. Echo, JSONPlaceholder, and memory-chat
-are fetched from their standalone immutable v0.1.0 releases by
-`ci/fetch-external-provider-components.sh`; the script requires the checksum and size pinned in core,
-and image staging additionally verifies GitHub attestations. The GitHub provider follows its own
+Core retains `cli-probe` and `http-probe` as checked conformance fixtures. JSONPlaceholder and
+memory-chat are fetched from their standalone immutable releases by
+`ci/fetch-external-provider-components.sh`; the script requires the release tag, checksum, and size
+pinned in core, and image staging additionally verifies GitHub attestations. The GitHub provider follows its own
 pinned standalone-release path. Docker build remains network-free because every download and
 verification happens while constructing the context.
 
@@ -99,7 +99,7 @@ The `COPY` that places them uses `--chown` and no `--chmod`, because BuildKit ap
 the directories it creates as well and a `0644` directory cannot be traversed. The components keep
 the mode they carry in the staged context, which the staging script normalises to `0644`.
 
-The fetched `echo-provider.wasm` is import-free. The other default components import HTTP,
+The in-tree `cli-probe-provider.wasm` is import-free. The other default components import HTTP,
 and fetched optional `memory-chat` imports JSONL. All are loaded only through the broker,
 whose exact grants and independent ceilings constrain every invocation.
 Memory lives outside `/opt/dekopon/providers`, so a default directory scan cannot silently enable
@@ -125,7 +125,7 @@ ci/verify-image-broker.sh ghcr.io/dekopon-agents/dekopon:<VERSION>
 ```
 
 The Linux verifier requires Docker, Python 3 and sudo to create broker-owned private files.
-It starts the real broker with the baked echo component and waits under a deadline for the
+It starts the real broker with the baked `cli-probe` component and waits under a deadline for the
 socket, which is bound only after compilation and description succeed, then runs
 `dekopon-brokerd probe` when the image's binary offers that subcommand. Owned containers and
 private files are removed on exit. This proves the selected release's bytes, not a build of

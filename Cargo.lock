@@ -1057,7 +1057,6 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.20",
  "wasmtime",
- "wit-bindgen 0.62.0",
 ]
 
 [[package]]

@@ -2,13 +2,13 @@ use std::{collections::BTreeMap, future::Future, io, sync::Arc, time::Duration};
 
 use dekopon_broker::{AttestorGrant, AuditLog, AuthenticatedContext, Broker, BrokerError};
 use dekopon_broker_protocol::{
-    Attestation, BrokerRequest, ERROR_BROKER_UNAVAILABLE, ERROR_CAPACITY_EXHAUSTED,
-    ERROR_INVALID_REQUEST, ERROR_OUTCOME_UNAUDITED, ERROR_PROVIDER, ERROR_UNAUTHENTICATED,
-    FrameLimits, InvocationRequest, ProtocolError, RequestEnvelope, ResponseEnvelope, TraceParent,
-    read_frame, write_frame,
+    Attestation, BrokerRequest, CommandRunOutcome, ERROR_BROKER_UNAVAILABLE,
+    ERROR_CAPACITY_EXHAUSTED, ERROR_INVALID_REQUEST, ERROR_OUTCOME_UNAUDITED, ERROR_PROVIDER,
+    ERROR_UNAUTHENTICATED, FrameLimits, InvocationRequest, ProtocolError, RequestEnvelope,
+    ResponseEnvelope, TraceParent, read_frame, write_frame,
 };
 use dekopon_core::{
-    ACCEPT_BACKOFF_MS, InvocationId, MAX_ACCEPT_BACKOFF_MS, TraceId, retryable_accept_error,
+    ACCEPT_BACKOFF_MS, InvocationId, MAX_ACCEPT_BACKOFF_MS, retryable_accept_error,
 };
 use dekopon_telemetry::TraceContextParts;
 use thiserror::Error;
@@ -22,10 +22,6 @@ use tracing::Instrument as _;
 use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 
 use crate::config::HARD_MAX_CONNECTIONS;
-
-pub(crate) fn storage_invocation_span(invocation: &InvocationId, trace: TraceId) -> tracing::Span {
-    tracing::info_span!("broker.invocation", invocation = %invocation, trace = %trace)
-}
 
 /// One mapped peer: its trusted transport context and optional attestor authority.
 ///
@@ -277,16 +273,12 @@ async fn refuse_invalid_claim(
 
 /// The invocation span, carrying the attested subject and agent only when a claim named them.
 ///
-/// A storage-routed proposal drops the capability as well, because the chat-memory routes make the
-/// capability identifier itself a statement about the sender.
+/// A storage-backed proposal opens the same span as any other: nothing a non-storage span records
+/// is withheld because the capability happens to keep durable state.
 fn invocation_span(
     request: &InvocationRequest,
     attestation: Option<&Attestation>,
-    storage: bool,
 ) -> tracing::Span {
-    if storage {
-        return storage_invocation_span(&request.id, request.trace_parent.trace());
-    }
     match attestation {
         Some(claim) => tracing::info_span!(
             "broker.invocation",
@@ -302,6 +294,17 @@ fn invocation_span(
             capability = %request.capability,
             trace = %request.trace_parent.trace(),
         ),
+    }
+}
+
+/// The stable `outcome` a `broker.command_run` span records for what the guest answered.
+///
+/// `error` — the fourth value — is recorded where the run produced no answer at all.
+const fn command_run_outcome(outcome: &CommandRunOutcome) -> &'static str {
+    match outcome {
+        CommandRunOutcome::Proposed { .. } => "proposed",
+        CommandRunOutcome::Rendered { .. } => "rendered",
+        CommandRunOutcome::Failed { .. } => "failed",
     }
 }
 
@@ -390,6 +393,7 @@ where
         }
         BrokerRequest::RunCommand {
             attestation,
+            trace_parent,
             word,
             argv,
             stdin,
@@ -397,6 +401,14 @@ where
             if !claim_is_valid(attestation.as_ref(), None) {
                 return refuse_invalid_claim(&mut stream, limits).await;
             }
+            // Joined to the client's trace so the word, and the proposal the caller submits next,
+            // are one run in the operator's trace rather than two unrelated roots.
+            let span = tracing::info_span!(
+                "broker.command_run",
+                word = %word,
+                outcome = tracing::field::Empty,
+            );
+            adopt_trace_parent(&span, trace_parent);
             match broker
                 .run_command(
                     context,
@@ -406,15 +418,21 @@ where
                     &argv,
                     stdin.as_deref(),
                 )
+                .instrument(span.clone())
                 .await
             {
                 // Whatever the guest answered travels intact: a proposal the caller submits next,
                 // text the guest rendered with the status it chose, or its own decline.
-                Ok(result) => ResponseEnvelope::command_run(result),
+                Ok(result) => {
+                    span.record("outcome", command_run_outcome(&result));
+                    ResponseEnvelope::command_run(result)
+                }
                 // Everything else — no such word, a trap, an input past the host bound, a host
-                // import — is the one opaque answer, with the cause recorded on this side.
+                // import — is the one opaque answer, with the cause recorded on this side, inside
+                // the run's own span so the trace names why the word stopped.
                 Err(error) => {
-                    report_command_run_failure(&word, &error);
+                    span.record("outcome", "error");
+                    span.in_scope(|| report_command_run_failure(&word, &error));
                     ResponseEnvelope::error(ERROR_PROVIDER, "command word could not be run")
                 }
             }
@@ -428,14 +446,9 @@ where
             if !claim_is_valid(attestation.as_ref(), Some(&invocation.id)) {
                 return refuse_invalid_claim(&mut stream, limits).await;
             }
-            // Correlation identifiers only. Input, output, and every provider-facing value stay
-            // out of this span for the same reason they stay out of audit records: telemetry is a
-            // second egress path and must not carry what the audit log deliberately redacts.
-            let span = invocation_span(
-                &invocation,
-                attestation.as_ref(),
-                broker.capability_uses_storage(&invocation.capability),
-            );
+            // Correlation identifiers only: the proposal's input is recorded once, on the
+            // `broker.authorize` span beneath this one.
+            let span = invocation_span(&invocation, attestation.as_ref());
             adopt_trace_parent(&span, invocation.trace_parent);
             match broker
                 .invoke(
@@ -461,7 +474,15 @@ where
             {
                 return refuse_invalid_claim(&mut stream, limits).await;
             }
-            let span = storage_invocation_span(&turn.id, turn.trace_parent.trace());
+            // The same span an attested invocation opens. The broker names the record capability
+            // from its own route, so `broker.authorize` beneath this span carries it and the turn.
+            let span = tracing::info_span!(
+                "broker.invocation",
+                invocation = %turn.id,
+                trace = %turn.trace_parent.trace(),
+                subject = %attestation.subject,
+                agent = %attestation.agent,
+            );
             adopt_trace_parent(&span, turn.trace_parent);
             match broker
                 .record_delivered_turn(context, peer.attestor.as_ref(), &attestation, turn)

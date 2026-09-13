@@ -63,14 +63,16 @@ The reusable agent session layer consumed by `dekopond` and external embeddings 
   snapshot also supplies trusted effect and risk metadata for self-inspection,
   never policy source, identity, constraints, or credentials. Each provider command word
   it runs is one cancellable `broker-command` process node around the `runCommand` round
-  trip; `BrokerLeg::with_cancel_signal` ties those runs to an embedder's cancellation (the
+  trip, which carries the calling script span's W3C trace parent exactly as an invocation does;
+  `BrokerLeg::with_cancel_signal` ties those runs to an embedder's cancellation (the
   gateway's Stop), and without it they are cancellable in contract only. A transport
   failure reaches the script as `CommandRun::Errored` naming its cause, and a cancelled run
   as `CommandRun::Denied { "session-cancelled" }`. The same signal read synchronously refuses a
   capability call the script starts *after* the Stop, with the same reason and before any proposal
   exists; that is a cooperative boundary rather than a refusal decision, which stays the broker's.
 - `command_run_from_outcome` and `report_unobserved_command_run` — the one mapping from
-  a provider's `CommandRunOutcome` onto the shell's `CommandRun`, and the one
+  a provider's `CommandRunOutcome` onto the shell's `CommandRun`, carrying any secret use the
+  provider's proposal names through to the broker-only invocation path, and the one
   `agent.command.unobserved` record for a run whose caller was dropped, shared by the
   broker leg and external embeddings.
 - `IdSequence` — one session's W3C trace and the collision-free invocation identifiers that
@@ -165,8 +167,9 @@ model's capability seam.
 
 The `bash` tool requires an object carrying a string `script`; malformed arguments end the
 session rather than being guessed at. Its result is combined script output followed by an
-`[exit code: N]` trailer. `cap --list` and `cap --describe` discover the granted surface;
-provider-specific argument validation remains provider-owned.
+`[exit code: N]` trailer. `cap --list` shows the capability identifiers the session was granted,
+and each provider command word documents itself through `<word> --help`; argument parsing and
+validation are provider-owned.
 
 Each model turn admits at most ten tool calls, and the model-step limit bounds the session.
 The capability-call ceiling is spent across the whole session, not refreshed per script.

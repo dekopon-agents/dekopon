@@ -269,7 +269,7 @@ impl Word {
     ///
     /// `x=$(cmd)` preserves the command's structured value instead of coercing it to text. This is
     /// a deliberate, documented deviation from bash, where `$()` is always textual; it is what lets
-    /// `ip=$(curl ...)` be followed by `echo ${ip[origin]}`.
+    /// `issue=$(gh issue view 12)` be followed by `echo ${issue[title]}`.
     #[must_use]
     #[cfg(test)]
     pub(crate) fn is_bare_command_substitution(&self) -> bool {

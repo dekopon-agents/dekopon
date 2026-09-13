@@ -112,21 +112,22 @@ Two things stop working:
   `Provider::run_command`; the `provider-commands` world and its `resolve-command` export stay in
   the published `0.3.0` package text — published versions are immutable — but nothing calls them.
 
-A component that exports only `describe` and `invoke`, including every one built against
-`dekopon:provider@0.1.0`, is unaffected: that world is unchanged and those components keep loading.
+A component that exports only `describe` and `invoke` no longer loads either, whatever SDK built it:
+0.15.0 also [refuses a provider with capabilities and no command word](#providers-run-on-argv-only-0150-unreleased).
 
-Every provider released from the `dekopon-agents` organization already satisfies this: `gh` 0.3.0,
-`curl` 0.2.0, `turso-sql` 0.2.0, `memory-chat` 0.2.0, `mediawiki` 0.2.0, `echo` 0.2.0,
-`jsonplaceholder` 0.2.0, `ripgrep` 0.2.0, `python` 0.2.0, `skylight-private` 0.2.0, `gpt-image`
-0.1.0, and `openobserve` 0.1.0. Pin those versions, or later ones. A provider you build yourself
-must be rebuilt on the 0.13.0 SDK the same way.
+`gh` 0.3.0, `curl` 0.2.0, `turso-sql` 0.2.0, `memory-chat` 0.2.0, `gpt-image` 0.1.0, and
+`openobserve` 0.1.0 satisfy both rules; pin those versions or later ones. `mediawiki`,
+`jsonplaceholder`, `ripgrep`, `python`, and `skylight-private` 0.2.0 are built on the 0.13.0 SDK and
+declare no word; their 0.3.0 releases declare `wikipedia`, `placeholder`, `rg`, `python`, and
+`skylight`, so pin 0.3.0 or later. `echo` is retired, and no release of it
+declares one. A provider you build yourself must be rebuilt on the 0.13.0 SDK the same way.
 
 Embedders lose the machinery with it:
 
 - `dekopon_provider_sdk::Provider::resolve_command`, `CommandResolution`,
   `export_provider_with_commands!`, and `host::RESOLVE_COMMAND_EXPORT` are gone.
-  `Provider::run_command` no longer has a default that delegates to the rewrite — its default
-  refuses, which is correct for a provider declaring no command words.
+  `Provider::run_command` no longer has a default that delegates to the rewrite, or any default:
+  every provider implements it.
 - `host::CommandExport` collapsed to `Present` / `Absent` / `Mismatched { found }`: there is one
   command export, so the variant no longer carries which name was found, and neither does
   `host::CommandExportProblem::Mismatched` or
@@ -137,6 +138,98 @@ Embedders lose the machinery with it:
   and `BrokerResponse::CommandResolution` no longer exist, and a broker answers the operation tag
   with `invalid-request`. It was kept for one release for a client predating `runCommand`; no
   in-tree client has sent it since 0.13.0. Send `runCommand` and match the `CommandRunOutcome`.
+
+## Providers run on argv only (0.15.0, unreleased)
+
+**Breaking.** A script reaches a provider only through that provider's command word, and the broker
+refuses to start with a provider that declares capabilities and no word. There is no shim, no dual
+path, and no deprecation window.
+
+Four things stop working:
+
+- **Bare capability words.** `wikipedia_page --title X` and `cli-probe.upper --text x` are ordinary
+  unknown commands: exit 127, `command not found`, whether or not the session holds the capability.
+  The shell no longer rewrites `--kebab-case` flags into a camelCase JSON object. A provider parses
+  its own argv, so nothing sits between the flag the model typed and the field the provider reads.
+- **Invoking through `cap`.** `cap <id> …`, with flags or a raw `{json}` object, is a usage error at
+  exit 2. `cap --list` (`-l`) prints the capability identifiers the session was granted, and
+  `cap --describe <id>` (`-d`) prints the identifier and its description, without `inputSchema`. A
+  word's `--help` documents its arguments.
+- **The shell `curl` builtin.** `curl` is `command not found` until a provider claims the word, and
+  DRN use moved to provider commands ([`secrets.md`](secrets.md#agent-syntax)). No released provider
+  proposes a DRN yet.
+- **A word-less provider.** Startup names every provider whose manifest has capabilities and an
+  empty `commandWords` in one error, beside any other provider-set conflict. This reverses the 0.13.0
+  promise that describe/invoke-only components keep loading: a component built on the
+  `dekopon:provider@0.1.0` or `0.2.0` base world has no `run-command` export and cannot declare a
+  word.
+
+Capability identifiers, Cedar policy, constraint sets, and constraint-set `credential:` injection
+are unchanged. `probe upper --text hello` authorizes as `cli-probe.upper`.
+
+### Operator steps
+
+1. **Re-pin every provider to a release that declares a command word, before upgrading the
+   broker.** [The rebuild section above](#rebuild-every-provider-component-on-the-0130-sdk-0140)
+   lists which fleet releases do.
+2. **Remove echo.** The container image no longer carries `/opt/dekopon/providers/echo-provider.wasm`
+   and `ci/fetch-external-provider-components.sh` no longer fetches it, so a `providers:` entry naming
+   it refuses startup. Delete that entry, every `echo.*` constraint set, and every Cedar statement
+   naming an `echo.*` action or `Dekopon::Provider::"echo"`. The image's no-network default and the
+   chart's default inline configuration are now the in-tree `cli-probe`: word `probe`, capabilities
+   `cli-probe.upper`, `cli-probe.count`, and `cli-probe.reverse`.
+3. **Rewrite agent `instructions` and skills that teach the old forms.** Search them for `$(name.`,
+   `cap --describe`, `cap <id>`, capability identifiers used as words (`wikipedia_`,
+   `gh.pull-request.`), and `curl`, and point the model at the provider's own `<word> --help`. A
+   skill still teaching `wikipedia_page --title` gets exit 127 on every call.
+4. **Upgrade both daemons together.** `runCommand` now requires a `traceParent`, and both envelopes
+   are strict-decoded: a 0.14.0 `dekopond` against a 0.15.0 broker has every command word refused
+   `invalid-request`, and a 0.15.0 `dekopond` against a 0.14.0 broker fails the same way. The
+   protocol version stays `dekopon.dev/broker/v1alpha2`, so nothing earlier in the connection says
+   so.
+5. **Re-point telemetry queries, and size retention for what the trace now holds.**
+   - `shell.command.kind` loses `capability` and `not-granted`: a provider word is
+     `provider-command`, and a capability-shaped word is `not-found`.
+   - `shell.command` and `provider.run_command` carry the arguments, the piped value, and the
+     output, each up to 4096 bytes plus `…[truncated]`, beside a `.bytes` total. A loop exports
+     every iteration's.
+   - `broker.command_run` is a new span per `runCommand`
+     ([`observability.md`](observability.md#broker-execution-spans)).
+   - Storage-backed spans and audit records carry the subject, agent, capability, provider, policy
+     fields, and `input` every other invocation does, and storage evidence carries exact `readBytes`
+     and `writeBytes`. Whose conversation a chat-memory call read is now in the telemetry store,
+     which was always inside the operator's boundary.
+
+### Provider-author steps
+
+1. **Build on `dekopon-provider-sdk` 0.13.0 or later against the `provider-cli` world**
+   (`include dekopon:provider/provider-cli@0.3.0;`) and export with `export_provider_with_cli!`. The
+   0.15.0 SDK deletes `export_provider!` and `export_provider_with_bindings!`.
+2. **Declare a command word** in the manifest's `command_words`. It may not be a word the shell owns
+   (`dekopon_core::RESERVED_COMMAND_WORDS`, which no longer holds `curl`) or another loaded
+   provider's word; either is a startup conflict. A provider whose capabilities only a gateway route
+   reaches, such as chat memory's record route, still needs one.
+3. **Implement `Provider::run_command`**, which the 0.15.0 SDK requires. Parse argv — the SDK's
+   `clap` feature maps a `clap::Command` tree — build the JSON your `invoke` already accepts, and
+   return `CommandRun::proposal(capability, input)`. Render `--help` and usage errors yourself as
+   `CommandRun::Rendered`. `stdin` is the piped value's display text. Flags are yours to spell:
+   nothing rewrites them on the way in.
+4. **To offer a secret**, return a `CommandInvocation` whose `secret_use` names the DRN the argv
+   carried, as `SecretUseProposal::HttpBearer { secret }` or `HttpBasic { secret, username }`. That
+   needs the 0.15.0 SDK. On the wire it is `secretUse`, absent when `None`, so a 0.13.0 provider's
+   output is unchanged. The provider never receives the material; the broker authorizes the use as
+   [`secrets.md`](secrets.md#two-independent-policies) describes.
+5. **Rebuild, release, and re-pin.**
+
+### Embedders
+
+- `BrokerClient::run_command` and `RequestEnvelope::run_command` take a `TraceParent`: pass the one
+  the calling span carries, as `invoke` does.
+- `CommandInvocation`, `CommandRunOutcome::Proposed`, and `dekopon-shell`'s `CommandRun::Proposed`
+  gain `secret_use`; a struct literal or exhaustive pattern has to name it.
+- `CapabilityInvoker::grants_namespace` and the shell's `curl_capability` plumbing are gone.
+- `dekopon_core::bounded_attribute` and `MAX_ATTRIBUTE_BYTES` are the span-attribute bound the shell
+  and the broker host share.
 
 ## Telemetry payloads (0.13.0)
 
@@ -277,9 +370,10 @@ socket:
 could not instantiate broker provider component <path>: component imports instance `dekopon:clock/wall@1.0.0`, but a matching implementation was not found in the linker
 ```
 
-Upgrade the broker before installing such a provider. Components that do not import the clock,
-including every provider built against `dekopon:provider@0.1.0` through `0.3.0`, load unchanged. A
-provider that reads the clock outside `invoke` — from `describe` or `run-command` — now fails that
+Upgrade the broker before installing such a provider. Components that do not import the clock load
+unchanged on this release; from 0.15.0 a component also needs
+[a command word](#providers-run-on-argv-only-0150-unreleased). A provider that reads the clock
+outside `invoke` — from `describe` or `run-command` — now fails that
 call as `DescribeUsedHostImport` or `RunCommandUsedHostImport`.
 
 ## Provider storage direct-write contract

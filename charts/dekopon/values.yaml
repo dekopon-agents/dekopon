@@ -104,7 +104,7 @@ broker:
   # The chart never parses or generates these files. Their formats are documented in
   # crates/dekopon-brokerd/README.md, and examples/conditional-write/ is a working set.
   config:
-    # Chart default: the echo example from crates/dekopon-brokerd/README.md, repointed at the
+    # Chart default: the cli-probe example from crates/dekopon-brokerd/README.md, repointed at the
     # chart's paths. It is a real, deny-by-default configuration that starts and authorizes
     # exactly one read-only capability for this pod's own UID — a broker you can install and
     # watch become ready before you give it anything that matters. Replace it.
@@ -115,7 +115,7 @@ broker:
       policyRevision: chart-default
       policiesPath: /etc/dekopon/policies.cedar
       providers:
-        - /opt/dekopon/providers/echo-provider.wasm
+        - /opt/dekopon/providers/cli-probe-provider.wasm
       identities:
         # Broker-owned probes use this identity; gateway deployments map UID 65533 separately.
         - uid: 65532
@@ -124,8 +124,8 @@ broker:
             type: service
             principal: dekopon-pod
       constraintSets:
-        echo.echo:
-          provider: echo
+        cli-probe.upper:
+          provider: cli-probe
           effect: read-only
           risk: Low
           constraints:
@@ -154,10 +154,10 @@ broker:
   # configured. An @id("…") annotation is what audit records carry as policy_ids.
   policies:
     inline: |
-      @id("pod-echo")
+      @id("pod-probe")
       permit(principal == Dekopon::Principal::"dekopon-pod",
-             action == Dekopon::Action::"echo.echo",
-             resource == Dekopon::Provider::"echo")
+             action == Dekopon::Action::"cli-probe.upper",
+             resource == Dekopon::Provider::"cli-probe")
       unless { context has via };
     existingSecret: ""
     existingSecretKey: policies.cedar

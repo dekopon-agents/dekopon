@@ -194,6 +194,7 @@ fn dispatch(
     Ok(CommandInvocation {
         capability: capability.parse().expect("static capability ID"),
         input: json!({"text": text}),
+        secret_use: None,
     })
 }
 
@@ -376,6 +377,7 @@ Options:\n\
             CommandRun::Proposal(CommandInvocation {
                 capability: "cli-probe.reverse".parse().expect("static capability"),
                 input: json!({"text": "abc"}),
+                secret_use: None,
             })
         );
     }

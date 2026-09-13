@@ -1,10 +1,11 @@
 //! Rust guest interface for Dekopon provider components.
 //!
-//! Provider authors implement [`Provider`] using ordinary domain types. [`export_provider!`]
-//! supplies the JSON-over-WIT adapter consumed by component hosts. A provider that
-//! contributes command words to the sandboxed shell implements [`Provider::run_command`] and
-//! exports through [`export_provider_with_cli!`], so `gh --help` renders a page and `gh pr view 7`
-//! proposes a capability.
+//! Provider authors implement [`Provider`] using ordinary domain types and export it through
+//! [`export_provider_with_cli!`], which supplies the JSON-over-WIT adapter component hosts call.
+//! A model reaches a provider only through the command words it declares: `gh --help` renders a
+//! page, and `gh pr view 7` proposes a capability the broker then authorizes. A host refuses to
+//! start with a provider that declares capabilities and no command word, since nothing could reach
+//! them.
 //!
 //! Hand-rolled argv handling — matching on slices and shifting values out by hand — is the
 //! baseline contract every command-line provider can rely on. The optional `clap` feature adds
@@ -21,7 +22,7 @@
 use std::fmt;
 
 pub use dekopon_capability::EffectKind;
-pub use dekopon_core::{CapabilityId, ProviderId, RiskLevel};
+pub use dekopon_core::{CapabilityId, ProviderId, RiskLevel, SecretDrn, SecretUseProposal};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -58,13 +59,14 @@ pub struct ProviderManifest {
     pub capabilities: Vec<ProviderCapability>,
     /// Command words this provider contributes to the sandboxed shell.
     ///
-    /// Each is a bare word a model may type, run through [`Provider::run_command`]. A manifest
-    /// that declares one without the component exporting `run-command` is refused at load, and a
-    /// word colliding with a shell builtin, a refused word, a control word, or another provider's
-    /// is a startup failure naming every conflict at once.
+    /// Each is a bare word a model may type, run through [`Provider::run_command`], and together
+    /// they are the only way a model reaches this provider's capabilities. A manifest that declares
+    /// capabilities and no word, or a word without the component exporting `run-command`, is
+    /// refused at load, and a word colliding with a shell builtin, a refused word, a control word,
+    /// or another provider's is a startup failure naming every conflict at once.
     ///
-    /// Defaulted so a component built against `dekopon:provider@0.1.0` still loads, contributing
-    /// none.
+    /// Defaulted so a manifest omitting the field still decodes and is refused by name in that
+    /// startup report, rather than as an undecodable manifest.
     #[serde(default)]
     pub command_words: Vec<String>,
 }
@@ -99,31 +101,23 @@ pub trait Provider {
 
     /// Runs one command word's argv the way the upstream command-line tool would.
     ///
-    /// This is where a provider implements the ergonomic spelling of its own capabilities —
-    /// `gh pr view 7 -R owner/repo` becoming `gh.pull-request.read` with a typed input. The command
-    /// word is selected before this call; `argv` contains only the arguments after it.
+    /// This is how a model reaches the provider: `gh pr view 7 -R owner/repo` becoming
+    /// `gh.pull-request.read` with a typed input. The command word is selected before this call;
+    /// `argv` contains only the arguments after it.
     ///
-    /// A [`CommandRun::Proposal`] is **pure and grants nothing**: it is authorized on exactly the
-    /// path a direct `cap <id> {…}` call takes — constraint-set lookup, Cedar evaluation,
-    /// credential injection at the native HTTP boundary — so naming a capability the caller was
-    /// not granted produces a denial, not an escalation. `--help`, `--version`, and usage errors
-    /// come back as [`CommandRun::Rendered`] text with an exit status, printed by the shell and
-    /// authorizing nothing. A decline is `Err(ProviderError)`, reported to the model as a usage
-    /// error.
+    /// A [`CommandRun::Proposal`] is **pure and grants nothing**: it is authorized on the path every
+    /// capability takes — constraint-set lookup, Cedar evaluation, credential injection at the
+    /// native HTTP boundary — so naming a capability the caller was not granted produces a denial,
+    /// not an escalation. A proposal may also name one secret use
+    /// ([`CommandInvocation::secret_use`]), which the broker authorizes like any other; the secret
+    /// it names never reaches the provider. `--help`, `--version`, and usage errors come back as
+    /// [`CommandRun::Rendered`] text with an exit status, printed by the shell and authorizing
+    /// nothing. A decline is `Err(ProviderError)`, reported to the model as a usage error.
     ///
     /// `stdin` is the value piped into the word, `None` when nothing was piped. The run happens
     /// before authorization, so it must not depend on host imports; a host may refuse a component
     /// that touches one here.
-    ///
-    /// The default refuses, which is correct for the majority of providers: one that declares no
-    /// command words can never be asked.
-    fn run_command(argv: &[String], stdin: Option<&str>) -> Result<CommandRun, ProviderError> {
-        let _ = (argv, stdin);
-        Err(ProviderError::new(
-            "unsupported-command",
-            "this provider declares no command words",
-        ))
-    }
+    fn run_command(argv: &[String], stdin: Option<&str>) -> Result<CommandRun, ProviderError>;
 }
 
 /// One capability proposal produced by [`Provider::run_command`].
@@ -133,6 +127,12 @@ pub struct CommandInvocation {
     pub capability: CapabilityId,
     /// The input object assembled from the arguments.
     pub input: Value,
+    /// The one secret use the proposal asks the broker to authorize beside the capability.
+    ///
+    /// A public DRN and the native sink to render it in, such as an HTTP `Authorization` header.
+    /// It is untrusted intent rather than authority: the broker authorizes it separately and
+    /// matches an owner-authored use binding, and the provider never receives the secret.
+    pub secret_use: Option<SecretUseProposal>,
 }
 
 /// What one command-word run produced, from [`Provider::run_command`].
@@ -156,10 +156,15 @@ pub enum CommandRun {
 }
 
 impl CommandRun {
-    /// A capability proposal for `capability` with `input` assembled from the arguments.
+    /// A capability proposal for `capability` with `input` assembled from the arguments, naming
+    /// no secret use.
     #[must_use]
     pub fn proposal(capability: CapabilityId, input: Value) -> Self {
-        Self::Proposal(CommandInvocation { capability, input })
+        Self::Proposal(CommandInvocation {
+            capability,
+            input,
+            secret_use: None,
+        })
     }
 
     /// Text on standard output with an exit status and nothing on standard error: a help page,
@@ -259,6 +264,10 @@ pub enum CommandRunOutcome {
         capability: CapabilityId,
         /// Input object assembled from the arguments.
         input: Value,
+        /// Secret use the proposal names, under the wire key `secretUse`; absent when it names
+        /// none, so a proposal without one keeps its earlier shape.
+        #[serde(rename = "secretUse", default, skip_serializing_if = "Option::is_none")]
+        secret_use: Option<SecretUseProposal>,
     },
     /// The guest answered by itself, as a command-line program prints and exits.
     Rendered {
@@ -274,15 +283,6 @@ pub enum CommandRunOutcome {
         /// Stable failure detail, reported to the model as a usage error.
         error: ComponentFailure,
     },
-}
-
-#[doc(hidden)]
-pub mod __wit {
-    wit_bindgen::generate!({
-        path: "wit",
-        world: "provider",
-        pub_export_macro: true,
-    });
 }
 
 /// Last-resort [`ComponentResponse`] when the real one cannot be serialized.
@@ -356,6 +356,7 @@ pub fn __run_command<P: Provider>(argv: Vec<String>, stdin: Option<String>) -> S
         Ok(CommandRun::Proposal(invocation)) => CommandRunOutcome::Proposed {
             capability: invocation.capability,
             input: invocation.input,
+            secret_use: invocation.secret_use,
         },
         Ok(CommandRun::Rendered {
             stdout,
@@ -377,70 +378,13 @@ pub fn __run_command<P: Provider>(argv: Vec<String>, stdin: Option<String>) -> S
     serde_json::to_string(&outcome).unwrap_or_else(|_error| RUN_SERIALIZATION_FALLBACK.to_owned())
 }
 
-/// Exports a Rust [`Provider`] implementation as the import-free Dekopon WIT world.
+/// Exports a [`Provider`] through caller-generated bindings: `describe`, `invoke`, and the
+/// `run-command` export its command words run through.
 ///
-/// Provider crates with additional imports use [`export_provider_with_bindings!`] instead.
-#[macro_export]
-macro_rules! export_provider {
-    ($provider:ty) => {
-        struct __DekoponProviderComponent;
-
-        impl $crate::__wit::Guest for __DekoponProviderComponent {
-            fn describe() -> ::std::string::String {
-                $crate::__describe::<$provider>()
-            }
-
-            fn invoke(
-                capability: ::std::string::String,
-                input_json: ::std::string::String,
-            ) -> ::std::string::String {
-                $crate::__invoke::<$provider>(capability, input_json)
-            }
-        }
-
-        $crate::__wit::export!(
-            __DekoponProviderComponent with_types_in $crate::__wit
-        );
-    };
-}
-
-/// Exports a Rust [`Provider`] implementation through caller-generated world bindings.
-///
-/// The bindings module must be an identifier that describes a world with the same root `describe`
-/// and `invoke` exports. It may add explicitly versioned imports such as
-/// `dekopon:http/client@1.0.0`. Imports remain structural requirements; only a broker host can
-/// grant and implement them.
-#[macro_export]
-macro_rules! export_provider_with_bindings {
-    ($provider:ty, $bindings:ident) => {
-        struct __DekoponProviderComponent;
-
-        impl $bindings::Guest for __DekoponProviderComponent {
-            fn describe() -> ::std::string::String {
-                $crate::__describe::<$provider>()
-            }
-
-            fn invoke(
-                capability: ::std::string::String,
-                input_json: ::std::string::String,
-            ) -> ::std::string::String {
-                $crate::__invoke::<$provider>(capability, input_json)
-            }
-        }
-
-        $bindings::export!(
-            __DekoponProviderComponent with_types_in $bindings
-        );
-    };
-}
-
-/// Exports a [`Provider`] whose command words behave like a command-line program, through
-/// caller-generated bindings.
-///
-/// The bindings module must describe a world including `dekopon:provider/provider-cli`, so it
-/// exports `run-command` alongside `describe` and `invoke`. Use this when the provider declares
-/// `commandWords` and implements [`Provider::run_command`]; [`export_provider_with_bindings!`] is
-/// the right macro otherwise.
+/// The bindings module must be an identifier naming a world that includes
+/// `dekopon:provider/provider-cli@0.3.0`. The world may add explicitly versioned imports such as
+/// `dekopon:http/client@1.0.0`; imports remain structural requirements, only a broker host can
+/// grant and implement them, and only `invoke` may reach one.
 #[macro_export]
 macro_rules! export_provider_with_cli {
     ($provider:ty, $bindings:ident) => {
@@ -477,24 +421,34 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        __describe, __invoke, __run_command, CapabilityId, CommandRun, CommandRunOutcome,
-        ComponentFailure, ComponentResponse, EffectKind, INVOKE_SERIALIZATION_FALLBACK, Provider,
-        ProviderApiVersion, ProviderCapability, ProviderError, ProviderManifest,
-        RUN_SERIALIZATION_FALLBACK, RiskLevel, describe_fallback,
+        __describe, __invoke, __run_command, CapabilityId, CommandInvocation, CommandRun,
+        CommandRunOutcome, ComponentFailure, ComponentResponse, EffectKind,
+        INVOKE_SERIALIZATION_FALLBACK, Provider, ProviderApiVersion, ProviderCapability,
+        ProviderError, ProviderManifest, RUN_SERIALIZATION_FALLBACK, RiskLevel, SecretUseProposal,
+        describe_fallback,
     };
 
-    struct Echo;
+    const UPPER: &str = "cli-probe.upper";
+    const DRN: &str = "drn:com.example:secret:prod:api/token";
+    const HELP: &str = "Usage: probe upper [-]\n       probe upper --bearer <DRN>\n";
 
-    impl Provider for Echo {
+    fn upper() -> CapabilityId {
+        UPPER.parse().expect("valid capability fixture")
+    }
+
+    /// A hand-rolled command-line provider: shifts values out of argv, no argument parser.
+    struct Probe;
+
+    impl Provider for Probe {
         fn manifest() -> ProviderManifest {
             ProviderManifest {
                 api_version: ProviderApiVersion::V1Alpha1,
-                id: "echo".parse().expect("valid provider fixture"),
-                description: "Echoes input".to_owned(),
-                command_words: Vec::new(),
+                id: "cli-probe".parse().expect("valid provider fixture"),
+                description: "Upper-cases text".to_owned(),
+                command_words: vec!["probe".to_owned()],
                 capabilities: vec![ProviderCapability {
-                    id: "echo.echo".parse().expect("valid capability fixture"),
-                    description: "Echoes input".to_owned(),
+                    id: upper(),
+                    description: "Upper-cases text".to_owned(),
                     effect: EffectKind::ReadOnly,
                     risk: RiskLevel::Low,
                     input_schema: json!({"type": "object"}),
@@ -506,47 +460,37 @@ mod tests {
             capability: &CapabilityId,
             input: serde_json::Value,
         ) -> Result<serde_json::Value, ProviderError> {
-            if capability.as_str() == "echo.echo" {
-                Ok(input)
-            } else {
-                Err(ProviderError::new("unsupported", capability.to_string()))
+            match (
+                capability.as_str(),
+                input.get("text").and_then(serde_json::Value::as_str),
+            ) {
+                (UPPER, Some(text)) => Ok(json!({"text": text.to_uppercase()})),
+                _ => Err(ProviderError::new("unsupported", capability.to_string())),
             }
-        }
-    }
-
-    /// A hand-rolled command-line provider: shifts values out of argv, no argument parser.
-    struct Cli;
-
-    impl Provider for Cli {
-        fn manifest() -> ProviderManifest {
-            Echo::manifest()
-        }
-
-        fn invoke(
-            capability: &CapabilityId,
-            input: serde_json::Value,
-        ) -> Result<serde_json::Value, ProviderError> {
-            Echo::invoke(capability, input)
         }
 
         fn run_command(argv: &[String], stdin: Option<&str>) -> Result<CommandRun, ProviderError> {
             match argv {
-                [flag] if flag == "--help" => Ok(CommandRun::rendered("Usage: echo say [-]\n", 0)),
-                [word, dash] if word == "say" && dash == "-" => match stdin {
-                    Some(text) => Ok(CommandRun::proposal(
-                        "echo.echo".parse().expect("valid capability fixture"),
-                        json!({"message": text}),
-                    )),
+                [flag] if flag == "--help" => Ok(CommandRun::rendered(HELP, 0)),
+                [word, dash] if word == "upper" && dash == "-" => match stdin {
+                    Some(text) => Ok(CommandRun::proposal(upper(), json!({"text": text}))),
                     None => Ok(CommandRun::rendered_error(
-                        "echo: `-` needs piped input\n",
+                        "probe: `-` needs piped input\n",
                         2,
                     )),
                 },
-                [word] if word == "say" => Ok(CommandRun::proposal(
-                    "echo.echo".parse().expect("valid capability fixture"),
-                    json!({}),
-                )),
-                _ => Err(ProviderError::new("usage", "echo say [-]")),
+                [word] if word == "upper" => Ok(CommandRun::proposal(upper(), json!({}))),
+                [word, flag, drn] if word == "upper" && flag == "--bearer" => {
+                    let secret = drn.parse().map_err(|error| {
+                        ProviderError::new("usage", format!("--bearer: {error}"))
+                    })?;
+                    Ok(CommandRun::Proposal(CommandInvocation {
+                        capability: upper(),
+                        input: json!({}),
+                        secret_use: Some(SecretUseProposal::HttpBearer { secret }),
+                    }))
+                }
+                _ => Err(ProviderError::new("usage", "probe upper [-]")),
             }
         }
     }
@@ -560,8 +504,9 @@ mod tests {
     #[test]
     fn adapter_serializes_the_typed_manifest() {
         let manifest: ProviderManifest =
-            serde_json::from_str(&__describe::<Echo>()).expect("manifest parses");
-        assert_eq!(manifest.id.as_str(), "echo");
+            serde_json::from_str(&__describe::<Probe>()).expect("manifest parses");
+        assert_eq!(manifest.id.as_str(), "cli-probe");
+        assert_eq!(manifest.command_words, ["probe"]);
     }
 
     /// No unknown field is accepted, the retired `idempotency` included. The refusal names it.
@@ -569,8 +514,8 @@ mod tests {
     fn a_manifest_carrying_any_other_unknown_field_is_still_refused() {
         for unknown in ["idempotency", "retries", "idempotencyKey"] {
             let error = serde_json::from_value::<ProviderCapability>(json!({
-                "id": "echo.echo",
-                "description": "Echoes input",
+                "id": UPPER,
+                "description": "Upper-cases text",
                 "effect": "read-only",
                 "risk": "Low",
                 unknown: "whatever",
@@ -587,16 +532,16 @@ mod tests {
 
     #[test]
     fn adapter_invokes_rust_provider_implementations() {
-        let response: ComponentResponse = serde_json::from_str(&__invoke::<Echo>(
-            "echo.echo".to_owned(),
-            r#"{"message":"hello"}"#.to_owned(),
+        let response: ComponentResponse = serde_json::from_str(&__invoke::<Probe>(
+            UPPER.to_owned(),
+            r#"{"text":"hello"}"#.to_owned(),
         ))
         .expect("response parses");
 
         assert_eq!(
             response,
             ComponentResponse::Succeeded {
-                output: json!({"message": "hello"})
+                output: json!({"text": "HELLO"})
             }
         );
     }
@@ -604,77 +549,150 @@ mod tests {
     #[test]
     fn adapter_turns_invalid_identifiers_into_failures() {
         let response: ComponentResponse =
-            serde_json::from_str(&__invoke::<Echo>("Not Valid".to_owned(), "{}".to_owned()))
+            serde_json::from_str(&__invoke::<Probe>("Not Valid".to_owned(), "{}".to_owned()))
                 .expect("response parses");
 
-        assert!(matches!(response, ComponentResponse::Failed { .. }));
-    }
-
-    /// A provider that declares no command words can never be asked, so the default refuses.
-    #[test]
-    fn the_default_run_command_refuses() {
-        assert_eq!(
-            run::<Echo>(&["say"], Some("piped")),
-            CommandRunOutcome::Failed {
-                error: ComponentFailure {
-                    code: "unsupported-command".to_owned(),
-                    message: "this provider declares no command words".to_owned(),
-                },
-            }
+        let ComponentResponse::Failed { error } = response else {
+            panic!("an invalid identifier must fail, got {response:?}");
+        };
+        assert_eq!(error.code, "invalid-capability");
+        assert!(
+            error
+                .message
+                .contains("must start with a lowercase ASCII letter or digit"),
+            "{error:?}"
         );
     }
 
     #[test]
     fn the_run_adapter_encodes_each_outcome_a_hand_rolled_provider_returns() {
         assert_eq!(
-            run::<Cli>(&["--help"], None),
+            run::<Probe>(&["--help"], None),
             CommandRunOutcome::Rendered {
-                stdout: "Usage: echo say [-]\n".to_owned(),
+                stdout: HELP.to_owned(),
                 stderr: String::new(),
                 status: 0,
             }
         );
         assert_eq!(
-            run::<Cli>(&["say", "-"], None),
+            run::<Probe>(&["upper", "-"], None),
             CommandRunOutcome::Rendered {
                 stdout: String::new(),
-                stderr: "echo: `-` needs piped input\n".to_owned(),
+                stderr: "probe: `-` needs piped input\n".to_owned(),
                 status: 2,
             }
         );
         assert_eq!(
-            run::<Cli>(&["say", "-"], Some("hello")),
+            run::<Probe>(&["upper", "-"], Some("hello")),
             CommandRunOutcome::Proposed {
-                capability: "echo.echo".parse().expect("valid capability fixture"),
-                input: json!({"message": "hello"}),
+                capability: upper(),
+                input: json!({"text": "hello"}),
+                secret_use: None,
             }
         );
         assert_eq!(
-            run::<Cli>(&["bogus"], None),
+            run::<Probe>(&["bogus"], None),
             CommandRunOutcome::Failed {
                 error: ComponentFailure {
                     code: "usage".to_owned(),
-                    message: "echo say [-]".to_owned(),
+                    message: "probe upper [-]".to_owned(),
                 },
             }
+        );
+    }
+
+    /// The secret use a provider proposes reaches the host unchanged, and a DRN the provider
+    /// refuses to parse is declined naming why.
+    #[test]
+    fn the_run_adapter_carries_a_proposed_secret_use_through() {
+        assert_eq!(
+            run::<Probe>(&["upper", "--bearer", DRN], None),
+            CommandRunOutcome::Proposed {
+                capability: upper(),
+                input: json!({}),
+                secret_use: Some(SecretUseProposal::HttpBearer {
+                    secret: DRN.parse().expect("canonical DRN fixture"),
+                }),
+            }
+        );
+        let encoded = __run_command::<Probe>(
+            vec!["upper".to_owned(), "--bearer".to_owned(), DRN.to_owned()],
+            None,
+        );
+        assert!(
+            encoded.contains(&format!(
+                r#""secretUse":{{"kind":"httpBearer","secret":"{DRN}"}}"#
+            )),
+            "{encoded}"
+        );
+
+        let CommandRunOutcome::Failed { error } =
+            run::<Probe>(&["upper", "--bearer", "vault://token"], None)
+        else {
+            panic!("a malformed DRN must be declined");
+        };
+        assert_eq!(error.code, "usage");
+        assert!(
+            error
+                .message
+                .starts_with("--bearer: secret DRN must be canonical"),
+            "{error:?}"
         );
     }
 
     /// The wire tags are the host's contract; pin them so a rename shows up here, not in a host.
     #[test]
     fn run_outcomes_serialize_under_their_documented_tags() {
-        let encoded = __run_command::<Cli>(vec!["--help".to_owned()], None);
+        let encoded = __run_command::<Probe>(vec!["--help".to_owned()], None);
         assert!(
             encoded.starts_with(r#"{"outcome":"rendered","#),
             "{encoded}"
         );
-        let encoded = __run_command::<Cli>(vec!["say".to_owned()], None);
+        let encoded = __run_command::<Probe>(vec!["upper".to_owned()], None);
         assert!(
             encoded.starts_with(r#"{"outcome":"proposed","#),
             "{encoded}"
         );
-        let encoded = __run_command::<Cli>(vec!["bogus".to_owned()], None);
+        let encoded = __run_command::<Probe>(vec!["bogus".to_owned()], None);
         assert!(encoded.starts_with(r#"{"outcome":"failed","#), "{encoded}");
+    }
+
+    /// A proposal naming a secret use carries it under `secretUse`; one naming none has exactly
+    /// the shape it had before the field existed, in both directions.
+    #[test]
+    fn a_proposal_carries_its_secret_use_under_secret_use_and_omits_it_when_absent() {
+        let with = CommandRunOutcome::Proposed {
+            capability: upper(),
+            input: json!({"text": "hello"}),
+            secret_use: Some(SecretUseProposal::HttpBasic {
+                secret: DRN.parse().expect("canonical DRN fixture"),
+                username: "user-a".to_owned(),
+            }),
+        };
+        let encoded = serde_json::to_string(&with).expect("a proposal serializes");
+        assert_eq!(
+            encoded,
+            r#"{"outcome":"proposed","capability":"cli-probe.upper","input":{"text":"hello"},"secretUse":{"kind":"httpBasic","secret":"drn:com.example:secret:prod:api/token","username":"user-a"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<CommandRunOutcome>(&encoded).expect("the proposal decodes"),
+            with
+        );
+
+        let without = CommandRunOutcome::Proposed {
+            capability: upper(),
+            input: json!({"text": "hello"}),
+            secret_use: None,
+        };
+        let encoded = serde_json::to_string(&without).expect("a proposal serializes");
+        assert_eq!(
+            encoded,
+            r#"{"outcome":"proposed","capability":"cli-probe.upper","input":{"text":"hello"}}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<CommandRunOutcome>(&encoded).expect("the proposal decodes"),
+            without
+        );
     }
 
     /// The decode side of the same contract: a host accepts this shape and nothing adjacent to it.
@@ -704,6 +722,12 @@ mod tests {
         )
         .expect_err("unknown fields are refused");
         assert!(error.to_string().contains("extra"), "{error}");
+
+        let error = serde_json::from_str::<CommandRunOutcome>(&format!(
+            r#"{{"outcome":"proposed","capability":"fixture.run","input":{{}},"secretUse":{{"kind":"httpBasic","secret":"{DRN}","username":"user:password"}}}}"#
+        ))
+        .expect_err("a Basic username carrying a colon is refused");
+        assert!(error.to_string().contains("colon-free"), "{error}");
     }
 
     /// The manifest fallback must name why it exists.

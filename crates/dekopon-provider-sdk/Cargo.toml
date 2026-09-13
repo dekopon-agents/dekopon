@@ -37,7 +37,6 @@ serde_json.workspace = true
 clap = { version = "4.6.4", default-features = false, features = ["std", "help", "usage", "error-context", "derive"], optional = true }
 thiserror = { workspace = true, optional = true }
 wasmtime = { workspace = true, optional = true }
-wit-bindgen.workspace = true
 
 [lints]
 workspace = true

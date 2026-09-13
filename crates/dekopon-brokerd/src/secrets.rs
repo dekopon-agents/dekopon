@@ -1,8 +1,12 @@
 //! Owner-only private secret map and broker-side source adapters.
 //!
-//! Public DRNs are deliberately absent from provider JSON and WIT. This module parses physical
-//! locators at startup without contacting their backends, then resolves one already-authorized
-//! snapshot per invocation. Bootstrap credentials are strict files and are never DRN-addressable.
+//! Public DRNs never appear in a provider's invoke input or in WIT. A provider's run-command
+//! proposal may name one beside the capability it proposes, and the broker authorizes that use
+//! exactly like any other secret use: a separate policy decision and a matching owner-authored
+//! binding, after which only the native HTTP sink receives the resolved bytes. This module parses
+//! physical locators at startup without contacting their backends, then resolves one
+//! already-authorized snapshot per invocation. Bootstrap credentials are strict files and are
+//! never DRN-addressable.
 
 use std::{
     collections::{BTreeMap, BTreeSet},

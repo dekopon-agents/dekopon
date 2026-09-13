@@ -7,8 +7,9 @@
 //! this crate does not, and [`evaluate`] handles both:
 //!
 //! - jq's standard library reaches the host. `jaq_std::funs()` exports `env`, which returns
-//!   [`std::env::vars`] — a script could dump the host process environment and post it through
-//!   `curl`, defeating this crate's "never reads the host process environment" guarantee outright.
+//!   [`std::env::vars`] — a script could dump the host process environment and pipe it into any
+//!   provider command word, defeating this crate's "never reads the host process environment"
+//!   guarantee outright.
 //!   The function set is therefore filtered by name rather than taken wholesale.
 //! - jaq has no fuel meter and offers no safe point to interrupt from outside, so nothing in a
 //!   tree-walking evaluator can stop `jq 'def f: f; f'`. Every other builtin returns to the
@@ -23,7 +24,7 @@
 //!
 //! # The worker is per thread, not per filter
 //!
-//! `jq` is the hottest builtin in model-written scripts — `curl ... | jq ...` is the shape of most
+//! `jq` is the hottest builtin in model-written scripts — `gh ... | jq ...` is the shape of most
 //! of them — and each call is one step of a script's budget. Spawning and joining an operating-
 //! system thread for every one of those was the largest fixed cost in the builtin, so a thread that
 //! has run a filter keeps its worker parked on the job channel and hands it the next one.
@@ -699,7 +700,7 @@ mod tests {
 
     #[test]
     fn a_thread_reuses_its_filter_worker() {
-        // The point of the whole worker arrangement: `curl ... | jq ...` in a loop is the shape of
+        // The point of the whole worker arrangement: `gh ... | jq ...` in a loop is the shape of
         // most model-written scripts, and each iteration used to spawn and join an operating-system
         // thread. libtest gives every test its own thread, so this count is this test's alone.
         for _ in 0..8 {
@@ -823,7 +824,7 @@ mod tests {
     #[test]
     fn host_reaching_standard_library_filters_are_not_linked() {
         // `jaq_std::funs()` exports `env`, which reads the real process environment. Linking it
-        // would let `jq -r env.OPENAI_API_KEY | curl -d @-` walk straight past this crate's
+        // would let `jq -r env.OPENAI_API_KEY | gh issue create -` walk straight past this crate's
         // namespace isolation, so the filter must not exist at all.
         assert!(std::env::var_os("PATH").is_some(), "PATH must be set here");
         for source in ["env", "env.PATH", "env|keys", "now"] {

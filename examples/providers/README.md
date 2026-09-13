@@ -17,8 +17,6 @@ These generated local files must never be committed.
 
 Standalone providers this tree consumes at pinned releases:
 
-- [`dekopon-provider-echo`](https://github.com/dekopon-agents/dekopon-provider-echo) — import-free
-  echo and deterministic Unicode message transformations.
 - [`dekopon-provider-jsonplaceholder`](https://github.com/dekopon-agents/dekopon-provider-jsonplaceholder)
   — bounded broker HTTP read and synthetic external-write operations.
 - [`dekopon-provider-memory-chat`](https://github.com/dekopon-agents/dekopon-provider-memory-chat)
@@ -31,7 +29,9 @@ Standalone providers this tree consumes at pinned releases:
 - [`dekopon-provider-turso-sql`](https://github.com/dekopon-agents/dekopon-provider-turso-sql) —
   SQLite-compatible SQL over `durable-files`, distributed outside core.
 
-The remaining checked components are repository-owned fixtures:
+The remaining checked components are repository-owned fixtures. Each declares a command word,
+because a model reaches a provider only through one and a broker refuses to start with a provider
+whose capabilities no word reaches:
 
 - [`cli-probe/`](cli-probe/) is the import-free `run-command` guest built on the SDK's `clap`
   layer: its `probe` word renders clap's help and usage errors, reads a piped value, and proposes
@@ -39,17 +39,17 @@ The remaining checked components are repository-owned fixtures:
 - [`clock-probe/`](clock-probe/) composes the `run-command` world with
   `dekopon:clock/wall@1.0.0`: its `date` word proposes `clock.now`, and the invocation reads the
   broker host's clock. It is the clock import's conformance fixture and is never packaged.
-- [`http-probe/`](http-probe/) composes provider exports with
-  `dekopon:http/client@1.0.0`. Its `conditional-write` capability keeps two-call host budgets,
-  per-call evidence, and etag-guarded writes covered without public network access.
+- [`http-probe/`](http-probe/) is the test fixture for the broker HTTP import: it composes the
+  `run-command` world with `dekopon:http/client@1.0.0`, and its `httpprobe` word proposes
+  `fetch`, `conditional-write`, and `purge` from flags. Its `conditional-write` capability keeps
+  two-call host budgets, per-call evidence, and etag-guarded writes covered without public
+  network access.
 - [`memory-reservation-probe/`](memory-reservation-probe/) is an import-free malicious
   chat-memory-route fixture, never packaged, and the hand-rolled `run-command` guest: its
   `recall` word is answered by shifting values out of argv with no argument parser.
-- [`provider-v0-1-compat/`](provider-v0-1-compat/) pins compatibility with the immutable
-  two-export `dekopon:provider@0.1.0` world.
 - [`storage-probe/`](storage-probe/) is the durable-files conformance fixture, a `run-command`
-  guest at the current `dekopon:provider@0.3.0` package; it is never packaged in a scanned image
-  directory.
+  guest at the current `dekopon:provider@0.3.0` package whose `storageprobe` word proposes its
+  conformance run; it is never packaged in a scanned image directory.
 
 Regenerate only repository-owned fixtures with their `build.sh`, each of which calls the shared
 [`build-component.sh`](build-component.sh). That script reads the compiler from

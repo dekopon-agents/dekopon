@@ -55,7 +55,6 @@ mod handle;
 mod jsonl;
 mod key;
 mod layout;
-mod metrics;
 mod namespace;
 mod quota;
 mod vfs;
@@ -102,17 +101,18 @@ impl fmt::Debug for StorageScopeCommitment {
     }
 }
 
-/// Content-free coarse storage evidence for one invocation.
+/// Content-free storage evidence for one invocation: operation counts and exact byte totals.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct StorageEvidence {
     pub operations: u64,
     pub syncs: u64,
     pub quota_denials: u64,
-    /// Coarse powers-of-two read bucket; never exact bytes.
-    pub read_byte_bucket: u8,
-    /// Coarse powers-of-two write bucket; never exact bytes.
-    pub write_byte_bucket: u8,
+    /// Exact bytes charged against this invocation's read budget: each read counts the length it
+    /// asked for, whatever it returned.
+    pub read_bytes: u64,
+    /// Exact bytes charged against this invocation's write budget.
+    pub write_bytes: u64,
     pub evidence_commitment: String,
     /// Commitment to the exact successful provider output, when one was supplied.
     #[serde(default, skip_serializing_if = "Option::is_none")]

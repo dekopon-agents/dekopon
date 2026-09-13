@@ -4,7 +4,7 @@
 //! in this interpreter is stringly typed, so capability inputs and outputs never need marshaling:
 //! the rest of the workspace already speaks `serde_json::Value` everywhere.
 
-use serde_json::{Map, Value};
+use serde_json::Value;
 
 /// Coerces one value to its display form.
 ///
@@ -109,11 +109,11 @@ pub fn index(value: &Value, key: &str) -> Value {
     }
 }
 
-/// Parses one argv token into a value, keeping ambiguous text as a string.
+/// Parses the value half of one `local NAME=value` token, keeping ambiguous text as a string.
 ///
 /// Only JSON numbers, `true`, `false`, and `null` are promoted. Objects and arrays are deliberately
-/// left as strings here so a flag value such as `--message '{"a":1}'` is not silently restructured;
-/// the single-bare-argument JSON form used by `cap` is the explicit way to pass an object.
+/// left as strings so `local body='{"a":1}'` is not silently restructured; `jq 'fromjson'` is the
+/// explicit way across.
 #[must_use]
 pub fn scalar_from_token(token: &str) -> Value {
     match token {
@@ -128,34 +128,11 @@ pub fn scalar_from_token(token: &str) -> Value {
     Value::String(token.to_owned())
 }
 
-/// Builds an object from ordered key/value pairs, folding repeated keys into arrays.
-#[must_use]
-pub fn object_from_pairs(pairs: Vec<(String, Value)>) -> Value {
-    let mut fields = Map::new();
-    for (key, value) in pairs {
-        match fields.remove(&key) {
-            None => {
-                fields.insert(key, value);
-            }
-            Some(Value::Array(mut existing)) => {
-                existing.push(value);
-                fields.insert(key, Value::Array(existing));
-            }
-            Some(existing) => {
-                fields.insert(key, Value::Array(vec![existing, value]));
-            }
-        }
-    }
-    Value::Object(fields)
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::{
-        Value, display, from_lines, index, object_from_pairs, scalar_from_token, to_lines, truthy,
-    };
+    use super::{Value, display, from_lines, index, scalar_from_token, to_lines, truthy};
 
     #[test]
     fn display_uses_documented_coercions() {
@@ -203,22 +180,12 @@ mod tests {
     }
 
     #[test]
-    fn argv_tokens_promote_only_unambiguous_scalars() {
+    fn local_tokens_promote_only_unambiguous_scalars() {
         assert_eq!(scalar_from_token("7"), json!(7));
         assert_eq!(scalar_from_token("-1.5"), json!(-1.5));
         assert_eq!(scalar_from_token("true"), json!(true));
         assert_eq!(scalar_from_token("null"), Value::Null);
         assert_eq!(scalar_from_token("hello"), json!("hello"));
         assert_eq!(scalar_from_token(r#"{"a":1}"#), json!(r#"{"a":1}"#));
-    }
-
-    #[test]
-    fn repeated_object_keys_fold_into_arrays() {
-        let object = object_from_pairs(vec![
-            ("headerName".to_owned(), json!("a")),
-            ("headerName".to_owned(), json!("b")),
-            ("other".to_owned(), json!(1)),
-        ]);
-        assert_eq!(object, json!({"headerName": ["a", "b"], "other": 1}));
     }
 }

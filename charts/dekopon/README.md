@@ -656,9 +656,9 @@ catalog, `/tmp`, and both projected configuration/key sources); a nested mount w
 shadow or destructively replace those files. Every one of those is a mistake whose only other
 symptom is a pod that starts and never becomes ready.
 
-The chart's default `broker.config.inline` is the echo example from the broker's own README, moved
-onto these paths: a real deny-by-default configuration that starts, loads the baked
-`echo-provider.wasm`, and authorizes exactly one read-only capability for the pod's own UID. It is
+The chart's default `broker.config.inline` is the cli-probe example from the broker's own README,
+moved onto these paths: a real deny-by-default configuration that starts, loads the baked
+`cli-probe-provider.wasm`, and authorizes exactly one read-only capability for the pod's own UID. It is
 there so you can install the chart and watch a broker become ready before you give it anything that
 matters. Replace it. Its `serverLimits` is all-or-nothing: when present every field is required.
 `brokerLimits` and `hostLimits` instead default each field independently. `gateway.enabled` is `false` by default because a gateway needs a chat token, a

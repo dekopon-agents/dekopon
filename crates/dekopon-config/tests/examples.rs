@@ -63,14 +63,21 @@ fn the_conditional_write_example_declares_the_slice_the_broker_constrains() {
         .expect("the conditional writer agent exists");
     assert!(agent.spec.enabled, "a disabled agent routes to nothing");
     assert_eq!(agent.spec.model_class.as_deref(), Some("reasoning"));
+    let instructions = agent
+        .spec
+        .instructions
+        .as_deref()
+        .expect("write behavior must be explicit standing orders");
     assert!(
-        agent
-            .spec
-            .instructions
-            .as_ref()
-            .is_some_and(|instructions| !instructions.trim().is_empty()),
+        !instructions.trim().is_empty(),
         "write behavior must be explicit standing orders"
     );
+    for command in ["httpprobe fetch", "httpprobe conditional-write"] {
+        assert!(
+            instructions.contains(command),
+            "the standing orders must name `{command}`, the command the provider answers"
+        );
+    }
     let capabilities = agent
         .spec
         .capabilities

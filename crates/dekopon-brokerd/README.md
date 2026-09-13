@@ -46,7 +46,7 @@ brokerPrincipal: local-broker
 policyRevision: policy-2026-01
 policiesPath: /home/dekopon/.config/dekopon/policies.cedar
 providers:
-  - /home/dekopon/lib/dekopon/echo-provider.wasm
+  - /home/dekopon/lib/dekopon/cli-probe-provider.wasm
   - /opt/dekopon/providers          # a directory loads every *.wasm directly inside it
 identities:
   - uid: 1000
@@ -55,8 +55,8 @@ identities:
       type: human
       principal: local-user
 constraintSets:
-  echo.echo:
-    provider: echo
+  cli-probe.upper:
+    provider: cli-probe
     effect: read-only
     risk: Low
     constraints:
@@ -66,10 +66,10 @@ constraintSets:
 
 ```cedar
 // policies.cedar — chmod 0600, owner-owned, single-link, 1 MiB maximum
-@id("local-user-echo")
+@id("local-user-probe")
 permit(principal == Dekopon::Principal::"local-user",
-       action == Dekopon::Action::"echo.echo",
-       resource == Dekopon::Provider::"echo")
+       action == Dekopon::Action::"cli-probe.upper",
+       resource == Dekopon::Provider::"cli-probe")
 unless { context has via };
 ```
 

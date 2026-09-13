@@ -55,7 +55,7 @@ use dekopon_shell::{
 };
 use serde_json::Value;
 #[cfg(unix)]
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 #[cfg(unix)]
 use thiserror::Error;
 
@@ -81,8 +81,6 @@ pub struct ShellRuntime<I> {
     pub invoker: I,
     /// Per-script interpreter bounds; the capability ceiling is narrowed per call.
     pub limits: ShellLimits,
-    /// The capability `curl` assembles requests for, when the session has one.
-    pub curl_capability: Option<String>,
 }
 
 impl<I: CapabilityInvoker> ScriptRuntime for ShellRuntime<I> {
@@ -96,9 +94,11 @@ impl<I: CapabilityInvoker> ScriptRuntime for ShellRuntime<I> {
             max_capability_calls: self.limits.max_capability_calls.min(max_capability_calls),
             ..self.limits
         };
-        Interpreter::new(limits)
-            .with_curl_capability(self.curl_capability.clone())
-            .run(script, &self.invoker)
+        let outcome = Interpreter::new(limits).run(script, &self.invoker);
+        // Before the outcome goes back to the prompt loop, so a tool use the script left open
+        // finishes on a progress surface ahead of the next model turn rather than behind it.
+        self.invoker.script_finished();
+        outcome
     }
 
     fn command_words(&self) -> Vec<String> {
@@ -138,17 +138,9 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
                 .is_some_and(|broker| broker.is_granted(capability))
     }
 
-    // Both membership queries ask each leg rather than merging the legs' lists and searching the
-    // merge. Dispatch asks them per command word, so building, extending, sorting, and deduping
-    // two `Vec<String>` here made a loop of a thousand commands do it a thousand times.
-    fn grants_namespace(&self, namespace: &str) -> bool {
-        self.direct.grants_namespace(namespace)
-            || self
-                .broker
-                .as_ref()
-                .is_some_and(|broker| broker.grants_namespace(namespace))
-    }
-
+    // Asks each leg rather than merging the legs' lists and searching the merge. Dispatch asks it
+    // per command word, so building, extending, sorting, and deduping two `Vec<String>` here made
+    // a loop of a thousand commands do it a thousand times.
     fn has_command_word(&self, word: &str) -> bool {
         self.direct.has_command_word(word)
             || self
@@ -208,6 +200,15 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
         self.direct
             .run_command(word, argv, stdin)
             .or_else(|| self.broker.as_ref()?.run_command(word, argv, stdin))
+    }
+
+    // Both legs, not whichever ran the last word: the method defaults to doing nothing, so a leg
+    // this forgot would compile and leave the progress pair a proposal opened on it unfinished.
+    fn script_finished(&self) {
+        self.direct.script_finished();
+        if let Some(broker) = &self.broker {
+            broker.script_finished();
+        }
     }
 }
 
@@ -302,12 +303,19 @@ fn minted_trace_parent() -> TraceParent {
 /// One definition for both legs: the direct host and the broker answer with the same
 /// [`CommandRunOutcome`], and the shell reads the same [`CommandRun`] from either. The provider's
 /// stable failure `code` stays with the operator; the model reads the message, as it always has.
+/// A proposal's secret use travels with it untouched: a provider command is the only way a script
+/// names a DRN, and only the broker may decide whether that use is allowed.
 #[must_use]
 pub fn command_run_from_outcome(outcome: CommandRunOutcome) -> CommandRun {
     match outcome {
-        CommandRunOutcome::Proposed { capability, input } => CommandRun::Proposed {
+        CommandRunOutcome::Proposed {
+            capability,
+            input,
+            secret_use,
+        } => CommandRun::Proposed {
             capability: capability.to_string(),
             input,
+            secret_use,
         },
         CommandRunOutcome::Rendered {
             stdout,
@@ -445,12 +453,6 @@ pub struct BrokerLeg {
     /// reason again: that consultation is a membership test, and a script running thousands of
     /// commands asks it thousands of times.
     command_words: BTreeSet<String>,
-    /// Provider namespaces this leg holds a grant in, derived from the capability set.
-    ///
-    /// Only [`CapabilityInvoker::grants_namespace`] reads it, on the path where a word was refused
-    /// — the answer that separates "the model typed nonsense" from "the model keeps reaching for
-    /// something we never granted".
-    namespaces: BTreeSet<String>,
     identifiers: IdSequence,
     /// `None` for a leg that speaks as its own connected peer, which is the original behavior.
     attestation: Option<Attestation>,
@@ -486,6 +488,14 @@ pub struct BrokerLeg {
     calls_used: AtomicU32,
     /// Attachments this session has accepted into the reply, which numbers each one for a surface.
     attachments_accepted: AtomicU32,
+    /// The command word whose proposal is waiting on its capability call, and when its run began.
+    ///
+    /// Held so the pair [`ProgressEvent::ToolStarted`] opened under the word finishes with the
+    /// call's own outcome. The next [`CapabilityInvoker::invoke`] takes it; a proposal the
+    /// interpreter never invoked is finished as failed by the next command word or the end of the
+    /// script instead. A lock only because the leg must stay `Sync`: one script runs on one
+    /// thread, and nothing holds it across a broker round trip.
+    pending_report: Mutex<Option<(CommandWord, Instant)>>,
 }
 
 #[cfg(unix)]
@@ -530,14 +540,12 @@ impl BrokerLeg {
         chat_memory: Option<ChatMemorySurface>,
     ) -> Result<Self, BrokerLegError> {
         let (capabilities, effective_capabilities) = snapshot(available)?;
-        let namespaces = capabilities.keys().map(|id| namespace_of(id)).collect();
         Ok(Self {
             client,
             runtime: tokio::runtime::Handle::current(),
             capabilities,
             effective_capabilities,
             command_words: command_words.into_iter().collect(),
-            namespaces,
             identifiers: IdSequence::for_session(),
             attestation,
             chat_memory,
@@ -548,6 +556,7 @@ impl BrokerLeg {
             calls_max: 0,
             calls_used: AtomicU32::new(0),
             attachments_accepted: AtomicU32::new(0),
+            pending_report: Mutex::new(None),
         })
     }
 
@@ -608,6 +617,29 @@ impl BrokerLeg {
     fn emit(&self, event: ProgressEvent) {
         if let Some(sink) = &self.progress {
             sink.emit(event);
+        }
+    }
+
+    /// Takes the report a proposing command word left for its capability call, if one is held.
+    fn take_pending_report(&self) -> Option<(CommandWord, Instant)> {
+        // Nothing panics while holding this lock, so even a poisoned one guards a whole report.
+        self.pending_report
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    /// Finishes, as failed, a command word whose proposal no capability call consumed.
+    ///
+    /// The call never happened, and the interpreter already told the script why: the grant was
+    /// missing, or the budget or the deadline ran out before it.
+    fn settle_pending_report(&self) {
+        if let Some((word, started)) = self.take_pending_report() {
+            self.emit(ProgressEvent::ToolFinished {
+                word,
+                outcome: ToolOutcome::Failed,
+                duration: started.elapsed(),
+            });
         }
     }
 
@@ -704,39 +736,10 @@ impl BrokerLeg {
     }
 }
 
-/// Returns the provider namespace one capability identifier belongs to.
-///
-/// A separator-free identifier is its own namespace, which is how the interpreter reads one too.
-#[cfg(unix)]
-fn namespace_of(capability: &str) -> String {
-    capability
-        .split_once('.')
-        .map_or(capability, |(namespace, _)| namespace)
-        .to_owned()
-}
-
 /// Reports a count to a progress surface without letting a model-sized argv overflow the field.
 #[cfg(unix)]
 fn bounded_count(count: usize) -> u32 {
     u32::try_from(count).unwrap_or(u32::MAX)
-}
-
-/// How one provider command word's run reads on a progress surface.
-///
-/// Rendered text at a non-zero status is the provider reporting a usage error, which is a failed
-/// run for the person watching even though the word answered.
-#[cfg(unix)]
-fn command_outcome(run: &CommandRun) -> ToolOutcome {
-    match run {
-        CommandRun::Proposed { .. } => ToolOutcome::Succeeded,
-        CommandRun::Rendered { status, .. } if *status == 0 => ToolOutcome::Succeeded,
-        CommandRun::Rendered { .. } | CommandRun::Failed { .. } | CommandRun::Errored { .. } => {
-            ToolOutcome::Failed
-        }
-        // The only refusal this leg builds for a word is its own cancellation: the broker answers
-        // a word with a proposal, its own text, or a failure, never with a denial.
-        CommandRun::Denied { .. } => ToolOutcome::Cancelled,
-    }
 }
 
 /// How one capability call reads on a progress surface.
@@ -789,7 +792,6 @@ fn snapshot(
             CapabilityDescription {
                 capability: id,
                 description: available.capability.description,
-                input_schema: available.capability.input_schema,
             },
         );
     }
@@ -824,11 +826,11 @@ impl CapabilityInvoker for BrokerLeg {
         self.command_words.contains(word)
     }
 
-    fn grants_namespace(&self, namespace: &str) -> bool {
-        self.namespaces.contains(namespace)
-    }
-
     fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
+        // A proposal still held here was never invoked (the interpreter stops short of `invoke`
+        // for a capability this session lacks), and the script has moved on to its next command,
+        // so that tool use is over whatever this word turns out to be.
+        self.settle_pending_report();
         // Same visibility check the capability path makes, and for the same reason: the broker
         // decides refusals, this only avoids spending a round trip on a word no provider owns.
         if !self.command_words.contains(word) {
@@ -839,11 +841,14 @@ impl CapabilityInvoker for BrokerLeg {
         // arguments themselves are model-authored and stay on the trace.
         let reported = CommandWord::new(word);
         let started = Instant::now();
+        // Before the round trip, because a guest run is itself a wait a person sees. Whether the
+        // pair finishes here or with the capability call the run proposes is known only once it
+        // answers.
         self.emit(ProgressEvent::ToolStarted {
             word: reported.clone(),
             argument_count: bounded_count(argv.len()),
             // Running a word is not itself a capability call: the proposal it returns is, and
-            // arrives here as an ordinary invocation that spends one.
+            // arrives at `invoke` as an ordinary invocation that spends one.
             calls_used: self.calls_used.load(Ordering::Relaxed),
             calls_max: self.calls_max,
         });
@@ -854,11 +859,15 @@ impl CapabilityInvoker for BrokerLeg {
         let client = self.client.clone();
         let attestation = self.attestation.clone();
         let (owned_word, argv, stdin) = (word.to_owned(), argv.to_vec(), stdin.map(str::to_owned));
+        // Read here, on the blocking thread the script runs on, for the reason `invoke` reads it
+        // there: the broker parents its run on the script span that typed the word, which is the
+        // span current here and not necessarily the one current inside the process node.
+        let trace_parent = self.identifiers.trace_parent();
         let operation = process_fn(
             ProcessMetadata::cancellable("broker-command", self.cancel.clone()),
             move || async move {
                 client
-                    .run_command(attestation, owned_word, argv, stdin)
+                    .run_command(attestation, owned_word, argv, stdin, trace_parent)
                     .await
                     .map(command_run_from_outcome)
             },
@@ -885,9 +894,32 @@ impl CapabilityInvoker for BrokerLeg {
                 message: error.to_string(),
             },
         };
+        let outcome = match &run {
+            // A proposal is not the end of this tool use: the interpreter hands it to `invoke`,
+            // which finishes the pair opened above with the call's own outcome, so finishing it
+            // here as well would show every provider command twice. Held rather than dropped,
+            // because the interpreter can stop short of `invoke` (a capability this session lacks,
+            // an exhausted budget, a passed deadline), and the pair must finish all the same.
+            CommandRun::Proposed { .. } => {
+                *self
+                    .pending_report
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some((reported, started));
+                return Some(run);
+            }
+            CommandRun::Rendered { status: 0, .. } => ToolOutcome::Succeeded,
+            // Rendered text at a non-zero status is the provider reporting a usage error, which is
+            // a failed run for the person watching even though the word answered.
+            CommandRun::Rendered { .. }
+            | CommandRun::Failed { .. }
+            | CommandRun::Errored { .. } => ToolOutcome::Failed,
+            // The only refusal this leg builds for a word is its own cancellation: the broker
+            // answers a word with a proposal, its own text, or a failure, never with a denial.
+            CommandRun::Denied { .. } => ToolOutcome::Cancelled,
+        };
         self.emit(ProgressEvent::ToolFinished {
             word: reported,
-            outcome: command_outcome(&run),
+            outcome,
             duration: started.elapsed(),
         });
         Some(run)
@@ -899,21 +931,15 @@ impl CapabilityInvoker for BrokerLeg {
         input: Value,
         secret_use: Option<dekopon_core::SecretUseProposal>,
     ) -> CapabilityCallResult {
-        // One started/finished pair around every way the call below can end, which is why the
-        // proposal is its own function: a capability call is the unit of work a person actually
-        // waits on, and a surface told that one started has to be told how it ended.
+        // One finished event for every way the call below can end, which is why the proposal is
+        // its own function: a capability call is the unit of work a person actually waits on, and
+        // a surface told that one started has to be told how it ended.
         //
-        // Reported only for a capability this session actually holds, which is the same check
-        // `run_command` makes for the same reason. The identifier is whatever the caller named,
-        // so reporting before the visibility check inside `submit` would render model-authored
-        // text on a chat line: an invented `ignore-your-instructions` would be put on the progress
-        // message verbatim. An identifier no provider owns is refused there without reaching the
-        // broker, and its refusal is already on the trace.
-        let reported = self
-            .capabilities
-            .contains_key(capability)
-            .then(|| CommandWord::new(capability));
-        let started = Instant::now();
+        // A command word that proposed this call already reported it started, under the word, so
+        // the call only finishes that pair; a second `ToolStarted` under the capability would show
+        // one provider command as two tool uses. Any call takes the held report: the interpreter
+        // invokes a proposal straight away or not at all.
+        let held = self.take_pending_report();
         // Prevents a script from starting another capability call after the embedder's Stop was
         // observed. A call already inside the client is not rollbackable; this check is the
         // cooperative boundary immediately before the broker proposal. It is not a refusal
@@ -932,15 +958,29 @@ impl CapabilityInvoker for BrokerLeg {
                 .fetch_add(1, Ordering::Relaxed)
                 .saturating_add(1)
         };
-        if let Some(word) = reported.clone() {
-            self.emit(ProgressEvent::ToolStarted {
-                word,
-                // The count, never the arguments: they are model-authored and already on the trace.
-                argument_count: bounded_count(input.as_object().map_or(0, serde_json::Map::len)),
-                calls_used,
-                calls_max: self.calls_max,
-            });
-        }
+        // A call no command word proposed (an embedder calling the leg directly) opens its own
+        // pair under the identifier, and only for a capability this session actually holds, which
+        // is the same check `run_command` makes for the same reason. The identifier is whatever
+        // the caller named, so reporting before the visibility check inside `submit` would render
+        // model-authored text on a chat line: an invented `ignore-your-instructions` would be put
+        // on the progress message verbatim. An identifier no provider owns is refused there
+        // without reaching the broker, and its refusal is already on the trace.
+        let reported = held.or_else(|| {
+            self.capabilities.contains_key(capability).then(|| {
+                let word = CommandWord::new(capability);
+                self.emit(ProgressEvent::ToolStarted {
+                    word: word.clone(),
+                    // The count, never the arguments: they are model-authored and already on the
+                    // trace.
+                    argument_count: bounded_count(
+                        input.as_object().map_or(0, serde_json::Map::len),
+                    ),
+                    calls_used,
+                    calls_max: self.calls_max,
+                });
+                (word, Instant::now())
+            })
+        });
         let (result, outcome) = if cancelled {
             (
                 CapabilityCallResult::Denied {
@@ -953,7 +993,9 @@ impl CapabilityInvoker for BrokerLeg {
             let outcome = call_outcome(&result);
             (result, outcome)
         };
-        if let Some(word) = reported {
+        // Timed from the word's run when a command word opened the pair, so the duration covers
+        // the guest run and the call together, as the one tool use they are.
+        if let Some((word, started)) = reported {
             self.emit(ProgressEvent::ToolFinished {
                 word,
                 outcome,
@@ -961,6 +1003,13 @@ impl CapabilityInvoker for BrokerLeg {
             });
         }
         result
+    }
+
+    fn script_finished(&self) {
+        // Finishes the pair a proposal opened when nothing invoked it (the budget or the deadline
+        // tripped between the proposal and its call, or the script ended after a refused one),
+        // before the script's outcome reaches the prompt loop and the next model turn is reported.
+        self.settle_pending_report();
     }
 }
 
@@ -979,18 +1028,17 @@ impl BrokerLeg {
         let Ok(parsed) = capability.parse::<CapabilityId>() else {
             return CapabilityCallResult::NotFound;
         };
-        // A visibility check, deliberately not an authorization one. Bare-word dispatch already
-        // filters on `is_granted`, but the `cap <id>` escape hatch does not, so without this a
-        // script could spend its whole capability budget probing the broker with guessed
-        // identifiers. What this must never do is decide a *refusal*: anything policy makes
-        // visible goes to the broker and comes back with the broker's own answer, including the
-        // denials that only it can issue.
+        // A visibility check, deliberately not an authorization one. The interpreter already
+        // checks a command word's proposal against `is_granted`, but this leg is a public
+        // `CapabilityInvoker` an embedder may call directly, and without this a caller could spend
+        // a whole capability budget probing the broker with guessed identifiers. What this must
+        // never do is decide a *refusal*: anything policy makes visible goes to the broker and
+        // comes back with the broker's own answer, including the denials that only it can issue.
         if !self.capabilities.contains_key(capability) {
             return CapabilityCallResult::NotFound;
         }
-        // The last point at which the proposal's JSON is still this process's to edit, and the one
-        // both proposal paths funnel through: a bare capability call arrives here directly, and a
-        // command word's `run-command` proposal arrives here after the interpreter checked the grant.
+        // The last point at which the proposal's JSON is still this process's to edit: a command
+        // word's `run-command` proposal arrives here after the interpreter checked the grant.
         let input = match self.expanded(capability, input) {
             Ok(input) => input,
             // A refusal here is permanent and the call never happened, which is the interpreter's
@@ -1117,11 +1165,11 @@ impl IdSequence {
 
     /// The W3C context to send with the next call.
     ///
-    /// The live span when it belongs to this session's trace, so the broker parents `broker.invocation`
-    /// on the script span that actually asked for the capability rather than on the session root, and
-    /// the session's own context otherwise. The filter is what keeps one promise true: the trace on
-    /// the wire is always the trace the invocation identifier extends, including for a leg built
-    /// outside the span its calls run under.
+    /// The live span when it belongs to this session's trace, so the broker parents
+    /// `broker.invocation` and `broker.command_run` on the script span that actually asked rather
+    /// than on the session root, and the session's own context otherwise. The filter is what keeps
+    /// one promise true: the trace on the wire is always the trace the invocation identifier
+    /// extends, including for a leg built outside the span its calls run under.
     #[must_use]
     pub fn trace_parent(&self) -> TraceParent {
         current_trace_parent()
@@ -1198,7 +1246,6 @@ mod tests {
             (capability == self.capability).then(|| CapabilityDescription {
                 capability: capability.to_owned(),
                 description: self.marker.to_owned(),
-                input_schema: json!({"type": "object"}),
             })
         }
 
@@ -1243,7 +1290,7 @@ mod tests {
     #[test]
     fn capabilities_absent_from_direct_mode_fall_through_to_the_broker() {
         let invoker = SessionInvoker {
-            direct: FakeLeg::new("echo.echo", "direct"),
+            direct: FakeLeg::new("cli-probe.upper", "direct"),
             broker: Some(Box::new(FakeLeg::new("http-probe.fetch", "broker"))),
         };
 
@@ -1254,7 +1301,7 @@ mod tests {
         assert!(invoker.is_granted("http-probe.fetch"));
         assert_eq!(
             invoker.granted(),
-            vec!["echo.echo".to_owned(), "http-probe.fetch".to_owned()]
+            vec!["cli-probe.upper".to_owned(), "http-probe.fetch".to_owned()]
         );
         assert_eq!(
             invoker
@@ -1265,39 +1312,15 @@ mod tests {
     }
 
     #[test]
-    fn membership_queries_agree_with_the_lists_they_replace() {
-        // Dispatch asks these per command word rather than merging both legs' lists and searching
-        // the merge. They have to answer what searching the merge would have answered, from either
-        // leg, including for a leg that overrides neither and is scanned by the default.
-        let invoker = SessionInvoker {
-            direct: FakeLeg::new("echo.echo", "direct"),
-            broker: Some(Box::new(FakeLeg::new("http-probe.fetch", "broker"))),
-        };
-
-        for granted in invoker.granted() {
-            let namespace = granted.split('.').next().expect("a namespace");
-            assert!(invoker.grants_namespace(namespace), "{granted}");
-        }
-        assert!(invoker.grants_namespace("echo"));
-        assert!(invoker.grants_namespace("http-probe"));
-        assert!(!invoker.grants_namespace("gh"));
-        assert!(!invoker.grants_namespace("ech"));
-
-        // Neither `FakeLeg` contributes command words, so nothing is one.
-        assert!(invoker.command_words().is_empty());
-        assert!(!invoker.has_command_word("gh"));
-    }
-
-    #[test]
     fn a_session_without_a_broker_is_exactly_as_capable_as_direct_mode() {
         // Omitting the broker leg has to leave a session behaving as direct mode always did, so a
         // local demo or a CI run with no daemon is unaffected.
         let invoker = SessionInvoker {
-            direct: FakeLeg::new("echo.echo", "direct"),
+            direct: FakeLeg::new("cli-probe.upper", "direct"),
             broker: None,
         };
 
-        assert_eq!(invoker.granted(), vec!["echo.echo".to_owned()]);
+        assert_eq!(invoker.granted(), vec!["cli-probe.upper".to_owned()]);
         assert!(!invoker.is_granted("http-probe.fetch"));
         assert_eq!(
             invoker.invoke("http-probe.fetch", json!({}), None),
@@ -1308,9 +1331,9 @@ mod tests {
     /// A DRN reaches the broker and nothing else, through the one invocation method.
     ///
     /// The composite used to answer this on a separate defaulted method while every wrapper around
-    /// it forwarded the other one, so the field a `curl --user USER:${drn:...}` produced was
-    /// dropped between the shell and this decision. There is one method now, and the deny for the
-    /// direct leg is a branch inside it rather than a default a wrapper can inherit by accident.
+    /// it forwarded the other one, so the secret use a script proposed was dropped between the
+    /// shell and this decision. There is one method now, and the deny for the direct leg is a
+    /// branch inside it rather than a default a wrapper can inherit by accident.
     #[test]
     fn a_secret_use_proposal_reaches_only_a_broker_backed_capability() {
         let proposal = dekopon_core::SecretUseProposal::HttpBearer {
@@ -1320,7 +1343,7 @@ mod tests {
         };
         let broker = Box::new(FakeLeg::new("http-probe.fetch", "broker"));
         let invoker = SessionInvoker {
-            direct: FakeLeg::new("echo.echo", "direct"),
+            direct: FakeLeg::new("cli-probe.upper", "direct"),
             broker: Some(broker),
         };
 
@@ -1332,7 +1355,7 @@ mod tests {
         // Deny-by-default on the direct leg: immediate mode has no authorizer, so a capability it
         // owns cannot carry a secret even though the call itself would succeed without one.
         assert_eq!(
-            invoker.invoke("echo.echo", json!({}), Some(proposal)),
+            invoker.invoke("cli-probe.upper", json!({}), Some(proposal)),
             dekopon_shell::secret_use_unsupported()
         );
         assert!(
@@ -1359,13 +1382,6 @@ mod tests {
 
         fn is_granted(&self, capability: &str) -> bool {
             capability == self.capability
-        }
-
-        fn grants_namespace(&self, namespace: &str) -> bool {
-            self.capability
-                .split('.')
-                .next()
-                .is_some_and(|candidate| candidate == namespace)
         }
 
         fn command_words(&self) -> Vec<String> {
@@ -1397,8 +1413,8 @@ mod tests {
     fn command_words_and_grants_survive_both_legs_rather_than_falling_back_to_the_defaults() {
         let invoker = SessionInvoker {
             direct: CommandLeg {
-                word: "echo",
-                capability: "echo.echo",
+                word: "probe",
+                capability: "cli-probe.upper",
             },
             broker: Some(Box::new(CommandLeg {
                 word: "gh",
@@ -1408,20 +1424,20 @@ mod tests {
 
         assert_eq!(
             invoker.command_words(),
-            vec!["echo".to_owned(), "gh".to_owned()],
+            vec!["gh".to_owned(), "probe".to_owned()],
             "a word a provider contributed became `command not found`"
         );
-        assert!(invoker.has_command_word("echo"));
+        assert!(invoker.has_command_word("probe"));
         assert!(invoker.has_command_word("gh"));
         assert!(!invoker.has_command_word("git"));
 
         assert!(invoker.granted().is_empty());
-        assert!(invoker.is_granted("echo.echo"), "the direct leg holds it");
+        assert!(
+            invoker.is_granted("cli-probe.upper"),
+            "the direct leg holds it"
+        );
         assert!(invoker.is_granted("gh.pr-view"), "the broker leg holds it");
         assert!(!invoker.is_granted("gh.pr-merge"));
-        assert!(invoker.grants_namespace("echo"));
-        assert!(invoker.grants_namespace("gh"));
-        assert!(!invoker.grants_namespace("git"));
     }
 
     #[cfg(unix)]
@@ -1443,7 +1459,8 @@ mod tests {
         use dekopon_core::{AgentId, ExternalSubject, SecretDrn, SecretUseProposal};
         use dekopon_process::CancelSignal;
         use dekopon_shell::{
-            CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun,
+            CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun, ExitCode,
+            Limits,
         };
         use serde_json::{Value, json};
         use tokio::{
@@ -1452,13 +1469,14 @@ mod tests {
         };
 
         use crate::{
-            Attestation, BrokerLeg, IdSequence, ProgressEvent, ProgressSink,
+            Attestation, BrokerLeg, IdSequence, ProgressEvent, ProgressSink, ShellRuntime,
             attachment::{
                 AttachmentRefusal, ChatAssetInputs, ChatAssetRefusal, ChatAssetSource,
                 ReplyAttachments,
             },
             current_trace_parent,
             meta::EffectiveCapabilityView,
+            prompt::ScriptRuntime,
         };
 
         const CAPABILITY: &str = "http-probe.fetch";
@@ -1616,6 +1634,9 @@ mod tests {
             )
             .await;
             leg.command_words.insert("probe".to_owned());
+            // The run joins the session's trace the way an invocation does, so the broker's span
+            // for it lands under the script that typed the word rather than in a trace of its own.
+            let trace_parent = leg.identifiers.trace_parent();
 
             assert_eq!(
                 run_word(leg, &["--help"], None).await,
@@ -1633,6 +1654,7 @@ mod tests {
                     word: "probe".to_owned(),
                     argv: vec!["--help".to_owned()],
                     stdin: None,
+                    trace_parent,
                 }
             );
         }
@@ -1643,6 +1665,7 @@ mod tests {
             let proposed = CommandRunOutcome::Proposed {
                 capability: "cli-probe.upper".parse().expect("valid capability fixture"),
                 input: json!({"text": "hello"}),
+                secret_use: None,
             };
             let (mut leg, mut observed) = stub_leg_observing(
                 directory.path(),
@@ -1651,21 +1674,65 @@ mod tests {
             )
             .await;
             leg.command_words.insert("probe".to_owned());
+            let trace_parent = leg.identifiers.trace_parent();
 
             assert_eq!(
                 run_word(leg, &["upper", "-"], Some("hello")).await,
                 Some(CommandRun::Proposed {
                     capability: "cli-probe.upper".to_owned(),
                     input: json!({"text": "hello"}),
+                    secret_use: None,
                 })
             );
             let request = observed.recv().await.expect("stub broker saw the run");
             assert!(
                 matches!(
                     &request.request,
-                    BrokerRequest::RunCommand { stdin: Some(piped), .. } if piped == "hello"
+                    BrokerRequest::RunCommand {
+                        stdin: Some(piped),
+                        trace_parent: sent,
+                        ..
+                    } if piped == "hello" && *sent == trace_parent
                 ),
                 "{request:?}"
+            );
+        }
+
+        /// The secret use a provider's proposal names reaches the script's invocation intact.
+        ///
+        /// A provider command is the only way a script names a DRN, so a mapping that dropped the
+        /// field would turn every such proposal into a credential-less call the broker never gets
+        /// to decide about. `HttpBasic` carries the most fields, so the username rides the wire
+        /// and its validation too.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_proposed_secret_use_survives_the_broker_leg() {
+            let directory = private_broker_directory();
+            let secret_use = SecretUseProposal::HttpBasic {
+                secret: "drn:com.xrl:secret:prod:api/token"
+                    .parse::<SecretDrn>()
+                    .expect("canonical DRN fixture"),
+                username: "deploy".to_owned(),
+            };
+            let proposed = CommandRunOutcome::Proposed {
+                capability: CAPABILITY.parse().expect("valid capability fixture"),
+                input: json!({"uri": "https://example.test/"}),
+                secret_use: Some(secret_use.clone()),
+            };
+            let (mut leg, _observed) = stub_leg_observing(
+                directory.path(),
+                vec![ResponseEnvelope::command_run(proposed)],
+                None,
+            )
+            .await;
+            leg.command_words.insert("probe".to_owned());
+
+            assert_eq!(
+                run_word(leg, &["fetch", "https://example.test/"], None).await,
+                Some(CommandRun::Proposed {
+                    capability: CAPABILITY.to_owned(),
+                    input: json!({"uri": "https://example.test/"}),
+                    secret_use: Some(secret_use),
+                })
             );
         }
 
@@ -1741,13 +1808,8 @@ mod tests {
                 CapabilityDescription {
                     capability: CAPABILITY.to_owned(),
                     description: "Fetches one broker-authorized URI".to_owned(),
-                    input_schema: json!({"type": "object"}),
                 },
             );
-            let namespaces = capabilities
-                .keys()
-                .map(|id| crate::namespace_of(id))
-                .collect();
             BrokerLeg {
                 client: BrokerClient::new(socket, server_uid(), FrameLimits::default())
                     .expect("stub broker client"),
@@ -1761,7 +1823,6 @@ mod tests {
                     risk: "Low".to_owned(),
                 }],
                 command_words: BTreeSet::new(),
-                namespaces,
                 identifiers: IdSequence::for_session(),
                 attestation,
                 chat_memory: None,
@@ -1772,6 +1833,7 @@ mod tests {
                 calls_max: 0,
                 calls_used: AtomicU32::new(0),
                 attachments_accepted: AtomicU32::new(0),
+                pending_report: Mutex::new(None),
             }
         }
 
@@ -2155,10 +2217,10 @@ mod tests {
         async fn the_cancellation_check_never_narrows_what_a_proposal_may_carry() {
             // A refusal decided before the proposal is one method away from a refusal decided
             // *about* the proposal. A wrapper in `dekopond` once sat here, forwarded the
-            // two-argument call and inherited a deny-by-default for the third, so a
-            // `curl --user USER:${drn:...}` in a gateway session was refused inside the process
-            // that made it — the broker, the only thing that can decide `secret.use` at all,
-            // never saw it. The check moved in here; the proposal still travels untouched.
+            // two-argument call and inherited a deny-by-default for the third, so a secret use
+            // proposed in a gateway session was refused inside the process that made it — the
+            // broker, the only thing that can decide `secret.use` at all, never saw it. The check
+            // moved in here; the proposal still travels untouched.
             let directory = private_broker_directory();
             let (leg, mut observed) = stub_leg_observing(
                 directory.path(),
@@ -2290,9 +2352,9 @@ mod tests {
             // the workspace reports conflicts.
             let error = crate::snapshot(vec![
                 available("http-probe.fetch"),
-                available("echo.echo"),
+                available("cli-probe.upper"),
                 available("http-probe.fetch"),
-                available("echo.echo"),
+                available("cli-probe.upper"),
             ])
             .expect_err("a duplicate identifier is refused");
 
@@ -2300,7 +2362,7 @@ mod tests {
                 matches!(
                     &error,
                     crate::BrokerLegError::DuplicateCapabilities { capabilities }
-                        if capabilities == "echo.echo, http-probe.fetch"
+                        if capabilities == "cli-probe.upper, http-probe.fetch"
                 ),
                 "{error}"
             );
@@ -2308,9 +2370,11 @@ mod tests {
 
         #[test]
         fn a_distinct_capability_set_indexes_both_views() {
-            let (descriptions, effective) =
-                crate::snapshot(vec![available("http-probe.fetch"), available("echo.echo")])
-                    .expect("a distinct set is accepted");
+            let (descriptions, effective) = crate::snapshot(vec![
+                available("http-probe.fetch"),
+                available("cli-probe.upper"),
+            ])
+            .expect("a distinct set is accepted");
 
             assert_eq!(descriptions.len(), 2);
             assert_eq!(
@@ -2318,7 +2382,7 @@ mod tests {
                     .iter()
                     .map(|view| view.id.as_str())
                     .collect::<Vec<_>>(),
-                vec!["echo.echo", "http-probe.fetch"]
+                vec!["cli-probe.upper", "http-probe.fetch"]
             );
         }
 
@@ -2469,38 +2533,195 @@ mod tests {
             );
         }
 
-        #[tokio::test(flavor = "multi_thread")]
-        async fn a_command_word_is_reported_by_the_word_rather_than_the_capability_it_proposes() {
-            // `probe --help` spends no capability call and reaches no capability: the word is the
-            // only name for this round trip, and a provider's usage error is a failed run for the
-            // person watching even though the word answered.
-            let directory = private_broker_directory();
-            let rendered = CommandRunOutcome::Rendered {
-                stdout: String::new(),
-                stderr: "probe: unknown flag
-"
-                .to_owned(),
-                status: 2,
-            };
-            let (mut leg, _observed) = stub_leg_observing(
-                directory.path(),
-                vec![ResponseEnvelope::command_run(rendered)],
-                None,
-            )
-            .await;
+        /// A leg that owns `probe`, answers each request with the next of `responses`, and reports
+        /// progress against a ceiling of four calls.
+        async fn reporting_probe_leg(
+            directory: &Path,
+            responses: Vec<ResponseEnvelope>,
+        ) -> (BrokerLeg, Arc<RecordingSink>) {
+            let (mut leg, _observed) = stub_leg_observing(directory, responses, None).await;
             leg.command_words.insert("probe".to_owned());
             let (sink, progress) = recording_sink();
-            let leg = leg.with_progress(progress, 4);
+            (leg.with_progress(progress, 4), sink)
+        }
 
-            assert!(matches!(
-                run_word(leg, &["--nonsense"], None).await,
-                Some(CommandRun::Rendered { status: 2, .. })
-            ));
+        /// A run that proposes `capability`, the way a provider answers a word it parsed.
+        fn proposal_of(capability: &str) -> ResponseEnvelope {
+            ResponseEnvelope::command_run(CommandRunOutcome::Proposed {
+                capability: capability.parse().expect("valid capability fixture"),
+                input: json!({"number": 7}),
+                secret_use: None,
+            })
+        }
+
+        /// A run that answers with the provider's own text at `status`: `0` for help, `2` for a
+        /// usage error.
+        fn rendered_at(status: u8) -> ResponseEnvelope {
+            ResponseEnvelope::command_run(CommandRunOutcome::Rendered {
+                stdout: String::new(),
+                stderr: String::new(),
+                status,
+            })
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_word_that_proposes_nothing_is_one_pair_under_the_word_with_its_own_outcome() {
+            // `probe --help` and `probe --nonsense` spend no capability call and reach no
+            // capability, so the word is the only name either round trip has. Each finishes where
+            // it answers — a provider's usage error is a failed run for the person watching even
+            // though the word answered — and nothing is held for the end of the script to finish.
+            let directory = private_broker_directory();
+            let (leg, sink) =
+                reporting_probe_leg(directory.path(), vec![rendered_at(0), rendered_at(2)]).await;
+
+            let (help, usage_error) = tokio::task::spawn_blocking(move || {
+                let help = leg.run_command("probe", &["--help".to_owned()], None);
+                let usage_error = leg.run_command("probe", &["--nonsense".to_owned()], None);
+                leg.script_finished();
+                (help, usage_error)
+            })
+            .await
+            .expect("blocking dispatch completes");
+
+            assert!(
+                matches!(help, Some(CommandRun::Rendered { status: 0, .. })),
+                "{help:?}"
+            );
+            assert!(
+                matches!(usage_error, Some(CommandRun::Rendered { status: 2, .. })),
+                "{usage_error:?}"
+            );
             assert_eq!(
                 sink.labels(),
                 vec![
                     "started probe arguments=1 calls=0/4".to_owned(),
+                    "finished probe Succeeded".to_owned(),
+                    "started probe arguments=1 calls=0/4".to_owned(),
                     "finished probe Failed".to_owned(),
+                ]
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_proposing_word_is_one_pair_under_the_word_finished_by_the_call_it_proposed() {
+            // The word opens the pair before its run and the capability call closes it with the
+            // broker's answer. Reporting the capability as well would show one provider command as
+            // two tool uses, and the budget reads as it stood when the word started.
+            let directory = private_broker_directory();
+            let (leg, sink) = reporting_probe_leg(
+                directory.path(),
+                vec![
+                    proposal_of(CAPABILITY),
+                    ResponseEnvelope::invocation(result(
+                        InvocationOutcome::Denied,
+                        Some("policy-denied"),
+                    )),
+                ],
+            )
+            .await;
+
+            let called = tokio::task::spawn_blocking(move || {
+                let argv = ["fetch".to_owned(), "7".to_owned()];
+                let Some(CommandRun::Proposed {
+                    capability,
+                    input,
+                    secret_use,
+                }) = leg.run_command("probe", &argv, None)
+                else {
+                    panic!("the stub broker answers the word with a proposal");
+                };
+                let called = leg.invoke(&capability, input, secret_use);
+                leg.script_finished();
+                called
+            })
+            .await
+            .expect("blocking dispatch completes");
+
+            assert_eq!(
+                called,
+                CapabilityCallResult::Denied {
+                    reason: "policy-denied".to_owned(),
+                }
+            );
+            assert_eq!(
+                sink.labels(),
+                vec![
+                    "started probe arguments=2 calls=0/4".to_owned(),
+                    "finished probe Denied".to_owned(),
+                ]
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_proposal_the_script_never_invokes_finishes_failed_before_the_script_returns() {
+            // The provider proposes without knowing what the session holds, and the interpreter
+            // refuses a capability it was not granted without ever calling `invoke`. Nothing in
+            // the script finishes the pair the word opened, so the runtime has to, through the
+            // composite dispatch, before the outcome goes back to the prompt loop.
+            let directory = private_broker_directory();
+            let (leg, sink) =
+                reporting_probe_leg(directory.path(), vec![proposal_of("gh.pr-merge")]).await;
+            let runtime = ShellRuntime {
+                invoker: crate::SessionInvoker {
+                    direct: super::FakeLeg::new("cli-probe.upper", "direct"),
+                    broker: Some(Box::new(leg)),
+                },
+                limits: Limits::default(),
+            };
+
+            let outcome =
+                tokio::task::spawn_blocking(move || runtime.run_script("probe merge 7", 4))
+                    .await
+                    .expect("blocking dispatch completes");
+
+            assert_eq!(outcome.exit_code, ExitCode::NOT_FOUND, "{}", outcome.output);
+            assert_eq!(
+                sink.labels(),
+                vec![
+                    "started probe arguments=2 calls=0/4".to_owned(),
+                    "finished probe Failed".to_owned(),
+                ],
+                "{}",
+                outcome.output
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_proposal_left_uninvoked_finishes_failed_before_the_next_word_starts() {
+            // A refused proposal does not end the script, and the next command is the earliest
+            // point the leg can tell that tool use is over: the pair has to finish before another
+            // opens, or a surface would show the next word running inside the last one.
+            let directory = private_broker_directory();
+            let (leg, sink) = reporting_probe_leg(
+                directory.path(),
+                vec![proposal_of("gh.pr-merge"), rendered_at(0)],
+            )
+            .await;
+
+            let (merge, help) = tokio::task::spawn_blocking(move || {
+                let merge = leg.run_command("probe", &["merge".to_owned(), "7".to_owned()], None);
+                let help = leg.run_command("probe", &["--help".to_owned()], None);
+                leg.script_finished();
+                (merge, help)
+            })
+            .await
+            .expect("blocking dispatch completes");
+
+            assert!(
+                matches!(merge, Some(CommandRun::Proposed { .. })),
+                "{merge:?}"
+            );
+            assert!(
+                matches!(help, Some(CommandRun::Rendered { status: 0, .. })),
+                "{help:?}"
+            );
+            assert_eq!(
+                sink.labels(),
+                vec![
+                    "started probe arguments=2 calls=0/4".to_owned(),
+                    "finished probe Failed".to_owned(),
+                    "started probe arguments=1 calls=0/4".to_owned(),
+                    "finished probe Succeeded".to_owned(),
                 ]
             );
         }

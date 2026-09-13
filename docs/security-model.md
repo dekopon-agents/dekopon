@@ -91,9 +91,11 @@ The example reviewer has `github.pull-request.read` and the explicit external-wr
 ## Public DRNs and private resolution
 
 **Status: current.** A model may propose one canonical logical DRN only through the typed top-level
-`SecretUseProposal`; it cannot place one in provider input, a WIT value, URL, header or body. The
-shell recognizes exact Basic/Bearer forms and strips the marker before capability JSON exists.
-Immediate invokers refuse it. A broker-backed proposal then passes four independent ceilings:
+`SecretUseProposal`; a DRN placed in provider input, a WIT value, URL, header or body is inert text.
+The proposal comes from a provider command: the model passes the DRN on the word's argv, and the
+guest's `run-command` answer returns it as `secretUse` beside the capability and input it built, so
+the invoke input never carries it. The shell forwards it to the broker leg; immediate invokers refuse
+it. A broker-backed proposal then passes four independent ceilings:
 
 1. ordinary capability Cedar policy;
 2. separate `secret.use` Cedar policy over the exact `Dekopon::Secret` resource and authenticated
@@ -134,7 +136,7 @@ must validate capability-specific input. The shared agent loop accepts only type
 arguments, and catalog skills are loaded under bounds before a session starts, never by the
 script. Skills are untrusted model text and grant no authority.
 
-By default, OTLP trace/log fields omit prompts, model responses, and component input/output; the payload opt-in adds them to every sink the process writes. *Committed direction:* the gate is removed; payloads always on ([goal 2](design.md#constitution)). Bearer tokens and raw untrusted errors are omitted either way. OTLP lifecycle logs are operational data rather than authorized invocation evidence. Final text and machine-readable outputs remain untrusted data. Terminal table cells in auth status remove control characters. [`observability.md`](observability.md) is the complete telemetry contract.
+OTLP trace and log fields carry prompts, model responses, command arguments and output, and component input; there is no payload gate and no metadata-only mode ([goal 2](design.md#constitution)). Bearer tokens and raw untrusted errors are omitted. OTLP lifecycle logs are operational data rather than authorized invocation evidence. Final text and machine-readable outputs remain untrusted data. Terminal table cells in auth status remove control characters. [`observability.md`](observability.md) is the complete telemetry contract.
 
 ## Current gateway posture
 
@@ -250,7 +252,9 @@ every command word of the provider they name. Naming a capability `memory.chat.e
 provider `memory-chat` reserves nothing, and renaming the shipped provider drops nothing. Generic
 chat invocation may reach the two retrieval routes but never the record route.
 
-A provider command word is ungated. `runCommand` carries no capability to decide on, so the broker runs the declaring component's argv handling — a
+Command words are the only way a script reaches a provider: a capability identifier used as a word
+is `command not found`, and `cap` lists and describes grants without invoking anything. A provider
+command word is ungated. `runCommand` carries no capability to decide on, so the broker runs the declaring component's argv handling — a
 pure, import-free guest call under the ordinary fuel and wall-clock bounds — before any
 authorization, and authorizes only the proposal that comes back, on exactly the path a direct
 `invoke` takes. Text the guest renders itself (a help page, a usage error) is provider-authored,
@@ -272,14 +276,17 @@ proves kernel acceptance. Discord partial delivery produces no receipt. The gate
 fresh dedicated request after acceptance, waits once, and never retries after timeout, EOF, denial,
 or outcome-unknown. Its already delivered answer remains answered.
 
-Storage audit records omit principal, actor/agent, via/subject, provider, broker principal/policy
-revision, policy IDs/digest, and credential. Physical paths, audit scope, record IDs, content/dedup,
-evidence, authority, and generations are separate unkeyed SHA-256 domains, so no two are equal.
-Nothing in them is secret: isolation is the broker granting only the caller's own scope and the host
-binding each handle to that scope's directory, and a name the operator can recompute is a name the
-operator could already list.
-Storage spans omit identity/scope/provider/capability and exact payload bytes; only operation/sync/
-quota counts and powers-of-two byte buckets remain.
+Storage audit records carry every field a non-storage record does — principal, actor/agent,
+via/subject, provider, broker principal and policy revision, policy IDs and digest, and credential —
+plus the audit-scope commitment and storage evidence. Physical paths, audit scope, record IDs,
+content/dedup, evidence, authority, and generations are separate unkeyed SHA-256 domains, so no two
+are equal. Nothing in them is secret: isolation is the broker granting only the caller's own scope
+and the host binding each handle to that scope's directory, and a name the operator can recompute is
+a name the operator could already list.
+Storage spans likewise carry identity, capability, provider, input, and the namespace token, and
+storage evidence carries exact read and write byte counts. The telemetry store is inside the
+operator's boundary, which already holds the conversation
+([`observability.md`](observability.md#storage-telemetry-and-audit)).
 
 The filesystem boundary retains directory descriptors and uses descriptor-relative no-follow
 opens, scans, creates, renames, and unlinks. It detects/refuses ordinary symlinks, hard links, wrong

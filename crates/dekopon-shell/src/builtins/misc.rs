@@ -586,9 +586,8 @@ mod tests {
             ..Limits::default()
         };
         let started = std::time::Instant::now();
-        let failure =
-            run_builtin_with(&Sleep, &["30"], None, limits, None, &mut Default::default())
-                .expect_err("an oversized sleep trips the deadline");
+        let failure = run_builtin_with(&Sleep, &["30"], None, limits, &mut Default::default())
+            .expect_err("an oversized sleep trips the deadline");
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "sleep was not capped"
@@ -613,15 +612,9 @@ mod tests {
         };
         for duration in ["1e30", "99999999999999999999", "1e300"] {
             let started = std::time::Instant::now();
-            let failure = run_builtin_with(
-                &Sleep,
-                &[duration],
-                None,
-                limits,
-                None,
-                &mut Default::default(),
-            )
-            .expect_err("an oversized sleep trips the deadline");
+            let failure =
+                run_builtin_with(&Sleep, &[duration], None, limits, &mut Default::default())
+                    .expect_err("an oversized sleep trips the deadline");
             assert!(matches!(failure, CommandFailure::Fatal(_)), "{duration}");
             assert!(started.elapsed() < Duration::from_secs(5), "{duration}");
         }
@@ -631,7 +624,7 @@ mod tests {
     fn cat_reads_only_named_in_memory_buffers() {
         let mut buffers = std::collections::BTreeMap::new();
         buffers.insert("buf".to_owned(), json!("hi"));
-        let result = run_builtin_with(&Cat, &["buf"], None, Limits::default(), None, &mut buffers)
+        let result = run_builtin_with(&Cat, &["buf"], None, Limits::default(), &mut buffers)
             .expect("cat runs");
         assert_eq!(result.value, json!("hi"));
 
@@ -640,7 +633,6 @@ mod tests {
             &["/etc/passwd"],
             None,
             Limits::default(),
-            None,
             &mut buffers,
         )
         .expect_err("real paths are not buffers");

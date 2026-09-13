@@ -1945,10 +1945,10 @@ pub enum AuditEvent {
         invocation: InvocationId,
         /// Trace identifier.
         trace: TraceId,
-        /// Authenticated caller principal; omitted for storage-backed records.
+        /// Authenticated caller principal.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         principal: Option<PrincipalId>,
-        /// Trusted actor; omitted for storage-backed records.
+        /// Trusted actor.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<Actor>,
         /// Attestor peer for attested contexts; absent for direct peers.
@@ -1968,12 +1968,12 @@ pub enum AuditEvent {
         /// Selected provider when a rule matched.
         #[serde(skip_serializing_if = "Option::is_none")]
         provider: Option<ProviderId>,
-        /// Broker principal that owns the authorization transition; omitted for storage records.
+        /// Broker principal that owns the authorization transition.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         authorized_by: Option<PrincipalId>,
         /// Broker decision identifier.
         decision_id: String,
-        /// Evaluated policy revision; omitted for storage records.
+        /// Evaluated policy revision.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy_revision: Option<String>,
         /// Identifiers of the Cedar policies that determined this decision.
@@ -2005,10 +2005,10 @@ pub enum AuditEvent {
         invocation: InvocationId,
         /// Trace identifier.
         trace: TraceId,
-        /// Authenticated caller principal; omitted for storage-backed records.
+        /// Authenticated caller principal.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         principal: Option<PrincipalId>,
-        /// Trusted actor; omitted for storage-backed records.
+        /// Trusted actor.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<Actor>,
         /// Attestor peer for attested contexts; absent for direct peers.
@@ -2025,15 +2025,15 @@ pub enum AuditEvent {
         /// Native sink in which the DRN was consumed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         secret_sink: Option<SecretSinkKind>,
-        /// Trusted selected provider; omitted for storage-backed records.
+        /// Trusted selected provider.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<ProviderId>,
-        /// Broker principal that owned the authorization transition; omitted for storage records.
+        /// Broker principal that owned the authorization transition.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         authorized_by: Option<PrincipalId>,
         /// Broker decision identifier.
         decision_id: String,
-        /// Evaluated policy revision; omitted for storage records.
+        /// Evaluated policy revision.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy_revision: Option<String>,
         /// Identifiers of the Cedar policies that authorized this execution.
@@ -2071,7 +2071,7 @@ pub enum AuditEvent {
         /// Scope commitment for storage records, distinct from physical path tokens.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         storage_scope_commitment: Option<StorageScopeCommitment>,
-        /// Content-free coarse storage evidence.
+        /// Storage evidence: operation, sync, and quota counts and the exact bytes read and written.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         storage: Option<StorageEvidence>,
     },
@@ -2412,11 +2412,10 @@ where
 
     /// Whether trusted routing constraints classify this capability as storage-backed.
     ///
-    /// Used before outer span construction so generic storage providers receive the same
-    /// identity-free telemetry treatment as the reserved chat-memory route. Every chat-memory
-    /// route declares chat storage, so one test answers for both.
-    #[must_use]
-    pub fn capability_uses_storage(&self, capability: &CapabilityId) -> bool {
+    /// It selects only how a denial's decision digest is committed; a storage-backed record and
+    /// span carry every field any other one carries. Every chat-memory route declares chat
+    /// storage, so one test answers for both.
+    fn capability_uses_storage(&self, capability: &CapabilityId) -> bool {
         self.constraints
             .get(capability)
             .is_some_and(|set| set.constraints.storage.is_some() || set.route.is_chat_memory())
@@ -3293,20 +3292,9 @@ where
         request: InvocationRequest,
         refusal: Option<Refusal>,
     ) -> Result<InvocationResult, BrokerError> {
-        // A storage-backed capability opens the blind span — identifiers and the decision only —
-        // because its input names storage keys the storage boundary exists to contain. Every other
-        // capability records its input: a decision a trace cannot attribute to a proposal is not a
-        // run anyone can reconstruct.
-        let storage_candidate = self.capability_uses_storage(&request.capability);
-        let authorize = if storage_candidate {
-            tracing::info_span!(
-                "broker.authorize",
-                invocation = %request.id,
-                outcome = tracing::field::Empty,
-                policy.errors_present = tracing::field::Empty,
-            )
-        } else {
-            tracing::info_span!(
+        // Every capability, storage-backed or not, records who proposed what: a decision a trace
+        // cannot attribute to a proposal is not a run anyone can reconstruct.
+        let authorize = tracing::info_span!(
             "broker.authorize",
             invocation = %request.id,
             capability = %request.capability,
@@ -3315,20 +3303,17 @@ where
             outcome = tracing::field::Empty,
             policy.errors_present = tracing::field::Empty,
             input = tracing::field::Empty,
-            )
-        };
-        if !storage_candidate && let Some(subject) = context.attested_subject() {
+        );
+        if let Some(subject) = context.attested_subject() {
             authorize.record("subject", tracing::field::display(subject));
         }
-        if !storage_candidate && let Some(via) = context.via() {
+        if let Some(via) = context.via() {
             authorize.record("via", tracing::field::display(via));
         }
         // Provider input is recorded unconditionally: a trace that omits what was proposed cannot
         // reconstruct the run. A `Redacted` value inside it still renders its marker, because that
         // is a property of the value rather than of this span.
-        if !storage_candidate {
-            authorize.record("input", tracing::field::display(&request.input));
-        }
+        authorize.record("input", tracing::field::display(&request.input));
         // Instrumented rather than entered with a guard: on every denial this section awaits an
         // audit append that can suspend. A guard held across that await stays entered on the
         // worker thread while this task is suspended, so another connection's spans parent under
@@ -3380,7 +3365,7 @@ where
                 authorize.record("outcome", reason);
                 if decision.errors_present {
                     // The invocation identifier only: it joins this event to the authorize span,
-                    // which is where the capability lives when the route may carry one.
+                    // which is where the capability lives.
                     tracing::warn!(
                         event = "broker_policy_evaluation_error",
                         invocation = %request.id,
@@ -3471,25 +3456,21 @@ where
             ControlFlow::Break(denied) => return Ok(denied),
             ControlFlow::Continue(allowed) => allowed,
         };
-        let provider = set.provider.clone();
-        let execute = if set.constraints.storage.is_some() {
-            tracing::info_span!(
-                "broker.execute",
-                storage = true,
-                storage.namespace = tracing::field::Empty,
-                storage.reset = tracing::field::Empty,
-                outcome = tracing::field::Empty,
-                error = tracing::field::Empty,
-            )
-        } else {
-            tracing::info_span!(
-                "broker.execute",
-                provider = %provider,
-                credential = tracing::field::Empty,
-                outcome = tracing::field::Empty,
-                error = tracing::field::Empty,
-            )
-        };
+        // One span for every execution. A storage-backed one adds `storage`, the namespace its
+        // chat scope lives in, and whether that namespace was reset; it withholds nothing.
+        let execute = tracing::info_span!(
+            "broker.execute",
+            provider = %set.provider,
+            credential = tracing::field::Empty,
+            storage = tracing::field::Empty,
+            storage.namespace = tracing::field::Empty,
+            storage.reset = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+            error = tracing::field::Empty,
+        );
+        if set.constraints.storage.is_some() {
+            execute.record("storage", true);
+        }
         // The symbolic name only, exactly as the audit record carries it: once one capability can
         // present two credentials, a trace that names neither cannot say which organization a
         // write reached. `Redacted` keeps the value itself out of both.
@@ -3555,34 +3536,22 @@ where
         self.record_audit(AuditEvent::Decision {
             invocation: request.id.clone(),
             trace,
-            principal: (!storage_backed).then(|| context.principal().clone()),
-            actor: (!storage_backed).then(|| context.actor().clone()),
-            via: (!storage_backed).then(|| context.via().cloned()).flatten(),
-            attested_subject: (!storage_backed)
-                .then(|| context.attested_subject().cloned())
-                .flatten(),
+            principal: Some(context.principal().clone()),
+            actor: Some(context.actor().clone()),
+            via: context.via().cloned(),
+            attested_subject: context.attested_subject().cloned(),
             capability: request.capability.clone(),
-            secret: (!storage_backed)
-                .then(|| {
-                    request
-                        .secret_use
-                        .as_ref()
-                        .map(|secret| secret.secret().clone())
-                })
-                .flatten(),
-            secret_sink: (!storage_backed)
-                .then(|| request.secret_use.as_ref().map(SecretUseProposal::sink))
-                .flatten(),
+            secret: request
+                .secret_use
+                .as_ref()
+                .map(|secret| secret.secret().clone()),
+            secret_sink: request.secret_use.as_ref().map(SecretUseProposal::sink),
             provider: None,
-            authorized_by: (!storage_backed).then(|| self.broker_principal.clone()),
+            authorized_by: Some(self.broker_principal.clone()),
             decision_id: decision_id.clone(),
-            policy_revision: (!storage_backed).then(|| self.policy_revision.clone()),
-            policy_ids: if storage_backed {
-                Vec::new()
-            } else {
-                policy_ids
-            },
-            policy_digest: (!storage_backed).then(|| self.policy_digest.clone()),
+            policy_revision: Some(self.policy_revision.clone()),
+            policy_ids,
+            policy_digest: Some(self.policy_digest.clone()),
             allowed: false,
             reason: Some(reason.to_owned()),
             decision_digest: digest.clone(),
@@ -3784,20 +3753,10 @@ where
         self.record_audit(AuditEvent::Decision {
             invocation: invocation_id.clone(),
             trace,
-            principal: storage_scope_commitment
-                .is_none()
-                .then(|| context.principal().clone()),
-            actor: storage_scope_commitment
-                .is_none()
-                .then(|| context.actor().clone()),
-            via: storage_scope_commitment
-                .is_none()
-                .then(|| context.via().cloned())
-                .flatten(),
-            attested_subject: storage_scope_commitment
-                .is_none()
-                .then(|| context.attested_subject().cloned())
-                .flatten(),
+            principal: Some(context.principal().clone()),
+            actor: Some(context.actor().clone()),
+            via: context.via().cloned(),
+            attested_subject: context.attested_subject().cloned(),
             capability: capability.clone(),
             secret: authorized
                 .proposal()
@@ -3809,24 +3768,12 @@ where
                 .secret_use
                 .as_ref()
                 .map(SecretUseProposal::sink),
-            provider: storage_scope_commitment
-                .is_none()
-                .then(|| set.provider.clone()),
-            authorized_by: storage_scope_commitment
-                .is_none()
-                .then(|| self.broker_principal.clone()),
+            provider: Some(set.provider.clone()),
+            authorized_by: Some(self.broker_principal.clone()),
             decision_id: decision_id.clone(),
-            policy_revision: storage_scope_commitment
-                .is_none()
-                .then(|| self.policy_revision.clone()),
-            policy_ids: if storage_scope_commitment.is_some() {
-                Vec::new()
-            } else {
-                policy_ids.clone()
-            },
-            policy_digest: storage_scope_commitment
-                .is_none()
-                .then(|| self.policy_digest.clone()),
+            policy_revision: Some(self.policy_revision.clone()),
+            policy_ids: policy_ids.clone(),
+            policy_digest: Some(self.policy_digest.clone()),
             allowed: true,
             reason: None,
             decision_digest,
@@ -4565,8 +4512,10 @@ fn report_inspection_refusal(
 /// crate linking any telemetry SDK.
 ///
 /// Field names follow [`AuditEvent`]'s own names rather than the surrounding span's. Absent is not
-/// null: a storage-routed decision names no principal, actor, provider, or policy at all, and every
-/// `Option` field simply disappears, so a present field always means the broker knew it. Nothing
+/// null: a denial names no provider, a direct peer no `via` or subject, and every `Option` field
+/// the broker did not know simply disappears, so a present field always means it knew. A
+/// storage-backed record carries every field any other record carries, plus its scope commitment
+/// and storage evidence. Nothing
 /// here can carry secret bytes — `secret` and `credential` are the symbolic names owner
 /// configuration already holds, and the HTTP evidence is the same sanitized set the span carries:
 /// method, authority, status, accounted bytes, and whether a credential was injected.
@@ -4758,16 +4707,13 @@ fn execution_event(
     storage_scope_commitment: Option<StorageScopeCommitment>,
     storage: Option<StorageEvidence>,
 ) -> AuditEvent {
-    let storage_backed = storage_scope_commitment.is_some();
     AuditEvent::Execution {
         invocation: invocation.clone(),
         trace,
-        principal: (!storage_backed).then(|| context.principal().clone()),
-        actor: (!storage_backed).then(|| context.actor().clone()),
-        via: (!storage_backed).then(|| context.via().cloned()).flatten(),
-        attested_subject: (!storage_backed)
-            .then(|| context.attested_subject().cloned())
-            .flatten(),
+        principal: Some(context.principal().clone()),
+        actor: Some(context.actor().clone()),
+        via: context.via().cloned(),
+        attested_subject: context.attested_subject().cloned(),
         capability: capability.clone(),
         secret: set
             .constraints
@@ -4779,21 +4725,15 @@ fn execution_event(
             .secret_use
             .as_ref()
             .map(|secret| secret.sink),
-        provider: (!storage_backed).then(|| set.provider.clone()),
-        authorized_by: (!storage_backed).then(|| authorized_by.clone()),
+        provider: Some(set.provider.clone()),
+        authorized_by: Some(authorized_by.clone()),
         decision_id: decision_id.to_owned(),
-        policy_revision: (!storage_backed).then(|| policy_revision.to_owned()),
-        policy_ids: if storage_backed {
-            Vec::new()
-        } else {
-            policy_ids.to_vec()
-        },
-        policy_digest: (!storage_backed).then(|| policy_digest.to_owned()),
+        policy_revision: Some(policy_revision.to_owned()),
+        policy_ids: policy_ids.to_vec(),
+        policy_digest: Some(policy_digest.to_owned()),
         effect: set.effect,
         risk: set.risk,
-        credential: (!storage_backed)
-            .then(|| credential.map(str::to_owned))
-            .flatten(),
+        credential: credential.map(str::to_owned),
         outcome,
         duration_ms,
         error,

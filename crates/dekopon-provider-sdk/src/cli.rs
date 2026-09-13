@@ -42,6 +42,7 @@
 //!             Some(("view", view)) => Ok(CommandInvocation {
 //!                 capability: PR_READ.parse().expect("static capability ID"),
 //!                 input: serde_json::json!({ "number": view.get_one::<String>("number") }),
+//!                 secret_use: None,
 //!             }),
 //!             _ => Err(ProviderError::new("usage", "gh pr view <NUMBER>")),
 //!         },
@@ -161,6 +162,7 @@ mod tests {
                 "number": view.get_one::<String>("number").expect("required by the tree"),
                 "stdin": stdin,
             }),
+            secret_use: None,
         })
     }
 

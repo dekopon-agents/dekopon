@@ -1,8 +1,8 @@
-//! What the per-command spans carry, and — more importantly — what they must not.
+//! What the per-command spans carry.
 //!
 //! These assert on real emitted `tracing` output rather than on the helpers in the parent module,
-//! because the redaction guarantee is a property of the call site: a field recorded by mistake in
-//! `run_argv` would leave every helper here passing.
+//! because what a span records is a property of the call site: a field recorded wrongly, or not at
+//! all, in `run_argv` would leave every helper here passing.
 
 use std::{
     collections::BTreeMap,
@@ -11,7 +11,7 @@ use std::{
 };
 
 use tracing::{
-    Event, Subscriber,
+    Subscriber,
     field::{Field, Visit},
     span,
 };
@@ -25,10 +25,10 @@ use crate::{Interpreter, Limits, ScriptOutcome, interp::tests::Fixture};
 
 use super::{CONTROL_WORDS, SCRIPT_SPAN};
 
-/// One span or event, flattened to the strings a remote collector would receive.
+/// One span, flattened to the strings a remote collector would receive.
 #[derive(Clone, Debug)]
 struct Captured {
-    /// Span name, or `None` for an event.
+    /// Span name.
     span: Option<String>,
     /// Enclosing span names, innermost first.
     parents: Vec<String>,
@@ -41,10 +41,10 @@ impl Captured {
     }
 }
 
-/// Collects every field of a span or event as its rendered string.
+/// Collects every field of a span as its rendered string.
 ///
-/// Rendering everything — including values recorded as `Debug` — is the point: a redaction test
-/// that inspected only the fields it expected would not notice a new one carrying a secret.
+/// Every value is rendered to the text a collector would hold, whatever type it was recorded with:
+/// integers such as the `.bytes` totals arrive through `record_debug`.
 #[derive(Default)]
 struct Fields(BTreeMap<String, String>);
 
@@ -58,10 +58,9 @@ impl Visit for Fields {
     }
 }
 
-/// A subscriber layer that records every span and event for later inspection.
+/// A subscriber layer that records every span for later inspection.
 struct CaptureLayer {
     spans: Arc<Mutex<Vec<Captured>>>,
-    events: Arc<Mutex<Vec<Captured>>>,
 }
 
 impl<S> Layer<S> for CaptureLayer
@@ -81,7 +80,8 @@ where
         }
     }
 
-    /// Fields recorded after creation — the exit code and outcome — arrive here.
+    /// Fields recorded after creation — arguments, stdin, output, the exit code, and the outcome
+    /// — arrive here.
     fn on_record(&self, id: &span::Id, values: &span::Record<'_>, context: Context<'_, S>) {
         if let Some(span) = context.span(id) {
             let mut extensions = span.extensions_mut();
@@ -89,21 +89,6 @@ where
                 values.record(fields);
             }
         }
-    }
-
-    fn on_event(&self, event: &Event<'_>, context: Context<'_, S>) {
-        let mut fields = Fields::default();
-        event.record(&mut fields);
-        self.events.lock().expect("event lock").push(Captured {
-            span: None,
-            parents: context
-                .event_scope(event)
-                .into_iter()
-                .flatten()
-                .map(|span| span.name().to_owned())
-                .collect(),
-            fields: fields.0,
-        });
     }
 
     fn on_close(&self, id: span::Id, context: Context<'_, S>) {
@@ -131,19 +116,9 @@ where
 struct Telemetry {
     outcome: ScriptOutcome,
     spans: Vec<Captured>,
-    events: Vec<Captured>,
 }
 
 impl Telemetry {
-    /// Every field value emitted anywhere, which is what a collector would end up holding.
-    fn all_values(&self) -> Vec<&str> {
-        self.spans
-            .iter()
-            .chain(&self.events)
-            .flat_map(|record| record.fields.values().map(String::as_str))
-            .collect()
-    }
-
     /// Every `shell.command` span, as `(kind, name)` pairs.
     ///
     /// Spans are captured on close, so these are in completion order: a command nested inside a
@@ -160,6 +135,17 @@ impl Telemetry {
             })
             .collect()
     }
+
+    /// Every `shell.command` span one command word opened, in completion order.
+    fn command_spans(&self, name: &str) -> Vec<&Captured> {
+        self.spans
+            .iter()
+            .filter(|span| {
+                span.span.as_deref() == Some("shell.command")
+                    && span.field("shell.command.name") == Some(name)
+            })
+            .collect()
+    }
 }
 
 /// Runs one script under a capturing subscriber scoped to this thread.
@@ -170,10 +156,8 @@ fn capture(script: &str) -> Telemetry {
 /// Runs one script, optionally inside an enclosing span standing in for the runner's own.
 fn capture_with(script: &str, limits: Limits, enclose: bool) -> Telemetry {
     let spans = Arc::new(Mutex::new(Vec::new()));
-    let events = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::registry().with(CaptureLayer {
         spans: Arc::clone(&spans),
-        events: Arc::clone(&events),
     });
 
     // Thread-local rather than global, so these tests stay independent under the default
@@ -183,24 +167,28 @@ fn capture_with(script: &str, limits: Limits, enclose: bool) -> Telemetry {
         // disabled forever, and entering it would prove nothing about nesting.
         let enclosing = enclose.then(|| tracing::info_span!("caller.enclosing"));
         let _entered = enclosing.as_ref().map(tracing::Span::enter);
-        Interpreter::new(limits)
-            .with_curl_capability(Some("http-probe.fetch".to_owned()))
-            .run(script, &Fixture::default())
+        Interpreter::new(limits).run(script, &Fixture::default())
     });
 
     let spans = spans.lock().expect("span lock").clone();
-    let events = events.lock().expect("event lock").clone();
-    Telemetry {
-        outcome,
-        spans,
-        events,
-    }
+    Telemetry { outcome, spans }
+}
+
+/// Asserts one recorded attribute and the byte total recorded beside it.
+fn assert_recorded(span: &Captured, field: &str, recorded: &str, total: usize) {
+    assert_eq!(span.field(field), Some(recorded), "{field}");
+    let bytes = format!("{field}.bytes");
+    assert_eq!(
+        span.field(&bytes),
+        Some(total.to_string().as_str()),
+        "{bytes}"
+    );
 }
 
 #[test]
 fn every_command_produces_exactly_one_span() {
     let telemetry =
-        capture("greet() { echo hi; }\ngreet\njq -n 1\necho.echo --message two\nnosuchcommand\n:");
+        capture("greet() { echo hi; }\ngreet\njq -n 1\nprobe upper --text two\nnosuchcommand\n:");
 
     // One span per command word actually executed. `greet`'s body runs `echo`, so the function
     // call and the command inside it are both here — which is the point of instrumenting the one
@@ -213,7 +201,7 @@ fn every_command_produces_exactly_one_span() {
             ("builtin", "echo"),
             ("function", "greet"),
             ("builtin", "jq"),
-            ("capability", "echo.echo"),
+            ("provider-command", "probe"),
             ("not-found", "nosuchcommand"),
             ("control", ":"),
         ]
@@ -239,20 +227,25 @@ fn a_span_carries_the_outcome_exit_code_and_argument_count() {
     assert_eq!(span.field("shell.command.name"), Some("echo"));
     assert_eq!(span.field("shell.command.kind"), Some("builtin"));
     assert_eq!(span.field("shell.command.argument_count"), Some("3"));
+    assert_eq!(
+        span.field("shell.command.arguments"),
+        Some(r#"["one","two","three"]"#)
+    );
     assert_eq!(span.field("shell.command.exit_code"), Some("0"));
     assert_eq!(span.field("outcome"), Some("succeeded"));
 }
 
 #[test]
 fn a_denied_capability_is_not_flattened_into_a_generic_failure() {
-    // A refusal, a provider that ran and errored, and a capability that does not exist are three
+    // A refusal, a provider that ran and errored, and a capability that is not reachable are three
     // different operational stories; `CapabilityCallResult` keeps them apart and so must this.
     for (script, outcome, exit_code) in [
-        ("echo.echo --message hi", "succeeded", "0"),
-        ("provider.broken", "failed", "1"),
-        ("policy.denied", "denied", "126"),
-        // The shared fixture answers every other identifier with success, so 127 is shown here by
-        // an unresolved word; both paths land on the same code and the same label.
+        ("probe upper --text hi", "succeeded", "0"),
+        ("probe broken", "failed", "1"),
+        ("probe denied", "denied", "126"),
+        // A proposal for a capability this session was not granted, and a word nothing provides,
+        // land on the same code and the same label.
+        ("probe ungranted", "not-found", "127"),
         ("nosuchcommand", "not-found", "127"),
     ] {
         let telemetry = capture(script);
@@ -260,7 +253,7 @@ fn a_denied_capability_is_not_flattened_into_a_generic_failure() {
             .spans
             .iter()
             .find(|span| span.span.as_deref() == Some("shell.command"))
-            .unwrap_or_else(|| panic!("{script}: a completed event"));
+            .unwrap_or_else(|| panic!("{script}: a completed span"));
         assert_eq!(completed.field("outcome"), Some(outcome), "{script}");
         assert_eq!(
             completed.field("shell.command.exit_code"),
@@ -292,7 +285,7 @@ fn an_exhausted_budget_is_reported_as_a_limit_rather_than_a_failure() {
     // The capability ceiling is the one a *command* trips. The step budget is charged between
     // statements, so it ends the script without any command span ever seeing it.
     let telemetry = capture_with(
-        "while true; do echo.echo --message x; done",
+        "while true; do probe upper --text x; done",
         Limits {
             max_capability_calls: 2,
             ..Limits::default()
@@ -308,39 +301,71 @@ fn an_exhausted_budget_is_reported_as_a_limit_rather_than_a_failure() {
 }
 
 #[test]
-fn argument_values_never_reach_telemetry() {
-    // Command *words* are exported in full; argument values are the one thing argv carries that
-    // this crate must not export, because a bearer token in a `curl -d` body and a capability input
-    // object are secret bytes. Asserting their *absence* is the test — asserting that the safe
-    // fields are present would pass just as happily while a `shell.command.arguments` field sat
-    // beside them leaking every one of these.
-    const SECRET: &str = "DEKOPON_SHELL_SECRET_DO_NOT_EXPORT";
-    let script = format!(
-        "curl -d '{{\"apiKey\":\"{SECRET}\"}}' https://example.test/{SECRET}\n\
-         cap echo.echo '{{\"token\":\"{SECRET}\"}}'\n\
-         echo.echo --message {SECRET}\n\
-         echo {SECRET} | grep {SECRET}\n\
-         jq -n '\"{SECRET}\"'\n\
-         x={SECRET}\n\
-         echo \"$x\"\n"
-    );
+fn a_command_span_records_its_arguments_stdin_and_output() {
+    // One trace, complete: the argv a command word ran with, the value piped into it, and what it
+    // produced are the record of what the agent did, not just the word it typed.
+    let telemetry = capture("probe upper --text hello\necho piped | probe upper -");
+    let probes = telemetry.command_spans("probe");
+    let [flag, piped] = probes.as_slice() else {
+        panic!("two probe spans: {probes:?}");
+    };
 
-    let telemetry = capture(&script);
-    assert!(
-        !telemetry.spans.is_empty(),
-        "the capture harness recorded nothing, so absence here would prove nothing"
-    );
+    let arguments = r#"["upper","--text","hello"]"#;
+    assert_recorded(flag, "shell.command.arguments", arguments, arguments.len());
+    // The capability's result, not an echo of the argv: the fixture uppercases.
+    let output = r#"{"text":"HELLO"}"#;
+    assert_recorded(flag, "shell.command.output", output, output.len());
+    // Nothing was piped, which is a different fact from an empty string being piped.
+    assert_eq!(flag.field("shell.command.stdin"), None);
+    assert_eq!(flag.field("shell.command.stdin.bytes"), None);
 
-    for value in telemetry.all_values() {
-        assert!(
-            !value.contains(SECRET),
-            "a script value reached telemetry: {value:?}"
-        );
+    let arguments = r#"["upper","-"]"#;
+    assert_recorded(piped, "shell.command.arguments", arguments, arguments.len());
+    assert_recorded(piped, "shell.command.stdin", "piped", "piped".len());
+    let output = r#"{"text":"PIPED"}"#;
+    assert_recorded(piped, "shell.command.output", output, output.len());
+}
+
+#[test]
+fn an_oversized_attribute_keeps_a_4096_byte_head_a_marker_and_its_full_length() {
+    // Bound an attribute's size, never the span count. The cap and the marker are the documented
+    // contract an operator's queries rely on, so they are spelled out here rather than borrowed
+    // from the implementation.
+    const CAP: usize = 4096;
+    const MARKER: &str = "…[truncated]";
+
+    let payload = "x".repeat(CAP + 904);
+    let telemetry = capture(&format!(
+        "probe upper --text {payload}\necho {payload} | probe upper -"
+    ));
+    let probes = telemetry.command_spans("probe");
+    let [flag, piped] = probes.as_slice() else {
+        panic!("two probe spans: {probes:?}");
+    };
+
+    let arguments = format!(r#"["upper","--text","{payload}"]"#);
+    let output = format!(r#"{{"text":"{}"}}"#, payload.to_uppercase());
+    for (span, field, full) in [
+        (flag, "shell.command.arguments", &arguments),
+        (flag, "shell.command.output", &output),
+        (piped, "shell.command.stdin", &payload),
+        (piped, "shell.command.output", &output),
+    ] {
+        // Every byte here is ASCII, so the head ends on a character boundary at exactly the cap.
+        let head = format!("{}{MARKER}", &full[..CAP]);
+        assert_recorded(span, field, &head, full.len());
     }
 
-    // The script itself really did carry the sentinel, so the absence above is redaction rather
-    // than a script that never mentioned it.
-    assert!(telemetry.outcome.output.contains(SECRET));
+    // A value of exactly the cap is whole: nothing was cut, so nothing says it was.
+    let exact = "x".repeat(CAP - r#"["upper","--text",""]"#.len());
+    let telemetry = capture(&format!("probe upper --text {exact}"));
+    let probes = telemetry.command_spans("probe");
+    let [span] = probes.as_slice() else {
+        panic!("one probe span: {probes:?}");
+    };
+    let arguments = format!(r#"["upper","--text","{exact}"]"#);
+    assert_eq!(arguments.len(), CAP);
+    assert_recorded(span, "shell.command.arguments", &arguments, CAP);
 }
 
 #[test]
@@ -362,36 +387,58 @@ fn a_model_authored_command_word_is_recorded_verbatim() {
     );
 }
 
+/// A capability identifier typed as a command word is an unknown word, and the trace says so.
+///
+/// There is no separate kind for it, granted or not. The word is on the span and its arguments
+/// beside it, so an operator still sees exactly what the model reached for.
+#[test]
+fn a_capability_shaped_word_is_recorded_as_not_found_with_its_arguments() {
+    let telemetry = capture("cli-probe.upper --text hi\nwikipedia_page --title x");
+
+    assert_eq!(
+        telemetry.commands(),
+        vec![
+            ("not-found", "cli-probe.upper"),
+            ("not-found", "wikipedia_page"),
+        ]
+    );
+    let spans = telemetry.command_spans("wikipedia_page");
+    let [span] = spans.as_slice() else {
+        panic!("one wikipedia_page span: {spans:?}");
+    };
+    let arguments = r#"["--title","x"]"#;
+    assert_recorded(span, "shell.command.arguments", arguments, arguments.len());
+    assert_eq!(span.field("shell.command.exit_code"), Some("127"));
+}
+
 #[test]
 fn xargs_records_every_command_it_actually_drove() {
     // One script word that maps a command over three items really did run three commands, so a
     // trace that showed one would be describing a script nobody wrote.
     // The list is built through `jq` rather than `echo`, because `echo` produces one string and
     // `xargs` would then have a single element to map over, passing for the wrong reason.
-    let telemetry = capture("echo.echo --a a --b b --c c | jq '[.a,.b,.c]' | xargs echo");
+    let telemetry =
+        capture("probe object --a a --b b --c c | jq '[.a,.b,.c]' | xargs probe upper --text");
 
-    let echoes = telemetry
-        .commands()
-        .into_iter()
-        .filter(|(kind, name)| *kind == "builtin" && *name == "echo")
-        .count();
-    assert_eq!(
-        echoes, 3,
-        "one `echo` per element, not one for the whole list"
-    );
-
-    // Each of those nests inside the `xargs` span rather than beside it, so the relationship
-    // between the one script word and the commands it drove survives into the trace.
-    let nested = telemetry
-        .spans
+    // The producer of the list is one `probe` span beside the `xargs` one; each element adds one
+    // more nested *inside* it, so the relationship between the one script word and the commands it
+    // drove survives into the trace.
+    let probes = telemetry.command_spans("probe");
+    assert_eq!(probes.len(), 4, "the producer plus one per element");
+    let nested = probes
         .iter()
-        .filter(|span| {
-            span.span.as_deref() == Some("shell.command")
-                && span.field("shell.command.name") == Some("echo")
-                && span.parents.iter().any(|parent| parent == "shell.command")
-        })
-        .count();
-    assert_eq!(nested, 3);
+        .filter(|span| span.parents.iter().any(|parent| parent == "shell.command"))
+        .map(|span| span.field("shell.command.arguments").unwrap_or("<missing>"))
+        .collect::<Vec<_>>();
+    // Each drove its own argv, element appended, not one command for the whole list.
+    assert_eq!(
+        nested,
+        vec![
+            r#"["upper","--text","a"]"#,
+            r#"["upper","--text","b"]"#,
+            r#"["upper","--text","c"]"#,
+        ]
+    );
 }
 
 #[test]
@@ -415,14 +462,14 @@ fn command_spans_nest_under_the_callers_active_span() {
 
 #[test]
 fn one_script_span_carries_the_totals_for_the_whole_run() {
-    let telemetry = capture("greet() { echo hi; }\ngreet\nnosuchcommand\necho.echo --message two");
+    let telemetry = capture("greet() { echo hi; }\ngreet\nnosuchcommand\nprobe upper --text two");
 
     let script = telemetry
         .spans
         .iter()
         .find(|span| span.span.as_deref() == Some(SCRIPT_SPAN))
         .expect("one script span");
-    // `greet`, the `echo` inside it, `nosuchcommand`, and the capability call.
+    // `greet`, the `echo` inside it, `nosuchcommand`, and the provider command.
     assert_eq!(script.field("shell.script.commands"), Some("4"));
     assert_eq!(script.field("shell.script.capability_commands"), Some("1"));
     assert_eq!(script.field("shell.script.failed_commands"), Some("1"));
@@ -498,38 +545,4 @@ fn control_words_and_their_dispatcher_agree() {
             .output
             .contains("command not found")
     );
-}
-
-/// A word the session was not granted, in a namespace it holds, is a different fact from a typo.
-///
-/// The kind is what separates them, and the word itself says which namespace was reached into — a
-/// separate `capability.namespace` attribute would only repeat the prefix of a word already on the
-/// span.
-#[test]
-fn an_ungranted_word_and_an_unknown_word_are_distinct_kinds() {
-    let telemetry = capture("echo.nonexistent\nnosuch.capability");
-
-    assert_eq!(
-        telemetry.commands(),
-        vec![
-            ("not-granted", "echo.nonexistent"),
-            ("not-found", "nosuch.capability")
-        ]
-    );
-}
-
-/// The script must not be able to tell the two apart.
-///
-/// A model that could distinguish "no such command" from "you were not granted that" would have an
-/// oracle for enumerating the deployment's capabilities one guess at a time.
-#[test]
-fn a_script_cannot_distinguish_ungranted_from_unknown() {
-    let ungranted =
-        Interpreter::new(Limits::default()).run("echo.nonexistent", &Fixture::default());
-    let unknown = Interpreter::new(Limits::default()).run("nosuch.capability", &Fixture::default());
-    assert_eq!(
-        ungranted.output.replace("echo.nonexistent", "WORD"),
-        unknown.output.replace("nosuch.capability", "WORD")
-    );
-    assert_eq!(ungranted.exit_code, unknown.exit_code);
 }

@@ -2510,13 +2510,13 @@ mod tests {
             .expect("404 fixture")
     }
 
-    fn echo_component() -> Vec<u8> {
+    fn cli_probe_component() -> Vec<u8> {
         fs::read(
             PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                 .join("../..")
-                .join("examples/providers/echo-provider.wasm"),
+                .join("examples/providers/cli-probe-provider.wasm"),
         )
-        .expect("checked echo component")
+        .expect("checked cli-probe component")
     }
 
     fn write_set(path: &Path, sources: &[String]) {
@@ -2907,7 +2907,7 @@ providers:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn sync_pins_tags_and_locked_sync_fetches_only_missing_blobs() {
-        let registry = TestRegistry::start(echo_component()).await;
+        let registry = TestRegistry::start(cli_probe_component()).await;
         let directory = tempfile::tempdir().expect("manager fixture");
         let source = format!("{}/test/provider:1.0.0", registry.authority);
         let (manager, _paths) = test_manager(directory.path(), &registry.authority, &[source]);
@@ -2964,7 +2964,7 @@ providers:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn manifest_digest_sources_lock_the_selected_manifest_identity() {
-        let registry = TestRegistry::start(echo_component()).await;
+        let registry = TestRegistry::start(cli_probe_component()).await;
         let directory = tempfile::tempdir().expect("manager fixture");
         let source = format!(
             "{}/test/provider@{}",
@@ -2987,7 +2987,7 @@ providers:
     async fn offline_verification_rejects_missing_insecure_linked_and_symlinked_blobs() {
         use std::os::unix::fs::symlink;
 
-        let registry = TestRegistry::start(echo_component()).await;
+        let registry = TestRegistry::start(cli_probe_component()).await;
         let directory = tempfile::tempdir().expect("manager fixture");
         let source = format!("{}/test/provider:1.0.0", registry.authority);
         let (manager, _paths) = test_manager(directory.path(), &registry.authority, &[source]);
@@ -3042,7 +3042,7 @@ providers:
 
     #[tokio::test(flavor = "multi_thread")]
     async fn failed_complete_set_validation_leaves_the_active_lock_unchanged() {
-        let registry = TestRegistry::start(echo_component()).await;
+        let registry = TestRegistry::start(cli_probe_component()).await;
         let directory = tempfile::tempdir().expect("manager fixture");
         let first_source = format!("{}/one/provider:1.0.0", registry.authority);
         let second_source = format!("{}/two/provider:1.0.0", registry.authority);
@@ -3061,7 +3061,7 @@ providers:
         let error = manager
             .sync()
             .await
-            .expect_err("two components describing echo conflict as one complete set");
+            .expect_err("two components declaring cli-probe conflict as one complete set");
         assert!(
             matches!(
                 error,

@@ -152,18 +152,19 @@ The session:
    sandboxed shell. It writes something like this — one tool call, several capability invocations:
 
    ```console
-   $ http-probe.fetch --input '{"uri":"https://api.example.com/records/incident-4711"}'
+   $ httpprobe fetch --uri https://api.example.com/records/incident-4711
    {"status":200,"bodyBytes":8931,"headerCount":7,
     "bodyText":"{\"id\":\"incident-4711\",\"state\":\"investigating\",\"etag\":\"\\\"v7\\\"\"}", ...}
 
-   $ http-probe.conditional-write --input '{"uri":"https://api.example.com/records/incident-4711",
-       "expectedEtag":"\"v7\""}'
+   $ httpprobe conditional-write --uri https://api.example.com/records/incident-4711 --expected-etag '"v7"'
    {"observedEtag":"\"v7\"","readStatus":200,"writeStatus":200}
    ```
 
-   Each command word is one capability proposal, not a subprocess: there is no binary and no
-   shell behind it, and there is no generic passthrough — one would collapse two separately
-   policed capabilities into "everything the token can reach".
+   Each `httpprobe` subcommand proposes exactly one capability — `fetch` proposes
+   `http-probe.fetch`, `conditional-write` proposes `http-probe.conditional-write` — and the broker
+   authorizes each on its own. There is no binary and no subprocess behind the word, and there is no
+   generic passthrough: one would collapse two separately policed capabilities into "everything the
+   token can reach".
 3. **The answer.** The session's final text goes back to the DM:
 
    > **dekopond:** Set incident-4711 to resolved. Read and wrote against etag `"v7"`, both

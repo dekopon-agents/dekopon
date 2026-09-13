@@ -251,7 +251,7 @@ async fn provider_attachments_and_chat_asset_inputs_are_per_route_opt_ins() {
     let directory = temporary();
     let mut document = document(directory.path());
     document["routes"][0]["providerAttachments"] = json!({"maxPerReply": 2});
-    document["routes"][0]["chatAssetInputs"] = json!(["echo.echo"]);
+    document["routes"][0]["chatAssetInputs"] = json!(["cli-probe.upper"]);
 
     let resolved = load(directory.path(), &document)
         .await
@@ -264,7 +264,7 @@ async fn provider_attachments_and_chat_asset_inputs_are_per_route_opt_ins() {
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>(),
-        ["echo.echo".to_owned()]
+        ["cli-probe.upper".to_owned()]
     );
     let routes = RoutingTable::bind(&resolved, &catalog(true, Some("reasoning")))
         .expect("the route binds both opt-ins");
@@ -272,7 +272,7 @@ async fn provider_attachments_and_chat_asset_inputs_are_per_route_opt_ins() {
         .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
         .expect("route matches");
     assert_eq!(bound.provider_attachments, 2);
-    assert_eq!(&*bound.chat_asset_inputs, ["echo.echo".to_owned()]);
+    assert_eq!(&*bound.chat_asset_inputs, ["cli-probe.upper".to_owned()]);
 }
 
 /// `apiKeyEnv` has three meanings and they used to have one outcome.
@@ -1270,7 +1270,8 @@ async fn every_failing_transport_connection_is_named_in_one_refusal() {
         catalog_text(true, Some("reasoning")),
     )
     .expect("write catalog");
-    let (broker, mut observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let (broker, mut observed) =
+        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
     let mut document = document(directory.path());
     document["broker"]["serverUid"] = json!(broker.server_uid);
     let paths = [
@@ -2773,10 +2774,10 @@ impl ChatDriver for PartialDeliveryDriver {
 /// set free of provider-SDK machinery it never links in production.
 fn capability(id: &str) -> AvailableCapability {
     serde_json::from_value(json!({
-        "provider": "echo",
+        "provider": "cli-probe",
         "capability": {
             "id": id,
-            "description": "Echoes its input",
+            "description": "Upper-cases the text",
             "effect": "read-only",
             "risk": "Low",
             "inputSchema": {"type": "object"}
@@ -2820,6 +2821,27 @@ fn record_output(output: Value) -> InvocationResult {
         output: Some(output),
         ..record_result(InvocationOutcome::Succeeded, None)
     }
+}
+
+/// The listing of a session that reaches `cli-probe.upper` through the provider's `probe` word.
+fn probe_listing() -> ResponseEnvelope {
+    ResponseEnvelope::capabilities(
+        vec![capability("cli-probe.upper")],
+        vec!["probe".to_owned()],
+    )
+}
+
+/// The broker's answer to `probe upper --text <text>`: the one proposal that argv maps to, built
+/// through the wire shape like the other broker fixtures here.
+fn upper_proposal(text: &str) -> ResponseEnvelope {
+    ResponseEnvelope::command_run(
+        serde_json::from_value(json!({
+            "outcome": "proposed",
+            "capability": "cli-probe.upper",
+            "input": {"text": text}
+        }))
+        .expect("proposal fixture decodes"),
+    )
 }
 
 /// Serves a fixed script of broker responses over a private Unix socket.
@@ -3216,7 +3238,7 @@ async fn an_authorized_message_reaches_its_agent_and_answers_in_chat() {
     let (broker, mut observed) = stub_broker(
         directory.path(),
         vec![ResponseEnvelope::capabilities(
-            vec![capability("echo.echo")],
+            vec![capability("cli-probe.upper")],
             Vec::new(),
         )],
     )
@@ -3265,12 +3287,16 @@ async fn a_provider_attachment_reaches_the_reply_without_entering_the_transcript
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![
-            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
+            probe_listing(),
+            upper_proposal("kitty"),
             ResponseEnvelope::invocation(record_output(attachment_output())),
         ],
     )
     .await;
-    let models = ModelScript::new([script_call("echo.echo '{}'"), answer("Here is your kitty.")]);
+    let models = ModelScript::new([
+        script_call("probe upper --text kitty"),
+        answer("Here is your kitty."),
+    ]);
     let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
     let mut route = route(model_config());
@@ -3331,12 +3357,13 @@ async fn no_model_message_in_a_session_carries_an_attachment_blob() {
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![
-            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
+            probe_listing(),
+            upper_proposal("kitty"),
             ResponseEnvelope::invocation(record_output(output)),
         ],
     )
     .await;
-    let models = ModelScript::new([script_call("echo.echo '{}'"), answer("Posted.")]);
+    let models = ModelScript::new([script_call("probe upper --text kitty"), answer("Posted.")]);
     let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
     let mut route = route(model_config());
@@ -3373,13 +3400,14 @@ async fn a_route_without_the_opt_in_strips_the_attachment_and_says_so() {
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![
-            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
+            probe_listing(),
+            upper_proposal("kitty"),
             ResponseEnvelope::invocation(record_output(attachment_output())),
         ],
     )
     .await;
     let models = ModelScript::new([
-        script_call("echo.echo '{}'"),
+        script_call("probe upper --text kitty"),
         answer("I cannot attach that."),
     ]);
     let driver = Arc::new(RecordingDriver::default());
@@ -3410,7 +3438,7 @@ async fn a_model_call_to_generate_image_is_now_an_unknown_tool() {
     let (broker, _) = stub_broker(
         directory.path(),
         vec![ResponseEnvelope::capabilities(
-            vec![capability("echo.echo")],
+            vec![capability("cli-probe.upper")],
             Vec::new(),
         )],
     )
@@ -3441,7 +3469,8 @@ async fn a_model_call_to_generate_image_is_now_an_unknown_tool() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_freshly_authorized_agent_message_claims_its_exact_sender_thread() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(1, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let models = ModelScript::new([answer("Claimed.")]);
     let driver = Arc::new(RecordingDriver::default());
     let ownership = Arc::new(RecordingThreadOwnership::default());
@@ -3610,7 +3639,7 @@ async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
     let (broker, mut observed) = stub_broker(
         directory.path(),
         vec![
-            ResponseEnvelope::capabilities(vec![capability("echo.echo")], vec!["probe".to_owned()]),
+            probe_listing(),
             ResponseEnvelope::command_run(CommandRunOutcome::Rendered {
                 stdout: "Usage: probe <COMMAND>\n".to_owned(),
                 stderr: String::new(),
@@ -3664,12 +3693,13 @@ async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() 
     let (broker, mut observed) = stub_broker(
         directory.path(),
         vec![
-            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
+            probe_listing(),
+            upper_proposal("maybe"),
             ResponseEnvelope::invocation(record_result(InvocationOutcome::Succeeded, None)),
         ],
     )
     .await;
-    let models = ModelScript::new([script_call("echo.echo '{}'"), decline_reply()]);
+    let models = ModelScript::new([script_call("probe upper --text maybe"), decline_reply()]);
     let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
     let mut route = persistent_route(model_config(), window());
@@ -3694,6 +3724,15 @@ async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() 
             attestation: Some(Attestation { scope: Some(_), .. })
         }
     ));
+    let run = observed.recv().await.expect("the command run").request;
+    assert!(
+        matches!(
+            &run,
+            BrokerRequest::RunCommand { word, argv, .. }
+                if word == "probe" && argv == &["upper", "--text", "maybe"]
+        ),
+        "{run:?}"
+    );
     assert!(matches!(
         observed
             .recv()
@@ -3958,7 +3997,7 @@ async fn authorized_work_publishes_status_until_after_the_durable_reply() {
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![ResponseEnvelope::capabilities(
-            vec![capability("echo.echo")],
+            vec![capability("cli-probe.upper")],
             Vec::new(),
         )],
     )
@@ -4011,7 +4050,7 @@ async fn a_hung_cosmetic_call_cannot_hold_the_answer_and_cleanup_follows_it() {
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![ResponseEnvelope::capabilities(
-            vec![capability("echo.echo")],
+            vec![capability("cli-probe.upper")],
             Vec::new(),
         )],
     )
@@ -4190,7 +4229,7 @@ async fn aborting_the_async_session_cancels_later_blocking_tool_work() {
     let (broker, mut observed) = stub_broker(
         directory.path(),
         vec![
-            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
+            probe_listing(),
             ResponseEnvelope::error(
                 "unexpected-invocation",
                 "tool work should have been cancelled",
@@ -4205,7 +4244,7 @@ async fn aborting_the_async_session_cancels_later_blocking_tool_work() {
             kind: "function".to_owned(),
             function: ModelFunctionCall {
                 name: "bash".to_owned(),
-                arguments: json!({"script": "echo.echo '{}'"}).to_string(),
+                arguments: json!({"script": "probe upper --text late"}).to_string(),
             },
         }],
         usage: None,
@@ -4285,7 +4324,7 @@ async fn a_session_lists_mounted_skills_by_summary_and_reads_one_on_demand() {
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![ResponseEnvelope::capabilities(
-            vec![capability("echo.echo")],
+            vec![capability("cli-probe.upper")],
             Vec::new(),
         )],
     )
@@ -4351,7 +4390,7 @@ async fn the_suggestion_tool_is_offered_only_where_the_route_opts_in() {
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![ResponseEnvelope::capabilities(
-            vec![capability("echo.echo")],
+            vec![capability("cli-probe.upper")],
             Vec::new(),
         )],
     )
@@ -4419,7 +4458,7 @@ async fn an_authorized_agent_can_inspect_its_credential_free_effective_configura
     let (broker, mut observed) = stub_broker(
         directory.path(),
         vec![ResponseEnvelope::capabilities(
-            vec![capability("echo.echo")],
+            vec![capability("cli-probe.upper")],
             Vec::new(),
         )],
     )
@@ -4469,7 +4508,7 @@ async fn an_authorized_agent_can_inspect_its_credential_free_effective_configura
     assert_eq!(result["effectiveAuthorization"]["engine"], "Cedar");
     assert_eq!(
         result["effectiveAuthorization"]["capabilities"][0]["id"],
-        "echo.echo"
+        "cli-probe.upper"
     );
     assert_eq!(
         result["effectiveAuthorization"]["capabilities"][0]["effect"],
@@ -4506,7 +4545,7 @@ async fn shared_scope_is_visible_in_effective_configuration_without_identity() {
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![ResponseEnvelope::capabilities(
-            vec![capability("echo.echo")],
+            vec![capability("cli-probe.upper")],
             Vec::new(),
         )],
     )
@@ -4548,7 +4587,7 @@ async fn a_session_delivers_the_model_answer() {
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![ResponseEnvelope::capabilities(
-            vec![capability("echo.echo")],
+            vec![capability("cli-probe.upper")],
             Vec::new(),
         )],
     )
@@ -4711,7 +4750,7 @@ async fn a_failed_session_answers_one_fixed_line_and_never_raw_error_text() {
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![ResponseEnvelope::capabilities(
-            vec![capability("echo.echo")],
+            vec![capability("cli-probe.upper")],
             Vec::new(),
         )],
     )
@@ -4760,7 +4799,7 @@ async fn a_model_answer_longer_than_chat_accepts_is_bounded_on_the_way_out() {
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![ResponseEnvelope::capabilities(
-            vec![capability("echo.echo")],
+            vec![capability("cli-probe.upper")],
             Vec::new(),
         )],
     )
@@ -4873,7 +4912,8 @@ async fn a_persistent_route_replays_the_previous_exchange_into_the_next_prompt()
     // The whole feature in one assertion: a follow-up that says "and the second one?" is answerable
     // because the exchange before it is in the prompt, in order, ahead of the new message.
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let (broker, mut observed) =
+        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
     let models = ModelScript::new([
         answer("Two things broke."),
         answer("The second one was the database."),
@@ -4922,7 +4962,8 @@ async fn a_persistent_route_replays_the_previous_exchange_into_the_next_prompt()
 #[tokio::test(flavor = "multi_thread")]
 async fn a_one_shot_route_starts_from_an_empty_prompt_every_message() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
     let models = ModelScript::new([answer("Two things broke."), answer("Which one?")]);
     let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
@@ -4958,7 +4999,8 @@ async fn one_client_serves_every_message_routed_to_the_same_model() {
     // fresh TCP and TLS handshake before the first token of every answer. Sharing is only correct
     // because the prompt cache key is request-scoped, which the cache-key tests above pin down.
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
     let models = ModelScript::new([answer("Two things broke."), answer("Which one?")]);
     let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
@@ -4986,7 +5028,8 @@ async fn two_configured_models_never_share_one_client() {
     // The key is the configured name the loader already proved unique. Two endpoints sharing a
     // client would send one route's messages to the other's host.
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
     let models = ModelScript::new([answer("from one"), answer("from the other")]);
     let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
@@ -5018,7 +5061,8 @@ async fn two_senders_in_one_conversation_never_see_each_others_history() {
     // private history key deliberately does, and this is the difference that makes.
     const OTHER_SUBJECT: &str = "tel.16035550100";
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(3, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(3, &["cli-probe.upper"])).await;
     let models = ModelScript::new([
         answer("Your deploy failed."),
         answer("Yours is still running."),
@@ -5064,7 +5108,8 @@ async fn two_senders_in_one_conversation_never_see_each_others_history() {
 async fn shared_scope_replays_attributed_turns_across_authenticated_participants() {
     const OTHER_SUBJECT: &str = "tel.16035550100";
     let directory = temporary();
-    let (broker, mut observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let (broker, mut observed) =
+        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
     let models = ModelScript::new([answer("The deploy failed."), answer("It was the database.")]);
     let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
@@ -5117,7 +5162,8 @@ async fn shared_scope_replays_attributed_turns_across_authenticated_participants
 async fn user_authored_attribution_lookalikes_remain_below_the_gateway_line() {
     const OTHER_SUBJECT: &str = "tel.16035550100";
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
     let models = ModelScript::new([answer("noted"), answer("still noted")]);
     let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
@@ -5165,7 +5211,8 @@ async fn user_authored_attribution_lookalikes_remain_below_the_gateway_line() {
 #[tokio::test(flavor = "multi_thread")]
 async fn shared_participant_attribution_counts_against_the_history_byte_window() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
     let models = ModelScript::new([answer("ok"), answer("still ok")]);
     let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
@@ -5214,10 +5261,10 @@ async fn a_narrowed_grant_drops_the_history_it_was_built_under() {
         directory.path(),
         vec![
             ResponseEnvelope::capabilities(
-                vec![capability("echo.echo"), capability("gh.pr_view")],
+                vec![capability("cli-probe.upper"), capability("gh.pr_view")],
                 Vec::new(),
             ),
-            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
+            ResponseEnvelope::capabilities(vec![capability("cli-probe.upper")], Vec::new()),
         ],
     )
     .await;
@@ -5254,7 +5301,7 @@ async fn an_empty_grant_removes_the_conversation_rather_than_only_refusing_the_m
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![
-            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
+            ResponseEnvelope::capabilities(vec![capability("cli-probe.upper")], Vec::new()),
             ResponseEnvelope::capabilities(Vec::new(), Vec::new()),
         ],
     )
@@ -5303,7 +5350,8 @@ async fn a_failed_session_records_the_question_it_could_not_answer() {
     // would teach the model to keep producing it. The question still happened, though: dropping it
     // would leave the retry with nothing to refer back to.
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
     let models = ModelScript::scripted([None, Some(answer("It was the database."))]);
     let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
@@ -5358,7 +5406,8 @@ async fn a_session_that_never_reached_a_model_remembers_nothing() {
     // The turn a session commits is the one the prompt loop recorded. A session that failed before
     // the loop recorded nothing, and must not commit the newest *seeded* turn in its place.
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(1, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let driver = Arc::new(RecordingDriver::default());
     let runner = runner_with(
         broker,
@@ -5389,7 +5438,7 @@ fn an_idle_conversation_is_dropped_and_the_next_message_starts_fresh() {
     // deterministic rather than a sleep.
     let store = ConversationStore::new(8);
     let key = private_conversation_key("dev", "dev", SUBJECT);
-    let allowed = granted(&["echo.echo"]);
+    let allowed = granted(&["cli-probe.upper"]);
     let start = Instant::now();
     commit(
         &store,
@@ -5424,7 +5473,7 @@ fn the_conversation_ceiling_evicts_the_least_recently_used_rather_than_refusing(
     // A person talking now matters more than one who stopped an hour ago, so a memory bound must
     // not become an admission bound.
     let store = ConversationStore::new(2);
-    let allowed = granted(&["echo.echo"]);
+    let allowed = granted(&["cli-probe.upper"]);
     let start = Instant::now();
     let keys = ["first", "second", "third"]
         .map(|conversation| private_conversation_key("dev", conversation, SUBJECT));
@@ -5481,7 +5530,7 @@ fn the_conversation_ceiling_evicts_the_least_recently_used_rather_than_refusing(
 fn each_window_bound_drops_the_oldest_exchange_on_its_own() {
     // Two bounds because they fail differently: twelve one-line exchanges and twelve
     // paragraph-length ones are the same number of turns and very different prompts.
-    let allowed = granted(&["echo.echo"]);
+    let allowed = granted(&["cli-probe.upper"]);
     let now = Instant::now();
     let by_turns = MemoryWindow {
         scope: MemoryScope::PrivateConversation,
@@ -5529,7 +5578,7 @@ fn each_window_bound_drops_the_oldest_exchange_on_its_own() {
 fn a_history_and_a_revoked_entry_are_two_different_removals() {
     let store = ConversationStore::new(8);
     let key = private_conversation_key("dev", "dev", SUBJECT);
-    let allowed = granted(&["echo.echo"]);
+    let allowed = granted(&["cli-probe.upper"]);
     let now = Instant::now();
 
     assert!(
@@ -5556,7 +5605,7 @@ fn two_sessions_sharing_one_conversation_both_land_their_exchange() {
     // read the same seed; neither may erase the other's answer.
     let store = ConversationStore::new(8);
     let key = private_conversation_key("slack", "c0123abc:1700000000.000001", SUBJECT);
-    let allowed = granted(&["echo.echo"]);
+    let allowed = granted(&["cli-probe.upper"]);
     let now = Instant::now();
 
     let first = store.begin(&key, &allowed, window(), now);
@@ -5653,7 +5702,7 @@ fn shared_history_cannot_cross_agent_transport_or_conversation_boundaries() {
     let reviewer = "reviewer".parse().expect("valid agent fixture");
     let auditor = "auditor".parse().expect("valid agent fixture");
     let origin = ConversationKey::shared(&reviewer, "slack", "channel:thread");
-    let allowed = granted(&["echo.echo"]);
+    let allowed = granted(&["cli-probe.upper"]);
     let now = Instant::now();
     commit(
         &store,
@@ -5688,8 +5737,8 @@ fn shared_history_cannot_cross_agent_transport_or_conversation_boundaries() {
 fn a_stale_wider_grant_commit_cannot_overwrite_its_replacement_generation() {
     let store = ConversationStore::new(8);
     let key = private_conversation_key("dev", "dev", SUBJECT);
-    let wide = granted(&["echo.echo", "gh.pr_view"]);
-    let narrow = granted(&["echo.echo"]);
+    let wide = granted(&["cli-probe.upper", "gh.pr_view"]);
+    let narrow = granted(&["cli-probe.upper"]);
     let now = Instant::now();
     commit(
         &store,
@@ -5727,7 +5776,7 @@ fn a_stale_wider_grant_commit_cannot_overwrite_its_replacement_generation() {
 fn a_stale_commit_cannot_recreate_history_after_an_empty_grant_removes_it() {
     let store = ConversationStore::new(8);
     let key = private_conversation_key("dev", "dev", SUBJECT);
-    let allowed = granted(&["echo.echo"]);
+    let allowed = granted(&["cli-probe.upper"]);
     let now = Instant::now();
     commit(
         &store,
@@ -5759,7 +5808,7 @@ fn a_capacity_evicted_generation_cannot_be_resurrected_by_late_work() {
     let store = ConversationStore::new(1);
     let first_key = private_conversation_key("dev", "first", SUBJECT);
     let second_key = private_conversation_key("dev", "second", SUBJECT);
-    let allowed = granted(&["echo.echo"]);
+    let allowed = granted(&["cli-probe.upper"]);
     let now = Instant::now();
     commit(
         &store,
@@ -5814,7 +5863,7 @@ fn a_capacity_evicted_generation_cannot_be_resurrected_by_late_work() {
 fn an_idle_replacement_is_not_overwritten_by_an_older_lease() {
     let store = ConversationStore::new(8);
     let key = private_conversation_key("dev", "dev", SUBJECT);
-    let allowed = granted(&["echo.echo"]);
+    let allowed = granted(&["cli-probe.upper"]);
     let now = Instant::now();
     commit(
         &store,
@@ -5854,7 +5903,7 @@ fn the_store_prints_counts_rather_than_conversations() {
     commit(
         &store,
         &private_conversation_key("dev", "secret-conversation", SUBJECT),
-        &granted(&["echo.echo"]),
+        &granted(&["cli-probe.upper"]),
         window(),
         ConversationTurn::completed("the secret question", "the secret answer"),
         Instant::now(),
@@ -5926,7 +5975,12 @@ fn a_cache_key_carries_nothing_about_the_sender() {
     const DISTINCTIVE: &str = "tel.15558675309";
     let store = ConversationStore::new(8);
     let key = private_conversation_key("dev", "c0123abc", DISTINCTIVE);
-    let seed = store.begin(&key, &granted(&["echo.echo"]), window(), Instant::now());
+    let seed = store.begin(
+        &key,
+        &granted(&["cli-probe.upper"]),
+        window(),
+        Instant::now(),
+    );
 
     for fragment in [DISTINCTIVE, "15558675309", "tel", "c0123abc"] {
         assert!(
@@ -5947,7 +6001,7 @@ fn an_evicted_conversation_comes_back_with_a_new_cache_key() {
     // replaced, so naming the old lane would be a guaranteed miss.
     let store = ConversationStore::new(8);
     let key = private_conversation_key("dev", "dev", SUBJECT);
-    let allowed = granted(&["echo.echo"]);
+    let allowed = granted(&["cli-probe.upper"]);
     let start = Instant::now();
 
     let first = store.begin(&key, &allowed, window(), start);
@@ -5978,8 +6032,8 @@ fn an_evicted_conversation_comes_back_with_a_new_cache_key() {
 
 #[test]
 fn grant_empty_and_capacity_invalidation_each_rotate_the_cache_lane() {
-    let allowed = granted(&["echo.echo"]);
-    let wider = granted(&["echo.echo", "gh.pr_view"]);
+    let allowed = granted(&["cli-probe.upper"]);
+    let wider = granted(&["cli-probe.upper", "gh.pr_view"]);
     let now = Instant::now();
 
     let grant_store = ConversationStore::new(8);
@@ -6068,7 +6122,8 @@ async fn one_conversation_keeps_one_cache_key_and_two_conversations_never_share_
     // as its prefix, and declaring the same lane is what lets the provider serve that prefix from
     // its cache instead of reading it again.
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(3, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(3, &["cli-probe.upper"])).await;
     let models = ModelScript::new([
         answer("Two things broke."),
         answer("The second one was the database."),
@@ -6112,7 +6167,8 @@ async fn a_one_shot_route_sends_every_sender_to_the_route_s_own_lane() {
     // request and give up the only caching a stateless route can have.
     const OTHER_SUBJECT: &str = "tel.16035550100";
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(3, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(3, &["cli-probe.upper"])).await;
     let models = ModelScript::new([answer("one"), answer("two"), answer("three")]);
     let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
@@ -6179,7 +6235,8 @@ async fn a_model_that_never_heard_of_a_cache_key_still_answers() {
     // callback is either: a model that reads neither loses a cache lookup and shows no partial
     // text, and still answers.
     let directory = temporary();
-    let (broker, _observed) = stub_broker(directory.path(), listings(1, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let driver = Arc::new(RecordingDriver::default());
     let runner = runner_with(broker, Arc::new(KeylessModel) as Arc<dyn ModelFactory>, 4);
 
@@ -6484,7 +6541,8 @@ async fn a_transport_owned_thread_continuation_bypasses_only_the_repeat_mention(
     let routes = Arc::new(
         RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("route binds"),
     );
-    let (broker, _observed) = stub_broker(directory.path(), listings(1, &["echo.echo"])).await;
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
     let models = ModelScript::new([answer("Useful follow-up.")]);
     let runner = runner(broker, Arc::clone(&models), 4);
     let driver = Arc::new(RecordingDriver::default());
@@ -7110,7 +7168,7 @@ async fn a_slack_envelope_is_acknowledged_before_the_session_that_answers_it() {
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![ResponseEnvelope::capabilities(
-            vec![capability("echo.echo")],
+            vec![capability("cli-probe.upper")],
             Vec::new(),
         )],
     )
@@ -8080,7 +8138,7 @@ async fn a_slack_answer_is_posted_as_a_markdown_block() {
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![ResponseEnvelope::capabilities(
-            vec![capability("echo.echo")],
+            vec![capability("cli-probe.upper")],
             Vec::new(),
         )],
     )
@@ -8152,7 +8210,7 @@ async fn a_slack_429_delays_the_identical_answer_once_without_reply_failure() {
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![ResponseEnvelope::capabilities(
-            vec![capability("echo.echo")],
+            vec![capability("cli-probe.upper")],
             Vec::new(),
         )],
     )
@@ -8466,8 +8524,8 @@ fn a_stale_shared_session_cannot_publish_or_fetch_across_a_grant_generation_race
     let store = Arc::new(asset_store());
     let agent = "reviewer".parse().expect("valid agent fixture");
     let key = ConversationKey::shared(&agent, "slack", "channel:thread");
-    let wide = granted(&["echo.echo", "gh.pr_view"]);
-    let narrow = granted(&["echo.echo"]);
+    let wide = granted(&["cli-probe.upper", "gh.pr_view"]);
+    let narrow = granted(&["cli-probe.upper"]);
     let now = Instant::now();
 
     let first = conversations.begin(&key, &wide, window(), now);
@@ -8574,7 +8632,7 @@ fn idle_replacement_retires_attachment_metadata_and_numbering() {
     // Longer than the transcript timeout so only the conversation generation can retire it.
     let store = AssetStore::new(4, Duration::from_secs(3_600));
     let key = private_conversation_key("dev", "idle-assets", SUBJECT);
-    let allowed = granted(&["echo.echo"]);
+    let allowed = granted(&["cli-probe.upper"]);
     let now = Instant::now();
     let first = conversations.begin(&key, &allowed, window(), now);
     let old_access = first.assets.clone();
@@ -8613,7 +8671,7 @@ fn idle_replacement_retires_attachment_metadata_and_numbering() {
 fn capacity_eviction_retires_attachment_access_for_in_flight_sessions() {
     let conversations = ConversationStore::new(1);
     let store = asset_store();
-    let allowed = granted(&["echo.echo"]);
+    let allowed = granted(&["cli-probe.upper"]);
     let first_key = private_conversation_key("dev", "first-assets", SUBJECT);
     let second_key = private_conversation_key("dev", "second-assets", SUBJECT);
     let now = Instant::now();
@@ -8680,7 +8738,7 @@ fn capacity_eviction_retires_attachment_access_for_in_flight_sessions() {
 fn asset_lru_removal_cannot_alias_a_number_within_a_live_generation() {
     let conversations = ConversationStore::new(2);
     let store = AssetStore::new(1, Duration::from_secs(3_600));
-    let allowed = granted(&["echo.echo"]);
+    let allowed = granted(&["cli-probe.upper"]);
     let first_key = private_conversation_key("dev", "first-live-assets", SUBJECT);
     let second_key = private_conversation_key("dev", "second-live-assets", SUBJECT);
     let now = Instant::now();
@@ -8757,7 +8815,7 @@ async fn empty_grant_removal_blocks_stale_metadata_and_byte_fetches() {
     let conversations = ConversationStore::new(8);
     let store = Arc::new(asset_store());
     let key = private_conversation_key("dev", "removed-assets", SUBJECT);
-    let allowed = granted(&["echo.echo"]);
+    let allowed = granted(&["cli-probe.upper"]);
     let now = Instant::now();
     let first = conversations.begin(&key, &allowed, window(), now);
     let old_access = first.assets.clone();
@@ -8856,7 +8914,7 @@ async fn bytes_finishing_after_generation_retirement_are_discarded() {
     let conversations = ConversationStore::new(8);
     let store = Arc::new(asset_store());
     let key = private_conversation_key("dev", "racing-byte-fetch", SUBJECT);
-    let allowed = granted(&["echo.echo"]);
+    let allowed = granted(&["cli-probe.upper"]);
     let now = Instant::now();
     let seed = conversations.begin(&key, &allowed, window(), now);
     let access = seed.assets.clone();
@@ -10967,7 +11025,7 @@ async fn answer_once(message: InboundMessage) {
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![ResponseEnvelope::capabilities(
-            vec![capability("echo.echo")],
+            vec![capability("cli-probe.upper")],
             Vec::new(),
         )],
     )
@@ -11532,7 +11590,7 @@ async fn a_session_parked_on_its_capability_listing_is_stoppable_before_its_gran
         let (broker, reached, release) = parked_broker(
             directory.path(),
             Vec::new(),
-            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
+            ResponseEnvelope::capabilities(vec![capability("cli-probe.upper")], Vec::new()),
         )
         .await;
         let models = ModelScript::forbidden();
@@ -11584,7 +11642,7 @@ async fn every_origin_stops_a_session_before_its_first_model_turn() {
         let (broker, _observed) = stub_broker(
             directory.path(),
             vec![ResponseEnvelope::capabilities(
-                vec![capability("echo.echo")],
+                vec![capability("cli-probe.upper")],
                 Vec::new(),
             )],
         )
@@ -11640,7 +11698,7 @@ async fn every_origin_stops_a_session_between_the_deltas_of_a_stream() {
         let (broker, _observed) = stub_broker(
             directory.path(),
             vec![ResponseEnvelope::capabilities(
-                vec![capability("echo.echo")],
+                vec![capability("cli-probe.upper")],
                 Vec::new(),
             )],
         )
@@ -11749,14 +11807,11 @@ async fn every_origin_stops_a_session_inside_a_parked_capability_call() {
         let directory = temporary();
         let (broker, reached, release) = parked_broker(
             directory.path(),
-            vec![ResponseEnvelope::capabilities(
-                vec![capability("echo.echo")],
-                Vec::new(),
-            )],
+            vec![probe_listing(), upper_proposal("hi")],
             ResponseEnvelope::invocation(record_result(InvocationOutcome::Succeeded, None)),
         )
         .await;
-        let models = ModelScript::new([script_call("echo.echo --message hi")]);
+        let models = ModelScript::new([script_call("probe upper --text hi")]);
         let driver = Arc::new(RecordingDriver::default().with_status());
         let runner = runner(broker, Arc::clone(&models), 4);
         let session = tokio::spawn(run_session(
@@ -11809,7 +11864,7 @@ async fn no_origin_takes_back_an_answer_that_is_already_being_delivered() {
         let (broker, _observed) = stub_broker(
             directory.path(),
             vec![ResponseEnvelope::capabilities(
-                vec![capability("echo.echo")],
+                vec![capability("cli-probe.upper")],
                 Vec::new(),
             )],
         )
@@ -11874,7 +11929,7 @@ async fn another_subjects_press_is_acknowledged_and_ignored() {
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![ResponseEnvelope::capabilities(
-            vec![capability("echo.echo")],
+            vec![capability("cli-probe.upper")],
             Vec::new(),
         )],
     )
@@ -11942,7 +11997,7 @@ async fn a_session_with_no_liveness_surface_is_still_registered_and_stoppable() 
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![ResponseEnvelope::capabilities(
-            vec![capability("echo.echo")],
+            vec![capability("cli-probe.upper")],
             Vec::new(),
         )],
     )
@@ -12124,7 +12179,7 @@ async fn a_route_that_withholds_self_inspection_offers_no_such_tool() {
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![ResponseEnvelope::capabilities(
-            vec![capability("echo.echo")],
+            vec![capability("cli-probe.upper")],
             Vec::new(),
         )],
     )

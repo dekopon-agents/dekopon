@@ -7,6 +7,10 @@
 //! `provider.describe`, `provider.run_command`, and `provider.invoke`. This file is what keeps them
 //! honest.
 //!
+//! `provider.run_command` also records what the word was asked and what it answered: the arguments
+//! as one JSON array, the piped value when there was one, and the guest's answer, each bounded at
+//! `dekopon_core::MAX_ATTRIBUTE_BYTES` beside the byte length of the whole.
+//!
 //! It lives in its own test binary because `tracing` resolves per-callsite interest against the
 //! global dispatcher: a sibling test reaching these callsites with no subscriber installed can
 //! disable them for the whole process. The tests hold one asynchronous mutex for the same reason —
@@ -72,6 +76,18 @@ fn recorded(capture: &CaptureLayer, name: &str, field: &str) -> Vec<u64> {
                 .expect("a numeric span field")
         })
         .collect()
+}
+
+/// Whether some recording onto spans named `name` rendered `field` as exactly `value`, whether the
+/// string was recorded quoted, as `Debug` renders it, or displayed.
+fn recorded_value(capture: &CaptureLayer, name: &str, field: &str, value: &str) -> bool {
+    let quoted = format!(" {field}={value:?}");
+    let displayed = format!(" {field}={value}");
+    recordings(capture, name).iter().any(|fields| {
+        fields.contains(&quoted)
+            || fields.ends_with(&displayed)
+            || fields.contains(&format!("{displayed} "))
+    })
 }
 
 /// Asserts that `name` ran `count` times, each in one fresh store with one instantiation.
@@ -159,6 +175,45 @@ async fn a_load_describes_once_and_a_run_adds_exactly_one_more() {
     );
     assert_one_store_each(&capture, "provider.describe", 1);
     assert_one_store_each(&capture, "provider.run_command", 1);
+
+    // What the word was asked and what it answered ride the same span, each beside its length.
+    let rendered = capture.spans_text();
+    assert!(
+        recorded_value(
+            &capture,
+            "provider.run_command",
+            "command.arguments",
+            r#"["recall"]"#
+        ),
+        "{rendered}"
+    );
+    assert_eq!(
+        recorded(&capture, "provider.run_command", "command.arguments.bytes"),
+        vec![10],
+        "{rendered}"
+    );
+    assert!(
+        recorded_value(&capture, "provider.run_command", "command.stdin", "piped"),
+        "{rendered}"
+    );
+    assert_eq!(
+        recorded(&capture, "provider.run_command", "command.stdin.bytes"),
+        vec![5],
+        "{rendered}"
+    );
+    let output = recorded(&capture, "provider.run_command", "command.output.bytes");
+    assert_eq!(
+        output.len(),
+        1,
+        "one run records its answer once:\n{rendered}"
+    );
+    assert!(output[0] > 0, "{rendered}");
+    assert!(
+        recordings(&capture, "provider.run_command")
+            .iter()
+            .any(|fields| fields.contains(" command.output=")),
+        "{rendered}"
+    );
 }
 
 /// A word plus its piped value beyond the input bound is refused before a store exists.
@@ -205,6 +260,40 @@ async fn command_input_beyond_the_bound_is_refused_before_a_store_exists() {
             .all(|fields| !fields.contains(" stores=") && !fields.contains(" instantiations=")),
         "a word refused on input size reaches no store:\n{refused:?}"
     );
+    // The refusal still says what was asked — the arguments and the piped value that pushed the
+    // run past the bound, each beside its full length — and, having no answer, records none.
+    assert!(
+        recorded_value(
+            &capture,
+            "provider.run_command",
+            "command.arguments",
+            r#"["recall"]"#
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        recorded(&capture, "provider.run_command", "command.arguments.bytes"),
+        vec![10],
+        "{refused:?}"
+    );
+    assert!(
+        recorded_value(
+            &capture,
+            "provider.run_command",
+            "command.stdin",
+            "more than eight"
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        recorded(&capture, "provider.run_command", "command.stdin.bytes"),
+        vec![15],
+        "{refused:?}"
+    );
+    assert!(
+        recorded(&capture, "provider.run_command", "command.output.bytes").is_empty(),
+        "{refused:?}"
+    );
 }
 
 /// Describe, every command run, and the invocation each instantiate once, in one store each.
@@ -239,6 +328,7 @@ async fn every_operation_instantiates_the_component_exactly_once() {
     assert_eq!(
         outcome,
         CommandRunOutcome::Proposed {
+            secret_use: None,
             capability: capability.clone(),
             input: json!({"text": "héllo"}),
         }
@@ -256,11 +346,100 @@ async fn every_operation_instantiates_the_component_exactly_once() {
     assert_one_store_each(&capture, "provider.run_command", 2);
     assert_one_store_each(&capture, "provider.invoke", 1);
 
+    // Both runs record their arguments and their answer; only the run with a piped value records
+    // stdin, and its length is bytes, not characters.
+    let rendered = capture.spans_text();
+    assert_eq!(
+        recorded(&capture, "provider.run_command", "command.arguments.bytes"),
+        vec![10, 13],
+        "{rendered}"
+    );
+    assert!(
+        recorded_value(
+            &capture,
+            "provider.run_command",
+            "command.arguments",
+            r#"["count","-"]"#
+        ),
+        "{rendered}"
+    );
+    assert_eq!(
+        recorded(&capture, "provider.run_command", "command.stdin.bytes"),
+        vec![6],
+        "{rendered}"
+    );
+    assert!(
+        recorded_value(&capture, "provider.run_command", "command.stdin", "héllo"),
+        "{rendered}"
+    );
+    assert_eq!(
+        recorded(&capture, "provider.run_command", "command.output.bytes").len(),
+        2,
+        "{rendered}"
+    );
+
     // What the guest actually burned, read back from the store. A run that recorded nothing here
     // would mean the fuel reading was lost, not that the component executed for free.
     let fuel = recorded(&capture, "provider.invoke", "fuel.consumed");
     assert_eq!(fuel.len(), 1, "one invocation reports fuel once: {fuel:?}");
     assert!(fuel[0] > 0, "a real invocation burns fuel: {fuel:?}");
+}
+
+/// A value past the attribute cap is recorded as its first `MAX_ATTRIBUTE_BYTES` plus a marker,
+/// beside the byte length of the whole, so the trace stays bounded without hiding how much the
+/// model sent.
+#[tokio::test(flavor = "multi_thread")]
+async fn command_run_attributes_past_the_cap_are_truncated_beside_their_full_length() {
+    let _sequential = SEQUENTIAL.lock().await;
+    let capture = capture();
+    capture.clear();
+
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("cli-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("command-line provider loads");
+    let piped = "x".repeat(5_000);
+    let outcome = registry
+        .run_command("probe", &["count".to_owned(), "-".to_owned()], Some(&piped))
+        .await
+        .expect("a piped value inside the fixture's bound proposes");
+    assert!(
+        matches!(outcome, CommandRunOutcome::Proposed { .. }),
+        "{outcome:?}"
+    );
+
+    let cap = dekopon_core::MAX_ATTRIBUTE_BYTES;
+    let rendered = capture.spans_text();
+    assert!(
+        recorded_value(
+            &capture,
+            "provider.run_command",
+            "command.stdin",
+            &format!("{}…[truncated]", "x".repeat(cap))
+        ),
+        "the piped value is its first {cap} bytes plus the marker:\n{rendered}"
+    );
+    assert_eq!(
+        recorded(&capture, "provider.run_command", "command.stdin.bytes"),
+        vec![5_000],
+        "{rendered}"
+    );
+    // The answer carries the piped text back as the proposal's input, so it crosses the cap too.
+    let output = recorded(&capture, "provider.run_command", "command.output.bytes");
+    assert_eq!(output.len(), 1, "{rendered}");
+    assert!(output[0] > 5_000, "{rendered}");
+    assert!(
+        recordings(&capture, "provider.run_command")
+            .iter()
+            .any(|fields| fields.contains(" command.output=") && fields.contains("…[truncated]")),
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains(&"x".repeat(cap + 1)),
+        "no attribute carries more than the cap"
+    );
 }
 
 /// The host's wall clock, in the units `dekopon:clock/wall@1.0.0` answers in.

@@ -216,7 +216,7 @@ async fn build_broker_with_principal(
     let storage = StorageHost::open(root, storage_limits).expect("storage host");
     let mut providers = vec![
         provider_fixture("memory-chat-provider.wasm"),
-        provider_fixture("echo-provider.wasm"),
+        provider_fixture("cli-probe-provider.wasm"),
         provider_fixture("storage-probe-provider.wasm"),
     ];
     if authority_credential.is_some() {
@@ -1200,8 +1200,8 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
             .is_err(),
         "legacy command resolution never enters the memory provider"
     );
-    // A routed capability on the two legacy paths: reserved, denied, and audited without the
-    // identity every non-storage record carries.
+    // A routed capability on the two legacy paths: reserved, denied, and audited with the same
+    // identity every other record carries.
     for (index, attested) in [false, true].into_iter().enumerate() {
         let id = format!("reserved-route-{index}")
             .parse::<InvocationId>()
@@ -1394,58 +1394,56 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
         .expect("opaque UTF-8 token");
     let records = audit.records().await;
     assert_eq!(records.len(), 5);
-    for record in records {
+    // A storage-backed record carries every identity and policy field a non-storage record does:
+    // the storage boundary contains what was stored, not who asked for it or which policy let them.
+    let encoded = serde_json::to_value(&records).expect("audit serializes");
+    let attested = |event: &serde_json::Value| {
+        assert_eq!(event["principal"], "maintainer", "{event}");
+        assert_eq!(
+            event["actor"],
+            json!({"type": "agent", "agent": "reviewer"}),
+            "{event}"
+        );
+        assert_eq!(event["via"], "gateway", "{event}");
+        assert_eq!(event["attested_subject"], "slack.t0123abc.u9xyz", "{event}");
+        assert_eq!(event["provider"], "memory-chat", "{event}");
+        assert!(
+            event["policy_ids"]
+                .as_array()
+                .is_some_and(|ids| ids.iter().any(|id| id == "memory")),
+            "{event}"
+        );
+    };
+    for (index, record) in records.into_iter().enumerate() {
+        let event = &encoded[index];
+        for field in ["principal", "actor", "authorized_by", "policy_digest"] {
+            assert!(
+                event.get(field).is_some_and(|value| !value.is_null()),
+                "a storage-backed record withheld {field}: {event}"
+            );
+        }
+        assert_eq!(event["authorized_by"], "broker", "{event}");
+        assert_eq!(event["policy_revision"], "memory-policy", "{event}");
         match record {
             AuditEvent::Decision {
                 invocation,
-                principal,
-                actor,
-                via,
-                attested_subject,
-                provider,
-                authorized_by,
-                policy_revision,
-                policy_ids,
-                policy_digest,
                 storage_scope_commitment,
                 ..
             } => {
-                assert!(
-                    principal.is_none()
-                        && actor.is_none()
-                        && via.is_none()
-                        && attested_subject.is_none()
-                );
-                assert!(provider.is_none() && authorized_by.is_none() && policy_revision.is_none());
-                assert!(policy_ids.is_empty() && policy_digest.is_none());
                 if invocation.as_str() == "record-1" {
+                    attested(event);
                     let scope = storage_scope_commitment.expect("scope commitment");
                     assert_ne!(scope.as_str().trim_start_matches("sha256:"), physical_base);
                 }
             }
             AuditEvent::Execution {
-                principal,
-                actor,
-                via,
-                attested_subject,
-                provider,
-                authorized_by,
-                policy_revision,
-                policy_ids,
-                policy_digest,
                 credential,
                 storage_scope_commitment,
                 storage,
                 ..
             } => {
-                assert!(
-                    principal.is_none()
-                        && actor.is_none()
-                        && via.is_none()
-                        && attested_subject.is_none()
-                );
-                assert!(provider.is_none() && authorized_by.is_none() && policy_revision.is_none());
-                assert!(policy_ids.is_empty() && policy_digest.is_none() && credential.is_none());
+                attested(event);
+                assert!(credential.is_none());
                 assert!(storage_scope_commitment.is_some() && storage.is_some());
             }
         }
@@ -2038,6 +2036,49 @@ async fn a_corrupt_memory_namespace_is_reset_by_the_invocation_that_finds_it() {
         "{}",
         capture.spans_text()
     );
+    // Beside those storage additions, the storage-backed invocation's spans record what every
+    // other invocation's do: the capability, the attested identity, and the input on
+    // `broker.authorize`, and the capability on `provider.invoke`.
+    let spans = capture.spans();
+    let recorded = |span: &str, fragment: &str| {
+        spans
+            .iter()
+            .any(|(name, fields)| *name == span && fields.contains(fragment))
+    };
+    assert!(
+        spans
+            .iter()
+            .any(|(name, fields)| *name == "broker.authorize"
+                && fields.contains(" invocation=reset-found")
+                && fields.contains(&format!(" capability={MEMORY_RECENT}"))),
+        "{}",
+        capture.spans_text()
+    );
+    for fragment in [
+        " subject=slack.t0123abc.u9xyz",
+        " via=gateway",
+        r#" input={"operation":"recent","last":1,"#,
+    ] {
+        assert!(
+            recorded("broker.authorize", fragment),
+            "{fragment}: {}",
+            capture.spans_text()
+        );
+    }
+    // The invocation that finds the corrupt namespace resets it and never reaches the provider;
+    // the record call that follows does, and its storage-backed `provider.invoke` carries the
+    // capability and input like any other.
+    for fragment in [
+        " capability=memory.chat.record",
+        r#" input={"operation":"record","#,
+        " storage=true",
+    ] {
+        assert!(
+            recorded("provider.invoke", fragment),
+            "{fragment}: {}",
+            capture.spans_text()
+        );
+    }
 
     assert_recent_empty(&broker, "reset-retry").await;
     drop(broker);
@@ -2547,10 +2588,6 @@ async fn authority_surface_ignores_order_and_denied_provider_but_rotates_every_s
         false,
     )
     .await;
-    assert!(
-        broker.capability_uses_storage(&"storage-probe.run".parse().expect("capability")),
-        "generic durable-files constraints must select identity-free outer spans"
-    );
     assert_eq!(
         record_turn(
             &broker,
@@ -2927,11 +2964,11 @@ async fn chat_memory_without_routes_names_every_missing_role() {
 #[tokio::test(flavor = "multi_thread")]
 async fn every_declared_route_conflict_is_reported_at_startup() {
     let registry = BrokerProviderRegistry::load(
-        [provider_fixture("echo-provider.wasm")],
+        [provider_fixture("cli-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
-    .expect("echo fixture loads");
+    .expect("cli-probe fixture loads");
     let world = PolicyWorld::new(
         ["caller".parse::<PrincipalId>().expect("caller")],
         registry
@@ -2961,15 +2998,19 @@ async fn every_declared_route_conflict_is_reported_at_startup() {
     });
     let constraints = ConstraintCatalog::new([
         (
-            "echo.echo".parse().expect("capability"),
-            routed(CapabilityRoute::ChatMemoryRecent, "echo", read_only.clone()),
+            "cli-probe.count".parse().expect("capability"),
+            routed(
+                CapabilityRoute::ChatMemoryRecent,
+                "cli-probe",
+                read_only.clone(),
+            ),
         ),
         (
-            "echo.second".parse().expect("capability"),
-            routed(CapabilityRoute::ChatMemoryRecent, "echo", read_only),
+            "cli-probe.second".parse().expect("capability"),
+            routed(CapabilityRoute::ChatMemoryRecent, "cli-probe", read_only),
         ),
         (
-            "echo.third".parse().expect("capability"),
+            "cli-probe.third".parse().expect("capability"),
             routed(CapabilityRoute::ChatMemorySearch, "elsewhere", None),
         ),
     ])
@@ -2996,25 +3037,25 @@ async fn every_declared_route_conflict_is_reported_at_startup() {
             RouteConflict::DuplicateRole {
                 route: CapabilityRoute::ChatMemoryRecent,
                 capabilities: vec![
-                    "echo.echo".parse().expect("capability"),
-                    "echo.second".parse().expect("capability"),
+                    "cli-probe.count".parse().expect("capability"),
+                    "cli-probe.second".parse().expect("capability"),
                 ],
             },
             RouteConflict::SplitProvider {
                 providers: vec![
-                    "echo".parse().expect("provider"),
+                    "cli-probe".parse().expect("provider"),
                     "elsewhere".parse().expect("provider"),
                 ],
             },
             RouteConflict::MissingChatStorage {
-                capability: "echo.third".parse().expect("capability"),
+                capability: "cli-probe.third".parse().expect("capability"),
                 route: CapabilityRoute::ChatMemorySearch,
                 access: StorageAccess::ReadOnly,
             },
         ],
         "one run must report every route mistake: {rendered}"
     );
-    for fragment in ["echo.second", "elsewhere", "echo.third"] {
+    for fragment in ["cli-probe.second", "elsewhere", "cli-probe.third"] {
         assert!(
             rendered.contains(fragment),
             "the message names {fragment}: {rendered}"

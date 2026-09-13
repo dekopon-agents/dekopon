@@ -33,8 +33,8 @@ const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1
 const POLICIES: &str = r#"
 @id("allow-reverse")
 permit(principal == Dekopon::Principal::"caller",
-       action == Dekopon::Action::"echo.reverse",
-       resource == Dekopon::Provider::"echo");
+       action == Dekopon::Action::"cli-probe.reverse",
+       resource == Dekopon::Provider::"cli-probe");
 "#;
 
 /// An audit log that parks inside `append` until the test lets it finish.
@@ -66,10 +66,12 @@ fn principal(name: &str) -> PrincipalId {
 
 fn constraint_set() -> (CapabilityId, ConstraintSet) {
     (
-        "echo.reverse".parse().expect("valid capability fixture"),
+        "cli-probe.reverse"
+            .parse()
+            .expect("valid capability fixture"),
         ConstraintSet {
             route: CapabilityRoute::Generic,
-            provider: "echo"
+            provider: "cli-probe"
                 .parse::<ProviderId>()
                 .expect("valid provider fixture"),
             effect: EffectKind::ReadOnly,
@@ -83,16 +85,18 @@ fn constraint_set() -> (CapabilityId, ConstraintSet) {
 
 async fn broker(audit: Arc<GatedAudit>) -> Broker<GatedAudit> {
     let registry = BrokerProviderRegistry::load(
-        [provider_fixture("echo-provider.wasm")],
+        [provider_fixture("cli-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
-    .expect("echo provider fixture loads");
+    .expect("cli-probe provider fixture loads");
     let world = PolicyWorld::new(
         [principal("caller")],
         [(
-            "echo.reverse".parse::<CapabilityId>().expect("capability"),
-            "echo".parse::<ProviderId>().expect("provider"),
+            "cli-probe.reverse"
+                .parse::<CapabilityId>()
+                .expect("capability"),
+            "cli-probe".parse::<ProviderId>().expect("provider"),
         )],
     )
     .expect("the world builds");
@@ -149,9 +153,9 @@ async fn a_suspended_authorization_does_not_parent_another_task_s_events() {
                         id: "invoke-suspended"
                             .parse()
                             .expect("valid invocation fixture"),
-                        capability: "echo.echo".parse().expect("valid capability fixture"),
+                        capability: "cli-probe.upper".parse().expect("valid capability fixture"),
                         trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
-                        input: serde_json::json!({"message": "denied"}),
+                        input: serde_json::json!({"text": "denied"}),
                         secret_use: None,
                     },
                 )
@@ -194,7 +198,7 @@ async fn a_suspended_authorization_does_not_parent_another_task_s_events() {
         .collect::<Vec<_>>()
         .join(" ");
     assert!(authorize.contains("invoke-suspended"), "{authorize}");
-    assert!(authorize.contains("echo.echo"), "{authorize}");
+    assert!(authorize.contains("cli-probe.upper"), "{authorize}");
     assert!(
         authorize.contains("outcome=\"unconstrained-capability\""),
         "{authorize}"

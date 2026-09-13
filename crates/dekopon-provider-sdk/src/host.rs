@@ -204,16 +204,19 @@ fn invalid(message: impl Into<String>) -> ManifestRejection {
 
 /// Everything wrong with one provider set, gathered so an operator sees it once.
 ///
-/// Ambiguity is fatal in a way absence is not: a provider identity, capability, or command word two
-/// components both claim has no meaning a host can pick without silently choosing for the operator.
-/// This reports rather than resolves, and reports *all of it* — fixing a provider set should take
-/// one run, not one run per mistake.
+/// Ambiguity is fatal: a provider identity, capability, or command word two components both claim
+/// has no meaning a host can pick without silently choosing for the operator. So is a provider no
+/// model can reach: command words are the only way into a provider, and one declaring capabilities
+/// with none would load and never run. This reports rather than resolves, and reports *all of it* —
+/// fixing a provider set should take one run, not one run per mistake.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderConflicts {
     /// Provider identities declared by more than one component.
     pub providers: Vec<ProviderId>,
     /// Capability identifiers declared by more than one component.
     pub capabilities: Vec<CapabilityId>,
+    /// Providers that declare capabilities and no command word to reach them through.
+    pub wordless: Vec<ProviderId>,
     /// Command words that cannot be granted to the providers claiming them.
     pub command_words: Vec<CommandWordConflict>,
 }
@@ -222,7 +225,10 @@ impl ProviderConflicts {
     /// Reports how many distinct conflicts this covers.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.providers.len() + self.capabilities.len() + self.command_words.len()
+        self.providers.len()
+            + self.capabilities.len()
+            + self.wordless.len()
+            + self.command_words.len()
     }
 
     /// Reports whether there is nothing to complain about.
@@ -255,6 +261,18 @@ impl fmt::Display for ProviderConflicts {
                 "    fix: rename it in one provider, or drop that provider"
             )?;
         }
+        for provider in &self.wordless {
+            writeln!(formatter, "\n  provider {provider}")?;
+            writeln!(
+                formatter,
+                "    declares capabilities but no command words, so no model can reach them"
+            )?;
+            writeln!(
+                formatter,
+                "    fix: declare commandWords and export run-command, or drop it from the provider \
+                 search path"
+            )?;
+        }
         for conflict in &self.command_words {
             writeln!(formatter, "\n  command word `{}`", conflict.word)?;
             for claimant in &conflict.claimants {
@@ -283,6 +301,7 @@ pub struct ConflictScan {
     provider_ids: BTreeSet<ProviderId>,
     duplicate_providers: BTreeSet<ProviderId>,
     duplicate_capabilities: BTreeSet<CapabilityId>,
+    wordless: BTreeSet<ProviderId>,
     declared_words: Vec<(String, Vec<String>)>,
     routes: BTreeMap<CapabilityId, usize>,
 }
@@ -298,6 +317,9 @@ impl ConflictScan {
     pub fn record(&mut self, manifest: &ProviderManifest, provider_index: usize) {
         if !self.provider_ids.insert(manifest.id.clone()) {
             self.duplicate_providers.insert(manifest.id.clone());
+        }
+        if !manifest.capabilities.is_empty() && manifest.command_words.is_empty() {
+            self.wordless.insert(manifest.id.clone());
         }
         self.declared_words
             .push((manifest.id.to_string(), manifest.command_words.clone()));
@@ -316,19 +338,22 @@ impl ConflictScan {
     ///
     /// # Errors
     ///
-    /// Returns [`ProviderConflicts`] when a provider identity or capability is claimed twice, or
-    /// when a command word collides with another provider's, a shell builtin, or a reserved word.
+    /// Returns [`ProviderConflicts`] when a provider identity or capability is claimed twice, when
+    /// a provider declares capabilities and no command word, or when a command word collides with
+    /// another provider's, a shell builtin, or a reserved word.
     pub fn finish(self) -> Result<BTreeMap<CapabilityId, usize>, ProviderConflicts> {
-        // Reserved words and shell builtins are collected here beside the duplicates so one
-        // report carries every reason a provider set cannot start.
+        // Reserved words and shell builtins are collected here beside the duplicates and the
+        // word-less providers so one report carries every reason a provider set cannot start.
         let command_words = dekopon_core::command_word_conflicts(&self.declared_words);
         if !self.duplicate_providers.is_empty()
             || !self.duplicate_capabilities.is_empty()
+            || !self.wordless.is_empty()
             || !command_words.is_empty()
         {
             return Err(ProviderConflicts {
                 providers: self.duplicate_providers.into_iter().collect(),
                 capabilities: self.duplicate_capabilities.into_iter().collect(),
+                wordless: self.wordless.into_iter().collect(),
                 command_words,
             });
         }
@@ -457,8 +482,8 @@ pub enum CommandExportProblem {
 ///
 /// A manifest promising words the component cannot run would fail at the first `gh …` a model
 /// typed, hours into a session. Both hosts prove it at load instead, from the component's own
-/// type. A manifest declaring no words passes whatever the component exports: nothing will ever
-/// call it.
+/// type. A manifest declaring no words passes here whatever the component exports: [`ConflictScan`]
+/// refuses it alongside every other conflict in the set, so one run names all of them.
 ///
 /// # Errors
 ///
@@ -599,12 +624,18 @@ mod tests {
         );
     }
 
+    fn worded(id: &str, capability: &str, word: &str) -> ProviderManifest {
+        let mut fixture = manifest(id, capability, EffectKind::ReadOnly);
+        fixture.command_words = vec![word.to_owned()];
+        fixture
+    }
+
     /// Two simultaneous conflicts, both reported: an operator fixes a provider set in one run.
     #[test]
     fn a_scan_reports_every_conflict_rather_than_the_first() {
         let mut scan = ConflictScan::new();
-        scan.record(&manifest("shared", "one.run", EffectKind::ReadOnly), 0);
-        scan.record(&manifest("shared", "one.run", EffectKind::ReadOnly), 1);
+        scan.record(&worded("shared", "one.run", "one"), 0);
+        scan.record(&worded("shared", "one.run", "two"), 1);
 
         let report = scan.finish().expect_err("a duplicated set must not route");
 
@@ -618,11 +649,55 @@ mod tests {
         assert!(rendered.contains("capability one.run"), "{rendered}");
     }
 
+    /// Two word-less providers and a reserved word, all in one report: every provider no model
+    /// could reach is named, beside the other conflict kinds, under a single header.
     #[test]
-    fn an_unambiguous_scan_routes_every_capability() {
+    fn every_wordless_provider_is_named_in_the_one_conflict_report() {
         let mut scan = ConflictScan::new();
         scan.record(&manifest("first", "first.run", EffectKind::ReadOnly), 0);
         scan.record(&manifest("second", "second.run", EffectKind::ReadOnly), 1);
+        scan.record(&worded("third", "third.run", "jq"), 2);
+
+        let report = scan
+            .finish()
+            .expect_err("a provider no word reaches must not route");
+
+        assert_eq!(
+            report
+                .wordless
+                .iter()
+                .map(|provider| provider.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert_eq!(report.command_words.len(), 1, "{report:?}");
+        assert_eq!(report.len(), 3);
+        let rendered = report.to_string();
+        assert_eq!(
+            rendered.matches("refusing to start").count(),
+            1,
+            "{rendered}"
+        );
+        assert!(
+            rendered.starts_with("refusing to start \u{2014} 3 provider conflict(s)"),
+            "{rendered}"
+        );
+        for provider in ["first", "second"] {
+            assert!(
+                rendered.contains(&format!(
+                    "\n  provider {provider}\n    declares capabilities but no command words"
+                )),
+                "{provider} must be named: {rendered}"
+            );
+        }
+        assert!(rendered.contains("command word `jq`"), "{rendered}");
+    }
+
+    #[test]
+    fn an_unambiguous_scan_routes_every_capability() {
+        let mut scan = ConflictScan::new();
+        scan.record(&worded("first", "first.run", "first"), 0);
+        scan.record(&worded("second", "second.run", "second"), 1);
 
         let routes = scan.finish().expect("distinct providers do not conflict");
 
@@ -673,7 +748,8 @@ mod tests {
         );
     }
 
-    /// Nothing calls an export no word routes to, so a wordless manifest is not held to it.
+    /// The export gate holds a manifest only to the words it declares; a word-less one is the
+    /// conflict scan's to refuse, in the report naming every other conflict.
     #[test]
     fn a_manifest_without_words_passes_the_command_gate_whatever_is_exported() {
         let fixture = manifest("fixture", "fixture.run", EffectKind::ReadOnly);

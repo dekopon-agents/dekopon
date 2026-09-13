@@ -5,7 +5,7 @@
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
-  echo "usage: $0 DESTINATION [echo|jsonplaceholder|memory-chat ...]" >&2
+  echo "usage: $0 DESTINATION [jsonplaceholder|memory-chat ...]" >&2
   exit 2
 fi
 
@@ -14,8 +14,6 @@ shift
 providers=("$@")
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)
 tracked=$(git -C "$root" ls-files -- \
-  examples/providers/echo examples/providers/echo-provider.wasm \
-  examples/providers/echo-provider.wasm.sha256 \
   examples/providers/jsonplaceholder examples/providers/jsonplaceholder-provider.wasm \
   examples/providers/jsonplaceholder-provider.wasm.sha256 \
   examples/providers/memory-chat examples/providers/memory-chat-provider.wasm \
@@ -26,13 +24,13 @@ tracked=$(git -C "$root" ls-files -- \
   exit 1
 }
 if [[ ${#providers[@]} -eq 0 ]]; then
-  providers=(echo jsonplaceholder memory-chat)
+  providers=(jsonplaceholder memory-chat)
 fi
 
 seen=' '
 for provider in "${providers[@]}"; do
   case "$provider" in
-    echo|jsonplaceholder|memory-chat) ;;
+    jsonplaceholder|memory-chat) ;;
     *)
       echo "error: unknown external provider: $provider" >&2
       exit 2
@@ -86,25 +84,15 @@ fetch_provider() {
   local provider=$1
   local repository asset release expected_sha expected_size signer source_ref source_digest
   case "$provider" in
-    echo)
-      repository=dekopon-agents/dekopon-provider-echo
-      asset=echo-provider.wasm
-      release=v0.2.0
-      expected_sha=eb0605682303a0c1adaffd307a7fbece0d8a959c756c8909228bfa57fd020645
-      expected_size=150975
-      signer="$repository/.github/workflows/release.yml"
-      source_ref=refs/tags/v0.2.0
-      source_digest=61891bd8426d9f0cf2c89bf89666ec243a3f48ce
-      ;;
     jsonplaceholder)
       repository=dekopon-agents/dekopon-provider-jsonplaceholder
       asset=jsonplaceholder-provider.wasm
-      release=v0.2.0
-      expected_sha=268d851747bfb4ddc33497dbb1009cf285537dd5001f9d39e8c44803fd3c14f8
-      expected_size=276060
+      release=v0.3.0
+      expected_sha=b20e20c675bfaa357623bfe443c2c4793938548e4cd1addc90dc23e9fe3c65c1
+      expected_size=470999
       signer="$repository/.github/workflows/release.yml"
-      source_ref=refs/tags/v0.2.0
-      source_digest=bcfe89d36c394307be64d0493808377121740183
+      source_ref=refs/tags/v0.3.0
+      source_digest=2deb4e8931c025055ec2f7ba96ca124d894093f5
       ;;
     memory-chat)
       repository=dekopon-agents/dekopon-provider-memory-chat
@@ -163,7 +151,6 @@ publish_provider() {
   local provider=$1
   local asset
   case "$provider" in
-    echo) asset=echo-provider.wasm ;;
     jsonplaceholder) asset=jsonplaceholder-provider.wasm ;;
     memory-chat) asset=memory-chat-provider.wasm ;;
   esac

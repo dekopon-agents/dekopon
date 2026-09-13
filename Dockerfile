@@ -65,7 +65,7 @@ COPY --chmod=0755 \
 # directories cannot be traversed. Without it the components keep the mode they carry in the
 # context, which the staging script normalises to 0644.
 COPY --chown=65532:65532 \
-     providers/echo-provider.wasm \
+     providers/cli-probe-provider.wasm \
      providers/gh-provider.wasm \
      providers/http-probe-provider.wasm \
      providers/jsonplaceholder-provider.wasm \

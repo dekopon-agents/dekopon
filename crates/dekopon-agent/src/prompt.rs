@@ -1231,7 +1231,7 @@ fn script_tool(command_words: &[String]) -> ModelTool {
         words.sort();
         words.dedup();
         description.push_str(&format!(
-            "\n\nThis session's providers add these command words: {}. Each behaves like its own command-line program: run `<word> --help` to see its subcommands and flags; `cap --describe` does not cover them.",
+            "\n\nThis session's providers add these command words: {}.",
             words.join(", ")
         ));
     }
@@ -1577,15 +1577,15 @@ fn script_argument(tool: &str, arguments: &str) -> Result<String, PromptError> {
 /// This replaces one JSON Schema per capability, so it is allowed to be long: it is paid once per
 /// request instead of once per capability, and it shrinks rather than grows as an operator grants
 /// more. What it must *not* do is describe anything the interpreter does not have. There is no
-/// `help` builtin — the runtime discovery surface is `cap --list` and `cap --describe`, and
-/// pointing a model at anything else would spend a tool call on "command not found".
+/// `help` builtin — the runtime discovery surface is each provider word's own `--help` and
+/// `cap --list`, and pointing a model at anything else would spend a tool call on "command not
+/// found".
 const SCRIPT_TOOL_DESCRIPTION: &str = "\
 Run one script in Dekopon's sandboxed shell. This is the only way to invoke capabilities: use it \
 whenever the task needs data or an action the session's capabilities provide, and write the whole \
 job as one script rather than one tool call per step. Send scripts one after another only when \
-the next step genuinely depends on a result you cannot know yet. If you do not yet know what this \
-session can call, the first script is `cap --list`. Returns the script's combined output followed \
-by an `[exit code: N]` trailer, exactly as a terminal would.
+the next step genuinely depends on a result you cannot know yet. Returns the script's combined \
+output followed by an `[exit code: N]` trailer, exactly as a terminal would.
 
 The dialect is eerily close to bash and explicitly not bash. Pipelines, `&&`, `||`, `;`, a \
 leading `!`, `if`/`elif`/`else`, `for`, `while`, `until`, `case`/`esac`, `[[ ... ]]`, `{ ...; }` \
@@ -1602,17 +1602,14 @@ If a script ran, it did what it said.
 
 Four things genuinely differ from a real shell:
 
-1. Commands are Dekopon capabilities, not programs. A command word containing `.`, `-`, or `_` is \
-a capability invocation; every other word is a builtin. There are no processes, no filesystem, no \
-environment variables, and no network reachable except through a capability. The capabilities you \
-may invoke are exactly those this session was granted: no flag, retry, or rewording escalates \
-past that set, and a refusal is a fact to report, not an obstacle to work around.
-2. Capability arguments are `--kebab-case` flags that become one JSON object. With a capability \
-such as `posts.get`, `posts.get --post-id 7 --include-body` sends `{\"postId\": 7, \
-\"includeBody\": true}`: a value that reads as a JSON number, `true`, `false`, or `null` is sent \
-typed, anything else is sent as a string, and a flag with no value is `true`. A repeated flag \
-becomes an array, and a single bare `{...}` argument is used as the input verbatim. `cap \
-<capability> ...` invokes one under the same argument rules.
+1. There are no processes, no filesystem, no environment variables, and no network reachable \
+except through a capability. The capabilities you may invoke are exactly those this session was \
+granted: no flag, retry, or rewording escalates past that set, and a refusal is a fact to report, \
+not an obstacle to work around.
+2. Provider command words are programs. A provider adds words of its own, and each behaves like a \
+command-line tool with subcommands and flags: run `<word> --help` to learn one before using it. \
+Its subcommands call capabilities on your behalf, so a word can do only what this session was \
+granted, and `cap --list` shows those capability IDs.
 3. Values are JSON, not text. `|` hands a structured value to the next command, and `jq` is built \
 in to work on it. A command writes its value to stdout and its diagnostics to stderr, so \
 `x=$(cmd)` captures the value while errors still reach you, and `x=$(cmd 2>&1)` is how you \
@@ -1622,17 +1619,14 @@ quiet command leaves its value, and its type, untouched.
 ceilings; tripping one ends the script with a message naming it. Filter with `jq`, loop in the \
 shell, and print only what you need next.
 
-Builtins: `jq`, `curl`, `cap`, `cat`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, \
-`grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`. One of them depends on session \
-configuration and reports its exact missing prerequisite otherwise: `curl`, which opens no socket \
-of its own but assembles a request for whichever HTTP capability the session was given. A provider \
-may contribute further command words, which behave the same way and are authorized identically; \
-any this session has are listed at the end of this description.
+Builtins: `jq`, `cap`, `cat`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, `grep`, \
+`sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`. Any provider command words this session has \
+are listed at the end of this description.
 
-A public secret DRN supplied in your instructions is a name, not a value or grant. Use it only in \
-exact broker-backed forms: `curl --oauth2-bearer '${drn:...}' URL` or `curl -u 'USER:${drn:...}' \
-URL`. Literal passwords, DRNs in headers/URLs/bodies, and DRN concatenation are rejected. The \
-provider never receives the DRN, and the broker independently authorizes every use.
+A public secret DRN supplied in your instructions is a name, not a value or grant. Pass one only to \
+a provider command whose `--help` says it accepts one: the command proposes using that secret, the \
+broker independently authorizes every use, and neither you nor the provider ever reads the secret \
+itself.
 
 Patterns are literal text, never globs, and regular expressions only where you ask for one with \
 `-E`: a `grep`/`sed` pattern, a `${NAME#p}`/`${NAME%p}`/`${NAME/p/r}` pattern, the right operand \
@@ -1648,11 +1642,12 @@ through `jq fromjson` when you want structure out of it.
 
 Reading the result. The tool result is your only evidence: what a script printed is what you \
 know, and what it did not print you do not know, so never guess what a capability returned, what \
-it accepts, or whether it exists. Exit 0 is success. Exit 1 is a command that ran and failed; a \
-capability's error arrives on stderr as `<capability>: failed: ...`, so read it before retrying. \
-Exit 127 (`command not found` or `capability not found`) means the word is misspelled or names a \
-capability this session does not hold; the two are deliberately indistinguishable, and `cap \
---list` is the fix, not guessing at more names. Exit 126 means this session holds the capability \
+it accepts, or whether it exists. Exit 0 is success. Exit 1 is a command that ran and failed; \
+its error arrives on stderr as `<name>: failed: ...`, naming the command or the capability it \
+called, so read it before retrying. Exit 127 means the word is not a builtin or a command this \
+session's providers add (`command not found`), or that a command needs a capability this session \
+was not granted, and the message says which; guessing at more names will not change either. Exit \
+126 means this session holds the capability \
 but authorization refused this use; different arguments will not change that, so report it. Exit \
 2 is a parse error, a refused construct, a usage error, or an exhausted budget, and the message \
 names which. Exit 124 is the wall-clock deadline. Output past the ceiling is truncated in the \
@@ -1665,10 +1660,8 @@ when the session offers a tool for one of them it is listed beside this one. The
 at all: `ls` and `cd` do not exist, and `cat` only passes along what is piped or here-documented \
 into it.
 
-There is no `help`. Discover this session with `cap --list`, which returns a JSON array of the \
-capability IDs you may invoke, and `cap --describe <capability>`, which returns one capability's \
-input schema alongside its description, as one object. Discover once, then prefer a single script \
-that does the whole job over many small ones — that is the entire point of this tool.";
+There is no `help` builtin. Discover once, then prefer a single script that does the whole job \
+over many small ones — that is the entire point of this tool.";
 
 /// Failure to complete a prompt/tool session.
 ///
@@ -1852,7 +1845,9 @@ mod tests {
         AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelFunctionCall, ModelMessage,
         ModelTool, ModelToolCall, ModelUsage,
     };
-    use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, ExitCode, ScriptOutcome};
+    use dekopon_shell::{
+        CapabilityCallResult, CapabilityInvoker, CommandRun, ExitCode, ScriptOutcome,
+    };
     use serde_json::{Value, json};
 
     use crate::meta::{
@@ -3120,9 +3115,10 @@ mod tests {
             tool.description
         );
         // A provider word is a program of its own, and its help page is the only place its
-        // subcommands and flags are described; the model has to be told where to look.
-        assert!(
-            tool.description.contains("run `<word> --help`"),
+        // subcommands and flags are described; the model has to be told where to look, once.
+        assert_eq!(
+            tool.description.matches("run `<word> --help`").count(),
+            1,
             "{}",
             tool.description
         );
@@ -3238,6 +3234,10 @@ mod tests {
     }
 
     /// A session whose capabilities cover every outcome the description explains.
+    ///
+    /// Reached the only way a script reaches a capability: through a provider command word.
+    /// `probe` renders its own help, declines an argv it does not know, and proposes one capability
+    /// per subcommand, including one this session was never granted.
     struct OutcomeCapabilities;
 
     impl CapabilityInvoker for OutcomeCapabilities {
@@ -3246,6 +3246,41 @@ mod tests {
                 .into_iter()
                 .map(str::to_owned)
                 .collect()
+        }
+
+        fn command_words(&self) -> Vec<String> {
+            vec!["probe".to_owned()]
+        }
+
+        fn run_command(
+            &self,
+            word: &str,
+            argv: &[String],
+            _stdin: Option<&str>,
+        ) -> Option<CommandRun> {
+            if word != "probe" {
+                return None;
+            }
+            let proposed = |capability: &str, input: Value| CommandRun::Proposed {
+                capability: capability.to_owned(),
+                input,
+                secret_use: None,
+            };
+            let argv = argv.iter().map(String::as_str).collect::<Vec<_>>();
+            Some(match argv.as_slice() {
+                ["--help"] => CommandRun::Rendered {
+                    stdout: "Usage: probe <get|door|broken|vault>\n".to_owned(),
+                    stderr: String::new(),
+                    status: 0,
+                },
+                ["get", "--post-id", id] => proposed("posts.get", json!({ "postId": id })),
+                ["door"] => proposed("locked.door", json!({})),
+                ["broken"] => proposed("broken.thing", json!({})),
+                ["vault"] => proposed("vault.open", json!({})),
+                _ => CommandRun::Failed {
+                    message: "probe: usage: probe <get|door|broken|vault>".to_owned(),
+                },
+            })
         }
 
         fn describe(&self, _capability: &str) -> Option<dekopon_shell::CapabilityDescription> {
@@ -3273,10 +3308,10 @@ mod tests {
 
     /// The exit codes, messages, and argument rules the description promises are the shell's.
     ///
-    /// The "Reading the result" paragraph and the flag-typing sentence describe interpreter
+    /// The "Reading the result" paragraph and the provider-word item describe interpreter
     /// behaviour that no prose can keep true on its own; this pins each promise to the shell the
     /// way `refusal_list` pins the refused constructs, so a remapped code, a reworded message, or
-    /// a changed typing rule fails here rather than misleading a model.
+    /// a provider word the shell stopped running fails here rather than misleading a model.
     #[test]
     fn every_outcome_the_description_explains_is_what_the_shell_produces() {
         for (code, phrase) in [
@@ -3293,7 +3328,7 @@ mod tests {
             ),
             (
                 ExitCode::NOT_FOUND,
-                "Exit 127 (`command not found` or `capability not found`)",
+                "Exit 127 means the word is not a builtin or a command this session's providers add",
             ),
         ] {
             assert!(SCRIPT_TOOL_DESCRIPTION.contains(phrase), "{phrase}");
@@ -3304,17 +3339,23 @@ mod tests {
             );
         }
 
-        let not_found = dekopon_shell::run("nosuch.capability --x 1", &OutcomeCapabilities);
+        // A capability-shaped word is an ordinary unknown command.
+        let not_found = dekopon_shell::run("wikipedia_page --title x", &OutcomeCapabilities);
         assert_eq!(not_found.exit_code, ExitCode::NOT_FOUND, "{not_found:?}");
         assert!(
             not_found.output.contains("command not found"),
             "{not_found:?}"
         );
 
-        let denied = dekopon_shell::run("locked.door --knock", &OutcomeCapabilities);
+        // A command that needs a capability this session was not granted says which one.
+        let ungranted = dekopon_shell::run("probe vault", &OutcomeCapabilities);
+        assert_eq!(ungranted.exit_code, ExitCode::NOT_FOUND, "{ungranted:?}");
+        assert!(ungranted.output.contains("vault.open"), "{ungranted:?}");
+
+        let denied = dekopon_shell::run("probe door", &OutcomeCapabilities);
         assert_eq!(denied.exit_code, ExitCode::DENIED, "{denied:?}");
 
-        let failed = dekopon_shell::run("broken.thing", &OutcomeCapabilities);
+        let failed = dekopon_shell::run("probe broken", &OutcomeCapabilities);
         assert_eq!(failed.exit_code, ExitCode::FAILURE, "{failed:?}");
         assert!(
             failed
@@ -3325,23 +3366,27 @@ mod tests {
 
         let usage = dekopon_shell::run("echo abc | grep '[0-9]'", &OutcomeCapabilities);
         assert_eq!(usage.exit_code, ExitCode::SYNTAX, "{usage:?}");
+        let declined = dekopon_shell::run("probe bogus", &OutcomeCapabilities);
+        assert_eq!(declined.exit_code, ExitCode::SYNTAX, "{declined:?}");
+        assert!(declined.output.contains("probe: usage:"), "{declined:?}");
 
-        // Item 2: numbers, booleans, and null typed; anything else a string; bare flag true;
-        // repeats an array. The echo-like capability returns exactly what it was sent.
-        let typed = dekopon_shell::run(
-            "posts.get --post-id 7 --include-body --tag a --tag b --name 7x --gone null",
-            &OutcomeCapabilities,
-        );
-        assert_eq!(typed.exit_code, ExitCode::SUCCESS, "{typed:?}");
+        // Item 2: a provider word documents itself, proposes what it parsed from its own argv,
+        // and `cap --list` shows the grants those proposals have to fall within.
+        let help = dekopon_shell::run("probe --help", &OutcomeCapabilities);
+        assert_eq!(help.exit_code, ExitCode::SUCCESS, "{help:?}");
+        assert!(help.output.contains("Usage: probe"), "{help:?}");
+        let proposed = dekopon_shell::run("probe get --post-id 7", &OutcomeCapabilities);
+        assert_eq!(proposed.exit_code, ExitCode::SUCCESS, "{proposed:?}");
         assert_eq!(
-            serde_json::from_str::<Value>(&typed.output).expect("the input is echoed as JSON"),
-            json!({"postId": 7, "includeBody": true, "tag": ["a", "b"], "name": "7x", "gone": null})
+            serde_json::from_str::<Value>(&proposed.output)
+                .expect("the proposal's input is echoed as JSON"),
+            json!({"postId": "7"})
         );
-        let via_cap = dekopon_shell::run("cap posts.get --post-id 7", &OutcomeCapabilities);
-        assert_eq!(via_cap.exit_code, ExitCode::SUCCESS, "{via_cap:?}");
+        let listed = dekopon_shell::run("cap --list", &OutcomeCapabilities);
+        assert_eq!(listed.exit_code, ExitCode::SUCCESS, "{listed:?}");
         assert_eq!(
-            serde_json::from_str::<Value>(&via_cap.output).expect("cap echoes the same input"),
-            json!({"postId": 7})
+            serde_json::from_str::<Value>(&listed.output).expect("cap --list prints a JSON array"),
+            json!(["broken.thing", "locked.door", "posts.get"])
         );
 
         let structured = dekopon_shell::run(
@@ -3379,9 +3424,30 @@ mod tests {
         assert_eq!(tool.parameters["required"], json!(["script"]));
         assert_eq!(tool.parameters["additionalProperties"], json!(false));
         // The description has to point at the interpreter's own self-disclosure, or a model has no
-        // way to learn which capabilities this session can reach.
+        // way to learn which capabilities this session holds or how to call a provider's word.
         assert!(tool.description.contains("cap --list"));
-        assert!(tool.description.contains("cap --describe"));
+        assert_eq!(
+            tool.description.matches("run `<word> --help`").count(),
+            1,
+            "{}",
+            tool.description
+        );
+        // A provider parses its own argv. Nothing may still describe the retired flag-to-JSON
+        // rewrite, capability identifiers typed as commands, schema discovery, or the `curl`
+        // builtin.
+        for retired in [
+            "kebab",
+            "JSON object",
+            "capability invocation",
+            "cap --describe",
+            "curl",
+        ] {
+            assert!(
+                !tool.description.contains(retired),
+                "{retired}: {}",
+                tool.description
+            );
+        }
         // A session with no provider command words reads exactly as it always did.
         assert!(
             !tool
@@ -3837,21 +3903,21 @@ mod tests {
     #[test]
     fn runs_a_model_script_and_returns_the_final_answer() {
         let model = ScriptedModel::new([
-            script_call("call-1", "echo.echo --message hi | jq -r .message"),
-            answer("The capability echoed hi."),
+            script_call("call-1", "probe upper --text hi | jq -r .text"),
+            answer("The probe answered HI."),
         ]);
         let runtime = RecordingRuntime::new(1);
 
         let outcome = run_prompt(&model, &runtime, "say hi", None, limits(4, 32))
             .expect("prompt session succeeds");
 
-        assert_eq!(outcome.answer, "The capability echoed hi.");
+        assert_eq!(outcome.answer, "The probe answered HI.");
         assert_eq!(outcome.model_turns, 2);
         assert_eq!(outcome.script_calls, 1);
         assert_eq!(outcome.capability_invocations, 1);
         let scripts = runtime.scripts.lock().expect("script lock");
         assert_eq!(scripts.len(), 1);
-        assert_eq!(scripts[0].0, "echo.echo --message hi | jq -r .message");
+        assert_eq!(scripts[0].0, "probe upper --text hi | jq -r .text");
     }
 
     #[test]
@@ -4097,7 +4163,7 @@ mod tests {
 
         let outcome = tokio::task::spawn_blocking(move || {
             let model = ScriptedModel::new([
-                script_call("call-1", "http.get --url https://example.test"),
+                script_call("call-1", "httpprobe fetch --uri https://example.test"),
                 answer("fetched"),
             ]);
             let runtime = BlockingBridgeRuntime {
@@ -4115,7 +4181,7 @@ mod tests {
         assert_eq!(outcome.capability_invocations, 1);
         assert_eq!(
             *dispatched.lock().expect("dispatch lock"),
-            vec!["http.get --url https://example.test".to_owned()]
+            vec!["httpprobe fetch --uri https://example.test".to_owned()]
         );
     }
 

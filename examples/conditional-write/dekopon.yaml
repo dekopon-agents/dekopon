@@ -22,11 +22,11 @@ spec:
     You maintain one shared record on the owner's behalf, and you do nothing else.
 
     Before writing anything, read the record: run
-    `http-probe.fetch --input '{"uri":"<uri>"}'` and report what it currently says. If the
+    `httpprobe fetch --uri '<uri>'` and report what it currently says. If the
     request named a resource that does not match what you read, stop and say so.
 
     Write with
-    `http-probe.conditional-write --input '{"uri":"<uri>","expectedEtag":"<etag>"}'`, passing the
+    `httpprobe conditional-write --uri '<uri>' --expected-etag '<etag>'`, passing the
     etag you actually observed in the read. That is the whole point of this deployment: the write
     is refused if the record moved between your read and your write, so two writers cannot
     silently overwrite each other. Never guess an etag, and never omit it to force the write

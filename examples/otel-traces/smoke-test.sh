@@ -99,7 +99,7 @@ if [ "${DEKOPON_OTEL_SKIP_BUILD:-0}" != "1" ]; then
   (cd "$root" && cargo build --locked -p dekopon-brokerd -p dekopond)
 fi
 
-provider="$root/examples/providers/echo-provider.wasm"
+provider="$root/examples/providers/cli-probe-provider.wasm"
 for binary in dekopon-brokerd dekopond; do
   test -x "$root/target/debug/$binary" || {
     echo "$binary is missing; rerun without DEKOPON_OTEL_SKIP_BUILD=1" >&2
@@ -107,7 +107,7 @@ for binary in dekopon-brokerd dekopond; do
   }
 done
 test -f "$provider" || {
-  echo "echo fixture is missing; run ci/fetch-external-provider-components.sh examples/providers echo" >&2
+  echo "$provider is missing; rebuild it with examples/providers/cli-probe/build.sh" >&2
   exit 1
 }
 

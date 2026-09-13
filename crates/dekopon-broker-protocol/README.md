@@ -27,7 +27,9 @@ having learned nothing they could not learn by naming the capability directly; r
 authorizes nothing. The piped value is bounded twice: by the frame ceiling on the client, where an
 oversized value fails in the request phase before a byte is written, and by the broker host's input
 bound before a store exists. A guest failure is the stable `provider-error` code with an opaque
-message.
+message. Like an invocation, the frame carries a mandatory, well-formed `traceParent`; the broker's
+`broker.command_run` span adopts it, so the word and its answer sit in the same trace as the
+proposal that follows.
 
 Unix clients accept server-owned, single-link `0600` sockets and shared IPC `0660` sockets, and
 inspect the parent directory in both cases: it must be a server-owned, non-symlink directory,

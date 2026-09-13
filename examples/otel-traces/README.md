@@ -12,15 +12,15 @@ Prerequisites: Docker Compose, `rustup` (the repository's `rust-toolchain.toml` 
 From the repository root:
 
 ```console
-ci/fetch-external-provider-components.sh examples/providers echo
 python3 examples/otel-traces/test-smoke.py
 examples/otel-traces/smoke-test.sh
 ```
 
 The script builds both daemons, creates private temporary configuration and a `0600`
 local chat socket, sends one request, receives one JSON response line, and verifies two
-model calls and the successful authorized echo's `broker.execution` audit record on the broker's
-stdout. The model first proposes a bash tool call and then answers from its actual provider result.
+model calls and the `broker.execution` audit record of the authorized `cli-probe.upper` on the
+broker's stdout. The model first proposes a bash tool call running `probe upper --text …` against
+the in-tree `cli-probe` component and then answers from its actual provider result.
 
 Both daemons export traces over OTLP/HTTP and deliver logs as structured stdout. A
 smoke-only Python shipper submits all captured JSON stdout records to OpenObserve's

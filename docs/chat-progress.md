@@ -85,7 +85,11 @@ Who emits what:
   sees it.
 - **`ModelTurn`, `TextDelta`, `Answered`, `Cancelled`, `Failed`, `Finished`** — the prompt loop.
 - **`ToolStarted`, `ToolFinished`, `Attachment`** — the broker leg, where the word, the outcome,
-  and the acceptance already are.
+  and the acceptance already are. One started/finished pair per tool use, reported under the
+  command word and started before its run. A command that proposes a capability call finishes with
+  that call's outcome, or `Failed` when the call never happens (the grant is missing, the budget or
+  the deadline ran out); one that ends without a proposal (help, a usage error, a failure, a stop)
+  finishes with its own.
 - **`KeepAlive`** — the policy's own clock. Nothing else synthesizes it.
 
 `FailureClass::of` derives a class from `PromptError` with a `match` naming every variant, so a new
