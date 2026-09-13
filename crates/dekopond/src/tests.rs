@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     ffi::OsString,
     fs,
+    ops::ControlFlow,
     os::unix::fs::PermissionsExt as _,
     path::{Path, PathBuf},
     sync::{
@@ -11,8 +12,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dekopon_agent::{
+    CancelVia,
     attachment::{ChatAssetSource as _, GeneratedImage},
     prompt::{
         AGENT_CONFIG_TOOL_NAME, AssetSource as _, ConversationTurn, DECLINE_REPLY_TOOL_NAME,
@@ -26,9 +29,16 @@ use dekopon_broker_protocol::{
 };
 use dekopon_config::LocalCatalog;
 use dekopon_core::ExternalSubject;
-use dekopon_model::model::{
-    AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelFunctionCall, ModelMessage,
-    ModelTool, ModelToolCall,
+use dekopon_model::{
+    TurnEvent,
+    model::{
+        AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelFunctionCall, ModelMessage,
+        ModelTool, ModelToolCall,
+    },
+};
+use dekopon_test_support::{
+    FailureKind, ProgressCall, RecordingCancelButton, RecordingDriver, RecordingProgress,
+    RecordingReaction, RecordingStatus, RecordingStream, RecordingTyping, StreamCall,
 };
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
@@ -38,22 +48,26 @@ use crate::{
     asset::{self, AssetAccess, AssetSourceRef, AssetStore, PendingAsset, SessionAssets},
     cache_key,
     config::{
-        self, ActivityMode, ConfigError, ConfigProblem, ConversationPolicy, ConversationScope,
-        ConversationWindow, ModelConfig, NativeActivityConfig, ResolvedBroker, RouteMatch,
-        SlackActivityConfig, SlackActivityFallback, SlackExperience,
+        self, ConfigError, ConfigProblem, ConversationPolicy, ConversationScope,
+        ConversationWindow, LivenessConfig, LivenessMode, LivenessSettings, ModelConfig,
+        ProgressSurface, ResolvedBroker, ResolvedLiveness, RouteMatch, SlackExperience,
+        SlackLivenessFallback,
     },
     conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
+    progress::{KeepAlive, ProgressDetail, ProgressText},
     routes::{RouteError, RouteProblem, RoutingTable},
     session::{
-        BUSY_REPLY, FAILURE_REPLY, ModelCache, ModelFactory, SessionError, SessionGate,
-        SessionRunner, SharedModel, UNAUTHORIZED_REPLY, UNREPORTED_WORK_REPLY,
+        BUSY_REPLY, CancelOutcome, FAILURE_REPLY, ModelCache, ModelFactory, SessionError,
+        SessionGate, SessionRunner, SharedModel, UNAUTHORIZED_REPLY, UNREPORTED_WORK_REPLY,
         memory_record_outcome_category, model_bearer_token, model_credential, run_session,
     },
     transport::{
-        ActivityTarget, AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind,
-        InboundMessage, MAX_INBOUND_TEXT_BYTES, MAX_OUTBOUND_TEXT_BYTES, OutboundReply,
-        ReplyTarget, ThreadClaim, ThreadContinuation, ThreadOwnership, TransportError,
-        TransportEvent, TransportIdentity, bound_inbound, bound_outbound, credential_value,
+        AssetFetcher, CancelButton, CancelPress, ChatDriver, ChatTransport, ConversationKind,
+        InboundMessage, InboundReaction, LivenessTarget, MAX_INBOUND_TEXT_BYTES,
+        MAX_OUTBOUND_TEXT_BYTES, MessageRef, NativeStatus, OutboundReply, ProgressLimits,
+        ProgressMessage, ReplyTarget, Status, StreamLimits, StreamedText, TextStream, ThreadClaim,
+        ThreadContinuation, ThreadOwnership, TransportError, TransportEvent, TransportIdentity,
+        TypingLease, bound_inbound, bound_outbound, credential_value,
     },
 };
 
@@ -271,6 +285,7 @@ fn a_model_api_key_variable_is_absent_or_usable_and_never_silently_empty() {
         model: "qwen3".to_owned(),
         api_key_env: api_key_env.map(ToOwned::to_owned),
         timeout_ms: 60_000,
+        stream: true,
         classes: vec!["fast".to_owned()],
         modalities: Vec::new(),
     };
@@ -315,7 +330,7 @@ fn a_model_api_key_variable_is_absent_or_usable_and_never_silently_empty() {
 }
 
 #[tokio::test]
-async fn slack_activity_and_experience_are_explicit_and_strict() {
+async fn slack_liveness_and_experience_are_explicit_and_strict() {
     let directory = temporary();
     let mut document = document(directory.path());
     document["transports"][0] = json!({
@@ -324,7 +339,7 @@ async fn slack_activity_and_experience_are_explicit_and_strict() {
         "appTokenEnv": "DEKOPOND_SLACK_APP_TOKEN",
         "botTokenEnv": "DEKOPOND_SLACK_BOT_TOKEN",
         "experience": "agent",
-        "activity": {"mode": "native", "classicFallback": "reaction"}
+        "liveness": {"mode": "native", "classicFallback": "reaction"}
     });
     document["routes"][0]["transport"] = json!("workspace-slack");
 
@@ -335,15 +350,16 @@ async fn slack_activity_and_experience_are_explicit_and_strict() {
         resolved.transports.first(),
         Some(config::TransportConfig::SlackSocketMode {
             experience: SlackExperience::Agent,
-            activity: SlackActivityConfig {
-                mode: ActivityMode::Native,
-                classic_fallback: SlackActivityFallback::Reaction,
+            liveness: LivenessConfig {
+                mode: LivenessMode::Native,
+                classic_fallback: SlackLivenessFallback::Reaction,
+                ..
             },
             ..
         })
     ));
 
-    document["transports"][0]["activity"]["unexpected"] = json!(true);
+    document["transports"][0]["liveness"]["unexpected"] = json!(true);
     let error = load(directory.path(), &document)
         .await
         .expect_err("unknown cosmetic settings still fail strict decoding");
@@ -480,7 +496,7 @@ async fn whatsapp_configuration_is_explicit_strict_and_pinned() {
 }
 
 #[tokio::test]
-async fn native_activity_is_off_unless_a_transport_opts_in() {
+async fn native_liveness_is_off_unless_a_transport_opts_in() {
     let directory = temporary();
     let mut document = document(directory.path());
     document["transports"][0] = json!({
@@ -495,8 +511,9 @@ async fn native_activity_is_off_unless_a_transport_opts_in() {
     assert!(matches!(
         resolved.transports.first(),
         Some(config::TransportConfig::DiscordGateway {
-            activity: NativeActivityConfig {
-                mode: ActivityMode::Off,
+            liveness: LivenessConfig {
+                mode: LivenessMode::Off,
+                ..
             },
             ..
         })
@@ -863,24 +880,24 @@ async fn invalid_configurations_fail_closed_at_startup() {
             },
         ),
         (
-            "a Slack reaction fallback while activity is off",
+            "a Slack reaction fallback while liveness is off",
             mutate(|document| {
                 document["transports"][0] = json!({
                     "name": "dev",
                     "kind": "slackSocketMode",
                     "appTokenEnv": "DEKOPOND_SLACK_APP_TOKEN",
                     "botTokenEnv": "DEKOPOND_SLACK_BOT_TOKEN",
-                    "activity": {"mode": "off", "classicFallback": "reaction"}
+                    "liveness": {"mode": "off", "classicFallback": "reaction"}
                 });
             }),
             |error| {
                 reports(error, |problem| {
-                    matches!(problem, ConfigProblem::InvalidSlackActivity { .. })
+                    matches!(problem, ConfigProblem::InvalidSlackLiveness { .. })
                 })
             },
         ),
         (
-            "classic native Slack activity with no visible fallback",
+            "classic native Slack liveness with no visible fallback",
             mutate(|document| {
                 document["transports"][0] = json!({
                     "name": "dev",
@@ -888,12 +905,12 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     "appTokenEnv": "DEKOPOND_SLACK_APP_TOKEN",
                     "botTokenEnv": "DEKOPOND_SLACK_BOT_TOKEN",
                     "experience": "classic",
-                    "activity": {"mode": "native", "classicFallback": "none"}
+                    "liveness": {"mode": "native", "classicFallback": "none"}
                 });
             }),
             |error| {
                 reports(error, |problem| {
-                    matches!(problem, ConfigProblem::InvalidSlackActivity { .. })
+                    matches!(problem, ConfigProblem::InvalidSlackLiveness { .. })
                 })
             },
         ),
@@ -1273,7 +1290,7 @@ async fn aggregate_telegram_connect_failures_never_render_bot_tokens() {
             name.to_owned(),
             endpoint.clone(),
             token.to_owned(),
-            ActivityMode::Off,
+            LivenessSettings::default(),
         )
         .expect("build token-owning transport");
         let source = tokio::time::timeout(Duration::from_secs(5), transport.connect())
@@ -1404,20 +1421,21 @@ async fn telegram_call_failures_never_render_bot_tokens() {
         "token-bearing-telegram".to_owned(),
         endpoint,
         TOKEN.to_owned(),
-        ActivityMode::Native,
+        liveness_settings(LivenessMode::Native),
     )
     .expect("build token-owning transport");
     let fetcher = transport
         .asset_fetcher()
         .expect("Telegram fetches its own attachments");
-    let activity = transport.activity().expect("native activity is configured");
-    let replier = transport.replier();
+    let driver = transport.driver();
+    let typing = driver.typing().expect("Telegram leases a typing indicator");
     let asset = AssetSourceRef::Telegram {
         file_id: "synthetic-file-id".to_owned(),
     };
-    let showing = ActivityTarget::Telegram {
+    let showing = LivenessTarget::Telegram {
         chat_id: 4242,
         message_thread_id: None,
+        message_id: 77,
     };
     let answering = ReplyTarget::Telegram {
         chat_id: 4242,
@@ -1444,28 +1462,25 @@ async fn telegram_call_failures_never_render_bot_tokens() {
                 fetcher.fetch(&asset, 1024).await.expect_err("broken peer"),
             ),
             (
-                "show",
-                activity
-                    .show(showing.clone())
-                    .await
-                    .expect_err("broken peer"),
+                "typing",
+                typing.renew(&showing).await.expect_err("broken peer"),
             ),
             (
-                "show: response body",
-                activity.show(showing).await.expect_err("broken peer"),
+                "typing: response body",
+                typing.renew(&showing).await.expect_err("broken peer"),
             ),
             (
                 "send_text",
-                replier
-                    .reply(answering.clone(), OutboundReply::text("an answer"))
+                driver
+                    .reply(&answering, OutboundReply::text("an answer"))
                     .await
                     .expect_err("broken peer"),
             ),
             (
                 "send_photo",
-                replier
+                driver
                     .reply(
-                        answering,
+                        &answering,
                         OutboundReply {
                             text: "a caption".to_owned(),
                             images: generated_images(1),
@@ -2135,22 +2150,16 @@ impl ModelFactory for Arc<ModelScript> {
 struct ScriptedModel(Arc<ModelScript>);
 
 impl ChatModel for ScriptedModel {
-    /// Every request the gateway makes arrives through `complete_with`; this exists because the
-    /// trait requires it, and it records a keyless request so a regression that stopped supplying
-    /// options would show up as a missing key rather than as a silently different code path.
+    /// A model that cannot stream calls `on_event` zero times and answers with the whole turn,
+    /// which is the degradation the one-method trait is for: every assertion below is about what
+    /// the gateway asked for and what it got back, and none of them changes because no deltas
+    /// arrived.
     fn complete(
         &self,
         messages: &[ModelMessage],
         tools: &[ModelTool],
-    ) -> Result<AssistantTurn, ModelError> {
-        self.complete_with(messages, tools, &CompletionOptions::default())
-    }
-
-    fn complete_with(
-        &self,
-        messages: &[ModelMessage],
-        tools: &[ModelTool],
         options: &CompletionOptions,
+        _on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
     ) -> Result<AssistantTurn, ModelError> {
         assert!(!self.0.forbidden, "this session must never reach a model");
         self.0
@@ -2322,41 +2331,261 @@ fn inspect_agent_config() -> AssistantTurn {
     }
 }
 
-/// Records every answer the gateway sent, so a test can assert on what a person would have read.
-#[derive(Default)]
-struct RecordingReplier {
-    replies: Mutex<Vec<String>>,
-    image_bytes: Mutex<Vec<Vec<usize>>>,
+/// One liveness target as the short string the shared recorder logs.
+///
+/// `dekopon-test-support` holds the recorder and the failure switches; it cannot hold these types,
+/// which are private to this crate. So the rendering lives here, once, and every capability object
+/// below renders through it — a call that reached the wrong conversation then shows up in the log
+/// rather than behind an elided field.
+fn rendered_target(target: &LivenessTarget) -> String {
+    match target {
+        LivenessTarget::Slack {
+            channel_id,
+            thread_ts,
+            ..
+        } => format!("slack:{channel_id}:{thread_ts}"),
+        LivenessTarget::Discord {
+            channel_id,
+            message_id,
+        } => format!("discord:{channel_id}:{message_id}"),
+        LivenessTarget::Telegram {
+            chat_id,
+            message_id,
+            ..
+        } => format!("telegram:{chat_id}:{message_id}"),
+        LivenessTarget::WhatsApp { recipient, .. } => format!("whatsapp:{recipient}"),
+        LivenessTarget::Local { connection } => format!("local:{connection}"),
+    }
 }
 
-impl RecordingReplier {
-    fn replies(&self) -> Vec<String> {
-        self.replies.lock().expect("reply lock").clone()
-    }
+/// One message reference as its target plus the service identifier the driver handed back.
+fn rendered_message(message: &MessageRef) -> String {
+    format!("{}#{}", rendered_target(&message.target), message.id)
+}
 
-    /// One entry per reply, each listing that reply's attachment byte counts in order.
-    fn image_bytes(&self) -> Vec<Vec<usize>> {
-        self.image_bytes.lock().expect("image reply lock").clone()
+/// The transport error a test's chosen failure stands for.
+///
+/// The shared recorder names the *kind* of failure a test wants because the error type is this
+/// crate's; this is the one place the two vocabularies meet, so a rung that degrades on a rate
+/// limit and one that degrades on a closed socket cannot be written as the same test by accident.
+fn injected(kind: FailureKind) -> TransportError {
+    match kind {
+        FailureKind::Response => TransportError::Response,
+        FailureKind::RateLimited => TransportError::Service {
+            code: "ratelimited".to_owned(),
+        },
+        FailureKind::Closed => TransportError::Closed,
     }
 }
 
-impl ChatReplier for RecordingReplier {
-    fn reply(
+#[async_trait]
+impl ChatDriver for RecordingDriver {
+    async fn reply(
         &self,
-        _target: ReplyTarget,
+        _target: &ReplyTarget,
         reply: OutboundReply,
-    ) -> BoxFuture<'_, Result<(), TransportError>> {
-        Box::pin(async move {
-            self.replies.lock().expect("reply lock").push(reply.text);
-            self.image_bytes.lock().expect("image reply lock").push(
-                reply
-                    .images
-                    .iter()
-                    .map(|image| image.bytes().len())
-                    .collect(),
-            );
-            Ok(())
+    ) -> Result<(), TransportError> {
+        if let Some(kind) = self.charge_reply() {
+            return Err(injected(kind));
+        }
+        self.record_reply(
+            reply.text,
+            reply
+                .images
+                .iter()
+                .map(|image| image.bytes().len())
+                .collect(),
+        );
+        Ok(())
+    }
+
+    fn typing(&self) -> Option<&dyn TypingLease> {
+        self.typing_object()
+            .map(|object| object as &dyn TypingLease)
+    }
+
+    fn status(&self) -> Option<&dyn NativeStatus> {
+        self.status_object()
+            .map(|object| object as &dyn NativeStatus)
+    }
+
+    fn progress(&self) -> Option<&dyn ProgressMessage> {
+        self.progress_object()
+            .map(|object| object as &dyn ProgressMessage)
+    }
+
+    fn stream(&self) -> Option<&dyn TextStream> {
+        self.stream_object().map(|object| object as &dyn TextStream)
+    }
+
+    fn reaction(&self) -> Option<&dyn InboundReaction> {
+        self.reaction_object()
+            .map(|object| object as &dyn InboundReaction)
+    }
+
+    fn cancel_button(&self) -> Option<&dyn CancelButton> {
+        self.cancel_button_object()
+            .map(|object| object as &dyn CancelButton)
+    }
+}
+
+#[async_trait]
+impl TypingLease for RecordingTyping {
+    fn renew_every(&self) -> Duration {
+        RecordingTyping::renew_every(self)
+    }
+
+    async fn renew(&self, target: &LivenessTarget) -> Result<(), TransportError> {
+        let failure = self.charge();
+        self.record(rendered_target(target));
+        failure.map_or(Ok(()), |kind| Err(injected(kind)))
+    }
+}
+
+#[async_trait]
+impl NativeStatus for RecordingStatus {
+    async fn set(&self, target: &LivenessTarget, status: Status) -> Result<(), TransportError> {
+        let failure = self.charge();
+        self.record(
+            rendered_target(target),
+            match status {
+                Status::Working => "working",
+                Status::Idle => "idle",
+            },
+        );
+        failure.map_or(Ok(()), |kind| Err(injected(kind)))
+    }
+}
+
+#[async_trait]
+impl ProgressMessage for RecordingProgress {
+    fn limits(&self) -> ProgressLimits {
+        ProgressLimits {
+            max_chars: self.max_chars(),
+            min_edit_interval: self.min_edit_interval(),
+        }
+    }
+
+    async fn post(
+        &self,
+        target: &LivenessTarget,
+        text: &ProgressText,
+        cancel: bool,
+    ) -> Result<MessageRef, TransportError> {
+        let failure = self.charge();
+        self.record(ProgressCall::Post {
+            target: rendered_target(target),
+            text: text.as_str().to_owned(),
+            cancel,
+        });
+        if let Some(kind) = failure {
+            return Err(injected(kind));
+        }
+        Ok(MessageRef {
+            target: target.clone(),
+            id: format!("progress-{}", self.calls()),
         })
+    }
+
+    async fn edit(
+        &self,
+        message: &MessageRef,
+        text: &ProgressText,
+        cancel: bool,
+    ) -> Result<(), TransportError> {
+        let failure = self.charge();
+        self.record(ProgressCall::Edit {
+            message: rendered_message(message),
+            text: text.as_str().to_owned(),
+            cancel,
+        });
+        failure.map_or(Ok(()), |kind| Err(injected(kind)))
+    }
+
+    async fn delete(&self, message: &MessageRef) -> Result<(), TransportError> {
+        let failure = self.charge();
+        self.record(ProgressCall::Delete {
+            message: rendered_message(message),
+        });
+        failure.map_or(Ok(()), |kind| Err(injected(kind)))
+    }
+
+    async fn finalize(
+        &self,
+        message: &MessageRef,
+        reply: &OutboundReply,
+    ) -> Result<(), TransportError> {
+        let failure = self.charge();
+        self.record(ProgressCall::Finalize {
+            message: rendered_message(message),
+            text: reply.text.clone(),
+        });
+        failure.map_or(Ok(()), |kind| Err(injected(kind)))
+    }
+}
+
+#[async_trait]
+impl TextStream for RecordingStream {
+    fn limits(&self) -> StreamLimits {
+        StreamLimits {
+            min_interval: self.min_interval(),
+            max_chars: self.max_chars(),
+        }
+    }
+
+    async fn show(
+        &self,
+        target: &LivenessTarget,
+        message: Option<&MessageRef>,
+        text: &StreamedText,
+        cancel: bool,
+    ) -> Result<MessageRef, TransportError> {
+        let failure = self.charge();
+        self.record(StreamCall::Show {
+            target: rendered_target(target),
+            message: message.map(rendered_message),
+            text: text.text.as_str().to_owned(),
+            truncated: text.truncated,
+            cancel,
+        });
+        if let Some(kind) = failure {
+            return Err(injected(kind));
+        }
+        Ok(message.cloned().unwrap_or_else(|| MessageRef {
+            target: target.clone(),
+            id: "stream".to_owned(),
+        }))
+    }
+
+    async fn finalize(
+        &self,
+        message: &MessageRef,
+        reply: &OutboundReply,
+    ) -> Result<(), TransportError> {
+        let failure = self.charge();
+        self.record(StreamCall::Finalize {
+            message: rendered_message(message),
+            text: reply.text.clone(),
+        });
+        failure.map_or(Ok(()), |kind| Err(injected(kind)))
+    }
+}
+
+#[async_trait]
+impl InboundReaction for RecordingReaction {
+    async fn set(&self, target: &LivenessTarget, present: bool) -> Result<(), TransportError> {
+        let failure = self.charge();
+        self.record(rendered_target(target), present);
+        failure.map_or(Ok(()), |kind| Err(injected(kind)))
+    }
+}
+
+#[async_trait]
+impl CancelButton for RecordingCancelButton {
+    async fn ack(&self, press: &CancelPress) -> Result<(), TransportError> {
+        let failure = self.charge();
+        self.record(press.subject.clone());
+        failure.map_or(Ok(()), |kind| Err(injected(kind)))
     }
 }
 
@@ -2379,141 +2608,80 @@ impl ThreadOwnership for RecordingThreadOwnership {
     }
 }
 
+/// A driver whose native status never answers `Working`, so a hung service can be aimed at the one
+/// task that also writes the answer.
+///
+/// The shared recorder answers immediately, which is right for almost everything and useless for
+/// the one property that matters here: that a cosmetic call cannot hold the answer. This one stops
+/// in the middle of `Working` and stays there — `release` exists so the park is a wait rather than
+/// a spin, and the test that owns it deliberately never fires it.
 #[derive(Default)]
-struct RecordingSurface {
-    events: Mutex<Vec<String>>,
-    shown: tokio::sync::Notify,
-    hidden: tokio::sync::Notify,
-}
-
-impl RecordingSurface {
-    fn events(&self) -> Vec<String> {
-        self.events.lock().expect("surface event lock").clone()
-    }
-
-    async fn wait_until_shown(&self) {
-        tokio::time::timeout(Duration::from_secs(5), self.shown.notified())
-            .await
-            .expect("activity becomes visible");
-    }
-
-    async fn wait_until_hidden(&self) {
-        tokio::time::timeout(Duration::from_secs(5), self.hidden.notified())
-            .await
-            .expect("activity cleanup completes");
-    }
-}
-
-impl ChatActivity for RecordingSurface {
-    fn show(&self, _target: ActivityTarget) -> BoxFuture<'_, Result<(), TransportError>> {
-        Box::pin(async move {
-            self.events
-                .lock()
-                .expect("surface event lock")
-                .push("show".to_owned());
-            self.shown.notify_one();
-            Ok(())
-        })
-    }
-
-    fn hide(&self, _target: ActivityTarget) -> BoxFuture<'_, Result<(), TransportError>> {
-        Box::pin(async move {
-            self.events
-                .lock()
-                .expect("surface event lock")
-                .push("hide".to_owned());
-            self.hidden.notify_one();
-            Ok(())
-        })
-    }
-
-    fn refresh_interval(&self) -> Option<Duration> {
-        None
-    }
-}
-
-impl ChatReplier for RecordingSurface {
-    fn reply(
-        &self,
-        _target: ReplyTarget,
-        reply: OutboundReply,
-    ) -> BoxFuture<'_, Result<(), TransportError>> {
-        Box::pin(async move {
-            self.events
-                .lock()
-                .expect("surface event lock")
-                .push(format!("reply:{}", reply.text));
-            Ok(())
-        })
-    }
-}
-
-#[derive(Default)]
-struct DelayedSurface {
+struct DelayedStatusDriver {
     events: Mutex<Vec<&'static str>>,
     entered: tokio::sync::Notify,
     release: tokio::sync::Notify,
-    hidden: tokio::sync::Notify,
+    idle: tokio::sync::Notify,
 }
 
-impl ChatActivity for DelayedSurface {
-    fn show(&self, _target: ActivityTarget) -> BoxFuture<'_, Result<(), TransportError>> {
-        Box::pin(async move {
-            self.events
-                .lock()
-                .expect("delayed surface events")
-                .push("show-start");
-            self.entered.notify_one();
-            self.release.notified().await;
-            self.events
-                .lock()
-                .expect("delayed surface events")
-                .push("show-finish");
-            Ok(())
-        })
+impl DelayedStatusDriver {
+    fn events(&self) -> Vec<&'static str> {
+        self.events.lock().expect("delayed driver events").clone()
     }
 
-    fn hide(&self, _target: ActivityTarget) -> BoxFuture<'_, Result<(), TransportError>> {
-        Box::pin(async move {
-            self.events
-                .lock()
-                .expect("delayed surface events")
-                .push("hide");
-            self.hidden.notify_one();
-            Ok(())
-        })
-    }
-
-    fn refresh_interval(&self) -> Option<Duration> {
-        None
+    fn push(&self, event: &'static str) {
+        self.events
+            .lock()
+            .expect("delayed driver events")
+            .push(event);
     }
 }
 
-impl ChatReplier for DelayedSurface {
-    fn reply(
+#[async_trait]
+impl ChatDriver for DelayedStatusDriver {
+    async fn reply(
         &self,
-        _target: ReplyTarget,
+        _target: &ReplyTarget,
         _reply: OutboundReply,
-    ) -> BoxFuture<'_, Result<(), TransportError>> {
-        Box::pin(async move {
-            self.events
-                .lock()
-                .expect("delayed surface events")
-                .push("reply");
-            Ok(())
-        })
+    ) -> Result<(), TransportError> {
+        self.push("reply");
+        Ok(())
+    }
+
+    fn status(&self) -> Option<&dyn NativeStatus> {
+        Some(self)
     }
 }
 
-struct PartialDeliveryReplier;
+#[async_trait]
+impl NativeStatus for DelayedStatusDriver {
+    async fn set(&self, _target: &LivenessTarget, status: Status) -> Result<(), TransportError> {
+        match status {
+            Status::Working => {
+                self.push("working-start");
+                self.entered.notify_one();
+                self.release.notified().await;
+                self.push("working-finish");
+            }
+            Status::Idle => {
+                self.push("idle");
+                self.idle.notify_one();
+            }
+        }
+        Ok(())
+    }
+}
 
-impl ChatReplier for PartialDeliveryReplier {
-    fn reply(
+/// A driver whose every answer is accepted in part, which is not success.
+struct PartialDeliveryDriver;
+
+#[async_trait]
+impl ChatDriver for PartialDeliveryDriver {
+    async fn reply(
         &self,
-        _target: ReplyTarget,
+        _target: &ReplyTarget,
         _reply: OutboundReply,
-    ) -> BoxFuture<'_, Result<(), TransportError>> {
-        Box::pin(async { Err(TransportError::PartialDelivery) })
+    ) -> Result<(), TransportError> {
+        Err(TransportError::PartialDelivery)
     }
 }
 
@@ -2628,10 +2796,22 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
             max_steps: 4,
             max_capability_calls: 8,
         },
+        // No wall clock by default: a route that does not name one is not on a timer, and every
+        // budget test says its own number rather than inheriting a fixture's.
+        max_duration: None,
+        progress_detail: ProgressDetail::Plain,
         conversation: ConversationPolicy::OneShot,
         // Minted the way `RoutingTable::bind` mints it, so a test that reuses one bound route
         // across messages reuses one lane exactly as the daemon does.
         cache_key: cache_key::for_route(),
+    }
+}
+
+/// The same route, on a wall clock.
+fn timed_route(model: ModelConfig, max_duration: Duration) -> crate::routes::BoundRoute {
+    crate::routes::BoundRoute {
+        max_duration: Some(max_duration),
+        ..route(model)
     }
 }
 
@@ -2669,6 +2849,7 @@ fn model_config() -> ModelConfig {
         model: "qwen3".to_owned(),
         api_key_env: None,
         timeout_ms: 1_000,
+        stream: true,
         classes: vec!["reasoning".to_owned()],
         // Text only, which is the default and the right one for a local endpoint.
         modalities: Vec::new(),
@@ -2692,7 +2873,7 @@ fn message(text: &str) -> InboundMessage {
         addressed: None,
         thread_continuation: None,
         reply: ReplyTarget::Local { connection: 1 },
-        activity: None,
+        liveness: None,
         // No transport ran, so there is no receipt to hang this message's trace from. A test that
         // asserts on the trace root drives a real transport instead.
         receive_span: tracing::Span::none(),
@@ -2766,9 +2947,46 @@ fn owned_slack_message(text: &str, inherited: bool) -> InboundMessage {
             channel: "c0123abc".to_owned(),
             thread_ts: Some("1700000000.000001".to_owned()),
         },
-        activity: None,
+        liveness: None,
         receive_span: tracing::Span::none(),
     }
+}
+
+/// One transport's driver-facing settings, where the mode is the only field a test varies.
+fn liveness_settings(mode: LivenessMode) -> LivenessSettings {
+    LivenessSettings {
+        mode,
+        ..LivenessSettings::default()
+    }
+}
+
+/// What each fixture transport is allowed to show, by transport name.
+///
+/// Native with every surface allowed, because the configuration is the outer gate and the driver is
+/// the inner one: a test says what its session can show by which capability objects its
+/// `RecordingDriver` offers, and an absent transport name here would silently turn every one of
+/// those assertions into "nothing was published". The keep-alive is an hour out so a test about
+/// anything else never races a tick.
+fn fixture_liveness() -> BTreeMap<String, Arc<ResolvedLiveness>> {
+    let liveness = Arc::new(ResolvedLiveness {
+        settings: LivenessSettings {
+            mode: LivenessMode::Native,
+            classic_fallback: SlackLivenessFallback::None,
+            progress: ProgressSurface::Message,
+            stream: true,
+            cancel_button: true,
+        },
+        keep_alive: KeepAlive {
+            at: vec![Duration::from_secs(3_600)],
+            every: Duration::from_secs(3_600),
+            max: 10,
+        },
+        ..ResolvedLiveness::default()
+    });
+    ["dev", "scientist-slack"]
+        .into_iter()
+        .map(|transport| (transport.to_owned(), Arc::clone(&liveness)))
+        .collect()
 }
 
 fn runner(
@@ -2808,7 +3026,7 @@ fn runner_tracking(
             Duration::from_secs(60 * 60),
         )),
         asset_fetchers: HashMap::new(),
-        activities: HashMap::new(),
+        liveness: fixture_liveness(),
         thread_ownership: HashMap::new(),
         active_sessions: Default::default(),
     })
@@ -2882,6 +3100,8 @@ impl ChatModel for BlockedHandle {
         &self,
         _messages: &[ModelMessage],
         _tools: &[ModelTool],
+        _options: &CompletionOptions,
+        _on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
     ) -> Result<AssistantTurn, ModelError> {
         if let Some(sender) = self.0.entered.lock().expect("entered lock").take() {
             let _ = sender.send(());
@@ -2905,17 +3125,17 @@ async fn an_authorized_message_reaches_its_agent_and_answers_in_chat() {
     )
     .await;
     let models = ModelScript::new([answer("Everything looks fine.")]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
 
     run_session(
         runner(broker, Arc::clone(&models), 4),
         route(model_config()),
         message("how are things?"),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
-    assert_eq!(replier.replies(), vec!["Everything looks fine.".to_owned()]);
+    assert_eq!(driver.replies(), vec!["Everything looks fine.".to_owned()]);
     assert_eq!(models.requests(), 1);
 
     // The gateway asked on the sender's behalf, not its own: the broker sees a subject and an
@@ -2954,7 +3174,7 @@ async fn a_provider_attachment_reaches_the_reply_without_entering_the_transcript
     )
     .await;
     let models = ModelScript::new([script_call("echo.echo '{}'"), answer("Here is your kitty.")]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
     let mut route = route(model_config());
     route.provider_attachments = 1;
@@ -2963,12 +3183,12 @@ async fn a_provider_attachment_reaches_the_reply_without_entering_the_transcript
         runner,
         route,
         message("draw me a kitty cat"),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
-    assert_eq!(replier.replies(), ["Here is your kitty."]);
-    assert_eq!(replier.image_bytes(), [vec![20]]);
+    assert_eq!(driver.replies(), ["Here is your kitty."]);
+    assert_eq!(driver.image_bytes(), [vec![20]]);
     let tool = tool_message(&models, 1);
     assert!(tool.contains("\"attached\""), "{tool}");
     assert!(tool.contains("\"bytes\""), "{tool}");
@@ -3020,7 +3240,7 @@ async fn no_model_message_in_a_session_carries_an_attachment_blob() {
     )
     .await;
     let models = ModelScript::new([script_call("echo.echo '{}'"), answer("Posted.")]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
     let mut route = route(model_config());
     route.provider_attachments = 1;
@@ -3029,11 +3249,11 @@ async fn no_model_message_in_a_session_carries_an_attachment_blob() {
         runner,
         route,
         message("draw me a kitty cat"),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
-    assert_eq!(replier.image_bytes(), [vec![png.len()]]);
+    assert_eq!(driver.image_bytes(), [vec![png.len()]]);
     for request in 0..models.requests() {
         let transcript = models
             .prompt(request)
@@ -3065,18 +3285,18 @@ async fn a_route_without_the_opt_in_strips_the_attachment_and_says_so() {
         script_call("echo.echo '{}'"),
         answer("I cannot attach that."),
     ]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
 
     run_session(
         runner,
         route(model_config()),
         message("draw me a kitty cat"),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
-    assert_eq!(replier.image_bytes(), [Vec::<usize>::new()]);
+    assert_eq!(driver.image_bytes(), [Vec::<usize>::new()]);
     let tool = tool_message(&models, 1);
     assert!(tool.contains("\"attached\":[]"), "{tool}");
     assert!(tool.contains("cannot carry attachments"), "{tool}");
@@ -3099,18 +3319,18 @@ async fn a_model_call_to_generate_image_is_now_an_unknown_tool() {
     )
     .await;
     let models = ModelScript::new([generate_image("a cheerful watercolor kitten")]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
 
     run_session(
         runner(broker, Arc::clone(&models), 4),
         route(model_config()),
         message("draw me a kitty cat"),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
-    assert_eq!(replier.replies(), [FAILURE_REPLY]);
-    assert_eq!(replier.image_bytes(), [Vec::<usize>::new()]);
+    assert_eq!(driver.replies(), [FAILURE_REPLY]);
+    assert_eq!(driver.image_bytes(), [Vec::<usize>::new()]);
     assert!(
         models
             .tool_names(0)
@@ -3126,7 +3346,7 @@ async fn a_freshly_authorized_agent_message_claims_its_exact_sender_thread() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(directory.path(), listings(1, &["echo.echo"])).await;
     let models = ModelScript::new([answer("Claimed.")]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let ownership = Arc::new(RecordingThreadOwnership::default());
     let mut runner = runner(broker, Arc::clone(&models), 4);
     Arc::get_mut(&mut runner)
@@ -3148,13 +3368,13 @@ async fn a_freshly_authorized_agent_message_claims_its_exact_sender_thread() {
         runner,
         route(model_config()),
         message,
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
     assert_eq!(*ownership.claimed.lock().expect("claim lock"), [expected]);
     assert!(ownership.revoked.lock().expect("revoke lock").is_empty());
-    assert_eq!(replier.replies(), ["Claimed."]);
+    assert_eq!(driver.replies(), ["Claimed."]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3162,7 +3382,7 @@ async fn a_revoked_sender_loses_owned_thread_continuation() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(directory.path(), listings(1, &[])).await;
     let models = ModelScript::forbidden();
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let ownership = Arc::new(RecordingThreadOwnership::default());
     let mut runner = runner(broker, Arc::clone(&models), 4);
     Arc::get_mut(&mut runner)
@@ -3184,13 +3404,13 @@ async fn a_revoked_sender_loses_owned_thread_continuation() {
         runner,
         route(model_config()),
         message,
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
     assert!(ownership.claimed.lock().expect("claim lock").is_empty());
     assert_eq!(*ownership.revoked.lock().expect("revoke lock"), [expected]);
-    assert_eq!(replier.replies(), [UNAUTHORIZED_REPLY]);
+    assert_eq!(driver.replies(), [UNAUTHORIZED_REPLY]);
     assert_eq!(models.requests(), 0);
 }
 
@@ -3206,19 +3426,11 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
     )
     .await;
     let models = ModelScript::new([decline_reply()]);
-    let replier = Arc::new(RecordingReplier::default());
-    let activity = Arc::new(RecordingSurface::default());
-    let mut runner = runner(broker, Arc::clone(&models), 4);
-    Arc::get_mut(&mut runner)
-        .expect("fixture owns its runner")
-        .activities
-        .insert(
-            "scientist-slack".to_owned(),
-            Arc::clone(&activity) as Arc<dyn ChatActivity>,
-        );
+    let driver = Arc::new(RecordingDriver::default().with_status());
+    let runner = runner(broker, Arc::clone(&models), 4);
     let route = persistent_route(model_config(), window());
     let mut message = owned_slack_message("OK, thanks", true);
-    message.activity = Some(ActivityTarget::Slack {
+    message.liveness = Some(LivenessTarget::Slack {
         channel_id: "c0123abc".to_owned(),
         thread_ts: "1700000000.000001".to_owned(),
         message_ts: "1700000000.000002".to_owned(),
@@ -3235,19 +3447,23 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
         Arc::clone(&runner),
         route,
         message,
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
     assert!(
-        replier.replies().is_empty(),
+        driver.replies().is_empty(),
         "declining must not call chat.postMessage"
     );
-    activity.wait_until_hidden().await;
+    driver
+        .status_object()
+        .expect("the driver publishes native status")
+        .wait_for_calls(2)
+        .await;
     assert_eq!(
-        activity.events().last().map(String::as_str),
-        Some("hide"),
-        "declining must return native activity to its inactive state"
+        driver.rendered().last().map(String::as_str),
+        Some("status:idle"),
+        "declining must return the native status to its inactive state"
     );
     assert_eq!(models.requests(), 1);
     assert!(
@@ -3306,18 +3522,18 @@ async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
     )
     .await;
     let models = ModelScript::new([script_call("probe --help"), answer("done")]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
 
     run_session(
         runner,
         route(model_config()),
         message("show me the help"),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
-    assert_eq!(replier.replies(), ["done"]);
+    assert_eq!(driver.replies(), ["done"]);
     assert!(matches!(
         observed
             .recv()
@@ -3356,7 +3572,7 @@ async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() 
     )
     .await;
     let models = ModelScript::new([script_call("echo.echo '{}'"), decline_reply()]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
     let mut route = persistent_route(model_config(), window());
     route.limits.max_steps = 2;
@@ -3365,11 +3581,11 @@ async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() 
         runner,
         route,
         owned_slack_message("maybe do this", true),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
-    assert_eq!(replier.replies(), [UNREPORTED_WORK_REPLY]);
+    assert_eq!(driver.replies(), [UNREPORTED_WORK_REPLY]);
     assert!(matches!(
         observed
             .recv()
@@ -3413,18 +3629,18 @@ async fn one_hidden_record_request_follows_transport_acceptance_and_is_never_ret
     )
     .await;
     let models = ModelScript::new([answer("The exact accepted answer.")]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
 
     run_session(
         runner,
         route(model_config()),
         message("the exact sender text"),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
-    assert_eq!(replier.replies(), ["The exact accepted answer."]);
+    assert_eq!(driver.replies(), ["The exact accepted answer."]);
     assert!(matches!(
         observed.recv().await.expect("surface request").request,
         BrokerRequest::Capabilities {
@@ -3546,18 +3762,18 @@ async fn denied_failed_dedup_and_storage_record_results_are_terminal_without_ret
         )
         .await;
         let models = ModelScript::new([answer("The delivered answer remains delivered.")]);
-        let replier = Arc::new(RecordingReplier::default());
+        let driver = Arc::new(RecordingDriver::default());
 
         run_session(
             runner(broker, Arc::clone(&models), 4),
             route(model_config()),
             message("record this once"),
-            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
         )
         .await;
 
         assert_eq!(
-            replier.replies(),
+            driver.replies(),
             ["The delivered answer remains delivered."]
         );
         assert!(matches!(
@@ -3589,15 +3805,15 @@ async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_te
     )
     .await;
     let models = ModelScript::scripted([None]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     run_session(
         runner(broker, Arc::clone(&models), 4),
         route(model_config()),
         message("the model will fail"),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
-    assert_eq!(replier.replies(), [FAILURE_REPLY]);
+    assert_eq!(driver.replies(), [FAILURE_REPLY]);
     assert!(matches!(
         observed.recv().await.expect("surface request").request,
         BrokerRequest::Capabilities {
@@ -3623,7 +3839,7 @@ async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_te
         runner(broker, Arc::clone(&models), 4),
         route(model_config()),
         message("partial delivery"),
-        Arc::new(PartialDeliveryReplier) as Arc<dyn ChatReplier>,
+        Arc::new(PartialDeliveryDriver) as Arc<dyn ChatDriver>,
     )
     .await;
     assert!(matches!(
@@ -3639,7 +3855,7 @@ async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_te
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn authorized_work_shows_activity_until_after_the_durable_reply() {
+async fn authorized_work_publishes_status_until_after_the_durable_reply() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(
         directory.path(),
@@ -3650,41 +3866,48 @@ async fn authorized_work_shows_activity_until_after_the_durable_reply() {
     )
     .await;
     let model = BlockedModel::new("All good.");
-    let surface = Arc::new(RecordingSurface::default());
-    let mut runner = runner_with(
+    let driver = Arc::new(RecordingDriver::default().with_status());
+    let runner = runner_with(
         broker,
         Arc::new(Arc::clone(&model)) as Arc<dyn ModelFactory>,
         4,
     );
-    Arc::get_mut(&mut runner)
-        .expect("fixture has one runner owner")
-        .activities
-        .insert(
-            "dev".to_owned(),
-            Arc::clone(&surface) as Arc<dyn ChatActivity>,
-        );
     let mut inbound = message("how are things?");
-    inbound.activity = Some(ActivityTarget::Discord {
+    inbound.liveness = Some(LivenessTarget::Discord {
         channel_id: "200000000000000001".to_owned(),
+        message_id: "300000000000000002".to_owned(),
     });
 
     let session = tokio::spawn(run_session(
         runner,
         route(model_config()),
         inbound,
-        Arc::clone(&surface) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     ));
-    surface.wait_until_shown().await;
+    let status = driver
+        .status_object()
+        .expect("the driver publishes native status");
+    status.wait_for_calls(1).await;
     model.wait_until_entered().await;
     model.release();
     session.await.expect("the session completes");
-    surface.wait_until_hidden().await;
+    status.wait_for_calls(2).await;
 
-    assert_eq!(surface.events(), ["show", "reply:All good.", "hide"]);
+    assert_eq!(
+        driver.rendered(),
+        ["status:working", "reply:All good.", "status:idle"]
+    );
 }
 
+/// A cosmetic call that never answers cannot hold the session's answer.
+///
+/// The policy task is the only terminal writer, which is what keeps one message from ever having
+/// two authors — so the one thing that has to be bounded is how long a service call inside that
+/// task can make the person wait. This driver never answers its status call at all, which is a hung
+/// endpoint rather than a slow one: the answer still arrives, the refused rung is the breaker's
+/// problem, and the service's own indicator is still returned to rest afterwards.
 #[tokio::test(flavor = "multi_thread")]
-async fn sealing_does_not_delay_reply_and_cleanup_follows_an_issued_show() {
+async fn a_hung_cosmetic_call_cannot_hold_the_answer_and_cleanup_follows_it() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(
         directory.path(),
@@ -3695,97 +3918,81 @@ async fn sealing_does_not_delay_reply_and_cleanup_follows_an_issued_show() {
     )
     .await;
     let model = BlockedModel::new("not delayed");
-    let surface = Arc::new(DelayedSurface::default());
-    let mut runner = runner_with(
+    let driver = Arc::new(DelayedStatusDriver::default());
+    let runner = runner_with(
         broker,
         Arc::new(Arc::clone(&model)) as Arc<dyn ModelFactory>,
         4,
     );
-    Arc::get_mut(&mut runner)
-        .expect("fixture has one runner owner")
-        .activities
-        .insert(
-            "dev".to_owned(),
-            Arc::clone(&surface) as Arc<dyn ChatActivity>,
-        );
     let mut inbound = message("do it");
-    inbound.activity = Some(ActivityTarget::Discord {
+    inbound.liveness = Some(LivenessTarget::Discord {
         channel_id: "200000000000000001".to_owned(),
+        message_id: "300000000000000002".to_owned(),
     });
     let session = tokio::spawn(run_session(
         runner,
         route(model_config()),
         inbound,
-        Arc::clone(&surface) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     ));
-    tokio::time::timeout(Duration::from_secs(5), surface.entered.notified())
+    tokio::time::timeout(Duration::from_secs(5), driver.entered.notified())
         .await
-        .expect("activity call starts");
+        .expect("the status call starts");
     model.wait_until_entered().await;
     model.release();
 
-    tokio::time::timeout(Duration::from_secs(1), session)
+    // Ten seconds rather than the deadline itself: what this pins is that the wait is the policy's
+    // own bound and not the driver's silence, and a test that names the number would have to be
+    // edited every time the bound moved.
+    tokio::time::timeout(Duration::from_secs(10), session)
         .await
-        .expect("cosmetic I/O cannot delay the answer")
+        .expect("a cosmetic call cannot hold the answer past the policy's per-call deadline")
         .expect("session task completes");
-    assert_eq!(
-        surface
-            .events
-            .lock()
-            .expect("delayed surface events")
-            .as_slice(),
-        ["show-start", "reply"]
-    );
-
-    surface.release.notify_one();
-    tokio::time::timeout(Duration::from_secs(5), surface.hidden.notified())
+    tokio::time::timeout(Duration::from_secs(5), driver.idle.notified())
         .await
-        .expect("cleanup follows the issued show");
-    assert_eq!(
-        surface
-            .events
-            .lock()
-            .expect("delayed surface events")
-            .as_slice(),
-        ["show-start", "reply", "show-finish", "hide"]
-    );
+        .expect("the service's own indicator is returned to rest after the answer");
+    assert_eq!(driver.events(), ["working-start", "reply", "idle"]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn unauthorized_work_never_publishes_activity() {
+async fn unauthorized_work_never_publishes_liveness() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![ResponseEnvelope::capabilities(Vec::new(), Vec::new())],
     )
     .await;
-    let surface = Arc::new(RecordingSurface::default());
-    let mut runner = runner(broker, ModelScript::forbidden(), 4);
-    Arc::get_mut(&mut runner)
-        .expect("fixture has one runner owner")
-        .activities
-        .insert(
-            "dev".to_owned(),
-            Arc::clone(&surface) as Arc<dyn ChatActivity>,
-        );
+    let driver = Arc::new(RecordingDriver::default().with_status().with_reaction());
+    let runner = runner(broker, ModelScript::forbidden(), 4);
     let mut inbound = message("not authorized");
-    inbound.activity = Some(ActivityTarget::Discord {
+    inbound.liveness = Some(LivenessTarget::Discord {
         channel_id: "200000000000000001".to_owned(),
+        message_id: "300000000000000002".to_owned(),
     });
 
     run_session(
         runner,
         route(model_config()),
         inbound,
-        Arc::clone(&surface) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
     assert_eq!(
-        surface.events(),
+        driver.rendered(),
         [format!("reply:{UNAUTHORIZED_REPLY}")],
-        "activity begins only after the broker's fresh grant"
+        "liveness begins only after the broker's fresh grant"
     );
+}
+
+/// One cancel request as a named origin would deliver it.
+fn cancel(subject: &str, via: CancelVia) -> crate::transport::CancelRequest {
+    crate::transport::CancelRequest {
+        transport: "dev".to_owned(),
+        conversation_id: "dev".to_owned(),
+        subject: subject.to_owned(),
+        via,
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3794,21 +4001,14 @@ async fn a_native_stop_wins_the_race_and_suppresses_answer_history_and_durable_r
     let (broker, mut observed) =
         stub_broker(directory.path(), vec![memory_surface_response()]).await;
     let model = BlockedModel::new("stale answer");
-    let surface = Arc::new(RecordingSurface::default());
-    let mut runner = runner_with(
+    let driver = Arc::new(RecordingDriver::default().with_status());
+    let runner = runner_with(
         broker,
         Arc::new(Arc::clone(&model)) as Arc<dyn ModelFactory>,
         4,
     );
-    Arc::get_mut(&mut runner)
-        .expect("fixture has one runner owner")
-        .activities
-        .insert(
-            "dev".to_owned(),
-            Arc::clone(&surface) as Arc<dyn ChatActivity>,
-        );
     let mut inbound = message("stop this");
-    inbound.activity = Some(ActivityTarget::Slack {
+    inbound.liveness = Some(LivenessTarget::Slack {
         channel_id: "d0123abc".to_owned(),
         thread_ts: "1700000000.000001".to_owned(),
         message_ts: "1700000000.000001".to_owned(),
@@ -3820,44 +4020,50 @@ async fn a_native_stop_wins_the_race_and_suppresses_answer_history_and_durable_r
         session_runner,
         route,
         inbound,
-        Arc::clone(&surface) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     ));
-    surface.wait_until_shown().await;
+    let status = driver
+        .status_object()
+        .expect("the driver publishes native status");
+    status.wait_for_calls(1).await;
     model.wait_until_entered().await;
 
-    let mut controls = tokio::task::JoinSet::new();
-    crate::stop_session(
-        &runner,
-        &mut controls,
-        crate::transport::SessionStop {
-            transport: "dev".to_owned(),
-            conversation_id: "dev".to_owned(),
-            subject: "tel.999".parse().expect("other canonical subject"),
-        },
-    );
     assert_eq!(
-        controls.len(),
-        0,
+        runner
+            .active_sessions
+            .cancel(&cancel("tel.999", CancelVia::Button)),
+        CancelOutcome::OtherSubject,
         "another chat user cannot stop the initiator's work"
     );
-    crate::stop_session(
-        &runner,
-        &mut controls,
-        crate::transport::SessionStop {
-            transport: "dev".to_owned(),
-            conversation_id: "dev".to_owned(),
-            subject: subject(),
-        },
+    assert_eq!(
+        runner
+            .active_sessions
+            .cancel(&cancel(SUBJECT, CancelVia::NativeStop)),
+        CancelOutcome::Cancelled
     );
-    while controls.join_next().await.is_some() {}
+    // The CAS is won once. A second press — the same person tapping again while the first is
+    // still draining — must reach nothing, or the policy writes `Stopped.` twice.
+    assert_eq!(
+        runner
+            .active_sessions
+            .cancel(&cancel(SUBJECT, CancelVia::StopReply)),
+        CancelOutcome::AlreadyEnded
+    );
     model.release();
     session.await.expect("the cancelled session exits");
-    surface.wait_until_hidden().await;
+    status.wait_for_calls(2).await;
 
-    let events = surface.events();
-    assert!(events.contains(&"show".to_owned()), "{events:?}");
-    assert!(events.contains(&"hide".to_owned()), "{events:?}");
-    assert!(events.contains(&format!("reply:{}", crate::session::STOPPED_REPLY)));
+    let events = driver.rendered();
+    assert!(events.contains(&"status:working".to_owned()), "{events:?}");
+    assert!(events.contains(&"status:idle".to_owned()), "{events:?}");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| *event == &format!("reply:{}", crate::session::STOPPED_REPLY))
+            .count(),
+        1,
+        "exactly one terminal writer answers a cancel: {events:?}"
+    );
     assert!(!events.iter().any(|event| event.contains("stale answer")));
     assert_eq!(
         runner.conversations.tracked(),
@@ -3903,7 +4109,7 @@ async fn aborting_the_async_session_cancels_later_blocking_tool_work() {
         usage: None,
         replay_items: Vec::new(),
     });
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let session = tokio::spawn(run_session(
         runner_with(
             broker,
@@ -3912,7 +4118,7 @@ async fn aborting_the_async_session_cancels_later_blocking_tool_work() {
         ),
         route(model_config()),
         message("cancel during shutdown"),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     ));
     model.wait_until_entered().await;
     let first = observed
@@ -3942,7 +4148,7 @@ async fn aborting_the_async_session_cancels_later_blocking_tool_work() {
             .is_err(),
         "the cancellation guard prevents the model's late tool call reaching the broker"
     );
-    assert!(replier.replies().is_empty());
+    assert!(driver.replies().is_empty());
 }
 
 /// The catalog's skills ride the bound route, so a session never touches the filesystem.
@@ -3987,7 +4193,7 @@ async fn a_session_lists_mounted_skills_by_summary_and_reads_one_on_demand() {
         inspect_agent_config(),
         answer("Counted twice."),
     ]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let route = crate::routes::BoundRoute {
         skills: Arc::from(vec![skill]),
         ..route(model_config())
@@ -3997,11 +4203,11 @@ async fn a_session_lists_mounted_skills_by_summary_and_reads_one_on_demand() {
         runner(broker, Arc::clone(&models), 4),
         route,
         message("count the posts"),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
-    assert_eq!(replier.replies(), vec!["Counted twice.".to_owned()]);
+    assert_eq!(driver.replies(), vec!["Counted twice.".to_owned()]);
     assert_eq!(models.requests(), 3);
     let tools = models.tool_names(0);
     assert!(tools.contains(&SKILL_TOOL_NAME.to_owned()), "{tools:?}");
@@ -4049,7 +4255,7 @@ async fn the_suggestion_tool_is_offered_only_where_the_route_opts_in() {
     )
     .await;
     let models = ModelScript::new([suggest_improvement(), answer("Noted.")]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let route = crate::routes::BoundRoute {
         improvement_suggestions: true,
         ..route(model_config())
@@ -4059,11 +4265,11 @@ async fn the_suggestion_tool_is_offered_only_where_the_route_opts_in() {
         runner(broker, Arc::clone(&models), 4),
         route,
         message("how could this go better?"),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
-    assert_eq!(replier.replies(), vec!["Noted.".to_owned()]);
+    assert_eq!(driver.replies(), vec!["Noted.".to_owned()]);
     assert_eq!(models.requests(), 2);
     let tools = models.tool_names(0);
     assert!(
@@ -4120,18 +4326,18 @@ async fn an_authorized_agent_can_inspect_its_credential_free_effective_configura
         inspect_agent_config(),
         answer("I have prepared the configuration table."),
     ]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
 
     run_session(
         runner(broker, Arc::clone(&models), 4),
         route(model_config()),
         message("what is this agent's configuration?"),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
     assert_eq!(
-        replier.replies(),
+        driver.replies(),
         vec!["I have prepared the configuration table.".to_owned()]
     );
     assert_eq!(models.requests(), 2);
@@ -4204,13 +4410,13 @@ async fn shared_scope_is_visible_in_effective_configuration_without_identity() {
     )
     .await;
     let models = ModelScript::new([inspect_agent_config(), answer("Configured.")]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
 
     run_session(
         runner(broker, Arc::clone(&models), 4),
         persistent_route(model_config(), shared_window()),
         message("what is this agent's configuration?"),
-        replier as Arc<dyn ChatReplier>,
+        driver as Arc<dyn ChatDriver>,
     )
     .await;
 
@@ -4246,16 +4452,16 @@ async fn a_session_delivers_the_model_answer() {
     )
     .await;
     let models = ModelScript::new([answer("Done.")]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     run_session(
         runner(broker, models, 1),
         route(model_config()),
         message("do it"),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
-    assert_eq!(replier.replies(), ["Done."]);
+    assert_eq!(driver.replies(), ["Done."]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4269,17 +4475,17 @@ async fn an_unauthorized_subject_is_refused_before_any_model_call() {
     )
     .await;
     let models = ModelScript::forbidden();
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
 
     run_session(
         runner(broker, Arc::clone(&models), 4),
         route(model_config()),
         message("do something privileged"),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
-    assert_eq!(replier.replies(), vec![UNAUTHORIZED_REPLY.to_owned()]);
+    assert_eq!(driver.replies(), vec![UNAUTHORIZED_REPLY.to_owned()]);
     assert_eq!(models.requests(), 0);
 }
 
@@ -4298,7 +4504,7 @@ async fn a_refused_attestation_reads_as_a_refusal_rather_than_a_breakage() {
     )
     .await;
     let models = ModelScript::forbidden();
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let ownership = Arc::new(RecordingThreadOwnership::default());
     let mut runner = runner(broker, Arc::clone(&models), 4);
     Arc::get_mut(&mut runner)
@@ -4320,11 +4526,11 @@ async fn a_refused_attestation_reads_as_a_refusal_rather_than_a_breakage() {
         runner,
         route(model_config()),
         message,
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
-    assert_eq!(replier.replies(), vec![UNAUTHORIZED_REPLY.to_owned()]);
+    assert_eq!(driver.replies(), vec![UNAUTHORIZED_REPLY.to_owned()]);
     assert_eq!(*ownership.revoked.lock().expect("revoke lock"), [expected]);
     assert_eq!(models.requests(), 0);
 }
@@ -4340,17 +4546,17 @@ async fn a_saturated_gateway_says_so_rather_than_queueing_work() {
         .gate
         .admit(("other".to_owned(), "other".to_owned(), None))
         .expect("the first session is admitted");
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
 
     run_session(
         Arc::clone(&runner),
         route(model_config()),
         message("hello"),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
-    assert_eq!(replier.replies(), vec![BUSY_REPLY.to_owned()]);
+    assert_eq!(driver.replies(), vec![BUSY_REPLY.to_owned()]);
     assert_eq!(models.requests(), 0);
 }
 
@@ -4417,17 +4623,17 @@ async fn a_failed_session_answers_one_fixed_line_and_never_raw_error_text() {
     .await;
     // An empty script: the first turn fails, which is a broken session rather than a failed script.
     let models = ModelScript::new([]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
 
     run_session(
         runner(broker, Arc::clone(&models), 4),
         route(model_config()),
         message("break something"),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
-    assert_eq!(replier.replies(), vec![FAILURE_REPLY.to_owned()]);
+    assert_eq!(driver.replies(), vec![FAILURE_REPLY.to_owned()]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -4439,17 +4645,17 @@ async fn an_unreachable_broker_fails_the_session_without_reaching_a_model() {
         frame: FrameLimits::default(),
     };
     let models = ModelScript::forbidden();
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
 
     run_session(
         runner(broker, Arc::clone(&models), 4),
         route(model_config()),
         message("hello"),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
-    assert_eq!(replier.replies(), vec![FAILURE_REPLY.to_owned()]);
+    assert_eq!(driver.replies(), vec![FAILURE_REPLY.to_owned()]);
     assert_eq!(models.requests(), 0);
 }
 
@@ -4466,17 +4672,17 @@ async fn a_model_answer_longer_than_chat_accepts_is_bounded_on_the_way_out() {
     .await;
     let long = format!("BEGIN{}END", "y".repeat(MAX_OUTBOUND_TEXT_BYTES * 2));
     let models = ModelScript::new([answer(&long)]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
 
     run_session(
         runner(broker, Arc::clone(&models), 4),
         route(model_config()),
         message("write a lot"),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
-    let replies = replier.replies();
+    let replies = driver.replies();
     assert_eq!(replies.len(), 1);
     assert!(
         replies[0].len() <= MAX_OUTBOUND_TEXT_BYTES,
@@ -4577,7 +4783,7 @@ async fn a_persistent_route_replays_the_previous_exchange_into_the_next_prompt()
         answer("Two things broke."),
         answer("The second one was the database."),
     ]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
     let route = persistent_route(model_config(), window());
 
@@ -4586,13 +4792,13 @@ async fn a_persistent_route_replays_the_previous_exchange_into_the_next_prompt()
             Arc::clone(&runner),
             route.clone(),
             message(text),
-            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
         )
         .await;
     }
 
     assert_eq!(
-        replier.replies(),
+        driver.replies(),
         vec![
             "Two things broke.".to_owned(),
             "The second one was the database.".to_owned()
@@ -4623,7 +4829,7 @@ async fn a_one_shot_route_starts_from_an_empty_prompt_every_message() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
     let models = ModelScript::new([answer("Two things broke."), answer("Which one?")]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
 
     for text in ["what broke?", "and the second one?"] {
@@ -4631,7 +4837,7 @@ async fn a_one_shot_route_starts_from_an_empty_prompt_every_message() {
             Arc::clone(&runner),
             route(model_config()),
             message(text),
-            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
         )
         .await;
     }
@@ -4659,7 +4865,7 @@ async fn one_client_serves_every_message_routed_to_the_same_model() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
     let models = ModelScript::new([answer("Two things broke."), answer("Which one?")]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
 
     for text in ["what broke?", "and the second one?"] {
@@ -4667,7 +4873,7 @@ async fn one_client_serves_every_message_routed_to_the_same_model() {
             Arc::clone(&runner),
             route(model_config()),
             message(text),
-            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
         )
         .await;
     }
@@ -4687,7 +4893,7 @@ async fn two_configured_models_never_share_one_client() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
     let models = ModelScript::new([answer("from one"), answer("from the other")]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
     let mut second = model_config();
     if let ModelConfig::OpenaiCompatible { name, .. } = &mut second {
@@ -4699,7 +4905,7 @@ async fn two_configured_models_never_share_one_client() {
             Arc::clone(&runner),
             route(model),
             message("who answers?"),
-            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
         )
         .await;
     }
@@ -4723,7 +4929,7 @@ async fn two_senders_in_one_conversation_never_see_each_others_history() {
         answer("Yours is still running."),
         answer("Still the deploy."),
     ]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
     let route = persistent_route(model_config(), window());
 
@@ -4736,7 +4942,7 @@ async fn two_senders_in_one_conversation_never_see_each_others_history() {
             Arc::clone(&runner),
             route.clone(),
             message,
-            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
         )
         .await;
     }
@@ -4765,7 +4971,7 @@ async fn shared_scope_replays_attributed_turns_across_authenticated_participants
     let directory = temporary();
     let (broker, mut observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
     let models = ModelScript::new([answer("The deploy failed."), answer("It was the database.")]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
     let route = persistent_route(model_config(), shared_window());
 
@@ -4777,7 +4983,7 @@ async fn shared_scope_replays_attributed_turns_across_authenticated_participants
             Arc::clone(&runner),
             route.clone(),
             inbound,
-            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
         )
         .await;
     }
@@ -4818,7 +5024,7 @@ async fn user_authored_attribution_lookalikes_remain_below_the_gateway_line() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
     let models = ModelScript::new([answer("noted"), answer("still noted")]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
     let route = persistent_route(model_config(), shared_window());
     let lookalike = format!(
@@ -4833,7 +5039,7 @@ async fn user_authored_attribution_lookalikes_remain_below_the_gateway_line() {
             Arc::clone(&runner),
             route.clone(),
             inbound,
-            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
         )
         .await;
     }
@@ -4866,7 +5072,7 @@ async fn shared_participant_attribution_counts_against_the_history_byte_window()
     let directory = temporary();
     let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
     let models = ModelScript::new([answer("ok"), answer("still ok")]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
     let route = persistent_route(
         model_config(),
@@ -4885,7 +5091,7 @@ async fn shared_participant_attribution_counts_against_the_history_byte_window()
             Arc::clone(&runner),
             route.clone(),
             message(text),
-            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
         )
         .await;
     }
@@ -4924,7 +5130,7 @@ async fn a_narrowed_grant_drops_the_history_it_was_built_under() {
         answer("Pull request 12 is open."),
         answer("I can't see it."),
     ]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
     let route = persistent_route(model_config(), window());
     let mut first = message("what is in pr 12?");
@@ -4935,7 +5141,7 @@ async fn a_narrowed_grant_drops_the_history_it_was_built_under() {
             Arc::clone(&runner),
             route.clone(),
             inbound,
-            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
         )
         .await;
     }
@@ -4959,7 +5165,7 @@ async fn an_empty_grant_removes_the_conversation_rather_than_only_refusing_the_m
     )
     .await;
     let models = ModelScript::new([answer("Here is the secret plan.")]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
     let route = persistent_route(model_config(), window());
 
@@ -4967,7 +5173,7 @@ async fn an_empty_grant_removes_the_conversation_rather_than_only_refusing_the_m
         Arc::clone(&runner),
         route.clone(),
         message("what is the plan?"),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
     assert_eq!(runner.conversations.tracked(), 1);
@@ -4976,12 +5182,12 @@ async fn an_empty_grant_removes_the_conversation_rather_than_only_refusing_the_m
         Arc::clone(&runner),
         route,
         message("remind me"),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
     assert_eq!(
-        replier.replies().last().map(String::as_str),
+        driver.replies().last().map(String::as_str),
         Some(UNAUTHORIZED_REPLY)
     );
     assert_eq!(
@@ -5004,7 +5210,7 @@ async fn a_failed_session_records_the_question_it_could_not_answer() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(directory.path(), listings(2, &["echo.echo"])).await;
     let models = ModelScript::scripted([None, Some(answer("It was the database."))]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
     let route = persistent_route(model_config(), window());
 
@@ -5012,16 +5218,16 @@ async fn a_failed_session_records_the_question_it_could_not_answer() {
         Arc::clone(&runner),
         route.clone(),
         message("what broke?"),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
-    assert_eq!(replier.replies(), vec![FAILURE_REPLY.to_owned()]);
+    assert_eq!(driver.replies(), vec![FAILURE_REPLY.to_owned()]);
 
     run_session(
         Arc::clone(&runner),
         route,
         message("try again"),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
@@ -5034,7 +5240,7 @@ async fn a_failed_session_records_the_question_it_could_not_answer() {
         ]),
         "an unanswered turn replays the question and nothing in the answer's place"
     );
-    let replies = replier.replies();
+    let replies = driver.replies();
     assert!(
         !replies
             .iter()
@@ -5058,7 +5264,7 @@ async fn a_session_that_never_reached_a_model_remembers_nothing() {
     // the loop recorded nothing, and must not commit the newest *seeded* turn in its place.
     let directory = temporary();
     let (broker, _observed) = stub_broker(directory.path(), listings(1, &["echo.echo"])).await;
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let runner = runner_with(
         broker,
         Arc::new(UnbuildableModel) as Arc<dyn ModelFactory>,
@@ -5069,11 +5275,11 @@ async fn a_session_that_never_reached_a_model_remembers_nothing() {
         Arc::clone(&runner),
         persistent_route(model_config(), window()),
         message("what broke?"),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
-    assert_eq!(replier.replies(), vec![FAILURE_REPLY.to_owned()]);
+    assert_eq!(driver.replies(), vec![FAILURE_REPLY.to_owned()]);
     assert_eq!(
         runner.conversations.tracked(),
         0,
@@ -5754,7 +5960,7 @@ async fn one_conversation_keeps_one_cache_key_and_two_conversations_never_share_
         answer("The second one was the database."),
         answer("Nothing is wrong over here."),
     ]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
     let route = persistent_route(model_config(), window());
 
@@ -5767,7 +5973,7 @@ async fn one_conversation_keeps_one_cache_key_and_two_conversations_never_share_
             Arc::clone(&runner),
             route.clone(),
             message,
-            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
         )
         .await;
     }
@@ -5794,7 +6000,7 @@ async fn a_one_shot_route_sends_every_sender_to_the_route_s_own_lane() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(directory.path(), listings(3, &["echo.echo"])).await;
     let models = ModelScript::new([answer("one"), answer("two"), answer("three")]);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
     // Bound once and cloned per message, exactly as the routing table hands it to a session.
     let route = route(model_config());
@@ -5808,7 +6014,7 @@ async fn a_one_shot_route_sends_every_sender_to_the_route_s_own_lane() {
             Arc::clone(&runner),
             route.clone(),
             message,
-            Arc::clone(&replier) as Arc<dyn ChatReplier>,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
         )
         .await;
     }
@@ -5841,6 +6047,8 @@ impl ChatModel for KeylessModel {
         &self,
         messages: &[ModelMessage],
         _tools: &[ModelTool],
+        _options: &CompletionOptions,
+        _on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
     ) -> Result<AssistantTurn, ModelError> {
         Ok(answer(
             messages
@@ -5853,22 +6061,23 @@ impl ChatModel for KeylessModel {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_model_that_never_heard_of_a_cache_key_still_answers() {
-    // `complete_with` is a provided method precisely so this keeps working: an implementation that
-    // ignores the options loses a cache lookup, never an answer.
+    // Nothing in `CompletionOptions` is required for a correct answer, and nothing in the event
+    // callback is either: a model that reads neither loses a cache lookup and shows no partial
+    // text, and still answers.
     let directory = temporary();
     let (broker, _observed) = stub_broker(directory.path(), listings(1, &["echo.echo"])).await;
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let runner = runner_with(broker, Arc::new(KeylessModel) as Arc<dyn ModelFactory>, 4);
 
     run_session(
         Arc::clone(&runner),
         persistent_route(model_config(), window()),
         message("what broke?"),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
 
-    assert_eq!(replier.replies(), vec!["what broke?".to_owned()]);
+    assert_eq!(driver.replies(), vec!["what broke?".to_owned()]);
     assert_eq!(
         runner.conversations.tracked(),
         1,
@@ -5884,7 +6093,7 @@ async fn a_model_that_never_heard_of_a_cache_key_still_answers() {
 struct FakeTransport {
     name: String,
     inbound: mpsc::UnboundedReceiver<InboundMessage>,
-    replier: Arc<RecordingReplier>,
+    driver: Arc<RecordingDriver>,
 }
 
 impl ChatTransport for FakeTransport {
@@ -5907,8 +6116,8 @@ impl ChatTransport for FakeTransport {
         })
     }
 
-    fn replier(&self) -> Arc<dyn ChatReplier> {
-        Arc::clone(&self.replier) as Arc<dyn ChatReplier>
+    fn driver(&self) -> Arc<dyn ChatDriver> {
+        Arc::clone(&self.driver) as Arc<dyn ChatDriver>
     }
 }
 
@@ -5918,7 +6127,7 @@ async fn a_transport_reader_forwards_messages_and_stops_when_the_transport_does(
     let transport = FakeTransport {
         name: "dev".to_owned(),
         inbound,
-        replier: Arc::new(RecordingReplier::default()),
+        driver: Arc::new(RecordingDriver::default()),
     };
     let (routed, mut received) = mpsc::channel(4);
     let health = Arc::new(crate::TransportHealth::new(1));
@@ -5954,7 +6163,7 @@ async fn a_reader_that_stops_because_the_daemon_stopped_is_not_a_dead_transport(
     let transport = FakeTransport {
         name: "dev".to_owned(),
         inbound,
-        replier: Arc::new(RecordingReplier::default()),
+        driver: Arc::new(RecordingDriver::default()),
     };
     let (routed, received) = mpsc::channel(1);
     drop(received);
@@ -5974,6 +6183,13 @@ async fn a_reader_that_stops_because_the_daemon_stopped_is_not_a_dead_transport(
         "a reader ending with the daemon is not a transport failure"
     );
 }
+
+/// The stop-word list for tests about routing rather than cancellation.
+///
+/// Empty on purpose: these tests assert which messages start a session, and a matcher that can
+/// never fire is how the two questions stay separate. Cancellation has its own tests, and they say
+/// their own words.
+const NO_STOP_WORDS: &[String] = &[];
 
 /// Everything `serve` needs when the test is about why it stopped rather than what it routed.
 async fn idle_routing_loop(directory: &Path) -> (Arc<SessionRunner>, Arc<RoutingTable>) {
@@ -6001,6 +6217,7 @@ async fn losing_every_transport_ends_the_daemon_as_a_failure() {
         routes,
         Arc::new(BTreeMap::new()),
         Arc::new(BTreeMap::new()),
+        Arc::new(NO_STOP_WORDS.to_vec()),
         receiver,
         std::future::pending(),
         Duration::from_secs(1),
@@ -6021,6 +6238,7 @@ async fn a_requested_shutdown_ends_the_daemon_successfully() {
         routes,
         Arc::new(BTreeMap::new()),
         Arc::new(BTreeMap::new()),
+        Arc::new(NO_STOP_WORDS.to_vec()),
         receiver,
         std::future::ready(()),
         Duration::from_secs(1),
@@ -6043,7 +6261,7 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
     let (broker, _observed) = stub_broker(directory.path(), Vec::new()).await;
     let models = ModelScript::forbidden();
     let runner = runner(broker, Arc::clone(&models), 4);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let mut identities = BTreeMap::new();
     identities.insert(
         "dev".to_owned(),
@@ -6052,11 +6270,8 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
             handle: None,
         },
     );
-    let mut repliers: BTreeMap<String, Arc<dyn ChatReplier>> = BTreeMap::new();
-    repliers.insert(
-        "dev".to_owned(),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
-    );
+    let mut repliers: BTreeMap<String, Arc<dyn ChatDriver>> = BTreeMap::new();
+    repliers.insert("dev".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>);
     let mut sessions = tokio::task::JoinSet::new();
 
     let mut ambient = message("just chatting with my colleagues");
@@ -6066,6 +6281,7 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
         &routes,
         &identities,
         &repliers,
+        NO_STOP_WORDS,
         &mut sessions,
         ambient,
     );
@@ -6085,6 +6301,7 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
         &routes,
         &identities,
         &repliers,
+        NO_STOP_WORDS,
         &mut sessions,
         structurally_unaddressed,
     );
@@ -6098,6 +6315,7 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
         &routes,
         &identities,
         &repliers,
+        NO_STOP_WORDS,
         &mut sessions,
         elsewhere,
     );
@@ -6114,6 +6332,7 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
         &routes,
         &identities,
         &repliers,
+        NO_STOP_WORDS,
         &mut sessions,
         addressed,
     );
@@ -6134,7 +6353,7 @@ async fn a_transport_owned_thread_continuation_bypasses_only_the_repeat_mention(
     let (broker, _observed) = stub_broker(directory.path(), listings(1, &["echo.echo"])).await;
     let models = ModelScript::new([answer("Useful follow-up.")]);
     let runner = runner(broker, Arc::clone(&models), 4);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let identities = BTreeMap::from([(
         "dev".to_owned(),
         TransportIdentity {
@@ -6142,10 +6361,7 @@ async fn a_transport_owned_thread_continuation_bypasses_only_the_repeat_mention(
             handle: None,
         },
     )]);
-    let repliers = BTreeMap::from([(
-        "dev".to_owned(),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
-    )]);
+    let repliers = BTreeMap::from([("dev".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
     let mut sessions = tokio::task::JoinSet::new();
     let mut continuation = message("and then?");
     continuation.conversation = ConversationKind::Channel("c0123abc".to_owned());
@@ -6157,6 +6373,7 @@ async fn a_transport_owned_thread_continuation_bypasses_only_the_repeat_mention(
         &routes,
         &identities,
         &repliers,
+        NO_STOP_WORDS,
         &mut sessions,
         continuation,
     );
@@ -6170,7 +6387,7 @@ async fn a_transport_owned_thread_continuation_bypasses_only_the_repeat_mention(
     }
 
     assert_eq!(models.requests(), 1);
-    assert_eq!(replier.replies(), ["Useful follow-up."]);
+    assert_eq!(driver.replies(), ["Useful follow-up."]);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -6189,7 +6406,7 @@ async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
 
     let (broker, _observed) = stub_broker(directory.path(), Vec::new()).await;
     let runner = runner(broker, ModelScript::forbidden(), 4);
-    let replier = Arc::new(RecordingReplier::default());
+    let driver = Arc::new(RecordingDriver::default());
     let identities = BTreeMap::from([(
         "dev".to_owned(),
         TransportIdentity {
@@ -6197,10 +6414,7 @@ async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
             handle: None,
         },
     )]);
-    let repliers = BTreeMap::from([(
-        "dev".to_owned(),
-        Arc::clone(&replier) as Arc<dyn ChatReplier>,
-    )]);
+    let repliers = BTreeMap::from([("dev".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
     let mut sessions = tokio::task::JoinSet::new();
 
     // A channel this configuration never names, which is the whole point of the catch-all.
@@ -6211,6 +6425,7 @@ async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
         &routes,
         &identities,
         &repliers,
+        NO_STOP_WORDS,
         &mut sessions,
         ambient,
     );
@@ -6229,6 +6444,7 @@ async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
         &routes,
         &identities,
         &repliers,
+        NO_STOP_WORDS,
         &mut sessions,
         addressed,
     );
@@ -6555,20 +6771,20 @@ fn app_mention(user: &str, ts: &str, thread_ts: Option<&str>, text: &str) -> Val
     event
 }
 
-/// One Telegram transport pointed at loopback mocks, with activity presentation off.
+/// One Telegram transport pointed at loopback mocks, with every liveness surface off.
 fn telegram(endpoint: &str) -> crate::transport::telegram::TelegramTransport {
-    telegram_with(endpoint, ActivityMode::Off)
+    telegram_with(endpoint, LivenessMode::Off)
 }
 
 fn telegram_with(
     endpoint: &str,
-    activity: ActivityMode,
+    liveness: LivenessMode,
 ) -> crate::transport::telegram::TelegramTransport {
     crate::transport::telegram::TelegramTransport::new(
         "tg".to_owned(),
         endpoint.to_owned(),
         "12345:test-token".to_owned(),
-        activity,
+        liveness_settings(liveness),
     )
     .expect("telegram transport builds")
 }
@@ -6591,14 +6807,14 @@ fn slack(endpoint: &str) -> crate::transport::slack::SlackTransport {
     slack_with(
         endpoint,
         SlackExperience::Classic,
-        SlackActivityConfig::default(),
+        LivenessConfig::default(),
     )
 }
 
 fn slack_with(
     endpoint: &str,
     experience: SlackExperience,
-    activity: SlackActivityConfig,
+    liveness: LivenessConfig,
 ) -> crate::transport::slack::SlackTransport {
     crate::transport::slack::SlackTransport::new(
         "scientist-slack".to_owned(),
@@ -6606,7 +6822,7 @@ fn slack_with(
         "xapp-test-app-token".to_owned(),
         "xoxb-test-bot-token".to_owned(),
         experience,
-        activity,
+        liveness.settings(),
     )
     .expect("slack transport builds")
 }
@@ -6651,7 +6867,7 @@ async fn a_slack_envelope_is_acknowledged_before_the_session_that_answers_it() {
     )
     .await;
     let model = BlockedModel::new("All good.");
-    let replier = transport.replier();
+    let driver = transport.driver();
     let message = expect_message(
         transport
             .next()
@@ -6667,7 +6883,7 @@ async fn a_slack_envelope_is_acknowledged_before_the_session_that_answers_it() {
         ),
         route(model_config()),
         message,
-        replier,
+        driver,
     ));
 
     // The model has been entered and is still blocked, so no answer has been produced yet.
@@ -7197,7 +7413,7 @@ async fn slack_agent_continues_only_an_exact_claimed_sender_thread() {
     let mut transport = slack_with(
         &http.base,
         SlackExperience::Agent,
-        SlackActivityConfig::default(),
+        LivenessConfig::default(),
     );
     transport.connect().await.expect("Slack Agent connects");
 
@@ -7235,7 +7451,7 @@ async fn slack_agent_continues_only_an_exact_claimed_sender_thread() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn slack_agent_activity_uses_thread_sessions_and_explicit_lifecycle_states() {
+async fn slack_agent_status_uses_thread_sessions_and_explicit_lifecycle_states() {
     let socket = spawn_socket_mock(vec![events_envelope(
         "envelope-1",
         direct_message("u9xyz", "1700000000.000001", "handle this"),
@@ -7250,9 +7466,10 @@ async fn slack_agent_activity_uses_thread_sessions_and_explicit_lifecycle_states
     let mut transport = slack_with(
         &http.base,
         SlackExperience::Agent,
-        SlackActivityConfig {
-            mode: ActivityMode::Native,
-            classic_fallback: SlackActivityFallback::Reaction,
+        LivenessConfig {
+            mode: LivenessMode::Native,
+            classic_fallback: SlackLivenessFallback::Reaction,
+            ..LivenessConfig::default()
         },
     );
     transport.connect().await.expect("Slack Agent connects");
@@ -7267,13 +7484,19 @@ async fn slack_agent_activity_uses_thread_sessions_and_explicit_lifecycle_states
             thread_ts: Some("1700000000.000001".to_owned()),
         }
     );
-    let target = message.activity.expect("Agent activity target");
-    let activity = transport.activity().expect("native activity is configured");
-    activity
-        .show(target.clone())
+    let target = message.liveness.expect("Agent liveness target");
+    let driver = transport.driver();
+    let status = driver
+        .status()
+        .expect("the Agent experience publishes native status");
+    status
+        .set(&target, Status::Working)
         .await
         .expect("processing status succeeds");
-    activity.hide(target).await.expect("active status succeeds");
+    status
+        .set(&target, Status::Idle)
+        .await
+        .expect("active status succeeds");
 
     let status_calls = http
         .calls()
@@ -7313,25 +7536,50 @@ async fn slack_permanently_degrades_agent_status_to_owned_tangerine_reactions() 
     let mut transport = slack_with(
         &http.base,
         SlackExperience::Agent,
-        SlackActivityConfig {
-            mode: ActivityMode::Native,
-            classic_fallback: SlackActivityFallback::Reaction,
+        LivenessConfig {
+            mode: LivenessMode::Native,
+            classic_fallback: SlackLivenessFallback::Reaction,
+            ..LivenessConfig::default()
         },
     );
     transport.connect().await.expect("Slack connects");
-    let activity = transport.activity().expect("activity configured");
+    let driver = transport.driver();
 
-    for _ in 0..2 {
+    for session in 0..2 {
         let target = next_message(&mut transport)
             .await
-            .activity
-            .expect("activity target");
-        activity
-            .show(target.clone())
+            .liveness
+            .expect("liveness target");
+        // The degrade is readable in the capability object itself: an installation Slack has
+        // refused the Agent status for stops advertising one, so a later session never spends a
+        // call finding that out again. Two sessions, one refusal.
+        match driver.status() {
+            Some(status) => {
+                assert_eq!(session, 0, "the refusal is remembered across sessions");
+                assert!(
+                    driver.reaction().is_none(),
+                    "the fallback is not offered while the native status is live"
+                );
+                let refused = status
+                    .set(&target, Status::Working)
+                    .await
+                    .expect_err("an installation without Agent sessions refuses the status");
+                assert!(
+                    matches!(&refused, TransportError::Service { code } if code == "feature_disabled"),
+                    "{refused:?}"
+                );
+            }
+            None => assert_eq!(session, 1, "the first session must still try the status"),
+        }
+        let reaction = driver
+            .reaction()
+            .expect("the refused installation falls back to the reaction");
+        reaction
+            .set(&target, true)
             .await
             .expect("reaction fallback succeeds");
-        activity
-            .hide(target)
+        reaction
+            .set(&target, false)
             .await
             .expect("owned reaction is removed");
     }
@@ -7385,22 +7633,27 @@ async fn slack_does_not_remove_a_reaction_this_generation_did_not_add() {
     let mut transport = slack_with(
         &http.base,
         SlackExperience::Classic,
-        SlackActivityConfig {
-            mode: ActivityMode::Native,
-            classic_fallback: SlackActivityFallback::Reaction,
+        LivenessConfig {
+            mode: LivenessMode::Native,
+            classic_fallback: SlackLivenessFallback::Reaction,
+            ..LivenessConfig::default()
         },
     );
     transport.connect().await.expect("classic Slack connects");
     let target = next_message(&mut transport)
         .await
-        .activity
+        .liveness
         .expect("reaction target");
-    let activity = transport.activity().expect("fallback configured");
-    activity
-        .show(target.clone())
+    let driver = transport.driver();
+    let reaction = driver.reaction().expect("the classic fallback reacts");
+    reaction
+        .set(&target, true)
         .await
         .expect("a pre-existing bot reaction is already visible");
-    activity.hide(target).await.expect("cleanup is a no-op");
+    reaction
+        .set(&target, false)
+        .await
+        .expect("cleanup is a no-op");
 
     assert_eq!(
         http.calls()
@@ -7441,20 +7694,22 @@ async fn slack_lost_reaction_response_never_grants_cleanup_ownership() {
     let mut transport = slack_with(
         &http.base,
         SlackExperience::Classic,
-        SlackActivityConfig {
-            mode: ActivityMode::Native,
-            classic_fallback: SlackActivityFallback::Reaction,
+        LivenessConfig {
+            mode: LivenessMode::Native,
+            classic_fallback: SlackLivenessFallback::Reaction,
+            ..LivenessConfig::default()
         },
     );
     transport.connect().await.expect("classic Slack connects");
     let target = next_message(&mut transport)
         .await
-        .activity
+        .liveness
         .expect("reaction target");
-    let activity = transport.activity().expect("fallback configured");
-    assert!(activity.show(target.clone()).await.is_err());
-    activity
-        .hide(target)
+    let driver = transport.driver();
+    let reaction = driver.reaction().expect("the classic fallback reacts");
+    assert!(reaction.set(&target, true).await.is_err());
+    reaction
+        .set(&target, false)
         .await
         .expect("there is nothing owned to clear");
 
@@ -7495,7 +7750,7 @@ async fn slack_agent_stop_events_are_acknowledged_and_decoded_as_control_not_pro
     let mut transport = slack_with(
         &http.base,
         SlackExperience::Agent,
-        SlackActivityConfig::default(),
+        LivenessConfig::default(),
     );
     transport.connect().await.expect("Slack Agent connects");
 
@@ -7503,34 +7758,32 @@ async fn slack_agent_stop_events_are_acknowledged_and_decoded_as_control_not_pro
         .await
         .expect("control event arrives")
         .expect("control event decodes");
-    let TransportEvent::SessionStopped(stopped) = event else {
+    let TransportEvent::CancelRequested(stopped) = event else {
         panic!("a native Stop is a session-control event, not a routable message");
     };
     assert_eq!(
         stopped,
-        crate::transport::SessionStop {
+        crate::transport::CancelRequest {
             transport: "scientist-slack".to_owned(),
             conversation_id: "d0123abc:1700000000.000001".to_owned(),
-            subject: "slack.t0123abc.u9xyz"
-                .parse()
-                .expect("canonical Slack subject"),
+            subject: "slack.t0123abc.u9xyz".to_owned(),
+            via: CancelVia::NativeStop,
         }
     );
     let alias = tokio::time::timeout(Duration::from_secs(5), transport.next())
         .await
         .expect("aliased control event arrives")
         .expect("aliased control event decodes");
-    let TransportEvent::SessionStopped(aliased) = alias else {
+    let TransportEvent::CancelRequested(aliased) = alias else {
         panic!("an aliased native Stop is a session-control event too");
     };
     assert_eq!(
         aliased,
-        crate::transport::SessionStop {
+        crate::transport::CancelRequest {
             transport: "scientist-slack".to_owned(),
             conversation_id: "d0123abc:1700000000.000003".to_owned(),
-            subject: "slack.t0123abc.u9xyz"
-                .parse()
-                .expect("canonical Slack subject"),
+            subject: "slack.t0123abc.u9xyz".to_owned(),
+            via: CancelVia::NativeStop,
         }
     );
 
@@ -7579,14 +7832,14 @@ async fn a_slack_answer_is_posted_as_a_markdown_block() {
     .await;
     let answer_text = "**Puñeta** is *vulgar*.\n\n| a | b |\n|---|---|\n| 1 | 2 |";
     let models = ModelScript::new([answer(answer_text)]);
-    let replier = transport.replier();
+    let driver = transport.driver();
     let message = next_message(&mut transport).await;
 
     run_session(
         runner(broker, Arc::clone(&models), 4),
         route(model_config()),
         message,
-        replier,
+        driver,
     )
     .await;
 
@@ -7607,10 +7860,7 @@ async fn a_slack_answer_is_posted_as_a_markdown_block() {
 
 #[tokio::test]
 async fn a_slack_429_delays_the_identical_answer_once_without_reply_failure() {
-    use dekopon_test_support::CaptureLayer;
     use tokio::io::AsyncWriteExt as _;
-    use tracing::instrument::WithSubscriber as _;
-    use tracing_subscriber::prelude::*;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -7658,16 +7908,19 @@ async fn a_slack_429_delays_the_identical_answer_once_without_reply_failure() {
         channel: "C1".into(),
         thread_ts: Some("1700000000.000001".into()),
     };
-    let capture = CaptureLayer::workspace();
+    // Thread-local rather than attached to the session's own future: the answer is written by the
+    // policy task, because that task is the only writer of one message, and a dispatcher attached
+    // to one future never reaches a task spawned out of it. A `current_thread` runtime polls that
+    // task on this thread, which is the scoping that does reach it.
+    let (capture, _subscriber) = capture_spans();
     tokio::time::timeout(
         Duration::from_secs(10),
         run_session(
             runner(broker, models, 4),
             route(model_config()),
             inbound,
-            slack(&endpoint).replier(),
-        )
-        .with_subscriber(tracing_subscriber::registry().with(capture.clone())),
+            slack(&endpoint).driver(),
+        ),
     )
     .await
     .expect("session finishes within ten seconds");
@@ -7707,11 +7960,11 @@ async fn slack_uploads_one_generated_png_without_sending_the_token_to_the_upload
         other => panic!("unexpected Slack image call: {other}"),
     });
     *base.lock().expect("base lock") = api.base.clone();
-    let replier = slack(&api.base).replier();
+    let driver = slack(&api.base).driver();
 
-    replier
+    driver
         .reply(
-            ReplyTarget::Slack {
+            &ReplyTarget::Slack {
                 channel: "d0123abc".to_owned(),
                 thread_ts: Some("1712345678.000100".to_owned()),
             },
@@ -7781,11 +8034,11 @@ async fn slack_uploads_each_attachment_and_comments_only_on_the_first() {
         other => panic!("unexpected Slack image call: {other}"),
     });
     *base.lock().expect("base lock") = api.base.clone();
-    let replier = slack(&api.base).replier();
+    let driver = slack(&api.base).driver();
 
-    replier
+    driver
         .reply(
-            ReplyTarget::Slack {
+            &ReplyTarget::Slack {
                 channel: "d0123abc".to_owned(),
                 thread_ts: None,
             },
@@ -7816,11 +8069,11 @@ async fn slack_and_telegram_never_accept_non_success_http_statuses() {
             br#"{"ok":true,"channel":"d0123abc","ts":"1712345678.000100"}"#.to_vec(),
         )
     });
-    let slack = slack(&slack_http.base).replier();
+    let slack = slack(&slack_http.base).driver();
     assert!(
         slack
             .reply(
-                ReplyTarget::Slack {
+                &ReplyTarget::Slack {
                     channel: "d0123abc".to_owned(),
                     thread_ts: None,
                 },
@@ -7837,11 +8090,11 @@ async fn slack_and_telegram_never_accept_non_success_http_statuses() {
             br#"{"ok":true,"result":{"message_id":7,"chat":{"id":42}}}"#.to_vec(),
         )
     });
-    let telegram = telegram(&telegram_http.base).replier();
+    let telegram = telegram(&telegram_http.base).driver();
     assert!(
         telegram
             .reply(
-                ReplyTarget::Telegram {
+                &ReplyTarget::Telegram {
                     chat_id: 42,
                     reply_to: None,
                     message_thread_id: None,
@@ -8938,7 +9191,7 @@ fn discord(endpoint: &str) -> crate::transport::discord::DiscordTransport {
         "community-discord".to_owned(),
         endpoint.to_owned(),
         "discord-test-bot-token".to_owned(),
-        ActivityMode::Off,
+        LivenessSettings::default(),
     )
     .expect("Discord transport builds")
 }
@@ -9043,8 +9296,8 @@ async fn discord_routes_photos_and_files_and_posts_a_no_ping_reply() {
     );
 
     transport
-        .replier()
-        .reply(message.reply, OutboundReply::text("@everyone **done**"))
+        .driver()
+        .reply(&message.reply, OutboundReply::text("@everyone **done**"))
         .await
         .expect("Discord answer posts");
     let posted = http
@@ -9084,9 +9337,9 @@ async fn discord_posts_generated_png_as_a_bounded_multipart_attachment() {
     let transport = discord(&http.base);
 
     let error = transport
-        .replier()
+        .driver()
         .reply(
-            ReplyTarget::Discord {
+            &ReplyTarget::Discord {
                 channel_id: DISCORD_CHANNEL.to_owned(),
                 reply_to: Some(DISCORD_MESSAGE.to_owned()),
             },
@@ -9124,9 +9377,9 @@ async fn discord_posts_every_attachment_on_the_first_message() {
     let transport = discord(&http.base);
 
     transport
-        .replier()
+        .driver()
         .reply(
-            ReplyTarget::Discord {
+            &ReplyTarget::Discord {
                 channel_id: DISCORD_CHANNEL.to_owned(),
                 reply_to: None,
             },
@@ -9145,7 +9398,7 @@ async fn discord_posts_every_attachment_on_the_first_message() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn discord_native_activity_triggers_typing_on_the_authenticated_channel() {
+async fn discord_native_liveness_triggers_typing_on_the_authenticated_channel() {
     let event = discord_message(
         "300000000000000099",
         "200000000000000099",
@@ -9161,22 +9414,24 @@ async fn discord_native_activity_triggers_typing_on_the_authenticated_channel() 
         "community-discord".to_owned(),
         http.base.clone(),
         "discord-test-bot-token".to_owned(),
-        ActivityMode::Native,
+        liveness_settings(LivenessMode::Native),
     )
     .expect("Discord transport builds");
     transport.connect().await.expect("Discord connects");
     let message = next_message(&mut transport).await;
     assert_eq!(
-        message.activity.as_ref(),
-        Some(&ActivityTarget::Discord {
+        message.liveness.as_ref(),
+        Some(&LivenessTarget::Discord {
             channel_id: "200000000000000099".to_owned(),
+            message_id: "300000000000000099".to_owned(),
         })
     );
 
-    transport
-        .activity()
-        .expect("native activity configured")
-        .show(message.activity.expect("activity target"))
+    let driver = transport.driver();
+    driver
+        .typing()
+        .expect("Discord leases a typing indicator")
+        .renew(&message.liveness.expect("liveness target"))
         .await
         .expect("typing request succeeds");
     assert!(http.calls().iter().any(|(path, body)| {
@@ -9231,9 +9486,9 @@ async fn discord_obeys_one_rest_retry_after_before_posting_the_reply() {
     transport.connect().await.expect("Discord connects");
 
     transport
-        .replier()
+        .driver()
         .reply(
-            ReplyTarget::Discord {
+            &ReplyTarget::Discord {
                 channel_id: DISCORD_CHANNEL.to_owned(),
                 reply_to: None,
             },
@@ -9332,15 +9587,15 @@ async fn a_discord_rate_limit_wait_releases_the_rest_lock() {
         .source
         .clone()
         .expect("attachment has a source");
-    let replier = transport.replier();
+    let driver = transport.driver();
     let fetcher = transport
         .asset_fetcher()
         .expect("Discord has an asset fetcher");
 
     let reply = tokio::spawn(async move {
-        replier
+        driver
             .reply(
-                ReplyTarget::Discord {
+                &ReplyTarget::Discord {
                     channel_id: "200000000000000007".to_owned(),
                     reply_to: None,
                 },
@@ -9396,9 +9651,9 @@ async fn discord_failure_after_one_accepted_chunk_is_partial_delivery() {
     });
     let transport = discord(&http.base);
     let error = transport
-        .replier()
+        .driver()
         .reply(
-            ReplyTarget::Discord {
+            &ReplyTarget::Discord {
                 channel_id: DISCORD_CHANNEL.to_owned(),
                 reply_to: None,
             },
@@ -9840,7 +10095,7 @@ fn an_unsupported_media_type_is_named_but_never_numbered() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn telegram_activity_and_replies_stay_inside_the_inbound_topic() {
+async fn telegram_liveness_and_replies_stay_inside_the_inbound_topic() {
     let http = spawn_http_mock(move |path, _body| {
         if path.contains("getMe") {
             return json!({"ok": true, "result": {"id": 1, "is_bot": true, "username": "dekopon_bot"}});
@@ -9872,7 +10127,7 @@ async fn telegram_activity_and_replies_stay_inside_the_inbound_topic() {
         }
         json!({"ok": true, "result": []})
     });
-    let mut transport = telegram_with(&http.base, ActivityMode::Native);
+    let mut transport = telegram_with(&http.base, LivenessMode::Native);
     transport.connect().await.expect("Telegram connects");
     let message = next_message(&mut transport).await;
 
@@ -9886,16 +10141,17 @@ async fn telegram_activity_and_replies_stay_inside_the_inbound_topic() {
             message_thread_id: Some(99),
         }
     );
-    let target = message.activity.clone().expect("topic activity target");
+    let target = message.liveness.clone().expect("topic liveness target");
     transport
-        .activity()
-        .expect("native activity configured")
-        .show(target)
+        .driver()
+        .typing()
+        .expect("Telegram leases a typing indicator")
+        .renew(&target)
         .await
         .expect("chat action succeeds");
     transport
-        .replier()
-        .reply(message.reply, OutboundReply::text("done"))
+        .driver()
+        .reply(&message.reply, OutboundReply::text("done"))
         .await
         .expect("topic reply succeeds");
 
@@ -9946,8 +10202,8 @@ async fn a_long_telegram_answer_is_split_instead_of_being_rejected_whole() {
     // code units, so a splitter counting characters would post one message Telegram refuses.
     let long = format!("{}\n{}", "a".repeat(2_000), "🦀".repeat(3_000));
     transport
-        .replier()
-        .reply(message.reply, OutboundReply::text(long.clone()))
+        .driver()
+        .reply(&message.reply, OutboundReply::text(long.clone()))
         .await
         .expect("a long answer is delivered");
 
@@ -10083,8 +10339,8 @@ async fn telegram_topics_have_distinct_scopes_and_replies_stay_in_the_topic() {
     assert_eq!(message.conversation_id, "-1001:topic:77");
     assert_eq!(message.thread.as_deref(), Some("77"));
     transport
-        .replier()
-        .reply(message.reply, OutboundReply::text("inside topic"))
+        .driver()
+        .reply(&message.reply, OutboundReply::text("inside topic"))
         .await
         .expect("topic reply is accepted");
     let body = http
@@ -10115,9 +10371,9 @@ async fn telegram_sends_a_generated_png_as_a_photo_in_the_authenticated_topic() 
     let transport = telegram(&http.base);
 
     transport
-        .replier()
+        .driver()
         .reply(
-            ReplyTarget::Telegram {
+            &ReplyTarget::Telegram {
                 chat_id: -1001,
                 reply_to: Some(3),
                 message_thread_id: Some(77),
@@ -10158,9 +10414,9 @@ async fn telegram_sends_one_photo_per_attachment_and_captions_the_first() {
     let transport = telegram(&http.base);
 
     transport
-        .replier()
+        .driver()
         .reply(
-            ReplyTarget::Telegram {
+            &ReplyTarget::Telegram {
                 chat_id: -1001,
                 reply_to: None,
                 message_thread_id: None,
@@ -10210,9 +10466,9 @@ async fn telegram_splits_long_generated_image_text_without_losing_it() {
     let text = format!("{}\n{}", "a".repeat(4_000), "b".repeat(1_000));
 
     transport
-        .replier()
+        .driver()
         .reply(
-            ReplyTarget::Telegram {
+            &ReplyTarget::Telegram {
                 chat_id: 42,
                 reply_to: Some(3),
                 message_thread_id: None,
@@ -10261,9 +10517,9 @@ async fn telegram_reports_partial_delivery_when_long_image_text_fails_after_the_
     let transport = telegram(&http.base);
 
     let error = transport
-        .replier()
+        .driver()
         .reply(
-            ReplyTarget::Telegram {
+            &ReplyTarget::Telegram {
                 chat_id: 42,
                 reply_to: None,
                 message_thread_id: None,
@@ -10287,8 +10543,11 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
     // same conversation, and one client driving several sessions needs to keep them apart.
     let directory = temporary();
     let socket_path = directory.path().join("dev.sock");
-    let mut transport =
-        crate::transport::local::LocalTransport::new("dev".to_owned(), socket_path.clone());
+    let mut transport = crate::transport::local::LocalTransport::new(
+        "dev".to_owned(),
+        socket_path.clone(),
+        LivenessSettings::default(),
+    );
     transport
         .connect()
         .await
@@ -10336,11 +10595,11 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
     // The reply resolves only after the transport writer has completed both `write_all` and
     // `flush`; reading the exact line from the peer proves the kernel-acceptance crossing.
     let reply = tokio::spawn({
-        let replier = transport.replier();
+        let driver = transport.driver();
         let target = first.reply.clone();
         async move {
-            replier
-                .reply(target, OutboundReply::text("accepted locally"))
+            driver
+                .reply(&target, OutboundReply::text("accepted locally"))
                 .await
         }
     });
@@ -10363,12 +10622,12 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
         .expect("local write and flush are accepted");
 
     let image_reply = tokio::spawn({
-        let replier = transport.replier();
+        let driver = transport.driver();
         let target = second.reply.clone();
         async move {
-            replier
+            driver
                 .reply(
-                    target,
+                    &target,
                     OutboundReply::with_images("two local kitties", generated_images(2)),
                 )
                 .await
@@ -10447,7 +10706,7 @@ async fn answer_once(message: InboundMessage) {
         runner(broker, ModelScript::new([answer("answered")]), 4),
         route(model_config()),
         message,
-        Arc::new(RecordingReplier::default()) as Arc<dyn ChatReplier>,
+        Arc::new(RecordingDriver::default()) as Arc<dyn ChatDriver>,
     )
     .await;
 }
@@ -10577,6 +10836,7 @@ async fn a_whatsapp_delivery_opens_its_trace_around_the_signature_check() {
         "secret".to_owned(),
         "verify".to_owned(),
         "access".to_owned(),
+        LivenessSettings::default(),
     )
     .expect("WhatsApp transport builds");
     transport
@@ -10633,8 +10893,11 @@ async fn a_local_request_opens_its_trace_on_the_line_it_arrived_on() {
     let (capture, _subscriber) = capture_spans();
     let directory = temporary();
     let socket_path = directory.path().join("dev.sock");
-    let mut transport =
-        crate::transport::local::LocalTransport::new("dev".to_owned(), socket_path.clone());
+    let mut transport = crate::transport::local::LocalTransport::new(
+        "dev".to_owned(),
+        socket_path.clone(),
+        LivenessSettings::default(),
+    );
     transport
         .connect()
         .await
@@ -10653,4 +10916,791 @@ async fn a_local_request_opens_its_trace_on_the_line_it_arrived_on() {
     answer_once(message).await;
 
     assert_trace_opens_at_receipt(&capture, "local", &message_id);
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation matrix
+// ---------------------------------------------------------------------------
+
+/// A broker that answers the first `answer_first` requests and then parks on the next connection.
+///
+/// `stub_broker` serves a fixed script and never stalls, which cannot reach the two stages a cancel
+/// has to survive: a session waiting on its capability listing, and a session inside a capability
+/// call. This one accepts the parked connection — so the client is genuinely blocked on a reply
+/// rather than on a connect — and answers it only when the test says so.
+async fn parked_broker(
+    directory: &Path,
+    answer_first: Vec<ResponseEnvelope>,
+    parked_answer: ResponseEnvelope,
+) -> (
+    ResolvedBroker,
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+) {
+    let socket = directory.join("broker.sock");
+    let listener = UnixListener::bind(&socket).expect("bind parked broker");
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))
+        .expect("secure parked broker socket");
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let entered = Arc::clone(&reached);
+    let released = Arc::clone(&release);
+    tokio::spawn(async move {
+        for response in answer_first {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            if read_frame::<_, RequestEnvelope>(&mut stream, FrameLimits::default())
+                .await
+                .is_err()
+            {
+                return;
+            }
+            if write_frame(&mut stream, &response, FrameLimits::default())
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
+        let Ok((mut stream, _)) = listener.accept().await else {
+            return;
+        };
+        if read_frame::<_, RequestEnvelope>(&mut stream, FrameLimits::default())
+            .await
+            .is_err()
+        {
+            return;
+        }
+        entered.notify_one();
+        released.notified().await;
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "the parked call is released only after the test has already cancelled the \
+                      session, so the client may well be gone; what the test asserts on is the \
+                      cancellation, not this write"
+        )]
+        let _ = write_frame(&mut stream, &parked_answer, FrameLimits::default()).await;
+    });
+    (
+        ResolvedBroker {
+            socket_path: socket,
+            server_uid: crate::current_uid(),
+            frame: FrameLimits::default(),
+        },
+        reached,
+        release,
+    )
+}
+
+/// The shared streaming model, as the factory a route selects.
+///
+/// `ScriptedStreamModel` lives in `dekopon-test-support` because two suites replay the same
+/// recorded transcripts, while `ModelFactory` is this crate's own seam. One cached client per
+/// configured model is exactly what the fixture wants: every session in a test releases events from
+/// the same script, which is what makes "the stream stopped at this event" an assertion at all.
+impl ModelFactory for Arc<dekopon_test_support::ScriptedStreamModel> {
+    fn build(&self, _model: &ModelConfig) -> Result<SharedModel, SessionError> {
+        Ok(Arc::clone(self) as SharedModel)
+    }
+}
+
+/// A driver that parks inside `reply`, so a cancel can be aimed at the delivery window itself.
+#[derive(Default)]
+struct ParkedReplyDriver {
+    delivering: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    delivered: Mutex<Vec<String>>,
+}
+
+impl ParkedReplyDriver {
+    fn delivered(&self) -> Vec<String> {
+        self.delivered.lock().expect("delivered replies").clone()
+    }
+}
+
+#[async_trait]
+impl ChatDriver for ParkedReplyDriver {
+    async fn reply(
+        &self,
+        _target: &ReplyTarget,
+        reply: OutboundReply,
+    ) -> Result<(), TransportError> {
+        self.delivering.notify_one();
+        self.release.notified().await;
+        self.delivered
+            .lock()
+            .expect("delivered replies")
+            .push(reply.text);
+        Ok(())
+    }
+}
+
+/// How long a route on this matrix's clock may run before its own budget stops it.
+///
+/// Real time and a short budget rather than a paused clock: the doubles that hold a session open
+/// park blocking threads and are joined with `block_in_place`, which panics on the current-thread
+/// runtime a paused clock needs. One second is long enough that every stage below is reached first
+/// on a loaded machine, and short enough to wait out five times over.
+const WALL_CLOCK: Duration = Duration::from_secs(1);
+
+/// Every way a running session can be stopped, as this matrix delivers each one.
+///
+/// Not five variations on one mechanism: three are a person acting through whichever affordance
+/// their transport offers, one is the embedder dropping the session task out from under the work,
+/// and one is the route's own clock firing inside the policy task. They meet at a single
+/// compare-exchange, and that meeting is what a matrix is for — every origin, at every stage a run
+/// can be interrupted at, ends the same way and costs the same nothing.
+#[derive(Clone, Copy, Debug)]
+enum CancelOrigin {
+    /// The person who asked, through one of the three affordances.
+    User(CancelVia),
+    /// A shutdown: the routing loop's `JoinSet` is dropped, which aborts the session task.
+    Operator,
+    /// The route's `maxDurationMs`, counted by the policy task from `Started`.
+    WallClock,
+}
+
+impl CancelOrigin {
+    /// The whole matrix, in the order the design lists it.
+    const EVERY: [Self; 5] = [
+        Self::User(CancelVia::NativeStop),
+        Self::User(CancelVia::Button),
+        Self::User(CancelVia::StopReply),
+        Self::Operator,
+        Self::WallClock,
+    ];
+
+    /// The route this origin needs: only the wall clock brings a budget of its own.
+    fn route(self) -> crate::routes::BoundRoute {
+        match self {
+            Self::User(_) | Self::Operator => route(model_config()),
+            Self::WallClock => timed_route(model_config(), WALL_CLOCK),
+        }
+    }
+
+    /// Delivers the stop, reporting what an authenticated request found when this origin is one.
+    ///
+    /// `None` for the two nobody asks on a person's behalf: a shutdown aborts the task and the
+    /// drop guard is the cancel, and the clock has been running since `Started`.
+    fn deliver(
+        self,
+        runner: &SessionRunner,
+        session: &tokio::task::JoinHandle<()>,
+    ) -> Option<CancelOutcome> {
+        match self {
+            Self::User(via) => Some(runner.active_sessions.cancel(&cancel(SUBJECT, via))),
+            Self::Operator => {
+                session.abort();
+                None
+            }
+            Self::WallClock => None,
+        }
+    }
+
+    /// Waits until the stop is in effect on the session itself, not merely requested.
+    ///
+    /// The three affordances and the clock all reach the compare-exchange before the call that
+    /// delivered them returns. A shutdown does not: `abort` only schedules the cancellation, and
+    /// the guard that marks the session cancelled runs when the runtime drops the task. Releasing a
+    /// parked double before that lands would let the work resume as though nobody had stopped it,
+    /// and the stage would be asserting on a race rather than on a stop.
+    async fn landed(self, session: &tokio::task::JoinHandle<()>) {
+        if !matches!(self, Self::Operator) {
+            return;
+        }
+        for _ in 0..600 {
+            if session.is_finished() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the aborted session task never unwound");
+    }
+
+    /// Whether anything is left alive to tell the person this run ended.
+    ///
+    /// Every origin but the shutdown: aborting the session task drops the policy's terminal channel
+    /// in the same instant it cancels the session, and which of the two the policy task observes
+    /// first is a race nothing settles. Nor should it — the process is going down, and
+    /// `docs/chat-progress.md` lists the stale surface a restart leaves behind as an accepted
+    /// limit. What a shutdown cell pins is the half that is not a race: the work stops, and its
+    /// answer never reaches the person.
+    const fn renders_the_ending(self) -> bool {
+        !matches!(self, Self::Operator)
+    }
+
+    /// Joins a session this origin may have aborted rather than let finish.
+    async fn joined(self, session: tokio::task::JoinHandle<()>) {
+        match session.await {
+            Ok(()) => {}
+            Err(error) if error.is_cancelled() && matches!(self, Self::Operator) => {}
+            Err(error) => panic!("the session task failed under {self:?}: {error}"),
+        }
+    }
+}
+
+/// Waits until the person has been told the run stopped, and reports whether they were.
+///
+/// Polled rather than signalled, because the writer is the policy's own task: it renders the
+/// ending on the decision rather than when the session unwinds. Every stage below asserts that
+/// while its work is still parked, which is the property that makes a stop feel like one.
+async fn told_it_stopped(driver: &RecordingDriver) -> bool {
+    for _ in 0..600 {
+        if driver
+            .rendered()
+            .iter()
+            .any(|line| line.contains(crate::session::STOPPED_REPLY))
+        {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    false
+}
+
+/// A model factory that parks while it resolves its client, then counts every turn it is asked for.
+///
+/// The stage between the grant and the first request, which nothing else reaches: `Started` has
+/// been emitted, the policy task is running and on its clock, and the loop has not yet built a
+/// single message. A stop that lands here must cost nothing, so `requests()` is the assertion;
+/// [`BlockedModel`] parks one layer further in, inside the turn it has already bought.
+struct ParkedBuild {
+    entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    entered_signal: tokio::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    release: Mutex<Option<std::sync::mpsc::Sender<()>>>,
+    release_signal: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    requests: AtomicUsize,
+}
+
+impl ParkedBuild {
+    fn new() -> Arc<Self> {
+        let (entered, entered_signal) = std::sync::mpsc::channel();
+        let (release, release_signal) = std::sync::mpsc::channel();
+        Arc::new(Self {
+            entered: Mutex::new(Some(entered)),
+            entered_signal: tokio::sync::Mutex::new(entered_signal),
+            release: Mutex::new(Some(release)),
+            release_signal: Mutex::new(Some(release_signal)),
+            requests: AtomicUsize::new(0),
+        })
+    }
+
+    async fn wait_until_building(&self) {
+        let guard = self.entered_signal.lock().await;
+        tokio::task::block_in_place(|| {
+            guard
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the session reaches its model client");
+        });
+    }
+
+    fn release(&self) {
+        if let Some(sender) = self.release.lock().expect("release lock").take() {
+            #[allow(
+                clippy::let_underscore_must_use,
+                reason = "a parked build that already gave up on being released fails the test at \
+                          its own recv_timeout, not here"
+            )]
+            let _ = sender.send(());
+        }
+    }
+
+    /// Turns this session asked the model for, which a stop before turn 1 must leave at zero.
+    fn requests(&self) -> usize {
+        self.requests.load(Ordering::SeqCst)
+    }
+}
+
+impl ModelFactory for Arc<ParkedBuild> {
+    #[allow(
+        clippy::let_underscore_must_use,
+        reason = "both halves are the test's own rendezvous: an unobserved entry signal fails \
+                  wait_until_building, and a release that never arrives is bounded by the timeout"
+    )]
+    fn build(&self, _model: &ModelConfig) -> Result<SharedModel, SessionError> {
+        if let Some(sender) = self.entered.lock().expect("entered lock").take() {
+            let _ = sender.send(());
+        }
+        if let Some(receiver) = self.release_signal.lock().expect("release lock").take() {
+            let _ = receiver.recv_timeout(Duration::from_secs(30));
+        }
+        Ok(Arc::new(ParkedBuildHandle(Arc::clone(self))))
+    }
+}
+
+struct ParkedBuildHandle(Arc<ParkedBuild>);
+
+impl ChatModel for ParkedBuildHandle {
+    fn complete(
+        &self,
+        _messages: &[ModelMessage],
+        _tools: &[ModelTool],
+        _options: &CompletionOptions,
+        _on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
+    ) -> Result<AssistantTurn, ModelError> {
+        self.0.requests.fetch_add(1, Ordering::SeqCst);
+        Ok(answer("the turn nobody asked for"))
+    }
+}
+
+/// A session parked on its capability listing is already stoppable, before any grant exists.
+///
+/// Registration happens before `connect`, which is what this pins and what nothing else can: the
+/// broker has not answered, so `Started` has not been emitted and the policy task does not exist
+/// yet, and a person waiting on a slow broker still has to be able to stop what they started. The
+/// stages below all run after the grant, where the rest of the matrix lives.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_parked_on_its_capability_listing_is_stoppable_before_its_grant() {
+    for via in [
+        CancelVia::NativeStop,
+        CancelVia::Button,
+        CancelVia::StopReply,
+    ] {
+        let directory = temporary();
+        let (broker, reached, release) = parked_broker(
+            directory.path(),
+            Vec::new(),
+            ResponseEnvelope::capabilities(vec![capability("echo.echo")], Vec::new()),
+        )
+        .await;
+        let models = ModelScript::forbidden();
+        let driver = Arc::new(RecordingDriver::default().with_status());
+        let runner = runner(broker, Arc::clone(&models), 4);
+        let session = tokio::spawn(run_session(
+            Arc::clone(&runner),
+            route(model_config()),
+            message("stop before you start"),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        ));
+        tokio::time::timeout(Duration::from_secs(5), reached.notified())
+            .await
+            .expect("the session parks on its capability listing");
+
+        assert_eq!(
+            runner.active_sessions.cancel(&cancel(SUBJECT, via)),
+            CancelOutcome::Cancelled,
+            "{via:?} found no session to stop"
+        );
+        release.notify_one();
+        session.await.expect("the cancelled session exits");
+
+        assert_eq!(
+            models.requests(),
+            0,
+            "a cancel before the grant must not buy a model turn: {via:?}"
+        );
+        assert!(
+            driver
+                .replies()
+                .contains(&crate::session::STOPPED_REPLY.to_owned()),
+            "{via:?} left the person with no answer at all: {:?}",
+            driver.rendered()
+        );
+    }
+}
+
+/// Stage one: every origin, after the grant and before the first request.
+///
+/// The stage is the point: the session holds its grant and is resolving its model client, so a stop
+/// that lands here must leave the model untouched. `requests()` is therefore the assertion rather
+/// than the reply text — a session that answered `Stopped.` *after* paying for a turn was not
+/// stopped before turn 1, it was stopped after it.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_origin_stops_a_session_before_its_first_model_turn() {
+    for origin in CancelOrigin::EVERY {
+        let directory = temporary();
+        let (broker, _observed) = stub_broker(
+            directory.path(),
+            vec![ResponseEnvelope::capabilities(
+                vec![capability("echo.echo")],
+                Vec::new(),
+            )],
+        )
+        .await;
+        let models = ParkedBuild::new();
+        let driver = Arc::new(RecordingDriver::default().with_status());
+        let runner = runner_with(
+            broker,
+            Arc::new(Arc::clone(&models)) as Arc<dyn ModelFactory>,
+            4,
+        );
+        let session = tokio::spawn(run_session(
+            Arc::clone(&runner),
+            origin.route(),
+            message("stop before you ask"),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        ));
+        models.wait_until_building().await;
+
+        if let Some(outcome) = origin.deliver(&runner, &session) {
+            assert_eq!(
+                outcome,
+                CancelOutcome::Cancelled,
+                "{origin:?} found no session to stop"
+            );
+        }
+        origin.landed(&session).await;
+        assert!(
+            !origin.renders_the_ending() || told_it_stopped(&driver).await,
+            "{origin:?} left the person watching a run that had already ended: {:?}",
+            driver.rendered()
+        );
+        models.release();
+        origin.joined(session).await;
+
+        assert_eq!(
+            models.requests(),
+            0,
+            "a stop before turn 1 must not buy a model turn: {origin:?}"
+        );
+    }
+}
+
+/// Stage two: every origin, between two deltas of a stream that is still arriving.
+///
+/// The partial text is the property. The loop owns the cumulative text, so interrupting the turn
+/// must neither throw away the half of the answer the person could already read nor show them a
+/// fragment that arrived after they stopped it.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_origin_stops_a_session_between_the_deltas_of_a_stream() {
+    for origin in CancelOrigin::EVERY {
+        let directory = temporary();
+        let (broker, _observed) = stub_broker(
+            directory.path(),
+            vec![ResponseEnvelope::capabilities(
+                vec![capability("echo.echo")],
+                Vec::new(),
+            )],
+        )
+        .await;
+        let model = Arc::new(
+            dekopon_test_support::ScriptedStreamModel::from_transcript(
+                dekopon_test_support::OPENAI_CHAT_COMPLETIONS_TWO_DELTAS,
+                answer("Echoed hello."),
+            )
+            .expect("the recorded transcript parses"),
+        );
+        let driver =
+            Arc::new(RecordingDriver::default().with_stream(2_000, Duration::from_millis(10)));
+        let runner = runner_with(
+            broker,
+            Arc::new(Arc::clone(&model)) as Arc<dyn ModelFactory>,
+            4,
+        );
+        let mut inbound = message("stream then stop");
+        // The stream is a surface, and a surface needs somewhere to be: with no liveness target the
+        // session is reply-only and there would be no renders to assert on at all.
+        inbound.liveness = Some(LivenessTarget::Discord {
+            channel_id: "200000000000000001".to_owned(),
+            message_id: "300000000000000002".to_owned(),
+        });
+        let session = tokio::spawn(run_session(
+            Arc::clone(&runner),
+            origin.route(),
+            inbound,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        ));
+
+        model.release_next();
+        tokio::time::timeout(Duration::from_secs(5), model.wait_for_event())
+            .await
+            .expect("the first delta reaches the loop");
+        // The render rather than the event is what the stop has to land after. The policy reads the
+        // cumulative text on its own task and its terminal branch is biased ahead of that read, so a
+        // stop raced against the first render would leave the surface blank and prove nothing about
+        // what the person had already been shown.
+        let stream = driver.stream_object().expect("the driver streams");
+        tokio::time::timeout(Duration::from_secs(5), stream.wait_for_calls(1))
+            .await
+            .expect("the first delta reaches the surface");
+
+        if let Some(outcome) = origin.deliver(&runner, &session) {
+            assert_eq!(
+                outcome,
+                CancelOutcome::Cancelled,
+                "{origin:?} found no session to stop"
+            );
+        }
+        origin.landed(&session).await;
+        assert!(
+            !origin.renders_the_ending() || told_it_stopped(&driver).await,
+            "{origin:?} left the stream saying it was still writing: {:?}",
+            driver.rendered()
+        );
+        model.release_next();
+        // Waited on rather than inferred from the join: an operator's abort resolves the session
+        // handle at once, while the event this assertion is about is still on the loop's thread.
+        tokio::time::timeout(Duration::from_secs(5), model.wait_for_event())
+            .await
+            .expect("the stream hands over the event the stop lands on");
+        origin.joined(session).await;
+
+        assert_eq!(
+            model.emitted(),
+            2,
+            "the stream stops at the first event after the stop, not before it: {origin:?}"
+        );
+        let shown = driver
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                dekopon_test_support::DriverCall::Stream(StreamCall::Show { text, .. }) => {
+                    Some(text)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            shown.iter().any(|text| text.starts_with("Echoed")),
+            "the text already delivered stays on screen under {origin:?}: {shown:?}"
+        );
+        assert!(
+            !shown.iter().any(|text| text.contains("hello.")),
+            "nothing after the stop may be rendered under {origin:?}: {shown:?}"
+        );
+    }
+}
+
+/// Stage three: every origin, while a capability call is in flight.
+///
+/// An issued call is never cancelled — the broker finishes it and the result is dropped — so what
+/// this pins is that the *session* does not sit on it. The person is told it stopped while the
+/// orphan is still parked, which is why the release comes after that assertion rather than before.
+///
+/// The park is the broker's rather than [`dekopon_test_support::BlockedRuntime`]'s: a gateway
+/// session builds its own `ShellRuntime` around its broker leg, so the only way in from this side
+/// is a broker that accepts the invocation and answers it when the test says so.
+#[tokio::test(flavor = "multi_thread")]
+async fn every_origin_stops_a_session_inside_a_parked_capability_call() {
+    for origin in CancelOrigin::EVERY {
+        let directory = temporary();
+        let (broker, reached, release) = parked_broker(
+            directory.path(),
+            vec![ResponseEnvelope::capabilities(
+                vec![capability("echo.echo")],
+                Vec::new(),
+            )],
+            ResponseEnvelope::invocation(record_result(InvocationOutcome::Succeeded, None)),
+        )
+        .await;
+        let models = ModelScript::new([script_call("echo.echo --message hi")]);
+        let driver = Arc::new(RecordingDriver::default().with_status());
+        let runner = runner(broker, Arc::clone(&models), 4);
+        let session = tokio::spawn(run_session(
+            Arc::clone(&runner),
+            origin.route(),
+            message("run the tool then stop"),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        ));
+        tokio::time::timeout(Duration::from_secs(10), reached.notified())
+            .await
+            .expect("the session parks inside its capability call");
+
+        if let Some(outcome) = origin.deliver(&runner, &session) {
+            assert_eq!(
+                outcome,
+                CancelOutcome::Cancelled,
+                "{origin:?} found no session to stop"
+            );
+        }
+        origin.landed(&session).await;
+        assert!(
+            !origin.renders_the_ending() || told_it_stopped(&driver).await,
+            "{origin:?} made the person wait out a call nobody was going to read: {:?}",
+            driver.rendered()
+        );
+        release.notify_one();
+        origin.joined(session).await;
+
+        assert!(
+            driver
+                .replies()
+                .iter()
+                .all(|reply| reply == crate::session::STOPPED_REPLY),
+            "a stopped session answered anyway under {origin:?}: {:?}",
+            driver.replies()
+        );
+    }
+}
+
+/// Stage four: no origin takes back an answer that is already being delivered.
+///
+/// One atomic decides it, and completion claimed it first. Rendering `Stopped.` over an answer
+/// already on its way is the failure this forbids, and the wall clock is in the matrix here for
+/// the same reason the presses are: its budget elapses while the surface is mid-write, and the
+/// ending it would have stopped is one the session had already claimed.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_origin_takes_back_an_answer_that_is_already_being_delivered() {
+    for origin in CancelOrigin::EVERY {
+        let directory = temporary();
+        let (broker, _observed) = stub_broker(
+            directory.path(),
+            vec![ResponseEnvelope::capabilities(
+                vec![capability("echo.echo")],
+                Vec::new(),
+            )],
+        )
+        .await;
+        let driver = Arc::new(ParkedReplyDriver::default());
+        let runner = runner(broker, ModelScript::new([answer("the real answer")]), 4);
+        let session = tokio::spawn(run_session(
+            Arc::clone(&runner),
+            origin.route(),
+            message("answer me"),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        ));
+        tokio::time::timeout(Duration::from_secs(10), driver.delivering.notified())
+            .await
+            .expect("the session reaches delivery");
+        if matches!(origin, CancelOrigin::WallClock) {
+            // Nothing else can make a budget elapse: the surface is inside the one call this task
+            // makes, so the clock cannot even be read until the answer is out.
+            tokio::time::sleep(WALL_CLOCK + Duration::from_millis(500)).await;
+        }
+
+        if let Some(outcome) = origin.deliver(&runner, &session) {
+            assert_eq!(
+                outcome,
+                CancelOutcome::AlreadyEnded,
+                "completion already claimed the one decision a session gets: {origin:?}"
+            );
+        }
+        driver.release.notify_one();
+        origin.joined(session).await;
+
+        assert_eq!(
+            wait_for_delivery(&driver).await,
+            ["the real answer"],
+            "{origin:?} took back an answer the person was already being shown"
+        );
+    }
+}
+
+/// Waits until the parked driver has recorded the answer it was holding, and reports what it has.
+///
+/// The delivery runs on the policy task, which outlives a session task the operator aborted, so
+/// "what was delivered" is not readable the instant the session's own handle resolves.
+async fn wait_for_delivery(driver: &ParkedReplyDriver) -> Vec<String> {
+    for _ in 0..600 {
+        let delivered = driver.delivered();
+        if !delivered.is_empty() {
+            return delivered;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    Vec::new()
+}
+
+/// A press from someone other than the person who asked is acknowledged and then ignored.
+///
+/// Both halves matter. The acknowledgment is what keeps the service from showing "this interaction
+/// failed" to a bystander, and the ignoring is what keeps one person from stopping another's work.
+#[tokio::test(flavor = "multi_thread")]
+async fn another_subjects_press_is_acknowledged_and_ignored() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("echo.echo")],
+            Vec::new(),
+        )],
+    )
+    .await;
+    let model = BlockedModel::new("the answer stands");
+    let driver = Arc::new(RecordingDriver::default().with_cancel_button());
+    let runner = runner_with(
+        broker,
+        Arc::new(Arc::clone(&model)) as Arc<dyn ModelFactory>,
+        4,
+    );
+    let session = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        route(model_config()),
+        message("mine, not theirs"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    model.wait_until_entered().await;
+
+    let press = CancelPress {
+        target: LivenessTarget::Local { connection: 1 },
+        subject: "tel.16035550100".to_owned(),
+        ack: crate::transport::AckToken::Local,
+    };
+    driver
+        .cancel_button()
+        .expect("the driver offers a cancel control")
+        .ack(&press)
+        .await
+        .expect("a bystander's press is still acknowledged");
+    assert_eq!(
+        runner
+            .active_sessions
+            .cancel(&cancel("tel.16035550100", CancelVia::Button)),
+        CancelOutcome::OtherSubject,
+        "a bystander cannot stop this session"
+    );
+    model.release();
+    session.await.expect("the session completes");
+
+    assert!(
+        driver
+            .rendered()
+            .contains(&"reply:the answer stands".to_owned()),
+        "{:?}",
+        driver.rendered()
+    );
+    assert!(
+        driver
+            .rendered()
+            .contains(&"cancel.ack:tel.16035550100".to_owned()),
+        "the press was acknowledged inside the service deadline: {:?}",
+        driver.rendered()
+    );
+}
+
+/// Every session registers, so every transport has a stop path rather than only Slack's Agent.
+///
+/// Before this, registration happened only when a message carried a native liveness target, which
+/// is why four transports had no way to stop a run at all. The message here carries no liveness
+/// target and the driver has no capability objects: the floor case, and it must still be stoppable.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_with_no_liveness_surface_is_still_registered_and_stoppable() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("echo.echo")],
+            Vec::new(),
+        )],
+    )
+    .await;
+    let model = BlockedModel::new("stale answer");
+    let driver = Arc::new(RecordingDriver::default());
+    let runner = runner_with(
+        broker,
+        Arc::new(Arc::clone(&model)) as Arc<dyn ModelFactory>,
+        4,
+    );
+    let mut inbound = message("stop me");
+    inbound.liveness = None;
+    let session = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        route(model_config()),
+        inbound,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    model.wait_until_entered().await;
+
+    assert_eq!(
+        runner
+            .active_sessions
+            .cancel(&cancel(SUBJECT, CancelVia::StopReply)),
+        CancelOutcome::Cancelled,
+        "a session with no liveness surface is registered like any other"
+    );
+    model.release();
+    session.await.expect("the cancelled session exits");
+
+    assert_eq!(driver.replies(), [crate::session::STOPPED_REPLY]);
 }

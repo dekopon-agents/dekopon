@@ -1,0 +1,12 @@
+data: {"type":"response.created","response":{"id":"resp_two_deltas","status":"in_progress"}}
+
+data: {"type":"response.output_item.added","item":{"type":"reasoning","id":"rs_1"}}
+
+data: {"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","encrypted_content":"opaque"}}
+
+data: {"type":"response.output_text.delta","delta":"Echoed "}
+
+data: {"type":"response.output_text.delta","delta":"hello."}
+
+data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":120,"input_tokens_details":{"cached_tokens":100},"output_tokens":30,"output_tokens_details":{"reasoning_tokens":7},"total_tokens":150}}}
+

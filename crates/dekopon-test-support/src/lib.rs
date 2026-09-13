@@ -8,8 +8,12 @@
 //! that is merely duplicated, because the difference is what the two suites then disagree about.
 //!
 //! This crate is `publish = false` and is only ever a path `[dev-dependencies]` entry. It depends
-//! on no crate in this workspace — in particular on nothing under the broker boundary — so adding
-//! it to `dekopond`'s dev-dependencies cannot put a broker crate in the gateway's dependency tree.
+//! on nothing under the broker boundary, so adding it to `dekopond`'s dev-dependencies cannot put
+//! a broker crate in the gateway's dependency tree; the three workspace crates it does depend on
+//! — `dekopon-agent`, `dekopon-model`, `dekopon-shell` — are the boundaries the shared doubles
+//! implement, and all three are already normal dependencies of `dekopond` itself. Because this
+//! crate is a dev-dependency everywhere, none of them appears in any `cargo tree --edges normal`
+//! CI reads.
 
 use std::{
     io::{ErrorKind, Read as _, Write as _},
@@ -21,8 +25,23 @@ use std::{
 };
 
 mod capture;
+mod driver;
+mod model;
+mod runtime;
+mod transcripts;
 
 pub use capture::{CaptureLayer, Record};
+pub use driver::{
+    DriverCall, FailureKind, ProgressCall, RecordingCancelButton, RecordingDriver,
+    RecordingProgress, RecordingReaction, RecordingStatus, RecordingStream, RecordingTyping,
+    StreamCall,
+};
+pub use model::{ScriptedStreamModel, scripted_text};
+pub use runtime::BlockedRuntime;
+pub use transcripts::{
+    CODEX_RESPONSES_TOOL_CALL, CODEX_RESPONSES_TWO_DELTAS, OPENAI_CHAT_COMPLETIONS_TOOL_CALL,
+    OPENAI_CHAT_COMPLETIONS_TWO_DELTAS,
+};
 
 /// How long a fixture waits on a peer before deciding the test, not the network, is stuck.
 const FIXTURE_TIMEOUT: Duration = Duration::from_secs(5);
