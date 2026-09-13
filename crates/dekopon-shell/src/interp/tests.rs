@@ -15,7 +15,15 @@ const PROBE: &str = "probe";
 /// The help page `probe --help` renders, newline-terminated the way `clap` writes it.
 const PROBE_HELP: &str = "Usage: probe <COMMAND>\n\nCommands:\n  upper  Uppercase text\n";
 
-/// A fixture exposing a few capabilities with distinguishable outcomes and one command word.
+/// A fixture exposing a few capabilities with distinguishable outcomes, reachable only through its
+/// one command word.
+///
+/// Nothing here loads a component: `probe` is a hand-written stand-in for a provider's own argv
+/// parser. Most subcommands propose one capability the way a real provider's `run-command` would;
+/// the rest stand for the other answers a run can end in. `cli-probe.upper` uppercases its `text`,
+/// so a result can never be mistaken for the argv that produced it; `fixture.object` hands back
+/// the object its flags describe, which is what the grammar tests use to put a structured value in
+/// a pipe.
 #[derive(Default)]
 pub(super) struct Fixture {
     pub(super) calls: RefCell<Vec<(String, Value)>>,
@@ -24,7 +32,8 @@ pub(super) struct Fixture {
 impl CapabilityInvoker for Fixture {
     fn granted(&self) -> Vec<String> {
         vec![
-            "echo.echo".to_owned(),
+            "cli-probe.upper".to_owned(),
+            "fixture.object".to_owned(),
             "http-probe.fetch".to_owned(),
             "policy.denied".to_owned(),
             "provider.broken".to_owned(),
@@ -32,10 +41,9 @@ impl CapabilityInvoker for Fixture {
     }
 
     fn describe(&self, capability: &str) -> Option<CapabilityDescription> {
-        (capability == "echo.echo").then(|| CapabilityDescription {
+        (capability == "cli-probe.upper").then(|| CapabilityDescription {
             capability: capability.to_owned(),
-            description: "Echoes its input".to_owned(),
-            input_schema: json!({"type": "object"}),
+            description: "Uppercases its text".to_owned(),
         })
     }
 
@@ -48,7 +56,7 @@ impl CapabilityInvoker for Fixture {
     }
 
     /// A `clap`-shaped provider command: help and usage errors are rendered text at the status
-    /// `clap` would choose, `upper` proposes the echo capability, and `-` reads stdin.
+    /// `clap` would choose, `-` reads stdin, and every other subcommand maps to one fixed answer.
     fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
         if word != PROBE {
             return None;
@@ -60,23 +68,23 @@ impl CapabilityInvoker for Fixture {
                 stderr: String::new(),
                 status: 0,
             },
-            ["upper", "--text", text] => CommandRun::Proposed {
-                capability: "echo.echo".to_owned(),
-                input: json!({ "text": text }),
-            },
+            ["upper", "--text", text] => proposal("cli-probe.upper", json!({ "text": text })),
             ["upper", "-"] => match stdin {
-                Some(text) => CommandRun::Proposed {
-                    capability: "echo.echo".to_owned(),
-                    input: json!({ "text": text }),
-                },
+                Some(text) => proposal("cli-probe.upper", json!({ "text": text })),
                 None => CommandRun::Failed {
                     message: "probe: no input was piped for -".to_owned(),
                 },
             },
-            ["ungranted"] => CommandRun::Proposed {
-                capability: "nothing.granted".to_owned(),
-                input: json!({}),
+            ["object", flags @ ..] => match object_from_flags(flags) {
+                Some(object) => proposal("fixture.object", object),
+                None => CommandRun::Failed {
+                    message: "probe: object takes --key value pairs".to_owned(),
+                },
             },
+            ["fetch"] => proposal("http-probe.fetch", json!({})),
+            ["denied"] => proposal("policy.denied", json!({})),
+            ["broken"] => proposal("provider.broken", json!({})),
+            ["ungranted"] => proposal("nothing.granted", json!({})),
             ["decline"] => CommandRun::Failed {
                 message: "probe: declined".to_owned(),
             },
@@ -110,6 +118,15 @@ impl CapabilityInvoker for Fixture {
             .borrow_mut()
             .push((capability.to_owned(), input.clone()));
         match capability {
+            "cli-probe.upper" => match input.get("text").and_then(Value::as_str) {
+                Some(text) => {
+                    CapabilityCallResult::Succeeded(json!({ "text": text.to_uppercase() }))
+                }
+                None => CapabilityCallResult::Failed {
+                    error: "input must be {\"text\": <string>}".to_owned(),
+                },
+            },
+            "fixture.object" => CapabilityCallResult::Succeeded(input),
             "policy.denied" => CapabilityCallResult::Denied {
                 reason: "exact policy refused this proposal".to_owned(),
             },
@@ -120,9 +137,36 @@ impl CapabilityInvoker for Fixture {
                 "status": 200,
                 "bodyText": "alpha\nbeta\nalpha",
             })),
-            _ => CapabilityCallResult::Succeeded(input),
+            _ => CapabilityCallResult::NotFound,
         }
     }
+}
+
+/// A proposal carrying no secret-use intent, which is every proposal this fixture makes.
+fn proposal(capability: &str, input: Value) -> CommandRun {
+    CommandRun::Proposed {
+        capability: capability.to_owned(),
+        input,
+        secret_use: None,
+    }
+}
+
+/// Builds the object `probe object --key value ...` describes.
+///
+/// A value that reads as JSON keeps its JSON type, so `--a 1` is a number; anything else is a
+/// string. `None` when the argv is not whole `--key value` pairs.
+fn object_from_flags(flags: &[&str]) -> Option<Value> {
+    let mut object = serde_json::Map::new();
+    for pair in flags.chunks(2) {
+        let [flag, text] = pair else {
+            return None;
+        };
+        let key = flag.strip_prefix("--")?;
+        let value = serde_json::from_str::<Value>(text)
+            .unwrap_or_else(|_| Value::String((*text).to_owned()));
+        object.insert(key.to_owned(), value);
+    }
+    Some(Value::Object(object))
 }
 
 fn run(script: &str) -> ScriptOutcome {
@@ -173,8 +217,8 @@ fn last_status_is_observable() {
     assert_eq!(output("true; echo $?"), "0");
     assert_eq!(output("false; echo $?"), "1");
     assert_eq!(
-        output("nope.missing; echo $?"),
-        "dekopon-shell: nope.missing: command not found\n127"
+        output("nosuchcmd; echo $?"),
+        "dekopon-shell: nosuchcmd: command not found\n127"
     );
 }
 
@@ -198,7 +242,7 @@ fn for_loops_iterate_over_words_and_arrays() {
     assert_eq!(output("for x in a b c; do echo $x; done"), "a\nb\nc");
     // An unquoted `$( )` producing a real JSON array expands element by element.
     assert_eq!(
-        output("for x in $(echo.echo --a 1 --b 2 --c 3 | jq '[.a,.b,.c]'); do echo $x; done"),
+        output("for x in $(probe object --a 1 --b 2 --c 3 | jq '[.a,.b,.c]'); do echo $x; done"),
         "1\n2\n3"
     );
 }
@@ -292,9 +336,12 @@ fn a_piped_value_survives_every_stage_and_every_statement_that_shares_it() {
         "first\npayload"
     );
     // Structure survives being handed from stage to stage rather than copied into each one.
-    assert_eq!(output(r#"echo.echo --a 1 --b two | jq '.b' | cat"#), "two");
     assert_eq!(
-        output(r#"g() { cat | jq '.a'; cat | jq '.b'; }; echo.echo --a 1 --b 2 | g"#),
+        output(r#"probe object --a 1 --b two | jq '.b' | cat"#),
+        "two"
+    );
+    assert_eq!(
+        output(r#"g() { cat | jq '.a'; cat | jq '.b'; }; probe object --a 1 --b 2 | g"#),
         "1\n2"
     );
     // A here-document still replaces whatever a pipe would have supplied.
@@ -355,9 +402,9 @@ fn quoted_all_positional_splits_one_word_per_parameter() {
 fn diagnostics_inside_a_substitution_still_reach_the_output() {
     // Only the *value* of `$( )` is captured. Swallowing its errors too left a script with an
     // empty variable, no explanation, and a `$?` it may never look at.
-    let outcome = run(r#"v=$(nosuchcmd.here); echo "v=[$v] status=$?""#);
+    let outcome = run(r#"v=$(nosuchcmd); echo "v=[$v] status=$?""#);
     assert!(
-        outcome.output.contains("nosuchcmd.here: command not found"),
+        outcome.output.contains("nosuchcmd: command not found"),
         "{}",
         outcome.output
     );
@@ -367,7 +414,7 @@ fn diagnostics_inside_a_substitution_still_reach_the_output() {
         outcome.output
     );
 
-    let outcome = run(r#"v=$(policy.denied); echo "[$v]""#);
+    let outcome = run(r#"v=$(probe denied); echo "[$v]""#);
     assert!(
         outcome
             .output
@@ -459,12 +506,12 @@ fn division_by_zero_is_recoverable_not_fatal() {
 fn command_substitution_preserves_structure_only_as_a_whole_rhs() {
     // Whole-RHS `$( )` keeps the structured value...
     assert_eq!(
-        output(r#"r=$(echo.echo --status 200); echo ${r[status]}"#),
+        output(r#"r=$(probe object --status 200); echo ${r[status]}"#),
         "200"
     );
     // ...while an interpolated `$( )` coerces to display form, exactly like bash.
     assert_eq!(
-        output(r#"r="x$(echo.echo --status 200)"; echo $r"#),
+        output(r#"r="x$(probe object --status 200)"; echo $r"#),
         r#"x{"status":200}"#
     );
 }
@@ -493,13 +540,16 @@ fn a_capture_honors_the_newline_a_command_suppressed() {
 
 #[test]
 fn indexing_is_backed_by_real_json() {
-    assert_eq!(output(r#"o=$(echo.echo --a 1 --b 2); echo ${o[b]}"#), "2");
     assert_eq!(
-        output(r#"a=$(echo.echo --x 10 | jq '[.x, 20]'); echo ${a[1]}"#),
+        output(r#"o=$(probe object --a 1 --b 2); echo ${o[b]}"#),
+        "2"
+    );
+    assert_eq!(
+        output(r#"a=$(probe object --x 10 | jq '[.x, 20]'); echo ${a[1]}"#),
         "20"
     );
     assert_eq!(
-        output(r#"a=$(echo.echo --x 10 | jq '[.x]'); echo "[${a[9]}]""#),
+        output(r#"a=$(probe object --x 10 | jq '[.x]'); echo "[${a[9]}]""#),
         "[]"
     );
 }
@@ -508,7 +558,7 @@ fn indexing_is_backed_by_real_json() {
 fn unquoted_arrays_expand_element_by_element() {
     // POSIX IFS splitting is dropped; a JSON array is what produces multiple argv words.
     assert_eq!(
-        output(r#"a=$(echo.echo --x x --y y | jq '[.x,.y]'); count() { echo $#; }; count $a"#),
+        output(r#"a=$(probe object --x x --y y | jq '[.x,.y]'); count() { echo $#; }; count $a"#),
         "2"
     );
     // A scalar containing spaces stays exactly one word.
@@ -520,10 +570,10 @@ fn unquoted_arrays_expand_element_by_element() {
 
 #[test]
 fn pipelines_deliver_structured_values() {
-    assert_eq!(output(r#"echo.echo --a 1 | jq .a"#), "1");
+    assert_eq!(output(r#"probe object --a 1 | jq .a"#), "1");
     assert_eq!(output("echo 'a\nb\na' | sort | uniq | wc -l"), "2");
     assert_eq!(
-        output("http-probe.fetch --uri x | jq -r .bodyText | grep alpha | wc -l"),
+        output("probe fetch | jq -r .bodyText | grep alpha | wc -l"),
         "2"
     );
 }
@@ -554,15 +604,22 @@ fn exit_sets_the_script_status_and_wraps_like_bash() {
 fn xargs_maps_a_command_over_a_list() {
     let fixture = Fixture::default();
     let outcome = Interpreter::new(Limits::default()).run(
-        r#"echo.echo --a a --b b | jq '[.a,.b]' | xargs cap echo.echo --name"#,
+        r#"probe object --a a --b b | jq '[.a,.b]' | xargs probe upper --text"#,
         &fixture,
     );
-    // One call builds the list, then `xargs` drives one call per element.
+    // One call builds the list, then `xargs` drives one provider command per element, each of
+    // which proposes its own capability call.
+    assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
     assert_eq!(outcome.capability_calls, 3);
-    let calls = fixture.calls.borrow();
-    assert_eq!(calls[1].1, json!({"name": "a"}));
-    assert_eq!(calls[2].1, json!({"name": "b"}));
-    assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
+    assert_eq!(
+        *fixture.calls.borrow(),
+        vec![
+            ("fixture.object".to_owned(), json!({"a": "a", "b": "b"})),
+            ("cli-probe.upper".to_owned(), json!({"text": "a"})),
+            ("cli-probe.upper".to_owned(), json!({"text": "b"})),
+        ]
+    );
+    assert_eq!(outcome.output, r#"[{"text":"A"},{"text":"B"}]"#);
 }
 
 // ---------------------------------------------------------------------------
@@ -570,30 +627,43 @@ fn xargs_maps_a_command_over_a_list() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_granted_capability_is_callable_as_a_bare_command() {
+fn a_capability_shaped_word_is_an_ordinary_unknown_command() {
+    // A capability is reached through the command word of the provider that owns it. A word
+    // shaped like a capability identifier is only a word — even one naming a capability this
+    // session holds — so it takes the shell's ordinary "command not found" path and runs nothing.
     let fixture = Fixture::default();
-    let outcome =
-        Interpreter::new(Limits::default()).run("echo.echo --post-id 7 --include-body", &fixture);
-    assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
-    assert_eq!(
-        fixture.calls.borrow()[0].1,
-        json!({"postId": 7, "includeBody": true})
+    let outcome = Interpreter::new(Limits::default()).run(
+        "wikipedia_page --title x; echo $?\ncli-probe.upper --text hi; echo $?",
+        &fixture,
     );
+    assert_eq!(
+        outcome.output,
+        "dekopon-shell: wikipedia_page: command not found\n127\n\
+         dekopon-shell: cli-probe.upper: command not found\n127"
+    );
+    assert!(
+        fixture.calls.borrow().is_empty(),
+        "a capability-shaped word invoked a capability"
+    );
+    assert_eq!(outcome.capability_calls, 0);
 }
 
 #[test]
 fn capability_outcomes_map_onto_their_documented_exit_codes() {
-    assert_eq!(code("echo.echo --a 1"), 0);
-    assert_eq!(code("provider.broken"), 1);
-    assert_eq!(code("policy.denied"), 126);
-    assert_eq!(code("not.granted"), 127);
+    assert_eq!(code("probe upper --text a"), 0);
+    assert_eq!(code("probe broken"), 1);
+    assert_eq!(code("probe denied"), 126);
+    assert_eq!(code("probe ungranted"), 127);
     assert_eq!(code("definitelynotacommand"), 127);
 }
 
 #[test]
 fn cap_lists_and_describes_capabilities() {
-    assert!(output("cap --list").contains("echo.echo"));
-    assert!(output("cap --describe echo.echo").contains("Echoes its input"));
+    assert!(output("cap --list").contains("cli-probe.upper"));
+    let described = output("cap --describe cli-probe.upper");
+    assert!(described.contains("Uppercases its text"), "{described}");
+    // Using a capability is its provider's `--help`, not a schema.
+    assert!(!described.contains("inputSchema"), "{described}");
 }
 
 #[test]
@@ -852,8 +922,8 @@ fn a_here_document_body_charges_the_value_byte_ceiling() {
 
 #[test]
 fn the_clock_is_not_a_command_this_shell_has() {
-    // There is no provider for "what time is it" and no capability to go through, so the word is
-    // simply not a command here — indistinguishable from any capability this session lacks.
+    // There is no provider for "what time is it" and no command word to go through, so the word is
+    // simply not a command here — indistinguishable from any other word nothing provides.
     let outcome = run("date");
     assert_eq!(outcome.exit_code, ExitCode::NOT_FOUND);
     assert!(
@@ -869,21 +939,21 @@ fn array_expansion_is_backed_by_real_json() {
     // array, which is what an unquoted `$NAME` holding one already spreads into.
     assert_eq!(
         output(
-            r#"arr=$(echo.echo --a x --b y | jq '[.a,.b]')
+            r#"arr=$(probe object --a x --b y | jq '[.a,.b]')
 for item in "${arr[@]}"; do echo "[$item]"; done"#
         ),
         "[x]\n[y]"
     );
     assert_eq!(
         output(
-            r#"arr=$(echo.echo --a x --b y | jq '[.a,.b]')
+            r#"arr=$(probe object --a x --b y | jq '[.a,.b]')
 echo "${arr[*]}""#
         ),
         "x y"
     );
     assert_eq!(
         output(
-            r#"arr=$(echo.echo --a x --b y | jq '[.a,.b]')
+            r#"arr=$(probe object --a x --b y | jq '[.a,.b]')
 echo ${#arr[@]}"#
         ),
         "2"
@@ -891,7 +961,7 @@ echo ${#arr[@]}"#
     // A quoted `"${NAME[@]}"` holding one element stays one word, spaces and all.
     assert_eq!(
         output(
-            r#"arr=$(echo.echo --a "one two" | jq '[.a]')
+            r#"arr=$(probe object --a "one two" | jq '[.a]')
 for item in "${arr[@]}"; do echo "[$item]"; done"#
         ),
         "[one two]"
@@ -907,16 +977,14 @@ fn while_read_walks_every_line_and_then_stops() {
     // The idiom this exists for. `read` consumes through the enclosing stage's cursor, so each
     // iteration sees the next line and end of input is what ends the loop.
     assert_eq!(
-        output(
-            r#"http-probe.fetch --uri x | jq -r .bodyText | while read line; do echo "[$line]"; done"#
-        ),
+        output(r#"probe fetch | jq -r .bodyText | while read line; do echo "[$line]"; done"#),
         "[alpha]\n[beta]\n[alpha]"
     );
     // And the loop keeps what it assigned, because nothing forked.
     assert_eq!(
         output(
             r#"count=0
-http-probe.fetch --uri x | jq -r .bodyText | while read line; do count=$(( count + 1 )); done
+probe fetch | jq -r .bodyText | while read line; do count=$(( count + 1 )); done
 echo $count"#
         ),
         "3"
@@ -977,16 +1045,16 @@ fn read_refuses_what_it_does_not_implement() {
 
 #[test]
 fn errexit_ends_the_script_at_the_first_untested_failure() {
-    let outcome = run("set -e\necho before\nnosuchcmd.here\necho after");
+    let outcome = run("set -e\necho before\nnosuchcmd\necho after");
     assert_eq!(outcome.exit_code.get(), 127);
     assert!(outcome.output.contains("before"), "{outcome:?}");
     assert!(!outcome.output.contains("after"), "{outcome:?}");
     assert!(outcome.output.contains("`set -e` is on"), "{outcome:?}");
 
     // Off by default, and `set +e` turns it back off.
-    assert!(output("nosuchcmd.here\necho after").contains("after"));
+    assert!(output("nosuchcmd\necho after").contains("after"));
     assert!(
-        output("set -e\nset +e\nnosuchcmd.here\necho after").contains("after"),
+        output("set -e\nset +e\nnosuchcmd\necho after").contains("after"),
         "`set +e` must restore the default"
     );
 }
@@ -996,10 +1064,10 @@ fn errexit_leaves_a_tested_status_alone() {
     // Bash's three exemptions, each one a position where the script is already asking whether the
     // command failed. Tripping there would break the very idiom used to handle failure.
     for script in [
-        "set -e\nif nosuchcmd.here; then echo yes; else echo handled; fi\necho after",
-        "set -e\nnosuchcmd.here || echo handled\necho after",
+        "set -e\nif nosuchcmd; then echo yes; else echo handled; fi\necho after",
+        "set -e\nnosuchcmd || echo handled\necho after",
         // `if a && b` nests two exemptions.
-        "set -e\nif true && nosuchcmd.here; then echo handled; else echo handled; fi\necho after",
+        "set -e\nif true && nosuchcmd; then echo handled; else echo handled; fi\necho after",
     ] {
         let outcome = run(script);
         assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{script}");
@@ -1014,13 +1082,13 @@ fn errexit_leaves_a_tested_status_alone() {
             outcome.output
         );
     }
-    assert_eq!(code("set -e\n! nosuchcmd.here\necho after"), 0);
+    assert_eq!(code("set -e\n! nosuchcmd\necho after"), 0);
     assert_eq!(
-        code("set -e\nwhile nosuchcmd.here; do echo body; done\necho after"),
+        code("set -e\nwhile nosuchcmd; do echo body; done\necho after"),
         0
     );
     // The final operand of a chain is *not* exempt: nothing is asking about it.
-    let outcome = run("set -e\ntrue && nosuchcmd.here\necho after");
+    let outcome = run("set -e\ntrue && nosuchcmd\necho after");
     assert_eq!(outcome.exit_code.get(), 127);
     assert!(!outcome.output.contains("after"), "{outcome:?}");
 }
@@ -1043,20 +1111,20 @@ fn nounset_refuses_a_name_nothing_ever_set() {
 
 #[test]
 fn pipefail_reports_the_rightmost_stage_that_failed() {
-    // Without it, a capability that never ran hides behind a `jq` that was handed nothing and
+    // Without it, a command that never ran hides behind a `jq` that was handed nothing and
     // succeeded anyway — the exact shape a model writes and then misreads.
-    assert_eq!(code("nosuchcmd.here | jq ."), 0);
-    assert_eq!(code("set -o pipefail\nnosuchcmd.here | jq ."), 127);
+    assert_eq!(code("nosuchcmd | jq ."), 0);
+    assert_eq!(code("set -o pipefail\nnosuchcmd | jq ."), 127);
     assert_eq!(code("set -o pipefail\necho hi | jq ."), 0);
     assert_eq!(
-        code("set -o pipefail\nset +o pipefail\nnosuchcmd.here | jq ."),
+        code("set -o pipefail\nset +o pipefail\nnosuchcmd | jq ."),
         0
     );
 }
 
 #[test]
 fn pipestatus_reports_every_stage() {
-    assert!(output("nosuchcmd.here | jq .\necho ${PIPESTATUS[@]}").ends_with("127 0"));
+    assert!(output("nosuchcmd | jq .\necho ${PIPESTATUS[@]}").ends_with("127 0"));
     assert_eq!(output("echo hi\necho ${PIPESTATUS[0]}"), "hi\n0");
     assert_eq!(
         output("echo a | jq . | wc -l\necho ${#PIPESTATUS[@]}"),
@@ -1083,7 +1151,7 @@ fn set_refuses_every_option_it_does_not_enforce() {
         );
     }
     // The long spellings of the three that are real do work.
-    assert_eq!(code("set -o errexit\nnosuchcmd.here"), 127);
+    assert_eq!(code("set -o errexit\nnosuchcmd"), 127);
     assert_eq!(code("set -o nounset\necho $missing"), 1);
 }
 
@@ -1139,7 +1207,7 @@ fn an_unquoted_expansion_inside_double_brackets_is_one_word() {
     // still one operand here.
     assert_eq!(
         output(
-            r#"v=$(echo.echo --a "one two" | jq '[.a]')
+            r#"v=$(probe object --a "one two" | jq '[.a]')
 [[ -n $v ]] && echo held"#
         ),
         "held"
@@ -1194,16 +1262,20 @@ fn a_compound_command_can_be_a_pipeline_stage() {
     // The shape this whole change exists for. `cat` inside the loop body reads the value piped
     // into the loop, which is the same rule a function body already followed.
     assert_eq!(
-        output(r#"echo.echo --a 1 | while [ -n "$(cat | jq -r .a)" ]; do echo saw; break; done"#),
+        output(
+            r#"probe object --a 1 | while [ -n "$(cat | jq -r .a)" ]; do echo saw; break; done"#
+        ),
         "saw"
     );
     assert_eq!(
-        output("echo.echo --a 1 | if [ $(cat | jq -r .a) -eq 1 ]; then echo yes; else echo no; fi"),
+        output(
+            "probe object --a 1 | if [ $(cat | jq -r .a) -eq 1 ]; then echo yes; else echo no; fi"
+        ),
         "yes"
     );
     assert_eq!(
         output(
-            "echo.echo --a 1 --b 2 | case $(cat | jq -r .a) in 1) echo one ;; *) echo other ;; esac"
+            "probe object --a 1 --b 2 | case $(cat | jq -r .a) in 1) echo one ;; *) echo other ;; esac"
         ),
         "one"
     );
@@ -1217,7 +1289,7 @@ fn a_piped_compound_stage_keeps_the_variables_it_assigns() {
     assert_eq!(
         output(
             r#"total=0
-echo.echo --a 7 | while [ $total -eq 0 ]; do total=$(cat | jq -r .a); done
+probe object --a 7 | while [ $total -eq 0 ]; do total=$(cat | jq -r .a); done
 echo $total"#
         ),
         "7"
@@ -1236,7 +1308,7 @@ fn a_compound_stage_feeding_a_pipe_collects_everything_it_emitted() {
 #[test]
 fn a_brace_group_runs_in_the_current_scope_and_is_one_branch() {
     // The idiom braces exist for.
-    let outcome = run("nosuchcmd.here || { echo handled; exit 3; }\necho unreachable");
+    let outcome = run("nosuchcmd || { echo handled; exit 3; }\necho unreachable");
     assert_eq!(outcome.exit_code.get(), 3);
     assert!(outcome.output.contains("handled"), "{outcome:?}");
     assert!(!outcome.output.contains("unreachable"), "{outcome:?}");
@@ -1255,7 +1327,7 @@ fn an_empty_or_unterminated_group_is_a_parse_error_naming_itself() {
 
 #[test]
 fn a_compound_stage_carries_its_own_redirections() {
-    let outcome = run("{ nosuchcmd.one; nosuchcmd.two; } 2> log\necho ---\ncat log | wc -l");
+    let outcome = run("{ nosuchone; nosuchtwo; } 2> log\necho ---\ncat log | wc -l");
     let (before, after) = outcome.output.split_once("---").expect("the marker");
     assert!(!before.contains("command not found"), "{before:?}");
     assert_eq!(after.trim(), "2");
@@ -1280,7 +1352,7 @@ fn default_and_alternate_expansions_follow_bash_including_the_colon() {
     // A default may itself be an expansion, and a bare substitution keeps its structure.
     assert_eq!(output("y=inner\necho ${x:-$y}"), "inner");
     assert_eq!(
-        output("v=${x:-$(echo.echo --a 1)}\necho ${v[a]}"),
+        output("v=${x:-$(probe object --a 1)}\necho ${v[a]}"),
         "1",
         "a bare substitution default keeps its structure"
     );
@@ -1291,12 +1363,12 @@ fn a_whole_right_hand_side_expansion_keeps_the_value_it_names() {
     // `copy=$obj` has to keep the object, or the very indexing this value model exists for stops
     // surviving one assignment.
     assert_eq!(
-        output("obj=$(echo.echo --a 1)\ncopy=$obj\necho ${copy[a]}"),
+        output("obj=$(probe object --a 1)\ncopy=$obj\necho ${copy[a]}"),
         "1"
     );
     // Glued to anything else it is text again, as it must be.
     assert_eq!(
-        output("obj=$(echo.echo --a 1)\njoined=x$obj\necho $joined"),
+        output("obj=$(probe object --a 1)\njoined=x$obj\necho $joined"),
         r#"x{"a":1}"#
     );
 }
@@ -1307,7 +1379,7 @@ fn assign_expansion_binds_the_name_it_substituted_for() {
     assert_eq!(output("x=kept\necho ${x:=other}\necho $x"), "kept\nkept");
     // Assigning *through* an index has nowhere to write, so it says so rather than dropping the
     // write on the floor.
-    let outcome = run("obj=$(echo.echo --a 1)\necho ${obj[b]:=x}");
+    let outcome = run("obj=$(probe object --a 1)\necho ${obj[b]:=x}");
     assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
     assert!(outcome.output.contains("cannot assign through an index"));
 }
@@ -1339,7 +1411,7 @@ fn length_counts_what_the_value_actually_is() {
     assert_eq!(output("echo ${#missing}"), "0");
     // Real JSON, so an array counts elements and an object counts keys — a string's character
     // count would be an answer about its JSON text rather than about the value.
-    assert_eq!(output("obj=$(echo.echo --a 1 --b 2)\necho ${#obj}"), "2");
+    assert_eq!(output("obj=$(probe object --a 1 --b 2)\necho ${#obj}"), "2");
     // Characters, not bytes.
     assert_eq!(output("x=héllo\necho ${#x}"), "5");
 }
@@ -1395,16 +1467,16 @@ fn nested_parameter_expansions_have_a_ceiling_rather_than_a_stack_overflow() {
 fn a_redirected_stderr_leaves_the_combined_output() {
     // The diagnostic is real — the exit code proves the command failed — but the script asked for
     // it to go somewhere else, and it went there.
-    let outcome = run("nosuchcmd.here 2>/dev/null\necho done");
+    let outcome = run("nosuchcmd 2>/dev/null\necho done");
     assert_eq!(outcome.output, "done");
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
 
-    assert_eq!(code("nosuchcmd.here 2>/dev/null"), 127);
+    assert_eq!(code("nosuchcmd 2>/dev/null"), 127);
 }
 
 #[test]
 fn stderr_redirects_into_a_named_buffer_that_cat_reads_back() {
-    let outcome = run("nosuchcmd.here 2> log\necho ---\ncat log");
+    let outcome = run("nosuchcmd 2> log\necho ---\ncat log");
     assert!(!outcome.output.starts_with("dekopon-shell:"), "{outcome:?}");
     let (before, after) = outcome.output.split_once("---").expect("the marker");
     assert!(!before.contains("command not found"), "{before:?}");
@@ -1424,7 +1496,7 @@ echo "[$x]""#);
 #[test]
 fn two_to_one_merges_diagnostics_into_the_value_a_substitution_captures() {
     // The idiom this exists for: capture *why* something failed, not just that it did.
-    let outcome = run(r#"x=$(nosuchcmd.here 2>&1)
+    let outcome = run(r#"x=$(nosuchcmd 2>&1)
 echo "[$x]""#);
     assert!(outcome.output.contains("command not found]"), "{outcome:?}");
 }
@@ -1435,15 +1507,15 @@ fn two_to_one_leaves_a_quiet_command_s_value_and_its_type_alone() {
     // must not be flattened into its own JSON text just because `2>&1` was written.
     assert_eq!(output("echo hi 2>&1"), "hi");
     assert_eq!(
-        output("echo.echo --a 1 2>&1 | jq -r .a"),
+        output("probe object --a 1 2>&1 | jq -r .a"),
         "1",
-        "a quiet capability keeps its object"
+        "a quiet provider command keeps its object"
     );
 }
 
 #[test]
 fn both_streams_can_land_in_one_buffer() {
-    let outcome = run("nosuchcmd.here > out 2>&1\ncat out");
+    let outcome = run("nosuchcmd > out 2>&1\ncat out");
     assert!(outcome.output.contains("command not found"), "{outcome:?}");
 
     let outcome = run("echo hi &> all\ncat all");
@@ -1461,7 +1533,7 @@ fn dev_null_discards_on_write_and_reads_empty() {
 #[test]
 fn a_redirection_covers_the_whole_body_of_the_function_it_is_written_on() {
     let outcome = run(
-        "noisy() { nosuchcmd.one; nosuchcmd.two; echo value; }\nnoisy 2> log\necho ---\ncat log | wc -l",
+        "noisy() { nosuchone; nosuchtwo; echo value; }\nnoisy 2> log\necho ---\ncat log | wc -l",
     );
     let (before, after) = outcome.output.split_once("---").expect("the marker");
     assert!(!before.contains("command not found"), "{before:?}");
@@ -1486,7 +1558,7 @@ fn a_fatal_diagnostic_is_never_swallowed_by_a_redirection() {
 fn a_redirection_target_still_has_to_be_one_word() {
     // An unquoted expansion holding a JSON array is what produces several words here; there is no
     // IFS to split a string on.
-    let outcome = run("x=$(echo.echo --a one --b two | jq '[.a,.b]')\necho hi > $x");
+    let outcome = run("x=$(probe object --a one --b two | jq '[.a,.b]')\necho hi > $x");
     assert_ne!(outcome.exit_code, ExitCode::SUCCESS);
     assert!(
         outcome.output.contains("exactly one buffer name"),
@@ -1598,7 +1670,7 @@ fn the_recursion_cap_stops_runaway_shell_functions() {
 #[test]
 fn the_capability_call_cap_is_independent_of_the_step_budget() {
     let outcome = run_with(
-        "for i in 1 2 3 4 5; do echo.echo --i $i; done",
+        "for i in 1 2 3 4 5; do probe upper --text $i; done",
         Limits {
             max_capability_calls: 2,
             ..Limits::default()
@@ -1700,6 +1772,19 @@ fn the_deadline_bounds_slow_capability_calls_not_only_long_scripts() {
             vec!["slow.call".to_owned()]
         }
 
+        fn has_command_word(&self, word: &str) -> bool {
+            word == "slow"
+        }
+
+        fn run_command(
+            &self,
+            word: &str,
+            _argv: &[String],
+            _stdin: Option<&str>,
+        ) -> Option<CommandRun> {
+            (word == "slow").then(|| proposal("slow.call", json!({})))
+        }
+
         fn invoke(
             &self,
             _capability: &str,
@@ -1711,10 +1796,10 @@ fn the_deadline_bounds_slow_capability_calls_not_only_long_scripts() {
         }
     }
 
-    // Three steps per capability line times the 32-call default budget is 96 steps, so a clock
-    // sampled every 128th step was structurally unreachable for the workload that most needs it:
-    // a straight-line script of slow calls used to overrun its deadline and report success.
-    let script = "slow.call --i 1\n".repeat(32);
+    // A few steps per command line times the 32-call default budget stays under 128 steps, so a
+    // clock sampled every 128th step was structurally unreachable for the workload that most needs
+    // it: a straight-line script of slow calls used to overrun its deadline and report success.
+    let script = "slow call\n".repeat(32);
     let outcome = Interpreter::new(Limits {
         timeout: Duration::from_millis(60),
         ..Limits::default()
@@ -1824,18 +1909,18 @@ fn a_provider_command_usage_error_is_a_diagnostic_with_exit_2() {
 fn a_provider_command_reads_piped_text_verbatim_and_values_as_json() {
     let fixture = Fixture::default();
     let outcome = Interpreter::new(Limits::default()).run(
-        "echo hello | probe upper -\necho.echo --a 1 | probe upper -\nprobe upper --text flag",
+        "echo hello | probe upper -\nprobe object --a 1 | probe upper -\nprobe upper --text flag",
         &fixture,
     );
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
     assert_eq!(
         *fixture.calls.borrow(),
         vec![
-            ("echo.echo".to_owned(), json!({"text": "hello"})),
+            ("cli-probe.upper".to_owned(), json!({"text": "hello"})),
             // The producer of the object, then the object as the provider saw it: compact JSON.
-            ("echo.echo".to_owned(), json!({"a": 1})),
-            ("echo.echo".to_owned(), json!({"text": "{\"a\":1}"})),
-            ("echo.echo".to_owned(), json!({"text": "flag"})),
+            ("fixture.object".to_owned(), json!({"a": 1})),
+            ("cli-probe.upper".to_owned(), json!({"text": "{\"a\":1}"})),
+            ("cli-probe.upper".to_owned(), json!({"text": "flag"})),
         ]
     );
     assert_eq!(outcome.capability_calls, 4);
@@ -1897,7 +1982,7 @@ fn a_rendered_page_charges_no_capability_call() {
         },
     );
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
-    assert_eq!(outcome.output, "{\"text\":\"once\"}\n0");
+    assert_eq!(outcome.output, "{\"text\":\"ONCE\"}\n0");
     assert_eq!(outcome.capability_calls, 1);
 }
 
@@ -1967,7 +2052,7 @@ results=''
 for group in 1 2 3; do
   inner=0
   while [ $inner -lt 3 ]; do
-    r=$(echo.echo --group $group --inner $inner)
+    r=$(probe object --group $group --inner $inner)
     echo ${r[group]}-${r[inner]}
     inner=$(( inner + 1 ))
   done
@@ -1981,8 +2066,9 @@ cap --list | jq length";
     assert!(outcome.output.contains("1-0"), "{}", outcome.output);
     assert!(outcome.output.contains("3-2"), "{}", outcome.output);
     assert!(outcome.output.contains("10"), "{}", outcome.output);
+    // The fixture grants five capabilities.
     assert!(
-        outcome.output.trim_end().ends_with('4'),
+        outcome.output.trim_end().ends_with('5'),
         "{}",
         outcome.output
     );
