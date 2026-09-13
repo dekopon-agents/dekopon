@@ -34,9 +34,10 @@ A component that exports only `describe` and `invoke`, including every one built
 `dekopon:provider@0.1.0`, is unaffected: that world is unchanged and those components keep loading.
 
 Released provider versions that already satisfy this, at the time of writing: `gh` 0.3.0, `curl`
-0.2.0, `turso-sql` 0.2.0, `memory-chat` 0.2.0, `mediawiki` 0.2.0, `gpt-image` 0.1.0, and
-`openobserve` 0.1.0. Any other out-of-tree provider must be rebuilt and re-released before this
-upgrade.
+0.2.0, `turso-sql` 0.2.0, `memory-chat` 0.2.0, `mediawiki` 0.2.0, `echo` 0.2.0, `jsonplaceholder`
+0.2.0, `gpt-image` 0.1.0, and `openobserve` 0.1.0. Any other out-of-tree provider must be rebuilt
+and re-released before this upgrade — `python`, `ripgrep`, and `skylight-private` are still
+published on a pre-0.13 SDK and will not load.
 
 Embedders lose the machinery with it:
 
