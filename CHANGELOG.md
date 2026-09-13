@@ -7,6 +7,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-13
+
 ### Added
 
 - One vocabulary for everything a waiting person is shown while a session runs, mapped down to each
@@ -198,7 +200,7 @@ All notable changes to Dekopon are documented here. The format is based on
 - **Breaking.** Deleted every pre-0.13 provider compatibility path. A provider component must now
   be built on `dekopon-provider-sdk` 0.13.0 or later, and the whole fleet must be rebuilt and
   re-pinned before the broker is upgraded; see
-  [`docs/upgrading.md`](docs/upgrading.md#rebuild-every-provider-component-on-the-0130-sdk-0140-unreleased).
+  [`docs/upgrading.md`](docs/upgrading.md#rebuild-every-provider-component-on-the-0130-sdk-0140).
 
   - A manifest carrying the retired `idempotency` field is refused at `describe`. 0.13.0 read and
     dropped the field for one release; `deny_unknown_fields` is back on `ProviderCapability`, so
@@ -265,6 +267,20 @@ All notable changes to Dekopon are documented here. The format is based on
   rest of the acknowledged poll batch.
 - A WhatsApp delivery is answered only when one of its own `contacts` is the message's sender, and
   each dropped message records its own reason instead of overwriting the delivery's shared trace.
+
+## [dekopon-chart-0.7.0] - 2026-09-13
+
+### Changed
+
+- `values-pr-summarizer-linter.yaml` is written in 0.14.0's configuration vocabulary: the Slack
+  transport's `activity:` block is `liveness:` carrying `progress: message`, the route matches
+  `conversation: { kind: [directMessage] }` rather than `match:`, its memory window is `memory:`
+  rather than `conversation:`, and the broker's chat-scope grant names
+  `conversation: { kind: any }` rather than `breadth: transportWide`. The chart ships that file and
+  both daemons refuse to start on the old spelling, so the 0.6.0 archive's copy rendered against a
+  0.14.0 image is a pod that never becomes ready. The templates are unchanged — they pass values
+  through — so a deployment with its own values file migrates on its own schedule, which
+  [`docs/upgrading.md`](docs/upgrading.md) describes.
 
 ## [dekopon-chart-0.6.0] - 2026-09-12
 

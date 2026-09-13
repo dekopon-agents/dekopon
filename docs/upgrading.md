@@ -8,7 +8,7 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
-## `activity:` becomes `liveness:` (0.14.0, unreleased)
+## `activity:` becomes `liveness:` (0.14.0)
 
 Rename the `activity:` block on every transport in the gateway configuration to `liveness:` before
 upgrading. No transport has such a field any more, so a file that still carries one never decodes:
@@ -55,7 +55,7 @@ through the new `stream:` field on an `openaiCompatible` model (default `true`);
 `chatgptSubscription` backend has always streamed and has no such field. An embedder that called
 `dekopon_agent`'s loop directly compiles against the new signature or pins 0.13.
 
-## Conversations replace route matches and chat-scope breadths; `memory:` replaces the route's `conversation:` (0.14.0, unreleased)
+## Conversations replace route matches and chat-scope breadths; `memory:` replaces the route's `conversation:` (0.14.0)
 
 Every route's `match:` becomes `conversation:`, and `kind` is a list or the word `any`.
 `{ kind: directMessage }` becomes `conversation: { kind: [directMessage] }`; `{ kind: channel, channel: X }`
@@ -80,7 +80,7 @@ capability nobody has. Durable chat-memory
 namespaces on WhatsApp, Telegram topics, and Discord threads change shape and start empty;
 Slack and Discord channels keep theirs. Restart the broker first, then the gateway.
 
-## Reinstall both Slack apps (0.14.0, unreleased)
+## Reinstall both Slack apps (0.14.0)
 
 Both manifests under [`../examples/slack/`](../examples/slack/README.md) gain `channels:read`,
 `groups:read`, `im:read`, and `mpim:read`, and the classic manifest enables interactivity. A scope
@@ -90,7 +90,7 @@ carries no `channel_type` — and every mention is dropped with
 `drop.reason = conversation-unresolved`; without interactivity a classic cancel button renders and
 the press reaches nothing. No gateway configuration changes.
 
-## Rebuild every provider component on the 0.13.0 SDK (0.14.0, unreleased)
+## Rebuild every provider component on the 0.13.0 SDK (0.14.0)
 
 **Breaking.** Every pre-0.13 provider compatibility path is gone. Re-pin every provider artifact
 your broker loads to a build on `dekopon-provider-sdk` 0.13.0 or later — and rebuild and re-release
@@ -191,7 +191,7 @@ unchanged and still matched byte for byte against the provider manifest.
 
 A provider **component** was the one exception, for one release only: `dekopon-provider-sdk`
 0.13.0 accepted and dropped an `idempotency` field in the manifest a component returns from
-`describe`. [0.14.0 removed that tolerance](#rebuild-every-provider-component-on-the-0130-sdk-0140-unreleased)
+`describe`. [0.14.0 removed that tolerance](#rebuild-every-provider-component-on-the-0130-sdk-0140)
 and a component still emitting the field is now refused at `describe`. A provider's Rust source
 changed here too: `ProviderCapability` no longer has the field, and
 `dekopon_provider_sdk::Idempotency` no longer exists.
