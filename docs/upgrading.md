@@ -8,7 +8,7 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
-## Rebuild every provider component on the 0.13.0 SDK (0.14.0)
+## Rebuild every provider component on the 0.13.0 SDK (0.14.0, unreleased)
 
 **Breaking.** Every pre-0.13 provider compatibility path is gone. Rebuild and re-release every
 out-of-tree provider component on `dekopon-provider-sdk` 0.13.0 or later, then re-pin the artifacts
@@ -108,7 +108,7 @@ unchanged and still matched byte for byte against the provider manifest.
 
 A provider **component** was the one exception, for one release only: `dekopon-provider-sdk`
 0.13.0 accepted and dropped an `idempotency` field in the manifest a component returns from
-`describe`. [0.14.0 removed that tolerance](#rebuild-every-provider-component-on-the-0130-sdk-0140)
+`describe`. [0.14.0 removed that tolerance](#rebuild-every-provider-component-on-the-0130-sdk-0140-unreleased)
 and a component still emitting the field is now refused at `describe`. A provider's Rust source
 changed here too: `ProviderCapability` no longer has the field, and
 `dekopon_provider_sdk::Idempotency` no longer exists.

@@ -31,7 +31,7 @@ All notable changes to Dekopon are documented here. The format is based on
 - **Breaking.** Deleted every pre-0.13 provider compatibility path. A provider component must now
   be built on `dekopon-provider-sdk` 0.13.0 or later, and the whole fleet must be rebuilt and
   re-pinned before the broker is upgraded; see
-  [`docs/upgrading.md`](docs/upgrading.md#rebuild-every-provider-component-on-the-0130-sdk-0140).
+  [`docs/upgrading.md`](docs/upgrading.md#rebuild-every-provider-component-on-the-0130-sdk-0140-unreleased).
 
   - A manifest carrying the retired `idempotency` field is refused at `describe`. 0.13.0 read and
     dropped the field for one release; `deny_unknown_fields` is back on `ProviderCapability`, so
