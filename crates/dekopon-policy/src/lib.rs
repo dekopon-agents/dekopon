@@ -53,21 +53,21 @@
 //! let world = PolicyWorld::new(
 //!     ["cpetersen".parse::<PrincipalId>()?],
 //!     [(
-//!         "echo.echo".parse::<CapabilityId>()?,
-//!         "echo".parse::<ProviderId>()?,
+//!         "cli-probe.upper".parse::<CapabilityId>()?,
+//!         "cli-probe".parse::<ProviderId>()?,
 //!     )],
 //! )?;
 //! let engine = PolicyEngine::new(
 //!     r#"permit(principal == Dekopon::Principal::"cpetersen",
-//!               action == Dekopon::Action::"echo.echo",
-//!               resource == Dekopon::Provider::"echo");"#,
+//!               action == Dekopon::Action::"cli-probe.upper",
+//!               resource == Dekopon::Provider::"cli-probe");"#,
 //!     &world,
 //! )?;
 //! let decision = engine.authorize(PolicyRequest {
 //!     principal: "cpetersen".parse()?,
 //!     target: PolicyTarget::Capability {
-//!         capability: "echo.echo".parse()?,
-//!         provider: "echo".parse()?,
+//!         capability: "cli-probe.upper".parse()?,
+//!         provider: "cli-probe".parse()?,
 //!         effect: EffectKind::ReadOnly,
 //!         risk: RiskLevel::Low,
 //!     },

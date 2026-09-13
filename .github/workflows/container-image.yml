@@ -242,7 +242,7 @@ jobs:
           docker run --rm dekopon-proof:amd64 dekopond --help
           docker run --rm dekopon-proof:amd64 dekopon-brokerd --version
           docker run --rm dekopon-proof:amd64 dekopond --version
-          # Exercise real broker loading/startup of the baked echo component. This proves
+          # Exercise real broker loading/startup of the baked cli-probe component. This proves
           # released image bytes, not a native build of the PR's source HEAD.
           "$RUNNER_TEMP/verify-image-broker.sh" dekopon-proof:amd64
           bytes=$(docker image inspect dekopon-proof:amd64 --format '{{.Size}}')

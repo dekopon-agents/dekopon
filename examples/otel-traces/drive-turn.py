@@ -18,7 +18,7 @@ import time
 
 PAYLOAD = "DEKOPON_OTEL_SMOKE_INPUT_MUST_APPEAR"
 CREDENTIAL = "DEKOPON_OTEL_SMOKE_CREDENTIAL_MUST_NOT_APPEAR"
-ANSWER = "The authorized echo completed."
+ANSWER = "The authorized probe completed."
 
 
 def main():
@@ -47,13 +47,13 @@ def main():
                     assert any(m.get("role") == "user" and PAYLOAD in m.get("content", "")
                                for m in request["messages"]), "missing local request"
                     message = {"role": "assistant", "content": None, "tool_calls": [{
-                        "id": "echo-call", "type": "function", "function": {
+                        "id": "probe-call", "type": "function", "function": {
                             "name": "bash", "arguments": json.dumps({
-                                "script": f"echo.echo --message {PAYLOAD} | jq -r .message"})}}]}
+                                "script": f'probe upper --text "{PAYLOAD}" | jq -r .text'})}}]}
                 else:
                     assert len(calls) == 2, "extra model call"
                     assert any(m.get("role") == "tool" and PAYLOAD in m.get("content", "")
-                               for m in request["messages"]), "real echo output missing"
+                               for m in request["messages"]), "real probe output missing"
                     message = {"role": "assistant", "content": ANSWER, "tool_calls": []}
                 body = json.dumps({"choices": [{"message": message}]}).encode()
                 self.send_response(200)
@@ -127,7 +127,7 @@ def main():
  action == Dekopon::Action::"agent.prompt", resource == Dekopon::Agent::"chat-agent")
  when { context has via && context.via == "dekopond-gateway" };
 permit(principal == Dekopon::Principal::"smoke-user",
- action == Dekopon::Action::"echo.echo", resource == Dekopon::Provider::"echo")
+ action == Dekopon::Action::"cli-probe.upper", resource == Dekopon::Provider::"cli-probe")
  when { context has via && context.via == "dekopond-gateway"
  && context has agent && context.agent == "chat-agent" };
 '''
@@ -136,7 +136,7 @@ permit(principal == Dekopon::Principal::"smoke-user",
             "socketPath": str(directory / "broker.sock"),
             "brokerPrincipal": "broker-smoke", "policyRevision": "policy-smoke",
             "policiesPath": write("policies.cedar", policy),
-            "providers": [str(root / "examples/providers/echo-provider.wasm")],
+            "providers": [str(root / "examples/providers/cli-probe-provider.wasm")],
             "identities": [{"uid": os.geteuid(), "principal": "dekopond-gateway",
                 "actor": {"type": "service", "principal": "dekopond-gateway"},
                 "attestor": {"namespaces": ["tel"], "chatScopes": [{
@@ -144,7 +144,7 @@ permit(principal == Dekopon::Principal::"smoke-user",
                     "conversation": {"kind": "any", "ids": ["dev"]},
                     "localSubjectService": "tel"}]}}],
             "identityMappings": [{"subject": "tel.16034700182", "principal": "smoke-user"}],
-            "constraintSets": {"echo.echo": {"provider": "echo", "effect": "read-only",
+            "constraintSets": {"cli-probe.upper": {"provider": "cli-probe", "effect": "read-only",
                 "risk": "Low",
                 "constraints": {"timeoutMs": 30000, "maxOutputBytes": 1048576}}},
             "telemetry": telemetry})
@@ -152,7 +152,7 @@ permit(principal == Dekopon::Principal::"smoke-user",
         ready("broker.sock", broker)
         catalog = write("catalog.json", {"apiVersion": "dekopon.dev/v1alpha1", "kind": "Agent",
             "metadata": {"name": "chat-agent"}, "spec": {"description": "Smoke agent",
-                "enabled": True, "instructions": "Use the authorized echo.", "modelClass": "reasoning"}})
+                "enabled": True, "instructions": "Use the authorized probe.", "modelClass": "reasoning"}})
         gateway_config = write("gateway.json", {
             "apiVersion": "dekopon.dev/dekopond/v1alpha1", "catalogPath": catalog,
             "broker": {"socketPath": str(directory / "broker.sock"), "serverUid": os.geteuid()},
@@ -183,10 +183,10 @@ permit(principal == Dekopon::Principal::"smoke-user",
         stop(broker)
         # The audit record is the broker's own stdout JSON line, whatever the exporter did with it.
         records = [json.loads(line) for line in (directory / "dekopon-brokerd.log").read_text().splitlines()]
-        assert any(r.get("audit.event") == "broker.execution" and r.get("capability.id") == "echo.echo"
+        assert any(r.get("audit.event") == "broker.execution" and r.get("capability.id") == "cli-probe.upper"
                    and r.get("outcome") == "Succeeded" and r.get("principal") == "smoke-user"
-                   for r in records), "authorized echo execution missing from broker audit"
-        print("Real broker + gateway: private local turn, two model calls, authorized echo audit verified")
+                   for r in records), "authorized probe execution missing from broker audit"
+        print("Real broker + gateway: private local turn, two model calls, authorized probe audit verified")
     finally:
         signal.alarm(0)
         for process in reversed(processes):

@@ -7,7 +7,6 @@ updates:
       - /examples/providers/clock-probe
       - /examples/providers/http-probe
       - /examples/providers/memory-reservation-probe
-      - /examples/providers/provider-v0-1-compat
       - /examples/providers/storage-probe
     groups:
       component-stack:
