@@ -237,9 +237,9 @@ resolution receive a disabled sticky context.
 Chat storage needs more than the existing subject attestation. New operations carry an
 invocation-bound transport and conversation claim; the owner must grant both the subject namespace
 and a `chatScopes` entry whose `conversation:` selector names the kinds, container, and ids it
-covers — the same selector a gateway route is written with, with no breadth words. A selector names
-a parent conversation and never one thread, so the kind list is what decides whether the threads
-under a claimed channel come with it. The canonical conversation also enters Cedar context, as the
+covers — the same selector a gateway route is written with. A selector names a parent conversation
+and never one thread, so the kind list is what decides whether the threads under a claimed channel
+come with it. The canonical conversation also enters Cedar context, as the
 record `context.conversation.{kind, container, id, thread}`; `container` and `thread` are optional
 there, so a policy reading either without a `has` guard fails strict validation at load, while a
 0.13 statement still guarding the retired `context.channel` loads and quietly stops matching

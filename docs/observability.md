@@ -296,14 +296,23 @@ answer joins. Service identifiers only, on both spans and on the `gateway_messag
 and never a byte of the message. A receipt the transport drops records none of them.
 
 `drop.reason` is the other half of that question: a receipt the transport declines to route records
-one low-cardinality word for why — `self-authored`, `bot-authored`, `content-withheld`, `duplicate`,
-`conversation-mismatch`, `malformed-envelope`, `conversation-unresolved` (a Discord guild channel
-whose one bounded `GET /channels/{id}` did not answer, so the message cannot be placed and is never
-guessed at), `broadcast-channel` (a Telegram broadcast, where nobody can reply) and
-`group-unsupported` (a WhatsApp group payload) among them — and a receipt that routes normally
-leaves it unset. It is declared once,
+one low-cardinality word for why, and a receipt that routes normally leaves it unset. The complete
+set is `self-authored`, `bot-authored`, `content-withheld`, `duplicate`, `conversation-mismatch`,
+`malformed-envelope` (which also covers a Telegram update whose forum-topic id is not a positive
+integer: that one update is dropped and the rest of the acknowledged poll batch still routes),
+`message-type` (a Discord payload that is neither an ordinary message nor a reply),
+`conversation-unresolved` (a Discord guild channel, or a Slack `app_mention` carrying no
+`channel_type`, whose one bounded lookup did not answer, so the message cannot be placed and is
+never guessed at), `broadcast-channel` (a Telegram broadcast, where nobody can reply),
+`not-a-component-press` (a Discord interaction that is not a button) and `not-a-cancel-button` (a
+press whose `custom_id` is not this gateway's cancel button). It is declared once,
 where the span is opened, because recording a field a span never declared is silently dropped. The
 word is the transport's own classification and never a fragment of the payload it read.
+
+A WhatsApp group payload is the one drop that does not use the field. One `transport.receive` span
+covers a whole delivery, so a `drop.reason` there would be overwritten by the next message in the
+same delivery and would stain the trace of an accepted message beside it; each dropped message
+instead emits `gateway_message_ignored` with `reason = group-unsupported` and its `message.index`.
 
 | Event | Level | Fields |
 |---|---|---|
@@ -336,19 +345,24 @@ minted from something predictable.
 
 In-flight presentation is metadata-minimal. Every event a running session produces is one
 `gateway.progress` record on the message's own trace, carrying `kind` and whichever of `agent`,
-`turn`, `of`, `max_steps`, `tool_calls`, `word`, `argument_count`, `calls_used`, `calls_max`,
-`index`, `media_type`, `bytes`, `count`, `elapsed_ms`, `first_delta_ms`, `outcome`, `class`, `by`,
-`edits`, `keep_alives`, `stream.deltas`, and `progress.dropped` that kind has. There is no field on
+`turn`, `turns`, `of`, `max_steps`, `tool_calls`, `word`, `argument_count`, `calls_used`,
+`calls_max`, `index`, `media_type`, `bytes`, `count`, `elapsed_ms`, `first_delta_ms`, `outcome`,
+`class`, `by`, `edits`, `keep_alives`, `stream.deltas`, and `progress.dropped` that kind has.
+`turn` is the turn a `model_turn` or `answered` record is about; `turns` is how many the session
+spent, on `kind = finished`. There is no field on
 it a prompt, a capability argument, a provider result, or model text could be written into. A text
 delta is the one event with no record of its own: it is the newest rendering of one value, it
 arrives hundreds of times per turn, and what a reader needs is the count — which rides
-`stream.deltas` on the terminal record and on `prompt.model_turn`.
+`stream.deltas` on the terminal record and on `prompt.model_turn`. That span also carries
+`stream.first_delta_ms`, the wait before the turn's first visible text.
 
 The rendering itself is debug-level. `gateway_progress_rendered` carries `transport`, `primitive`
 (`typing`, `status`, `reaction`, `progress`, `stream`, `finalize`, `delete`), `outcome`, the stable
 transport-error category on a failure, and `chars` on a stream render — which is what was actually
 on screen, rather than what the model had written by then. `gateway_progress_degraded` names the
-`primitive` that two consecutive failures stopped for that session;
+`primitive` that two consecutive failures stopped for that session and the `category` of the failure
+that stopped it — and one deadline miss is the whole budget for the call that creates the surface,
+the first `post` or first stream render, because the transport may still land it;
 `gateway_progress_budget_exhausted` carries the `edits` a session spent; `gateway_progress_dropped`
 carries the running `count` of events the policy's bounded queue could not take, and its `reason`.
 `gateway_progress_terminal_unobserved` carries nothing at all: the ending was written on screen and
@@ -358,7 +372,14 @@ A permanent Slack installation fallback emits the same degraded record with `tra
 `surface` of `agent-status` or `reaction`, which is a transport-wide breaker rather than a
 per-session one. `gateway_session_stop_requested` carries the transport and
 `via` (`native-stop`, `button`, `stop-reply`, `wall-clock`); `gateway_session_stop_ignored` carries
-the transport and `reason` (`no-session`, `other-subject`, `already-ended`). None records channel,
+the transport and `reason` (`no-session`, `other-subject`, `already-ended`). Three transport-side
+records sit beside those. `gateway_cancel_ack_failed` (debug, Discord) and
+`gateway_transport_ack_failed` (warn, Telegram) each carry the transport and the stable error
+`category` of an acknowledgment the service refused; the press is routed either way, so what was
+lost is the immediate `Stopping…` on the button rather than the cancellation.
+`gateway_transport_press_ignored` (debug, Telegram) carries the transport and a `reason`
+(`malformed`, `bot`, `conversation-mismatch`, `subject`) for a `callback_query` the reader never
+turns into a cancel request. None records channel,
 thread, message, subject, status text, emoji, raw service response, or credential.
 
 ### The WhatsApp webhook is the one signal a stranger can drive
@@ -401,9 +422,14 @@ different quantities. `usage.input_tokens` rises for the same reason, and for re
 occupied; on `sharedConversation` the byte count includes each retained gateway-authored
 canonical-participant label. Both are zero on a `oneShot` route and on the first message of any
 conversation, which makes "seeded or not" a filter rather than a guess.
-`gateway_conversation_unresolved` is the debug-level record of why a Discord guild channel could
-not be placed — `cause` is `rest-cooldown`, `request`, `status`, `timeout`, `body`, or
-`channel-type` — and is the cause behind `drop.reason = conversation-unresolved`.
+`gateway_conversation_unresolved` is the debug-level record of why a conversation could not be
+placed, and the cause behind `drop.reason = conversation-unresolved`. On Discord, where the
+conversation is a guild channel, `cause` is `rest-cooldown`, `request`, `status`, `timeout`, `body`,
+or `channel-type`; on Slack, where it is an `app_mention` carrying no `channel_type`, it is
+`channel-id`, `rate-limited`, `request`, `response`, or `channel-flags`. It carries the transport,
+the cause, and `cause_type` rendering the underlying error where there is one — Slack's own stable
+error word, or the HTTP client's failure — with Discord's `status` arm carrying the response
+`status` instead. Never a token and never a byte of the payload.
 
 `gateway_conversation_evicted` carries a reason of `idle`, `capacity`, or `grant-changed` and
 nothing else, so a `maxConversations` ceiling set too low reads as eviction churn instead of as a
@@ -688,7 +714,7 @@ These events join the accounting and refusal ones:
 | Event | Carries |
 |---|---|
 | `agent.model.prompt` | The session's opening message list on its first turn, and on every later turn only the messages appended since the previous one |
-| `agent.model.answer` | Assistant text and the tool calls it requested, with arguments |
+| `agent.model.answer` | Assistant text and the tool calls it requested, with arguments; `stream.interrupted = true` when a cancellation cut the turn short, and the text is then what had arrived |
 | `agent.tool.script` | The script the model authored |
 | `agent.tool.output` | That script's combined output |
 | `gateway.message.received` | The inbound chat text, its channel, and the sender's canonical subject |

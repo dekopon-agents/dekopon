@@ -781,11 +781,12 @@ Startup accounts the worst-case JSON escaping of a bounded search query and prov
 decoded files plus canonical-ABI compaction copies and fixed allocator headroom fit the independent
 Wasm linear-memory ceiling.
 
-The gateway peer's attestor additionally needs `chatScopes`. Breadth is an explicit tagged value:
-`transportWide`, `exactChannel`, or `exactConversation`; each names transport kind and configured
-transport ID, and narrower forms name canonical channel and conversation. A local transport must
-also name `localSubjectService`. Subject namespace authority remains independently required. Scope
-fields enter Cedar as optional `transportKind`, `transport`, `channel`, and `conversation`.
+The gateway peer's attestor additionally needs `chatScopes`. Each entry names the transport kind and
+the configured transport ID, plus a `conversation:` selector — the word `any` or a list of kinds,
+with an optional `container` and an optional `ids` list — written exactly as a gateway route writes
+it. A local transport must also name `localSubjectService`. Subject namespace authority remains
+independently required. Scope fields enter Cedar as the optional `transportKind` and `transport`
+strings and the optional `conversation` record `{kind, container, id, thread}`.
 
 ```yaml
 identities:

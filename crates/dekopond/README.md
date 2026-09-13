@@ -57,7 +57,8 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   `agent.improvement.suggested`, which is why the route flag is off by default: the record
   carries model-authored text, and setting the flag is that consent. A suggestion is advisory by construction — no instruction, skill, limit, or grant
   moves because a model asked — and the gateway never relays it to chat.
-- **Self-inspection** — every authorized session offers `inspect_agent_config`, returning its
+- **Self-inspection** — every authorized session on a route that has not written
+  `inspectAgentConfig: false` offers `inspect_agent_config`, returning its
   standing prompt, mounted skills by name, description, and resource file paths (never their
   text; `skills` is absent when nothing is mounted), route limits, and fresh subject-specific
   effective Cedar grants. The fixed shape omits raw policy, identity, endpoints, broker paths,

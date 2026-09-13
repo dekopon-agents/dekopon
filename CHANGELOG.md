@@ -174,11 +174,11 @@ All notable changes to Dekopon are documented here. The format is based on
   the whole one.
 - The gateway's end-to-end test model now answers as a server-sent event stream rather than one
   JSON document, because that is the path the model client takes by default.
-
 - `ci/fetch-external-provider-components.sh` pins a release tag, checksum, and size per provider
   rather than `v0.1.0` for all three. Echo, JSONPlaceholder, and memory-chat all move to `v0.2.0`,
   their first builds on `dekopon-provider-sdk` 0.13.0 — the `v0.1.0` assets emit `idempotency`, so
   they no longer load.
+- `gateway_progress_degraded` carries the `category` of the failure that stopped the rung.
 
 ### Removed
 
@@ -187,10 +187,14 @@ All notable changes to Dekopon are documented here. The format is based on
   `SlackActivityFallback`, `ActivityLease`, `ActivityControl`, `SessionStop`, `StopReply`,
   `TransportEvent::SessionStopped`, `ChatTransport::replier`, `ChatTransport::activity`, and
   `InboundMessage.activity`. Nothing is aliased, deprecated, or kept behind a flag.
-- `ChatModel::complete_with` and the two-argument `ChatModel::complete`. Implementations now
-  define one `complete` taking `options` and an event callback; one that cannot stream calls the
-  callback zero times and returns the whole turn.
-
+- **Breaking.** `ChatModel::complete_with` and the two-argument `ChatModel::complete`.
+  Implementations now define one `complete` taking `options` and an event callback; one that cannot
+  stream calls the callback zero times and returns the whole turn.
+- The producer-less `FailureClass::WallClock` and `FailureClass::Provider` variants, and
+  `BudgetLimit::Steps` and `BudgetLimit::CapabilityCalls` with their `budget:steps` and
+  `budget:capability-calls` cancellation labels. A route's `maxDurationMs` is the only budget that
+  cancels a session; step exhaustion is `Failed { class: StepBudget }`, and the capability-call
+  ceiling is a shell budget error the model reads and recovers from.
 - **Breaking.** Deleted every pre-0.13 provider compatibility path. A provider component must now
   be built on `dekopon-provider-sdk` 0.13.0 or later, and the whole fleet must be rebuilt and
   re-pinned before the broker is upgraded; see
@@ -229,6 +233,37 @@ All notable changes to Dekopon are documented here. The format is based on
 - The Discord transport records why it dropped an inbound message as `drop.reason` on its
   `transport.receive` span, so a message the gateway never answers says so in its own trace
   instead of vanishing.
+- A capability identifier a model invents — `cap <anything>` in a script — no longer reaches the
+  progress line. The broker leg reports `ToolStarted` and `ToolFinished` only for a capability the
+  session holds, the same check bare-word dispatch already made; an unheld identifier is refused
+  exactly as before, and its refusal stays on the trace.
+- A progress `post` or first stream render that misses its two-second deadline stops that rung for
+  the session instead of posting a second message beside one the gateway cannot name, and a
+  `finalize` that misses it is no longer followed by a delete: the answer is posted beside the
+  surface rather than replacing a message that may already carry it.
+- A session that fails or declines while its answer is streaming closes the stream in place, with
+  the partial answer above the failure sentence, instead of leaving the stream open and posting
+  that sentence as a second message.
+- A Slack or Discord Stop button carries the exact conversation key the session registry holds. A
+  press in a real (uppercase) Slack channel, and a press in a Discord thread, previously routed a
+  second spelling of that key and stopped nothing.
+- A Slack `app_mention` carries no `channel_type`, so the gateway resolves the conversation's kind
+  through one bounded, cached `conversations.info` call. A mention in a direct message or a
+  multi-person DM was minted as a `channel` before, and matched no `directMessage` or
+  `groupDirectMessage` route. Both Slack app manifests gain `channels:read`, `groups:read`,
+  `im:read`, and `mpim:read`, and the classic manifest enables interactivity so a Stop press
+  reaches the gateway; reinstall the app.
+- The Slack message that opens a thread is no longer read as a thread under itself: a `thread_ts`
+  equal to the message's own `ts` is the opening post, and it keeps the kind of the conversation it
+  was posted in.
+- Every line on the development transport is addressed, so a local `channel`, `thread`, or
+  `groupDirectMessage` line reaches its route; the owner-only socket is the authentication.
+- Telegram treats `message_thread_id` as a forum topic only when `is_topic_message` says so, so an
+  ordinary reply in a non-forum supergroup or a private chat no longer becomes a conversation of
+  its own. A topic id the Bot API would never mint drops that one update instead of abandoning the
+  rest of the acknowledged poll batch.
+- A WhatsApp delivery is answered only when one of its own `contacts` is the message's sender, and
+  each dropped message records its own reason instead of overwriting the delivery's shared trace.
 
 ## [dekopon-chart-0.6.0] - 2026-09-12
 

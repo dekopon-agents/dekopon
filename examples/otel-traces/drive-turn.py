@@ -160,7 +160,8 @@ permit(principal == Dekopon::Principal::"smoke-user",
             "models": [{"name": "stub", "kind": "openaiCompatible", "model": "smoke-model",
                 "endpoint": f"http://127.0.0.1:{model.server_port}/v1", "apiKeyEnv": "SMOKE_MODEL_KEY",
                 "timeoutMs": 15000, "classes": ["reasoning"]}],
-            "routes": [{"transport": "dev", "match": {"kind": "directMessage"}, "agent": "chat-agent",
+            "routes": [{"transport": "dev", "conversation": {"kind": ["directMessage"]},
+                "agent": "chat-agent",
                 "limits": {"maxSteps": 4, "maxCapabilityCalls": 4}}],
             "sessions": {"maxConcurrent": 1}, "shutdownGraceMs": 15000, "telemetry": telemetry})
         gateway = start("dekopond", gateway_config, {"SMOKE_MODEL_KEY": CREDENTIAL})
@@ -168,7 +169,9 @@ permit(principal == Dekopon::Principal::"smoke-user",
         with socket.socket(socket.AF_UNIX) as client:
             client.settimeout(60)
             client.connect(str(path))
-            client.sendall((json.dumps({"subject": "tel.16034700182", "channel": "dev", "text": PAYLOAD}) + "\n").encode())
+            client.sendall((json.dumps({"subject": "tel.16034700182",
+                "conversation": {"kind": "directMessage", "id": "dev"},
+                "text": PAYLOAD}) + "\n").encode())
             with client.makefile("rb") as reader:
                 line = reader.readline(65537)
             assert len(line) <= 65536 and line.endswith(b"\n"), "response line bound"

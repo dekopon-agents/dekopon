@@ -181,7 +181,8 @@ Terminal handling has exactly **one** writer, the policy task:
 |---|---|
 | Answered | the surface finalized in place as the answer; attachments follow on the reply path |
 | Stopped | the partial text kept, with the fixed stopped trailer, then the terminal stopped line |
-| Failed | the surface deleted and the fixed failure line as the reply |
+| Failed | a progress message deleted and the fixed failure line as the reply; a streamed surface closed in place, with the partial answer above that line |
+| Declined | a progress message removed and no reply at all; a streamed surface closed on exactly the text already on screen |
 
 Two tasks writing the same conversation on cancel is the one race worth naming: the session's
 cancelled branch hands the event to the policy rather than replying itself, and the policy does
@@ -189,7 +190,13 @@ finalize-then-reply in order through one driver. Nothing else posts a stopped li
 
 Every progress call has a 2 s deadline, honors the transport's rate-limit cooldown, never takes a
 transport's reply lock, and cannot fail the session. A failed edit is dropped and counted; the next
-tick renders the latest state. Nothing is persisted: a restart forgets every progress message.
+tick renders the latest state. Two calls are exceptions, because a missed deadline is this task
+giving up on a call the transport may still land. The call that *creates* the surface — the first
+`post`, or the first stream render — stops that rung on one deadline miss rather than counting
+toward two: a second attempt would post a second message beside one the session holds no reference
+to. A `finalize` that misses its deadline is not followed by a delete either; the answer goes out
+beside the surface, because a person can read a second copy of an answer and cannot read a deleted
+one. Nothing is persisted: a restart forgets every progress message.
 
 ## Streaming the model
 
@@ -239,8 +246,8 @@ Three origins, one path, one compare-and-swap.
 | A person, native control | the service's own stop event | partial text kept with the stopped trailer, then the stopped line |
 | A person, button | the transport reader, which acknowledges before the inbound send | the same |
 | A person, stop word | `dispatch`, before the addressed check | the same |
-| The operator | shutdown grace expiring | a best-effort stopped line under a short deadline |
-| A budget | steps, capability calls, or `maxDurationMs` counted from `Started` | a fixed line naming which bound |
+| The operator | shutdown grace expiring | nothing written: the indicators return to rest and the last progress line stays as it was |
+| A budget | `maxDurationMs` counted from `Started` | the fixed stopped line |
 
 The stop-word matcher runs in `dispatch` **before** the addressed check, strips the bot mention
 using the same forms the transport identity already knows, trims trailing punctuation, and matches
@@ -259,6 +266,12 @@ inbound channel — that send can block on a full buffer, and the service's ackn
 is a few seconds. Where the service supports it the acknowledgment is an update of the pressed
 message that replaces the button with `Stopping…` and empty components: one call, the button gone
 atomically so a second press is impossible, no follow-up edit, and no reply lock taken.
+
+An operator shutdown is the one origin that writes nothing. The grace period expiring aborts the
+session task, so its locals drop — the cancellation guard first, then the progress handle — and the
+policy task's biased select sees the terminal receiver closed and runs only its cleanup: the
+service's indicators return to rest and the last progress line stays exactly as it was. Nothing
+survives the process either, because a progress message is session state and a restart forgets it.
 
 What cannot be interrupted: a read waiting on a silent socket, and a broker invocation already
 inside the client. In both cases the person still sees the stopped line immediately, because the
