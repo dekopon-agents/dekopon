@@ -60,9 +60,8 @@ the body, so the payload-size name would misreport transfer volume by the size o
 
 ## Refusals, errors, and outcomes
 
-The other half of what survives trace expiry is what a process refused or could not do. These fire
-in either payload mode, because each carries a fixed category rather than the untrusted text that
-triggered it:
+The other half of what survives trace expiry is what a process refused or could not do. Each of
+these carries a fixed category rather than the untrusted text that triggered it:
 
 | Event | Emitted by | Carries |
 |---|---|---|
@@ -83,8 +82,7 @@ triggered it:
 
 `agent.improvement.suggested` is the exception to that sentence. Its four free-text fields are
 model-authored — bounded and stripped of control characters other than newline and tab, never
-reduced to a category — and they are recorded whether or not payloads are on, because a suggestion
-nobody can read is not a suggestion. That is why `suggest_improvement` is offered only when the
+reduced to a category — because a suggestion nobody can read is not a suggestion. That is why `suggest_improvement` is offered only when the
 embedder opted in, for example through `improvementSuggestions: true` on a `dekopond` route.
 Enabling it is the consent that declares the log sink in scope for that text, and nothing else
 widens with it: the record carries no chat text the gateway holds and no subject, only what the
@@ -104,8 +102,8 @@ therefore inside the caller's trace. Two events carry the whole record:
 | `broker.execution` | info | `dekopon-broker` | everything `broker.decision` carries except the decision verdict, plus `effect`, `risk`, `credential` — the symbolic name only — `outcome`, `duration_ms`, `error` and `output.digest` when there is one, and `http.calls`: the sanitized `HttpCallEvidence` array, method, authority, status, accounted bytes, and `credentialInjected` |
 
 Both ride the `dekopon_broker::audit` target. An optional field is absent rather than null when the
-record does not carry it: a storage-routed decision names no principal, actor, provider, or policy
-at all, so a present field always means the broker knew it.
+record does not carry it, so a present field always means the broker knew it. A storage-routed
+decision carries every field a non-storage one does, plus its scope commitment and evidence.
 
 Four decisions produce a record — a denial, an allow, a failure after authorization but before the
 provider ran, and the terminal outcome — and each produces exactly one. The record is emitted before
@@ -228,9 +226,10 @@ including disabled trace export, neither ID is fabricated.
 
 ## Trace context across the socket
 
-`InvocationRequest` and `DeliveredTurnRequest` each carry a mandatory W3C `traceParent`. The shared
-broker leg fills it from the span that requested the capability, and the broker opens
-`broker.invocation` beneath it as a remote parent, so one trace spans both processes. The trace
+`InvocationRequest`, `DeliveredTurnRequest`, and `runCommand` each carry a mandatory W3C
+`traceParent`. The shared broker leg fills it from the span that requested the capability or ran the
+command word, and the broker opens `broker.invocation` — `broker.command_run` for a command word —
+beneath it as a remote parent, so one trace spans both processes. The trace
 identifier inside it is the only correlation identifier the system has: every span the broker opens
 for the call and every audit record it emits sits inside that trace, and the invocation identifier
 extends it (`<trace>-<counter>`), so one session's calls are recoverable by prefix.
@@ -251,9 +250,12 @@ correlation and nothing else — never policy or routing. A malformed value, an
 explicit `null`, and an omitted key are all decode failures, since attaching broker spans and audit
 records to a trace that does not exist is worse than refusing the frame.
 
-The broker span carries the invocation, capability, and trace identifiers. Provider input and output
-ride the payload-gated `input` fields below; URL paths and queries, headers, and bodies stay out of
-spans and audit alike.
+The broker span carries the invocation, capability, and trace identifiers, for a storage-backed
+capability exactly as for any other. Provider input rides the `input` fields below, and a command
+word's argv, piped value, and output ride `provider.run_command`, so a header or body a command
+takes as an argument or prints as output is on the span like any other argument or output. The
+credential a sink injects and the wire request the HTTP host builds from it stay out of spans, and
+audit records carry no headers or bodies.
 
 An attested proposal adds routing fields to both spans: `broker.invocation` records the claimed
 `subject` and `agent`, and `broker.authorize` records the `subject` and the `via` peer the broker
@@ -330,7 +332,7 @@ metadata level: `declined` means an optional owned-thread continuation produced 
 liveness call was made, `busy` means admission control refused the message, `cancelled` means a
 stop won the race against terminal delivery, and `failed` names a category and the `error` that
 produced it through the `gateway_session_failed` log event. The sender's canonical subject and the message text
-ride the `gateway.message.received` log event under the payload gate below. `agent.reply.declined`
+ride the `gateway.message.received` log event below. `agent.reply.declined`
 records only the model-turn number. `unreported-capability-work` is a stable failure category whose
 fixed chat warning directs the sender to audit before retrying.
 
@@ -475,11 +477,12 @@ migration is implemented here.
 |---|---|---|
 | `provider.compile` | `dekopon-broker-host` | `path`, `artifact_bytes`, `elapsed_ms`; emitted once per provider at startup |
 | `provider.describe` | `dekopon-broker-host` | `path`, `stores`, `instantiations`, `fuel.consumed`; emitted once per provider at startup, for the manifest call |
-| `provider.run_command` | `dekopon-broker-host` | provider, `word`, `command.export` (`run-command`), `stores`, `instantiations`, `fuel.consumed` |
+| `broker.command_run` | `dekopon-brokerd` | `word` and `outcome` (`proposed`, `rendered`, `failed`, `error`); opened once per `runCommand` beneath the client's `traceParent` |
+| `provider.run_command` | `dekopon-broker-host` | provider, `word`, `command.export` (`run-command`), `command.arguments` and `command.arguments.bytes`, `command.stdin` and `command.stdin.bytes` when a value was piped, `command.output` and `command.output.bytes`, `stores`, `instantiations`, `fuel.consumed`; nests under `broker.command_run` |
 | `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `policy-error`, `secret-denied`, `unconstrained-capability`, `agent-denied`, `attestation-denied`, `unmapped-subject`, `chat-attestation-denied`, `chat-scope-required`, `record-operation-required`, `memory-unavailable`, `invalid-memory-input`, `invalid-turn`), `policy.errors_present`; `subject` and `via` on attested proposals |
-| `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one; `outcome` (`succeeded`, `failed`, `decision-unaudited`, `outcome-unaudited`) and `error` — the same classified reason the terminal audit record carries |
+| `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one; `outcome` (`succeeded`, `failed`, `decision-unaudited`, `outcome-unaudited`) and `error` — the same classified reason the terminal audit record carries; on a storage-backed invocation also `storage = true`, `storage.namespace`, and `storage.reset` |
 | `broker.credential.refresh` | `dekopon-brokerd` | the symbolic `credential` name, and `outcome` (`current`, `adopted`, `rotated`, `rotated-unsaved`, `failed`); emitted once per invocation that selects a credential the broker renews per use, and never any token, account identifier, or file content. `chatgpt.refresh` from `dekopon-model` nests inside it |
-| `provider.invoke` | `dekopon-broker-host` | capability, provider, `stores`, `instantiations`, `fuel.consumed` |
+| `provider.invoke` | `dekopon-broker-host` | capability, provider, `input`, `stores`, `instantiations`, `fuel.consumed`; `storage = true` on a storage-backed invocation |
 | `http.request` | `dekopon-http-host` | `http.request.method`, `server.address`, `http.response.status_code`, `dekopon.http.request.accounted_bytes`, `dekopon.http.response.accounted_bytes`, `outcome`; `error.code` and `error.message` on failure |
 
 `http.request` fields mirror `HttpCallEvidence` exactly: the span reports the same call the audit
@@ -522,13 +525,25 @@ reading arrived at the bound. It is recorded on every path a store can end on �
 rejection, and timeout alike — and a store that reports no reading records nothing rather than a
 zero that would read as a component that ran for free.
 
-All three are counts of host work, never provider content, so the storage-backed `provider.invoke`
-span carries them too.
+All three are counts of host work, recorded on a storage-backed `provider.invoke` like any other.
 
-`provider.run_command` carries the provider, the command word, and the export name that served it,
-never the argv or the value piped into the word. Model-authored argv and piped text are untrusted
-content for the same reason `provider.invoke` omits `input`; the help page or usage error a
-`run-command` guest renders travels back in the result, not in telemetry.
+`provider.run_command` records what the guest was asked and what it answered. `command.arguments` is
+the argv after the word as a JSON array, `command.stdin` the piped value when there was one, and
+`command.output` the guest's JSON answer: the proposal, the help page or usage error it rendered, or
+its decline. Model-authored argv is untrusted content, and recording it is the decision
+`provider.invoke` already made for `input`: the trace is where a run is reconstructed from. Each
+value is [bounded](#span-payloads) with its uncut length beside it. Argv may carry a public DRN, as
+in `--oauth2-bearer '${drn:…}'`; that is a name and is recorded as one, and the secret it names is
+resolved inside the broker after authorization and never reaches the guest or this span.
+
+`broker.command_run` is the command word's half of `broker.invocation`. `dekopon-brokerd` opens it
+for every `runCommand` beneath the `traceParent` the client sent, so the guest call that turns argv
+into a proposal sits inside the message's trace instead of starting its own. `outcome` is `proposed`
+when the guest returned a capability proposal, which the client then submits as an ordinary
+invocation; `rendered` when the guest answered by itself; `failed` when it declined the argv; and
+`error` when the run did not complete — no provider declares the word, the input passed
+`maxInputBytes`, the guest trapped, or its answer did not decode — whose cause
+`command.resolve.failed` records.
 
 Every read of the `dekopon:clock/wall@1.0.0` import emits `provider_clock_read` at `INFO` from
 `dekopon-broker-host`, parented by `provider.invoke`, carrying `unix_millis`: the exact value the
@@ -557,7 +572,7 @@ on alongside `chatgpt_credential_save_failed`: the record on disk is the retired
 `broker.execute`'s `credential` is the owner-authored symbolic name from `broker.yaml`, never the
 secret and never the header. One capability can present a different credential per acting agent, and
 a trace that named none of them would make two writes to two different organizations look identical.
-A `Redacted` value renders its marker in either payload mode. The legacy selection bindings
+A `Redacted` value renders its marker wherever it is formatted. The legacy selection bindings
 [will be replaced by public DRNs](design.md#legacy-credential-bindings); the current symbolic field
 is not itself a DRN.
 
@@ -630,22 +645,26 @@ probe` is an ordinary client authenticating as the broker's own UID, so a config
 `identities` omit that UID refuses its own health check. The Helm chart refuses that combination at
 render time; this event names it everywhere else.
 
-## Storage telemetry and audit privacy
+## Storage telemetry and audit
 
-Storage-backed invocations do not follow the ordinary provider span shape. The `broker.execute` and
-`provider.invoke` storage spans omit provider, capability, agent, subject, transport scope, logical
-names, offsets, search terms, and exact bytes even when payload telemetry is enabled; `stores` and
-`instantiations` are the exception, and they count host work rather than describing the call.
-`broker.execute` does carry `storage.namespace`, the base directory token under `namespaces/`, so a
-trace leads to the directory its conversation's bytes are in. Storage evidence retains only
-invocation/operation/sync/quota counts and the largest powers-of-two read/write bucket; that
-evidence and the public ceilings never contain root paths or opaque tokens.
+A storage-backed invocation is traced and audited like every other one: no field present on a
+non-storage span or audit record is withheld on a storage-backed one. `broker.invocation`,
+`broker.authorize`, `broker.execute`, and `provider.invoke` carry the capability, provider, subject,
+agent, `via`, and `input` they carry for any capability, and `broker.decision` and `broker.execution`
+carry the principal, actor, provider, policy revision, policy identifiers and digest, and credential.
+`recordDeliveredTurn` opens a complete `broker.invocation` from the turn it records.
 
-Storage audit decisions and outcomes omit principal, actor/agent, via/subject, provider, broker
-principal/policy revision, policy IDs/digest, and credential, carrying an audit-scope commitment in
-their place. *Committed direction:* removed; the blanking hides chat scope from the operator, which
-is a [non-goal](design.md#non-goals). Every storage name and commitment is an unkeyed,
-domain-separated SHA-256; commitments are written `sha256:` like non-storage records.
+Storage adds fields on top. `broker.execute` records `storage = true`, `storage.reset`, and
+`storage.namespace`, the base directory token under `namespaces/`, so a trace leads to the directory
+its conversation's bytes are in; `provider.invoke` records `storage = true`. The audit records add
+`storage.scope_commitment` and `storage.evidence`: operation, sync, and quota-denial counts, exact
+`readBytes` and `writeBytes`, and commitments. Evidence and the public ceilings never contain root
+paths or opaque tokens. Every storage name and commitment is an unkeyed, domain-separated SHA-256;
+commitments are written `sha256:` like non-storage records.
+
+A chat-memory call's subject and agent therefore say whose conversation it read. The telemetry store
+was always inside the operator's boundary ([non-goals](design.md#non-goals)); withholding them hid
+chat scope from the one reader the trace exists for.
 
 A retained storage document that fails to decode emits `storage_document_decode_failed` at `WARN`
 under `category = "storage"`. It carries the static document kind plus the `serde_json` failure's
@@ -671,8 +690,8 @@ nothing in them reaches a guest or a model.
 
 Entropy and wall/monotonic clock values from durable-files are never emitted as telemetry. The
 separate `dekopon:clock/wall@1.0.0` import is not a storage interface; its `provider_clock_read`
-reading is emitted in either span shape, and it names no more than the enclosing span's own
-timestamps already do. A native
+reading is emitted on storage-backed and other invocations alike, and it names no more than the
+enclosing span's own timestamps already do. A native
 filesystem operation may outlive a timeout signal; `finalizationBudgetMs` prevents the next bounded
 finalization step from starting after its deadline, while the base/generation leases and quota
 reservation remain held until an already-started blocking job drains. Duration is therefore
@@ -689,17 +708,26 @@ withholds half of it serves nobody the constitution recognizes ([goal
 |---|---|
 | `broker.authorize` | `input` — the untrusted proposal payload |
 | `provider.invoke` | `input` — the payload passed to the component |
+| `shell.command` | `shell.command.arguments`, `shell.command.stdin`, `shell.command.output` — the argv after the word, the piped value, and the command's stdout |
+| `provider.run_command` | `command.arguments`, `command.stdin`, `command.output` — the argv, the piped value, and the guest's answer |
 | `http.request` | `url.full` — the destination with its path and query |
 | model/tool log events | the verbatim transcript; see below |
 
-This is **data**, not credentials. Request and response headers and HTTP bodies stay out — a
-credential is injected into a header at the native HTTP boundary — and a `Redacted` value renders
-its marker wherever it is formatted, because that is a property of the value. Both exclusions are
+The six command fields cut through `dekopon_core::bounded_attribute`. A value of up to 4096 bytes
+passes unchanged; a longer one is cut at the last character boundary within 4096 bytes and suffixed
+`…[truncated]`. Each field's `.bytes` sibling — `shell.command.output.bytes`,
+`command.arguments.bytes`, and so on — records the uncut length, so a cut value is distinguishable
+from one that happened to end there. The attribute is bounded, never the span.
+
+This is **data**, not credentials. A credential is injected into a header at the native HTTP
+boundary, so that header and the wire request carrying it stay out; a header or body a command
+takes as an argument or prints as output is data and is recorded like any other. A `Redacted` value
+renders its marker wherever it is formatted, because that is a property of the value. Both exclusions are
 unconditional and neither ever had a switch. Audit records carry their own metadata-only shape,
 unchanged by any of this.
 
-A storage-backed `broker.authorize` and `provider.invoke` still open the blind span: identifiers and
-the decision only. *Committed direction:* that arm records its input like every other one.
+A storage-backed `broker.authorize` and `provider.invoke` record `input` like every other one; there
+is no blind span ([storage telemetry and audit](#storage-telemetry-and-audit)).
 
 ## Model and tool transcript
 
@@ -728,23 +756,22 @@ duplicates. `transcript.scope` says which shape an event carries (`full` or `del
 `message.count` gives the size of the request actually sent, so a reader can tell a trimmed session
 from a truncated log. Concatenating a session's events in order reconstructs the exact transcript.
 
-`accounting.model.turn` fires in either mode, so turn counts, durations, and outcomes remain
-available without opting in to content. `agent.config.inspected` also fires in either mode and
+`accounting.model.turn` carries turn counts, durations, and outcomes. `agent.config.inspected`
 carries only the bounded result byte count and whether this call repeated an earlier one; it never
-logs the configuration itself. With payloads enabled, the credential-free meta result appears as a
-tool message inside the next `agent.model.prompt` transcript, just as script output does — once per
-session, because a repeated inspection is answered with a short pointer at the copy already in the
-conversation. Per-command detail lives on the `shell.command` span: the command word, its kind, its
-argument count, its exit code, and its outcome — and, past the per-script span cap, on the
+logs the configuration itself. The credential-free meta result appears as a tool message inside the
+next `agent.model.prompt` transcript, just as script output does — once per session, because a
+repeated inspection is answered with a short pointer at the copy already in the conversation.
+Per-command detail lives on the `shell.command` span: the command word, its kind, its arguments, the
+value piped into it, its output, its exit code, and its outcome — and, in constant size, on the
 `shell.script` span's counters.
 
 A mounted skill takes the same route as that meta result. The listing the model sees — names and
 one-line descriptions, beginning `Skills mounted for this agent` — is a system message of its own,
 placed after the standing instructions, so it rides the first turn's `full` `agent.model.prompt`.
 The skill's text does not: a `read_skill` result is appended to the conversation like any other tool
-message and reaches the log stream only inside the following turn's `agent.model.prompt` delta, with
-payloads on. Neither `agent.tool.script` nor `agent.tool.output` fires for a skill read;
-`agent.skill.read` records the name, the path, and the byte count in either mode.
+message and reaches the log stream only inside the following turn's `agent.model.prompt` delta.
+Neither `agent.tool.script` nor `agent.tool.output` fires for a skill read; `agent.skill.read`
+records the name, the path, and the byte count.
 
 ## Redacting secrets
 
@@ -775,9 +802,9 @@ One generated OpenTelemetry trace links the command to spans such as:
   a ChatGPT subscription credential is rotated or adopted — it carries `forced`, `outcome`
   (`adopted`, `rotated`, `rotated-unsaved`, or `failed`), `duration_ms`, and the new
   `credential.expires_at`, and never any token material;
-- `prompt.script`, `shell.script`, and `shell.command`; and
-- `provider.compile`, `provider.describe`, and `provider.invoke`; and
-- `provider.run_command` at `DEBUG`.
+- `prompt.script`, `shell.script`, and `shell.command`;
+- `broker.invocation` and `broker.command_run`; and
+- `provider.compile`, `provider.describe`, `provider.run_command`, and `provider.invoke`.
 
 `process.run` carries only its private stable `run.id`. `process.node` carries that `run.id`, a
 private stable `node.id`, root parent, fixed `process.kind`, the `process.interruptibility` contract
@@ -798,8 +825,8 @@ One model turn drives at most a handful of scripts, and one script drives many c
 `prompt.script` is the span for a whole unit of model-requested work rather than for a single
 capability invocation. Inside it, the interpreter opens one `shell.script` span per run, and inside
 *that*, `shell.command` is one span per command word the script actually ran, in execution order — a
-builtin, a capability call, a shell function, a word this shell refuses, or a word that resolved to
-nothing. A trace therefore reads as the ordered list of commands a script executed, and the reading
+builtin, a provider command word, a shell function, a word this shell refuses, or a word that
+resolved to nothing. A trace therefore reads as the ordered list of commands a script executed, and the reading
 survives constructs where one script word drives several executions: `xargs` mapping a command over
 ten items produces ten `shell.command` spans nested inside its own. The interpreter emits these as
 plain `tracing` spans and knows nothing about OTLP; `dekopon_shell` is named in this file's trace
@@ -808,30 +835,35 @@ and log filters. Each command span carries:
 | Attribute | Value |
 |---|---|
 | `shell.command.name` | The command word, whoever wrote it |
-| `shell.command.kind` | `builtin`, `capability`, `function`, `control`, `rejected`, `not-granted`, or `not-found` |
-| `shell.command.argument_count` | How many arguments the word received, never their values; see [Exclusions](#exclusions) |
+| `shell.command.kind` | `builtin`, `provider-command`, `function`, `control`, `rejected`, or `not-found` |
+| `shell.command.arguments` | The arguments after the word as a JSON array of strings, [bounded](#span-payloads) |
+| `shell.command.arguments.bytes` | The uncut length of that array |
+| `shell.command.argument_count` | How many arguments the word received |
+| `shell.command.stdin` | The piped value's display text, bounded; absent when nothing was piped |
+| `shell.command.stdin.bytes` | The uncut length of the piped value |
+| `shell.command.output` | What the command wrote to stdout, bounded |
+| `shell.command.output.bytes` | The uncut length of that output |
 | `shell.command.exit_code` | The status the command reported |
 | `outcome` | `succeeded`, `failed`, `denied`, `not-found`, `usage-error`, `timed-out`, `limit-exceeded`, or `rejected` |
 
 Every command word gets its span, at `INFO`, however many a run executes. A model-authored `while`
 loop is bounded only by the step budget (default 100,000) and the script deadline, so one bash tool
-call can produce tens of thousands of them — and every one is exported: an attribute may be
-truncated with a marker, a span is never dropped ([goal 2](design.md#constitution)). The
-`shell.script` span carries the run's shape in constant size beside them:
+call can produce tens of thousands of them — and every one is exported, arguments and output
+included: each value is cut at 4096 bytes with a marker and its uncut length beside it, and a span is
+never dropped ([goal 2](design.md#constitution)). The `shell.script` span carries the run's shape in
+constant size beside them:
 
 | Attribute | Value |
 |---|---|
 | `shell.script.commands` | Command words the script executed, loop iterations and `xargs` sub-invocations included |
-| `shell.script.capability_commands` | How many were a capability call or a provider command word |
+| `shell.script.capability_commands` | How many were a provider command word |
 | `shell.script.failed_commands` | How many reported a non-zero exit code |
 
-`not-granted` splits the swing-and-a-miss out of `not-found`. A word that parses as a capability
-identifier, in a namespace this session *does* hold but naming a capability it was not granted, is a
-different fact from a typo: it is a model repeatedly reaching for something an operator may want to
-grant. A trend of them in one namespace is the signal worth acting on, and the word itself says
-which namespace was reached into. The script cannot tell the two apart: both print `command not
-found` and exit 127, since a model that could distinguish them would have an oracle for enumerating
-the deployment's capabilities one guess at a time.
+A capability identifier is not a command word. `wikipedia_page --title X` and
+`cli-probe.upper --text x` resolve to nothing, record `not-found`, and exit 127 with the shell's
+ordinary `command not found`, whether or not the session holds the capability; the provider's own
+word is the only way to reach one. A model guessing capability names learns nothing about the
+deployment from the answer, and `shell.command.name` still says what it reached for.
 
 `outcome` keeps a policy refusal (`denied`) distinct from a capability that ran and errored
 (`failed`) and from one that is unreachable (`not-found`), mirroring the interpreter's own exit-code
@@ -861,12 +893,12 @@ else:
 - provider credentials; and
 - broker socket paths.
 
-Command arguments are still recorded as a count rather than as values, because a
-`curl -d '{"apiKey":...}'` body and a `cap some.id '{"token":...}'` object are secret bytes wearing
-argv's clothes, and `shell.command.argument_count` carries how many there were. The command *word*
-is recorded in full whatever wrote it. *Committed direction:* argument values are recorded too, with
-secret material excluded at the point it is identified rather than by withholding the whole vector
-([goal 2](design.md#constitution)).
+Command arguments are recorded as values, on `shell.command.arguments` and `command.arguments`, and
+the command *word* in full whatever wrote it. A public DRN on argv — `--oauth2-bearer '${drn:…}'` —
+is a name and is recorded as one; the secret it names is resolved inside the broker after
+authorization and never enters argv, a piped value, a guest, or a span. A secret a model typed into
+argv itself was already in the `agent.tool.script` record of the script that carried it, so the span
+discloses nothing the transcript had not.
 
 Model-selected invalid tool names are not copied into remote rejection events; a rejection records a
 stable category such as `unknown-tool`. Error telemetry records stable categories rather than raw
@@ -881,8 +913,8 @@ container with one Docker volume, documents authenticated OTLP/HTTP export, and 
 inspect traces in the UI.
 
 `examples/otel-traces/smoke-test.sh` is the repository-level black-box check. It runs real broker
-and gateway processes, a stdlib model stub, and one private local-transport turn that executes an
-authorized echo provider. It asserts `transport.receive`, `gateway.message`, `gateway.session`,
+and gateway processes, a stdlib model stub, and one private local-transport turn that runs
+`probe upper` against the authorized in-tree `cli-probe` provider. It asserts `transport.receive`, `gateway.message`, `gateway.session`,
 `broker.invocation`, `provider.compile`, and `provider.invoke`, including cross-process invocation
 trace continuity from the transport's receipt onward. A
 smoke-only stdout shipper checks ingestion-record counts; complete bounded remote log queries

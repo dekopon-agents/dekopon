@@ -7,6 +7,133 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- `dekopon-brokerd` opens `broker.command_run` for every `runCommand`, beneath the client's
+  `traceParent`, carrying `word` and `outcome` (`proposed`, `rendered`, `failed`, `error`).
+  `provider.run_command` nests inside it, and a failed run's `command.resolve.failed` event lands
+  inside it.
+- A command's arguments, piped value, and output ride its trace. `shell.command` records
+  `shell.command.arguments` (the argv after the word, as a JSON array), `shell.command.stdin` (only
+  when a value was piped), and `shell.command.output` (its stdout); `provider.run_command` records
+  `command.arguments`, `command.stdin`, and `command.output` (the guest's JSON answer). Each value
+  is cut at 4096 bytes on a character boundary and suffixed `…[truncated]`, and a sibling `.bytes`
+  attribute carries its uncut length. `dekopon_core::bounded_attribute` and `MAX_ATTRIBUTE_BYTES`
+  are the one bound both processes cut through. A public DRN on argv is a name and is recorded; the
+  secret it names never enters argv, a guest, or a span.
+- A provider command may propose secret use. `CommandInvocation::secret_use` names a
+  `SecretUseProposal`, and `CommandRunOutcome::Proposed` carries it on the wire as `secretUse`,
+  omitted when `None`, so a proposal without one keeps its shape. The broker leg and the shell pass
+  it to the broker, which authorizes it as any other DRN use: capability Cedar, a separate
+  `secret.use` decision, and the owner's binding. With the `curl` builtin gone, this is how DRN
+  secret use stays reachable; a DRN still never appears in provider invoke input or WIT.
+  `SecretUseProposal` and `SecretDrn` are re-exported from `dekopon-provider-sdk`. See
+  [`docs/secrets.md`](docs/secrets.md#agent-syntax).
+
+### Changed
+
+- **Breaking.** A provider whose manifest declares capabilities and no command word refuses broker
+  startup. `ProviderConflicts` gains `wordless`, and the one startup report names every such
+  provider beside any duplicate provider identity, duplicate capability, or command-word conflict
+  in the same set. A component built on `dekopon:provider@0.1.0` or `0.2.0`, or on the `provider`
+  world alone, has no `run-command` export and cannot declare a word, so it no longer loads; this
+  reverses 0.14.0's note that a component exporting only `describe` and `invoke` keeps loading.
+  [`docs/upgrading.md`](docs/upgrading.md#providers-run-on-argv-only-0150-unreleased) names the
+  fleet releases that declare a word.
+- **Breaking (`dekopon-provider-sdk`).** `Provider::run_command` has no default: every provider
+  implements it and exports through `export_provider_with_cli!`.
+- **Breaking (broker protocol).** `runCommand` requires a W3C `traceParent`, validated exactly as on
+  `invoke`, and a frame without one fails to decode. `RequestEnvelope::run_command` and
+  `BrokerClient::run_command` take a trailing `trace_parent: TraceParent`. The protocol stays
+  `dekopon.dev/broker/v1alpha2` and both envelopes are strict, so 0.14.0 and 0.15.0 daemons refuse
+  each other's `runCommand` in both directions: upgrade `dekopond` and `dekopon-brokerd` together.
+  `BrokerLeg` sends the calling script span's trace parent, so `broker.command_run` joins the
+  session trace.
+- **Breaking (API).** `CommandInvocation`, `CommandRunOutcome::Proposed`, and `dekopon-shell`'s
+  `CommandRun::Proposed` gain `secret_use`, so a struct literal or exhaustive pattern has to name
+  it, and `CapabilityInvoker::invoke` takes it as a third argument.
+- **Breaking (audit records).** Storage-backed invocations are no longer traced blind.
+  `broker.invocation`, `broker.authorize`, `broker.execute`, and `provider.invoke` record the
+  capability, provider, subject, agent, `via`, and `input` they record for any other capability,
+  with `storage`, `storage.namespace`, and `storage.reset` on top, and `recordDeliveredTurn` opens
+  a complete `broker.invocation`. Storage-backed `broker.decision` and `broker.execution` records
+  carry `principal`, `actor`, `via`, `subject`, `provider`, `authorizedBy`, `policyRevision`,
+  `policyIds`, `policyDigest`, `secret`, and `credential` like any other, beside
+  `storageScopeCommitment` and the storage evidence. That evidence reports exact `readBytes` and
+  `writeBytes` where it reported powers-of-two `readByteBucket` and `writeByteBucket`.
+- **Breaking (telemetry).** `shell.command.kind` loses `capability` and `not-granted`: a provider
+  word is `provider-command`, and a capability-shaped word is `not-found`.
+  `shell.script.capability_commands` counts provider command words.
+- `dekopon-agent` reports one `ToolStarted`/`ToolFinished` pair per tool use instead of two, under
+  the command word. A command that proposes a capability finishes with that call's outcome, or
+  `failed` when the call never happens (not granted, budget spent, deadline); one that proposes
+  nothing finishes with its own outcome. `ShellRuntime` settles a pending report through the new
+  defaulted `CapabilityInvoker::script_finished` before a script's result returns to the loop.
+- `dekopon-agent`'s `bash` tool description says provider command words are programs (run
+  `<word> --help`), that `cap --list` shows the granted capability IDs, and that a DRN goes only to
+  a provider command whose `--help` accepts one. It no longer teaches capability identifiers as
+  commands, `--kebab-case` flag-to-JSON input, `cap <id>` invocation, `cap --describe` schemas, or
+  the `curl` builtin.
+- `dekopon-chart`: the default `broker.config.inline` loads
+  `/opt/dekopon/providers/cli-probe-provider.wasm` and authorizes exactly `cli-probe.upper` for the
+  pod's own UID (policy `@id("pod-probe")`), replacing the echo example. It starts only on an image
+  that ships `cli-probe`, and a values file that still names `echo-provider.wasm` or `echo.echo`
+  fails broker startup.
+- The `http-probe` test fixture answers the `httpprobe` command word: `httpprobe fetch`,
+  `httpprobe conditional-write`, and `httpprobe purge`, one subcommand per capability and one
+  kebab-case flag per input field, each building the input object the capability read before.
+  `httpprobe fetch --bearer <DRN>` and `--basic <USER> <DRN>` propose secret use, which the broker
+  tests drive end to end. Its component exports `run-command`, which the WIT package workflow now
+  expects.
+- `ci/fetch-external-provider-components.sh` pins JSONPlaceholder to `v0.3.0`, which answers the
+  `placeholder` command word.
+
+### Removed
+
+- **Breaking (`dekopon-shell`).** Agent-facing JSON invocation. Argv through a provider command word
+  is the only way a script reaches a provider; see
+  [`docs/upgrading.md`](docs/upgrading.md#providers-run-on-argv-only-0150-unreleased).
+
+  - The shell no longer rewrites `--kebab-case` flags into a camelCase JSON object. A provider
+    parses its own argv, so a snake_case provider no longer receives keys it refuses.
+  - A capability identifier is not a command word. `wikipedia_page --title X` or
+    `cli-probe.upper --text x` is an ordinary unknown command: exit 127, `command not found`,
+    whether or not the session holds the capability.
+  - `cap <id> …`, with flags or a raw `{json}` object, no longer invokes; every form but two is a
+    usage error at exit 2. `cap --list` (`-l`) prints the granted capability identifiers, and
+    `cap --describe <id>` (`-d`) prints the identifier and its description without `inputSchema`.
+    A word's `--help` documents its arguments.
+  - `CapabilityInvoker::grants_namespace` (and its `SessionInvoker` and `BrokerLeg` impls),
+    `CapabilityDescription::input_schema`, and `dekopon_shell::value::object_from_pairs` are gone
+    with the paths they served.
+
+  Capability identifiers, Cedar policy, constraint sets, and constraint-set `credential:` injection
+  are unchanged: `probe upper --text hello` authorizes as `cli-probe.upper`.
+- **Breaking (`dekopon-shell`).** The `curl` builtin and all of its `curl_capability` plumbing,
+  including `Interpreter::with_curl_capability` and `dekopon-agent`'s
+  `ShellRuntime::curl_capability`. `curl` leaves `dekopon_core::RESERVED_COMMAND_WORDS`, so a
+  provider may claim it; until one does, `curl https://…` exits 127, `command not found`.
+- **Breaking (`dekopon-core`).** `CommandWordConflictKind::CapabilityShaped`. A command word
+  containing `.`, `-`, or `_` shadows nothing now that capability identifiers are not commands, so
+  it follows the ordinary reserved, duplicate, and repeat rules.
+- **Breaking (`dekopon-provider-sdk`).** `export_provider!` and `export_provider_with_bindings!`,
+  with the SDK's own import-free bindings and its `wit-bindgen` dependency.
+  `export_provider_with_cli!` is the export; a provider with host imports adds them to a world that
+  includes `dekopon:provider/provider-cli@0.3.0`.
+- **Breaking.** The echo example provider, from the container image, CI, the chart's default, and
+  `ci/fetch-external-provider-components.sh`, which no longer accepts `echo`. The in-tree
+  `cli-probe` fixture replaces it as the no-network default: word `probe`, capabilities
+  `cli-probe.upper`, `cli-probe.count`, and `cli-probe.reverse`, input `{"text": "…"}`. The image
+  ships `cli-probe-provider.wasm` beside `http-probe`, JSONPlaceholder, and gh, so a `broker.yaml`
+  naming `/opt/dekopon/providers/echo-provider.wasm` refuses to start: point it at
+  `cli-probe-provider.wasm` and move `echo.echo` constraint sets and Cedar actions to
+  `cli-probe.upper` on provider `cli-probe`. The OpenObserve smoke test (`examples/otel-traces/`)
+  drives `probe upper --text` against the tracked component, so the OTLP and CLI smoke CI lanes
+  fetch no standalone provider.
+- The `provider-v0-1-compat` fixture, source and component, with the WIT package workflow's
+  inspection of it. A two-export `dekopon:provider@0.1.0` component cannot declare a command word,
+  so nothing loads one.
+
 ## [0.14.0] - 2026-09-13
 
 ### Added

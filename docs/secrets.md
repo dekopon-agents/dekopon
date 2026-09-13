@@ -14,7 +14,8 @@ A model may name a secret; it never receives one.
 
 ```text
 model-authored script
-  -> typed SecretUseProposal carrying a public DRN
+  -> provider command word with a public DRN on its argv
+  -> the guest's run-command answer: capability, input, typed SecretUseProposal
   -> ordinary capability Cedar decision
   -> separate secret.use Cedar decision over the exact DRN
   -> owner-authored SecretUseBinding
@@ -23,8 +24,10 @@ model-authored script
   -> constrained HTTP request
 ```
 
-The typed DRN/secret-use field is never copied into provider JSON or either provider WIT interface;
-the Wasm component sees an ordinary `{uri, method, headers, body}` input. A DRN is public text, so a
+A DRN never appears in a provider's invoke input or in either provider WIT interface; the invoked
+component sees an ordinary `{uri, method, headers, body}` input. A provider's command proposal may
+name one — the command guest reads it from argv and returns it — and the broker authorizes that
+exactly like any other secret use. A DRN is public text, so a
 model may quote those characters as ordinary provider data; doing so has no secret semantics and
 grants no resolution. Resolved bytes pass only from the broker resolver to `dekopon-http-host`,
 beside an authorization committing to the same DRN, sink, and binding identifier.
@@ -82,7 +85,22 @@ less descriptive logical path.
 
 ## Agent syntax
 
-The sandboxed `curl` builtin recognizes only two exact credential forms:
+A provider command proposes secret use; the shell has no secret syntax of its own. The model passes
+the DRN on the command word's argv, and the guest's `run-command` answer returns it as `secretUse`
+beside the capability and input:
+
+```text
+{"outcome": "proposed",
+ "capability": "http-probe.fetch",
+ "input": {…},
+ "secretUse": {"kind": "httpBearer", "secret": "drn:com.xrl:secret:prod:api/token"}}
+```
+
+`httpBasic` adds `username`, and `secretUse` is absent when the proposal names no secret. A provider
+sets it through `CommandInvocation::secret_use`, which needs `dekopon-provider-sdk` 0.15.0.
+
+*Committed direction:* the out-of-tree `curl` provider takes the word `curl` and accepts the two
+credential forms the retired shell builtin did:
 
 ```sh
 curl --oauth2-bearer '${drn:com.xrl:secret:prod:api/token}' \
@@ -92,13 +110,13 @@ curl -u 'userA:${drn:com.xrl:secret:prod:api/password}' \
   https://api.example.com/v1/thing
 ```
 
-`-U` is an accepted alias for the second form; `-u` and `--user` are the curl-compatible spellings.
+No released provider proposes a DRN yet.
 
-The complete `${...}` value must be one canonical DRN. Literal passwords, prefixes/suffixes,
-`${drn:…}` markers in URLs, headers or bodies, and arbitrary interpolation are rejected. Bare DRN
-characters elsewhere are ordinary public text with no resolution semantics, and the marker is
-removed before provider input is built. Immediate/direct invokers refuse secret use; only a
-broker-backed leg forwards the typed top-level proposal. Invocation is one method, so every
+The broker checks the proposal, not the provider's parsing of it: a `secretUse` whose DRN is not
+canonical does not decode, and the owner's binding — never the argv — fixes the sink, username,
+destination, and injection count. Bare DRN characters elsewhere are ordinary public text with no
+resolution semantics. Immediate/direct invokers refuse secret use; only a broker-backed leg
+forwards the typed top-level proposal. Invocation is one method, so every
 broker-backed session reaches it, a `dekopond` chat session included, and a wrapper that records a
 call or stops one at a cancellation boundary cannot drop the proposal on the way through.
 
@@ -517,7 +535,8 @@ This describes today's audit schema, not an already-shipped field migration. Raw
 backend, locator, selector, source revision, path/query, headers and bodies are absent. A record
 without those optional fields retains its serialized bytes and chain hashes.
 
-Telemetry carries model-authored scripts and therefore public DRNs. It cannot carry resolved bytes,
+Telemetry carries model-authored scripts and command arguments, and therefore public DRNs, in the
+transcript and on `shell.command.arguments` and `command.arguments`. It cannot carry resolved bytes,
 which never enter a value it reads.
 
 ## Current non-goals
@@ -530,7 +549,8 @@ The project-wide list is [`design.md`](design.md#non-goals). Local to this featu
 - a generalized `oauth2RefreshToken { tokenEndpoint, clientId }` kind, or any provider-declared
   refresh callback: only owner-authored broker configuration may name a token endpoint, and one
   consumer does not justify the template machinery;
-- provider-visible secret references or a new HTTP/provider WIT package;
+- secret references in provider invoke input, or a new HTTP/provider WIT package; a command guest
+  reads a reference from argv only to propose it;
 - Vault dynamic leases and lifecycle;
 - 1Password direct service-account SDK mode or file fields;
 - AWS ambient credential/role chains, GCP ADC/WIF, Azure managed identity, kubeconfig exec plugins;
