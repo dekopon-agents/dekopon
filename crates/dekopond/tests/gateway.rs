@@ -2,7 +2,7 @@
 //! names the *sender's* principal rather than the daemon's.
 //!
 //! Nothing here is stubbed on the authority side. `dekopon-brokerd` runs for real, with its own
-//! owner-controlled configuration, the exact fetched echo provider component, an attestor grant,
+//! owner-controlled configuration, the checked-in cli-probe provider component, an attestor grant,
 //! identity mappings, and `via`-scoped rules. The only mock is the model endpoint, because a
 //! model is the one participant whose answer must be deterministic for a test to assert on it.
 //!
@@ -51,10 +51,6 @@ fn provider(name: &str) -> PathBuf {
         .join(format!("examples/providers/{name}-provider.wasm"))
 }
 
-fn echo_provider() -> PathBuf {
-    provider("echo")
-}
-
 fn temporary() -> tempfile::TempDir {
     let parent = std::env::temp_dir()
         .canonicalize()
@@ -73,7 +69,7 @@ fn write_owner_only(path: &Path, contents: &[u8]) {
 }
 
 /// The broker's whole authorization surface: both mapped principals may drive `chat-agent` and
-/// reach `echo.echo`, but only *via* the gateway that vouched for them.
+/// reach `cli-probe.upper`, but only *via* the gateway that vouched for them.
 ///
 /// The direct twin is deliberately absent. That is the whole point of `via`: configuring a gateway
 /// must not widen anything, so the daemon's own peer identity authorizes nothing on its own.
@@ -92,10 +88,10 @@ permit(principal == Dekopon::Principal::"{principal}",
        resource == Dekopon::Agent::"{AGENT}")
 when {{ context has via && context.via == "{GATEWAY_PRINCIPAL}" }};
 
-@id("chat-agent-echo-{suffix}")
+@id("chat-agent-probe-{suffix}")
 permit(principal == Dekopon::Principal::"{principal}",
-       action == Dekopon::Action::"echo.echo",
-       resource == Dekopon::Provider::"echo")
+       action == Dekopon::Action::"cli-probe.upper",
+       resource == Dekopon::Provider::"cli-probe")
 when {{ context has via && context.via == "{GATEWAY_PRINCIPAL}"
      && context has agent && context.agent == "{AGENT}" }};
 
@@ -130,7 +126,7 @@ fn broker_config(directory: &Path, uid: u32) -> Value {
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-gateway",
         "policiesPath": directory.join("policies.cedar"),
-        "providers": [echo_provider(), provider("memory-chat")],
+        "providers": [provider("cli-probe"), provider("memory-chat")],
         "identities": [{
             "uid": uid,
             "principal": GATEWAY_PRINCIPAL,
@@ -150,8 +146,8 @@ fn broker_config(directory: &Path, uid: u32) -> Value {
             {"subject": OTHER_MAPPED_SUBJECT, "principal": OTHER_MAPPED_PRINCIPAL}
         ],
         "constraintSets": {
-            "echo.echo": {
-                "provider": "echo", "effect": "read-only", "risk": "Low",
+            "cli-probe.upper": {
+                "provider": "cli-probe", "effect": "read-only", "risk": "Low",
                 "constraints": {"timeoutMs": 30_000, "maxOutputBytes": 1_048_576}
             },
             "memory.chat.record": {
@@ -989,8 +985,8 @@ async fn a_chat_message_reaches_a_provider_under_the_senders_own_principal() {
     // to that person — not to the process that relayed their message.
     let audit = Audit::exclusive().await;
     let fixture = boot(vec![
-        bash_tool_call("call-1", "echo.echo --message hi | jq -r .message"),
-        final_answer("The capability echoed hi."),
+        bash_tool_call("call-1", "probe upper --text hi | jq -r .text"),
+        final_answer("The capability upper-cased hi."),
     ])
     .await;
 
@@ -998,8 +994,17 @@ async fn a_chat_message_reaches_a_provider_under_the_senders_own_principal() {
     let reply = tokio::task::spawn_blocking(move || ask(&socket, MAPPED_SUBJECT, "say hi"))
         .await
         .expect("the request completes");
-    assert_eq!(reply, "The capability echoed hi.");
+    assert_eq!(reply, "The capability upper-cased hi.");
     assert_eq!(fixture.model_requests.load(Ordering::SeqCst), 2);
+    let tool_output = fixture
+        .prompt(1)
+        .into_iter()
+        .find_map(|(role, content)| (role == "tool").then_some(content))
+        .expect("second model turn carries the command output");
+    assert!(
+        tool_output.lines().any(|line| line == "HI"),
+        "the provider ran and upper-cased its text: {tool_output}"
+    );
 
     let _directory = fixture.shutdown().await;
 
@@ -1011,7 +1016,7 @@ async fn a_chat_message_reaches_a_provider_under_the_senders_own_principal() {
         .find(
             "broker.execution",
             &[
-                ("capability.id", "echo.echo"),
+                ("capability.id", "cli-probe.upper"),
                 ("principal", &principal),
                 ("via", &via),
                 ("subject", &subject),
@@ -1106,8 +1111,8 @@ async fn explicit_shared_scope_replays_attributed_history_across_two_principals(
     let fixture = boot_shared(vec![
         final_answer("Two things broke."),
         bash_tool_call(
-            "shared-participant-echo",
-            "echo.echo --message second-participant | jq -r .message",
+            "shared-participant-probe",
+            "probe upper --text second-participant | jq -r .text",
         ),
         final_answer("The second one was the database."),
     ])
@@ -1151,6 +1156,15 @@ async fn explicit_shared_scope_replays_attributed_history_across_two_principals(
             ("user".to_owned(), second_prompt),
         ],
         "the second authenticated principal receives one shared, provenance-labelled transcript"
+    );
+    let tool_output = fixture
+        .prompt(2)
+        .into_iter()
+        .find_map(|(role, content)| (role == "tool").then_some(content))
+        .expect("the second participant's follow-up turn carries the command output");
+    assert!(
+        tool_output.lines().any(|line| line == "SECOND-PARTICIPANT"),
+        "the second participant's command ran and upper-cased its text: {tool_output}"
     );
 
     let _directory = fixture.shutdown().await;
@@ -1347,8 +1361,8 @@ fn elapsed_seconds(tick: &str) -> u64 {
 
 fn tool_run() -> Vec<Value> {
     vec![
-        bash_tool_call("call-1", "echo.echo --message hi | jq -r .message"),
-        final_answer("The capability echoed hi."),
+        bash_tool_call("call-1", "probe upper --text hi | jq -r .text"),
+        final_answer("The capability upper-cased hi."),
     ]
 }
 
@@ -1408,7 +1422,7 @@ async fn the_local_driver_streams_a_whole_run_and_finalizes_the_answer_in_place(
             .last()
             .and_then(|line| line["reply"].as_str())
             .expect("the answer carries text"),
-        "The capability echoed hi."
+        "The capability upper-cased hi."
     );
     fixture.shutdown().await;
 }
@@ -1751,12 +1765,16 @@ async fn one_run_renders_at_off_plain_and_detailed() {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_trace_carries_one_progress_record_per_event_and_no_prompt_script_or_result_text() {
     const PLANTED_PROMPT: &str = "zarquon-the-planted-question";
-    // Echoed back by the provider, so this string is genuinely in the tool result the model read.
+    // Upper-cased by the provider, so its upper-case form is genuinely in the tool result the
+    // model read; both spellings are checked below.
     const PLANTED_RESULT: &str = "zarquon-the-planted-result";
 
     let audit = Audit::exclusive().await;
-    let script = format!("echo.echo --message {PLANTED_RESULT} | jq -r .message");
-    let responses = vec![bash_tool_call("call-1", &script), final_answer("Echoed.")];
+    let script = format!("probe upper --text {PLANTED_RESULT} | jq -r .text");
+    let responses = vec![
+        bash_tool_call("call-1", &script),
+        final_answer("Upper-cased."),
+    ];
     let fixture = boot(responses.clone()).await;
     let socket = fixture.socket();
     // Every line the driver wrote, not only the answer: `ask` keeps the reply and drops the
@@ -1769,7 +1787,7 @@ async fn the_trace_carries_one_progress_record_per_event_and_no_prompt_script_or
             .expect("the request completes");
     assert_eq!(
         lines.last().and_then(|line| line["reply"].as_str()),
-        Some("Echoed."),
+        Some("Upper-cased."),
         "{lines:?}"
     );
     fixture.shutdown().await;
@@ -1804,7 +1822,13 @@ async fn the_trace_carries_one_progress_record_per_event_and_no_prompt_script_or
             "a progress record outside the session's trace: {record} under {scope:?}"
         );
     }
-    for planted in [PLANTED_PROMPT, script.as_str(), PLANTED_RESULT] {
+    let planted_upper = PLANTED_RESULT.to_uppercase();
+    for planted in [
+        PLANTED_PROMPT,
+        script.as_str(),
+        PLANTED_RESULT,
+        planted_upper.as_str(),
+    ] {
         assert!(
             !progress.iter().any(|(record, _)| record.contains(planted)),
             "a progress record carried {planted}: {progress:#?}"
@@ -1839,5 +1863,5 @@ async fn the_trace_carries_one_progress_record_per_event_and_no_prompt_script_or
         .rev()
         .find(|record| record.contains("agent.model.answer"))
         .unwrap_or_else(|| panic!("the answer is on the trace: {records:#?}"));
-    assert!(answered.contains("Echoed."), "{answered}");
+    assert!(answered.contains("Upper-cased."), "{answered}");
 }
