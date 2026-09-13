@@ -1,5 +1,5 @@
 use dekopon_provider_sdk::{
-    CapabilityId, CommandInvocation, EffectKind, Provider, ProviderApiVersion, ProviderCapability,
+    CapabilityId, CommandRun, EffectKind, Provider, ProviderApiVersion, ProviderCapability,
     ProviderError, ProviderManifest, RiskLevel,
 };
 use dekopon_provider_storage::durable_files::{
@@ -70,14 +70,14 @@ impl Provider for StorageProbe {
         }
     }
 
-    fn resolve_command(argv: &[String]) -> Result<CommandInvocation, ProviderError> {
+    fn run_command(argv: &[String], _stdin: Option<&str>) -> Result<CommandRun, ProviderError> {
         if !argv.is_empty() {
             return Err(failure("invalid-command"));
         }
-        Ok(CommandInvocation {
-            capability: "storage-probe.run".parse().expect("static capability"),
-            input: json!({}),
-        })
+        Ok(CommandRun::proposal(
+            "storage-probe.run".parse().expect("static capability"),
+            json!({}),
+        ))
     }
 }
 
@@ -296,4 +296,4 @@ fn failure(code: &str) -> ProviderError {
     ProviderError::new(code, "storage probe failed")
 }
 
-dekopon_provider_sdk::export_provider_with_commands!(StorageProbe, bindings);
+dekopon_provider_sdk::export_provider_with_cli!(StorageProbe, bindings);

@@ -15,7 +15,7 @@ mod bindings {
 
 /// Reads the broker host's wall clock: milliseconds since 1970-01-01T00:00:00Z.
 ///
-/// Call it from `invoke` only. `describe`, `run-command`, and `resolve-command` are pure by
+/// Call it from `invoke` only. `describe` and `run-command` are pure by
 /// contract, and the broker host traps a component that reads the clock from any of them.
 #[must_use]
 pub fn now_unix_millis() -> u64 {

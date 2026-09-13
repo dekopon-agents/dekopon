@@ -964,25 +964,6 @@ pub enum BrokerRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attestation: Option<Attestation>,
     },
-    /// Rewrites one command word's arguments into a capability proposal: the legacy operation.
-    ///
-    /// Kept so a client that predates [`BrokerRequest::RunCommand`] keeps working against this
-    /// broker for one release. This client no longer sends it. A server answers it exactly as it
-    /// answers a run with no piped value, except that text a `run-command` guest rendered — a
-    /// help page, a usage error — has no shape on this answer and reaches the caller as a decline
-    /// carrying that text.
-    ///
-    /// Deliberately not gated on the caller's grants, for the reason [`BrokerRequest::RunCommand`]
-    /// gives.
-    ResolveCommand {
-        /// The on-behalf-of claim, or `None` to speak as the connected peer.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        attestation: Option<Attestation>,
-        /// The command word, which must belong to a loaded provider.
-        word: String,
-        /// Arguments as the script supplied them, **without** the word itself.
-        argv: Vec<String>,
-    },
     /// Runs one command word as the command-line program its provider declared.
     ///
     /// Deliberately not gated on the caller's grants. The run is a pure function inside the
@@ -1025,9 +1006,8 @@ pub enum BrokerRequest {
     /// Dedicated model-hidden recording operation after transport acceptance.
     ///
     /// Its own operation on purpose: the chat-memory record route is unreachable through
-    /// [`BrokerRequest::Invoke`], [`BrokerRequest::RunCommand`], and
-    /// [`BrokerRequest::ResolveCommand`] whatever attestation accompanies them, so recording
-    /// cannot be reached by a proposal a model shaped.
+    /// [`BrokerRequest::Invoke`] and [`BrokerRequest::RunCommand`] whatever attestation
+    /// accompanies them, so recording cannot be reached by a proposal a model shaped.
     RecordDeliveredTurn {
         /// The chat-scoped claim, bound to `turn.id`. A subject-only claim cannot record.
         attestation: Attestation,
@@ -1076,32 +1056,6 @@ impl ResponseEnvelope {
                 capabilities,
                 command_words,
                 chat_memory,
-            },
-        }
-    }
-
-    /// Creates a successful command-word rewrite response.
-    #[must_use]
-    pub const fn command_resolution(capability: CapabilityId, input: serde_json::Value) -> Self {
-        Self {
-            api_version: ProtocolVersion::V1Alpha2,
-            response: BrokerResponse::CommandResolution {
-                capability: Some(capability),
-                input: Some(input),
-                message: None,
-            },
-        }
-    }
-
-    /// Creates a response for a provider that declined to rewrite an argv.
-    #[must_use]
-    pub const fn command_declined(message: String) -> Self {
-        Self {
-            api_version: ProtocolVersion::V1Alpha2,
-            response: BrokerResponse::CommandResolution {
-                capability: None,
-                input: None,
-                message: Some(message),
             },
         }
     }
@@ -1163,20 +1117,6 @@ pub enum BrokerResponse {
     Invocation {
         /// Denied, failed, or succeeded result with public evidence.
         result: InvocationResult,
-    },
-    /// One command word rewritten into a capability proposal: the legacy answer to
-    /// [`BrokerRequest::ResolveCommand`].
-    ///
-    /// The provider may also decline, which is a usage error rather than a failure: `message`
-    /// carries the provider's own text for the model to read. Text a guest rendered arrives the
-    /// same way, because this shape has nowhere else to put it.
-    CommandResolution {
-        /// The capability the word maps to, absent when the provider declined.
-        capability: Option<CapabilityId>,
-        /// The input object assembled from the arguments, absent when the provider declined.
-        input: Option<serde_json::Value>,
-        /// The provider's message when it declined to rewrite this argv.
-        message: Option<String>,
     },
     /// One command word run to completion: the answer to [`BrokerRequest::RunCommand`].
     ///
@@ -1495,9 +1435,9 @@ impl BrokerClient {
                 chat_memory,
             } => Ok((capabilities, command_words, chat_memory)),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::CommandResolution { .. }
-            | BrokerResponse::CommandRun { .. }
-            | BrokerResponse::Invocation { .. } => Err(ClientError::UnexpectedResponse),
+            BrokerResponse::CommandRun { .. } | BrokerResponse::Invocation { .. } => {
+                Err(ClientError::UnexpectedResponse)
+            }
         }
     }
 
@@ -1532,9 +1472,9 @@ impl BrokerClient {
         {
             BrokerResponse::CommandRun { result } => Ok(result),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::Capabilities { .. }
-            | BrokerResponse::CommandResolution { .. }
-            | BrokerResponse::Invocation { .. } => Err(ClientError::UnexpectedResponse),
+            BrokerResponse::Capabilities { .. } | BrokerResponse::Invocation { .. } => {
+                Err(ClientError::UnexpectedResponse)
+            }
         }
     }
 
@@ -1554,9 +1494,9 @@ impl BrokerClient {
         {
             BrokerResponse::Invocation { result } => Ok(result),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::Capabilities { .. }
-            | BrokerResponse::CommandResolution { .. }
-            | BrokerResponse::CommandRun { .. } => Err(ClientError::UnexpectedResponse),
+            BrokerResponse::Capabilities { .. } | BrokerResponse::CommandRun { .. } => {
+                Err(ClientError::UnexpectedResponse)
+            }
         }
     }
 
@@ -1573,9 +1513,9 @@ impl BrokerClient {
         {
             BrokerResponse::Invocation { result } => Ok(result),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
-            BrokerResponse::Capabilities { .. }
-            | BrokerResponse::CommandResolution { .. }
-            | BrokerResponse::CommandRun { .. } => Err(ClientError::UnexpectedResponse),
+            BrokerResponse::Capabilities { .. } | BrokerResponse::CommandRun { .. } => {
+                Err(ClientError::UnexpectedResponse)
+            }
         }
     }
 
