@@ -197,9 +197,10 @@ gateway:
           appTokenEnv: DEKOPOND_SLACK_APP_TOKEN
           botTokenEnv: DEKOPOND_SLACK_BOT_TOKEN
           experience: agent
-          activity:
+          liveness:
             mode: native
             classicFallback: reaction
+            progress: message
       models:
         - name: hosted-reasoning
           kind: openaiCompatible

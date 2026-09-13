@@ -6,7 +6,7 @@
 //! cheapest possible refusal, and one that cannot be talked out of by the message text.
 
 use std::{
-    collections::{BTreeSet, HashMap, hash_map::Entry},
+    collections::{BTreeMap, BTreeSet, HashMap, hash_map::Entry},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU8, Ordering},
@@ -15,7 +15,7 @@ use std::{
 };
 
 use dekopon_agent::{
-    BrokerLeg, BrokerLegError, IdSequence, ShellRuntime,
+    BrokerLeg, BrokerLegError, CancelSource, IdSequence, ProgressEvent, ProgressSink, ShellRuntime,
     attachment::{ChatAssetInputs, ReplyAttachments},
     meta::{
         AgentConfigView, ConversationConfigView, ConversationScopeView, SessionConfigView,
@@ -38,21 +38,21 @@ use dekopon_model::{
 use dekopon_process::{CancelHandle, CancelSignal};
 use dekopon_shell::{CapabilityInvoker as _, Limits as ShellLimits};
 use thiserror::Error;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument as _;
 
 use crate::{
-    activity::{ActivityControl, ActivityLease},
     asset::{self, AssetAccess, AssetStore, SessionAssets},
     config::{
         ConversationPolicy, ConversationScope, ConversationWindow, ModelConfig, ResolvedBroker,
+        ResolvedLiveness,
     },
     conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
+    progress::{ProgressInputs, ProgressPolicy, Terminal},
     routes::BoundRoute,
     transport::{
-        AssetFetcher, ChatActivity, ChatReplier, InboundMessage, OutboundReply, ReplyTarget,
-        SessionStop, ThreadOwnership, TransportError, bound_inbound, bound_outbound,
-        credential_from,
+        AssetFetcher, CancelRequest, ChatDriver, InboundMessage, OutboundReply, ThreadOwnership,
+        TransportError, bound_inbound, bound_outbound, credential_from,
     },
 };
 
@@ -68,7 +68,7 @@ pub(crate) const BUSY_REPLY: &str = "I'm busy — try again shortly.";
 pub(crate) const FAILURE_REPLY: &str = "The agent could not complete this request.";
 /// Fixed warning when capability work may have happened but the model produced no report.
 pub(crate) const UNREPORTED_WORK_REPLY: &str = "The agent attempted capability work but could not report the result. Check the audit before retrying.";
-/// Confirmation sent when Slack's authenticated Agent-session Stop event wins the completion race.
+/// Confirmation a cancelled session ends with, and the default of `liveness.templates.stopped`.
 pub(crate) const STOPPED_REPLY: &str = "Stopped.";
 /// One transport-independent normalization for a successful empty model answer.
 pub(crate) const EMPTY_REPLY: &str = "[empty response]";
@@ -139,18 +139,25 @@ impl ModelFactory for ConfiguredModels {
                 model,
                 api_key_env,
                 timeout_ms,
+                stream,
                 ..
             } => {
                 let bearer_token = api_key_env
                     .as_deref()
                     .map(|variable| model_credential(model, variable, std::env::var_os(variable)))
                     .transpose()?;
-                Ok(Arc::new(OpenAiChatModel::new(
-                    endpoint,
-                    model,
-                    bearer_token,
-                    std::time::Duration::from_millis(*timeout_ms),
-                )?))
+                Ok(Arc::new(
+                    OpenAiChatModel::new(
+                        endpoint,
+                        model,
+                        bearer_token,
+                        std::time::Duration::from_millis(*timeout_ms),
+                    )?
+                    // The configured answer to "does this endpoint stream", which is the only
+                    // place it is decided: the client defaults to streaming and this turns it off
+                    // for the one endpoint an operator found it broken on.
+                    .with_streaming(*stream),
+                ))
             }
             ModelConfig::ChatgptSubscription {
                 model,
@@ -272,6 +279,12 @@ impl Drop for SessionAdmission {
 #[derive(Clone)]
 pub(crate) struct SessionCancellation {
     state: Arc<AtomicU8>,
+    /// Why the session stopped, written by whichever caller won the race and read by the policy
+    /// task that renders the ending.
+    source: Arc<Mutex<Option<CancelSource>>>,
+    /// Wakes the progress policy the instant the race is decided, so the screen changes while the
+    /// model request the session is parked on is still in flight.
+    woken: Arc<Notify>,
     /// Fired exactly once, by the caller that won the race to cancel, into the broker leg's
     /// in-flight command-word run.
     handle: CancelHandle,
@@ -283,38 +296,84 @@ impl SessionCancellation {
         let (handle, signal) = CancelSignal::pair();
         Self {
             state: Arc::new(AtomicU8::new(SESSION_RUNNING)),
+            source: Arc::new(Mutex::new(None)),
+            woken: Arc::new(Notify::new()),
             handle,
             signal,
         }
     }
 
-    fn claim_completion(&self) -> bool {
-        self.state
-            .compare_exchange(
-                SESSION_RUNNING,
-                SESSION_COMPLETING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
+    /// Claims this session as ended by its own work, so a stop that arrives afterwards loses.
+    ///
+    /// Claimed twice on the answering path, and idempotent for that reason. The progress sink
+    /// claims the instant the prompt loop reports `ProgressEvent::Finished`, on the loop's own
+    /// thread, because that is where the answer stops being stoppable; the session claims again
+    /// when it resumes to deliver it. Without the first claim the two are separated by a thread
+    /// hand-off, and a stop word landing inside it won a race whose subject had already ended —
+    /// the policy wrote `Stopped.` under the answer the person was already reading.
+    ///
+    /// `SESSION_COMPLETING` is only ever written here, so finding it already set means this
+    /// session won the race earlier rather than lost it.
+    #[must_use]
+    pub(crate) fn claim_completion(&self) -> bool {
+        match self.state.compare_exchange(
+            SESSION_RUNNING,
+            SESSION_COMPLETING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => true,
+            Err(state) => state == SESSION_COMPLETING,
+        }
     }
 
-    pub(crate) fn cancel(&self) -> bool {
-        let cancelled = self
-            .state
-            .compare_exchange(
-                SESSION_RUNNING,
-                SESSION_CANCELLED,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok();
+    /// Wins the race to stop this session, recording who asked.
+    ///
+    /// The origin is written under the same lock that decides the race, so anything that observes
+    /// the cancelled state and then asks for the origin waits for the winner's write rather than
+    /// reading the absence that preceded it.
+    pub(crate) fn cancel(&self, source: CancelSource) -> bool {
+        let cancelled = {
+            let mut recorded = self.source.lock().expect("session cancellation source");
+            let won = self
+                .state
+                .compare_exchange(
+                    SESSION_RUNNING,
+                    SESSION_CANCELLED,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok();
+            if won {
+                *recorded = Some(source);
+            }
+            won
+        };
         // Only the winner fires it, so a session that completed normally — whose drop guard
         // still calls this — never aborts a broker round trip it already finished.
         if cancelled {
             self.handle.cancel();
+            self.woken.notify_waiters();
         }
         cancelled
+    }
+
+    /// Who stopped this session, once one caller has won the race.
+    pub(crate) fn source(&self) -> Option<CancelSource> {
+        *self.source.lock().expect("session cancellation source")
+    }
+
+    /// Resolves as soon as this session is cancelled, including when it already was.
+    pub(crate) async fn cancelled(&self) {
+        loop {
+            // Registered before the state is read, which is what makes a cancel between the two
+            // a wakeup rather than a missed one.
+            let woken = self.woken.notified();
+            if self.state.load(Ordering::Acquire) == SESSION_CANCELLED {
+                return;
+            }
+            woken.await;
+        }
     }
 
     /// The signal the broker leg supervises its command-word runs against.
@@ -334,7 +393,12 @@ struct CancellationOnDrop(SessionCancellation);
 
 impl Drop for CancellationOnDrop {
     fn drop(&mut self) {
-        let _ = self.0.cancel();
+        #[allow(
+            clippy::let_underscore_must_use,
+            reason = "the bool says whether this drop won the race; a session that already \
+                      completed or was already stopped needs nothing more done about it"
+        )]
+        let _ = self.0.cancel(CancelSource::Operator);
     }
 }
 
@@ -344,18 +408,45 @@ type ActiveSessionKey = (String, String);
 struct ActiveSession {
     subject: dekopon_core::ExternalSubject,
     cancellation: SessionCancellation,
-    activity: ActivityControl,
-    replier: Arc<dyn ChatReplier>,
-    reply: ReplyTarget,
 }
 
-/// A durable response to one native Stop event, sent outside the transport-reader task.
-pub(crate) struct StopReply {
-    pub replier: Arc<dyn ChatReplier>,
-    pub target: ReplyTarget,
+/// What a cancel request found.
+///
+/// Four answers rather than a bool because the caller acts differently on each: a stop word with no
+/// session behind it is an ordinary message to answer, another person's press is acknowledged and
+/// ignored, and a session that already finished needs nothing done about it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CancelOutcome {
+    /// This request won the race; the session's own policy task writes the ending.
+    Cancelled,
+    /// No session is running in that conversation.
+    NoSession,
+    /// A session is running, but somebody else started it.
+    OtherSubject,
+    /// The session had already finished or already been stopped.
+    AlreadyEnded,
 }
 
-/// Active Agent sessions keyed only by authenticated transport-native conversation identity.
+impl CancelOutcome {
+    /// Stable low-cardinality reason this request stopped nothing, or `None` when it did.
+    ///
+    /// One definition, because the routing loop reports the same set from two places: an inbound
+    /// stop word and an authenticated press on a control.
+    pub(crate) const fn ignored_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Cancelled => None,
+            Self::NoSession => Some("no-session"),
+            Self::OtherSubject => Some("other-subject"),
+            Self::AlreadyEnded => Some("already-ended"),
+        }
+    }
+}
+
+/// Every running session, keyed only by authenticated transport-native conversation identity.
+///
+/// Every session registers, not only the ones on a transport with a native Stop control: the stop
+/// word and the wall-clock bound reach a session through this registry, and they exist on every
+/// transport.
 #[derive(Clone, Default)]
 pub(crate) struct ActiveSessions {
     entries: Arc<Mutex<HashMap<ActiveSessionKey, ActiveSession>>>,
@@ -366,16 +457,11 @@ impl ActiveSessions {
         &self,
         message: &InboundMessage,
         cancellation: SessionCancellation,
-        activity: ActivityControl,
-        replier: Arc<dyn ChatReplier>,
     ) -> ActiveRegistration {
         let key = (message.transport.clone(), message.conversation_id.clone());
         let session = ActiveSession {
             subject: message.subject.clone(),
             cancellation: cancellation.clone(),
-            activity,
-            replier,
-            reply: message.reply.clone(),
         };
         let registered = match self
             .entries
@@ -402,22 +488,31 @@ impl ActiveSessions {
         }
     }
 
-    pub(crate) fn stop(&self, request: &SessionStop) -> Option<StopReply> {
+    /// Stops the session one authenticated request names, if that sender is the one running it.
+    pub(crate) fn cancel(&self, request: &CancelRequest) -> CancelOutcome {
         let key = (request.transport.clone(), request.conversation_id.clone());
-        let session = self
+        let Some(session) = self
             .entries
             .lock()
             .expect("active session registry")
             .get(&key)
-            .cloned()?;
-        if session.subject != request.subject || !session.cancellation.cancel() {
-            return None;
+            .cloned()
+        else {
+            return CancelOutcome::NoSession;
+        };
+        // The canonical rendering on both sides: every origin proves the same thing about the
+        // sender, and the registry holds the typed subject the transport envelope produced.
+        if session.subject.canonical() != request.subject {
+            return CancelOutcome::OtherSubject;
         }
-        session.activity.finish();
-        Some(StopReply {
-            replier: session.replier,
-            target: session.reply,
-        })
+        if session
+            .cancellation
+            .cancel(CancelSource::User { via: request.via })
+        {
+            CancelOutcome::Cancelled
+        } else {
+            CancelOutcome::AlreadyEnded
+        }
     }
 }
 
@@ -454,11 +549,11 @@ pub(crate) struct SessionRunner {
     pub assets: Arc<AssetStore>,
     /// How each transport turns one of those references back into bytes, by transport name.
     pub asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>>,
-    /// Optional service-native in-flight activity, by transport name.
-    pub activities: HashMap<String, Arc<dyn ChatActivity>>,
+    /// What each transport shows while a session runs, by transport name.
+    pub liveness: BTreeMap<String, Arc<ResolvedLiveness>>,
     /// Bounded transport-owned Slack Agent thread claims, by transport name.
     pub thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>>,
-    /// Native Agent sessions that can receive authenticated Stop events.
+    /// Every running session, so any authenticated cancel can reach the one it names.
     pub active_sessions: ActiveSessions,
 }
 
@@ -501,7 +596,7 @@ pub(crate) async fn run_session(
     runner: Arc<SessionRunner>,
     route: BoundRoute,
     mut message: InboundMessage,
-    replier: Arc<dyn ChatReplier>,
+    driver: Arc<dyn ChatDriver>,
 ) {
     // The trace already exists: the transport opened `transport.receive` when the envelope arrived,
     // which is what puts the acknowledgment and the routing decision in front of this span rather
@@ -518,7 +613,7 @@ pub(crate) async fn run_session(
             outcome = tracing::field::Empty
         )
     };
-    let outcome = execute(runner, route, message, replier)
+    let outcome = execute(runner, route, message, driver)
         .instrument(span.clone())
         .await;
     span.record("outcome", outcome);
@@ -528,7 +623,7 @@ async fn execute(
     runner: Arc<SessionRunner>,
     route: BoundRoute,
     message: InboundMessage,
-    replier: Arc<dyn ChatReplier>,
+    driver: Arc<dyn ChatDriver>,
 ) -> &'static str {
     // Who said it and what they said, on the log record rather than the span: chat text is
     // unbounded and span attributes are the wrong container for it. A person talking to a Dekopon
@@ -552,7 +647,7 @@ async fn execute(
     let Some(admission) = runner.gate.admit(key) else {
         tracing::info!(event = "gateway_session_rejected", reason = "busy");
         if runner.reply_on_busy {
-            answer(&replier, &message, BUSY_REPLY).await;
+            answer(&driver, &message, BUSY_REPLY).await;
         }
         return "busy";
     };
@@ -561,7 +656,7 @@ async fn execute(
     // conversation, which makes "was this session seeded" a filter rather than a guess. They stay a
     // count and a byte total because a span attribute is the wrong container for unbounded text;
     // the history itself rides `agent.model.prompt` on the log stream.
-    let outcome = session(&runner, &route, &message, &replier)
+    let outcome = session(&runner, &route, &message, &driver)
         .instrument(tracing::info_span!(
             "gateway.session",
             agent = %route.agent,
@@ -577,8 +672,21 @@ async fn session(
     runner: &SessionRunner,
     route: &BoundRoute,
     message: &InboundMessage,
-    replier: &Arc<dyn ChatReplier>,
+    driver: &Arc<dyn ChatDriver>,
 ) -> &'static str {
+    // Registered before the broker is reached, and held for the whole function: a session parked
+    // on its capability listing is a session somebody is waiting on, and a stop aimed at it must
+    // find it rather than be told nothing is running. Registering publishes nothing — the leg
+    // takes the cancel signal once it exists, the policy task starts later still, and a session
+    // refused here deregisters on the way out.
+    //
+    // Every session registers, on every transport: a stop word, a button, a native Stop, and the
+    // wall-clock bound all reach a session through this one registry, and only the first of those
+    // is limited to the transports with a native control.
+    let cancellation = SessionCancellation::new();
+    let _active_registration = runner
+        .active_sessions
+        .register(message, cancellation.clone());
     let leg = match connect(runner, route, message).await {
         Ok(leg) => leg,
         // A refused attestation never reaches a decision record, so it arrives as a transport-level
@@ -592,7 +700,7 @@ async fn session(
                 event = "gateway_session_rejected",
                 reason = "attestation-refused"
             );
-            answer(replier, message, UNAUTHORIZED_REPLY).await;
+            answer(driver, message, UNAUTHORIZED_REPLY).await;
             return "unauthorized";
         }
         Err(error) => {
@@ -600,7 +708,7 @@ async fn session(
                 event = "gateway_session_failed",
                 category = error.category()
             );
-            answer(replier, message, FAILURE_REPLY).await;
+            answer(driver, message, FAILURE_REPLY).await;
             return "failed";
         }
     };
@@ -622,7 +730,7 @@ async fn session(
             .conversations
             .remove(&key, EvictionReason::GrantChanged);
         tracing::info!(event = "gateway_session_rejected", reason = "unauthorized");
-        answer(replier, message, UNAUTHORIZED_REPLY).await;
+        answer(driver, message, UNAUTHORIZED_REPLY).await;
         return "unauthorized";
     }
     // An Agent thread becomes a continuation surface only after this exact sender's fresh broker
@@ -739,12 +847,16 @@ async fn session(
     // the first conversation forever while quietly mislabeling every later one.
     let options = CompletionOptions::default().with_prompt_cache_key(cache_key.clone());
 
-    // Activity is armed only after the fresh authorization gate and immediately before the costly
-    // model/tool work. The registry and cancellation probe share one generation, so a native Slack
-    // Stop event can win exactly once against the terminal answer.
-    let driver = runner.activities.get(&message.transport).cloned();
-    let activity_enabled = driver.is_some() && message.activity.is_some();
-    let cancellation = SessionCancellation::new();
+    // Liveness is armed only after the fresh authorization gate and immediately before the costly
+    // model/tool work, which is later than registration on purpose: a stop may reach a session
+    // from the moment it exists, but nothing is *shown* to anyone until the broker has said this
+    // sender may drive this agent. The registry and the probe share one generation, so one cancel
+    // can win exactly once against the terminal answer.
+    let liveness = runner
+        .liveness
+        .get(&message.transport)
+        .cloned()
+        .unwrap_or_default();
     // A Stop that wins the race also aborts whichever broker command-word run the script is
     // parked on, so the blocking loop reaches its next cancellation check instead of waiting out
     // a broker that is still working.
@@ -765,17 +877,25 @@ async fn session(
             route.chat_asset_inputs.to_vec(),
         ))
     };
-    let mut activity = ActivityLease::start(driver, message.activity.clone());
-    let _active_registration = activity_enabled.then(|| {
-        runner.active_sessions.register(
-            message,
-            cancellation.clone(),
-            activity.control(),
-            Arc::clone(replier),
-        )
+    let (mut progress, sink) = ProgressPolicy::start(ProgressInputs {
+        driver: Arc::clone(driver),
+        target: message.liveness.clone(),
+        reply: message.reply.clone(),
+        transport: message.transport.clone(),
+        detail: route.progress_detail,
+        liveness: Arc::clone(&liveness),
+        cancellation: cancellation.clone(),
+        max_duration: route.max_duration,
+    });
+    // The gateway emits `Started` because the gateway owns the grant: nothing is shown before the
+    // broker has said this sender may drive this agent, and the wall-clock budget is counted from
+    // here rather than from receipt, because waiting for an admission slot is not agent time.
+    sink.emit(ProgressEvent::Started {
+        agent: route.agent.to_string(),
+        max_steps: limits.max_steps,
     });
     // Declared last so task abortion drops this guard first, marking the blocking loop cancelled
-    // before activity/registry cleanup releases the rest of the async session state.
+    // before the policy handle and the registry release the rest of the async session state.
     let _cancel_on_drop = CancellationOnDrop(cancellation.clone());
 
     // The prompt loop and the interpreter are both synchronous and both can block for a long time
@@ -791,6 +911,17 @@ async fn session(
     let skills = Arc::clone(&route.skills);
     let improvement_suggestions = route.improvement_suggestions;
     let session_attachments = Arc::clone(&attachments);
+    let progress_sink = Arc::clone(&sink) as Arc<dyn ProgressSink>;
+    // The same sink on the broker leg, because the two halves of a run are reported by two
+    // different owners: the prompt loop knows a turn happened and a script ran, and only the leg
+    // knows which command word it invoked and how many of the session's calls that spent. Without
+    // this the surface can say it is working but never which capability is running. The ceiling
+    // travels with the sink because `ToolStarted` renders "3 of 16", and the route's budget is
+    // spent across every script of one session, so this caller is the only one that knows it.
+    let leg = leg.with_progress(Arc::clone(&progress_sink), limits.max_capability_calls);
+    // Moved into the blocking task so the policy's event queue closes when the loop ends, which is
+    // how the policy learns there is nothing more coming without a second signal to keep in step.
+    drop(sink);
     let result = tokio::task::spawn_blocking(move || {
         let _entered = blocking_span.enter();
         // Resolved before the accumulator exists, so a model client that cannot be constructed
@@ -814,7 +945,8 @@ async fn session(
             .with_options(&options)
             .with_assets(assets.as_ref())
             .with_agent_config(&agent_config)
-            .with_cancellation(&prompt_cancellation);
+            .with_cancellation(&prompt_cancellation)
+            .with_progress(Arc::clone(&progress_sink));
         if improvement_suggestions {
             inputs = inputs.with_improvement_suggestions();
         }
@@ -847,15 +979,17 @@ async fn session(
         Ok(session) => session,
         Err(_) => {
             if !cancellation.claim_completion() {
-                tracing::info!(event = "gateway_session_cancelled");
-                activity.finish_in_background();
-                return "cancelled";
+                return stopped(&mut progress, &cancellation).await;
             }
             // The task itself died, so there is no history to trust and nothing to record.
-            activity.seal();
+            progress.seal();
             tracing::error!(event = "gateway_session_failed", category = "session-task");
-            let replied = answer(replier, message, FAILURE_REPLY).await;
-            activity.finish_in_background();
+            let replied = progress
+                .terminal(Terminal::Failed(bound_outbound(
+                    liveness.templates.failed(),
+                )))
+                .await;
+            progress.finish_in_background();
             return if replied { "failed" } else { "reply-failed" };
         }
     };
@@ -864,15 +998,13 @@ async fn session(
         || cancellation.is_cancelled()
         || !cancellation.claim_completion()
     {
-        tracing::info!(event = "gateway_session_cancelled");
-        activity.finish_in_background();
-        return "cancelled";
+        return stopped(&mut progress, &cancellation).await;
     }
 
-    // Seal renewal before terminal delivery or deliberate silence, but do no remote cleanup on
-    // this latency-sensitive path. Slack's explicit `active` and reaction removal run only after
-    // the completion decision is durable in gateway state.
-    activity.seal();
+    // Seal rendering before terminal delivery or deliberate silence, but do no remote cleanup on
+    // this latency-sensitive path. The service's own indicators return to rest only after the
+    // completion decision is durable in gateway state.
+    progress.seal();
 
     // The exchange when the session answered, and the bare question when it did not. The fixed
     // failure line is never stored: it is this daemon's sentence rather than the agent's, and
@@ -889,51 +1021,84 @@ async fn session(
         &outcome,
         Ok(outcome) if outcome.disposition == ReplyDisposition::Suppress
     ) {
-        // No reply call means no acceptance receipt and therefore no durable recording. Native
-        // activity still returns to its inactive state through the separate cosmetic surface. The
-        // unanswered in-process turn was committed above so a later continuation still sees what
-        // the person said. Activity cleanup remains best effort and cannot create a chat message.
-        activity.finish_in_background();
+        // No reply call means no acceptance receipt and therefore no durable recording. The
+        // progress message is still removed: a surface left saying "Working on it…" is a claim
+        // about a session that ended. The unanswered in-process turn was committed above so a
+        // later continuation still sees what the person said.
+        progress.terminal(Terminal::Silent).await;
+        progress.finish_in_background();
         return "declined";
     }
 
-    let (answer_text, completed_outcome, recordable) = match outcome {
-        Ok(outcome) if outcome.answer.is_empty() => (EMPTY_REPLY.to_owned(), "answered", true),
-        Ok(outcome) => (outcome.answer, "answered", true),
+    let (terminal, completed_outcome, delivered_answer) = match outcome {
+        Ok(outcome) => {
+            let text = bound_outbound(if outcome.answer.is_empty() {
+                EMPTY_REPLY
+            } else {
+                outcome.answer.as_str()
+            });
+            let reply = if attachments.is_empty() {
+                OutboundReply::text(text.clone())
+            } else {
+                OutboundReply::with_images(text.clone(), attachments)
+            };
+            (Terminal::Answered(reply), "answered", Some(text))
+        }
         Err(SessionError::Prompt(PromptError::UnreportedCapabilityWork)) => {
             tracing::error!(
                 event = "gateway_session_failed",
                 category = "unreported-capability-work"
             );
-            (UNREPORTED_WORK_REPLY.to_owned(), "failed", false)
+            (
+                Terminal::Failed(UNREPORTED_WORK_REPLY.to_owned()),
+                "failed",
+                None,
+            )
         }
         Err(error) => {
             tracing::error!(
                 event = "gateway_session_failed",
                 category = error.category()
             );
-            (FAILURE_REPLY.to_owned(), "failed", false)
+            (
+                Terminal::Failed(bound_outbound(liveness.templates.failed())),
+                "failed",
+                None,
+            )
         }
     };
-    let delivered_answer = bound_outbound(&answer_text);
-    let reply = if attachments.is_empty() {
-        OutboundReply::text(delivered_answer.clone())
-    } else {
-        OutboundReply::with_images(delivered_answer.clone(), attachments)
-    };
-    let delivered = deliver(replier, message, reply).await;
-    activity.finish_in_background();
+    // The policy writes it, because the policy owns the one message on screen: an answer becomes
+    // that message in place where the transport can, and falls back to removing it and replying.
+    let delivered = progress.terminal(terminal).await;
+    progress.finish_in_background();
     if delivered {
-        if recordable
-            && memory_surface.is_some()
+        if memory_surface.is_some()
+            && let Some(answer) = delivered_answer
             && let Some(claim) = chat_claim
         {
-            record_delivered_turn(runner, message, claim, delivered_answer).await;
+            record_delivered_turn(runner, message, claim, answer).await;
         }
         completed_outcome
     } else {
         "reply-failed"
     }
+}
+
+/// The one ending a cancelled session has, written by the task that owns its surface.
+///
+/// The policy has usually rendered it already, from the notification the cancel raised, which is
+/// what puts `Stopped.` on screen while the model request this session was parked on is still in
+/// flight. Handing it the terminal again is the ordered handoff for the case where it had not yet
+/// been scheduled, and a no-op when it had.
+async fn stopped(
+    progress: &mut ProgressPolicy,
+    cancellation: &SessionCancellation,
+) -> &'static str {
+    tracing::info!(event = "gateway_session_cancelled");
+    let by = cancellation.source().unwrap_or(CancelSource::Operator);
+    progress.terminal(Terminal::Cancelled { by }).await;
+    progress.finish_in_background();
+    "cancelled"
 }
 
 fn claim_thread_ownership(runner: &SessionRunner, message: &InboundMessage) {
@@ -1226,16 +1391,11 @@ fn memory_record_category(error: &MemoryRecordFailure) -> &'static str {
 /// The outbound bound is applied here, once, rather than in each transport: a model writes this
 /// text, every chat service rejects or mangles an oversized post, and one bound at the session
 /// boundary is one place to read rather than three places to keep in agreement.
-async fn answer(replier: &Arc<dyn ChatReplier>, message: &InboundMessage, text: &str) -> bool {
-    deliver(replier, message, OutboundReply::text(bound_outbound(text))).await
-}
-
-async fn deliver(
-    replier: &Arc<dyn ChatReplier>,
-    message: &InboundMessage,
-    reply: OutboundReply,
-) -> bool {
-    match replier.reply(message.reply.clone(), reply).await {
+async fn answer(driver: &Arc<dyn ChatDriver>, message: &InboundMessage, text: &str) -> bool {
+    match driver
+        .reply(&message.reply, OutboundReply::text(bound_outbound(text)))
+        .await
+    {
         Ok(()) => true,
         Err(error) => {
             tracing::error!(event = "gateway_reply_failed", category = error.category());

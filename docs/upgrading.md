@@ -8,6 +8,53 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## `activity:` becomes `liveness:` (0.14.0, unreleased)
+
+Rename the `activity:` block on every transport in the gateway configuration to `liveness:` before
+upgrading. No transport has such a field any more, so a file that still carries one never decodes:
+startup stops there, and the refusal names `liveness:` and says the old `activity.classicFallback`
+moves to `liveness.classicFallback`, rather than listing the keys a transport does accept. There is
+no alias and no migration read — a block that had become a no-op would leave an operator believing a
+surface was configured — and because the file never decodes, this is the one gateway refusal that
+arrives on its own instead of beside every other problem in the file.
+
+```yaml
+# before
+    activity:
+      mode: native
+      classicFallback: reaction
+
+# after
+    liveness:
+      mode: native                 # off | native, unchanged
+      classicFallback: reaction    # unchanged; slackSocketMode only, and refused elsewhere
+      progress: message            # new; off by default, so nothing new is posted until you ask
+      stream: false                # new; refused on whatsappCloudApi
+      cancelButton: false          # new; refused on whatsappCloudApi and on experience: agent
+```
+
+`mode` and `classicFallback` keep their meanings and their values, so a rename alone reproduces
+today's behavior exactly: `progress`, `stream`, and `cancelButton` all default off. The block is now
+accepted on `whatsappCloudApi` and `local` too, which previously had none.
+
+Three settings are new and optional:
+
+- **`stopWords:`**, top-level, default `[stop, cancel]`. A message that is exactly one of these
+  words — after the bot mention and trailing punctuation are stripped, case-insensitively — stops
+  the session the same sender is running in that conversation. Set it to your deployment's language,
+  or leave it out. An empty list is refused: to switch this off, there is nothing to switch off,
+  because a stop word fires only against that sender's own running session.
+- **`progressDetail:`** on a route, `off | plain | detailed`, default `plain`. `off` reproduces the
+  previous release's behavior for a route whose transport also leaves `progress: off`.
+- **`limits.maxDurationMs`** on a route, optional. A wall-clock bound on one session counted from
+  the moment the agent starts working. `0` is refused.
+
+`ChatModel` changed shape in the same release: `complete` now takes a per-event callback and
+streaming is not optional at the trait, and `complete_with` is gone. That reaches an operator only
+through the new `stream:` field on an `openaiCompatible` model (default `true`); the
+`chatgptSubscription` backend has always streamed and has no such field. An embedder that called
+`dekopon_agent`'s loop directly compiles against the new signature or pins 0.13.
+
 ## Telemetry payloads (0.13.0)
 
 Remove `telemetryPayloads` from the `telemetry:` block of both `broker.yaml` and the gateway

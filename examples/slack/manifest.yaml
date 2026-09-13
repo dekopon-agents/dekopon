@@ -4,7 +4,7 @@
 # pick the workspace, and paste this file.
 #
 # This classic/free-workspace profile requests the reply surface plus the explicitly configured
-# tangerine-reaction activity fallback:
+# tangerine-reaction liveness fallback:
 #
 # - Socket Mode, so events arrive over an outbound WebSocket wakeup and the gateway
 #   needs no public HTTP endpoint.
@@ -14,9 +14,11 @@
 #   traffic by design.
 # - `chat:write`, so the gateway can reply.
 # - `files:write`, so an explicitly image-enabled route can share its one generated PNG.
-# - `reactions:write`, so `activity.mode: native` with `classicFallback: reaction`
+# - `reactions:write`, so `liveness.mode: native` with `classicFallback: reaction`
 #   can add and later remove the fixed `:tangerine:` in-flight marker. Remove this scope and leave
-#   activity off when even that cosmetic message mutation is unwanted.
+#   liveness off when even that cosmetic message mutation is unwanted.
+# - `chat:write` also covers editing and deleting the gateway's own progress message, which is what
+#   `liveness.progress: message` posts and then finalizes as the answer.
 #
 # Two tokens exist after creation, and neither lives in any Dekopon config file —
 # dekopond reads both from environment variables named in its `transports` entry:
@@ -26,7 +28,7 @@
 #    declare app-level tokens; this step is always manual. This token opens the
 #    Socket Mode connection.
 # 2. Bot token (`xoxb-...`): "Install App" → install to the workspace. This token
-#    sends the configured reaction activity and replies.
+#    sends the configured reaction, the progress message, and replies.
 #
 # To extend later: seeing every message in a public channel (not just mentions) needs
 # the `channels:history` scope plus the `message.channels` event; private channels

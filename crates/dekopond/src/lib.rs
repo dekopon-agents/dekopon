@@ -23,11 +23,11 @@
 #![forbid(unsafe_code)]
 #![cfg(unix)]
 
-mod activity;
 mod asset;
 mod cache_key;
 mod config;
 mod conversation;
+mod progress;
 mod routes;
 mod session;
 mod transport;
@@ -48,11 +48,11 @@ use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinSet, time::timeout};
 
 pub use config::{
-    ActivityMode, CONFIG_API_VERSION, ConfigApiVersion, ConfigError, ConfigProblem,
-    ConversationConfig, ConversationPolicy, ConversationScope, ConversationWindow, DekopondConfig,
-    HARD_MAX_CONFIG_BYTES, NativeActivityConfig, ProviderAttachmentsConfig, ResolvedConfig,
-    ResolvedRoute, ResolvedTelemetry, SlackActivityConfig, SlackActivityFallback, SlackExperience,
-    TelemetryConfig, TransportConfig,
+    CONFIG_API_VERSION, ConfigApiVersion, ConfigError, ConfigProblem, ConversationConfig,
+    ConversationPolicy, ConversationScope, ConversationWindow, DEFAULT_STOP_WORDS, DekopondConfig,
+    HARD_MAX_CONFIG_BYTES, KeepAliveConfig, LivenessConfig, LivenessMode, LivenessSettings,
+    ProgressSurface, ProviderAttachmentsConfig, ResolvedConfig, ResolvedRoute, ResolvedTelemetry,
+    SlackExperience, SlackLivenessFallback, TelemetryConfig, TemplateOverrides, TransportConfig,
 };
 pub use routes::{RouteError, RouteProblem};
 pub use session::SessionError;
@@ -64,14 +64,14 @@ use crate::{
     conversation::ConversationStore,
     routes::RoutingTable,
     session::{
-        ConfiguredModels, ModelCache, ModelCredentialError, STOPPED_REPLY, SessionGate,
+        CancelOutcome, ConfiguredModels, ModelCache, ModelCredentialError, SessionGate,
         SessionRunner, model_bearer_token,
     },
     transport::{
-        AssetFetcher, ChatActivity, ChatReplier, ChatTransport, ConversationKind, InboundMessage,
-        OutboundReply, SessionStop, ThreadOwnership, TransportEvent, TransportIdentity,
-        discord::DiscordTransport, local::LocalTransport, slack::SlackTransport,
-        telegram::TelegramTransport, whatsapp::WhatsappTransport,
+        AssetFetcher, CancelRequest, ChatDriver, ChatTransport, ConversationKind, InboundMessage,
+        ThreadOwnership, TransportEvent, TransportIdentity, discord::DiscordTransport,
+        local::LocalTransport, slack::SlackTransport, telegram::TelegramTransport,
+        whatsapp::WhatsappTransport,
     },
 };
 
@@ -149,9 +149,8 @@ where
     );
     let mut transports = Vec::with_capacity(config.transports.len());
     let mut identities = BTreeMap::new();
-    let mut repliers: BTreeMap<String, Arc<dyn ChatReplier>> = BTreeMap::new();
+    let mut drivers: BTreeMap<String, Arc<dyn ChatDriver>> = BTreeMap::new();
     let mut asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>> = HashMap::new();
-    let mut activities: HashMap<String, Arc<dyn ChatActivity>> = HashMap::new();
     let mut thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>> = HashMap::new();
     let mut connect_problems = Vec::new();
     for (spec, mut transport) in config.transports.iter().zip(built_transports) {
@@ -171,14 +170,11 @@ where
             kind = spec.kind()
         );
         identities.insert(spec.name().to_owned(), identity);
-        repliers.insert(spec.name().to_owned(), transport.replier());
+        drivers.insert(spec.name().to_owned(), transport.driver());
         // Absent for a transport that carries no attachments, which is what makes the tool
         // unavailable on a route bound to one.
         if let Some(fetcher) = transport.asset_fetcher() {
             asset_fetchers.insert(spec.name().to_owned(), fetcher);
-        }
-        if let Some(activity) = transport.activity() {
-            activities.insert(spec.name().to_owned(), activity);
         }
         if let Some(ownership) = transport.thread_ownership() {
             thread_ownership.insert(spec.name().to_owned(), ownership);
@@ -205,7 +201,7 @@ where
             ASSET_IDLE_TIMEOUT,
         )),
         asset_fetchers,
-        activities,
+        liveness: config.liveness.clone(),
         thread_ownership,
         active_sessions: session::ActiveSessions::default(),
     });
@@ -233,7 +229,8 @@ where
         runner,
         routes,
         Arc::new(identities),
-        Arc::new(repliers),
+        Arc::new(drivers),
+        Arc::new(config.stop_words.clone()),
         receiver,
         shutdown,
         config.shutdown_grace,
@@ -280,7 +277,8 @@ async fn serve<F>(
     runner: Arc<SessionRunner>,
     routes: Arc<RoutingTable>,
     identities: Arc<BTreeMap<String, TransportIdentity>>,
-    repliers: Arc<BTreeMap<String, Arc<dyn ChatReplier>>>,
+    drivers: Arc<BTreeMap<String, Arc<dyn ChatDriver>>>,
+    stop_words: Arc<Vec<String>>,
     mut receiver: mpsc::Receiver<TransportEvent>,
     shutdown: F,
     grace: Duration,
@@ -316,15 +314,14 @@ where
                                 &runner,
                                 &routes,
                                 &identities,
-                                &repliers,
+                                &drivers,
+                                &stop_words,
                                 &mut sessions,
                                 *message,
                             );
                         });
                     }
-                    TransportEvent::SessionStopped(request) => {
-                        stop_session(&runner, &mut sessions, request);
-                    }
+                    TransportEvent::CancelRequested(request) => cancel_session(&runner, &request),
                 }
             }
         }
@@ -364,7 +361,8 @@ fn dispatch(
     runner: &Arc<SessionRunner>,
     routes: &Arc<RoutingTable>,
     identities: &BTreeMap<String, TransportIdentity>,
-    repliers: &BTreeMap<String, Arc<dyn ChatReplier>>,
+    drivers: &BTreeMap<String, Arc<dyn ChatDriver>>,
+    stop_words: &[String],
     sessions: &mut JoinSet<()>,
     message: InboundMessage,
 ) {
@@ -378,6 +376,43 @@ fn dispatch(
         );
         return;
     };
+    // Before the addressed check, because in a channel a stop word arrives as `<@U0123> stop` and
+    // every unaddressed channel message is dropped below — which is where the matcher could never
+    // see it. It fires only when this conversation has a session this sender started, so "stop"
+    // said to an idle agent is still a question the agent answers.
+    if transport::is_stop_word(
+        identities.get(&message.transport),
+        &message.text,
+        stop_words,
+    ) {
+        let request = CancelRequest {
+            transport: message.transport.clone(),
+            conversation_id: message.conversation_id.clone(),
+            subject: message.subject.canonical(),
+            via: dekopon_agent::CancelVia::StopReply,
+        };
+        match runner.active_sessions.cancel(&request) {
+            CancelOutcome::Cancelled => {
+                tracing::info!(
+                    event = "gateway_session_stop_requested",
+                    transport = %request.transport,
+                    via = "stop-reply"
+                );
+                return;
+            }
+            // The session existed and this sender owned it; it simply finished first. Routing the
+            // word as a question would answer a message that was never one.
+            outcome @ CancelOutcome::AlreadyEnded => {
+                tracing::debug!(
+                    event = "gateway_session_stop_ignored",
+                    transport = %request.transport,
+                    reason = outcome.ignored_reason()
+                );
+                return;
+            }
+            CancelOutcome::NoSession | CancelOutcome::OtherSubject => {}
+        }
+    }
     // A channel route that fired on every message would be noise and cost. Shared conversations
     // therefore require an explicit address, except for one Slack Agent continuation that the
     // transport proved belongs to this authenticated sender in a freshly authorized owned thread.
@@ -402,11 +437,11 @@ fn dispatch(
         );
         return;
     }
-    let Some(replier) = repliers.get(&message.transport).cloned() else {
+    let Some(driver) = drivers.get(&message.transport).cloned() else {
         tracing::error!(
             event = "gateway_message_ignored",
             transport = %message.transport,
-            reason = "no-replier"
+            reason = "no-driver"
         );
         return;
     };
@@ -414,31 +449,38 @@ fn dispatch(
         Arc::clone(runner),
         route.clone(),
         message,
-        replier,
+        driver,
     ));
 }
 
-fn stop_session(runner: &Arc<SessionRunner>, sessions: &mut JoinSet<()>, request: SessionStop) {
-    let Some(reply) = runner.active_sessions.stop(&request) else {
-        tracing::debug!(
+/// Routes one authenticated cancel request to the session that owns the conversation.
+///
+/// Nothing is replied here. The session's own policy task owns the message on screen and writes
+/// the ending, which is what keeps `Stopped.` from arriving ahead of the partial answer it follows.
+fn cancel_session(runner: &Arc<SessionRunner>, request: &CancelRequest) {
+    match runner.active_sessions.cancel(request).ignored_reason() {
+        None => tracing::info!(
+            event = "gateway_session_stop_requested",
+            transport = %request.transport,
+            via = via_label(request.via)
+        ),
+        // Acknowledged by the transport reader already; ignored here because only the subject that
+        // started a session may stop it, and because a session that already ended has no work left.
+        Some(reason) => tracing::debug!(
             event = "gateway_session_stop_ignored",
-            transport = %request.transport
-        );
-        return;
-    };
-    tracing::info!(
-        event = "gateway_session_stop_requested",
-        transport = %request.transport
-    );
-    sessions.spawn(async move {
-        if let Err(error) = reply
-            .replier
-            .reply(reply.target, OutboundReply::text(STOPPED_REPLY))
-            .await
-        {
-            tracing::error!(event = "gateway_reply_failed", category = error.category());
-        }
-    });
+            transport = %request.transport,
+            reason
+        ),
+    }
+}
+
+/// Stable low-cardinality label for how a cancel reached the daemon.
+const fn via_label(via: dekopon_agent::CancelVia) -> &'static str {
+    match via {
+        dekopon_agent::CancelVia::NativeStop => "native-stop",
+        dekopon_agent::CancelVia::Button => "button",
+        dekopon_agent::CancelVia::StopReply => "stop-reply",
+    }
 }
 
 /// One reader task per transport, feeding the routing loop.
@@ -579,8 +621,9 @@ fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, Tra
             app_token_env,
             bot_token_env,
             experience,
-            activity,
+            liveness,
             endpoint,
+            ..
         } => Box::new(SlackTransport::new(
             name.clone(),
             endpoint
@@ -589,20 +632,21 @@ fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, Tra
             transport::read_credential(app_token_env)?,
             transport::read_credential(bot_token_env)?,
             *experience,
-            *activity,
+            liveness.settings(),
         )?),
         TransportConfig::DiscordGateway {
             name,
             bot_token_env,
-            activity,
+            liveness,
             endpoint,
+            ..
         } => Box::new(DiscordTransport::new(
             name.clone(),
             endpoint
                 .clone()
                 .unwrap_or_else(|| config::DISCORD_ENDPOINT.to_owned()),
             transport::read_credential(bot_token_env)?,
-            activity.mode,
+            liveness.settings(),
         )?),
         TransportConfig::WhatsappCloudApi {
             name,
@@ -614,6 +658,7 @@ fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, Tra
             waba_id,
             phone_number_id,
             graph_api_version,
+            liveness,
             graph_endpoint,
         } => Box::new(WhatsappTransport::new(
             name.clone(),
@@ -628,23 +673,31 @@ fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, Tra
             transport::read_credential(app_secret_env)?,
             transport::read_credential(verify_token_env)?,
             transport::read_credential(access_token_env)?,
+            liveness.settings(),
         )?),
         TransportConfig::TelegramLongPoll {
             name,
             bot_token_env,
-            activity,
+            liveness,
             endpoint,
+            ..
         } => Box::new(TelegramTransport::new(
             name.clone(),
             endpoint
                 .clone()
                 .unwrap_or_else(|| config::TELEGRAM_ENDPOINT.to_owned()),
             transport::read_credential(bot_token_env)?,
-            activity.mode,
+            liveness.settings(),
         )?),
-        TransportConfig::Local { name, socket_path } => {
-            Box::new(LocalTransport::new(name.clone(), socket_path.clone()))
-        }
+        TransportConfig::Local {
+            name,
+            socket_path,
+            liveness,
+        } => Box::new(LocalTransport::new(
+            name.clone(),
+            socket_path.clone(),
+            liveness.settings(),
+        )),
     })
 }
 

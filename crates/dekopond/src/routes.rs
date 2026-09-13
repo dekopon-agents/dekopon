@@ -4,7 +4,7 @@
 //! with no reachable model is a configuration mistake, and finding it when the daemon starts beats
 //! finding it in a chat reply an hour later.
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use dekopon_agent::prompt::PromptLimits;
 use dekopon_config::{LocalCatalog, Skill};
@@ -14,6 +14,7 @@ use thiserror::Error;
 use crate::{
     cache_key,
     config::{ConversationPolicy, ModelConfig, ResolvedConfig, RouteMatch, render_problems},
+    progress::ProgressDetail,
     transport::ConversationKind,
 };
 
@@ -45,6 +46,14 @@ pub(crate) struct BoundRoute {
     /// Whether this route's sessions may record improvement suggestions.
     pub improvement_suggestions: bool,
     pub limits: PromptLimits,
+    /// Wall-clock bound on one session, counted from the moment the agent starts working.
+    ///
+    /// Absent means no wall-clock bound: the step and capability-call budgets are what most
+    /// deployments need, and a bound that cancels a working session is worth choosing rather than
+    /// inheriting.
+    pub max_duration: Option<Duration>,
+    /// How much this route's progress surface says.
+    pub progress_detail: ProgressDetail,
     /// What this route remembers between messages.
     pub conversation: ConversationPolicy,
     /// The provider cache lane a message on this route uses when it has no conversation of its own.
@@ -155,6 +164,8 @@ impl RoutingTable {
                     max_steps: route.limits.max_steps,
                     max_capability_calls: route.limits.max_capability_calls,
                 },
+                max_duration: route.limits.max_duration_ms.map(Duration::from_millis),
+                progress_detail: route.progress_detail,
                 conversation: route.conversation,
                 cache_key: cache_key::for_route(),
             });

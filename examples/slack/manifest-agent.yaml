@@ -11,7 +11,8 @@
 #
 # If Agent status returns `feature_disabled` or another permanent installation error, dekopond
 # degrades to the fixed `:tangerine:` reaction requested by `classicFallback: reaction`, and then
-# to no activity if reactions are unavailable. Final replies are independent of every activity API.
+# to nothing at all if reactions are unavailable. Final replies are independent of every one of
+# these APIs.
 #
 # The bot scope split is:
 # - `assistant:write`: declares the installed app as an Agent.

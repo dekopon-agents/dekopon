@@ -57,7 +57,8 @@ transports:
   - name: community-discord
     kind: discordGateway
     botTokenEnv: DEKOPOND_DISCORD_BOT_TOKEN
-    activity: { mode: native } # optional; absent/off preserves reply-only behavior
+    # optional; absent means off, which preserves reply-only behavior
+    liveness: { mode: native, progress: message, cancelButton: true }
 
 routes:
   - transport: community-discord
@@ -80,11 +81,16 @@ In guild channels, Discord's structured `mentions` array decides whether the bot
 Ambient messages never start a model session. Direct messages are addressed by definition. Bot,
 webhook, self-authored, and system messages are dropped.
 
-With native activity enabled, an authorized session triggers Discord's channel typing indicator and
+With `liveness.mode: native`, an authorized session triggers Discord's channel typing indicator and
 renews it around every eight seconds inside Discord's ten-second lease. It starts only after fresh
 broker authorization, never holds the final-message REST lock, and stops renewing before the reply.
-Discord has no explicit clear endpoint; the final message clears it sooner. Activity errors and rate
+Discord has no explicit clear endpoint; the final message clears it sooner. These calls and rate
 limits are cosmetic and never alter the answer.
+
+`progress: message` adds one editable message that says what the session is doing and becomes the
+answer at the end, and `cancelButton: true` puts a Stop button on it. A reply of `stop` or `cancel`
+in the same conversation does the same thing on any transport — see
+[Liveness, progress, and stopping a run](../../docs/dekopond.md#liveness-progress-and-stopping-a-run).
 
 ## 3. Map Discord users at the broker
 

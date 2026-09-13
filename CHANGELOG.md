@@ -9,6 +9,78 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Added
 
+- One vocabulary for everything a waiting person is shown while a session runs, mapped down to each
+  transport's own surfaces. `ChatDriver` replaces `ChatReplier` and `ChatActivity`, and exposes
+  typing, native status, an editable progress message, a streamed answer, an inbound reaction, and a
+  cancel button as capability objects a transport either implements or does not. One per-session
+  policy task owns timing, budgets, and the single message the gateway may edit: a reaction and a
+  typing lease at t=0, a progress message posted on the first text delta, capability call, or
+  15-second keep-alive tick and never on a fast one-turn answer, keep-alives at 15 s, 45 s and then
+  every 60 s up to ten, edits coalesced inside each transport's minimum interval and bounded at 60
+  per session, and the answer finalized into that same message at the end.
+- `liveness:` per transport, with `progress`, `stream`, `cancelButton`, `keepAlive`, and five
+  operator `templates`; `progressDetail` per route (`off`, `plain`, `detailed`); top-level
+  `stopWords:` (default `[stop, cancel]`); and `limits.maxDurationMs` per route. Every setting a
+  transport cannot honor is a startup refusal naming it, reported together with every other problem
+  in the file.
+- Stopping a run on every transport, not only the ones with a native Stop. A stop word in the
+  conversation, a cancel button on the progress message where the service has components, an
+  operator shutdown, and the new wall-clock budget all reach one cooperative decision; only the
+  subject who started a session may stop it, and another person's press is acknowledged and ignored.
+  Partial streamed text stays on screen with the stopped line after it, and a stop that arrives once
+  the loop already has an answer is refused as `already-ended` rather than landing underneath it.
+- `gateway.progress` on the message's own trace, one record per event, carrying counters, durations,
+  and the provider's own command word and never a prompt, an argument, a provider result, or model
+  text. `gateway_progress_rendered`, `gateway_progress_degraded`, `gateway_progress_budget_exhausted`
+  and `gateway_progress_dropped` are its debug-level rendering counterparts.
+- `dekopon-agent` reports what a session is doing: `progress::ProgressEvent` and `ProgressSink`,
+  installed with `prompt::SessionInputs::with_progress` and `BrokerLeg::with_progress`. The loop
+  reports each model turn, each streamed fragment, each answer, and how the session ended; the
+  broker leg reports each command word, capability call, and accepted attachment. An absent sink
+  is a no-op at every seam.
+- `docs/chat-progress.md`: the design of record for chat progress, liveness, streaming, and
+  cancellation — the vocabulary, the driver trait, the policy's rendering and terminal rules, and
+  the limits that are accepted rather than solved.
+- The development transport is the reference chat driver: typing, native status, an editable
+  progress message, a streamed answer, a reaction, and a cancel acknowledgement each arrive as one
+  JSON line, and an inbound `{"stop": true}` line cancels the run on that conversation.
+- Discord shows what a session is doing: a typing lease renewed inside its ten-second window, a
+  tangerine reaction on the question, an editable progress message carrying a danger-styled Stop
+  button, the answer streamed by cumulative edits, and the answer finalized in place when it fits
+  one message.
+- Pressing Stop on Discord is acknowledged in the transport reader with a type 7 `UPDATE_MESSAGE`
+  that rewrites the message and removes the button, before the press reaches the routing loop.
+- A streamed answer the policy had to cut ends with `…` on Discord and on the development
+  transport, so the text on screen says it is not the whole answer yet.
+- Slack sessions now show what they are doing: a progress message posted as a thread reply, edited
+  in place, and finalized as the answer; the model's answer streamed through
+  `chat.startStream`/`appendStream`/`stopStream`, carrying a `…` once the answer is cut to fit the
+  stream while the closing message still holds it whole; and a Block Kit Stop button on classic
+  apps whose press arrives as `block_actions` over Socket Mode.
+- Telegram sessions show an editable progress message, stream the answer into it by cumulative
+  `editMessageText`, react to the message being answered, and carry an inline Stop button whose
+  press is acknowledged inside the long-poll reader before the cancel request reaches the gateway.
+  A stream is cut at 4,000 Unicode scalars rather than at the Bot API's 4,096 UTF-16 units, which
+  leaves room for the ellipsis a cut render ends in: an edited message that simply stops looks
+  finished.
+- WhatsApp sessions show Meta's typing indicator, fused with the read receipt on the message being
+  answered and re-posted every 20 seconds while the session runs; whether re-posting renews Meta's
+  25-second dismissal is unverified against the Graph API.
+- Shared chat-progress test scaffolding in `dekopon-test-support`: a script runtime that parks
+  inside `run_script`, a streaming model that hands out one recorded event per release and can hold
+  a silent phase open to a caller-chosen deadline, a chat driver whose capability objects are
+  switched on per test with per-object failure injection, recorded OpenAI chat-completions and
+  Codex Responses SSE transcripts, and a capture layer that records each event's whole enclosing
+  span scope rather than only its immediate parent.
+- Streaming model turns. `ChatModel::complete` takes an event callback and reports a turn's
+  visible answer text as it arrives; returning `ControlFlow::Break` drops the response body,
+  closes the connection, and answers `ModelError::Interrupted`. New `dekopon_model::ModelText` and
+  `dekopon_model::TurnEvent`; `ModelText` can be filled from bytes only inside `dekopon-model`, so
+  nothing else can put reasoning, tool-call arguments, or tool output on a chat surface.
+- `stream` on `kind: openaiCompatible` models, default `true`. Streaming requests send `stream:
+  true` and `stream_options.include_usage`; `stream: false` omits both fields and reports no
+  events, for an endpoint or proxy that gets event streams wrong. `kind: chatgptSubscription`
+  always streams and has no such field.
 - `http.plaintextHosts` in `broker.yaml` opts exact hostnames out of the native HTTP host's
   loopback-only plaintext rule. Plaintext `http://` is still refused to everything else, because a
   credential injected into a request that crosses a network in the clear is a credential on that
@@ -25,6 +97,66 @@ All notable changes to Dekopon are documented here. The format is based on
   The list widens nothing by itself: a request still needs the constraint set to name its
   destination in `allowedHosts` and still needs that set's `allowPlaintextLoopback`. Default empty,
   which is the previous behavior exactly.
+
+### Changed
+
+- **Breaking (configuration).** `activity:` is replaced by `liveness:`. No transport has an
+  `activity` field any more, so a configuration that still carries one no longer decodes, and the
+  refusal names `liveness:` and where `classicFallback` goes instead of listing the keys a transport
+  does accept. `mode` and `classicFallback` keep their meanings and values, so a rename alone
+  reproduces the previous behavior: [`docs/upgrading.md`](docs/upgrading.md) has the migration.
+- **Breaking (API).** `ChatTransport::driver()` replaces `replier()` and `activity()`;
+  `TransportEvent::CancelRequested` replaces `SessionStopped`; and `InboundMessage.liveness` replaces
+  `.activity`. Every session now registers for cancellation, where previously only a transport with a
+  native Stop control did.
+- The session's policy task is the only writer of a terminal message once a session has started, so
+  `Stopped.` can no longer land ahead of the partial answer it follows.
+- The prompt loop streams every model turn through `ChatModel::complete`'s per-event callback: it
+  forwards visible text as it arrives, bounded at 8 KiB of cumulative text per turn, and stops the
+  turn between events when the cancellation probe fires. `prompt.model_turn` gains `stream.deltas`
+  and `stream.first_delta_ms`; an interrupted turn records `agent.model.answer` with the partial
+  text and `stream.interrupted = true`, and `accounting.model.turn` with `outcome = interrupted`
+  and no usage.
+- `prompt::CancellationProbe` gains a defaulted `cancel_source`, so an embedder that knows whether
+  a person, a shutdown, or a budget asked for the stop can say so; the default reports the
+  embedder itself.
+- `attachment::strip_attachments` answers with the accepted attachment sizes alongside the
+  refusals, and `attachment::ATTACHMENT_MEDIA_TYPE` is public: a progress surface names the file
+  that arrived before the reply carrying it is posted.
+- Slack's Agent session status and `:tangerine:` reaction moved behind the new driver capability
+  objects, and the reaction stays strictly the fallback: it is offered to a classic app, or to an
+  Agent installation only after Slack has permanently refused it a native status, never beside a
+  working spinner. Every transient Slack call — status, reaction, progress, stream — shares one
+  429 cooldown and is never retried, because Tier 3 is counted per app per workspace across
+  sessions.
+- Telegram's typing action, reactions, progress edits, and button acknowledgments share one
+  two-second deadline and one server-directed cooldown, and a cooldown is now reported as a
+  failure with its cause rather than as a silent success.
+- Both model backends read server-sent events through one parser bounded at 16 MiB, and the
+  chat-completions accumulator tolerates what compatible endpoints actually send: `delta.content`
+  null, `usage` null, a whole tool call in one fragment, and every call of a batch reported at
+  index 0. A streamed turn equals the non-streaming parse of the same completion; a stream cut off
+  before `[DONE]` or a finish reason fails naming that rather than passing a half answer off as
+  the whole one.
+- The gateway's end-to-end test model now answers as a server-sent event stream rather than one
+  JSON document, because that is the path the model client takes by default.
+
+### Removed
+
+- **Breaking.** `crates/dekopond/src/activity.rs` and every name it owned: `ChatActivity`,
+  `ChatReplier`, `ActivityTarget`, `ActivityMode`, `NativeActivityConfig`, `SlackActivityConfig`,
+  `SlackActivityFallback`, `ActivityLease`, `ActivityControl`, `SessionStop`, `StopReply`,
+  `TransportEvent::SessionStopped`, `ChatTransport::replier`, `ChatTransport::activity`, and
+  `InboundMessage.activity`. Nothing is aliased, deprecated, or kept behind a flag.
+- `ChatModel::complete_with` and the two-argument `ChatModel::complete`. Implementations now
+  define one `complete` taking `options` and an event callback; one that cannot stream calls the
+  callback zero times and returns the whole turn.
+
+### Fixed
+
+- The Discord transport records why it dropped an inbound message as `drop.reason` on its
+  `transport.receive` span, so a message the gateway never answers says so in its own trace
+  instead of vanishing.
 
 ## [dekopon-chart-0.6.0] - 2026-09-12
 

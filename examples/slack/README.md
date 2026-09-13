@@ -3,7 +3,7 @@
 This directory contains the Slack app profiles used by the
 [conditional writer](../conditional-write/README.md). Both receive direct messages and
 explicit channel mentions over Socket Mode, open supported attachments on demand, and publish
-best-effort in-flight activity. The Agent profile additionally receives channel history so one
+best-effort in-flight liveness. The Agent profile additionally receives channel history so one
 freshly authorized sender can continue in that exact owned thread without repeating the mention;
 all other ambient messages are dropped before routing. No public endpoint is needed.
 
@@ -18,7 +18,7 @@ Slack's [Agent guide](https://docs.slack.dev/ai/developing-agents/) says some AI
 paid plan; the [Developer Program](https://api.slack.com/developer-program) offers a fully featured
 sandbox for development. Slack exposes some Agent settings on free workspaces even when the API is
 disabled. Dekopon never infers billing: an Agent installation that receives `feature_disabled` permanently downgrades that
-transport to its configured reaction fallback. If that also lacks `reactions:write`, activity is a
+transport to its configured reaction fallback. If that also lacks `reactions:write`, liveness is a
 no-op and the final reply is unchanged.
 
 ## Create the app and credentials
@@ -28,7 +28,7 @@ no-op and the final reply is unchanged.
 | Credential | Prefix | Purpose | Environment variable |
 |---|---|---|---|
 | App-level token | `xapp-…` | Opens the outbound Socket Mode connection | `DEKOPOND_SLACK_APP_TOKEN` |
-| Bot User OAuth Token | `xoxb-…` | Identifies the bot, publishes activity/text or attachment replies, and reads attachments | `DEKOPOND_SLACK_BOT_TOKEN` |
+| Bot User OAuth Token | `xoxb-…` | Identifies the bot, publishes liveness/text or attachment replies, and reads attachments | `DEKOPOND_SLACK_BOT_TOKEN` |
 
 Neither token belongs in the app manifest or a Dekopon configuration file.
 
@@ -43,7 +43,7 @@ Neither token belongs in the app manifest or a Dekopon configuration file.
 
 Both manifests enable Socket Mode and the App Home messages tab. Both include `files:write` for
 bounded provider-attachment replies; remove it only when no route sets `providerAttachments`. The classic profile adds
-`reactions:write` for the explicitly configured fallback; remove that scope and leave activity off
+`reactions:write` for the explicitly configured fallback; remove that scope and leave liveness off
 if the classic deployment wants final replies only. The Agent profile additionally adds
 `agent_view`, `assistant:write`, and `agent_session_stopped`, plus the `app_home_opened` event Slack
 requires for Agent View. It also adds `channels:history`/`message.channels` and
@@ -90,19 +90,21 @@ otherwise reply behavior stays text-only and `files:write` is unused. See
 [`../../docs/dekopond.md#provider-attachments-and-chat-asset-inputs`](../../docs/dekopond.md#provider-attachments-and-chat-asset-inputs)
 for the conventions and their bounds.
 
-## Configure in-flight activity
+## Configure in-flight liveness
 
-Activity is opt-in and starts only after the sender's fresh broker authorization succeeds. Busy,
-unrouted, ambient, and unauthorized messages create no activity.
+Liveness is opt-in and starts only after the sender's fresh broker authorization succeeds. Busy,
+unrouted, ambient, and unauthorized messages show nothing.
 
 Classic/free profile:
 
 ```yaml
 kind: slackSocketMode
 experience: classic
-activity:
+liveness:
   mode: native
   classicFallback: reaction
+  progress: message
+  cancelButton: true
 ```
 
 Agent profile:
@@ -110,10 +112,15 @@ Agent profile:
 ```yaml
 kind: slackSocketMode
 experience: agent
-activity:
+liveness:
   mode: native
   classicFallback: reaction
+  progress: message
 ```
+
+`cancelButton` is refused on `experience: agent`: Slack renders its own Stop control there. On both
+profiles a reply of `stop` or `cancel` in the conversation stops the run — see
+[Liveness, progress, and stopping a run](../../docs/dekopond.md#liveness-progress-and-stopping-a-run).
 
 `experience` controls conversation semantics and never changes in response to a cosmetic API
 failure. Classic DMs retain top-level replies and one whole-DM conversation. Agent DMs use one
@@ -143,10 +150,10 @@ runs none of it; after any earlier capability invocation, the model must visibly
 result. If its turn budget is exhausted, a fixed warning says to inspect audit before retrying.
 Explicit mentions and DMs always require replies.
 
-Activity failures never delay or fail the terminal reply. `feature_disabled`, `missing_scope`, and
-other permanent Agent installation failures trip a per-transport breaker. Reaction cleanup removes
-only a reaction this activity generation successfully added; a failed cleanup may leave a harmless
-`:tangerine:` marker.
+Liveness failures never delay or fail the terminal reply. `feature_disabled`, `missing_scope`, and
+other permanent Agent installation failures trip a per-transport breaker, and two consecutive
+failures on any one surface stop it for that session. Reaction cleanup removes only a reaction this
+session successfully added; a failed cleanup may leave a harmless `:tangerine:` marker.
 
 ### Export the credentials
 

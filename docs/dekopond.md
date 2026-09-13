@@ -42,17 +42,27 @@ transports:
     botTokenEnv: DEKOPOND_SLACK_BOT_TOKEN
     endpoint: https://slack.com               # optional, tests only: the pinned origin or a literal loopback http:// URL
     experience: agent                         # optional: classic (default) | agent
-    activity:                                 # optional; absent means off
+    liveness:                                 # optional; absent means off
       mode: native                            # off | native
-      classicFallback: reaction               # none (default) | reaction
+      classicFallback: reaction               # none (default) | reaction; slackSocketMode only
+      progress: message                       # off (default) | message
+      stream: true                            # default false; refused on whatsappCloudApi
+      cancelButton: false                     # default false; refused on whatsappCloudApi and experience: agent
+      keepAlive: { atSeconds: [15, 45], everySeconds: 60, max: 10 }   # optional; defaults shown
+      templates:                              # optional; defaults ship in the binary
+        working: "Working on it…"
+        tool: "Running {word}…"
+        keepAlive: "Still working ({elapsed_s} s)…"
+        stopped: "Stopped."
+        failed: "The agent could not complete this request."
   - name: community-discord
     kind: discordGateway
     botTokenEnv: DEKOPOND_DISCORD_BOT_TOKEN
-    activity: { mode: native }                # renewable native typing; optional/off by default
+    liveness: { mode: native, progress: message, cancelButton: true }
   - name: tg
     kind: telegramLongPoll
     botTokenEnv: DEKOPOND_TELEGRAM_TOKEN
-    activity: { mode: native }                # renewable native typing; optional/off by default
+    liveness: { mode: native, progress: message, cancelButton: true }
   - name: whatsapp
     kind: whatsappCloudApi
     appSecretEnv: DEKOPOND_WHATSAPP_APP_SECRET
@@ -63,9 +73,13 @@ transports:
     wabaId: "123456789"
     phoneNumberId: "987654321"
     graphApiVersion: v23.0                 # explicit; no implicit/latest version
+    liveness: { mode: native }             # typing only: WhatsApp cannot edit a message
   - name: dev
     kind: local
     socketPath: /path/to/dekopond-dev.sock
+    liveness: { mode: native, progress: message, stream: true, cancelButton: true }
+
+stopWords: [stop, cancel]                     # optional, default shown; see Stopping a run
 
 models:
   - name: local-qwen
@@ -75,6 +89,9 @@ models:
     apiKeyEnv: OPENAI_API_KEY                 # optional; absent means the endpoint needs no key.
                                               # Named but unset or blank is a startup failure.
     timeoutMs: 120000
+    stream: true                              # optional, default true; write false only for an endpoint
+                                              # whose SSE is broken. chatgptSubscription has no such
+                                              # field: it always streams.
     classes: [reasoning, analysis]
   - name: subscription
     kind: chatgptSubscription
@@ -103,7 +120,8 @@ routes:                                       # first match wins; order matters
       maxPerReply: 1                          # required, 1-255 attachments per reply
     chatAssetInputs: [gpt-image.edit]         # optional; capabilities whose input may name a chat asset
     improvementSuggestions: true              # optional; offers suggest_improvement, recorded to telemetry
-    limits: { maxSteps: 8, maxCapabilityCalls: 16 }
+    progressDetail: plain                     # optional: off | plain (default) | detailed
+    limits: { maxSteps: 8, maxCapabilityCalls: 16, maxDurationMs: 300000 }   # maxDurationMs optional; 0 refused
     conversation:                             # optional; default { mode: oneShot }
       mode: persistent                        # oneShot | persistent
       scope: privateConversation              # privateConversation (default) | sharedConversation
@@ -145,9 +163,23 @@ A gateway that starts and then refuses everything is worse than one that does no
 - a `channel` written beside `kind: directMessage`. The field belongs to the other kind, and a decoder that shrugged at it would leave an operator convinced they had scoped a route to one channel while it claimed every direct message on the transport;
 - a missing or blank chat or bound-route model credential environment variable. A model's `apiKeyEnv` is optional and absent means "this endpoint needs no key", which a loopback llama.cpp genuinely does not; naming a variable that is unset or exported blank is the opposite claim, and this process cannot see one exported after it started;
 - a route naming `providerAttachments` on a text-only transport, which today means `whatsappCloudApi`, or one whose `providerAttachments.maxPerReply` is `0` (omit the block instead);
-- an unknown Slack experience, activity mode/fallback, or field inside those strict blocks; an off
-  Slack activity with a reaction fallback, or classic native activity with no reaction fallback,
-  is also refused because the configured fallback could never take effect;
+- an unknown Slack experience, liveness mode/fallback, or field inside those strict blocks; an off
+  Slack liveness with a reaction fallback, or a classic app with native liveness and no reaction
+  fallback, is also refused because the configured fallback could never take effect;
+- `liveness.progress`, `liveness.stream`, or `liveness.cancelButton` set while `liveness.mode` is
+  `off`, where none of them could ever take effect; each one is named;
+- `liveness.stream` or `liveness.cancelButton` on `whatsappCloudApi`, which can neither edit a
+  message nor carry an interactive component, and `liveness.cancelButton` on a Slack transport with
+  `experience: agent`, which renders its own Stop control;
+- `liveness.classicFallback` on a transport that is not `slackSocketMode`;
+- a `liveness.keepAlive` with `everySeconds: 0` or an offset of `0` — a period of zero is a render
+  loop rather than a keep-alive;
+- a `liveness.templates` line using a placeholder that field cannot render. The known placeholders
+  are `{word}` (the `tool` line only), `{turn}`, `{of}`, `{calls}`, `{calls_max}`, and
+  `{elapsed_s}`; `stopped` and `failed` are written after the session ended and render none. Every
+  offending placeholder in the block is named, not the first;
+- an empty `stopWords:` list, or one with a blank word. Omit the key to keep `[stop, cancel]`;
+- a route with `limits.maxDurationMs: 0`, which would cancel every session the instant it started;
 - an unreachable broker. `dekopond` makes one `capabilities()` call on the configured socket before connecting any transport and logs the capability count as `gateway_broker_ready`;
 - an empty `transports:`, `models:`, or `routes:` list;
 - a model with `timeoutMs: 0`, or `shutdownGraceMs: 0`;
@@ -268,7 +300,7 @@ An app-level token opens `apps.connections.open`, which returns a `wss://` URL; 
 `experience` controls Slack's conversation model and is never inferred from a cosmetic API result:
 
 - `classic` (default) retains top-level DM replies and one whole-DM conversation. With native
-  activity and `classicFallback: reaction`, the gateway adds its fixed `:tangerine:` reaction to
+  liveness and `classicFallback: reaction`, the gateway adds its fixed `:tangerine:` reaction to
   the inbound message and removes only a reaction that generation successfully added.
 - `agent` makes DMs thread-scoped like Slack Agent sessions and enables authorization-fed channel
   thread continuation. After fresh broker authorization the gateway calls
@@ -299,7 +331,7 @@ mention. This is **owned-thread continuation**, not ambient activation:
   `(workspace, channel, root thread, sender)` claim;
 - only a fresh non-empty broker capability surface installs or refreshes that claim;
 - a later unmentioned event must match every coordinate and is freshly authorized again before
-  activity or inference; another sender and another thread remain ambient;
+  liveness or inference; another sender and another thread remain ambient;
 - a definitive authorization refusal removes the claim; the 1,024-entry LRU and every claim vanish
   on process restart; and
 - all unmatched channel-history events are discarded inside the Slack transport before routing,
@@ -334,7 +366,7 @@ Discord Gateway v10 is another outbound WebSocket transport. The daemon discover
 - Absence of `guild_id` is a direct message. A guild message is a channel message and must name the bot in its structured mentions. Subject: `discord.<user id>`; Discord user snowflakes are global, so a guild is not part of the canonical subject.
 - A Discord thread is itself a channel. Its channel ID is the route key, conversation identity, and reply destination. A catch-all channel route covers transient threads; a route naming only a parent channel does not automatically claim its thread IDs.
 - Replies use `POST /api/v10/channels/{channel}/messages`. Provider attachments ride the first post as multipart attachments; the first guild post references the incoming message with `fail_if_not_exists: false`; every post disables parsed/reply mentions, so model-authored text cannot ping a user, role, or `@everyone`. Discord's 2,000-character ceiling is handled by lossless multi-message splitting, with Markdown left unchanged. Failure after an accepted attachment or first chunk is partial delivery rather than a complete receipt.
-- With `activity.mode: native`, an authorized session immediately triggers `POST /channels/{id}/typing` and renews around every eight seconds, inside Discord's ten-second native lease. Typing has no explicit clear; sealing stops renewal and the final message clears it sooner. Calls use a short deadline, honor a `429` cooldown, never take the final-message REST lock, and cannot fail the answer.
+- With `liveness.mode: native`, an authorized session immediately triggers `POST /channels/{id}/typing` and renews around every eight seconds, inside Discord's ten-second native lease. Typing has no explicit clear; sealing stops renewal and the final message clears it sooner. Calls use a short deadline, honor a `429` cooldown, never take the final-message REST lock, and cannot fail the answer.
 
 [`../examples/discord/`](../examples/discord/README.md) is the bot installation, permission, token, route, and identity-mapping walkthrough.
 
@@ -377,11 +409,11 @@ Messages from bots are dropped. A private chat is a direct message; a group is a
 `sendMessage` refuses text over 4,096 UTF-16 code units, which is half the gateway's own outbound bound, so an answer is split losslessly across sequential messages the same way Discord's is. Only the first quotes the incoming message; the topic identifier goes on every one, because it is what keeps a continuation in the same forum topic.
 
 Telegram's optional `message_thread_id` is preserved consistently in admission, conversation
-identity, replies, generated-photo uploads, and activity, so a forum-topic pulse cannot appear in
+identity, replies, generated-photo uploads, and liveness, so a forum-topic pulse cannot appear in
 another topic. Generated PNGs use `sendPhoto`; text up to Telegram's 1,024-unit caption ceiling is
 accepted with the first photo, while longer text follows as losslessly split `sendMessage` calls; a
 failure after any accepted part is partial delivery. With
-`activity.mode: native`, an authorized session sends `sendChatAction(action=typing)` and renews
+`liveness.mode: native`, an authorized session sends `sendChatAction(action=typing)` and renews
 around every four seconds inside Telegram's five-second lease. There is no explicit clear; renewal
 stops before the final message, which clears the action. Calls override the long-poll client's
 70-second timeout with a short deadline, honor `retry_after`, and remain cosmetic.
@@ -441,7 +473,7 @@ ignored, descriptor or buffer exhaustion is warned and retried after a short pau
 listening socket that can never serve again stops the loop with
 `gateway_whatsapp_listener_stopped`.
 
-Media, templates, interactive messages, reactions, activity, status processing, business-management
+Media, templates, interactive messages, reactions, progress messages, status processing, business-management
 APIs, embedded signup, webhook multiplexing, and daemon TLS termination are outside this transport;
 the project-wide list is [non-goals](design.md#non-goals). See
 [`../examples/whatsapp/`](../examples/whatsapp/README.md) for placeholder-only setup.
@@ -483,15 +515,103 @@ A route matching every channel widens no authority whatsoever, and an operator r
 
 Nor do two people in one channel share a conversation **by default**. A persistent route whose scope is omitted or `privateConversation` keys history per authenticated subject, so the bot remembers each person separately. An operator can explicitly choose `sharedConversation`; that changes prompt audience, not authority, and carries the warnings in [Scope selects the replay audience](#scope-selects-the-replay-audience). A catch-all channel does not imply that choice.
 
+## Liveness, progress, and stopping a run
+
+A long turn used to look like a hang. `liveness:` is what one transport shows while a session runs,
+and `stopWords:` plus `limits.maxDurationMs` are how a run ends before it finishes on its own.
+
+**One message per session.** Whatever the policy posts, it posts once and then edits: a keep-alive
+is an edit, a streamed answer grows in place, and the answer finalizes the same message. There is
+never a second gateway message beside it, which is why `stream: true` means the stream *is* the
+surface and no separate progress line is posted.
+
+**What is shown, in order.** At the moment a session is authorized: the transport's reaction on the
+inbound message, its typing lease, and its native status, whichever of the three the driver
+implements. A progress message is posted on the first of a text delta, a capability call starting, a
+turn that drove one, or the 15-second keep-alive tick — never on the first model turn alone, so a
+fast one-turn answer never leaves a "Working on it…" message behind the reply that obsoleted it a
+second later. With the stream off the text itself is never shown, so the first delta posts the
+working line and later ones change nothing: a model that has started writing is the news, not what
+it wrote. Every later event edits that message, coalesced to the newest state inside the
+transport's own minimum edit interval, with 60 edits and 10 keep-alives per session as the bounds.
+
+**Detail levels.** `progressDetail` is per route, because the same event stream serves a family
+Discord and an operations channel:
+
+| Level | What the message says |
+|---|---|
+| `off` | Nothing is posted or edited. The reaction, typing, and native status still run. |
+| `plain` | The verbs only — `Working on it…`, `Running gpt-image…` — with elapsed seconds on keep-alive ticks, where the number is fresh by construction rather than frozen since the last event. |
+| `detailed` | The same verbs plus turn, capability-call, and elapsed counters on every edit. |
+
+Every driver renders every level. A level a transport truly cannot show is a no-op there, never an
+error, so a route is not configured per transport.
+
+**Keep-alive.** `keepAlive: { atSeconds: [15, 45], everySeconds: 60, max: 10 }` is the default: two
+early ticks that answer "did it hear me", then one a minute, ten times, then silence. Each tick is
+an edit of the one message. Each tick is also scheduled from the one before it, so a task that woke
+late ticks late rather than firing every offset it slept through at once.
+
+**Nothing cosmetic can hold the answer.** Every call the policy makes — reaction, typing, status,
+post, edit, delete, stream, finalize — has a two-second deadline of its own. A service that accepts
+the connection and then answers nothing costs the waiting person those two seconds and no more: the
+call counts as that rung's failure, two consecutive failures stop that rung for the session, and the
+answer is delivered either way. `gateway_progress_rendered` reports it with `category=deadline`.
+
+**Templates.** Five operator strings, each overridable per transport, all defaulting to the
+sentences this daemon ships. `tool` may use `{word}`; `working`, `tool`, and `keepAlive` may also
+use `{turn}`, `{of}`, `{calls}`, `{calls_max}`, and `{elapsed_s}`; `stopped` and `failed` are
+written after the session ended and use none. A placeholder a field cannot render is a startup
+refusal naming it. The rendered command word is a provider manifest's own, bounded to 32 characters;
+no prompt, capability argument, provider result, or model text can reach a progress line, because
+the type the drivers receive is built only from these templates and the session's numbers.
+
+**Streaming.** With `stream: true` and a driver that implements it, the model's answer appears as it
+is written, cut to the transport's own character ceiling with a trailing `…` where it was cut, and
+finalized in place when the turn ends. That is the transport half; the model half is `stream:` on
+an `openaiCompatible` model, which is on by default and is also what lets a stop interrupt a turn
+instead of waiting out `timeoutMs`. Turning it off is for the endpoint that claims
+chat-completions compatibility and gets streaming wrong — a proxy that buffers the whole body, a
+server that drops `usage` — and costs that model both properties; `kind: chatgptSubscription`
+always streams and refuses the field.
+During a reasoning phase the model sends nothing at all — 10 to 60 seconds on a `gpt-5`-class model
+— so the streamed text does not move and a stop pressed then takes effect at the model timeout
+rather than at the next event. The person still sees `Stopped.` immediately, because the policy
+renders on the decision rather than on the model returning.
+
+**Stopping a run.** Three ways, all of them authenticated, and all of them reaching the same
+single decision:
+
+- a **stop word** in the conversation. `stopWords:` defaults to `[stop, cancel]` and is an operator
+  list because the people talking to a deployment do not all speak English. A message matches only
+  if it is *exactly* one of those words after the bot mention and any trailing punctuation are
+  stripped, case-insensitively — so `<@U0123> stop.` in a channel matches and "we should stop doing
+  that" does not. It fires only when that conversation has a session this same sender started;
+  said to an idle agent, "stop" is an ordinary question the agent answers;
+- a **cancel button** on the progress message, where `cancelButton: true` and the service has
+  interactive components. Slack's Agent experience renders its own Stop instead, which is why the
+  flag is refused there;
+- `limits.maxDurationMs`, counted from the moment the agent starts working rather than from
+  receipt, because waiting for an admission slot is not the agent taking too long.
+
+Only the subject who started a session may stop it; another person's press is acknowledged by the
+transport and then ignored, recorded as `gateway_session_stop_ignored`. A stop is cooperative, not a
+rollback: a model request or a provider effect already in flight finishes and its result is
+suppressed. Whatever the answer had already streamed stays on screen with the `stopped` line after
+it; nothing else replies. A stop is too late once the loop has an answer: the session is claimed as
+finished the instant the loop reports one, so a word or a press that lands while it is still being
+delivered is ignored with reason `already-ended` rather than writing `Stopped.` underneath the
+answer the person is already reading.
+
 ## Sessions
 
 Each routed message runs one session. On a `oneShot` route — the default, and every route in a configuration that never writes a `conversation:` block — that session is entirely independent, and the `persistent` clauses in steps 4 and 5 are the whole difference the other mode makes:
 
 1. **Admission.** A process-wide semaphore bounds what the daemon costs at once, and a per-`(transport, channel, thread)` in-flight set stops one conversation from queueing work on itself — what a person does when a bot seems slow and they send the same thing again. A rejected message gets `I'm busy — try again shortly.` when `replyOnBusy` is set, and silence otherwise.
-2. **Authorization.** The session opens an attested broker leg with `capabilities(subject, agent, scope)`. If the answer is empty — or the broker refuses, because the attestation was not honored or because policy does not permit this principal to drive this agent — the sender gets `You're not authorized to use this agent.` and **no model call or activity write is made**. That is the cheapest possible refusal, and one the message text cannot argue with.
-3. **Activity.** When the transport opted in, one session-owned generation starts immediately after the fresh grant. The service renders it; the model supplies no target, status text, frame, emoji, or timing. The coordinator permits one request at a time, refreshes expiring signals, seals synchronously before terminal delivery, and queues cleanup afterwards so cosmetic I/O never delays the reply or holds admission. Two consecutive failures stop renewal for that generation; permanent Slack installation failures additionally trip a transport-wide fallback breaker.
+2. **Authorization.** The session opens an attested broker leg with `capabilities(subject, agent, scope)`. If the answer is empty — or the broker refuses, because the attestation was not honored or because policy does not permit this principal to drive this agent — the sender gets `You're not authorized to use this agent.` and **no model call or liveness write is made**. That is the cheapest possible refusal, and one the message text cannot argue with.
+3. **Liveness.** When the transport opted in, one session-owned policy task starts immediately after the fresh grant. The service renders everything; the model supplies no target, wording, emoji, cadence, or timing. The policy owns one message, spends the session's edit budget, seals synchronously before terminal delivery, and returns the service's own indicators to rest afterwards, so cosmetic I/O never delays the reply or holds admission. Two consecutive failures stop that surface for the session; permanent Slack installation failures additionally trip a transport-wide fallback breaker. What it shows is [Liveness, progress, and stopping a run](#liveness-progress-and-stopping-a-run).
 4. **Execution.** On a `persistent` route the session first looks up its conversation under the key in [Scope selects the replay audience](#scope-selects-the-replay-audience). An entry idle past the route's timeout, or built under a granted capability set that differs from the one this message's leg just reported, is dropped rather than used; whatever survives is seeded into the prompt ahead of the new message as compacted `(question, answer)` pairs, oldest dropped first until the window's turn and byte bounds both hold. A shared turn's user text starts with a gateway-authored canonical-participant label, for both the current message and later replay. The lookup happens *after* step 2 because the grant comparison needs a fresh grant to compare against. Then the model client is built from the route's model, the shell runtime is given the attested leg as its only capability dispatch, the credential-free `inspect_agent_config` view is built from the same fresh leg, the route's `providerAttachments` slot and `chatAssetInputs` expansion are attached to that leg, and the prompt loop runs on a blocking task with the agent's `instructions` as the system prompt. The agent's catalog skills ride the bound route — read whole into memory when the catalog loaded and shared by every session rather than re-read, so a session never touches the filesystem — and are mounted on every session on that route: a second system message after the instructions lists each by name and description, and the `read_skill` tool loads one skill's instructions, or one of its resource files, on demand. A route with `improvementSuggestions: true` additionally offers `suggest_improvement`; what it records is written to telemetry as `agent.improvement.suggested` and is never relayed to chat, so the sender sees only the answer. Instructions are supplied fresh on every message and never stored, so editing an agent's standing orders takes effect on the next message without rewriting a single remembered conversation. Shell bounds are `dekopon-shell`'s defaults except `maxCapabilityCalls`, which comes from the route. Every model request the session then makes declares a [prompt cache key](#the-prompt-cache-key) — the conversation's on a `persistent` route, the route's on a `oneShot` one.
-5. **Answer, silence, and optional durable recording.** A required session's final bounded text and accepted provider attachments go back to chat. An inherited Slack Agent continuation may instead call `decline_chat_reply` before capability work, which commits its user-only in-process turn, cleans up activity, and sends no reply request. On failure the sender gets one fixed line, `The agent could not complete this request.` — a `PromptError` can carry model-chosen text, a provider message, or a transport diagnostic, and chat is the last place any of those belong. The operator reads the category from telemetry. A `persistent` route writes only the textual exchange back as one more in-process remembered turn, trims the window, and restarts the idle clock. A generation lease makes a commit from older in-flight work inert after grant invalidation, empty-grant removal, idle replacement, or capacity eviction, while concurrent work in the same generation appends in completion order. **The fixed failure line and attachment bytes are never stored.** A declined or failed model session records its question with nothing in the in-process answer's place, which is truthful and is what makes a later follow-up answerable; a session refused at step 2 records nothing at all. Optional durable recording happens under the conditions in [Durable memory after transport acceptance](#durable-memory-after-transport-acceptance).
+5. **Answer, silence, and optional durable recording.** A required session's final bounded text and accepted provider attachments go back to chat. An inherited Slack Agent continuation may instead call `decline_chat_reply` before capability work, which commits its user-only in-process turn, removes the progress message, and sends no reply request. On failure the sender gets one fixed line, `The agent could not complete this request.` — a `PromptError` can carry model-chosen text, a provider message, or a transport diagnostic, and chat is the last place any of those belong. The operator reads the category from telemetry. A `persistent` route writes only the textual exchange back as one more in-process remembered turn, trims the window, and restarts the idle clock. A generation lease makes a commit from older in-flight work inert after grant invalidation, empty-grant removal, idle replacement, or capacity eviction, while concurrent work in the same generation appends in completion order. **The fixed failure line and attachment bytes are never stored.** A declined or failed model session records its question with nothing in the in-process answer's place, which is truthful and is what makes a later follow-up answerable; a session refused at step 2 records nothing at all. Optional durable recording happens under the conditions in [Durable memory after transport acceptance](#durable-memory-after-transport-acceptance).
 
 Text is bounded in both directions: inbound to 16 KiB keeping the head (a chat message states its request first), outbound to 8 KiB keeping head and tail (an answer's conclusion is usually its last line). Both truncations say so in the text.
 
@@ -665,11 +785,11 @@ Spans follow [`observability.md`](observability.md):
 
 | Span | Fields |
 |---|---|
-| `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`; the trace root |
+| `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`, `drop.reason`; the trace root |
 | `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `busy`, `failed`, `cancelled`, `reply-failed`) |
 | `gateway.session` | `agent`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 
-A message's trace starts in the transport that received it, not at routing: `transport.receive` is opened before the payload is parsed, so Slack's envelope acknowledgment, WhatsApp's signature check and its 200, Telegram's `offset` advance, Discord's addressing decision, the local transport's line parse, and the routing decision itself are all inside it. `gateway.message` nests under it and closes it. `message.id` is the service's own identifier for the turn — a Slack `ts`, a Discord snowflake, a Telegram `message_id`, a WhatsApp `wamid`, the development transport's boot-scoped counter — and a receipt that routes nothing closes without one, which is the trace that answers why a message went unanswered. The sender and the text stay off it; they ride `gateway.message.received` below.
+A message's trace starts in the transport that received it, not at routing: `transport.receive` is opened before the payload is parsed, so Slack's envelope acknowledgment, WhatsApp's signature check and its 200, Telegram's `offset` advance, Discord's addressing decision, the local transport's line parse, and the routing decision itself are all inside it. `gateway.message` nests under it and closes it. `message.id` is the service's own identifier for the turn — a Slack `ts`, a Discord snowflake, a Telegram `message_id`, a WhatsApp `wamid`, the development transport's boot-scoped counter — and a receipt that routes nothing closes without one, which is the trace that answers why a message went unanswered. The sender and the text stay off it; they ride `gateway.message.received` below. A receipt the transport declines to route records `drop.reason` instead — one word for why, such as `self-authored`, `content-withheld`, or `duplicate` — so a message that produced no reply says so in its own trace.
 
 The prompt loop's own spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `shell.script`, `shell.command`) nest under `gateway.session`, and the broker's `broker.invocation` joins the same trace through the proposal's `traceParent` field (a W3C `traceparent` value); [`observability.md`](observability.md#gateway-spans) is the authoritative list.
 
@@ -677,7 +797,7 @@ Chat text and canonical subject identifiers reach telemetry as the `gateway.mess
 
 `gateway.session` carries `conversation.turns` and `conversation.bytes` — how much history this message replayed, as a count and a byte total and never as text; both are zero on a `oneShot` route and on the first message of any conversation. `gateway_conversation_evicted` is in the lifecycle events below with a reason of `idle`, `capacity`, or `grant-changed`. On a seeded session `message.count` counts the replayed window plus this exchange rather than this exchange alone. [`observability.md`](observability.md#what-conversation-history-changes) has the dashboard consequences.
 
-Lifecycle events on stdout as structured JSON (this is the lifecycle subset, not every `gateway_*` record the daemon emits): `gateway_broker_ready`, `gateway_transport_connected`, `gateway_started` (transport and route counts), `gateway_session_rejected`, `gateway_session_failed`, `gateway_session_cancelled`, `gateway_session_stop_requested`, `gateway_activity_degraded`, `gateway_conversation_evicted`, `gateway_transport_disconnected`, `gateway_transport_silent` (transport and phase), `gateway_transport_stopped`, `gateway_transport_jitter_unavailable` (an operating system that refused the entropy every reconnect delay is jittered with), `gateway_cache_key_entropy_unavailable`, `gateway_transports_degraded` (dead and configured counts plus the configured names, repeated every 60 seconds for as long as any transport stays dead), `gateway_stopped` (`shutdown` or `transports-lost`). Beyond lifecycle: `gateway_message_ignored` (debug for an unrouted or unaddressed message) and `gateway_local_request_rejected` (debug); `gateway_reply_failed`, `gateway_memory_record_failed`, `gateway_session_stop_ignored` (debug), `gateway_session_registry_conflict`; `gateway_transport_poll_failed` and `gateway_transport_reconnect_failed`; `gateway_sessions_abandoned` and `gateway_session_task_failed` (shutdown grace expired, or a session task panicked); `gateway_whatsapp_accept_failed` and `gateway_whatsapp_image_unsupported`, plus the `gateway_whatsapp_webhook_refused`, `gateway_whatsapp_reply_partial`, and `gateway_whatsapp_listener_stopped` records named in that transport's section; `gateway_signal_failed`; and at exit `gateway_exit` and `gateway_telemetry_shutdown_failed` — see [`observability.md`](observability.md#daemon-exit-and-shutdown-records). Activity-call failures are debug-level `gateway_activity_failed` records. They carry only operation and stable category; degradation carries transport and surface. Neither includes a subject, target identifier, status text, raw service response, or credential. Other failure events likewise carry stable categories, and an eviction carries a reason and nothing about the conversation it forgot. An optional no-reply decision closes `gateway.message` with `outcome=declined`; its `agent.reply.declined` record carries only the model-turn number and no text or thread coordinate.
+Lifecycle events on stdout as structured JSON (this is the lifecycle subset, not every `gateway_*` record the daemon emits): `gateway_broker_ready`, `gateway_transport_connected`, `gateway_started` (transport and route counts), `gateway_session_rejected`, `gateway_session_failed`, `gateway_session_cancelled`, `gateway_session_stop_requested`, `gateway_progress_degraded`, `gateway_conversation_evicted`, `gateway_transport_disconnected`, `gateway_transport_silent` (transport and phase), `gateway_transport_stopped`, `gateway_transport_jitter_unavailable` (an operating system that refused the entropy every reconnect delay is jittered with), `gateway_cache_key_entropy_unavailable`, `gateway_transports_degraded` (dead and configured counts plus the configured names, repeated every 60 seconds for as long as any transport stays dead), `gateway_stopped` (`shutdown` or `transports-lost`). Beyond lifecycle: `gateway_message_ignored` (debug for an unrouted or unaddressed message) and `gateway_local_request_rejected` (debug); `gateway_reply_failed`, `gateway_memory_record_failed`, `gateway_session_stop_ignored` (debug), `gateway_session_registry_conflict`; `gateway_transport_poll_failed` and `gateway_transport_reconnect_failed`; `gateway_sessions_abandoned` and `gateway_session_task_failed` (shutdown grace expired, or a session task panicked); `gateway_whatsapp_accept_failed` and `gateway_whatsapp_image_unsupported`, plus the `gateway_whatsapp_webhook_refused`, `gateway_whatsapp_reply_partial`, and `gateway_whatsapp_listener_stopped` records named in that transport's section; `gateway_signal_failed`; and at exit `gateway_exit` and `gateway_telemetry_shutdown_failed` — see [`observability.md`](observability.md#daemon-exit-and-shutdown-records). Progress-call outcomes are debug-level `gateway_progress_rendered` records carrying the transport, the primitive, the outcome, and — for a stream render — how many characters were on screen; `gateway_progress_degraded` says which primitive stopped, `gateway_progress_budget_exhausted` that a session spent its edits, and `gateway_progress_dropped` that the policy's queue overflowed. Neither includes a subject, target identifier, status text, raw service response, or credential. Other failure events likewise carry stable categories, and an eviction carries a reason and nothing about the conversation it forgot. An optional no-reply decision closes `gateway.message` with `outcome=declined`; its `agent.reply.declined` record carries only the model-turn number and no text or thread coordinate.
 
 ## Current process boundary
 

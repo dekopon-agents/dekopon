@@ -14,6 +14,7 @@ categories = ["command-line-utilities", "network-programming"]
 include = ["src/**", "tests/**", "README.md", "Cargo.toml"]
 
 [dependencies]
+async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
 clap.workspace = true
@@ -50,6 +51,9 @@ dekopon-test-support = { path = "../dekopon-test-support" }
 dekopon-brokerd.workspace = true
 dekopon-storage-host.workspace = true
 tempfile.workspace = true
+# The paused clock the progress-policy tests drive: keep-alive ticks, coalescing windows, and a
+# wall-clock budget are all minutes long, and waiting them out is not a test suite.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

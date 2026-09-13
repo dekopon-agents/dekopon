@@ -269,7 +269,7 @@ two further spans of its own:
 
 | Span | Fields |
 |---|---|
-| `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`; the trace root |
+| `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`, `drop.reason`; the trace root |
 | `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `busy`, `failed`, `cancelled`, `reply-failed`) |
 | `gateway.session` | `agent`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 
@@ -288,6 +288,13 @@ WhatsApp delivery. A WhatsApp delivery carrying more than one message leaves it 
 every message's `gateway.message` under the one delivery. Neither the sender nor the message text
 goes on this span: those stay on the `gateway.message.received` log event below.
 
+`drop.reason` is the other half of that question: a receipt the transport declines to route records
+one low-cardinality word for why — `self-authored`, `bot-authored`, `content-withheld`, `duplicate`,
+`conversation-mismatch` and `malformed-envelope` among them — and a receipt that routes normally
+leaves it unset. It is declared once,
+where the span is opened, because recording a field a span never declared is silently dropped. The
+word is the transport's own classification and never a fragment of the payload it read.
+
 | Event | Level | Fields |
 |---|---|---|
 | `gateway_reply_rate_limited` | warn | `transport=slack`, `retry_after_seconds`; no message text or credentials |
@@ -301,8 +308,8 @@ The prompt loop's spans (`prompt.session`, `prompt.model_turn`, `prompt.script`,
 Neither gateway span carries chat text or a subject identifier. `outcome` is the whole answer at the
 metadata level: `declined` means an optional owned-thread continuation produced no chat delivery,
 `unauthorized` means the broker's chat-scoped `capabilities` returned nothing and no model or
-activity call was made, `busy` means admission control refused the message, `cancelled` means an
-authenticated native Stop won the race against terminal delivery, and `failed` names a category
+liveness call was made, `busy` means admission control refused the message, `cancelled` means a
+stop won the race against terminal delivery, and `failed` names a category
 through the `gateway_session_failed` log event. The sender's canonical subject and the message text
 ride the `gateway.message.received` log event under the payload gate below. `agent.reply.declined`
 records only the model-turn number. `unreported-capability-work` is a stable failure category whose
@@ -317,11 +324,32 @@ when a non-exporting session's minted trace falls back to the hasher constructio
 `gateway_cache_key_entropy_unavailable` (warn) when a prompt cache key is dropped rather than
 minted from something predictable.
 
-In-flight presentation is metadata-minimal. `gateway_activity_failed` is debug-level and carries
-`operation` plus the stable transport-error category. A permanent Slack installation fallback emits
-`gateway_activity_degraded` with `transport=slack` and `surface` (`agent-status` or `reaction`).
-`gateway_session_stop_requested` carries the transport. None records channel, thread, message,
-subject, status text, emoji, raw service response, or credential.
+In-flight presentation is metadata-minimal. Every event a running session produces is one
+`gateway.progress` record on the message's own trace, carrying `kind` and whichever of `agent`,
+`turn`, `of`, `max_steps`, `tool_calls`, `word`, `argument_count`, `calls_used`, `calls_max`,
+`index`, `media_type`, `bytes`, `count`, `elapsed_ms`, `first_delta_ms`, `outcome`, `class`, `by`,
+`edits`, `keep_alives`, `stream.deltas`, and `progress.dropped` that kind has. There is no field on
+it a prompt, a capability argument, a provider result, or model text could be written into. A text
+delta is the one event with no record of its own: it is the newest rendering of one value, it
+arrives hundreds of times per turn, and what a reader needs is the count — which rides
+`stream.deltas` on the terminal record and on `prompt.model_turn`.
+
+The rendering itself is debug-level. `gateway_progress_rendered` carries `transport`, `primitive`
+(`typing`, `status`, `reaction`, `progress`, `stream`, `finalize`, `delete`), `outcome`, the stable
+transport-error category on a failure, and `chars` on a stream render — which is what was actually
+on screen, rather than what the model had written by then. `gateway_progress_degraded` names the
+`primitive` that two consecutive failures stopped for that session;
+`gateway_progress_budget_exhausted` carries the `edits` a session spent; `gateway_progress_dropped`
+carries the running `count` of events the policy's bounded queue could not take, and its `reason`.
+`gateway_progress_terminal_unobserved` carries nothing at all: the ending was written on screen and
+the session task that asked for it had already gone, so the receipt saying whether the person was
+told went nowhere.
+A permanent Slack installation fallback emits the same degraded record with `transport=slack` and a
+`surface` of `agent-status` or `reaction`, which is a transport-wide breaker rather than a
+per-session one. `gateway_session_stop_requested` carries the transport and
+`via` (`native-stop`, `button`, `stop-reply`, `wall-clock`); `gateway_session_stop_ignored` carries
+the transport and `reason` (`no-session`, `other-subject`, `already-ended`). None records channel,
+thread, message, subject, status text, emoji, raw service response, or credential.
 
 ### The WhatsApp webhook is the one signal a stranger can drive
 
