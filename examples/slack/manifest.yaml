@@ -12,6 +12,12 @@
 # - `app_mention` events (requires `app_mentions:read`), so channel routes fire only
 #   when the bot is explicitly addressed — dekopond ignores unaddressed channel
 #   traffic by design.
+# - `channels:read`, `groups:read`, `im:read`, `mpim:read`, so `conversations.info` can say what
+#   kind of conversation a mention arrived in. Slack sends no `channel_type` on `app_mention`, and
+#   this profile receives channel traffic only as one, so without the lookup a mention in a direct
+#   message or a multi-person DM would be minted as a channel and match no `directMessage` or
+#   `groupDirectMessage` route. The result is remembered per conversation, so it costs one call
+#   per conversation the bot is addressed in, and a lookup that fails drops that one message.
 # - `chat:write`, so the gateway can reply.
 # - `files:write`, so an explicitly image-enabled route can share its one generated PNG.
 # - `reactions:write`, so `liveness.mode: native` with `classicFallback: reaction`
@@ -19,6 +25,8 @@
 #   liveness off when even that cosmetic message mutation is unwanted.
 # - `chat:write` also covers editing and deleting the gateway's own progress message, which is what
 #   `liveness.progress: message` posts and then finalizes as the answer.
+# - Interactivity, so a press of the Stop button `liveness.cancelButton: true` renders arrives as a
+#   `block_actions` envelope over the same socket.
 #
 # Two tokens exist after creation, and neither lives in any Dekopon config file —
 # dekopond reads both from environment variables named in its `transports` entry:
@@ -62,10 +70,16 @@ oauth_config:
   scopes:
     bot:
       - app_mentions:read
+      # `*:read` resolve one conversation's kind: an `app_mention` carries no `channel_type`, so
+      # without them a mention in a DM or a group DM is minted as a channel and matches no route.
+      - channels:read
       - chat:write
       - files:read
       - files:write
+      - groups:read
       - im:history
+      - im:read
+      - mpim:read
       - reactions:write
 settings:
   event_subscriptions:
@@ -73,7 +87,9 @@ settings:
       - app_mention
       - message.im
   interactivity:
-    is_enabled: false
+    # Socket Mode delivers `block_actions`, so the gateway's Stop button (`liveness.cancelButton`)
+    # reaches it without a request URL. Off, Slack never sends the press and the button is inert.
+    is_enabled: true
   org_deploy_enabled: false
   socket_mode_enabled: true
   token_rotation_enabled: false

@@ -260,8 +260,10 @@ impl ChatTransportKind {
     ///
     /// Telegram has no workspace above a chat, so a `container:` on a Telegram selector is a
     /// refusal naming the field rather than a line that matches nothing.
-    #[must_use]
-    pub const fn has_container(self) -> bool {
+    ///
+    /// Crate-private: [`ConversationMatch::validate`] is the one caller, and an operator learns
+    /// the answer from the refusal it renders rather than by asking a transport kind directly.
+    pub(crate) const fn has_container(self) -> bool {
         !matches!(self, Self::Telegram)
     }
 }
@@ -486,10 +488,15 @@ pub enum ConversationMatchProblem {
 }
 
 /// Whether a value is the `id:thread` form a selector must never carry.
+///
+/// Never on the local transport: a colon is an ordinary character inside a local id
+/// ([`lowercase_scope_value`] admits it), and a local conversation carries no thread at all, so
+/// `ids: [team:dev]` is one authored id rather than a parent and a thread under it.
 fn thread_form(transport: ChatTransportKind, value: &str) -> bool {
-    value
-        .split_once(':')
-        .is_some_and(|(parent, thread)| !thread.is_empty() && canonical_id_for(transport, parent))
+    transport != ChatTransportKind::Local
+        && value.split_once(':').is_some_and(|(parent, thread)| {
+            !thread.is_empty() && canonical_id_for(transport, parent)
+        })
 }
 
 /// The conversation-id grammar of one transport family, independent of kind.
@@ -636,4 +643,36 @@ where
     }
 
     deserializer.deserialize_option(OptionalPart)
+}
+
+#[cfg(test)]
+mod local_selector_tests {
+    use super::{
+        ChatTransportKind, ConversationKind, ConversationKindMatch, ConversationMatch,
+        ConversationMatchProblem,
+    };
+
+    /// A colon is part of a local id, not a thread coordinate: the local transport mints no thread.
+    #[test]
+    fn a_local_id_containing_a_colon_is_one_id_rather_than_a_thread_form() {
+        let selector = ConversationMatch {
+            kind: ConversationKindMatch::Kinds(vec![ConversationKind::Channel]),
+            container: None,
+            ids: Some(vec!["team:dev".to_owned(), "plain".to_owned()]),
+        };
+
+        assert_eq!(selector.validate(ChatTransportKind::Local), Vec::new());
+        assert_eq!(
+            ConversationMatch {
+                kind: ConversationKindMatch::Kinds(vec![ConversationKind::Thread]),
+                container: None,
+                ids: Some(vec!["c0123abc:1712345678.000100".to_owned()]),
+            }
+            .validate(ChatTransportKind::Slack),
+            vec![ConversationMatchProblem::ThreadFormId {
+                id: "c0123abc:1712345678.000100".to_owned()
+            }],
+            "a transport that does thread is still refused the parent:thread form"
+        );
+    }
 }

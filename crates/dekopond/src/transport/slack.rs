@@ -94,6 +94,11 @@ const DEFAULT_PROGRESS_COOLDOWN: Duration = Duration::from_secs(5);
 const CANCEL_ACTION_ID: &str = "dekopon-cancel";
 /// Inbound messages whose reaction ownership this transport remembers at once.
 const MAX_TRACKED_REACTIONS: usize = 256;
+/// Conversations whose kind this transport remembers, which bounds one `conversations.info` each.
+///
+/// A conversation does not turn from a direct message into a channel, so a hit is never stale; a
+/// restart pays one lookup per conversation the bot is addressed in, and eviction costs a repeat.
+const MAX_TRACKED_CHANNEL_KINDS: usize = 512;
 /// Open streams whose appended length this transport remembers at once.
 const MAX_TRACKED_STREAMS: usize = 64;
 /// Fixed marker a stream carries once the policy has cut the answer to [`STREAM_MAX_CHARS`].
@@ -116,6 +121,8 @@ pub(crate) struct SlackTransport {
     identity: TransportIdentity,
     team_id: Option<String>,
     seen: SeenIds,
+    /// What each conversation turned out to be, for the events that do not say.
+    channel_kinds: Tracked<SlackChannelKind>,
     pending: VecDeque<TransportEvent>,
     failures: u32,
     experience: SlackExperience,
@@ -159,6 +166,7 @@ impl SlackTransport {
             identity: TransportIdentity::default(),
             team_id: None,
             seen: SeenIds::new(DEDUP_CAPACITY),
+            channel_kinds: Tracked::new(MAX_TRACKED_CHANNEL_KINDS),
             pending: VecDeque::new(),
             failures: 0,
             experience,
@@ -272,7 +280,9 @@ impl SlackTransport {
                 .instrument(received.clone())
                 .await;
         }
-        received.in_scope(|| self.accept(&frame, &received))
+        self.accept(&frame, &received)
+            .instrument(received.clone())
+            .await
     }
 
     /// Turns one acknowledged interactive envelope into an acknowledged, routable cancel request.
@@ -354,6 +364,10 @@ impl SlackTransport {
                     thread_ts: thread_ts.to_owned(),
                     message_ts: message_ts.to_owned(),
                     initiator_user_id: user.to_owned(),
+                    // The value this transport wrote on the button, verbatim: the press names the
+                    // session rather than this reader re-deriving that identity from an
+                    // interactive payload shaped unlike the message event that opened it.
+                    conversation_id: conversation_id.to_owned(),
                 },
                 subject: subject.clone(),
                 ack: AckToken::Slack {
@@ -371,9 +385,10 @@ impl SlackTransport {
 
     /// Turns one acknowledged envelope into a pending event, inside its receive span.
     ///
-    /// Split out of [`Self::pump`] only so the span wraps every branch of it: nothing here awaits,
-    /// so `in_scope` is what enters it.
-    fn accept(&mut self, frame: &Value, received: &Span) -> Result<(), TransportError> {
+    /// Split out of [`Self::pump`] only so the span wraps every branch of it, which is why the
+    /// caller instruments this future rather than entering a guard around it: [`Self::routable`]
+    /// awaits, and a span guard held across an await is the wrong trace for whatever ran next.
+    async fn accept(&mut self, frame: &Value, received: &Span) -> Result<(), TransportError> {
         match frame["type"].as_str() {
             // Slack rotates sockets on its own schedule; a disconnect is routine, not a failure.
             Some("disconnect") => {
@@ -398,7 +413,7 @@ impl SlackTransport {
                 self.pending
                     .push_back(TransportEvent::CancelRequested(stopped));
             }
-        } else if let Some(message) = self.routable(&team, event, received)? {
+        } else if let Some(message) = self.routable(&team, event, received).await? {
             received.record("message.id", message.message_id.as_str());
             self.pending
                 .push_back(TransportEvent::Message(Box::new(message)));
@@ -407,7 +422,14 @@ impl SlackTransport {
     }
 
     /// Turns one Slack event into a routable message, or `None` when it is not ours to answer.
-    fn routable(
+    ///
+    /// Async for one reason: an `app_mention` carries no `channel_type`, so the conversation's
+    /// kind has to be asked for. [`Self::channel_kind`] is deliberately the *last* thing this does
+    /// — after the event-type, bot-authored, self-authored, subtyped, malformed, empty-content and
+    /// redelivery drops — and it answers from [`Self::channel_kinds`] for every message after the
+    /// first in one conversation, so ambient traffic costs one `conversations.info` per
+    /// conversation the bot is addressed in.
+    async fn routable(
         &mut self,
         team: &str,
         event: &Value,
@@ -446,19 +468,15 @@ impl SlackTransport {
         if text.trim().is_empty() && assets.is_empty() {
             return Ok(None);
         }
-        let thread_ts = event["thread_ts"].as_str().map(str::to_owned);
+        // Slack sends `thread_ts` on the message that *starts* a thread as well as on every reply
+        // inside one, and on the opening message it is that message's own `ts`. Equal means a
+        // top-level post that happens to have been threaded since, never a reply: reading it as
+        // one mints a `thread` whose parent is the message itself.
+        let thread_ts = event["thread_ts"]
+            .as_str()
+            .filter(|thread| *thread != ts)
+            .map(str::to_owned);
         let root_ts = thread_ts.clone().unwrap_or_else(|| ts.to_owned());
-        // Kind is where the message was posted. `im` stays a direct message however it threads —
-        // Slack's Agent experience roots a thread on every DM turn, so a `thread` kind there would
-        // make direct messages unmatchable. A multi-person DM is its own kind because it has no
-        // container membership behind it, and a message already inside a thread is a thread under
-        // its parent.
-        let kind = match (event["channel_type"].as_str(), &thread_ts) {
-            (Some("im"), _) => ConversationKind::DirectMessage,
-            (Some("mpim"), None) => ConversationKind::GroupDirectMessage,
-            (_, None) => ConversationKind::Channel,
-            (_, Some(_)) => ConversationKind::Thread,
-        };
         // `message.channels`/`message.groups` expose ambient traffic to an Agent installation so
         // an owned thread can continue without another mention. Drop everything else here, before
         // it reaches routing, authorization, payload telemetry, or a model. An app_mention event is
@@ -466,6 +484,20 @@ impl SlackTransport {
         // because the parallel message event may win the dedup race.
         let explicitly_addressed =
             event["type"].as_str() == Some("app_mention") || self.identity.is_addressed(&text);
+        // Ahead of the kind, so a redelivery is answered from this transport's own ring rather
+        // than from Slack: every drop that costs nothing happens before the one that costs a call.
+        if !self.seen.insert(format!("{channel}:{ts}")) {
+            return Ok(None);
+        }
+        // Kind is where the message was posted. `im` stays a direct message however it threads —
+        // Slack's Agent experience roots a thread on every DM turn, so a `thread` kind there would
+        // make direct messages unmatchable. A multi-person DM is its own kind because it has no
+        // container membership behind it, and a message already inside a thread is a thread under
+        // its parent.
+        let Some(posted_in) = self.channel_kind(channel, event, received).await else {
+            return Ok(None);
+        };
+        let kind = posted_in.conversation_kind(thread_ts.is_some());
         // F13: every kind but a direct message is ambient traffic here, group DMs included.
         let is_shared = kind != ConversationKind::DirectMessage;
         let thread_continuation = match (is_shared, self.experience) {
@@ -487,9 +519,6 @@ impl SlackTransport {
             }
             _ => None,
         };
-        if !self.seen.insert(format!("{channel}:{ts}")) {
-            return Ok(None);
-        }
         // Agent sessions are thread-scoped even in DMs. Classic DMs deliberately retain today's
         // top-level reply and whole-DM conversation behavior; a cosmetic API result never decides
         // which model the installed app exposes.
@@ -513,6 +542,10 @@ impl SlackTransport {
             thread: reply_thread.clone(),
         };
         record_conversation(received, &conversation);
+        // Minted once here and carried, never re-derived: the registry keys the session on this
+        // value, so a Stop button that spelled it a second way from the original-case channel id
+        // would name no session at all.
+        let conversation_id = conversation.key();
 
         Ok(Some(InboundMessage {
             transport: self.name.clone(),
@@ -537,9 +570,104 @@ impl SlackTransport {
                 thread_ts: root_ts,
                 message_ts: ts.to_owned(),
                 initiator_user_id: user.to_owned(),
+                conversation_id,
             }),
             receive_span: received.clone(),
         }))
+    }
+
+    /// What one Slack conversation is, from the event when it says and from Slack when it does not.
+    ///
+    /// `app_mention` carries no `channel_type` at all — and the classic manifest subscribes to
+    /// `app_mention` plus `message.im` only, so channel traffic arrives *only* as a mention and
+    /// dropping it is not an option. Assuming `channel` there mints a direct message or a
+    /// multi-person DM as a channel, which no `directMessage` or `groupDirectMessage` route or
+    /// grant then matches, so the kind is asked for rather than guessed.
+    ///
+    /// `None` is "this gateway could not place the message": the cause is recorded here and the
+    /// caller drops the event. Never retried — this runs inside the reader, on the app-wide,
+    /// workspace-wide tier every other Web API call shares.
+    async fn channel_kind(
+        &mut self,
+        channel: &str,
+        event: &Value,
+        received: &Span,
+    ) -> Option<SlackChannelKind> {
+        if let Some(channel_type) = event["channel_type"].as_str() {
+            return Some(SlackChannelKind::of_channel_type(channel_type));
+        }
+        if let Some(kind) = self.channel_kinds.get(channel).copied() {
+            return Some(kind);
+        }
+        let unresolved = |cause: &'static str| -> Option<SlackChannelKind> {
+            received.record("drop.reason", "conversation-unresolved");
+            tracing::debug!(
+                event = "gateway_conversation_unresolved",
+                transport = "slack",
+                cause
+            );
+            None
+        };
+        // Slack conversation identifiers are alphanumeric, so this is also what keeps a payload
+        // value out of the query string it is about to be interpolated into.
+        if channel.is_empty() || !channel.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return unresolved("channel-id");
+        }
+        if self.replier.progress_cooldown().is_some() {
+            return unresolved("rate-limited");
+        }
+        let response = self
+            .http
+            .get(format!(
+                "{}/api/conversations.info?channel={channel}",
+                self.endpoint
+            ))
+            .header(
+                "authorization",
+                format!("Bearer {}", self.replier.bot_token.expose()),
+            )
+            .timeout(LIVENESS_REQUEST_TIMEOUT)
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(source) => {
+                tracing::debug!(
+                    event = "gateway_conversation_unresolved",
+                    transport = "slack",
+                    cause = "request",
+                    cause_type = %source
+                );
+                received.record("drop.reason", "conversation-unresolved");
+                return None;
+            }
+        };
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            // Published for every other progress-class call as well: one throttled workspace is
+            // one deadline, not a per-surface guess.
+            self.replier.begin_cooldown(retry_after(response.headers()));
+            return unresolved("rate-limited");
+        }
+        let body = match check_ok(response).await {
+            Ok(body) => body,
+            Err(error) => {
+                tracing::debug!(
+                    event = "gateway_conversation_unresolved",
+                    transport = "slack",
+                    cause = "response",
+                    // Slack's own stable error word (`channel_not_found`, `missing_scope`) or an
+                    // HTTP status, which is what `TransportError` renders and never a token.
+                    cause_type = %error
+                );
+                received.record("drop.reason", "conversation-unresolved");
+                return None;
+            }
+        };
+        let Some(kind) = SlackChannelKind::of_info(&body["channel"]) else {
+            return unresolved("channel-flags");
+        };
+        self.channel_kinds.insert(channel.to_owned(), kind);
+        Some(kind)
     }
 
     fn session_stopped(
@@ -559,14 +687,83 @@ impl SlackTransport {
         ) else {
             return Ok(None);
         };
+        // Through the same type and the same lowercase fold [`Self::routable`] mints with: an
+        // Agent session is thread-scoped in a channel and in a direct message alike, and the key
+        // reads `id` and `thread` only. A second spelling here is a Stop that stops nothing, so
+        // `a_native_stop_names_the_conversation_routing_minted` pins the two against each other.
+        let conversation = Conversation {
+            kind: ConversationKind::Thread,
+            container: Some(team.to_ascii_lowercase()),
+            id: channel.to_ascii_lowercase(),
+            thread: Some(thread_ts.to_owned()),
+        };
         Ok(Some(CancelRequest {
             transport: self.name.clone(),
-            conversation_id: format!("{channel}:{thread_ts}"),
+            conversation_id: conversation.key(),
             subject: ExternalSubject::slack(team, user)
                 .map_err(TransportError::Subject)?
                 .to_string(),
             via: CancelVia::NativeStop,
         }))
+    }
+}
+
+/// Where a Slack message was posted, before the thread coordinate decides its conversation kind.
+///
+/// Separate from [`ConversationKind`] because this is the fact `conversations.info` answers and the
+/// fact a cache entry stays true for: a conversation does not become a different one, while the
+/// kind of any given message in it depends on whether that message was inside a thread.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SlackChannelKind {
+    /// Slack `im`: one human and the bot.
+    Im,
+    /// Slack `mpim`: several humans and the bot, with no workspace channel behind it.
+    Mpim,
+    /// A public channel or a private group inside the workspace.
+    Channel,
+}
+
+impl SlackChannelKind {
+    /// Slack's own `channel_type`, which every `message` event carries and `app_mention` never does.
+    ///
+    /// Anything that is neither `im` nor `mpim` — `channel`, `group`, and whatever Slack adds next
+    /// — is a conversation inside the workspace container, which is what `channel` means here.
+    fn of_channel_type(value: &str) -> Self {
+        match value {
+            "im" => Self::Im,
+            "mpim" => Self::Mpim,
+            _ => Self::Channel,
+        }
+    }
+
+    /// One `conversations.info` channel object.
+    ///
+    /// Order matters: Slack marks a multi-person DM `is_mpim` *and* `is_group`, so the narrower
+    /// flag is read first. `None` is an object claiming none of the four, which is a conversation
+    /// this gateway cannot place rather than one it guesses at.
+    fn of_info(channel: &Value) -> Option<Self> {
+        if channel["is_im"].as_bool() == Some(true) {
+            return Some(Self::Im);
+        }
+        if channel["is_mpim"].as_bool() == Some(true) {
+            return Some(Self::Mpim);
+        }
+        (channel["is_channel"].as_bool() == Some(true)
+            || channel["is_group"].as_bool() == Some(true))
+        .then_some(Self::Channel)
+    }
+
+    /// The kind of one message, which is where it was posted and not where its answer lands.
+    ///
+    /// A direct message stays one however it threads: Slack's Agent experience roots a thread on
+    /// every DM turn, and a `thread` kind there would make direct messages unmatchable.
+    const fn conversation_kind(self, threaded: bool) -> ConversationKind {
+        match (self, threaded) {
+            (Self::Im, _) => ConversationKind::DirectMessage,
+            (Self::Mpim, false) => ConversationKind::GroupDirectMessage,
+            (Self::Channel, false) => ConversationKind::Channel,
+            (Self::Mpim | Self::Channel, true) => ConversationKind::Thread,
+        }
     }
 }
 
@@ -933,6 +1130,7 @@ impl ProgressMessage for SlackReplier {
         let LivenessTarget::Slack {
             channel_id,
             thread_ts,
+            conversation_id,
             ..
         } = target
         else {
@@ -942,7 +1140,7 @@ impl ProgressMessage for SlackReplier {
             "channel": channel_id,
             "thread_ts": thread_ts,
             "text": text.as_str(),
-            "blocks": self.progress_blocks(text.as_str(), cancel, channel_id, thread_ts),
+            "blocks": self.progress_blocks(text.as_str(), cancel, conversation_id),
         });
         let body = self.liveness_call("chat.postMessage", &body).await?;
         let (Some(posted_channel), Some(timestamp)) =
@@ -967,7 +1165,7 @@ impl ProgressMessage for SlackReplier {
     ) -> Result<(), TransportError> {
         let LivenessTarget::Slack {
             channel_id,
-            thread_ts,
+            conversation_id,
             ..
         } = &message.target
         else {
@@ -977,7 +1175,7 @@ impl ProgressMessage for SlackReplier {
             "channel": channel_id,
             "ts": message.id,
             "text": text.as_str(),
-            "blocks": self.progress_blocks(text.as_str(), cancel, channel_id, thread_ts),
+            "blocks": self.progress_blocks(text.as_str(), cancel, conversation_id),
         });
         self.liveness_call("chat.update", &body).await.map(|_| ())
     }
@@ -1354,16 +1552,11 @@ impl SlackReplier {
 
     /// The progress message's blocks, with a Stop button only where a press has somewhere to go.
     ///
-    /// The button's value is the conversation the press stops, so the reader names a session from
-    /// the payload it is handed rather than re-deriving that identity from an interactive payload
-    /// shaped unlike the message event the session was opened by.
-    fn progress_blocks(
-        &self,
-        text: &str,
-        cancel: bool,
-        channel_id: &str,
-        thread_ts: &str,
-    ) -> Value {
+    /// The button's value is [`Conversation::key`] exactly as the transport minted it when the
+    /// message arrived, carried on the target rather than re-derived here: a press names the
+    /// session the registry holds, and any second derivation of that identity — from the
+    /// original-case channel id, from a leading-letter rule — names no session at all.
+    fn progress_blocks(&self, text: &str, cancel: bool, conversation_id: &str) -> Value {
         let mut blocks = vec![json!({ "type": "markdown", "text": text })];
         if cancel && self.experience == SlackExperience::Classic {
             blocks.push(json!({
@@ -1373,24 +1566,22 @@ impl SlackReplier {
                     "action_id": CANCEL_ACTION_ID,
                     "style": "danger",
                     "text": { "type": "plain_text", "text": "Stop" },
-                    "value": self.conversation_id(channel_id, thread_ts),
+                    "value": conversation_id,
                 }],
             }));
         }
         Value::Array(blocks)
     }
 
-    /// The conversation identity [`SlackTransport::routable`] minted for this thread.
+    /// Publishes the deadline Slack's last 429 named, for every progress-class call at once.
     ///
-    /// A classic direct message is answered at the top level and is identified by its DM channel
-    /// alone; every other Slack conversation is `<channel>:<thread>`. Slack conversation identifiers
-    /// carry their kind in the first character, so a `D` channel is that direct message. The unit
-    /// test `the_stop_button_carries_the_conversation_routing_minted` pins the two rules together.
-    fn conversation_id(&self, channel_id: &str, thread_ts: &str) -> String {
-        if self.experience == SlackExperience::Classic && channel_id.starts_with(['D', 'd']) {
-            return channel_id.to_owned();
-        }
-        format!("{channel_id}:{thread_ts}")
+    /// Tier 3 is counted per app per workspace, so the reader's conversation lookup and a session's
+    /// progress edit share one deadline rather than each discovering the throttle separately.
+    fn begin_cooldown(&self, wait: Duration) {
+        *self
+            .progress_cooldown_until
+            .lock()
+            .expect("Slack progress cooldown") = Some(Instant::now() + wait);
     }
 
     /// One progress-class Web API call: a short deadline, no retry, one shared 429 cooldown.
@@ -1425,11 +1616,7 @@ impl SlackReplier {
             .await
             .map_err(|source| TransportError::Request(Box::new(source)))?;
         if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
-            let wait = retry_after(response.headers());
-            *self
-                .progress_cooldown_until
-                .lock()
-                .expect("Slack progress cooldown") = Some(Instant::now() + wait);
+            self.begin_cooldown(retry_after(response.headers()));
             return Err(TransportError::Service {
                 code: "ratelimited".to_owned(),
             });
@@ -1876,11 +2063,13 @@ mod driver_tests {
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
     use dekopon_agent::{CancelVia, attachment::GeneratedImage};
+    use dekopon_broker_protocol::ChatTransportKind;
     use dekopon_core::Redacted;
     use dekopon_model::ModelText;
-    use dekopon_test_support::OPENAI_CHAT_COMPLETIONS_TWO_DELTAS;
+    use dekopon_test_support::{CaptureLayer, OPENAI_CHAT_COMPLETIONS_TWO_DELTAS};
     use serde_json::{Value, json};
-    use tracing::Span;
+    use tracing::{Instrument as _, Span};
+    use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
     use super::{
         CANCEL_ACTION_ID, ConversationKind, MAX_TRACKED_REACTIONS, MAX_TRACKED_STREAMS,
@@ -1892,14 +2081,22 @@ mod driver_tests {
         transport::{
             AckToken, CancelButton, CancelPress, ChatDriver, InboundReaction, LivenessTarget,
             MessageRef, NativeStatus, OutboundReply, ProgressMessage, Status, StreamedText,
-            TextStream, TransportError, TransportEvent, credential_client,
+            TextStream, TransportError, TransportEvent, credential_client, receive_span,
         },
     };
 
-    const TEAM: &str = "t0123abc";
-    const CHANNEL: &str = "c0123abc";
-    const DIRECT_CHANNEL: &str = "d0123abc";
-    const USER: &str = "u9xyz";
+    // Uppercase, as Slack sends them. The canonical form is the transport's own fold, and a
+    // fixture that arrived pre-folded is what let a second spelling of the conversation key hide.
+    const TEAM: &str = "T0123ABC";
+    const CHANNEL: &str = "C0123ABC";
+    const DIRECT_CHANNEL: &str = "D0123ABC";
+    /// A multi-person DM, which older workspaces spell `G…` and newer ones `C…` (F15).
+    const GROUP_CHANNEL: &str = "G0123ABC";
+    const USER: &str = "U9XYZ";
+    /// The subject Slack's identifiers normalize to, which is lowercase whatever the wire said.
+    const SUBJECT: &str = "slack.t0123abc.u9xyz";
+    /// `C0123ABC:1700000000.000001` — the conversation key `routable` mints for [`CHANNEL`].
+    const CONVERSATION: &str = "c0123abc:1700000000.000001";
     const INBOUND_TS: &str = "1700000000.000001";
     const POSTED_TS: &str = "1700000000.000100";
     const STREAM_TS: &str = "1700000000.000200";
@@ -1912,6 +2109,7 @@ mod driver_tests {
             thread_ts: INBOUND_TS.to_owned(),
             message_ts: INBOUND_TS.to_owned(),
             initiator_user_id: USER.to_owned(),
+            conversation_id: CONVERSATION.to_owned(),
         }
     }
 
@@ -2025,6 +2223,20 @@ mod driver_tests {
 
     /// Answers every Web API call this transport makes with the fields it reads back.
     fn accepting(path: &str, body: &Value) -> (u16, Value) {
+        if let Some(channel) = path.strip_prefix("/api/conversations.info?channel=") {
+            // Slack's own shape: the flags come from the identifier's first letter here only
+            // because a fixture has to decide something, never because the gateway reads one.
+            return (
+                200,
+                json!({ "ok": true, "channel": {
+                    "id": channel,
+                    "is_im": channel.starts_with('D'),
+                    "is_mpim": channel.starts_with('G'),
+                    "is_channel": channel.starts_with('C'),
+                    "is_group": false,
+                }}),
+            );
+        }
         match path {
             "/api/chat.postMessage" => (
                 200,
@@ -2095,8 +2307,13 @@ mod driver_tests {
                     let Some((path, body)) = read_request(&mut stream).await else {
                         return;
                     };
-                    let body = serde_json::from_str::<Value>(&body)
-                        .expect("every call this transport makes carries a JSON body");
+                    // A GET carries no body at all; every POST this transport makes carries JSON.
+                    let body = if body.is_empty() {
+                        Value::Null
+                    } else {
+                        serde_json::from_str::<Value>(&body)
+                            .expect("every call with a body carries a JSON one")
+                    };
                     recorded
                         .lock()
                         .expect("mock call log")
@@ -2346,8 +2563,9 @@ mod driver_tests {
         );
         assert_eq!(
             posted["blocks"][1]["elements"][0]["value"],
-            json!(format!("{CHANNEL}:{INBOUND_TS}")),
-            "the button names the conversation a press stops"
+            json!(CONVERSATION),
+            "the button names the conversation a press stops, in the canonical form the registry \
+             keys on rather than the original-case channel Slack sent"
         );
         let edited = mock.body("/api/chat.update");
         assert_eq!(edited["channel"], json!(CHANNEL));
@@ -2634,7 +2852,7 @@ mod driver_tests {
                 "message": { "ts": POSTED_TS, "thread_ts": INBOUND_TS },
                 "actions": [{
                     "action_id": CANCEL_ACTION_ID,
-                    "value": format!("{CHANNEL}:{INBOUND_TS}"),
+                    "value": CONVERSATION,
                 }],
             },
         });
@@ -2652,8 +2870,8 @@ mod driver_tests {
             panic!("a press on the Stop button is routed as a cancel request");
         };
         assert_eq!(request.transport, "scientist-slack");
-        assert_eq!(request.conversation_id, format!("{CHANNEL}:{INBOUND_TS}"));
-        assert_eq!(request.subject, format!("slack.{TEAM}.{USER}"));
+        assert_eq!(request.conversation_id, CONVERSATION);
+        assert_eq!(request.subject, SUBJECT);
         assert_eq!(request.via, CancelVia::Button);
         assert!(
             mock.calls().is_empty(),
@@ -2690,7 +2908,7 @@ mod driver_tests {
         let replier = replier(UNREACHABLE, SlackExperience::Classic);
         let press = CancelPress {
             target: target(),
-            subject: format!("slack.{TEAM}.{USER}"),
+            subject: SUBJECT.to_owned(),
             ack: AckToken::Local,
         };
 
@@ -2701,59 +2919,246 @@ mod driver_tests {
         assert!(matches!(&error, TransportError::Response), "{error:?}");
     }
 
+    /// The button a person presses stops the session the registry actually holds.
+    ///
+    /// End to end on loopback and with Slack's own uppercase identifiers, because the bug this
+    /// pins was exactly a second spelling: the registry keys on the lowercased channel, and a
+    /// button built from the original-case `C0123ABC` named a session nobody had.
     #[tokio::test]
-    async fn the_stop_button_carries_the_conversation_routing_minted() {
-        let mut transport = transport(UNREACHABLE, SlackExperience::Classic);
+    async fn a_pressed_stop_button_names_the_conversation_the_registry_keys_on() {
+        let mock = spawn_slack_mock(accepting);
+        let mut transport = transport(&mock.base, SlackExperience::Classic);
+        let (working, _) = rendered();
         let mention = json!({
             "type": "app_mention",
             "channel": CHANNEL,
-            "channel_type": "channel",
             "user": USER,
             "ts": INBOUND_TS,
-            "text": "<@b0123abc> how are things?",
-        });
-        let direct = json!({
-            "type": "message",
-            "channel": DIRECT_CHANNEL,
-            "channel_type": "im",
-            "user": USER,
-            "ts": "1700000000.000002",
-            "text": "how are things?",
+            "text": "<@B0123ABC> how are things?",
         });
 
-        let in_channel = transport
+        let message = transport
             .routable(TEAM, &mention, &Span::none())
+            .await
             .expect("the mention is readable")
             .expect("the mention is routable");
-        let in_direct_message = transport
-            .routable(TEAM, &direct, &Span::none())
-            .expect("the direct message is readable")
-            .expect("the direct message is routable");
+        let target = message.liveness.clone().expect("a Slack message is live");
+        ProgressMessage::post(&*transport.replier, &target, &working, true)
+            .await
+            .expect("the progress message is posted");
+        let value = mock.body("/api/chat.postMessage")["blocks"][1]["elements"][0]["value"].clone();
+        let frame = json!({
+            "type": "interactive",
+            "envelope_id": "envelope-9",
+            "payload": {
+                "type": "block_actions",
+                "team": { "id": TEAM },
+                "user": { "id": USER },
+                "channel": { "id": CHANNEL },
+                "message": { "ts": POSTED_TS, "thread_ts": INBOUND_TS },
+                "actions": [{ "action_id": CANCEL_ACTION_ID, "value": value }],
+            },
+        });
+        transport
+            .cancel_pressed(&frame)
+            .await
+            .expect("the press is acknowledged");
 
-        // The identity in the button and the identity the session is registered under are one rule,
-        // in one place: a press that named anything else would stop nothing.
+        let TransportEvent::CancelRequested(request) = transport
+            .pending
+            .pop_front()
+            .expect("the press is routed as a cancel request")
+        else {
+            panic!("a press on the Stop button is routed as a cancel request");
+        };
         assert_eq!(
-            in_channel.conversation.key(),
-            transport.replier.conversation_id(CHANNEL, INBOUND_TS)
+            request.conversation_id,
+            message.conversation.key(),
+            "the value on the button and the key the session is registered under are one value"
         );
-        assert_eq!(in_channel.conversation.kind, ConversationKind::Channel);
+        assert_eq!(request.conversation_id, CONVERSATION);
+        assert_eq!(request.subject, SUBJECT);
+        assert_eq!(request.via, CancelVia::Button);
+    }
+
+    /// Slack's native Stop names the same conversation the message path minted.
+    #[tokio::test]
+    async fn a_native_stop_names_the_conversation_routing_minted() {
+        let mock = spawn_slack_mock(accepting);
+        let mut transport = transport(&mock.base, SlackExperience::Agent);
+        let mention = json!({
+            "type": "app_mention",
+            "channel": CHANNEL,
+            "user": USER,
+            "ts": INBOUND_TS,
+            "text": "<@B0123ABC> how are things?",
+        });
+
+        let message = transport
+            .routable(TEAM, &mention, &Span::none())
+            .await
+            .expect("the mention is readable")
+            .expect("the mention is routable");
+        let stopped = transport
+            .session_stopped(
+                TEAM,
+                &json!({
+                    "type": "agent_session_stopped",
+                    "channel": CHANNEL,
+                    "thread_ts": INBOUND_TS,
+                    "user": USER,
+                }),
+            )
+            .expect("the envelope is readable")
+            .expect("a native stop is a cancel request");
+
+        assert_eq!(stopped.conversation_id, message.conversation.key());
+        assert_eq!(stopped.via, CancelVia::NativeStop);
+        assert_eq!(stopped.subject, SUBJECT);
+    }
+
+    /// `app_mention` carries no `channel_type`, so the kind is asked for rather than assumed.
+    ///
+    /// Both ambient kinds at once: a mention in a direct message is a `directMessage` and a
+    /// mention in a multi-person DM is a `groupDirectMessage`. Guessing `channel` for either is
+    /// what made a `directMessage` route unreachable from a mention.
+    #[tokio::test]
+    async fn a_mention_resolves_its_kind_through_one_bounded_conversations_info() {
+        let mock = spawn_slack_mock(accepting);
+        let mut transport = transport(&mock.base, SlackExperience::Classic);
+        let mention = |channel: &str, ts: &str| {
+            json!({
+                "type": "app_mention",
+                "channel": channel,
+                "user": USER,
+                "ts": ts,
+                "text": "<@B0123ABC> how are things?",
+            })
+        };
+
+        let direct = transport
+            .routable(TEAM, &mention(DIRECT_CHANNEL, INBOUND_TS), &Span::none())
+            .await
+            .expect("readable")
+            .expect("routable");
+        let group = transport
+            .routable(TEAM, &mention(GROUP_CHANNEL, POSTED_TS), &Span::none())
+            .await
+            .expect("readable")
+            .expect("routable");
+        let public = transport
+            .routable(TEAM, &mention(CHANNEL, STREAM_TS), &Span::none())
+            .await
+            .expect("readable")
+            .expect("routable");
+        // A second message in a conversation already looked up costs no second call.
+        let again = transport
+            .routable(TEAM, &mention(CHANNEL, "1700000000.000300"), &Span::none())
+            .await
+            .expect("readable")
+            .expect("routable");
+
+        assert_eq!(direct.conversation.kind, ConversationKind::DirectMessage);
         assert_eq!(
-            in_direct_message.conversation.key(),
-            transport
-                .replier
-                .conversation_id(DIRECT_CHANNEL, "1700000000.000002"),
-            "a classic direct message is answered at the top level and named by its channel"
+            group.conversation.kind,
+            ConversationKind::GroupDirectMessage
         );
+        assert_eq!(public.conversation.kind, ConversationKind::Channel);
+        assert_eq!(again.conversation.kind, ConversationKind::Channel);
         assert_eq!(
-            in_direct_message.conversation.kind,
-            ConversationKind::DirectMessage
+            mock.calls().len(),
+            3,
+            "one lookup per conversation, not one per message: {:?}",
+            mock.calls()
         );
-        let blocks = transport
-            .replier
-            .progress_blocks("Working on it…", true, CHANNEL, INBOUND_TS);
+    }
+
+    /// A lookup this gateway cannot complete drops the event and says why.
+    #[tokio::test]
+    async fn a_mention_whose_kind_cannot_be_resolved_is_dropped_naming_its_cause() {
+        let capture = CaptureLayer::workspace();
+        let _subscriber = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
+        // A closed loopback port: the lookup fails rather than the kind being guessed.
+        let mut transport = transport(UNREACHABLE, SlackExperience::Classic);
+        let span = receive_span(ChatTransportKind::Slack);
+
+        let routed = transport
+            .routable(
+                TEAM,
+                &json!({
+                    "type": "app_mention",
+                    "channel": CHANNEL,
+                    "user": USER,
+                    "ts": INBOUND_TS,
+                    "text": "<@B0123ABC> how are things?",
+                }),
+                &span,
+            )
+            .instrument(span.clone())
+            .await
+            .expect("a drop is not a transport failure");
+        drop(span);
+
+        assert!(routed.is_none(), "an unplaceable mention is not routed");
+        assert!(
+            capture
+                .spans_text()
+                .contains("drop.reason=\"conversation-unresolved\""),
+            "{}",
+            capture.spans_text()
+        );
+        assert!(
+            capture.saw("cause=\"request\""),
+            "the drop names which step failed: {}",
+            capture.events_text()
+        );
+    }
+
+    /// Slack sends `thread_ts` equal to `ts` on the message that opened a thread.
+    ///
+    /// That message was posted in the channel, not in a thread under itself: reading it as a
+    /// thread mints one whose parent is the message, which no channel route or grant names.
+    #[tokio::test]
+    async fn a_thread_root_is_the_conversation_it_was_posted_in_rather_than_a_thread_under_itself()
+    {
+        let mock = spawn_slack_mock(accepting);
+        let mut transport = transport(&mock.base, SlackExperience::Classic);
+        let root = json!({
+            "type": "app_mention",
+            "channel": CHANNEL,
+            "user": USER,
+            "ts": INBOUND_TS,
+            "thread_ts": INBOUND_TS,
+            "text": "<@B0123ABC> how are things?",
+        });
+        let reply = json!({
+            "type": "app_mention",
+            "channel": CHANNEL,
+            "user": USER,
+            "ts": POSTED_TS,
+            "thread_ts": INBOUND_TS,
+            "text": "<@B0123ABC> and then?",
+        });
+
+        let opened = transport
+            .routable(TEAM, &root, &Span::none())
+            .await
+            .expect("readable")
+            .expect("routable");
+        let inside = transport
+            .routable(TEAM, &reply, &Span::none())
+            .await
+            .expect("readable")
+            .expect("routable");
+
+        assert_eq!(opened.conversation.kind, ConversationKind::Channel);
+        assert_eq!(inside.conversation.kind, ConversationKind::Thread);
         assert_eq!(
-            blocks[1]["elements"][0]["value"],
-            json!(in_channel.conversation.key())
+            opened.conversation.key(),
+            inside.conversation.key(),
+            "the opening question and the answers to it are one exchange"
         );
     }
 

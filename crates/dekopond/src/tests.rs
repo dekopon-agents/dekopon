@@ -2430,6 +2430,7 @@ fn rendered_target(target: &LivenessTarget) -> String {
         LivenessTarget::Discord {
             channel_id,
             message_id,
+            ..
         } => format!("discord:{channel_id}:{message_id}"),
         LivenessTarget::Telegram {
             chat_id,
@@ -3531,6 +3532,7 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
         thread_ts: "1700000000.000001".to_owned(),
         message_ts: "1700000000.000002".to_owned(),
         initiator_user_id: "u9xyz".to_owned(),
+        conversation_id: message.conversation.key(),
     });
     let key = ConversationKey::private(
         &route.agent,
@@ -3972,6 +3974,7 @@ async fn authorized_work_publishes_status_until_after_the_durable_reply() {
     inbound.liveness = Some(LivenessTarget::Discord {
         channel_id: "200000000000000001".to_owned(),
         message_id: "300000000000000002".to_owned(),
+        conversation_id: inbound.conversation.key(),
     });
 
     let session = tokio::spawn(run_session(
@@ -4024,6 +4027,7 @@ async fn a_hung_cosmetic_call_cannot_hold_the_answer_and_cleanup_follows_it() {
     inbound.liveness = Some(LivenessTarget::Discord {
         channel_id: "200000000000000001".to_owned(),
         message_id: "300000000000000002".to_owned(),
+        conversation_id: inbound.conversation.key(),
     });
     let session = tokio::spawn(run_session(
         runner,
@@ -4064,6 +4068,7 @@ async fn unauthorized_work_never_publishes_liveness() {
     inbound.liveness = Some(LivenessTarget::Discord {
         channel_id: "200000000000000001".to_owned(),
         message_id: "300000000000000002".to_owned(),
+        conversation_id: inbound.conversation.key(),
     });
 
     run_session(
@@ -4109,6 +4114,7 @@ async fn a_native_stop_wins_the_race_and_suppresses_answer_history_and_durable_r
         thread_ts: "1700000000.000001".to_owned(),
         message_ts: "1700000000.000001".to_owned(),
         initiator_user_id: "u9xyz".to_owned(),
+        conversation_id: inbound.conversation.key(),
     });
     let route = persistent_route(model_config(), window());
     let session_runner = Arc::clone(&runner);
@@ -6596,6 +6602,85 @@ async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
     while sessions.join_next().await.is_some() {}
 }
 
+/// A local line reaches a `channel` route without a mention, because the socket is the address.
+///
+/// Driven through `dispatch` rather than the route table: the table matched this line all along,
+/// and what dropped it was the routing loop's ambient-traffic rule, which has no mention grammar
+/// to satisfy on a line-delimited JSON request. Every kind but `directMessage` was therefore
+/// unreachable from the one transport that can produce them all.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_channel_line_reaches_its_route_without_a_mention() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["routes"][0]["conversation"] = json!({"kind": ["channel"], "ids": ["ops"]});
+    let config = resolved(directory.path(), &document).await;
+    let routes = Arc::new(
+        RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("route binds"),
+    );
+    let socket_path = directory.path().join("dispatch.sock");
+    let mut transport = crate::transport::local::LocalTransport::new(
+        "dev".to_owned(),
+        socket_path.clone(),
+        LivenessSettings::default(),
+    );
+    transport
+        .connect()
+        .await
+        .expect("the development transport binds");
+    use tokio::io::AsyncWriteExt as _;
+    let mut client = tokio::net::UnixStream::connect(&socket_path)
+        .await
+        .expect("a local caller connects");
+    client
+        .write_all(
+            format!(
+                "{}\n",
+                json!({
+                    "subject": SUBJECT,
+                    "conversation": {"kind": "channel", "id": "ops"},
+                    "text": "what is the status?"
+                })
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("the request is written");
+
+    let message = next_message(&mut transport).await;
+    assert_eq!(message.conversation.kind, ConversationKind::Channel);
+
+    let (broker, _observed) = stub_broker(directory.path(), Vec::new()).await;
+    let runner = runner(broker, ModelScript::forbidden(), 4);
+    let driver = Arc::new(RecordingDriver::default());
+    // A bot identity whose mention syntax this line deliberately does not carry.
+    let identities = BTreeMap::from([(
+        "dev".to_owned(),
+        TransportIdentity {
+            user_id: Some("U0BOTBOT".to_owned()),
+            handle: None,
+        },
+    )]);
+    let repliers = BTreeMap::from([("dev".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
+    let mut sessions = tokio::task::JoinSet::new();
+    crate::dispatch(
+        &runner,
+        &routes,
+        &identities,
+        &repliers,
+        NO_STOP_WORDS,
+        &mut sessions,
+        message,
+    );
+
+    assert_eq!(
+        sessions.len(),
+        1,
+        "the private socket is the authentication a mention stands in for elsewhere"
+    );
+    sessions.abort_all();
+    while sessions.join_next().await.is_some() {}
+}
+
 // ---------------------------------------------------------------------------
 // Slack Socket Mode
 // ---------------------------------------------------------------------------
@@ -6908,9 +6993,17 @@ fn channel_message(user: &str, ts: &str, thread_ts: Option<&str>, text: &str) ->
     event
 }
 
+/// One `app_mention`, in Slack's own shape: the event carries no `channel_type` at all.
+///
+/// Which is why the transport asks `conversations.info` what the conversation is — a fixture that
+/// fabricated the field would test a payload Slack never sends.
 fn app_mention(user: &str, ts: &str, thread_ts: Option<&str>, text: &str) -> Value {
     let mut event = channel_message(user, ts, thread_ts, text);
     event["type"] = json!("app_mention");
+    event
+        .as_object_mut()
+        .expect("a message event is an object")
+        .remove("channel_type");
     event
 }
 
@@ -6983,6 +7076,19 @@ fn slack_handler(sockets: Vec<String>) -> impl Fn(&str, &str) -> Value + Send + 
             json!({"ok": true, "url": url})
         }
         "/api/chat.postMessage" => json!({"ok": true, "ts": "1700000000.000100"}),
+        // The kind of a conversation an `app_mention` never names. `d…` is a direct message here
+        // only because a fixture has to answer something; the gateway reads the flags, never the
+        // identifier's first letter.
+        _ if path.starts_with("/api/conversations.info?channel=") => {
+            let channel = path.rsplit('=').next().unwrap_or_default();
+            json!({"ok": true, "channel": {
+                "id": channel,
+                "is_im": channel.starts_with('d'),
+                "is_mpim": channel.starts_with('g'),
+                "is_channel": channel.starts_with('c'),
+                "is_group": false,
+            }})
+        }
         _ => json!({"ok": false, "error": "unknown_method"}),
     }
 }
@@ -9583,6 +9689,7 @@ async fn discord_native_liveness_triggers_typing_on_the_authenticated_channel() 
         Some(&LivenessTarget::Discord {
             channel_id: "200000000000000099".to_owned(),
             message_id: "300000000000000099".to_owned(),
+            conversation_id: message.conversation.key(),
         })
     );
 
@@ -10265,6 +10372,7 @@ async fn telegram_liveness_and_replies_stay_inside_the_inbound_topic() {
                 "message": {
                     "message_id": 11,
                     "message_thread_id": 99,
+                    "is_topic_message": true,
                     "from": {"id": 16034700182_i64, "is_bot": false},
                     "chat": {"id": -1001, "type": "supergroup"},
                     "text": "topic work"
@@ -10479,6 +10587,7 @@ async fn telegram_topics_have_distinct_scopes_and_replies_stay_in_the_topic() {
                 "topic question",
             );
             message["message_thread_id"] = json!(77);
+            message["is_topic_message"] = json!(true);
             return json!({"ok": true, "result": [{"update_id": 500, "message": message}]});
         }
         if path.contains("sendMessage") {
@@ -11010,6 +11119,7 @@ async fn a_whatsapp_delivery_opens_its_trace_around_the_signature_check() {
         "entry": [{"id": "123", "changes": [{"field": "messages", "value": {
             "messaging_product": "whatsapp",
             "metadata": {"phone_number_id": "456"},
+            "contacts": [{"wa_id": "16034700182"}],
             "messages": [{
                 "id": "wamid.traced",
                 "from": "16034700182",
@@ -11555,6 +11665,7 @@ async fn every_origin_stops_a_session_between_the_deltas_of_a_stream() {
         inbound.liveness = Some(LivenessTarget::Discord {
             channel_id: "200000000000000001".to_owned(),
             message_id: "300000000000000002".to_owned(),
+            conversation_id: inbound.conversation.key(),
         });
         let session = tokio::spawn(run_session(
             Arc::clone(&runner),

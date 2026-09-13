@@ -217,6 +217,12 @@ pub(crate) struct ThreadContinuation {
 /// and the cancel button, because they all address the same conversation on the same service and a
 /// second coordinate set would be a second thing to keep in agreement. Every field comes from the
 /// authenticated transport envelope; no model text reaches one.
+///
+/// The two services whose stop control carries a payload also carry `conversation_id`: the exact
+/// [`Conversation::key`] the transport minted, written onto the button and read back off the press.
+/// Every other spelling of that identity — a service's original-case channel id, a thread's own
+/// snowflake, a leading-letter rule — is a second derivation that has to agree with the registry
+/// and does not, so a real press stops nothing. Telegram already carried its key this way.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum LivenessTarget {
     Slack {
@@ -224,10 +230,12 @@ pub(crate) enum LivenessTarget {
         thread_ts: String,
         message_ts: String,
         initiator_user_id: String,
+        conversation_id: String,
     },
     Discord {
         channel_id: String,
         message_id: String,
+        conversation_id: String,
     },
     Telegram {
         chat_id: i64,

@@ -268,7 +268,6 @@ impl LocalTransport {
                 // would restart the conversation every time a developer reconnected.
                 let conversation = request.conversation;
                 record_conversation(&received, &conversation);
-                let addressed = conversation.kind == ConversationKind::DirectMessage;
                 let message = InboundMessage {
                     transport: name.clone(),
                     transport_kind: ChatTransportKind::Local,
@@ -278,9 +277,13 @@ impl LocalTransport {
                     text: bound_inbound(&text),
                     // The development transport speaks line-delimited JSON and carries no files.
                     assets: Vec::new(),
-                    // A direct-message line is addressed by definition; anything else is ambient
-                    // traffic the routing loop applies the same addressing rule to as a channel.
-                    addressed: addressed.then_some(true),
+                    // Every local line is addressed: the private, owner-owned socket is the
+                    // authentication, and there is no ambient traffic on it to be summoned into.
+                    // This is what lets the local transport exercise a `channel`, `thread`, or
+                    // `groupDirectMessage` route at all — the routing loop's mention grammar has
+                    // no identifier or handle to find in a line-delimited JSON request, so an
+                    // unaddressed line would be dropped before it ever reached a route.
+                    addressed: Some(true),
                     thread_continuation: None,
                     reply: ReplyTarget::Local { connection },
                     liveness: native.then_some(LivenessTarget::Local { connection }),
@@ -1112,6 +1115,7 @@ mod unit_tests {
         let elsewhere = LivenessTarget::Discord {
             channel_id: "12".to_owned(),
             message_id: "34".to_owned(),
+            conversation_id: "12".to_owned(),
         };
 
         let refused = driver

@@ -647,14 +647,8 @@ fn parse_delivery(
             let Some(messages) = value.get("messages").and_then(Value::as_array) else {
                 continue;
             };
-            for message in messages {
-                // A group payload names the group in `from` and the human in `group_id`/
-                // `participant`; the Cloud API's individual-message path cannot answer one, so it
-                // is dropped by name rather than answered as if the group were a person.
-                if message.get("group_id").is_some() || message.get("participant").is_some() {
-                    received.record("drop.reason", "group-unsupported");
-                    continue;
-                }
+            let contacts = value.get("contacts").and_then(Value::as_array);
+            for (index, message) in messages.iter().enumerate() {
                 if message.get("type").and_then(Value::as_str) != Some("text") {
                     continue;
                 }
@@ -665,6 +659,32 @@ fn parse_delivery(
                 ) else {
                     continue;
                 };
+                // An individual message, positively: the delivery's `contacts` name the human the
+                // Cloud API would send a reply to, and on an individual message exactly one of
+                // them is `from`. A group payload names the group in `from` — with the human in
+                // `group_id`/`participant`, which are kept as the two checks that say so outright
+                // — and no contact matches it, so a shape Meta adds later that this gateway cannot
+                // answer is dropped rather than answered as if the group were a person.
+                let individual = contacts.is_some_and(|contacts| {
+                    contacts
+                        .iter()
+                        .any(|contact| contact.get("wa_id").and_then(Value::as_str) == Some(sender))
+                });
+                if !individual
+                    || message.get("group_id").is_some()
+                    || message.get("participant").is_some()
+                {
+                    // On an event rather than on `received`: one span covers the whole delivery,
+                    // so a `drop.reason` recorded there is overwritten by the next message's and
+                    // stains the trace of an accepted message beside it.
+                    tracing::debug!(
+                        event = "gateway_message_ignored",
+                        transport = %state.name,
+                        reason = "group-unsupported",
+                        message.index = index
+                    );
+                    continue;
+                }
                 if !canonical_whatsapp_message_id(id)
                     || sender.is_empty()
                     || sender.len() > 64
@@ -1146,6 +1166,7 @@ mod tests {
             "object":"whatsapp_business_account",
             "entry":[{"id":"123","changes":[{"field":"messages","value":{
                 "messaging_product":"whatsapp","metadata":{"phone_number_id":"456"},
+                "contacts":[{"wa_id":"1603"}],
                 "messages":[{"id":"same","from":"1603","type":"text","text":{"body":"hello ✓"}}]
             }}]}]
         }))
@@ -1242,6 +1263,7 @@ mod tests {
             "object":"whatsapp_business_account",
             "entry":[{"id":"123","changes":[{"field":"messages","value":{
                 "messaging_product":"whatsapp","metadata":{"phone_number_id":"456"},
+                "contacts":[{"wa_id":"1603"}],
                 "messages":[{"id":"retry-me","from":"1603","type":"text","text":{"body":"hello"}}]
             }}]}]
         }))
@@ -1304,6 +1326,7 @@ mod tests {
                       "statuses":[{"id":"status"}] }},
                     {"field":"messages","value":{"messaging_product":"whatsapp",
                       "metadata":{"phone_number_id":"456","display_phone_number":"+1 999"},
+                      "contacts":[{"wa_id":"1603"},{"wa_id":"01603"},{"wa_id":"1999"}],
                       "messages":[
                         {"id":"one","from":"1603","type":"image"},
                         {"id":"bad-sender","from":"01603","type":"text","text":{"body":"ignore"}},
@@ -1334,23 +1357,47 @@ mod tests {
         );
     }
 
-    /// A group payload is dropped by name rather than answered as though the group were a person.
+    /// Only a message whose sender is one of the delivery's own contacts is answered.
+    ///
+    /// Two shapes at once, because the rule is positive rather than a list of things to refuse: a
+    /// group payload, where `from` is the group and the contact is the human inside it, and a
+    /// delivery naming no contact for its sender at all — a shape this gateway cannot answer even
+    /// though it carries neither of the two group keys.
     #[test]
-    fn a_group_payload_is_dropped_as_group_unsupported() {
-        let payload = json!({
+    fn a_message_whose_sender_is_not_a_contact_of_the_delivery_is_dropped() {
+        let group = json!({
             "object": "whatsapp_business_account",
             "entry": [{"id":"123","changes":[{"field":"messages","value":{
                 "messaging_product":"whatsapp","metadata":{"phone_number_id":"456"},
+                "contacts":[{"wa_id":"1603"}],
                 "messages":[{
                     "id":"group-one","from":"120363000000000000","group_id":"120363000000000000",
                     "participant":"1603","type":"text","text":{"body":"hello everyone"}
                 }]
             }}]}]
         });
-        let messages = parse_delivery(&state(), &payload, &received()).expect("delivery");
+        let uncontacted = json!({
+            "object": "whatsapp_business_account",
+            "entry": [{"id":"123","changes":[{"field":"messages","value":{
+                "messaging_product":"whatsapp","metadata":{"phone_number_id":"456"},
+                "contacts":[{"wa_id":"1603"}],
+                "messages":[{
+                    "id":"elsewhere","from":"1700","type":"text","text":{"body":"hello"}
+                }]
+            }}]}]
+        });
+
         assert!(
-            messages.is_empty(),
+            parse_delivery(&state(), &group, &received())
+                .expect("delivery")
+                .is_empty(),
             "the Cloud API's individual-message path cannot answer a group"
+        );
+        assert!(
+            parse_delivery(&state(), &uncontacted, &received())
+                .expect("delivery")
+                .is_empty(),
+            "a reply has nowhere to go when no contact in the delivery is the sender"
         );
     }
 
@@ -1363,6 +1410,7 @@ mod tests {
             "object": "whatsapp_business_account",
             "entry": [{"id":"123","changes":[{"field":"messages","value":{
                 "messaging_product":"whatsapp","metadata":{"phone_number_id":"456"},
+                "contacts":[{"wa_id":"1603"}],
                 "messages":[{"id":"one","from":"1603","type":"text","text":{"body":"hello"}}]
             }}]}]
         });
@@ -1379,6 +1427,7 @@ mod tests {
                 "object":"whatsapp_business_account",
                 "entry":[{"id":"123","changes":[{"field":"messages","value":{
                     "messaging_product":"whatsapp","metadata":{"phone_number_id":"456"},
+                    "contacts":[{"wa_id":"1603"}],
                     "messages":[{"id":"same","from":"1603","type":"text","text":{"body":"hello"}}]
                 }}]}]
             }),
@@ -1428,6 +1477,7 @@ mod tests {
             "object":"whatsapp_business_account",
             "entry":[{"id":"123","changes":[{"field":"messages","value":{
                 "messaging_product":"whatsapp","metadata":{"phone_number_id":"456"},
+                "contacts":[{"wa_id":"1603"}],
                 "messages":[{"id":"wamid.loopback","from":"1603","type":"text","text":{"body":"hello"}}]
             }}]}]
         })).expect("body");

@@ -556,7 +556,9 @@ impl DiscordTransport {
     /// thread, or a forum post, and only `GET /channels/{id}` says so. That call is deliberately
     /// the *last* thing this does — after the message-type, bot-authored, malformed, self-authored,
     /// empty-content and redelivery drops — because `GUILD_MESSAGES` delivers every message in
-    /// every channel of every guild the bot is in, and ambient traffic must not cost a request.
+    /// every channel of every guild the bot is in. It still runs ahead of the addressing decision,
+    /// which the routing loop rather than this reader makes, so ambient traffic costs one
+    /// `GET /channels/{id}` per channel: [`ChannelShapes`] answers every message after the first.
     async fn routable(
         &mut self,
         message: &Value,
@@ -652,6 +654,10 @@ impl DiscordTransport {
             }
         };
         record_conversation(received, &conversation);
+        // Minted once here and carried onto the button, never re-derived: a thread is keyed on
+        // `parent:thread` while the channel a thread's message arrives in is the thread's own
+        // snowflake, so a `custom_id` built from that id alone names no session at all.
+        let conversation_id = conversation.key();
 
         Ok(Some(InboundMessage {
             transport: self.name.clone(),
@@ -673,6 +679,7 @@ impl DiscordTransport {
             liveness: self.native.then(|| LivenessTarget::Discord {
                 channel_id: channel_id.to_owned(),
                 message_id: message_id.to_owned(),
+                conversation_id,
             }),
             receive_span: received.clone(),
         }))
@@ -807,7 +814,7 @@ impl DiscordTransport {
             .unwrap_or_default();
         let Some(conversation_id) = custom_id
             .strip_prefix(CANCEL_CUSTOM_ID_PREFIX)
-            .filter(|conversation| is_snowflake(conversation))
+            .filter(|conversation| is_conversation_key(conversation))
         else {
             received.record("drop.reason", "not-a-cancel-button");
             return Ok(None);
@@ -838,8 +845,11 @@ impl DiscordTransport {
         }
         // The button lives on a message in the conversation it stops. A press arriving from
         // anywhere else is a copy of the component, and stopping a run from another channel on
-        // the strength of it is not something this transport does.
-        if interaction["channel_id"].as_str() != Some(conversation_id) {
+        // the strength of it is not something this transport does. The channel it arrives in is
+        // the last segment of the key, because a Discord thread *is* a channel: a message inside
+        // one carries the thread's own snowflake while the conversation is `parent:thread`.
+        let channel_id = key_channel(conversation_id);
+        if interaction["channel_id"].as_str() != Some(channel_id) {
             received.record("drop.reason", "conversation-mismatch");
             return Ok(None);
         }
@@ -851,8 +861,9 @@ impl DiscordTransport {
         let subject = ExternalSubject::discord(user_id).map_err(TransportError::Subject)?;
         let press = CancelPress {
             target: LivenessTarget::Discord {
-                channel_id: conversation_id.to_owned(),
+                channel_id: channel_id.to_owned(),
                 message_id: message_id.to_owned(),
+                conversation_id: conversation_id.to_owned(),
             },
             subject: subject.canonical(),
             ack: AckToken::Discord {
@@ -1126,7 +1137,7 @@ impl TypingLease for DiscordDriver {
     }
 
     async fn renew(&self, target: &LivenessTarget) -> Result<(), TransportError> {
-        let (channel_id, _) = discord_coordinates(target)?;
+        let (channel_id, _, _) = discord_coordinates(target)?;
         if self.cooling_down() {
             // A pulse suppressed by Discord's own retry deadline is the cooldown working, not a
             // failure for the policy to count against the lease.
@@ -1143,7 +1154,7 @@ impl TypingLease for DiscordDriver {
 #[async_trait]
 impl InboundReaction for DiscordDriver {
     async fn set(&self, target: &LivenessTarget, present: bool) -> Result<(), TransportError> {
-        let (channel_id, message_id) = discord_coordinates(target)?;
+        let (channel_id, message_id, _) = discord_coordinates(target)?;
         let url = format!(
             "{}/api/v{API_VERSION}/channels/{channel_id}/messages/{message_id}/reactions/{}/@me",
             self.endpoint,
@@ -1188,7 +1199,7 @@ impl ProgressMessage for DiscordDriver {
     }
 
     async fn delete(&self, message: &MessageRef) -> Result<(), TransportError> {
-        let (channel_id, _) = discord_coordinates(&message.target)?;
+        let (channel_id, _, _) = discord_coordinates(&message.target)?;
         if !is_snowflake(&message.id) {
             return Err(TransportError::Response);
         }
@@ -1372,8 +1383,8 @@ impl DiscordDriver {
         content: &str,
         cancel: bool,
     ) -> Result<MessageRef, TransportError> {
-        let (channel_id, inbound_message_id) = discord_coordinates(target)?;
-        let mut body = liveness_body(content, cancel, channel_id);
+        let (channel_id, inbound_message_id, conversation_id) = discord_coordinates(target)?;
+        let mut body = liveness_body(content, cancel, conversation_id);
         // Tied to the question it answers, exactly as the reply is: in a busy channel a floating
         // status line says nothing about which message it belongs to.
         body["message_reference"] = json!({
@@ -1413,11 +1424,11 @@ impl DiscordDriver {
         content: &str,
         cancel: bool,
     ) -> Result<(), TransportError> {
-        let (channel_id, _) = discord_coordinates(&message.target)?;
+        let (channel_id, _, conversation_id) = discord_coordinates(&message.target)?;
         if !is_snowflake(&message.id) {
             return Err(TransportError::Response);
         }
-        let body = liveness_body(content, cancel, channel_id);
+        let body = liveness_body(content, cancel, conversation_id);
         self.liveness_empty(
             self.http
                 .patch(format!(
@@ -1823,22 +1834,47 @@ fn pending_assets(
         .collect()
 }
 
-/// The channel and the message one liveness target names, refusing another service's coordinates.
+/// The channel, the message, and the conversation one liveness target names, refusing another
+/// service's coordinates.
 ///
 /// The message identifier is the inbound message on an inbound target and the gateway's own
-/// message on a press, which is why both are validated here and neither is assumed.
-fn discord_coordinates(target: &LivenessTarget) -> Result<(&str, &str), TransportError> {
+/// message on a press, which is why both are validated here and neither is assumed. The
+/// conversation is [`Conversation::key`] as the transport minted it, and it is what goes on the
+/// button rather than the channel beside it.
+fn discord_coordinates(target: &LivenessTarget) -> Result<(&str, &str, &str), TransportError> {
     let LivenessTarget::Discord {
         channel_id,
         message_id,
+        conversation_id,
     } = target
     else {
         return Err(TransportError::Response);
     };
-    if !is_snowflake(channel_id) || !is_snowflake(message_id) {
+    if !is_snowflake(channel_id)
+        || !is_snowflake(message_id)
+        || !is_conversation_key(conversation_id)
+    {
         return Err(TransportError::Response);
     }
-    Ok((channel_id, message_id))
+    Ok((channel_id, message_id, conversation_id))
+}
+
+/// Whether a value is a Discord [`Conversation::key`]: one channel snowflake, or `parent:thread`.
+fn is_conversation_key(value: &str) -> bool {
+    value.split_once(':').map_or_else(
+        || is_snowflake(value),
+        |(parent, thread)| is_snowflake(parent) && is_snowflake(thread),
+    )
+}
+
+/// The channel a Discord conversation key is addressed at: its thread, or the channel itself.
+///
+/// A thread is a channel on Discord, so `parent:thread` is answered, edited, and pressed in
+/// `thread`; the parent is what a route or a grant names and never what REST is called with.
+fn key_channel(conversation_id: &str) -> &str {
+    conversation_id
+        .split_once(':')
+        .map_or(conversation_id, |(_, thread)| thread)
 }
 
 /// The body of every message this gateway posts or edits for liveness.
@@ -1870,9 +1906,9 @@ fn allowed_mentions_none() -> Value {
 /// it was on and nothing else this gateway wrote: the reader reads the conversation back out of
 /// it, and the routing loop decides whether the presser is the person who may stop that run.
 ///
-/// Nothing truncates the identifier and nothing needs to: a Discord conversation is the channel,
-/// [`discord_coordinates`] has already refused anything that is not a snowflake, and the prefix
-/// plus the widest `u64` is a quarter of Discord's hundred-byte ceiling.
+/// Nothing truncates the identifier and nothing needs to: [`discord_coordinates`] has already
+/// refused anything that is not a [`Conversation::key`] of snowflakes, and the prefix plus two of
+/// the widest `u64` with a separator is still under half of Discord's hundred-byte ceiling.
 fn cancel_components(cancel: bool, conversation_id: &str) -> Value {
     if !cancel {
         return json!([]);
@@ -2205,6 +2241,7 @@ mod unit_tests {
         LivenessTarget::Discord {
             channel_id: "100".to_owned(),
             message_id: "200".to_owned(),
+            conversation_id: "100".to_owned(),
         }
     }
 
@@ -2637,6 +2674,7 @@ mod unit_tests {
             LivenessTarget::Discord {
                 channel_id: "100".to_owned(),
                 message_id: "555".to_owned(),
+                conversation_id: "100".to_owned(),
             },
             "the press names the message the button was on"
         );
@@ -2672,11 +2710,84 @@ mod unit_tests {
         }
     }
 
+    /// A thread's stop button names `parent:thread`, which is the key the registry holds.
+    ///
+    /// A Discord thread *is* a channel, so a message inside one arrives carrying the thread's own
+    /// snowflake while the conversation is the parent with the thread beside it. A `custom_id`
+    /// built from the channel alone named a session nobody had, and a reader that insisted on a
+    /// bare snowflake refused the corrected one.
+    #[tokio::test]
+    async fn a_stop_pressed_in_a_thread_names_the_conversation_routing_minted() {
+        let mut transport = transport("elote");
+        transport.identity = TransportIdentity {
+            user_id: Some("999".to_owned()),
+            handle: None,
+        };
+        // Seeded rather than fetched: what this pins is the key, not the lookup that finds it.
+        transport.channels.insert(
+            "100".to_owned(),
+            ChannelShape::Thread {
+                parent: "50".to_owned(),
+            },
+        );
+        let span = receive_span(ChatTransportKind::Discord);
+        let routed = transport
+            .routable(
+                &message(json!({ "guild_id": "300", "mentions": [{ "id": "999" }] })),
+                &span,
+            )
+            .instrument(span.clone())
+            .await
+            .expect("a routable message")
+            .expect("the thread places the message");
+        drop(span);
+        let target = routed.liveness.clone().expect("a live Discord message");
+
+        let (endpoint, server) = loopback(vec![(
+            200,
+            json!({ "id": "555", "channel_id": "100" }).to_string(),
+        )]);
+        driver(&endpoint)
+            .progress()
+            .expect("Discord posts progress messages")
+            .post(&target, &progress_text("Working on it…"), true)
+            .await
+            .expect("the progress message is posted");
+        let recorded = server.await.expect("the stand-in joins");
+        let custom_id = recorded[0].body["components"][0]["components"][0]["custom_id"]
+            .as_str()
+            .expect("the button carries a custom_id")
+            .to_owned();
+
+        let span = receive_span(ChatTransportKind::Discord);
+        let (_, request) = transport
+            .cancel_press(
+                &json!({
+                    "id": "300",
+                    "token": "interaction-token-1",
+                    "type": 3,
+                    // The press arrives from the thread, which is the channel it is posted in.
+                    "channel_id": "100",
+                    "data": { "component_type": 2, "custom_id": custom_id },
+                    "message": { "id": "555" },
+                    "member": { "user": { "id": "42" } },
+                }),
+                &span,
+            )
+            .expect("a well-formed envelope")
+            .expect("this gateway's own button");
+
+        assert_eq!(request.conversation_id, routed.conversation.key());
+        assert_eq!(request.conversation_id, "50:100");
+        assert_eq!(request.via, CancelVia::Button);
+    }
+
     /// The `custom_id` the button is built with stays inside Discord's ceiling for the widest
-    /// identifier the service can mint, which is why nothing along the way truncates it.
+    /// conversation key the service can mint — a thread, which is two snowflakes and a separator —
+    /// which is why nothing along the way truncates it.
     #[test]
     fn a_stop_buttons_custom_id_fits_discords_ceiling() {
-        let components = cancel_components(true, &u64::MAX.to_string());
+        let components = cancel_components(true, &format!("{0}:{0}", u64::MAX));
         let widest = components[0]["components"][0]["custom_id"]
             .as_str()
             .expect("the button carries a custom_id");
@@ -2866,6 +2977,7 @@ mod unit_tests {
             Some(LivenessTarget::Discord {
                 channel_id: "100".to_owned(),
                 message_id: "200".to_owned(),
+                conversation_id: "100".to_owned(),
             })
         );
 

@@ -20,6 +20,11 @@
 # - `reactions:write`: optional free/classic fallback; pair `classicFallback: none` with removing it.
 # - `message.im`/`im:history`: direct-message prompts.
 # - `app_mention`/`app_mentions:read`: explicitly addressed channel prompts.
+# - `channels:read`, `groups:read`, `im:read`, `mpim:read`: `conversations.info`, which is the only
+#   thing that says what kind of conversation a mention arrived in — `app_mention` carries no
+#   `channel_type`, so without them a mention in a direct message or a multi-person DM is minted as
+#   a channel and matches no `directMessage` or `groupDirectMessage` route. The answer is
+#   remembered per conversation, so it costs one call per conversation the bot is addressed in.
 # - `message.channels`/`channels:history` and `message.groups`/`groups:history`: receive channel
 #   traffic so the transport can admit only exact freshly authorized sender/thread continuations.
 #   All other ambient messages are dropped before routing, authorization, telemetry, or inference.
@@ -52,11 +57,17 @@ oauth_config:
       - app_mentions:read
       - assistant:write
       - channels:history
+      # `*:read` resolve one conversation's kind: an `app_mention` carries no `channel_type`, so
+      # without them a mention in a DM or a group DM is minted as a channel and matches no route.
+      - channels:read
       - chat:write
       - files:read
       - files:write
       - groups:history
+      - groups:read
       - im:history
+      - im:read
+      - mpim:read
       - reactions:write
 settings:
   event_subscriptions:

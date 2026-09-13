@@ -270,19 +270,26 @@ impl TelegramTransport {
         let Some(chat_id) = chat.get("id").and_then(Value::as_i64) else {
             return Ok(None);
         };
-        // Plain chats remain one conversation. Forum topics and private-chat topic mode carry a
-        // positive service-native thread identifier, which must scope history, admission, replies,
-        // durable memory, and transient liveness together.
-        let message_thread_id = message["message_thread_id"].as_i64();
-        if message_thread_id.is_some_and(|id| id <= 0) {
-            return Err(TransportError::Response);
+        // Only a forum topic is a thread. Telegram also sets `message_thread_id` on an ordinary
+        // reply in a non-forum supergroup and in a private chat, where it is the id of the message
+        // being replied to and names no topic at all — reading it as one files every reply in a
+        // conversation of its own, so history, admission, memory, and liveness all split apart.
+        // `is_topic_message` is the flag that says it really is a topic.
+        let topic = message["message_thread_id"]
+            .as_i64()
+            .filter(|_| message["is_topic_message"].as_bool() == Some(true));
+        if topic.is_some_and(|id| id <= 0) {
+            // One update, not the batch: `poll` has already advanced past this update, and
+            // returning an error here would abandon every update behind it in the same response.
+            received.record("drop.reason", "malformed-envelope");
+            return Ok(None);
         }
         // Every private chat is a direct message however it threads; a group or supergroup is a
         // channel, or a thread when the message is in a forum topic, and the daemon separately
         // requires the bot to be addressed in both. A broadcast channel is not a conversation this
         // gateway answers: nobody can reply in one, so a message there is dropped by name.
         let chat_type = chat.get("type").and_then(Value::as_str);
-        let kind = match (chat_type, message_thread_id) {
+        let kind = match (chat_type, topic) {
             (Some("private"), _) => ConversationKind::DirectMessage,
             (Some("channel"), _) => {
                 received.record("drop.reason", "broadcast-channel");
@@ -300,7 +307,7 @@ impl TelegramTransport {
             // Telegram has nothing above a chat: no workspace, no guild, no business account.
             container: None,
             id: chat_id.to_string(),
-            thread: message_thread_id.map(|topic| topic.to_string()),
+            thread: topic.map(|topic| topic.to_string()),
         };
         record_conversation(received, &conversation);
 
@@ -316,14 +323,17 @@ impl TelegramTransport {
             // Telegram's message text carries `@handle`, so the shared fallback checks it.
             addressed: None,
             thread_continuation: None,
+            // The topic and nothing else: `sendMessage` takes `message_thread_id` as the forum
+            // topic to post in, so passing an ordinary reply's thread id would answer into a
+            // topic the chat does not have.
             reply: ReplyTarget::Telegram {
                 chat_id,
                 reply_to,
-                message_thread_id,
+                message_thread_id: topic,
             },
             liveness: self.native.then_some(LivenessTarget::Telegram {
                 chat_id,
-                message_thread_id,
+                message_thread_id: topic,
                 message_id,
             }),
             receive_span: received.clone(),
@@ -372,11 +382,17 @@ impl TelegramTransport {
         let Some(claimed) = data.strip_prefix(CANCEL_CALLBACK_PREFIX) else {
             return ignored("malformed");
         };
-        let message_thread_id = message.get("message_thread_id").and_then(Value::as_i64);
-        if message_thread_id.is_some_and(|id| id <= 0) {
+        // Filtered exactly as the message path filters it, or the key this press is checked
+        // against would carry an ordinary reply's thread id that the session's own key does not,
+        // and every press in a non-forum supergroup would be ignored as a mismatch.
+        let topic = message
+            .get("message_thread_id")
+            .and_then(Value::as_i64)
+            .filter(|_| message.get("is_topic_message").and_then(Value::as_bool) == Some(true));
+        if topic.is_some_and(|id| id <= 0) {
             return ignored("malformed");
         }
-        let conversation_id = conversation_id(chat_id, message_thread_id);
+        let conversation_id = conversation_id(chat_id, topic);
         if claimed != conversation_id {
             return ignored("conversation-mismatch");
         }
@@ -388,7 +404,7 @@ impl TelegramTransport {
             press: CancelPress {
                 target: LivenessTarget::Telegram {
                     chat_id,
-                    message_thread_id,
+                    message_thread_id: topic,
                     message_id,
                 },
                 subject: subject.canonical(),
@@ -1224,6 +1240,8 @@ fn described(body: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use dekopon_model::ModelText;
+    use dekopon_test_support::CaptureLayer;
+    use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
     use super::*;
 
@@ -1783,6 +1801,123 @@ mod tests {
         );
     }
 
+    /// Only a forum topic is a thread; `message_thread_id` alone is not one.
+    ///
+    /// Telegram sets `message_thread_id` on an ordinary reply in a non-forum supergroup, where it
+    /// is the id of the message being replied to. Keying the conversation on it filed every reply
+    /// in a conversation of its own, so history, admission, memory, and liveness all split apart.
+    #[tokio::test]
+    async fn only_a_message_marked_as_a_topic_is_a_thread() {
+        let in_chat = |extra: Value| {
+            let mut message = json!({
+                "message_id": 3,
+                "from": { "id": 16034700182_i64, "is_bot": false },
+                "chat": { "id": -1001, "type": "supergroup" },
+                "text": "@dekopon_bot what broke?"
+            });
+            for (key, value) in extra.as_object().expect("an object of overrides") {
+                message[key] = value.clone();
+            }
+            one_update(json!({ "update_id": 100, "message": message }))
+        };
+
+        let mut replying = transport(&bot_api(in_chat(json!({ "message_thread_id": 77 }))).base);
+        replying.poll_once().await.expect("one poll cycle");
+        let TransportEvent::Message(reply) =
+            replying.next().await.expect("the reply is one message")
+        else {
+            panic!("a message update is a message");
+        };
+        let mut in_topic = transport(
+            &bot_api(in_chat(
+                json!({ "message_thread_id": 77, "is_topic_message": true }),
+            ))
+            .base,
+        );
+        in_topic.poll_once().await.expect("one poll cycle");
+        let TransportEvent::Message(topic) =
+            in_topic.next().await.expect("the topic message arrives")
+        else {
+            panic!("a message update is a message");
+        };
+
+        assert_eq!(reply.conversation.kind, ConversationKind::Channel);
+        assert_eq!(reply.conversation.key(), "-1001");
+        assert_eq!(
+            reply.reply,
+            ReplyTarget::Telegram {
+                chat_id: -1001,
+                reply_to: Some(3),
+                message_thread_id: None,
+            },
+            "`sendMessage` takes a forum topic, and this chat has none"
+        );
+        assert_eq!(topic.conversation.kind, ConversationKind::Thread);
+        assert_eq!(topic.conversation.key(), "-1001:77");
+    }
+
+    /// A topic id the Bot API would never mint costs that update and no other.
+    ///
+    /// The offset has already advanced past every update in the batch by the time one is read, so
+    /// failing the poll would abandon the ones behind it: they are acknowledged and never resent.
+    #[tokio::test]
+    async fn an_impossible_topic_id_drops_its_own_update_rather_than_the_batch() {
+        let capture = CaptureLayer::workspace();
+        let _subscriber = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
+        let api = bot_api(|method, body| {
+            if method == "getUpdates" {
+                return accepted(json!([
+                    {
+                        "update_id": 100,
+                        "message": {
+                            "message_id": 3,
+                            "message_thread_id": -5,
+                            "is_topic_message": true,
+                            "from": { "id": 16034700182_i64, "is_bot": false },
+                            "chat": { "id": -1001, "type": "supergroup" },
+                            "text": "@dekopon_bot first"
+                        }
+                    },
+                    {
+                        "update_id": 101,
+                        "message": {
+                            "message_id": 4,
+                            "from": { "id": 16034700182_i64, "is_bot": false },
+                            "chat": { "id": -1001, "type": "supergroup" },
+                            "text": "@dekopon_bot second"
+                        }
+                    }
+                ]));
+            }
+            posting(method, body)
+        });
+        let mut transport = transport(&api.base);
+
+        transport
+            .poll_once()
+            .await
+            .expect("one bad update is not a failed poll");
+
+        assert_eq!(
+            transport.pending.len(),
+            1,
+            "the update behind it still routes"
+        );
+        assert_eq!(
+            transport.offset, 102,
+            "every update in the batch is acknowledged"
+        );
+        assert!(
+            capture
+                .spans_text()
+                .contains("drop.reason=\"malformed-envelope\""),
+            "{}",
+            capture.spans_text()
+        );
+    }
+
     #[test]
     fn the_cancel_payload_always_fits_the_bot_api_ceiling() {
         let widest = format!(
@@ -1904,6 +2039,7 @@ mod tests {
             target: LivenessTarget::Discord {
                 channel_id: "1".to_owned(),
                 message_id: "2".to_owned(),
+                conversation_id: "1".to_owned(),
             },
             id: "2".to_owned(),
         };
