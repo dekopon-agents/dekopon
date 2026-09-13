@@ -2,7 +2,7 @@
 //!
 //! Each of these accepts either a raw string or a JSON array of lines and returns a line list
 //! re-coerced by [`crate::value::from_lines`]. That auto-coercion is what lets
-//! `curl ... | grep foo | wc -l` read and behave like real bash while `jq` stays JSON-native.
+//! `gh issue list | grep foo | wc -l` read and behave like real bash while `jq` stays JSON-native.
 //!
 //! Patterns here are **literal strings with optional `^` and `$` anchors** unless the command is
 //! given `-E`. The default is not about dependency weight — `jq`'s `regex` feature already links

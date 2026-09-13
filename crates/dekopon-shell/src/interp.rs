@@ -31,7 +31,7 @@ use crate::{
     builtins::{
         self, BuiltinContext, BuiltinKind, CommandFailure, CommandResult, FatalError, xargs,
     },
-    dispatch::{self, Resolution, arguments_to_input},
+    dispatch::{self, Resolution},
     limits::{Budget, LimitExceeded, Limits, OutputBuffer},
     parser::{
         expanded_case_pattern, expanded_conditional_pattern, expanded_parameter_pattern, parse,
@@ -190,12 +190,7 @@ struct Frame {
 }
 
 /// Parses and evaluates one script, returning its outcome.
-pub(crate) fn run(
-    script: &str,
-    invoker: &dyn CapabilityInvoker,
-    limits: Limits,
-    curl_capability: Option<&str>,
-) -> ScriptOutcome {
+pub(crate) fn run(script: &str, invoker: &dyn CapabilityInvoker, limits: Limits) -> ScriptOutcome {
     let program = match parse(script) {
         Ok(program) => program,
         Err(error) => {
@@ -224,7 +219,6 @@ pub(crate) fn run(
         testing_status: 0,
         stdin: Vec::new(),
         stderr_capture: Vec::new(),
-        curl_capability: curl_capability.map(str::to_owned),
         counters: telemetry::ScriptCounters::default(),
         last_status: ExitCode::SUCCESS,
         last_substitution_status: ExitCode::SUCCESS,
@@ -298,8 +292,7 @@ struct Evaluator<'a> {
     /// `f 2> log` collects its whole body's diagnostics, while a command *inside* that body with
     /// its own `2>` collects only its own and then restores the function's.
     stderr_capture: Vec<StderrCapture>,
-    curl_capability: Option<String>,
-    /// Per-script command totals, and the cap on how many command spans reach INFO.
+    /// Per-script command totals, recorded on the script span when it closes.
     counters: telemetry::ScriptCounters,
     last_status: ExitCode,
     last_substitution_status: ExitCode,
@@ -971,7 +964,8 @@ impl Evaluator<'_> {
                         // Only the terminal command's result is ever read, and the terminal
                         // command is by construction never piped — so an intermediate value moves
                         // into the next stage instead of being copied into it and then dropped.
-                        // Without this `cap big | jq . | grep x` deep-copies the payload per stage.
+                        // Without this `gh issue list | jq . | grep x` deep-copies the payload per
+                        // stage.
                         last = CommandResult::status(result.status);
                         input = Some(Rc::new(result.value));
                     } else {
@@ -981,8 +975,8 @@ impl Evaluator<'_> {
             }
         }
 
-        // `pipefail` reports the rightmost stage that failed, so `cap x | jq .` stops hiding a
-        // capability that never ran behind a `jq` that was handed nothing and succeeded.
+        // `pipefail` reports the rightmost stage that failed, so `gh issue view 12 | jq .` stops
+        // hiding a capability that never ran behind a `jq` that was handed nothing and succeeded.
         let mut status = last.status;
         if self.options.pipefail
             && let Some(failed) = stages
@@ -1121,7 +1115,7 @@ impl Evaluator<'_> {
 
         // Command words are expanded *before* any prefix assignment is applied, so `x=new echo $x`
         // prints the old value, and the binding is restored afterwards so it does not leak into the
-        // rest of the script. Both halves are what `DEBUG=1 some.capability` means in bash.
+        // rest of the script. Both halves are what `DEBUG=1 some-command` means in bash.
         let mut argv = Vec::new();
         for word in &command.words {
             match self.expand_word(word) {
@@ -1379,12 +1373,12 @@ impl Evaluator<'_> {
     /// Executes one command word, wrapped in the span every command in a script produces.
     ///
     /// This is the single place a command word actually runs, so it is the single place worth
-    /// instrumenting: one span here covers builtins, capability calls, shell functions, refused
-    /// words, and unknown words alike, and covers builtins added later without another edit. The
-    /// recursion `xargs` drives back into this function is deliberately *not* special-cased — one
-    /// script word that maps a command over ten items really did run ten commands, and each of
-    /// them gets its own span nested inside the `xargs` one, which is exactly the syscall-by-
-    /// syscall reading this instrumentation exists to give.
+    /// instrumenting: one span here covers builtins, provider command words, shell functions,
+    /// refused words, and unknown words alike, and covers builtins added later without another
+    /// edit. The recursion `xargs` drives back into this function is deliberately *not*
+    /// special-cased — one script word that maps a command over ten items really did run ten
+    /// commands, and each of them gets its own span nested inside the `xargs` one, which is
+    /// exactly the syscall-by-syscall reading this instrumentation exists to give.
     ///
     /// See [`telemetry`] for what these spans carry.
     fn run_argv(
@@ -1409,6 +1403,15 @@ impl Evaluator<'_> {
         self.counters.charge(kind);
         let span = telemetry::command_span(command, kind, arguments.len());
         let _entered = span.enter();
+        // The payload attributes cost a serialization each, so they are built only for a span
+        // something will record.
+        let traced = !span.is_disabled();
+        if traced {
+            telemetry::record_arguments(&span, arguments);
+            if let Some(piped) = input.as_deref() {
+                telemetry::record_stdin(&span, piped);
+            }
+        }
 
         let executed = self.dispatch_command(
             command,
@@ -1438,6 +1441,9 @@ impl Evaluator<'_> {
         };
         span.record("shell.command.exit_code", status.get());
         span.record("outcome", outcome);
+        if traced && let Ok(Executed::Result(result)) = &executed {
+            telemetry::record_output(&span, &result.value);
+        }
         self.counters.record_status(status);
         executed
     }
@@ -1473,7 +1479,6 @@ impl Evaluator<'_> {
                         invoker: self.invoker,
                         budget: &mut self.budget,
                         buffers: &mut self.buffers,
-                        curl_capability: self.curl_capability.as_deref(),
                     };
                     // The one place a piped value has to become owned. A pipeline stage's own
                     // output is held by nobody else and moves straight through; a function frame's
@@ -1491,22 +1496,27 @@ impl Evaluator<'_> {
             }
             Resolution::Builtin(BuiltinKind::Xargs) => self.run_xargs(arguments, input),
             // The provider runs its own argv like a small command-line program. A proposal it
-            // makes then travels the identical path a direct capability word takes: same budget,
-            // same denial, same telemetry. Running the word proposes; it does not grant.
+            // makes is charged, authorized, and traced like every capability call, and any secret
+            // reference it names travels with it to the invoker. Running the word proposes; it
+            // does not grant.
             Resolution::ProviderCommand => {
                 // Encoded once, with the rule every emitted value follows — strings verbatim,
                 // everything else as compact JSON — so a provider reads `echo hello | word -` and
-                // `some.capability | word -` exactly as the script would have printed them.
+                // `jq -n '{a:1}' | word -` exactly as the script would have printed them.
                 let stdin = input.as_deref().map(display);
                 // A guest run costs wall clock the same way a capability call does, and for the
-                // same reason `invoke_capability` re-reads the clock on both sides of one.
+                // same reason `invoke_capability_with_secret_use` re-reads the clock around one.
                 self.budget.check_deadline()?;
                 let run = self
                     .invoker
                     .run_command(command, arguments, stdin.as_deref());
                 self.budget.check_deadline()?;
-                let (capability, input) = match run {
-                    Some(CommandRun::Proposed { capability, input }) => (capability, input),
+                let (capability, input, secret_use) = match run {
+                    Some(CommandRun::Proposed {
+                        capability,
+                        input,
+                        secret_use,
+                    }) => (capability, input, secret_use),
                     Some(CommandRun::Failed { message }) => {
                         let status = self.absorb(CommandFailure::usage(message))?;
                         return Ok(Executed::Result(CommandResult::status(status)));
@@ -1556,9 +1566,8 @@ impl Evaluator<'_> {
                         invoker: self.invoker,
                         budget: &mut self.budget,
                         buffers: &mut self.buffers,
-                        curl_capability: self.curl_capability.as_deref(),
                     };
-                    context.invoke_capability(&capability, input)
+                    context.invoke_capability_with_secret_use(&capability, input, secret_use)
                 };
                 match outcome {
                     Ok(result) => Ok(Executed::Result(result)),
@@ -1568,39 +1577,7 @@ impl Evaluator<'_> {
                     }
                 }
             }
-            // A piped value is not offered to a bare capability word: its input is exactly the
-            // `--flag value` argv, so `x | echo.echo` sees nothing of `x`. Only a provider command
-            // word receives stdin, above. The crate README states the rule.
-            Resolution::Capability => {
-                let input = match arguments_to_input(command, arguments) {
-                    Ok(input) => input,
-                    Err(failure) => {
-                        let status = self.absorb(failure)?;
-                        return Ok(Executed::Result(CommandResult::status(status)));
-                    }
-                };
-                let outcome = {
-                    let mut context = BuiltinContext {
-                        invoker: self.invoker,
-                        budget: &mut self.budget,
-                        buffers: &mut self.buffers,
-                        curl_capability: self.curl_capability.as_deref(),
-                    };
-                    context.invoke_capability(command, input)
-                };
-                match outcome {
-                    Ok(result) => Ok(Executed::Result(result)),
-                    Err(failure) => {
-                        let status = self.absorb(failure)?;
-                        Ok(Executed::Result(CommandResult::status(status)))
-                    }
-                }
-            }
-            // Byte for byte what `NotFound` reports, and that is the point: a model that could
-            // tell "no such command" from "you were not granted that" would have an oracle for
-            // enumerating the deployment's capabilities one guess at a time. The difference is
-            // recorded in the span and nowhere the script can read.
-            Resolution::NotFound | Resolution::NotGranted => {
+            Resolution::NotFound => {
                 self.write_line(&format!("dekopon-shell: {command}: command not found"));
                 Ok(Executed::Result(CommandResult::status(ExitCode::NOT_FOUND)))
             }
@@ -1845,9 +1822,9 @@ impl Evaluator<'_> {
     /// Evaluates an assignment right-hand side.
     ///
     /// A whole-RHS `$(cmd)` or `$NAME` keeps its structured value instead of collapsing to text.
-    /// This is the documented deviation from bash that makes `ip=$(curl ...)` followed by
-    /// `${ip[origin]}` work, and it has to cover both spellings or `copy=$ip` would silently
-    /// flatten what `ip` holds.
+    /// This is the documented deviation from bash that makes `issue=$(gh issue view 12)` followed
+    /// by `${issue[title]}` work, and it has to cover both spellings or `copy=$issue` would
+    /// silently flatten what `issue` holds.
     fn assignment_value(&mut self, word: &Word) -> Result<Value, CommandFailure> {
         self.last_substitution_status = ExitCode::SUCCESS;
         if word.parts.is_empty() {
@@ -2379,9 +2356,9 @@ fn parameter_length(value: &Value) -> Value {
 /// Folds a command's captured diagnostics into its value, for `2>&1`.
 ///
 /// A command with nothing to say leaves its value untouched — including its type, so
-/// `posts.get 2>&1` still yields an object rather than that object's JSON text. Only when there
-/// *are* diagnostics do the two channels have to become one, and they become one the way every
-/// text-shaped builtin already crosses between a value and its lines.
+/// `gh issue view 12 2>&1` still yields an object rather than that object's JSON text. Only when
+/// there *are* diagnostics do the two channels have to become one, and they become one the way
+/// every text-shaped builtin already crosses between a value and its lines.
 fn merge_diagnostics(value: Value, diagnostics: Vec<String>) -> Value {
     if diagnostics.is_empty() {
         return value;

@@ -1,17 +1,15 @@
 //! The fixed builtin table and the context builtins run against.
 //!
-//! Every builtin name in this table is separator-free: it contains no `.`, `-`, or `_`. Capability
-//! fallback in [`crate::dispatch`] only fires for words that *do* contain a separator, so a builtin
-//! and a capability can never collide on the same bare word. That is the collision-avoidance
-//! mechanism, not a coincidence, and [`tests::builtin_names_can_never_collide_with_capabilities`]
-//! asserts it.
+//! Every name in this table is reserved: `dekopon_core::RESERVED_COMMAND_WORDS` mirrors it, a test
+//! beside [`crate::dispatch`] pins the two together, and a provider declaring one as a command word
+//! is refused at load rather than shadowed.
 //!
 //! Builtins are either **text-shaped** or **value-shaped**:
 //!
 //! - text-shaped (`grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`) accept a raw string or a
 //!   JSON array of lines, newline-joining arrays on the way in and re-coercing line lists to arrays
-//!   on the way out, so `curl ... | grep foo | wc -l` reads like bash;
-//! - value-shaped (`jq`, `cap`, `curl`, `cat`) stay JSON-native end to end.
+//!   on the way out, so `gh issue list | grep foo | wc -l` reads like bash;
+//! - value-shaped (`jq`, `cap`, `cat`) stay JSON-native end to end.
 
 use std::collections::BTreeMap;
 
@@ -24,7 +22,6 @@ use crate::{
 };
 
 pub(crate) mod cap;
-pub(crate) mod curl;
 pub(crate) mod encode;
 pub(crate) mod jq;
 pub(crate) mod misc;
@@ -132,26 +129,16 @@ pub(crate) struct BuiltinContext<'a> {
     pub budget: &'a mut Budget,
     /// Named in-memory buffers written by `>` and `>>`; never real paths.
     pub buffers: &'a mut BTreeMap<String, Value>,
-    /// The capability `curl` assembles requests for, when the embedder configured one.
-    pub curl_capability: Option<&'a str>,
 }
 
 impl BuiltinContext<'_> {
-    /// Charges the capability-call budget and invokes one capability.
+    /// Charges the capability-call budget and invokes one capability, carrying the proposal's
+    /// typed secret intent to the invoker unchanged.
     ///
     /// The deadline is re-read on both sides of the call. A capability invocation is the single
     /// most expensive thing a script can do in wall-clock terms and the cheapest in steps — the
     /// default budget lets thirty-two of them run in ninety-six steps — so leaving the clock to the
     /// step counter alone let a script overrun its deadline by minutes and still report success.
-    pub(crate) fn invoke_capability(
-        &mut self,
-        capability: &str,
-        input: Value,
-    ) -> Result<CommandResult, CommandFailure> {
-        self.invoke_capability_with_secret_use(capability, input, None)
-    }
-
-    /// Charges the capability-call budget and invokes one capability with typed secret intent.
     pub(crate) fn invoke_capability_with_secret_use(
         &mut self,
         capability: &str,
@@ -193,7 +180,7 @@ impl BuiltinContext<'_> {
 
 /// One builtin command.
 pub(crate) trait Builtin {
-    /// The separator-free name this builtin is dispatched by.
+    /// The name this builtin is dispatched by.
     fn name(&self) -> &'static str;
 
     /// Runs the builtin with already-expanded argv and the piped input value, if any.
@@ -217,7 +204,6 @@ pub(crate) enum BuiltinKind {
 /// The complete builtin registry, in dispatch order.
 const REGISTRY: &[&dyn Builtin] = &[
     &jq::Jq,
-    &curl::Curl,
     &misc::Sleep,
     &text::Grep,
     &text::Sed,
@@ -308,14 +294,7 @@ pub(crate) mod test_support {
         input: Option<Value>,
     ) -> Result<CommandResult, CommandFailure> {
         let mut buffers = BTreeMap::new();
-        run_builtin_with(
-            builtin,
-            arguments,
-            input,
-            Limits::default(),
-            None,
-            &mut buffers,
-        )
+        run_builtin_with(builtin, arguments, input, Limits::default(), &mut buffers)
     }
 
     /// Runs one builtin against a caller-supplied invoker.
@@ -330,7 +309,6 @@ pub(crate) mod test_support {
             invoker,
             budget: &mut budget,
             buffers: &mut buffers,
-            curl_capability: None,
         };
         let arguments = arguments
             .iter()
@@ -339,13 +317,12 @@ pub(crate) mod test_support {
         builtin.run(&mut context, &arguments, None)
     }
 
-    /// Runs one builtin with explicit limits, curl capability, and buffer store.
+    /// Runs one builtin with explicit limits and buffer store.
     pub(crate) fn run_builtin_with(
         builtin: &dyn Builtin,
         arguments: &[&str],
         input: Option<Value>,
         limits: Limits,
-        curl_capability: Option<&str>,
         buffers: &mut BTreeMap<String, Value>,
     ) -> Result<CommandResult, CommandFailure> {
         let invoker = NoCapabilities;
@@ -354,7 +331,6 @@ pub(crate) mod test_support {
             invoker: &invoker,
             budget: &mut budget,
             buffers,
-            curl_capability,
         };
         let arguments = arguments
             .iter()
@@ -366,19 +342,12 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::{lookup, names, xargs};
+    use dekopon_core::SecretUseProposal;
+    use serde_json::Value;
 
-    #[test]
-    fn builtin_names_can_never_collide_with_capabilities() {
-        // Capability fallback only fires for words containing `.`, `-`, or `_`. Keeping every
-        // builtin name separator-free is what makes that disjointness total rather than likely.
-        for name in names() {
-            assert!(
-                !name.contains(['.', '-', '_']),
-                "builtin {name:?} contains a capability-identifier separator"
-            );
-        }
-    }
+    use crate::{CapabilityCallResult, CapabilityInvoker, ExitCode, Interpreter, Limits};
+
+    use super::{lookup, names, xargs};
 
     #[test]
     fn the_registry_covers_every_documented_builtin() {
@@ -387,7 +356,6 @@ mod tests {
             "base64",
             "cap",
             "cat",
-            "curl",
             "cut",
             "echo",
             "false",
@@ -410,5 +378,37 @@ mod tests {
             assert!(lookup(name).is_some(), "{name} must resolve");
         }
         assert!(lookup("definitely-not-a-builtin").is_none());
+    }
+
+    /// A session holding an HTTP capability and no provider word that would propose it.
+    struct HttpGranted;
+
+    impl CapabilityInvoker for HttpGranted {
+        fn granted(&self) -> Vec<String> {
+            vec!["http-probe.fetch".to_owned()]
+        }
+
+        fn invoke(
+            &self,
+            _capability: &str,
+            _input: Value,
+            secret_use: Option<SecretUseProposal>,
+        ) -> CapabilityCallResult {
+            if secret_use.is_some() {
+                return crate::secret_use_unsupported();
+            }
+            CapabilityCallResult::Failed {
+                error: "curl reached a capability".to_owned(),
+            }
+        }
+    }
+
+    #[test]
+    fn curl_is_not_a_builtin_and_exits_127_even_with_an_http_capability_granted() {
+        assert!(lookup("curl").is_none());
+        let outcome = Interpreter::new(Limits::default()).run("curl https://x", &HttpGranted);
+        assert_eq!(outcome.exit_code, ExitCode::NOT_FOUND, "{}", outcome.output);
+        assert_eq!(outcome.output, "dekopon-shell: curl: command not found");
+        assert_eq!(outcome.capability_calls, 0);
     }
 }

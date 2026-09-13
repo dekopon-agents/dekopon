@@ -1,25 +1,36 @@
-//! Per-command `tracing` vocabulary, and the redaction rule it follows.
+//! Per-command `tracing` vocabulary, and what a command span carries.
 //!
 //! # Why this lives at one seam
 //!
 //! Every command word a script runs passes through [`super::Evaluator::run_argv`], after
 //! [`crate::dispatch::resolve`] has decided what it is. One span there therefore covers every
-//! builtin, capability call, shell function, refused word, and unknown word — including builtins
-//! that do not exist yet. Instrumenting the individual builtin implementations instead would leave
-//! each newly added one silently untraced, and would put the same twenty-line preamble in twenty
-//! files.
+//! builtin, provider command word, shell function, refused word, and unknown word — including
+//! builtins that do not exist yet. Instrumenting the individual builtin implementations instead
+//! would leave each newly added one silently untraced, and would put the same twenty-line preamble
+//! in twenty files.
 //!
 //! # What is recorded
 //!
-//! Every command word, whoever wrote it: a builtin name, a control word, a capability identifier, a
-//! shell function the model declared, and a word that resolved to nothing. The operator's trace is
-//! the record of what an agent did, and a word replaced by a placeholder makes the run
+//! Every command word, whoever wrote it: a builtin name, a control word, a provider command word,
+//! a shell function the model declared, and a word that resolved to nothing. The operator's trace
+//! is the record of what an agent did, and a word replaced by a placeholder makes the run
 //! unreconstructible for the reader the trace exists for. Alongside it go the resolution kind, the
-//! argument *count*, the duration, the exit code, and a stable outcome label.
+//! argument count, the duration, the exit code, a stable outcome label, and three payloads:
 //!
-//! Argument *values* are the one exclusion, and it is goal 1's rather than this module's:
-//! `curl -d '{"apiKey":...}'` puts a credential in argv, and secret bytes are the material no part
-//! of this workspace exports. That exclusion is unconditional and has no switch.
+//! - `shell.command.arguments`, the argv after the word as a JSON array;
+//! - `shell.command.stdin`, the piped value as the command received it, present only when a value
+//!   was piped;
+//! - `shell.command.output`, what the command produced on stdout.
+//!
+//! Each payload passes through `dekopon_core::bounded_attribute`, which cuts a value past its byte
+//! cap on a character boundary and marks the cut, and carries a `.bytes` sibling holding the full
+//! length, so a truncated attribute still says how much there was. The bound is on an attribute's
+//! size, never on how many spans are kept.
+//!
+//! Nothing is withheld or redacted. A broker-held secret is named by a public DRN that a provider
+//! command proposes and only the broker resolves, so argv carrying a DRN carries the reference,
+//! never the secret bytes it names. Literal secret text a script types into argv or pipes through
+//! stdin is recorded as written.
 //!
 //! # How much is recorded
 //!
@@ -33,7 +44,11 @@
 //! the same whether a script ran three commands or thirty thousand and give a reader the shape of
 //! the run before they walk it.
 
-use crate::{ExitCode, builtins::FatalError, dispatch::Resolution, limits::LimitExceeded};
+use serde_json::Value;
+
+use crate::{
+    ExitCode, builtins::FatalError, dispatch::Resolution, limits::LimitExceeded, value::display,
+};
 
 /// The span one whole script run opens, and the home of its totals.
 pub(crate) const SCRIPT_SPAN: &str = "shell.script";
@@ -42,7 +57,8 @@ pub(crate) const SCRIPT_SPAN: &str = "shell.script";
 ///
 /// Whatever a script did, these describe its whole run in three bounded integers, recorded on the
 /// [`SCRIPT_SPAN`] when it closes — the shape of the run, ahead of the per-command spans that give
-/// it in full.
+/// it in full. A capability command is a provider command word, the only command that proposes a
+/// capability.
 #[derive(Debug, Default)]
 pub(crate) struct ScriptCounters {
     commands: u64,
@@ -54,7 +70,7 @@ impl ScriptCounters {
     /// Charges one command word.
     pub(crate) fn charge(&mut self, kind: CommandKind) {
         self.commands = self.commands.saturating_add(1);
-        if matches!(kind, CommandKind::Capability | CommandKind::ProviderCommand) {
+        if kind == CommandKind::ProviderCommand {
             self.capability_commands = self.capability_commands.saturating_add(1);
         }
     }
@@ -75,15 +91,65 @@ impl ScriptCounters {
 }
 
 /// Opens the span for one command word.
+///
+/// The payloads are declared empty here and filled by [`record_arguments`], [`record_stdin`], and
+/// [`record_output`], so a span nothing records never pays for serializing them.
 pub(crate) fn command_span(name: &str, kind: CommandKind, argument_count: usize) -> tracing::Span {
     tracing::info_span!(
         "shell.command",
         shell.command.name = name,
         shell.command.kind = kind.label(),
         shell.command.argument_count = argument_count,
+        shell.command.arguments = tracing::field::Empty,
+        shell.command.arguments.bytes = tracing::field::Empty,
+        shell.command.stdin = tracing::field::Empty,
+        shell.command.stdin.bytes = tracing::field::Empty,
+        shell.command.output = tracing::field::Empty,
+        shell.command.output.bytes = tracing::field::Empty,
         shell.command.exit_code = tracing::field::Empty,
         outcome = tracing::field::Empty,
     )
+}
+
+/// Records a command's argv after the word, as a JSON array.
+pub(crate) fn record_arguments(span: &tracing::Span, arguments: &[String]) {
+    let encoded = arguments
+        .iter()
+        .map(String::as_str)
+        .collect::<Value>()
+        .to_string();
+    record_bounded(
+        span,
+        "shell.command.arguments",
+        "shell.command.arguments.bytes",
+        &encoded,
+    );
+}
+
+/// Records the value piped into a command, under the display rule a provider word receives it by.
+pub(crate) fn record_stdin(span: &tracing::Span, piped: &Value) {
+    record_bounded(
+        span,
+        "shell.command.stdin",
+        "shell.command.stdin.bytes",
+        &display(piped),
+    );
+}
+
+/// Records what a command produced on stdout, under the display rule it is emitted by.
+pub(crate) fn record_output(span: &tracing::Span, output: &Value) {
+    record_bounded(
+        span,
+        "shell.command.output",
+        "shell.command.output.bytes",
+        &display(output),
+    );
+}
+
+/// Records one payload through `dekopon_core::bounded_attribute`, beside its full byte length.
+fn record_bounded(span: &tracing::Span, field: &str, bytes_field: &str, text: &str) {
+    span.record(field, &*dekopon_core::bounded_attribute(text));
+    span.record(bytes_field, text.len());
 }
 
 /// Opens the span covering one whole script run.
@@ -124,16 +190,12 @@ pub(crate) enum CommandKind {
     Function,
     /// A builtin from the fixed registry.
     Builtin,
-    /// A granted capability, dispatched through the invoker seam.
-    Capability,
     /// A command word a loaded provider contributed.
     ProviderCommand,
     /// A word this shell refuses by name, such as `eval`.
     Rejected,
-    /// Nothing matched; the script sees exit code 127.
+    /// Nothing matched, a capability-shaped word included; the script sees exit code 127.
     NotFound,
-    /// A capability the session did not get, in a namespace it did; the script sees 127 too.
-    NotGranted,
 }
 
 impl CommandKind {
@@ -142,9 +204,7 @@ impl CommandKind {
         match resolution {
             Resolution::Function => Self::Function,
             Resolution::Builtin(_) => Self::Builtin,
-            Resolution::Capability => Self::Capability,
             Resolution::ProviderCommand => Self::ProviderCommand,
-            Resolution::NotGranted => Self::NotGranted,
             Resolution::Rejected(_) => Self::Rejected,
             Resolution::NotFound => Self::NotFound,
         }
@@ -156,11 +216,9 @@ impl CommandKind {
             Self::Control => "control",
             Self::Function => "function",
             Self::Builtin => "builtin",
-            Self::Capability => "capability",
             Self::ProviderCommand => "provider-command",
             Self::Rejected => "rejected",
             Self::NotFound => "not-found",
-            Self::NotGranted => "not-granted",
         }
     }
 }

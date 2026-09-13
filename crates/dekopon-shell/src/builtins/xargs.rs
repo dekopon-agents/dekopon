@@ -65,7 +65,7 @@ pub(crate) fn plan(arguments: &[String], input: Option<&Value>) -> Result<Plan, 
     let template = &arguments[index..];
     let Some(command) = template.first() else {
         return Err(CommandFailure::usage(
-            "xargs: a command is required, as in `xargs some.capability --id`",
+            "xargs: a command is required, as in `xargs gh issue view`",
         ));
     };
     if command.starts_with('-') {
@@ -110,13 +110,12 @@ mod tests {
 
     #[test]
     fn appends_each_array_element_as_a_trailing_argument() {
-        let planned =
-            plan(&arguments(&["posts.get", "--id"]), Some(&json!([1, 2]))).expect("plans");
+        let planned = plan(&arguments(&["probe", "--id"]), Some(&json!([1, 2]))).expect("plans");
         assert_eq!(
             planned.invocations,
             vec![
-                arguments(&["posts.get", "--id", "1"]),
-                arguments(&["posts.get", "--id", "2"]),
+                arguments(&["probe", "--id", "1"]),
+                arguments(&["probe", "--id", "2"]),
             ]
         );
     }
@@ -124,13 +123,13 @@ mod tests {
     #[test]
     fn a_placeholder_substitutes_anywhere_in_the_template() {
         let planned = plan(
-            &arguments(&["-I", "{}", "posts.get", "--id", "{}", "--tag", "x{}y"]),
+            &arguments(&["-I", "{}", "probe", "--id", "{}", "--tag", "x{}y"]),
             Some(&json!(["7"])),
         )
         .expect("plans");
         assert_eq!(
             planned.invocations,
-            vec![arguments(&["posts.get", "--id", "7", "--tag", "x7y"])]
+            vec![arguments(&["probe", "--id", "7", "--tag", "x7y"])]
         );
     }
 

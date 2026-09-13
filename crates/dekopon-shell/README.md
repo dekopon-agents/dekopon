@@ -10,7 +10,6 @@ This crate is a pure interpreter library. It links no Wasmtime, no broker, no HT
 pub trait CapabilityInvoker {
     fn granted(&self) -> Vec<String>;
     fn is_granted(&self, capability: &str) -> bool { /* scans `granted` */ }
-    fn grants_namespace(&self, namespace: &str) -> bool { /* scans `granted` */ }
     fn command_words(&self) -> Vec<String> { /* none */ }
     fn has_command_word(&self, word: &str) -> bool { /* scans `command_words` */ }
     fn run_command(
@@ -26,14 +25,19 @@ pub trait CapabilityInvoker {
         input: serde_json::Value,
         secret_use: Option<SecretUseProposal>,
     ) -> CapabilityCallResult;
+    fn script_finished(&self) { /* no-op: the script's last command has returned */ }
 }
 ```
 
+## Command resolution
+
+A command word resolves in a fixed order. A word this shell refuses outright (`eval`, `exec`, `source`, job control, `declare`) ends the script naming itself; otherwise a shell function declared earlier in the script runs, then a builtin, then a command word the session's loaded providers contribute. Anything else is `command not found` at exit `127`, and that includes a word shaped like a capability identifier, granted or not: `wikipedia_page --title x` is an unknown command. A capability is reached only through the provider command word that proposes it. `cap --list` prints what this session was granted, `cap --describe <id>` prints one identifier and its description, and `<word> --help` is how to use it.
+
 ## Provider command words
 
-A loaded provider can contribute bare words — `gh pr view 12` instead of `cap gh.pr-view '{"number":12}'` — and each behaves like its own command-line program run through `run_command`. `<word> --help` renders on stdout at whatever status the provider chose (`0` for help, `2` for a usage error by `clap` convention), so `h=$(gh --help)` captures the page like any other value. A `CommandRun::Rendered` answer charges no capability call; its bytes are charged against the value ceiling and both streams then obey the output ceilings, and its stderr goes to the diagnostic stream, so it escapes a `$( )` capture unless the script says `2>&1`. A `CommandRun::Failed` answer is a usage error at exit `2`. A run that never reached the provider's answer is not: `CommandRun::Errored` (the broker was unreachable, the host refused the input or trapped, the task did not complete) is reported like a capability that ran and errored, at exit `1`, and `CommandRun::Denied` (the session was cancelled underneath the run) like a refused capability, at exit `126`, so the model reads them as "retry later" or "stop" rather than "fix your argv". A `CommandRun::Proposed` answer is invoked exactly as a bare capability word would be — the same budget, denial, and telemetry — and one naming a capability this session was not granted exits `127` naming it, because the provider proposes without knowing what was granted.
+A loaded provider can contribute bare words — `gh pr view 12` — and each behaves like its own command-line program run through `run_command`. `<word> --help` renders on stdout at whatever status the provider chose (`0` for help, `2` for a usage error by `clap` convention), so `h=$(gh --help)` captures the page like any other value. A `CommandRun::Rendered` answer charges no capability call; its bytes are charged against the value ceiling and both streams then obey the output ceilings, and its stderr goes to the diagnostic stream, so it escapes a `$( )` capture unless the script says `2>&1`. A `CommandRun::Failed` answer is a usage error at exit `2`. A run that never reached the provider's answer is not: `CommandRun::Errored` (the broker was unreachable, the host refused the input or trapped, the task did not complete) is reported like a capability that ran and errored, at exit `1`, and `CommandRun::Denied` (the session was cancelled underneath the run) like a refused capability, at exit `126`, so the model reads them as "retry later" or "stop" rather than "fix your argv". A `CommandRun::Proposed` answer is invoked through the same budget, denial, and telemetry path as every capability call, and one naming a capability this session was not granted exits `127` naming it, because the provider proposes without knowing what was granted. A proposal may also carry `secret_use`, the typed intent to use one public DRN the provider's command named. It reaches `CapabilityInvoker::invoke` unchanged, the broker authorizes it separately as documented in [`docs/secrets.md`](../../docs/secrets.md), and an invoker with no broker behind it refuses it.
 
-The piped value reaches the provider as text under the display rule above: a string verbatim, anything else as compact JSON, and `None` when nothing was piped, so `echo hello | gh issue create -` and `jq -n '{a:1}' | gh issue create -` read as the script would have printed them. A bare capability word receives no stdin at all — its input is exactly its `--flag value` argv — so `x | echo.echo` sees nothing of `x`.
+The piped value reaches the provider as text under the display rule above: a string verbatim, anything else as compact JSON, and `None` when nothing was piped, so `echo hello | gh issue create -` and `jq -n '{a:1}' | gh issue create -` read as the script would have printed them.
 
 ## Value model
 
@@ -82,7 +86,7 @@ chain but the last, and a pipeline inverted by `!`. They compose — `if a && b;
 the exemption is a counter rather than a flag.
 
 `pipefail` makes a pipeline report its rightmost failing stage. It matters more here than in bash:
-`some.capability x | jq .` succeeds by default even when the capability never ran, because `jq` was
+`gh issue view 12 | jq .` succeeds by default even when the capability never ran, because `jq` was
 handed nothing and had no complaint. `${PIPESTATUS[@]}` is an ordinary global holding one status per
 stage, so `${PIPESTATUS[0]}` and `${#PIPESTATUS[@]}` work through the expansion machinery already
 here.
@@ -155,8 +159,8 @@ cannot exempt that one because its quotes are already gone. There is no `basenam
 `jq -r 'split("/") | last'` covers what `${p##*/}` would have.
 
 A whole right-hand side keeps its value rather than collapsing to text — `copy=$obj` followed by
-`${copy[key]}` works, the same deviation that already made `ip=$(curl ...)` followed by
-`${ip[origin]}` work. Glued to anything else it is text again.
+`${copy[key]}` works, the same deviation that already made `issue=$(gh issue view 12)` followed by
+`${issue[title]}` work. Glued to anything else it is text again.
 
 Reading a `${NAME:-...}` substitute or a `${NAME[...]}` index re-enters the tokenizer on the native
 stack, so nesting has a fixed ceiling and deep `${a:-${a:- ... }}` is a lex error rather than a
@@ -175,8 +179,8 @@ than admitting it.
 `2>&1` is the one place the value model shows through. Merging a text channel into a value channel
 has to mean something exact, so it means what every text-shaped builtin already means: the
 diagnostics become extra lines. A command that produced no diagnostics has nothing to merge and its
-value is left alone — including its type, so `posts.get 2>&1` hands `jq` an object rather than
-that object's JSON text. The result is that `x=$(cmd 2>&1)` captures *why* something failed, which
+value is left alone — including its type, so `gh issue view 12 2>&1` hands `jq` an object rather
+than that object's JSON text. The result is that `x=$(cmd 2>&1)` captures *why* something failed, which
 is the idiom the construct exists for.
 
 Redirections resolve left to right, so a duplication copies the destination its target holds at that
@@ -190,13 +194,11 @@ inside a script; what a caller receives is the transcript a terminal would have 
 
 ## Builtins
 
-`jq` (the real [jaq](https://github.com/01mf02/jaq) engine), `curl` (a flag parser that submits to a capability, never a socket), `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, `cat`, and the `cap` escape hatch. Every builtin name is separator-free, and capability fallback fires only for separator-containing words, so the two namespaces are provably disjoint. A loaded provider may also contribute separator-free *command words* (for example `gh`), resolved after functions and builtins through `CapabilityInvoker::run_command` into a capability proposal that takes the ordinary budget, denial, and telemetry path, rendered text at the provider's own exit status, or a usage error (see [Provider command words](#provider-command-words)); a provider word that collides with a builtin is refused at load by `dekopon_core::command_word_conflicts`, never shadowed here.
+`jq` (the real [jaq](https://github.com/01mf02/jaq) engine), `grep`, `sed`, `cut`, `sort`, `uniq`, `wc`, `base64`, `xargs`, `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, `cat`, and `cap` (what this session was granted). There is no `curl` builtin; HTTP is reached through a provider command word like any other capability. A loaded provider may also contribute *command words* (for example `gh`), resolved after functions and builtins through `CapabilityInvoker::run_command` into a capability proposal that takes the ordinary budget, denial, and telemetry path, rendered text at the provider's own exit status, or a usage error (see [Provider command words](#provider-command-words)); a provider word that collides with a builtin, another reserved word, or another provider's word is refused at load by `dekopon_core::command_word_conflicts`, never shadowed here.
 
 `grep` and `sed` are the only two that take `-E`, and it is the only way regex syntax ever becomes regex syntax here. Unflagged, both read a literal pattern and reject an unescaped metacharacter by name — one matching semantics shared with `case`, `${p#…}`, and the right operand of `[[ == ]]`, so a script never has to know which construct it is in to know what `[0-9]` means. With `-E` the pattern goes to `regex-bites`, the engine `jq`'s own `regex` builtins already link, rather than to a second one added for this. Anchors are real (`grep -E '^ba(r|z)$'`, `sed -E 's/^ *//'`), `.` is the wildcard, and the engine's compile error is reported by name when a pattern does not compile. An `-E` pattern is model-authored text, so it is bounded before it sees input: 1 KiB of pattern source, a 64 KiB compiled program, and sixteen levels of nesting. A replacement stays literal text in both modes — the engine's `$1` interpolation is off, and a real-sed `\1` group reference is refused rather than emitted verbatim. Flags are matched whole, so the two are written separately: `-i -E` folds ASCII case only, because this engine matches codepoint by codepoint; that is narrower than the literal path's `-i`, never wider. The bundled `-iE` is "option not yet supported".
 
-One of them exists only when the embedder configured it, and is "command not found" otherwise: `curl`, whose target capability is fixed for the whole execution. A broker-backed `curl` may additionally propose an inert public DRN through exact `--oauth2-bearer '${drn:…}'` or `-u 'USER:${drn:…}'` syntax. The DRN stays in a typed invocation field and is removed before provider JSON is built. Literal passwords and arbitrary interpolation are refused; direct invokers deny the proposal. The broker separately authorizes and resolves it as documented in [`docs/secrets.md`](../../docs/secrets.md).
-
-The shell has no clock. Reading the wall time from here would be ambient authority with no capability to go through, so `date` is not a builtin. It was an embedder opt-in that no embedder ever set, and without a provider that claims it a script asking for the time gets the same "command not found" an ungranted capability gets. The time is a provider capability instead, granted, authorized, and audited like any other: a provider holding a durable-files storage grant already reads `wall-time-ms`, and the broker host's `dekopon:clock/wall@1.0.0` import is the clock a provider reads with no other grant, inside an authorized `invoke`. A provider that claims `date` proposes its clock capability from `run-command` and reads the clock when the broker invokes it, as the in-tree [`clock-probe`](../../examples/providers/clock-probe/README.md) fixture does.
+The shell has no clock. Reading the wall time from here would be ambient authority with no capability to go through, so `date` is not a builtin. It was an embedder opt-in that no embedder ever set, and without a provider that claims it a script asking for the time gets "command not found" like any other unknown word. The time is a provider capability instead, granted, authorized, and audited like any other: a provider holding a durable-files storage grant already reads `wall-time-ms`, and the broker host's `dekopon:clock/wall@1.0.0` import is the clock a provider reads with no other grant, inside an authorized `invoke`. A provider that claims `date` proposes its clock capability from `run-command` and reads the clock when the broker invokes it, as the in-tree [`clock-probe`](../../examples/providers/clock-probe/README.md) fixture does.
 
 ## Sandboxing
 
@@ -210,16 +212,15 @@ One residual is worth stating plainly rather than leaving to be discovered. jaq 
 
 Dropping the receiver is the cancellation check for every filter that *does* yield — it fails its next send and returns — so what accumulates is only the non-terminating kind. Each abandonment logs a `tracing::warn!` with the elapsed time, `dekopon_shell::abandoned_filter_workers()` reports how many are running, and past a small ceiling `jq` refuses to start another filter rather than adding one more spinning thread to a host that is already saturated.
 
-The worker belongs to the thread, not to the filter: a thread that has run one filter parks its worker on a job channel and hands it the next, so a script full of `curl ... | jq ...` pays one thread rather than one per call. Abandoning a filter also gives up that worker, so the filter nobody can stop is never offered another one and the next `jq` starts from a freshly spawned worker. Values cross the boundary as values — jaq's own type deserializes from `serde_json::Value` and converts back structurally — rather than being rendered to JSON text and re-parsed on each side. jaq's value type is a JSON superset, so the outputs JSON cannot represent (`nan`, `infinite`, byte strings, non-string object keys) are refused by name exactly as the JSON parser refuses them, and output nesting keeps that parser's 128-container ceiling.
+The worker belongs to the thread, not to the filter: a thread that has run one filter parks its worker on a job channel and hands it the next, so a script full of `gh ... | jq ...` pays one thread rather than one per call. Abandoning a filter also gives up that worker, so the filter nobody can stop is never offered another one and the next `jq` starts from a freshly spawned worker. Values cross the boundary as values — jaq's own type deserializes from `serde_json::Value` and converts back structurally — rather than being rendered to JSON text and re-parsed on each side. jaq's value type is a JSON superset, so the outputs JSON cannot represent (`nan`, `infinite`, byte strings, non-string object keys) are refused by name exactly as the JSON parser refuses them, and output nesting keeps that parser's 128-container ceiling.
 
 ## Observability
 
 Each script run opens a `tracing` span named `shell.script`, and every command word inside it opens
 a `shell.command` span — the span carries the whole record, and there are no events. A trace
-therefore reads as the ordered list of commands a script executed — `jq`, then `curl`, then
-`http-probe.fetch`, then `grep` — rather than as one opaque "a script ran, exit 0". One script word
-that drives several executions is shown as several: `xargs` mapping a command over ten items
-produces ten nested spans.
+therefore reads as the ordered list of commands a script executed — `jq`, then `gh`, then `grep` —
+rather than as one opaque "a script ran, exit 0". One script word that drives several executions is
+shown as several: `xargs` mapping a command over ten items produces ten nested spans.
 
 Nothing is capped. A model-authored `while` loop is bounded only by the step budget, so one tool
 call can execute tens of thousands of command words, and each of them gets its INFO span: an
@@ -228,23 +229,22 @@ The `shell.script` span carries the run's totals beside them — commands execut
 commands, failed commands — which cost the same whether a script ran three commands or thirty
 thousand.
 
-A word that resolved to nothing is reported as `not-granted` when it names a capability in a
-namespace this session holds, and `not-found` otherwise. The script sees identical output either
-way — the distinction is in the span and nowhere a script can read it.
-
 Instrumentation lives at the single seam every command word passes through, so a builtin added
 later is traced without another edit, and none of the twenty builtin implementations carries
 telemetry code.
 
 `tracing` is this crate's only dependency for that. There is no exporter here, no collector, and no
-telemetry protocol — the embedding binary's subscriber decides where spans go, exactly as `curl`
-here links no HTTP client and only assembles a request for one capability. Spans must therefore be
-assumed to leave the process, and they are: a command records its name — whoever wrote it, a
-model-authored function name included — its resolution kind, its argument *count*, a duration, an
-exit code, and a stable outcome label. Argument *values* are the one exclusion, because a `curl -d`
-body and a `cap <id> {...}` object are secret bytes wearing argv's clothes. *Committed direction:*
-arguments are recorded too, with secret material excluded where it is identified rather than by
-withholding the vector ([goal 2](../../docs/design.md#constitution)).
+telemetry protocol — the embedding binary's subscriber decides where spans go. Spans must therefore
+be assumed to leave the process, and they carry the whole command: its word — whoever wrote it, a
+model-authored function name included — its resolution kind (`control`, `function`, `builtin`,
+`provider-command`, `rejected`, or `not-found`), its argument count, a duration, an exit code, and a
+stable outcome label, beside three payloads. `shell.command.arguments` is the argv after the word as
+a JSON array, `shell.command.stdin` the piped value as the command received it (present only when a
+value was piped), and `shell.command.output` what the command produced. Each payload passes through
+`dekopon_core::bounded_attribute`, which cuts a value past its byte cap on a character boundary and
+marks the cut, and carries a `.bytes` sibling with its full length, so a truncated attribute still
+says how much there was ([goal 2](../../docs/design.md#constitution)). A secret reference in argv is
+a public DRN, never the secret it names; only the broker resolves one.
 
 ## License
 
