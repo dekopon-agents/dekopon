@@ -1,6 +1,6 @@
 //! The `dekopon:clock/wall@1.0.0` import: the host's wall clock, readable during `invoke` only.
 //!
-//! `describe`, `run-command`, and `resolve-command` are pure by contract. HTTP and storage enforce
+//! `describe` and `run-command` are pure by contract. HTTP and storage enforce
 //! that with disabled states whose calls return a typed denial and are refused afterwards through
 //! the `DescribeUsedHostImport` and `RunCommandUsedHostImport` tripwires. `now-unix-millis` has no
 //! error in its signature, so a read outside an invocation traps instead, and the store remembers

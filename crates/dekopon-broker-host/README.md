@@ -31,14 +31,11 @@ consume loaded-provider metadata. Imports are resolved into one `InstancePre` pe
 at load, so a description, invocation, or command run instantiates without rebuilding a linker or
 re-resolving imports, and each gets a fresh store and component instance.
 
-A provider declaring command words must export `run-command` (`argv` plus an optional piped `stdin`)
-or `resolve-command` (`argv` alone). The host reads which one the component's type offers at load,
-refuses a manifest whose words have no callable export, calls `run-command` when both exist, and
-adapts a `resolve-command` answer into the same `CommandRunOutcome`, so
-`BrokerProviderRegistry::run_command` returns one type whichever export served it. A
-`resolve-command` guest never receives `stdin`, by contract. Export precedence rests on the lookup
-order in `dekopon-provider-sdk::host::command_export`; no checked-in component exports both. The
-`RunCommandUsedHostImport` tripwire refuses a run that reached for any host import. `clock-probe`'s
+A provider declaring command words must export `run-command` (`argv` plus an optional piped
+`stdin`). The host reads whether the component's type offers it at load, from
+`dekopon-provider-sdk::host::command_export`, and refuses a manifest whose words have no callable
+export — absent and wrong-typed are separate refusals, because they are separate operator problems.
+The `RunCommandUsedHostImport` tripwire refuses a run that reached for any host import. `clock-probe`'s
 test-only `date --clock-in-run-command` is the checked-in path that drives it; the HTTP and storage
 halves share its code path with the describe-mode states and no fixture drives them directly.
 

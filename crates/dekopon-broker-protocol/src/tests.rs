@@ -1516,28 +1516,6 @@ fn every_verb_is_one_operation_whatever_attestation_accompanies_it() {
             RequestEnvelope::capabilities(Some(chat.clone())),
         ),
         (
-            "resolveCommand",
-            RequestEnvelope {
-                api_version: ProtocolVersion::V1Alpha2,
-                request: BrokerRequest::ResolveCommand {
-                    attestation: None,
-                    word: "memory".to_owned(),
-                    argv: Vec::new(),
-                },
-            },
-        ),
-        (
-            "resolveCommand",
-            RequestEnvelope {
-                api_version: ProtocolVersion::V1Alpha2,
-                request: BrokerRequest::ResolveCommand {
-                    attestation: Some(chat.clone()),
-                    word: "memory".to_owned(),
-                    argv: vec!["recent".to_owned()],
-                },
-            },
-        ),
-        (
             "runCommand",
             RequestEnvelope::run_command(None, "memory".to_owned(), Vec::new(), None),
         ),
@@ -1601,6 +1579,7 @@ fn the_previous_protocol_version_and_its_retired_operation_tags_both_fail_to_dec
     for retired in [
         json!({"operation": "capabilitiesFor", "subject": "slack.t0123abc.u9xyz", "agent": "reviewer"}),
         json!({"operation": "capabilitiesForChat", "claim": {}}),
+        json!({"operation": "resolveCommand", "word": "memory", "argv": []}),
         json!({"operation": "resolveCommandForChat", "claim": {}, "word": "memory", "argv": []}),
         json!({"operation": "invokeFor", "invocation": {}, "attestation": {}}),
         json!({"operation": "invokeForChat", "invocation": {}, "attestation": {}}),
@@ -1675,7 +1654,6 @@ fn recording_is_reachable_only_through_its_own_operation() {
         json!({"operation": "invoke", "invocation": {
             "id": "invoke-chat", "capability": "echo.echo", "trace": "trace-chat", "input": {},
         }, "turn": turn.clone()}),
-        json!({"operation": "resolveCommand", "word": "memory", "argv": [], "turn": turn.clone()}),
         json!({"operation": "runCommand", "word": "memory", "argv": [], "turn": turn.clone()}),
         json!({"operation": "capabilities", "turn": turn}),
     ] {

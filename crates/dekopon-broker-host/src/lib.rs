@@ -23,13 +23,12 @@ use dekopon_core::{CapabilityId, ProviderId};
 use dekopon_provider_sdk::host::CommandExport;
 pub use dekopon_provider_sdk::host::ProviderConflicts;
 use dekopon_provider_sdk::host::{
-    self, CommandExportProblem, ConflictScan, EngineError, RESOLVE_COMMAND_EXPORT,
-    RUN_COMMAND_EXPORT, StoreLimits, check_command_export, command_export, command_input_bytes,
-    parse_command_run,
+    self, CommandExportProblem, ConflictScan, EngineError, RUN_COMMAND_EXPORT, StoreLimits,
+    check_command_export, command_export, command_input_bytes,
 };
 pub use dekopon_provider_sdk::{
-    CommandResolution, CommandRunOutcome, ComponentFailure, ComponentResponse, ProviderApiVersion,
-    ProviderCapability, ProviderManifest,
+    CommandRunOutcome, ComponentFailure, ComponentResponse, ProviderApiVersion, ProviderCapability,
+    ProviderManifest,
 };
 use dekopon_storage_host::{StorageEvidence, StorageGrant, StorageHost};
 use serde::Serialize;
@@ -774,11 +773,10 @@ impl BrokerWasmProvider {
                     provider: manifest.id.clone(),
                     path: source.clone(),
                 },
-                CommandExportProblem::Mismatched { name, found } => {
+                CommandExportProblem::Mismatched { found } => {
                     BrokerHostError::CommandExportSignature {
                         provider: manifest.id.clone(),
                         path: source.clone(),
-                        name,
                         found,
                     }
                 }
@@ -810,10 +808,8 @@ impl BrokerWasmProvider {
     ///
     /// Bounded exactly as `describe` is: import-free, timed out, input- and output-capped. The run
     /// happens *before* authorization, so a component that reaches for a host import here is
-    /// refused rather than trusted. Which export is called was decided once at load from the
-    /// component's type: `run-command` receives `argv` and `stdin`; a legacy `resolve-command`
-    /// guest receives only `argv`, because its contract has no piped value — `stdin` is dropped for
-    /// it by contract, not lost.
+    /// refused rather than trusted. That the component exports a callable `run-command` at all was
+    /// decided once at load from its own type.
     ///
     /// # Errors
     ///
@@ -833,24 +829,22 @@ impl BrokerWasmProvider {
                 maximum: self.runtime.limits.max_input_bytes,
             });
         }
-        let export_name = match &self.command_export {
-            CommandExport::RunCommand => RUN_COMMAND_EXPORT,
-            CommandExport::ResolveCommand => RESOLVE_COMMAND_EXPORT,
+        match &self.command_export {
+            CommandExport::Present => {}
             CommandExport::Absent => {
                 return Err(BrokerHostError::MissingCommandExport {
                     provider: self.manifest.id.clone(),
                     path: self.source.clone(),
                 });
             }
-            CommandExport::Mismatched { name, found } => {
+            CommandExport::Mismatched { found } => {
                 return Err(BrokerHostError::CommandExportSignature {
                     provider: self.manifest.id.clone(),
                     path: self.source.clone(),
-                    name,
                     found: found.clone(),
                 });
             }
-        };
+        }
         let operation_timeout = self.runtime.limits.max_timeout;
         let http = HttpState::describe(self.runtime.http_ceilings(), operation_timeout)
             .map_err(|source| BrokerHostError::HttpConfiguration { source })?;
@@ -864,7 +858,6 @@ impl BrokerWasmProvider {
         let signature = |source: wasmtime::Error| BrokerHostError::CommandExportSignature {
             provider: self.manifest.id.clone(),
             path: self.source.clone(),
-            name: export_name,
             found: source.to_string(),
         };
         let failed = |source: wasmtime::Error| BrokerHostError::RunCommand {
@@ -882,28 +875,16 @@ impl BrokerWasmProvider {
                     source,
                 })?;
             store.data_mut().instantiations += 1;
-            let output = if export_name == RUN_COMMAND_EXPORT {
-                let function = instance
-                    .get_typed_func::<(Vec<String>, Option<String>), (String,)>(
-                        &mut store,
-                        RUN_COMMAND_EXPORT,
-                    )
-                    .map_err(signature)?;
-                let (output,) = function
-                    .call_async(&mut store, (argv, stdin))
-                    .await
-                    .map_err(failed)?;
-                output
-            } else {
-                let function = instance
-                    .get_typed_func::<(Vec<String>,), (String,)>(&mut store, RESOLVE_COMMAND_EXPORT)
-                    .map_err(signature)?;
-                let (output,) = function
-                    .call_async(&mut store, (argv,))
-                    .await
-                    .map_err(failed)?;
-                output
-            };
+            let function = instance
+                .get_typed_func::<(Vec<String>, Option<String>), (String,)>(
+                    &mut store,
+                    RUN_COMMAND_EXPORT,
+                )
+                .map_err(signature)?;
+            let (output,) = function
+                .call_async(&mut store, (argv, stdin))
+                .await
+                .map_err(failed)?;
             Ok::<_, BrokerHostError>(output)
         };
         #[allow(
@@ -915,7 +896,7 @@ impl BrokerWasmProvider {
             timeout(operation_timeout, operation)
                 .await
                 .map_err(|_| BrokerHostError::Timeout {
-                    operation: format!("{export_name} {}", self.manifest.id),
+                    operation: format!("{RUN_COMMAND_EXPORT} {}", self.manifest.id),
                     timeout_ms: operation_timeout.as_millis() as u64,
                 });
         record_store_outcome(&store, self.runtime.limits.fuel);
@@ -1290,9 +1271,8 @@ impl BrokerProviderRegistry {
 
     /// Runs one command word's argv through the provider that declared it.
     ///
-    /// The provider's `run-command` export receives `argv` and `stdin`; a legacy `resolve-command`
-    /// export receives `argv` alone, and its answer is adapted into the same
-    /// [`CommandRunOutcome`], so a caller handles one type whichever export the component has.
+    /// The provider's `run-command` export receives `argv` and `stdin` and answers with a
+    /// [`CommandRunOutcome`].
     ///
     /// # Errors
     ///
@@ -1336,7 +1316,7 @@ impl BrokerProviderRegistry {
                 fuel.consumed = tracing::field::Empty,
             ))
             .await?;
-        parse_command_run(&provider.command_export, &json).map_err(|source| {
+        serde_json::from_str::<CommandRunOutcome>(&json).map_err(|source| {
             BrokerHostError::InvalidCommandRun {
                 provider: provider.manifest.id.clone(),
                 source,
@@ -1571,8 +1551,7 @@ fn record_store_outcome(store: &Store<StoreState>, supplied: u64) {
 /// declaring words never loads with one, so the line only ever says it for a wordless component.
 const fn command_export_name(export: &CommandExport) -> &'static str {
     match export {
-        CommandExport::RunCommand => RUN_COMMAND_EXPORT,
-        CommandExport::ResolveCommand => RESOLVE_COMMAND_EXPORT,
+        CommandExport::Present => RUN_COMMAND_EXPORT,
         CommandExport::Absent | CommandExport::Mismatched { .. } => "none",
     }
 }
@@ -1956,8 +1935,8 @@ pub enum BrokerHostError {
     },
     /// Provider declared command words but exports no way to run them.
     #[error(
-        "provider {provider} declares command words but component {} exports neither run-command \
-         nor resolve-command; rebuild it against the dekopon:provider/provider-cli world",
+        "provider {provider} declares command words but component {} exports no run-command; \
+         rebuild it against the dekopon:provider/provider-cli world",
         path.display()
     )]
     MissingCommandExport {
@@ -1966,10 +1945,10 @@ pub enum BrokerHostError {
         /// Component path.
         path: PathBuf,
     },
-    /// Provider exports a command export as something the host cannot call.
+    /// Provider exports the command export as something the host cannot call.
     #[error(
-        "provider {provider} exports {name} from component {} as {found}, not the function the \
-         dekopon:provider package declares",
+        "provider {provider} exports run-command from component {} as {found}, not the function \
+         the dekopon:provider package declares",
         path.display()
     )]
     CommandExportSignature {
@@ -1977,8 +1956,6 @@ pub enum BrokerHostError {
         provider: ProviderId,
         /// Component path.
         path: PathBuf,
-        /// Which export name was found.
-        name: &'static str,
         /// Bounded description of what the component actually exports.
         found: String,
     },

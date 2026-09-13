@@ -250,8 +250,7 @@ every command word of the provider they name. Naming a capability `memory.chat.e
 provider `memory-chat` reserves nothing, and renaming the shipped provider drops nothing. Generic
 chat invocation may reach the two retrieval routes but never the record route.
 
-A provider command word is ungated. `runCommand` and the legacy `resolveCommand`
-carry no capability to decide on, so the broker runs the declaring component's argv handling — a
+A provider command word is ungated. `runCommand` carries no capability to decide on, so the broker runs the declaring component's argv handling — a
 pure, import-free guest call under the ordinary fuel and wall-clock bounds — before any
 authorization, and authorizes only the proposal that comes back, on exactly the path a direct
 `invoke` takes. Text the guest renders itself (a help page, a usage error) is provider-authored,

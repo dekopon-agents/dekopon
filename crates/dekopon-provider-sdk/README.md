@@ -23,7 +23,7 @@ dekopon_provider_sdk::export_provider!(Example);
 
 The SDK owns the canonical provider WIT. Update every surviving broker and guest mirror together; the mirror list and equality gates are in `docs/development.md`.
 
-Two more paths exist for a provider that contributes words to the sandboxed shell: [command-line providers](#command-line-providers) (`run-command`, the current contract: help pages, usage errors, stdin, and proposals, hand-rolled or through the optional [`clap` layer](#the-clap-layer)) and the legacy [command words](#command-words) rewrite (`resolve-command`).
+One more path exists for a provider that contributes words to the sandboxed shell: [command-line providers](#command-line-providers) (`run-command` — help pages, usage errors, stdin, and proposals, hand-rolled or through the optional [`clap` layer](#the-clap-layer)).
 
 ## Provider-owned worlds
 
@@ -49,7 +49,7 @@ mod bindings {
 dekopon_provider_sdk::export_provider_with_bindings!(Example, bindings);
 ```
 
-The composed world must retain the root `describe` and `invoke` exports. Additional imports are embedded in the component type and fail closed unless an authorized broker linker implements them. See the [`http-probe`](../../examples/providers/http-probe/README.md) fixture, and [`clock-probe`](../../examples/providers/clock-probe/README.md) for the `dekopon:clock/wall@1.0.0` import beside a `run-command` world. Host imports are for `invoke`: `run-command` and `resolve-command` stay pure, and a broker refuses a component that reaches for one there.
+The composed world must retain the root `describe` and `invoke` exports. Additional imports are embedded in the component type and fail closed unless an authorized broker linker implements them. See the [`http-probe`](../../examples/providers/http-probe/README.md) fixture, and [`clock-probe`](../../examples/providers/clock-probe/README.md) for the `dekopon:clock/wall@1.0.0` import beside a `run-command` world. Host imports are for `invoke`: `run-command` stays pure, and a broker refuses a component that reaches for one there.
 
 ## Attachments out of band
 
@@ -91,17 +91,15 @@ Providers never enable it, and the default feature set is empty, so a `wasm32-un
 never compiles it. The optional `host` feature adds `dekopon_provider_sdk::host`: the Wasmtime
 plumbing consumed by `dekopon-broker-host` and external embeddings — manifest validation, the report
 a whole conflicting provider set fails with, the bounds on one store, the engine constructor, and
-the command-export plumbing: `command_export` reads which of `run-command`
-and `resolve-command` a compiled component offers (the newer one wins when both exist),
-`check_command_export` is the load gate a manifest declaring `commandWords` must pass,
-`command_input_bytes` is what a host counts against its input bound for one run, and
-`parse_command_run` decodes either export's answer into one `CommandRunOutcome`. It pulls in
-Wasmtime. Each host owns its own linker and its own way of interrupting a guest that runs too
+the command-export plumbing: `command_export` reads whether a compiled component offers
+`run-command` and with what type, `check_command_export` is the load gate a manifest declaring
+`commandWords` must pass, and `command_input_bytes` is what a host counts against its input bound
+for one run. It pulls in Wasmtime. Each host owns its own linker and its own way of interrupting a guest that runs too
 long.
 
 ## WIT package
 
-The same import-free world is published as `dekopon:provider@0.3.0`, alongside a `provider-cli` world adding the optional `run-command` export and a `provider-commands` world adding the legacy `resolve-command` export. Fetch it through Dekopon's public registry metadata:
+The same import-free world is published as `dekopon:provider@0.3.0`, alongside a `provider-cli` world adding the optional `run-command` export. Fetch it through Dekopon's public registry metadata:
 
 ```console
 wkg get \
@@ -110,7 +108,7 @@ wkg get \
   dekopon:provider@0.3.0
 ```
 
-The package contains three worlds and no imports: `provider` exports exactly `describe` and `invoke`; `provider-commands` includes it and adds `resolve-command`; `provider-cli` includes it and adds `run-command`. They are separate so a host can require the base contract and look the command export up by name, which keeps components built against `dekopon:provider@0.1.0` and `@0.2.0` loadable and a `0.2.0` `resolve-command` guest working on the same shell path. A host that finds both exports calls `run-command`. The published package is an authoring contract; it adds no host function and no runtime authority.
+The published `0.3.0` package contains three worlds and no imports: `provider` exports exactly `describe` and `invoke`; `provider-cli` includes it and adds `run-command`; a third world, `provider-commands`, adds a `resolve-command` export this SDK no longer generates and no host still calls. Published package versions are immutable, so that world stays in the text; build against `provider` or `provider-cli`. `provider` and `provider-cli` are separate so a host can require the base contract and look the command export up by name, which keeps a component built against `dekopon:provider@0.1.0` or `@0.2.0` loadable as long as it exports nothing under a command name the host cannot call. The published package is an authoring contract; it adds no host function and no runtime authority.
 
 ## Command-line providers
 
@@ -153,9 +151,7 @@ fn run_command(argv: &[String], stdin: Option<&str>) -> Result<CommandRun, Provi
 dekopon_provider_sdk::export_provider_with_cli!(Example, bindings);
 ```
 
-Keep each capability identifier in one `const` used by both `manifest()` and `run_command`, so renaming one is a compile error rather than an exit code a model discovers mid-session. `stdin` is `None` when nothing was piped into the word. Rendered text authorizes nothing and is produced before authorization, so the same rule as the rewrite applies: pure, and no host imports. The [`memory-reservation-probe`](../../examples/providers/memory-reservation-probe/README.md) fixture is this path checked in.
-
-The default `run_command` delegates to `resolve_command`, so a provider written against the legacy rewrite can move to `export_provider_with_cli!` and the `provider-cli` world without changing anything else; it then gains no stdin until it implements `run_command`, because the legacy contract has none.
+Keep each capability identifier in one `const` used by both `manifest()` and `run_command`, so renaming one is a compile error rather than an exit code a model discovers mid-session. `stdin` is `None` when nothing was piped into the word. A proposal is pure and grants nothing: it is authorized on exactly the path a direct `cap <id> {…}` call takes, so naming a capability the caller was not granted produces a denial rather than an escalation. Rendered text authorizes nothing either, and both are produced before authorization, so neither may touch a host import. Declaring `commandWords` without exporting `run-command` is refused at load, and a word colliding with a shell builtin, a refused or control word, or another provider's word is a startup failure that names every conflict at once. The [`memory-reservation-probe`](../../examples/providers/memory-reservation-probe/README.md) fixture is this path checked in.
 
 ### The `clap` layer
 
@@ -201,34 +197,3 @@ fn run_command(argv: &[String], stdin: Option<&str>) -> Result<CommandRun, Provi
 The same `const`-per-capability convention applies: `manifest()` and `dispatch` read one identifier, so a rename is a compile error, and a fixture test that walks every dispatch target and finds it in the manifest closes the remaining gap. The tree is built on every call — a command word runs in a fresh store under a fuel bound, and there is no process-lifetime static to hold it — so keep it declarative. What clap cannot know (whether anything was piped into `-`, a bound on a value) is the dispatch closure's to refuse, as a decline naming its cause.
 
 The SDK's clap feature set is narrow: `std`, `help`, `usage`, `error-context`, and `derive`, declared directly rather than inherited from the workspace so that two features never reach a guest. `env` would let an argument default from a process environment a component does not have and must never read; `color` pulls in a terminal probe and would put escape sequences in text a model reads. The layer never calls `get_matches` (which reads `std::env::args_os`), `Error::exit`, or `Error::print`; rendered text is returned, never printed. The [`cli-probe`](../../examples/providers/cli-probe/README.md) fixture is this path checked in, with clap's exact help page pinned by its lockfile.
-
-## Command words
-
-The legacy form of the same thing: a provider contributes bare words to the sandboxed shell — `memory recent --last 5` instead of `cap memory.chat.recent '{"last":5}'` — and can only rewrite an argv into a proposal or decline it; it cannot render help and receives no stdin. Declare the words in the manifest's `commandWords`, implement `Provider::resolve_command`, generate bindings for a world including `dekopon:provider/provider-commands@0.3.0`, and export with `export_provider_with_commands!`:
-
-```wit
-world provider {
-    include dekopon:provider/provider-commands@0.3.0;
-}
-```
-
-```rust,ignore
-fn manifest() -> ProviderManifest {
-    ProviderManifest {
-        command_words: vec!["memory".to_owned()],
-        // ...
-    }
-}
-
-fn resolve_command(argv: &[String]) -> Result<CommandInvocation, ProviderError> {
-    // `argv` holds the arguments after the word; the word itself is already selected.
-    match argv {
-        [operation, flag, last] if operation == "recent" && flag == "--last" => { /* ... */ }
-        _ => Err(ProviderError::new("usage", "memory recent --last N")),
-    }
-}
-
-dekopon_provider_sdk::export_provider_with_commands!(Example, bindings);
-```
-
-The rewrite is pure and grants nothing: it returns a proposal that is authorized on exactly the path a direct `cap <id> {…}` call takes, so naming a capability the caller was not granted produces a denial rather than an escalation. It runs before authorization and must not touch a host import. Declaring `commandWords` without exporting `run-command` or `resolve-command` is refused at load, and a word colliding with a shell builtin, a refused or control word, or another provider's word is a startup failure that names every conflict at once. Components built against `provider-commands@0.2.0` keep loading and keep working unchanged.

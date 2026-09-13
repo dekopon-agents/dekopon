@@ -175,6 +175,11 @@ All notable changes to Dekopon are documented here. The format is based on
 - The gateway's end-to-end test model now answers as a server-sent event stream rather than one
   JSON document, because that is the path the model client takes by default.
 
+- `ci/fetch-external-provider-components.sh` pins a release tag, checksum, and size per provider
+  rather than `v0.1.0` for all three. Echo, JSONPlaceholder, and memory-chat all move to `v0.2.0`,
+  their first builds on `dekopon-provider-sdk` 0.13.0 — the `v0.1.0` assets emit `idempotency`, so
+  they no longer load.
+
 ### Removed
 
 - **Breaking.** `crates/dekopond/src/activity.rs` and every name it owned: `ChatActivity`,
@@ -185,6 +190,39 @@ All notable changes to Dekopon are documented here. The format is based on
 - `ChatModel::complete_with` and the two-argument `ChatModel::complete`. Implementations now
   define one `complete` taking `options` and an event callback; one that cannot stream calls the
   callback zero times and returns the whole turn.
+
+- **Breaking.** Deleted every pre-0.13 provider compatibility path. A provider component must now
+  be built on `dekopon-provider-sdk` 0.13.0 or later, and the whole fleet must be rebuilt and
+  re-pinned before the broker is upgraded; see
+  [`docs/upgrading.md`](docs/upgrading.md#rebuild-every-provider-component-on-the-0130-sdk-0140-unreleased).
+
+  - A manifest carrying the retired `idempotency` field is refused at `describe`. 0.13.0 read and
+    dropped the field for one release; `deny_unknown_fields` is back on `ProviderCapability`, so
+    the refusal now names it as it names any other unknown field.
+  - A component exporting only `resolve-command` no longer loads. The host looks up `run-command`
+    alone, and a manifest declaring `commandWords` behind a component with no callable
+    `run-command` is refused at load. A component exporting only `describe` and `invoke` — the
+    unchanged base `dekopon:provider` world — keeps loading.
+  - `Provider::resolve_command`, `CommandResolution`, `export_provider_with_commands!`, and
+    `host::RESOLVE_COMMAND_EXPORT` are gone from `dekopon-provider-sdk`. `Provider::run_command`'s
+    default no longer delegates to the rewrite; it refuses, which is what a provider declaring no
+    command words wants. `host::CommandExport` collapsed to `Present`/`Absent`/`Mismatched`, which
+    no longer carries an export name, and `host::parse_command_run` is gone — decode the guest's
+    answer as `CommandRunOutcome` directly. `BrokerHostError::CommandExportSignature` lost its
+    `name` field for the same reason.
+  - The `resolveCommand` broker operation is removed from the wire: `BrokerRequest::ResolveCommand`
+    and `BrokerResponse::CommandResolution` no longer exist, and a broker answers that operation
+    tag with `invalid-request`. It was kept for one release for a client predating `runCommand`.
+  - The `provider-v0-2-compat` fixture, which existed only to prove a `resolve-command` guest still
+    ran, is deleted. `storage-probe` moved to the `provider-cli` world and `run_command`.
+    `provider-v0-1-compat` stays: the two-export `dekopon:provider@0.1.0` world it pins is
+    unchanged, so it tests a current contract rather than a tolerance.
+
+  The published `dekopon:provider@0.3.0` WIT text is unchanged. Published package versions are
+  immutable, ten provider repositories have vendored that exact text and gate on its digest, and
+  the host resolves a command export by name rather than by world version — so retiring the
+  host-side and guest-side machinery is the whole breaking change, with no second round of fleet
+  churn behind a package bump.
 
 ### Fixed
 

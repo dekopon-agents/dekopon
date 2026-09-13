@@ -47,11 +47,9 @@ The remaining checked components are repository-owned fixtures:
   `recall` word is answered by shifting values out of argv with no argument parser.
 - [`provider-v0-1-compat/`](provider-v0-1-compat/) pins compatibility with the immutable
   two-export `dekopon:provider@0.1.0` world.
-- [`provider-v0-2-compat/`](provider-v0-2-compat/) pins compatibility with the immutable
-  `dekopon:provider@0.2.0` `provider-commands` world and its legacy `resolve-command` export.
-- [`storage-probe/`](storage-probe/) is the durable-files conformance fixture and the legacy
-  `resolve-command` guest at the current `dekopon:provider@0.3.0` package; it is never packaged
-  in a scanned image directory.
+- [`storage-probe/`](storage-probe/) is the durable-files conformance fixture, a `run-command`
+  guest at the current `dekopon:provider@0.3.0` package; it is never packaged in a scanned image
+  directory.
 
 Regenerate only repository-owned fixtures with their `build.sh`, each of which calls the shared
 [`build-component.sh`](build-component.sh). That script reads the compiler from

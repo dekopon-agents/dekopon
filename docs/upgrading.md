@@ -55,6 +55,54 @@ through the new `stream:` field on an `openaiCompatible` model (default `true`);
 `chatgptSubscription` backend has always streamed and has no such field. An embedder that called
 `dekopon_agent`'s loop directly compiles against the new signature or pins 0.13.
 
+## Rebuild every provider component on the 0.13.0 SDK (0.14.0, unreleased)
+
+**Breaking.** Every pre-0.13 provider compatibility path is gone. Re-pin every provider artifact
+your broker loads to a build on `dekopon-provider-sdk` 0.13.0 or later — and rebuild and re-release
+any provider you own yourself — *before* upgrading the broker. There is no deprecation window and no
+flag: a component that has not moved fails at load, and the broker refuses to start with it in its
+provider set.
+
+Two things stop working:
+
+- **A manifest carrying `idempotency` is refused at `describe`.** 0.13.0 read the retired field and
+  dropped it so an already-signed `.wasm` kept loading for one release; 0.14.0 restores
+  `deny_unknown_fields` on `ProviderCapability`, so the field is now an unknown field like any
+  other and the refusal names it. A component is a signed artifact, not a source file an upgrade
+  can edit, so the only fix is a rebuild.
+- **A component exporting only `resolve-command` no longer loads.** The host looks a command export
+  up by name and now looks up `run-command` alone. A manifest declaring `commandWords` behind a
+  component that exports no callable `run-command` is refused at load, naming the provider and the
+  path. Build against `dekopon:provider@0.3.0`'s `provider-cli` world and implement
+  `Provider::run_command`; the `provider-commands` world and its `resolve-command` export stay in
+  the published `0.3.0` package text — published versions are immutable — but nothing calls them.
+
+A component that exports only `describe` and `invoke`, including every one built against
+`dekopon:provider@0.1.0`, is unaffected: that world is unchanged and those components keep loading.
+
+Every provider released from the `dekopon-agents` organization already satisfies this: `gh` 0.3.0,
+`curl` 0.2.0, `turso-sql` 0.2.0, `memory-chat` 0.2.0, `mediawiki` 0.2.0, `echo` 0.2.0,
+`jsonplaceholder` 0.2.0, `ripgrep` 0.2.0, `python` 0.2.0, `skylight-private` 0.2.0, `gpt-image`
+0.1.0, and `openobserve` 0.1.0. Pin those versions, or later ones. A provider you build yourself
+must be rebuilt on the 0.13.0 SDK the same way.
+
+Embedders lose the machinery with it:
+
+- `dekopon_provider_sdk::Provider::resolve_command`, `CommandResolution`,
+  `export_provider_with_commands!`, and `host::RESOLVE_COMMAND_EXPORT` are gone.
+  `Provider::run_command` no longer has a default that delegates to the rewrite — its default
+  refuses, which is correct for a provider declaring no command words.
+- `host::CommandExport` collapsed to `Present` / `Absent` / `Mismatched { found }`: there is one
+  command export, so the variant no longer carries which name was found, and neither does
+  `host::CommandExportProblem::Mismatched` or
+  `dekopon_broker_host::BrokerHostError::CommandExportSignature`.
+- `host::parse_command_run` is gone. Decode the guest's answer as
+  `serde_json::from_str::<CommandRunOutcome>`.
+- **The `resolveCommand` broker operation is removed from the wire.** `BrokerRequest::ResolveCommand`
+  and `BrokerResponse::CommandResolution` no longer exist, and a broker answers the operation tag
+  with `invalid-request`. It was kept for one release for a client predating `runCommand`; no
+  in-tree client has sent it since 0.13.0. Send `runCommand` and match the `CommandRunOutcome`.
+
 ## Telemetry payloads (0.13.0)
 
 Remove `telemetryPayloads` from the `telemetry:` block of both `broker.yaml` and the gateway
@@ -106,11 +154,11 @@ does not declare, so a retained clause is also a startup refusal. Idempotency, e
 duplicate-effect defense are [named non-goals](design.md#non-goals); `effect` and `risk` are
 unchanged and still matched byte for byte against the provider manifest.
 
-A provider **component** is the exception. `dekopon-provider-sdk` accepts and drops an
-`idempotency` field in the manifest a component returns from `describe`, for one release, so an
-already-built out-of-tree `.wasm` keeps loading across this upgrade. Rebuild providers against the
-new SDK before the release after this one; every other unknown manifest field is still refused. A
-provider's Rust source does change: `ProviderCapability` no longer has the field, and
+A provider **component** was the one exception, for one release only: `dekopon-provider-sdk`
+0.13.0 accepted and dropped an `idempotency` field in the manifest a component returns from
+`describe`. [0.14.0 removed that tolerance](#rebuild-every-provider-component-on-the-0130-sdk-0140-unreleased)
+and a component still emitting the field is now refused at `describe`. A provider's Rust source
+changed here too: `ProviderCapability` no longer has the field, and
 `dekopon_provider_sdk::Idempotency` no longer exists.
 
 The field was also one byte of the authority surface every storage namespace generation is keyed
@@ -196,8 +244,8 @@ could not instantiate broker provider component <path>: component imports instan
 
 Upgrade the broker before installing such a provider. Components that do not import the clock,
 including every provider built against `dekopon:provider@0.1.0` through `0.3.0`, load unchanged. A
-provider that reads the clock outside `invoke` — from `describe`, `run-command`, or
-`resolve-command` — now fails that call as `DescribeUsedHostImport` or `RunCommandUsedHostImport`.
+provider that reads the clock outside `invoke` — from `describe` or `run-command` — now fails that
+call as `DescribeUsedHostImport` or `RunCommandUsedHostImport`.
 
 ## Provider storage direct-write contract
 

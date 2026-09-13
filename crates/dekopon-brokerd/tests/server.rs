@@ -10,10 +10,9 @@ use dekopon_broker::{
 };
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{
-    Attestation, BrokerClient, BrokerRequest, BrokerResponse, ClientError, CommandRunOutcome,
+    Attestation, BrokerClient, BrokerResponse, ClientError, CommandRunOutcome,
     ERROR_BROKER_UNAVAILABLE, ERROR_CAPACITY_EXHAUSTED, ERROR_INVALID_REQUEST,
-    ERROR_UNAUTHENTICATED, FrameLimits, ProtocolVersion, RequestEnvelope, ResponseEnvelope,
-    read_frame, write_frame,
+    ERROR_UNAUTHENTICATED, FrameLimits, RequestEnvelope, ResponseEnvelope, read_frame, write_frame,
 };
 use dekopon_brokerd::{
     BrokerServer, BrokerdError, CONFIG_API_VERSION, MappedPeer, ServerLimits, current_uid, run,
@@ -421,85 +420,6 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
         audit.records().await.len(),
         2,
         "one decision and one execution for the one invocation"
-    );
-
-    shutdown_send.send(()).expect("signal clean shutdown");
-    task.await
-        .expect("server task exits")
-        .expect("server shuts down");
-}
-
-/// An older client's `resolveCommand` is still answered in the shape it reads: a proposal as
-/// before, and a rendered help page as the decline that shape can carry, stdout then stderr.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_legacy_resolve_command_frame_is_still_answered() {
-    let uid = current_uid();
-    let directory = private_directory();
-    let socket_path = directory.path().join("broker.sock");
-    let listener = bind_fixture(&socket_path);
-    let (broker, audit) = cli_probe_broker().await;
-    let mut identities = BTreeMap::new();
-    identities.insert(
-        uid,
-        MappedPeer {
-            context: context("caller"),
-            attestor: None,
-        },
-    );
-    let limits = server_limits();
-    let server = BrokerServer::new(broker, identities, limits).expect("server limits valid");
-    let (shutdown_send, shutdown_receive) = oneshot::channel::<()>();
-    let task = tokio::spawn(server.serve(listener, shutdown_on(shutdown_receive)));
-
-    async fn legacy(socket_path: &Path, limits: FrameLimits, argv: Vec<String>) -> BrokerResponse {
-        let mut stream = UnixStream::connect(socket_path)
-            .await
-            .expect("connect to the fixture socket");
-        let envelope = RequestEnvelope {
-            api_version: ProtocolVersion::V1Alpha2,
-            request: BrokerRequest::ResolveCommand {
-                attestation: None,
-                word: "probe".to_owned(),
-                argv,
-            },
-        };
-        write_frame(&mut stream, &envelope, limits)
-            .await
-            .expect("write the legacy frame");
-        read_frame::<_, ResponseEnvelope>(&mut stream, limits)
-            .await
-            .expect("read the legacy answer")
-            .response
-    }
-
-    match legacy(&socket_path, limits.frame, vec!["--help".to_owned()]).await {
-        BrokerResponse::CommandResolution {
-            capability: None,
-            input: None,
-            message: Some(message),
-        } => assert!(message.starts_with("Usage: probe <COMMAND>"), "{message}"),
-        other => panic!("expected a decline carrying the help page, got {other:?}"),
-    }
-    match legacy(
-        &socket_path,
-        limits.frame,
-        vec!["upper".to_owned(), "--text".to_owned(), "hi".to_owned()],
-    )
-    .await
-    {
-        BrokerResponse::CommandResolution {
-            capability: Some(capability),
-            input: Some(input),
-            message: None,
-        } => {
-            assert_eq!(capability.as_str(), "cli-probe.upper");
-            assert_eq!(input, json!({"text": "hi"}));
-        }
-        other => panic!("expected a legacy resolution, got {other:?}"),
-    }
-    assert!(
-        audit.records().await.is_empty(),
-        "the legacy operation decides nothing either"
     );
 
     shutdown_send.send(()).expect("signal clean shutdown");

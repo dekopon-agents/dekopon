@@ -2561,8 +2561,7 @@ where
     /// unreachable from any word.
     ///
     /// `stdin` is the value the script piped into the word, already rendered to text; the host
-    /// counts it with the argv against its input bound before a store exists. A legacy
-    /// `resolve-command` guest receives no piped value by contract.
+    /// counts it with the argv against its input bound before a store exists.
     ///
     /// # Errors
     ///

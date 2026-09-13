@@ -1,7 +1,6 @@
 use std::{collections::BTreeMap, future::Future, io, sync::Arc, time::Duration};
 
 use dekopon_broker::{AttestorGrant, AuditLog, AuthenticatedContext, Broker, BrokerError};
-use dekopon_broker_host::CommandRunOutcome;
 use dekopon_broker_protocol::{
     Attestation, BrokerRequest, ERROR_BROKER_UNAVAILABLE, ERROR_CAPACITY_EXHAUSTED,
     ERROR_INVALID_REQUEST, ERROR_OUTCOME_UNAUDITED, ERROR_PROVIDER, ERROR_UNAUTHENTICATED,
@@ -228,7 +227,8 @@ const fn protocol_error_kind(error: &ProtocolError) -> &'static str {
 /// The model is told only that the word could not be run, which is right — a guest trap or an
 /// input past the host bound is not something it can act on from the message — so the host error
 /// has to land here or nowhere. The event keeps its `command.resolve.failed` name: it is the
-/// operator-facing identifier for this class on both the run and the legacy rewrite operation.
+/// operator-facing identifier for this class, and renaming it would break every filter built on
+/// it for nothing.
 fn report_command_run_failure(word: &str, error: &dekopon_broker_host::BrokerHostError) {
     tracing::warn!(
         target: "dekopon_brokerd::audit",
@@ -386,46 +386,6 @@ where
                     ERROR_UNAUTHENTICATED,
                     "attestation refused: no attestor authority for this subject",
                 ),
-            }
-        }
-        BrokerRequest::ResolveCommand {
-            attestation,
-            word,
-            argv,
-        } => {
-            if !claim_is_valid(attestation.as_ref(), None) {
-                return refuse_invalid_claim(&mut stream, limits).await;
-            }
-            // The legacy operation: the same run with no piped value, answered in the shape an
-            // older client reads. Rendered text has nowhere to go on that shape, so it travels as
-            // a decline carrying the text, stdout first and then stderr, exactly as it did before
-            // the run operation existed.
-            match broker
-                .run_command(
-                    context,
-                    peer.attestor.as_ref(),
-                    attestation.as_ref(),
-                    &word,
-                    &argv,
-                    None,
-                )
-                .await
-            {
-                Ok(CommandRunOutcome::Proposed { capability, input }) => {
-                    ResponseEnvelope::command_resolution(capability, input)
-                }
-                // The provider declined this argv. That is a usage error for the model to read,
-                // not a broker failure, so its own message travels back.
-                Ok(CommandRunOutcome::Failed { error }) => {
-                    ResponseEnvelope::command_declined(error.message)
-                }
-                Ok(CommandRunOutcome::Rendered { stdout, stderr, .. }) => {
-                    ResponseEnvelope::command_declined(format!("{stdout}{stderr}"))
-                }
-                Err(error) => {
-                    report_command_run_failure(&word, &error);
-                    ResponseEnvelope::error(ERROR_PROVIDER, "command word could not be run")
-                }
             }
         }
         BrokerRequest::RunCommand {

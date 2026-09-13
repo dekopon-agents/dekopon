@@ -77,7 +77,7 @@ triggered it:
 | `agent.improvement.refused` | `dekopon-agent` | model turn, tool-call index, and a stable `reason` — `invalid-category`, `invalid-confidence`, `empty-field`, `field-too-long`, or `session-limit`; none of the submitted text |
 | `policy.name.unresolved` | `dekopon-brokerd` | policy id, name kind, and the action or provider name no loaded provider declares, so a rule that can never match is visible at startup |
 | `config.startup.warning` | `dekopon-brokerd` | the capability id and a stable `reason` — `unrouted-constraint-set` or `unconstrained-capability` |
-| `command.resolve.failed` | `dekopon-brokerd` | the provider-declared command word, a stable `error.kind`, and the host error's chain, recorded when running the word (`runCommand`, or the legacy `resolveCommand`) fails rather than declines: no provider declares it, the argv plus piped value exceeded `maxInputBytes`, the guest trapped or reached for an import, or its answer would not decode |
+| `command.resolve.failed` | `dekopon-brokerd` | the provider-declared command word, a stable `error.kind`, and the host error's chain, recorded when running the word (`runCommand`) fails rather than declines: no provider declares it, the argv plus piped value exceeded `maxInputBytes`, the guest trapped or reached for an import, or its answer would not decode |
 | `policy.request.refused` | `dekopon-broker` | the capability id and a rendered `error.reason` for a Cedar request the policy schema could not admit — the caller sees plain `policy-denied` |
 | `agent.command.unobserved` | `dekopon-agent` | `command.leg` (`broker` or `direct`), a low-cardinality `outcome` (`succeeded`, `operation-error`, `cancelled`, or `task-failed`), and a fixed `error.type` (`none`, the leg's own error kind, `task-cancelled`, or `task-panicked`), recorded when a command-word run's caller was dropped while its process node was joined; never the word, the argv, the piped value, or the text a provider rendered, and the failure's complete cause goes out as an ordinary error event at the same site rather than into this record |
 
@@ -449,7 +449,7 @@ migration is implemented here.
 |---|---|---|
 | `provider.compile` | `dekopon-broker-host` | `path`, `artifact_bytes`, `elapsed_ms`; emitted once per provider at startup |
 | `provider.describe` | `dekopon-broker-host` | `path`, `stores`, `instantiations`, `fuel.consumed`; emitted once per provider at startup, for the manifest call |
-| `provider.run_command` | `dekopon-broker-host` | provider, `word`, `command.export` (`run-command`, or the legacy `resolve-command`), `stores`, `instantiations`, `fuel.consumed` |
+| `provider.run_command` | `dekopon-broker-host` | provider, `word`, `command.export` (`run-command`), `stores`, `instantiations`, `fuel.consumed` |
 | `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `policy-error`, `secret-denied`, `unconstrained-capability`, `agent-denied`, `attestation-denied`, `unmapped-subject`, `chat-attestation-denied`, `chat-scope-required`, `record-operation-required`, `memory-unavailable`, `invalid-memory-input`, `invalid-turn`), `policy.errors_present`; `subject` and `via` on attested proposals |
 | `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one; `outcome` (`succeeded`, `failed`, `decision-unaudited`, `outcome-unaudited`) and `error` — the same classified reason the terminal audit record carries |
 | `broker.credential.refresh` | `dekopon-brokerd` | the symbolic `credential` name, and `outcome` (`current`, `adopted`, `rotated`, `rotated-unsaved`, `failed`); emitted once per invocation that selects a credential the broker renews per use, and never any token, account identifier, or file content. `chatgpt.refresh` from `dekopon-model` nests inside it |
@@ -476,7 +476,7 @@ thread.
 concurrently, so their spans overlap and the compile times sum to more than the wall-clock
 validation. Each loaded provider also emits one info event carrying its identity, artifact digest
 prefix, artifact bytes, compile milliseconds, its capability and command-word counts, and
-`command_export` — `run-command`, `resolve-command`, or `none` — naming which export the host calls
+`command_export` — `run-command` or `none` — naming which export the host calls
 for its words. The offline `dekopon-brokerd provider sync` and `verify` commands reuse the same host
 validation and can emit the span to their stderr subscriber, but they install no OTLP exporter.
 
@@ -568,8 +568,7 @@ the refresh failure classes remain part of the migration contract.
 | `broker_peer_unmapped` | warn | `dekopon-brokerd` | `peer.uid`, the UID the refused connection authenticated as |
 
 `broker_capabilities_refused` exists because an attested `capabilities` and an attested `runCommand`
-(or legacy `resolveCommand`) answer a refused caller with the same opaque nothing whatever went
-wrong — a distinguishable answer would tell an unauthorized gateway whether a subject is mapped, and
+answer a refused caller with the same opaque nothing whatever went wrong — a distinguishable answer would tell an unauthorized gateway whether a subject is mapped, and
 an unknown command word would disclose the surface the refusal withheld. The class, its determining
 policies, and the canonical subject land on the broker's own side of the socket, which is what makes
 bootstrapping an `identityMapping` for a new sender possible without reading the subject out of a
