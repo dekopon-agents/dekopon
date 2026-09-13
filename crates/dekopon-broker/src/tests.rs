@@ -33,7 +33,7 @@ fn decision(invocation: &str, allowed: bool) -> AuditEvent {
         }),
         via: None,
         attested_subject: None,
-        capability: "echo.echo"
+        capability: "cli-probe.upper"
             .parse::<CapabilityId>()
             .expect("valid capability fixture"),
         secret: None,
@@ -464,19 +464,21 @@ fn capability_authority_commits_exactly_these_fields() {
 
     let set = ConstraintSet {
         route: CapabilityRoute::Generic,
-        provider: "echo".parse().expect("valid provider fixture"),
+        provider: "cli-probe".parse().expect("valid provider fixture"),
         effect: dekopon_capability::EffectKind::ReadOnly,
         risk: dekopon_core::RiskLevel::Low,
-        credential: Some("echo-token".to_owned()),
+        credential: Some("probe-token".to_owned()),
         credential_by_agent: Default::default(),
         constraints: ExecutionConstraints::default(),
     };
     let mut encoded = AuthorityEncoder::new();
     encode_capability_authority(
         &mut encoded,
-        &"echo.echo".parse::<CapabilityId>().expect("valid fixture"),
+        &"cli-probe.upper"
+            .parse::<CapabilityId>()
+            .expect("valid fixture"),
         &set,
-        Some("echo-token"),
+        Some("probe-token"),
         "sha256:artifact",
     );
 
@@ -1016,7 +1018,7 @@ fn policy_http_scope_values_are_bounded() {
     fn constrain(http: dekopon_capability::HttpConstraints) -> ConstraintSet {
         ConstraintSet {
             route: CapabilityRoute::Generic,
-            provider: "echo".parse().expect("provider"),
+            provider: "cli-probe".parse().expect("provider"),
             effect: dekopon_capability::EffectKind::ReadOnly,
             risk: dekopon_core::RiskLevel::Low,
             credential: None,

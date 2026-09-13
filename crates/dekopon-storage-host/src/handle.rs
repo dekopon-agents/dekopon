@@ -5,7 +5,6 @@ use crate::{
         DOMAIN_LOGICAL_PATH, DOMAIN_OPERATION_EVIDENCE, DOMAIN_OUTPUT_EVIDENCE, commitment, token,
     },
     layout::{ENTRY_CHARGE, EntryKind, Usage, scan_usage, usage_with_directory_entry},
-    metrics::byte_bucket,
     namespace::{Namespace, lock_exclusive, logical_file},
     quota::{QuotaLedger, Reservation},
     vfs::LockLevel,
@@ -720,8 +719,8 @@ impl StorageHandle {
             operations: self.evidence.operations,
             syncs: self.evidence.syncs,
             quota_denials: self.evidence.quota_denials,
-            read_byte_bucket: byte_bucket(self.evidence.read_bytes),
-            write_byte_bucket: byte_bucket(self.evidence.write_bytes),
+            read_bytes: self.evidence.read_bytes,
+            write_bytes: self.evidence.write_bytes,
             evidence_commitment: commitment(
                 DOMAIN_OPERATION_EVIDENCE,
                 &[

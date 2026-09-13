@@ -9,7 +9,7 @@ use crate::value::to_text;
 /// Encodes or decodes standard base64.
 ///
 /// Text-shaped: a JSON array of lines is newline-joined before encoding, so
-/// `curl ... | base64` behaves the way a script expects.
+/// `gh issue list | base64` behaves the way a script expects.
 pub(crate) struct Base64;
 
 impl Builtin for Base64 {

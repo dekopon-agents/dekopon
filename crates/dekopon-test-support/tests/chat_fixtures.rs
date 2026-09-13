@@ -44,17 +44,17 @@ fn scripted(body: &str) -> Vec<TurnEvent> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_blocked_runtime_parks_inside_run_script_until_it_is_released() {
-    let runtime = Arc::new(BlockedRuntime::new("done").offering(&["echo.echo"]));
+    let runtime = Arc::new(BlockedRuntime::new("done").offering(&["probe"]));
     let parked = Arc::clone(&runtime);
     let running =
-        tokio::task::spawn_blocking(move || parked.run_script("echo.echo --message hi", 4));
+        tokio::task::spawn_blocking(move || parked.run_script("probe upper --text hi", 4));
 
     tokio::time::timeout(Duration::from_secs(5), runtime.wait_until_parked())
         .await
         .expect("the script reaches the park");
     assert!(!running.is_finished(), "a parked script has not returned");
-    assert_eq!(runtime.scripts(), ["echo.echo --message hi"]);
-    assert_eq!(runtime.command_words(), ["echo.echo"]);
+    assert_eq!(runtime.scripts(), ["probe upper --text hi"]);
+    assert_eq!(runtime.command_words(), ["probe"]);
 
     runtime.release();
     let outcome = running.await.expect("the released script finishes");
@@ -178,7 +178,7 @@ async fn a_parked_no_event_stream_is_interrupted_only_when_its_deadline_elapses(
         turn("the answer nobody reads"),
         DEADLINE,
     ));
-    let runtime = Arc::new(BlockedRuntime::new("no script runs").offering(&["echo.echo"]));
+    let runtime = Arc::new(BlockedRuntime::new("no script runs").offering(&["probe"]));
     let stop = Arc::new(Pressed(AtomicBool::new(false)));
     let session = {
         let (model, runtime, stop) = (Arc::clone(&model), Arc::clone(&runtime), Arc::clone(&stop));

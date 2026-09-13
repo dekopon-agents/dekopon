@@ -5,12 +5,14 @@
 //! keeping transport, command-line, async-runtime, and policy concerns out of this crate.
 //!
 //! It also holds the helpers that separate processes must not disagree about — the `accept()` retry
-//! classification, `error_chain`, and the trusted-file predicate behind [`read_trusted_file`] —
-//! because a fact split across five crates drifts, and the file-permission mask already had.
+//! classification, `error_chain`, the span-attribute bound [`bounded_attribute`], and the
+//! trusted-file predicate behind [`read_trusted_file`] — because a fact split across five crates
+//! drifts, and the file-permission mask already had.
 
 #![forbid(unsafe_code)]
 
 mod accept;
+mod attribute;
 mod diagnostics;
 mod redaction;
 mod skill;
@@ -25,6 +27,7 @@ use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use thiserror::Error;
 
 pub use accept::{ACCEPT_BACKOFF_MS, MAX_ACCEPT_BACKOFF_MS, retryable_accept_error};
+pub use attribute::{MAX_ATTRIBUTE_BYTES, bounded_attribute};
 pub use diagnostics::error_chain;
 pub use redaction::{REDACTION_MARKER, Redacted, redaction_marker, serialize_exposed};
 pub use skill::{MAX_SKILL_NAME_LENGTH, SkillId, SkillIdError};
@@ -60,12 +63,11 @@ pub const PROVIDER_COMPONENT_EXTENSION: &str = "wasm";
 /// this mirrors and pins the two together with a bidirectional test, so a builtin added or removed
 /// there fails the build until this list agrees.
 pub const RESERVED_COMMAND_WORDS: &[&str] = &[
-    ".", ":", "[", "[[", "]]", "base64", "bg", "break", "cap", "case", "cat", "continue", "curl",
-    "cut", "declare", "do", "done", "echo", "elif", "else", "esac", "eval", "exec", "exit",
-    "export", "false", "fg", "fi", "for", "function", "grep", "if", "in", "jobs", "jq", "kill",
-    "local", "printf", "read", "return", "sed", "select", "set", "shift", "sleep", "sort",
-    "source", "test", "then", "trap", "true", "uniq", "unset", "until", "wait", "wc", "while",
-    "xargs",
+    ".", ":", "[", "[[", "]]", "base64", "bg", "break", "cap", "case", "cat", "continue", "cut",
+    "declare", "do", "done", "echo", "elif", "else", "esac", "eval", "exec", "exit", "export",
+    "false", "fg", "fi", "for", "function", "grep", "if", "in", "jobs", "jq", "kill", "local",
+    "printf", "read", "return", "sed", "select", "set", "shift", "sleep", "sort", "source", "test",
+    "then", "trap", "true", "uniq", "unset", "until", "wait", "wc", "while", "xargs",
 ];
 
 /// The reason a Dekopon identifier could not be parsed.
@@ -669,12 +671,6 @@ mod tests {
 pub enum CommandWordConflictKind {
     /// The sandboxed shell owns the word: a builtin, a control word, or one it refuses by name.
     Reserved,
-    /// The word is shaped like a capability identifier, which it would shadow.
-    ///
-    /// The shell resolves provider command words *before* capability fallback, so allowing one
-    /// would make the provider command win and the granted capability of that name unreachable
-    /// under its own spelling. Provider words and capability identifiers stay disjoint instead.
-    CapabilityShaped,
     /// More than one provider claimed it.
     Duplicate,
     /// One provider declared it more than once.
@@ -687,10 +683,6 @@ impl CommandWordConflictKind {
     pub const fn explanation(self) -> &'static str {
         match self {
             Self::Reserved => "is reserved by the sandboxed shell and could never dispatch",
-            Self::CapabilityShaped => {
-                "contains `.`, `-`, or `_`, so it would shadow the capability of that name; the \
-                 shell resolves provider command words before capability fallback"
-            }
             Self::Duplicate => "is claimed by more than one provider",
             Self::Repeated => "is declared more than once by the same provider",
         }
@@ -701,10 +693,6 @@ impl CommandWordConflictKind {
     pub const fn remedy(self) -> &'static str {
         match self {
             Self::Duplicate => "rename one command word, or drop a provider from the search path",
-            Self::CapabilityShaped => {
-                "rename the command word to a separator-free one; the capability remains invocable \
-                 by its full identifier"
-            }
             Self::Reserved => "rename the command word; this name is reserved",
             Self::Repeated => "remove the repeated entry from that provider's command words",
         }
@@ -755,8 +743,6 @@ pub fn command_word_conflicts(declared: &[(String, Vec<String>)]) -> Vec<Command
         }
         let kind = if RESERVED_COMMAND_WORDS.contains(&word) {
             CommandWordConflictKind::Reserved
-        } else if word.contains(['.', '-', '_']) && word.parse::<CapabilityId>().is_ok() {
-            CommandWordConflictKind::CapabilityShaped
         } else if distinct.len() > 1 {
             CommandWordConflictKind::Duplicate
         } else if distinct.len() < providers.len() {
@@ -813,7 +799,6 @@ mod command_word_tests {
             ("jq", CommandWordConflictKind::Reserved),
             ("eval", CommandWordConflictKind::Reserved),
             ("break", CommandWordConflictKind::Reserved),
-            ("gh.pr", CommandWordConflictKind::CapabilityShaped),
         ] {
             let conflicts = command_word_conflicts(&declared(&[("some-provider", &[word])]));
             assert_eq!(conflicts.len(), 1, "{word}: {conflicts:?}");
@@ -851,22 +836,23 @@ mod command_word_tests {
         assert_eq!(conflicts[0].claimants, ["fly", "k8s"]);
     }
 
-    /// The explanation is printed verbatim in the broker's startup report, so it has to describe
-    /// the mechanism that actually exists: provider words resolve before capability fallback.
+    /// A separator in a command word shadows nothing, because a capability identifier is not a
+    /// command: a word shaped like one is claimed and contested by the same rules as any other.
     #[test]
-    fn the_capability_shaped_explanation_names_the_shadowing_hazard() {
-        let conflicts = command_word_conflicts(&declared(&[("some-provider", &["gh.pr"])]));
+    fn a_word_containing_a_separator_follows_the_ordinary_rules() {
+        assert!(
+            command_word_conflicts(&declared(&[(
+                "some-provider",
+                &["gh.pr", "wiki-page", "wikipedia_page"]
+            )]))
+            .is_empty()
+        );
 
+        let conflicts =
+            command_word_conflicts(&declared(&[("fly", &["gh.pr"]), ("k8s", &["gh.pr"])]));
         assert_eq!(conflicts.len(), 1, "{conflicts:?}");
-        let explanation = conflicts[0].kind.explanation();
-        assert!(
-            explanation.contains("shadow the capability"),
-            "{explanation}"
-        );
-        assert!(
-            explanation.contains("before capability fallback"),
-            "{explanation}"
-        );
+        assert_eq!(conflicts[0].kind, CommandWordConflictKind::Duplicate);
+        assert_eq!(conflicts[0].claimants, ["fly", "k8s"]);
     }
 
     #[test]
@@ -886,6 +872,7 @@ mod command_word_tests {
     fn conflicts_of_several_classes_are_all_reported_at_once() {
         let conflicts = command_word_conflicts(&declared(&[
             ("fly", &["deploy", "jq"]),
+            // Claimed once, `gh.pr` shadows nothing and stays out of the report.
             ("k8s", &["deploy", "gh.pr"]),
             ("danger", &["eval"]),
         ]));
@@ -900,7 +887,6 @@ mod command_word_tests {
             [
                 ("deploy", CommandWordConflictKind::Duplicate),
                 ("eval", CommandWordConflictKind::Reserved),
-                ("gh.pr", CommandWordConflictKind::CapabilityShaped),
                 ("jq", CommandWordConflictKind::Reserved),
             ]
         );

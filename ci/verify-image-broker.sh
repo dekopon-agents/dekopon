@@ -37,7 +37,7 @@ config.update({
     "socketPath": "/proof/broker.sock",
     "brokerPrincipal": "image-broker",
     "policyRevision": "image-proof",
-    "providers": ["/opt/dekopon/providers/echo-provider.wasm"],
+    "providers": ["/opt/dekopon/providers/cli-probe-provider.wasm"],
     "identities": [{"uid": 65532, "principal": "image-peer",
                     "actor": {"type": "service", "principal": "image-peer"}}],
 })
@@ -91,7 +91,7 @@ if [ "$ready" != true ]; then
   echo "error: broker component-load/startup deadline exceeded" >&2
   exit 1
 fi
-# The broker binds only after compiling and describing the configured echo component.
+# The broker binds only after compiling and describing the configured cli-probe component.
 # New releases additionally exercise the existing bounded protocol probe in the image.
 if [ "$tier" != checkpoint ]; then
   docker exec "$container" dekopon-brokerd probe --socket /proof/broker.sock

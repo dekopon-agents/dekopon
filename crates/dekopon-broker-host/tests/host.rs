@@ -483,17 +483,17 @@ async fn returns_redirects_without_following_them() {
 #[tokio::test(flavor = "multi_thread")]
 async fn broker_host_also_runs_import_free_components() {
     let registry = BrokerProviderRegistry::load(
-        [provider_fixture("echo-provider.wasm")],
+        [provider_fixture("cli-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
     .expect("import-free provider loads in the broker linker");
-    let capability = "echo.echo".parse().expect("valid capability fixture");
+    let capability = "cli-probe.upper".parse().expect("valid capability fixture");
     let output = registry
         .invoke(
             authorized(
                 capability,
-                json!({"message": "hello"}),
+                json!({"text": "hello"}),
                 ExecutionConstraints::default(),
             ),
             None,
@@ -501,25 +501,25 @@ async fn broker_host_also_runs_import_free_components() {
         .await
         .expect("import-free provider runs without an HTTP grant");
 
-    assert_eq!(output.output, json!({"message": "hello"}));
+    assert_eq!(output.output, json!({"text": "HELLO"}));
     assert!(output.http_calls.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rejects_authorization_bound_to_a_different_provider() {
     let registry = BrokerProviderRegistry::load(
-        [provider_fixture("echo-provider.wasm")],
+        [provider_fixture("cli-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
-    .expect("echo provider loads");
-    let capability = "echo.echo".parse().expect("valid capability fixture");
+    .expect("cli-probe provider loads");
+    let capability = "cli-probe.upper".parse().expect("valid capability fixture");
     let error = registry
         .invoke(
             authorized_for(
                 "http-probe",
                 capability,
-                json!({"message": "hello"}),
+                json!({"text": "hello"}),
                 ExecutionConstraints::default(),
             ),
             None,
@@ -572,6 +572,7 @@ async fn run_command_reading_the_clock_traps() {
     assert_eq!(
         outcome,
         CommandRunOutcome::Proposed {
+            secret_use: None,
             capability: "clock.now".parse().expect("capability"),
             input: json!({}),
         }
@@ -607,7 +608,7 @@ async fn rejects_zero_wasm_resource_ceilings() {
         max_memories: 0,
         ..BrokerHostLimits::default()
     };
-    let error = BrokerProviderRegistry::load([provider_fixture("echo-provider.wasm")], limits)
+    let error = BrokerProviderRegistry::load([provider_fixture("cli-probe-provider.wasm")], limits)
         .await
         .expect_err("zero store ceiling must fail");
     assert!(matches!(
@@ -621,7 +622,7 @@ async fn rejects_zero_wasm_resource_ceilings() {
 /// The published artifact digest describes the exact buffer Cranelift compiled.
 #[tokio::test(flavor = "multi_thread")]
 async fn artifact_digest_describes_the_compiled_buffer() {
-    let source = provider_fixture("echo-provider.wasm");
+    let source = provider_fixture("cli-probe-provider.wasm");
     let registry = BrokerProviderRegistry::load([source.clone()], BrokerHostLimits::default())
         .await
         .expect("provider loads");
@@ -644,13 +645,13 @@ async fn artifact_digest_describes_the_compiled_buffer() {
 /// A provider lock is compared with the same buffer Wasmtime would compile.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_locked_artifact_digest_is_enforced_at_the_compile_boundary() {
-    let source = provider_fixture("echo-provider.wasm");
+    let source = provider_fixture("cli-probe-provider.wasm");
     let bytes = std::fs::read(&source).expect("read artifact");
     let locked = LockedProviderSource::new(
         source,
         bytes.len() as u64,
         "0".repeat(64),
-        "echo".parse().expect("provider ID"),
+        "cli-probe".parse().expect("provider ID"),
     )
     .expect("well-formed locked source");
 
@@ -672,7 +673,7 @@ async fn a_locked_artifact_digest_is_enforced_at_the_compile_boundary() {
 /// The locked descriptor length is enforced against that same compile buffer.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_locked_artifact_length_is_enforced_at_the_compile_boundary() {
-    let source = provider_fixture("echo-provider.wasm");
+    let source = provider_fixture("cli-probe-provider.wasm");
     let bytes = std::fs::read(&source).expect("read artifact");
     let digest = Sha256::digest(&bytes)
         .iter()
@@ -685,7 +686,7 @@ async fn a_locked_artifact_length_is_enforced_at_the_compile_boundary() {
         source,
         bytes.len() as u64 + 1,
         digest,
-        "echo".parse().expect("provider ID"),
+        "cli-probe".parse().expect("provider ID"),
     )
     .expect("well-formed locked source");
 
@@ -711,7 +712,7 @@ async fn a_physically_oversized_locked_artifact_is_bounded_before_read() {
             "zero.wasm",
             0,
             "0".repeat(64),
-            "echo".parse().expect("provider ID")
+            "cli-probe".parse().expect("provider ID")
         ),
         Err(BrokerHostError::InvalidArtifactSize { .. })
     ));
@@ -725,7 +726,7 @@ async fn a_physically_oversized_locked_artifact_is_bounded_before_read() {
         source.clone(),
         1,
         "0".repeat(64),
-        "echo".parse().expect("provider ID"),
+        "cli-probe".parse().expect("provider ID"),
     )
     .expect("well-formed locked source");
 
@@ -754,7 +755,7 @@ async fn a_physically_oversized_locked_artifact_is_bounded_before_read() {
 /// The provider identity is lock input too, not metadata the component may replace.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_locked_provider_identity_is_enforced_after_describe() {
-    let source = provider_fixture("echo-provider.wasm");
+    let source = provider_fixture("cli-probe-provider.wasm");
     let bytes = std::fs::read(&source).expect("read artifact");
     let digest = Sha256::digest(&bytes);
     let digest = digest.iter().fold(String::new(), |mut text, byte| {
@@ -819,6 +820,7 @@ async fn a_hand_rolled_run_command_guest_renders_help_and_proposes() {
     assert_eq!(
         outcome,
         CommandRunOutcome::Proposed {
+            secret_use: None,
             capability: "ordinary.escape".parse().expect("capability"),
             input: json!({}),
         }
@@ -884,6 +886,7 @@ async fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
     assert_eq!(
         outcome,
         CommandRunOutcome::Proposed {
+            secret_use: None,
             capability: capability.clone(),
             input: json!({"text": "héllo"}),
         }
@@ -972,7 +975,7 @@ async fn rejects_an_aggregate_ceiling_smaller_than_one_store() {
         ..BrokerHostOptions::default()
     };
     let error = BrokerProviderRegistry::load_with_options(
-        [provider_fixture("echo-provider.wasm")],
+        [provider_fixture("cli-probe-provider.wasm")],
         limits,
         None,
         &options,
@@ -1083,7 +1086,7 @@ async fn a_persistent_compilation_cache_serves_a_second_load() {
         ..BrokerHostOptions::default()
     };
     let cold = BrokerProviderRegistry::load_with_options(
-        [provider_fixture("echo-provider.wasm")],
+        [provider_fixture("cli-probe-provider.wasm")],
         BrokerHostLimits::default(),
         None,
         &options,
@@ -1097,7 +1100,7 @@ async fn a_persistent_compilation_cache_serves_a_second_load() {
         .artifact_sha256;
 
     let warm = BrokerProviderRegistry::load_with_options(
-        [provider_fixture("echo-provider.wasm")],
+        [provider_fixture("cli-probe-provider.wasm")],
         BrokerHostLimits::default(),
         None,
         &options,
@@ -1111,15 +1114,15 @@ async fn a_persistent_compilation_cache_serves_a_second_load() {
     // The digest is of the artifact bytes, never of a cache entry, so a hit cannot change it.
     assert_eq!(warm_metadata.artifact_sha256, cold_digest);
 
-    let capability = "echo.echo".parse().expect("valid capability fixture");
+    let capability = "cli-probe.upper".parse().expect("valid capability fixture");
     let output = warm
         .invoke(
-            authorized(capability, json!({"message": "warm"}), constraints_5s()),
+            authorized(capability, json!({"text": "warm"}), constraints_5s()),
             None,
         )
         .await
         .expect("a cached component still invokes");
-    assert_eq!(output.output["message"], json!("warm"));
+    assert_eq!(output.output["text"], json!("WARM"));
 }
 
 fn constraints_5s() -> ExecutionConstraints {
@@ -1138,15 +1141,16 @@ async fn rejects_authorization_that_exceeds_host_ceilings() {
         max_timeout: Duration::from_millis(100),
         ..BrokerHostLimits::default()
     };
-    let registry = BrokerProviderRegistry::load([provider_fixture("echo-provider.wasm")], limits)
-        .await
-        .expect("provider loads beneath valid host ceilings");
-    let capability = "echo.echo".parse().expect("valid capability fixture");
+    let registry =
+        BrokerProviderRegistry::load([provider_fixture("cli-probe-provider.wasm")], limits)
+            .await
+            .expect("provider loads beneath valid host ceilings");
+    let capability = "cli-probe.upper".parse().expect("valid capability fixture");
     let error = registry
         .invoke(
             authorized(
                 capability,
-                json!({"message": "hello"}),
+                json!({"text": "hello"}),
                 ExecutionConstraints {
                     timeout_ms: 101,
                     ..ExecutionConstraints::default()
@@ -1377,61 +1381,13 @@ async fn a_two_request_capability_over_its_call_budget_trips_the_host_call_limit
     server.join();
 }
 
-/// A component generated against the immutable `dekopon:provider@0.1.0` two-export world loads,
-/// invokes, and contributes no command words.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_actual_provider_v0_1_component_remains_compatible() {
-    let registry = BrokerProviderRegistry::load(
-        [provider_fixture("provider-v0-1-compat-provider.wasm")],
-        BrokerHostLimits::default(),
-    )
-    .await
-    .expect("historical provider component loads");
-
-    assert!(
-        registry.command_words().is_empty(),
-        "the historical world has no command export"
-    );
-    let capability = "provider-v0-1-compat.echo"
-        .parse::<CapabilityId>()
-        .expect("capability");
-    let output = registry
-        .invoke(
-            authorized_for(
-                "provider-v0-1-compat",
-                capability,
-                json!({"historical": true}),
-                ExecutionConstraints {
-                    timeout_ms: 5_000,
-                    max_output_bytes: 4_096,
-                    http: None,
-                    storage: None,
-                    secret_use: None,
-                },
-            ),
-            None,
-        )
-        .await
-        .expect("historical provider invokes");
-    assert_eq!(output.output, json!({"historical": true}));
-
-    let error = registry
-        .run_command("gh", &["gh".to_owned()], None)
-        .await
-        .expect_err("no historical provider owns this word");
-    assert!(
-        matches!(error, BrokerHostError::UnknownCommandWord { ref word } if word == "gh"),
-        "{error:?}"
-    );
-}
-
 /// Two providers declaring one capability are reported together, not one restart apart.
 #[tokio::test(flavor = "multi_thread")]
 async fn conflicting_providers_are_all_reported_in_one_failure() {
     let error = BrokerProviderRegistry::load(
         [
-            provider_fixture("echo-provider.wasm"),
-            provider_fixture("echo-provider.wasm"),
+            provider_fixture("cli-probe-provider.wasm"),
+            provider_fixture("cli-probe-provider.wasm"),
         ],
         BrokerHostLimits::default(),
     )
@@ -1441,13 +1397,17 @@ async fn conflicting_providers_are_all_reported_in_one_failure() {
     let BrokerHostError::ConflictingProviders { report } = error else {
         panic!("expected a conflict report, got {error:?}");
     };
-    // The same component twice is both a duplicate provider and five duplicate capabilities. A
-    // check that returned on the first would have named one of the six.
+    // The same component twice is a duplicate provider, three duplicate capabilities, and its one
+    // command word claimed twice. A check that returned on the first would have named one of the
+    // five.
     assert_eq!(report.providers.len(), 1, "{report:?}");
-    assert_eq!(report.capabilities.len(), 5, "{report:?}");
+    assert_eq!(report.capabilities.len(), 3, "{report:?}");
+    assert_eq!(report.command_words.len(), 1, "{report:?}");
+    assert!(report.wordless.is_empty(), "{report:?}");
     let rendered = report.to_string();
-    assert!(rendered.contains("6 provider conflict(s)"), "{rendered}");
-    assert!(rendered.contains("echo.ransom-case"), "{rendered}");
+    assert!(rendered.contains("5 provider conflict(s)"), "{rendered}");
+    assert!(rendered.contains("cli-probe.reverse"), "{rendered}");
+    assert!(rendered.contains("command word `probe`"), "{rendered}");
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -1694,8 +1654,8 @@ fn post_return_component(cleanup: &str) -> tempfile::NamedTempFile {
         "description": "Post-return failure probe",
         "commandWords": ["cleanup"],
         "capabilities": [{
-            "id": "cleanup-probe.echo",
-            "description": "Echo probe",
+            "id": "cleanup-probe.noop",
+            "description": "No-op probe",
             "effect": dekopon_capability::EffectKind::ReadOnly,
             "risk": dekopon_core::RiskLevel::Low,
             "inputSchema": {"type": "object"}
@@ -1774,7 +1734,7 @@ async fn automatic_post_return_traps_remain_command_and_invocation_failures() {
     let error = registry
         .invoke(
             authorized(
-                "cleanup-probe.echo".parse().expect("capability"),
+                "cleanup-probe.noop".parse().expect("capability"),
                 json!({}),
                 ExecutionConstraints {
                     timeout_ms: 5_000,

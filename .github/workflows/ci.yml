@@ -343,8 +343,6 @@ jobs:
           key: cargo-registry-v1-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             cargo-registry-v1-${{ runner.os }}-
-      - name: Fetch exact standalone echo fixture
-        run: ci/fetch-external-provider-components.sh examples/providers echo
       - name: Sign in to the organization registry
         # The example pulls upstream by default; CI pulls the mirror instead, because an anonymous
         # pull from a public registry fails on other people's traffic rather than on this change.
@@ -446,8 +444,6 @@ jobs:
             cargo-registry-v1-${{ runner.os }}-
       - name: Build CLIs
         run: cargo build --locked -p dekopon-brokerd -p dekopond
-      - name: Fetch exact standalone echo fixture
-        run: ci/fetch-external-provider-components.sh examples/providers echo
       - name: Exercise generated help and example commands
         shell: bash
         run: |
@@ -580,7 +576,7 @@ jobs:
           policyRevision: chart-default
           policiesPath: /etc/dekopon/policies.cedar
           providers:
-            - /opt/dekopon/providers/echo-provider.wasm
+            - /opt/dekopon/providers/cli-probe-provider.wasm
           identities:
             - uid: 65533
               principal: dekopon-pod
@@ -588,8 +584,8 @@ jobs:
                 type: service
                 principal: dekopon-pod
           constraintSets:
-            echo.echo:
-              provider: echo
+            cli-probe.upper:
+              provider: cli-probe
               effect: read-only
               risk: Low
               constraints:

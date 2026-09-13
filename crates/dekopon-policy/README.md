@@ -105,10 +105,10 @@ text-parsed policies positionally (`policy0`, `policy1`, …); an optional `@id(
 replaces that with a stable name, which is what an audit trail wants:
 
 ```cedar
-@id("chat-agent-echo")
+@id("chat-agent-upper")
 permit(principal == Dekopon::Principal::"cpetersen",
-       action == Dekopon::Action::"echo.echo",
-       resource == Dekopon::Provider::"echo")
+       action == Dekopon::Action::"cli-probe.upper",
+       resource == Dekopon::Provider::"cli-probe")
 when { context has via && context.via == "dekopond-gateway" };
 ```
 

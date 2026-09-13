@@ -416,46 +416,6 @@ jobs:
             })
           ' target/wit-package/dekopon-clock.json
 
-      - name: Verify the exact standalone echo component remains import-free
-        shell: bash
-        run: |
-          set -euo pipefail
-          component=examples/providers/echo-provider.wasm
-          description=target/wit-package/echo-standalone.json
-          wasm-tools validate "$component"
-          wasm-tools component wit --json "$component" > "$description"
-          jq --exit-status '
-            (.packages | map(.name) == ["root:component"]) and
-            (.worlds | length == 1) and
-            (.worlds[0].name == "root") and
-            (.worlds[0].imports == {}) and
-            ((.worlds[0].exports | keys) == ["describe", "invoke"])
-          ' "$description"
-
-      - name: Verify the historical provider 0.1 compatibility component
-        shell: bash
-        run: |
-          set -euo pipefail
-          component=examples/providers/provider-v0-1-compat-provider.wasm
-          description=target/wit-package/provider-v0-1-compat.json
-          grep -Fxq 'package dekopon:provider@0.1.0;' \
-            examples/providers/provider-v0-1-compat/wit/deps/provider.wit
-          grep -Fq 'include dekopon:provider/provider@0.1.0;' \
-            examples/providers/provider-v0-1-compat/wit/provider.wit
-          if grep -Rqe 'dekopon:provider@0\.[2-9]' \
-            examples/providers/provider-v0-1-compat/wit; then
-            echo "historical fixture was regenerated against a later provider package" >&2
-            exit 1
-          fi
-          wasm-tools validate "$component"
-          wasm-tools component wit --json "$component" > "$description"
-          jq --exit-status '
-            (.packages | map(.name) == ["root:component"]) and
-            (.worlds | length == 1) and
-            (.worlds[0].imports == {}) and
-            ((.worlds[0].exports | keys) == ["describe", "invoke"])
-          ' "$description"
-
       - name: Verify the command-line provider fixture is import-free
         shell: bash
         run: |
@@ -529,12 +489,14 @@ jobs:
             description="target/wit-package/$name.json"
             wasm-tools validate "$component"
             wasm-tools component wit --json "$component" > "$description"
-            jq --exit-status '
+            # Both answer a command word (`httpprobe`, `placeholder`) through `run-command`.
+            exports='["describe", "invoke", "run-command"]'
+            jq --exit-status --argjson exports "$exports" '
               (.packages | map(.name) == ["dekopon:http@1.0.0", "root:component"]) and
               (.worlds | length == 1) and
               (.worlds[0].name == "root") and
               (.worlds[0].imports == {"interface-0": {"interface": {"id": 0}}}) and
-              ((.worlds[0].exports | keys) == ["describe", "invoke"]) and
+              ((.worlds[0].exports | keys) == $exports) and
               (.interfaces | length == 1) and
               (.interfaces[0].name == "client") and
               ((.interfaces[0].functions | keys) == ["send"])

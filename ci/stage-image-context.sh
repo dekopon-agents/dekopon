@@ -48,8 +48,8 @@ context="$work/context"
 max_glibc="2.41"
 
 binaries="dekopon-brokerd dekopond"
-providers="http-probe"
-standalone_default_providers="echo jsonplaceholder"
+providers="cli-probe http-probe"
+standalone_default_providers="jsonplaceholder"
 # Other out-of-tree providers, as <owner>/<repo>@<tag>. These ship in the image so it is useful
 # without assembling a provider set by hand; each one releases on its own schedule.
 external_providers="dekopon-agents/dekopon-provider-gh@v0.1.0"
@@ -133,11 +133,11 @@ for provider in $providers; do
   fi
   cp "$component" "$context/providers/"
 done
-# Echo, JSONPlaceholder, and optional memory are independently released. The shared fetcher pins
-# both v0.1.0 and each expected checksum; image staging additionally requires provenance.
+# JSONPlaceholder and optional memory are independently released. The shared fetcher pins each
+# release tag and expected checksum; image staging additionally requires provenance.
 DEKOPON_VERIFY_PROVIDER_ATTESTATIONS=1 \
   "$source_dir/ci/fetch-external-provider-components.sh" \
-    "$work/standalone-providers" echo jsonplaceholder memory-chat
+    "$work/standalone-providers" jsonplaceholder memory-chat
 for provider in $standalone_default_providers; do
   cp "$work/standalone-providers/$provider-provider.wasm" "$context/providers/"
 done

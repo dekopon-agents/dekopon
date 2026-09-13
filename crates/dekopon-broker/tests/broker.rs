@@ -86,7 +86,7 @@ fn request(id: &str, capability: &str, input: serde_json::Value) -> InvocationRe
     }
 }
 
-/// One constraint set with the classification the echo provider actually declares.
+/// One constraint set with the classification the cli-probe provider actually declares.
 fn set(provider: &str, constraints: ExecutionConstraints) -> ConstraintSet {
     set_with_metadata(provider, EffectKind::ReadOnly, RiskLevel::Low, constraints)
 }
@@ -148,17 +148,15 @@ fn engine<'a>(
     PolicyEngine::new(policies, &world).expect("fixture policy validates")
 }
 
-/// The echo world every echo fixture shares.
-fn echo_engine<'a>(policies: &str, principals: impl IntoIterator<Item = &'a str>) -> PolicyEngine {
+/// The cli-probe world every cli-probe fixture shares.
+fn probe_engine<'a>(policies: &str, principals: impl IntoIterator<Item = &'a str>) -> PolicyEngine {
     engine(
         policies,
         principals,
         [
-            ("echo.echo", "echo"),
-            ("echo.reverse", "echo"),
-            ("echo.upcase", "echo"),
-            ("echo.downcase", "echo"),
-            ("echo.ransom-case", "echo"),
+            ("cli-probe.upper", "cli-probe"),
+            ("cli-probe.count", "cli-probe"),
+            ("cli-probe.reverse", "cli-probe"),
         ],
     )
 }
@@ -222,7 +220,7 @@ fn jsonplaceholder_engine(policies: &str) -> PolicyEngine {
     )
 }
 
-/// [`direct_policy`] for a provider other than `echo`.
+/// [`direct_policy`] for a provider other than `cli-probe`.
 fn direct_provider_policy(
     name: &str,
     agent_name: &str,
@@ -272,7 +270,7 @@ fn direct_policy(name: &str, agent_name: &str, capability: &str) -> String {
     format!(
         r#"permit(principal == Dekopon::Principal::"{name}",
                   action == Dekopon::Action::"{capability}",
-                  resource == Dekopon::Provider::"echo")
+                  resource == Dekopon::Provider::"cli-probe")
            when {{ context has agent && context.agent == "{agent_name}" }}
            unless {{ context has via }};"#
     )
@@ -293,7 +291,7 @@ fn attested_policy(name: &str, agent_name: &str, via: &str, capability: &str) ->
     format!(
         r#"permit(principal == Dekopon::Principal::"{name}",
                   action == Dekopon::Action::"{capability}",
-                  resource == Dekopon::Provider::"echo")
+                  resource == Dekopon::Provider::"cli-probe")
            when {{ context has via && context.via == "{via}"
                 && context has agent && context.agent == "{agent_name}" }};"#
     )
@@ -323,26 +321,26 @@ fn directory<'a>(entries: impl IntoIterator<Item = (&'a str, &'a str)>) -> Ident
     .expect("distinct subject fixtures build a directory")
 }
 
-async fn echo_registry(limits: BrokerHostLimits) -> BrokerProviderRegistry {
-    BrokerProviderRegistry::load([provider_fixture("echo-provider.wasm")], limits)
+async fn probe_registry(limits: BrokerHostLimits) -> BrokerProviderRegistry {
+    BrokerProviderRegistry::load([provider_fixture("cli-probe-provider.wasm")], limits)
         .await
-        .expect("echo provider fixture loads")
+        .expect("cli-probe provider fixture loads")
 }
 
-/// A broker whose only grant is attested: `cpetersen` may `echo.echo`, but only through
+/// A broker whose only grant is attested: `cpetersen` may `cli-probe.upper`, but only through
 /// `gateway`.
 async fn attested_broker(
     identities: IdentityDirectory,
     audit: Arc<InMemoryAuditLog>,
 ) -> Broker<InMemoryAuditLog> {
     Broker::new(
-        echo_registry(BrokerHostLimits::default()).await,
+        probe_registry(BrokerHostLimits::default()).await,
         principal("broker-test"),
         "policy-test".to_owned(),
-        echo_engine(
+        probe_engine(
             &format!(
                 "{}\n{}\n{}",
-                attested_policy("cpetersen", "some-agent", "gateway", "echo.echo"),
+                attested_policy("cpetersen", "some-agent", "gateway", "cli-probe.upper"),
                 agent_prompt_policy("cpetersen", "some-agent", "gateway"),
                 // `oncall` may drive the agent and holds no capability, which is what makes
                 // "allowed to ask, granted nothing" distinguishable from "may not ask".
@@ -350,7 +348,10 @@ async fn attested_broker(
             ),
             ["cpetersen", "oncall", "gateway"],
         ),
-        catalog([("echo.echo", set("echo", ExecutionConstraints::default()))]),
+        catalog([(
+            "cli-probe.upper",
+            set("cli-probe", ExecutionConstraints::default()),
+        )]),
         CredentialStore::empty(),
         identities,
         audit,
@@ -361,7 +362,7 @@ async fn attested_broker(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn policy_authorizes_and_audits_no_payloads() {
-    let registry = echo_registry(BrokerHostLimits::default()).await;
+    let registry = probe_registry(BrokerHostLimits::default()).await;
     let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
     let broker = Broker::new(
         registry,
@@ -369,11 +370,14 @@ async fn policy_authorizes_and_audits_no_payloads() {
             .parse::<PrincipalId>()
             .expect("valid broker principal"),
         "policy-test".to_owned(),
-        echo_engine(
-            &direct_policy("caller", "provider-test", "echo.echo"),
+        probe_engine(
+            &direct_policy("caller", "provider-test", "cli-probe.upper"),
             ["caller"],
         ),
-        catalog([("echo.echo", set("echo", ExecutionConstraints::default()))]),
+        catalog([(
+            "cli-probe.upper",
+            set("cli-probe", ExecutionConstraints::default()),
+        )]),
         CredentialStore::empty(),
         IdentityDirectory::empty(),
         Arc::clone(&audit),
@@ -388,8 +392,8 @@ async fn policy_authorizes_and_audits_no_payloads() {
             None,
             request(
                 "invoke-once",
-                "echo.echo",
-                json!({"message": "top-secret-payload"}),
+                "cli-probe.upper",
+                json!({"text": "top-secret-payload"}),
             ),
         )
         .await
@@ -400,10 +404,7 @@ async fn policy_authorizes_and_audits_no_payloads() {
     );
     assert_eq!(result.decision.decision_id, "allow-invoke-once");
     assert_eq!(result.decision.policy_revision, "policy-test");
-    assert_eq!(
-        result.output,
-        Some(json!({"message": "top-secret-payload"}))
-    );
+    assert_eq!(result.output, Some(json!({"text": "TOP-SECRET-PAYLOAD"})));
     assert_eq!(result.evidence.len(), 2);
 
     let records = audit.records().await;
@@ -415,11 +416,12 @@ async fn policy_authorizes_and_audits_no_payloads() {
     assert!(matches!(records[1], AuditEvent::Execution { .. }));
     let serialized = serde_json::to_string(&records).expect("audit serializes");
     assert!(!serialized.contains("top-secret-payload"));
+    assert!(!serialized.contains("TOP-SECRET-PAYLOAD"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn unmatched_identity_is_denied_before_provider_execution() {
-    let registry = echo_registry(BrokerHostLimits::default()).await;
+    let registry = probe_registry(BrokerHostLimits::default()).await;
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
     let broker = Broker::new(
         registry,
@@ -427,11 +429,14 @@ async fn unmatched_identity_is_denied_before_provider_execution() {
             .parse::<PrincipalId>()
             .expect("valid broker principal"),
         "policy-test".to_owned(),
-        echo_engine(
-            &direct_policy("allowed-caller", "provider-test", "echo.echo"),
+        probe_engine(
+            &direct_policy("allowed-caller", "provider-test", "cli-probe.upper"),
             ["allowed-caller", "other-caller"],
         ),
-        catalog([("echo.echo", set("echo", ExecutionConstraints::default()))]),
+        catalog([(
+            "cli-probe.upper",
+            set("cli-probe", ExecutionConstraints::default()),
+        )]),
         CredentialStore::empty(),
         IdentityDirectory::empty(),
         Arc::clone(&audit),
@@ -441,8 +446,8 @@ async fn unmatched_identity_is_denied_before_provider_execution() {
 
     let allowed = broker.capabilities(&context("allowed-caller"));
     assert_eq!(allowed.len(), 1);
-    assert_eq!(allowed[0].provider.as_str(), "echo");
-    assert_eq!(allowed[0].capability.id.as_str(), "echo.echo");
+    assert_eq!(allowed[0].provider.as_str(), "cli-probe");
+    assert_eq!(allowed[0].capability.id.as_str(), "cli-probe.upper");
     assert!(broker.capabilities(&context("other-caller")).is_empty());
 
     let result = broker
@@ -450,7 +455,11 @@ async fn unmatched_identity_is_denied_before_provider_execution() {
             &context("other-caller"),
             None,
             None,
-            request("invoke-denied", "echo.echo", json!({"message": "secret"})),
+            request(
+                "invoke-denied",
+                "cli-probe.upper",
+                json!({"text": "secret"}),
+            ),
         )
         .await
         .expect("policy denial is audited");
@@ -471,7 +480,7 @@ async fn unmatched_identity_is_denied_before_provider_execution() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
-    let registry = echo_registry(BrokerHostLimits::default()).await;
+    let registry = probe_registry(BrokerHostLimits::default()).await;
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
     let error = Broker::new(
         registry,
@@ -479,9 +488,9 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
             .parse::<PrincipalId>()
             .expect("valid broker principal"),
         "policy-test".to_owned(),
-        echo_engine("", ["caller"]),
+        probe_engine("", ["caller"]),
         catalog([(
-            "echo.echo",
+            "cli-probe.upper",
             set("different-provider", ExecutionConstraints::default()),
         )]),
         CredentialStore::empty(),
@@ -492,7 +501,7 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
     .expect_err("trusted provider mismatch must fail broker construction");
     assert!(matches!(error, BrokerBuildError::ProviderMismatch { .. }));
 
-    let registry = echo_registry(BrokerHostLimits {
+    let registry = probe_registry(BrokerHostLimits {
         max_timeout: Duration::from_millis(100),
         ..BrokerHostLimits::default()
     })
@@ -504,11 +513,11 @@ async fn policy_metadata_and_host_ceilings_are_checked_at_startup() {
             .parse::<PrincipalId>()
             .expect("valid broker principal"),
         "policy-test".to_owned(),
-        echo_engine("", ["caller"]),
+        probe_engine("", ["caller"]),
         catalog([(
-            "echo.echo",
+            "cli-probe.upper",
             set(
-                "echo",
+                "cli-probe",
                 ExecutionConstraints {
                     timeout_ms: 101,
                     ..ExecutionConstraints::default()
@@ -1468,6 +1477,239 @@ async fn capability_policy_alone_cannot_authorize_a_drn() {
     assert!(!encoded.contains("never-resolved"), "{encoded}");
 }
 
+/// The secret [`basic_secret_broker`] resolves; at least the 16 bytes the native sink requires.
+const BASIC_SECRET: &[u8] = b"drn-secret-never-visible";
+
+/// `httpprobe fetch` asking for [`secret_drn`] as HTTP Basic under the username `user-a`.
+fn basic_fetch_argv(uri: &str) -> Vec<String> {
+    let drn = secret_drn();
+    ["fetch", "--uri", uri, "--basic", "user-a", drn.as_str()]
+        .map(str::to_owned)
+        .into()
+}
+
+/// A broker over the HTTP probe whose one private binding lets [`secret_drn`] reach
+/// `http-probe.fetch` as HTTP Basic for exactly `username`.
+///
+/// Its policy permits that `secret.use` whatever the username, because Cedar never sees one: which
+/// name may present the secret is the owner's binding alone.
+fn basic_secret_broker(
+    registry: BrokerProviderRegistry,
+    authority: &str,
+    username: &str,
+    audit: &Arc<InMemoryAuditLog>,
+) -> Broker<InMemoryAuditLog> {
+    let policy = format!(
+        "{}\n{}",
+        direct_http_policy("caller", "provider-test", "http-probe.fetch"),
+        r#"@id("caller-basic-secret-use")
+           permit(principal == Dekopon::Principal::"caller",
+                  action == Dekopon::Action::"secret.use",
+                  resource == Dekopon::Secret::"drn:com.xrl:secret:test:http-probe/token")
+           when { context.capability == "http-probe.fetch"
+               && context.provider == "http-probe"
+               && context.sink == "httpBasic" };"#,
+    );
+    Broker::new(
+        registry,
+        principal("broker-test"),
+        "policy-test".to_owned(),
+        http_probe_secret_engine(&policy),
+        catalog([(
+            "http-probe.fetch",
+            set("http-probe", loopback_constraints(authority)),
+        )]),
+        CredentialStore::empty(),
+        IdentityDirectory::empty(),
+        Arc::clone(audit),
+        BrokerLimits::default(),
+    )
+    .expect("broker")
+    .with_secret_catalog(
+        SecretCatalog::new(
+            vec![SecretUseBinding {
+                binding_id: "http-probe-basic".to_owned(),
+                secret: secret_drn(),
+                capability: "http-probe.fetch".parse().expect("capability"),
+                sink: SecretSinkKind::HttpBasic,
+                basic_username: Some(username.to_owned()),
+                allowed_hosts: vec![authority.to_owned()],
+                allowed_methods: vec!["GET".to_owned()],
+                allowed_paths: vec![HttpPathRule::Exact {
+                    path: "/api/v1/thing".to_owned(),
+                }],
+                allow_query: false,
+                max_injections: 1,
+            }],
+            Arc::new(StaticSecretResolver(BASIC_SECRET)),
+        )
+        .expect("secret catalog"),
+    )
+    .expect("binding fits capability")
+}
+
+/// A command word proposes secret use from its own argv.
+///
+/// No shell builtin produces a secret-use proposal any more; a provider's `run-command` guest does.
+/// `httpprobe fetch --basic` reads the username and DRN off its flag and returns them as the
+/// proposal's typed secret use, beside an input that names no secret. Running the word decides
+/// nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_word_proposes_basic_secret_use_from_its_argv() {
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("HTTP provider fixture loads");
+    let audit = Arc::new(InMemoryAuditLog::new(4).expect("audit"));
+    let broker = basic_secret_broker(registry, "127.0.0.1:9", "user-a", &audit);
+    let uri = "http://127.0.0.1:9/api/v1/thing";
+
+    let proposed = broker
+        .run_command(
+            &context("caller"),
+            None,
+            None,
+            "httpprobe",
+            &basic_fetch_argv(uri),
+            None,
+        )
+        .await
+        .expect("the word proposes");
+    assert_eq!(
+        proposed,
+        CommandRunOutcome::Proposed {
+            capability: "http-probe.fetch".parse().expect("capability"),
+            input: json!({"uri": uri}),
+            secret_use: Some(SecretUseProposal::HttpBasic {
+                secret: secret_drn(),
+                username: "user-a".to_owned(),
+            }),
+        }
+    );
+    assert!(
+        audit.records().await.is_empty(),
+        "running a word decides nothing"
+    );
+}
+
+/// A word's Basic proposal is authorized like any other secret use, and the binding fixes the
+/// username.
+///
+/// The `--basic user-a` proposal is refused `secret-denied` by a broker that binds the DRN for
+/// `user-b`, and rendered into the Authorization header by one that binds it for `user-a`. Policy
+/// permits the `secret.use` on both, so the refusal belongs to the binding alone.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_word_s_basic_proposal_needs_a_binding_for_its_exact_username() {
+    let server = LoopbackServer::once(
+        b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+    );
+    let authority = server.authority().to_owned();
+    let uri = format!("http://{authority}/api/v1/thing");
+    let audit = Arc::new(InMemoryAuditLog::new(8).expect("audit"));
+    let other_user = basic_secret_broker(
+        BrokerProviderRegistry::load(
+            [provider_fixture("http-probe-provider.wasm")],
+            BrokerHostLimits::default(),
+        )
+        .await
+        .expect("HTTP provider fixture loads"),
+        &authority,
+        "user-b",
+        &audit,
+    );
+    let bound_user = basic_secret_broker(
+        BrokerProviderRegistry::load(
+            [provider_fixture("http-probe-provider.wasm")],
+            BrokerHostLimits::default(),
+        )
+        .await
+        .expect("HTTP provider fixture loads"),
+        &authority,
+        "user-a",
+        &audit,
+    );
+
+    let proposed = bound_user
+        .run_command(
+            &context("caller"),
+            None,
+            None,
+            "httpprobe",
+            &basic_fetch_argv(&uri),
+            None,
+        )
+        .await
+        .expect("the word proposes");
+    let CommandRunOutcome::Proposed {
+        capability,
+        input,
+        secret_use,
+    } = proposed
+    else {
+        panic!("expected a proposal, got {proposed:?}");
+    };
+    assert!(secret_use.is_some(), "the proposal names its secret use");
+    let submit = |id: &str| InvocationRequest {
+        id: id
+            .parse::<InvocationId>()
+            .expect("valid invocation fixture"),
+        capability: capability.clone(),
+        trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
+        input: input.clone(),
+        secret_use: secret_use.clone(),
+    };
+
+    let refused = other_user
+        .invoke(
+            &context("caller"),
+            None,
+            None,
+            submit("invoke-basic-other-user"),
+        )
+        .await
+        .expect("denial audited");
+    assert_eq!(
+        refused.outcome,
+        dekopon_capability::InvocationOutcome::Denied
+    );
+    assert_eq!(refused.error.as_deref(), Some("secret-denied"));
+
+    let allowed = bound_user
+        .invoke(
+            &context("caller"),
+            None,
+            None,
+            submit("invoke-basic-bound-user"),
+        )
+        .await
+        .expect("dual-authorized invocation completes");
+    assert_eq!(
+        allowed.outcome,
+        dekopon_capability::InvocationOutcome::Succeeded
+    );
+    let wire = server.request_text();
+    // base64("user-a:drn-secret-never-visible"): the bound username, then the resolved secret.
+    assert!(
+        wire.contains("authorization: Basic dXNlci1hOmRybi1zZWNyZXQtbmV2ZXItdmlzaWJsZQ=="),
+        "{wire}"
+    );
+    server.join();
+
+    let serialized = serde_json::to_string(&audit.records().await).expect("audit serializes");
+    assert!(
+        serialized.contains(secret_drn().as_str()),
+        "DRN is attributable"
+    );
+    for leaked in [
+        "drn-secret-never-visible",
+        "dXNlci1hOmRybi1zZWNyZXQtbmV2ZXItdmlzaWJsZQ",
+    ] {
+        assert!(!serialized.contains(leaked), "secret leaked: {leaked}");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn authorized_source_failure_is_a_terminal_audited_failure_not_an_ambiguous_gap() {
     let registry = BrokerProviderRegistry::load(
@@ -1965,21 +2207,27 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
 async fn via_isolation_holds_in_both_directions() {
     let audit = Arc::new(InMemoryAuditLog::new(16).expect("valid audit bound"));
     let broker = Broker::new(
-        echo_registry(BrokerHostLimits::default()).await,
+        probe_registry(BrokerHostLimits::default()).await,
         principal("broker-test"),
         "policy-test".to_owned(),
-        echo_engine(
+        probe_engine(
             &format!(
                 "{}\n{}\n{}",
-                direct_policy("caller", "provider-test", "echo.reverse"),
-                attested_policy("cpetersen", "some-agent", "gateway", "echo.echo"),
+                direct_policy("caller", "provider-test", "cli-probe.reverse"),
+                attested_policy("cpetersen", "some-agent", "gateway", "cli-probe.upper"),
                 agent_prompt_policy("cpetersen", "some-agent", "gateway"),
             ),
             ["caller", "cpetersen", "gateway"],
         ),
         catalog([
-            ("echo.echo", set("echo", ExecutionConstraints::default())),
-            ("echo.reverse", set("echo", ExecutionConstraints::default())),
+            (
+                "cli-probe.upper",
+                set("cli-probe", ExecutionConstraints::default()),
+            ),
+            (
+                "cli-probe.reverse",
+                set("cli-probe", ExecutionConstraints::default()),
+            ),
         ]),
         CredentialStore::empty(),
         directory([(SLACK_SUBJECT, "cpetersen")]),
@@ -1999,8 +2247,8 @@ async fn via_isolation_holds_in_both_directions() {
             Some(&attestation(&subject, "some-agent", "invoke-attested")),
             request(
                 "invoke-attested",
-                "echo.echo",
-                json!({"message": "on behalf of"}),
+                "cli-probe.upper",
+                json!({"text": "on behalf of"}),
             ),
         )
         .await
@@ -2009,7 +2257,7 @@ async fn via_isolation_holds_in_both_directions() {
         attested.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
     );
-    assert_eq!(attested.output, Some(json!({"message": "on behalf of"})));
+    assert_eq!(attested.output, Some(json!({"text": "ON BEHALF OF"})));
 
     // The mapped principal arriving as itself, with the same agent actor, is a different context
     // than the attested one and matches nothing.
@@ -2020,8 +2268,8 @@ async fn via_isolation_holds_in_both_directions() {
             None,
             request(
                 "invoke-direct-as-mapped",
-                "echo.echo",
-                json!({"message": "direct"}),
+                "cli-probe.upper",
+                json!({"text": "direct"}),
             ),
         )
         .await
@@ -2046,8 +2294,8 @@ async fn via_isolation_holds_in_both_directions() {
             Some(&attestation(&subject, "some-agent", "invoke-crossed")),
             request(
                 "invoke-crossed",
-                "echo.reverse",
-                json!({"message": "crossed"}),
+                "cli-probe.reverse",
+                json!({"text": "crossed"}),
             ),
         )
         .await
@@ -2071,10 +2319,13 @@ async fn via_isolation_holds_in_both_directions() {
         .expect("the attestation is honored")
         .0;
     assert_eq!(visible.len(), 1);
-    assert_eq!(visible[0].capability.id.as_str(), "echo.echo");
+    assert_eq!(visible[0].capability.id.as_str(), "cli-probe.upper");
     let direct_visible = broker.capabilities(&context("caller"));
     assert_eq!(direct_visible.len(), 1);
-    assert_eq!(direct_visible[0].capability.id.as_str(), "echo.reverse");
+    assert_eq!(
+        direct_visible[0].capability.id.as_str(),
+        "cli-probe.reverse"
+    );
     assert!(
         broker.capabilities(&gateway).is_empty(),
         "attestor authority is not capability: the gateway holds nothing of its own"
@@ -2107,7 +2358,11 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
             &gateway,
             None,
             Some(&attestation(&subject, "some-agent", "invoke-no-grant")),
-            request("invoke-no-grant", "echo.echo", json!({"message": "claim"})),
+            request(
+                "invoke-no-grant",
+                "cli-probe.upper",
+                json!({"text": "claim"}),
+            ),
         )
         .await
         .expect("a refused attestation is accounted");
@@ -2125,8 +2380,8 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
             Some(&attestation(&subject, "some-agent", "invoke-out-of-scope")),
             request(
                 "invoke-out-of-scope",
-                "echo.echo",
-                json!({"message": "claim"}),
+                "cli-probe.upper",
+                json!({"text": "claim"}),
             ),
         )
         .await
@@ -2180,7 +2435,11 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
             &gateway,
             Some(&attestor_grant(["slack.t0123abc"])),
             Some(&attestation(&subject, "some-agent", "invoke-unmapped")),
-            request("invoke-unmapped", "echo.echo", json!({"message": "claim"})),
+            request(
+                "invoke-unmapped",
+                "cli-probe.upper",
+                json!({"text": "claim"}),
+            ),
         )
         .await
         .expect("an unmapped subject is accounted");
@@ -2230,8 +2489,8 @@ async fn attested_success_audits_via_and_subject() {
             )),
             request(
                 "invoke-attested-audit",
-                "echo.echo",
-                json!({"message": "top-secret-payload"}),
+                "cli-probe.upper",
+                json!({"text": "top-secret-payload"}),
             ),
         )
         .await
@@ -2306,7 +2565,7 @@ async fn attested_capabilities_distinguishes_refusal_from_empty() {
         .expect("the attestation is honored")
         .0;
     assert_eq!(granted.len(), 1);
-    assert_eq!(granted[0].capability.id.as_str(), "echo.echo");
+    assert_eq!(granted[0].capability.id.as_str(), "cli-probe.upper");
 
     // Attested successfully, mapped successfully, and granted nothing: an empty list is the
     // honest answer and is not a refusal.
@@ -2393,7 +2652,7 @@ fn audit_events_written_before_attestation_serialize_unchanged() {
     let legacy = concat!(
         r#"{"type":"decision","invocation":"invoke-legacy","trace":"0000000000000000000000000000f1c7","#,
         r#""principal":"caller","actor":{"type":"agent","agent":"provider-test"},"#,
-        r#""capability":"echo.echo","provider":"echo","authorized_by":"broker-test","#,
+        r#""capability":"cli-probe.upper","provider":"cli-probe","authorized_by":"broker-test","#,
         r#""decision_id":"allow-invoke-legacy","policy_revision":"policy-test","allowed":true,"#,
         r#""decision_digest":"sha256-legacy"}"#,
     );
@@ -2427,7 +2686,7 @@ fn execution_records_written_before_per_agent_credentials_serialize_unchanged() 
     let legacy = concat!(
         r#"{"type":"execution","invocation":"invoke-legacy","trace":"0000000000000000000000000000f1c7","#,
         r#""principal":"caller","actor":{"type":"agent","agent":"provider-test"},"#,
-        r#""capability":"echo.echo","provider":"echo","authorized_by":"broker-test","#,
+        r#""capability":"cli-probe.upper","provider":"cli-probe","authorized_by":"broker-test","#,
         r#""decision_id":"allow-invoke-legacy","policy_revision":"policy-test","#,
         r#""effect":"read-only","risk":"Low","outcome":"Succeeded","#,
         r#""duration_ms":3,"output_digest":"sha256-legacy"}"#,
@@ -2449,16 +2708,19 @@ fn execution_records_written_before_per_agent_credentials_serialize_unchanged() 
 /// it, and at decision time with its own reason if it somehow arrives anyway.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
-    // Startup: the policy names `echo.reverse`, the catalog does not.
+    // Startup: the policy names `cli-probe.reverse`, the catalog does not.
     let error = Broker::new(
-        echo_registry(BrokerHostLimits::default()).await,
+        probe_registry(BrokerHostLimits::default()).await,
         principal("broker-test"),
         "policy-test".to_owned(),
-        echo_engine(
-            &direct_policy("caller", "provider-test", "echo.reverse"),
+        probe_engine(
+            &direct_policy("caller", "provider-test", "cli-probe.reverse"),
             ["caller"],
         ),
-        catalog([("echo.echo", set("echo", ExecutionConstraints::default()))]),
+        catalog([(
+            "cli-probe.upper",
+            set("cli-probe", ExecutionConstraints::default()),
+        )]),
         CredentialStore::empty(),
         IdentityDirectory::empty(),
         Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound")),
@@ -2467,21 +2729,24 @@ async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
     .expect_err("a grant nothing knows how to execute must refuse startup");
     assert!(matches!(
         error,
-        BrokerBuildError::UnconstrainedCapability { capability } if capability.as_str() == "echo.reverse"
+        BrokerBuildError::UnconstrainedCapability { capability } if capability.as_str() == "cli-probe.reverse"
     ));
 
     // Decision time: a policy that constrains no action can permit anything, so the missing
     // constraint set is the only thing standing between the caller and an unexecutable capability.
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
     let broker = Broker::new(
-        echo_registry(BrokerHostLimits::default()).await,
+        probe_registry(BrokerHostLimits::default()).await,
         principal("broker-test"),
         "policy-test".to_owned(),
-        echo_engine(
+        probe_engine(
             r#"permit(principal == Dekopon::Principal::"caller", action, resource);"#,
             ["caller"],
         ),
-        catalog([("echo.echo", set("echo", ExecutionConstraints::default()))]),
+        catalog([(
+            "cli-probe.upper",
+            set("cli-probe", ExecutionConstraints::default()),
+        )]),
         CredentialStore::empty(),
         IdentityDirectory::empty(),
         Arc::clone(&audit),
@@ -2495,8 +2760,8 @@ async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
             None,
             request(
                 "invoke-unconstrained",
-                "echo.reverse",
-                json!({"message": "x"}),
+                "cli-probe.reverse",
+                json!({"text": "x"}),
             ),
         )
         .await
@@ -2510,7 +2775,7 @@ async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
         broker
             .capabilities(&context("caller"))
             .iter()
-            .all(|available| available.capability.id.as_str() == "echo.echo"),
+            .all(|available| available.capability.id.as_str() == "cli-probe.upper"),
         "a capability with no constraint set is never listed"
     );
 }
@@ -2521,17 +2786,20 @@ async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
 async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
     let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
     let broker = Broker::new(
-        echo_registry(BrokerHostLimits::default()).await,
+        probe_registry(BrokerHostLimits::default()).await,
         principal("broker-test"),
         "policy-test".to_owned(),
-        echo_engine(
+        probe_engine(
             &format!(
-                "@id(\"caller-echo\")\n{}",
-                direct_policy("caller", "provider-test", "echo.echo")
+                "@id(\"caller-upper\")\n{}",
+                direct_policy("caller", "provider-test", "cli-probe.upper")
             ),
             ["caller", "other-caller"],
         ),
-        catalog([("echo.echo", set("echo", ExecutionConstraints::default()))]),
+        catalog([(
+            "cli-probe.upper",
+            set("cli-probe", ExecutionConstraints::default()),
+        )]),
         CredentialStore::empty(),
         IdentityDirectory::empty(),
         Arc::clone(&audit),
@@ -2546,7 +2814,7 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
             &context("caller"),
             None,
             None,
-            request("invoke-explained", "echo.echo", json!({"message": "hi"})),
+            request("invoke-explained", "cli-probe.upper", json!({"text": "hi"})),
         )
         .await
         .expect("the allowed invocation is accounted");
@@ -2555,7 +2823,11 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
             &context("other-caller"),
             None,
             None,
-            request("invoke-unexplained", "echo.echo", json!({"message": "hi"})),
+            request(
+                "invoke-unexplained",
+                "cli-probe.upper",
+                json!({"text": "hi"}),
+            ),
         )
         .await
         .expect("the denial is accounted");
@@ -2564,7 +2836,7 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
     let encoded = serde_json::to_value(&records).expect("audit serializes");
     // Event fields keep the enum's own snake_case.
     for index in [0, 1] {
-        assert_eq!(encoded[index]["policy_ids"], json!(["caller-echo"]));
+        assert_eq!(encoded[index]["policy_ids"], json!(["caller-upper"]));
         assert_eq!(encoded[index]["policy_digest"], json!(digest));
     }
     // A deny-by-default refusal is reached by no policy, so the absent list is the explanation and
@@ -2584,14 +2856,17 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
 async fn tolerating_an_unconstrained_capability_warns_but_still_denies_it() {
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
     let (broker, warnings) = Broker::start(
-        echo_registry(BrokerHostLimits::default()).await,
+        probe_registry(BrokerHostLimits::default()).await,
         principal("broker-test"),
         "policy-test".to_owned(),
-        echo_engine(
-            &direct_policy("caller", "provider-test", "echo.reverse"),
+        probe_engine(
+            &direct_policy("caller", "provider-test", "cli-probe.reverse"),
             ["caller"],
         ),
-        catalog([("echo.echo", set("echo", ExecutionConstraints::default()))]),
+        catalog([(
+            "cli-probe.upper",
+            set("cli-probe", ExecutionConstraints::default()),
+        )]),
         CredentialStore::empty(),
         IdentityDirectory::empty(),
         Arc::clone(&audit),
@@ -2604,7 +2879,7 @@ async fn tolerating_an_unconstrained_capability_warns_but_still_denies_it() {
     assert!(matches!(
         &warnings[0],
         StartupWarning::UnconstrainedCapability { capability }
-            if capability.as_str() == "echo.reverse"
+            if capability.as_str() == "cli-probe.reverse"
     ));
 
     // The part that matters: enforcement is untouched.
@@ -2613,7 +2888,11 @@ async fn tolerating_an_unconstrained_capability_warns_but_still_denies_it() {
             &context("caller"),
             None,
             None,
-            request("invoke-tolerated", "echo.reverse", json!({"message": "x"})),
+            request(
+                "invoke-tolerated",
+                "cli-probe.reverse",
+                json!({"text": "x"}),
+            ),
         )
         .await
         .expect("the refusal is accounted");
@@ -2626,7 +2905,7 @@ async fn tolerating_an_unconstrained_capability_warns_but_still_denies_it() {
         broker
             .capabilities(&context("caller"))
             .iter()
-            .all(|available| available.capability.id.as_str() == "echo.echo"),
+            .all(|available| available.capability.id.as_str() == "cli-probe.upper"),
         "a tolerated capability is still never listed"
     );
 }
@@ -2636,7 +2915,10 @@ async fn tolerating_an_unconstrained_capability_warns_but_still_denies_it() {
 #[tokio::test(flavor = "multi_thread")]
 async fn tolerating_a_constraint_set_that_routes_nowhere_drops_it() {
     let unrouted = [
-        ("echo.echo", set("echo", ExecutionConstraints::default())),
+        (
+            "cli-probe.upper",
+            set("cli-probe", ExecutionConstraints::default()),
+        ),
         (
             "gh.pull-request.read",
             set("gh", ExecutionConstraints::default()),
@@ -2644,11 +2926,11 @@ async fn tolerating_a_constraint_set_that_routes_nowhere_drops_it() {
     ];
 
     let error = Broker::new(
-        echo_registry(BrokerHostLimits::default()).await,
+        probe_registry(BrokerHostLimits::default()).await,
         principal("broker-test"),
         "policy-test".to_owned(),
-        echo_engine(
-            &direct_policy("caller", "provider-test", "echo.echo"),
+        probe_engine(
+            &direct_policy("caller", "provider-test", "cli-probe.upper"),
             ["caller"],
         ),
         catalog(unrouted.clone()),
@@ -2665,11 +2947,11 @@ async fn tolerating_a_constraint_set_that_routes_nowhere_drops_it() {
     ));
 
     let (broker, warnings) = Broker::start(
-        echo_registry(BrokerHostLimits::default()).await,
+        probe_registry(BrokerHostLimits::default()).await,
         principal("broker-test"),
         "policy-test".to_owned(),
-        echo_engine(
-            &direct_policy("caller", "provider-test", "echo.echo"),
+        probe_engine(
+            &direct_policy("caller", "provider-test", "cli-probe.upper"),
             ["caller"],
         ),
         catalog(unrouted),
@@ -2695,7 +2977,7 @@ async fn tolerating_a_constraint_set_that_routes_nowhere_drops_it() {
             &context("caller"),
             None,
             None,
-            request("invoke-routed", "echo.echo", json!({"message": "x"})),
+            request("invoke-routed", "cli-probe.upper", json!({"text": "x"})),
         )
         .await
         .expect("the routed capability still executes");
@@ -2713,14 +2995,17 @@ async fn tolerating_a_constraint_set_that_routes_nowhere_drops_it() {
 async fn command_words_are_filtered_by_what_policy_allows() {
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
     let (broker, _) = Broker::start(
-        echo_registry(BrokerHostLimits::default()).await,
+        probe_registry(BrokerHostLimits::default()).await,
         principal("broker-test"),
         "policy-test".to_owned(),
-        echo_engine(
-            &direct_policy("caller", "provider-test", "echo.echo"),
+        probe_engine(
+            &direct_policy("caller", "provider-test", "cli-probe.upper"),
             ["caller", "stranger"],
         ),
-        catalog([("echo.echo", set("echo", ExecutionConstraints::default()))]),
+        catalog([(
+            "cli-probe.upper",
+            set("cli-probe", ExecutionConstraints::default()),
+        )]),
         CredentialStore::empty(),
         IdentityDirectory::empty(),
         Arc::clone(&audit),
@@ -2729,10 +3014,10 @@ async fn command_words_are_filtered_by_what_policy_allows() {
     )
     .expect("broker starts");
 
-    // The exact fetched echo fixture declares no command words, so both are empty — but the granted
-    // and ungranted contexts must agree on that for the right reason, which the capability lists
-    // below establish.
-    assert!(broker.command_words(&context("caller")).is_empty());
+    // The granted context reaches the provider, so it is told the provider's word; the ungranted
+    // context is told nothing. The capability lists below establish that both answers are for the
+    // right reason.
+    assert_eq!(broker.command_words(&context("caller")), ["probe"]);
     assert!(broker.command_words(&context("stranger")).is_empty());
     assert_eq!(broker.capabilities(&context("caller")).len(), 1);
     assert!(
@@ -2756,14 +3041,17 @@ async fn command_words_are_filtered_by_what_policy_allows() {
 async fn an_unknown_command_word_is_refused_without_running_anything() {
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
     let (broker, _) = Broker::start(
-        echo_registry(BrokerHostLimits::default()).await,
+        probe_registry(BrokerHostLimits::default()).await,
         principal("broker-test"),
         "policy-test".to_owned(),
-        echo_engine(
-            &direct_policy("caller", "provider-test", "echo.echo"),
+        probe_engine(
+            &direct_policy("caller", "provider-test", "cli-probe.upper"),
             ["caller"],
         ),
-        catalog([("echo.echo", set("echo", ExecutionConstraints::default()))]),
+        catalog([(
+            "cli-probe.upper",
+            set("cli-probe", ExecutionConstraints::default()),
+        )]),
         CredentialStore::empty(),
         IdentityDirectory::empty(),
         Arc::clone(&audit),
@@ -2850,6 +3138,7 @@ async fn a_command_word_renders_help_and_reads_the_piped_value_through_the_broke
     assert_eq!(
         proposed,
         CommandRunOutcome::Proposed {
+            secret_use: None,
             capability: "cli-probe.upper".parse().expect("valid capability fixture"),
             input: json!({"text": "hello"}),
         }

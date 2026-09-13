@@ -500,10 +500,10 @@ impl FakeBroker {
 
     /// Returns the storage root on disk.
     ///
-    /// [`StorageEvidence`] reports byte counts only as coarse powers-of-two buckets, so a test
-    /// asserting an exact size — that a write-ahead log was truncated to zero, say — has to look
-    /// at the tree. Note every path component is an opaque SHA-256 token, so walk it rather than
-    /// guessing names.
+    /// [`StorageEvidence`] counts the bytes an invocation read and wrote through storage, not what
+    /// the files hold afterwards, so a test asserting an on-disk size — that a write-ahead log was
+    /// truncated to zero, say — has to look at the tree. Note every path component is an opaque
+    /// SHA-256 token, so walk it rather than guessing names.
     #[must_use]
     pub fn storage_root(&self) -> &Path {
         &self.root

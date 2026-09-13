@@ -41,7 +41,6 @@ dependencies = [
  "dekopon-core",
  "serde",
  "serde_json",
- "wit-bindgen",
 ]
 
 [[package]]

@@ -1,35 +1,27 @@
-//! Command-word resolution and the argv-to-JSON convention for capability calls.
+//! Command-word resolution.
 //!
 //! Resolution order is fixed:
 //!
 //! 1. words this shell refuses outright (`eval`, `exec`, `source`, job control, `declare`),
 //! 2. shell functions declared earlier in the same script,
 //! 3. the fixed builtin table,
-//! 4. command words declared by the session's loaded providers,
-//! 5. capability fallback, and
-//! 6. `cap <id>`, which is itself a builtin and therefore already covered by step 3.
+//! 4. command words declared by the session's loaded providers.
 //!
-//! Otherwise the word is "command not found", exit code 127.
+//! Otherwise the word is "command not found", exit code 127. That includes a word shaped like a
+//! capability identifier (`wikipedia_page`, `cli-probe.upper`), granted or not: a capability is
+//! reached only through the provider command word that proposes it, never by typing its
+//! identifier, so a granted capability's name is as unknown here as a typo.
 //!
-//! Steps 3 and 5 cannot collide. Every builtin name is separator-free, and capability fallback only
-//! fires for words containing `.`, `-`, or `_`. The two sets are disjoint by construction, not by
-//! luck, and [`tests::builtin_and_capability_namespaces_are_disjoint`] proves it.
-//!
-//! Step 4 could collide with either, and would win: a provider word matching a builtin would hide
-//! it, and a capability-shaped provider word would shadow the capability of that name. Neither is
-//! resolved here — `dekopon_core::command_word_conflicts` refuses both at load, so a manifest that
-//! would shadow something never reaches this table.
+//! Step 4 could collide with step 3, and would lose. A provider word matching a builtin or any
+//! other reserved word is refused at load by `dekopon_core::command_word_conflicts`, so a manifest
+//! that would be shadowed never reaches this table; the ordering here is the second line.
 
 use std::collections::BTreeSet;
 
-use dekopon_core::CapabilityId;
-use serde_json::Value;
-
 use crate::{
     CapabilityInvoker,
-    builtins::{self, BuiltinKind, CommandFailure},
+    builtins::{self, BuiltinKind},
     parser::REJECTED_COMMANDS,
-    value::{object_from_pairs, scalar_from_token},
 };
 
 /// How one command word resolves.
@@ -38,17 +30,8 @@ pub(crate) enum Resolution {
     Function,
     /// A builtin.
     Builtin(BuiltinKind),
-    /// A granted capability, invoked through the fallback rule.
-    Capability,
     /// A command word a loaded provider contributed, rewritten by that provider into a proposal.
     ProviderCommand,
-    /// A capability identifier in a namespace this session holds, but not one it was granted.
-    ///
-    /// Dispatches exactly as [`Resolution::NotFound`] does — same message, same exit code. The
-    /// distinction exists only for telemetry: it is the difference between "the model typed
-    /// nonsense" and "the model keeps reaching for something we never granted", and only the
-    /// second is a trend worth acting on.
-    NotGranted,
     /// A word this shell refuses, with the reason why.
     Rejected(&'static str),
     /// Nothing matched.
@@ -78,399 +61,202 @@ pub(crate) fn resolve(
     if invoker.has_command_word(word) {
         return Resolution::ProviderCommand;
     }
-    if looks_like_capability(word) {
-        if invoker.is_granted(word) {
-            return Resolution::Capability;
-        }
-        if in_granted_namespace(word, invoker) {
-            return Resolution::NotGranted;
-        }
-    }
     Resolution::NotFound
-}
-
-/// Reports whether a word names a provider namespace this session already holds.
-///
-/// Deliberately bounded by the session's *own* granted set rather than by anything global: a word
-/// in a namespace the session never held is an ordinary typo, and reporting it as `not-granted`
-/// would tell an operator the model reached for a provider that was never in play.
-fn in_granted_namespace(word: &str, invoker: &dyn CapabilityInvoker) -> bool {
-    let namespace = word.split('.').next().unwrap_or(word);
-    !namespace.is_empty() && namespace != word && invoker.grants_namespace(namespace)
-}
-
-/// Reports whether a word could be a capability identifier.
-///
-/// A capability identifier is not *required* to contain a separator by `dekopon-core`'s rules, but
-/// this shell requires one before it will try capability fallback. That extra condition is what
-/// keeps the builtin and capability namespaces provably disjoint; a separator-free capability
-/// remains reachable through `cap <id>`.
-#[must_use]
-pub(crate) fn looks_like_capability(word: &str) -> bool {
-    word.contains(['.', '-', '_']) && word.parse::<CapabilityId>().is_ok()
-}
-
-/// Converts argv into a capability input object.
-///
-/// `some.capability --post-id 7 --include-body` becomes `{"postId": 7, "includeBody": true}`, so
-/// kebab-case flags land on the camelCase keys this workspace uses everywhere. A single bare
-/// argument starting with `{` bypasses conversion and is parsed as the literal input object.
-pub(crate) fn arguments_to_input(
-    command: &str,
-    arguments: &[String],
-) -> Result<Value, CommandFailure> {
-    if arguments.is_empty() {
-        return Ok(Value::Object(serde_json::Map::new()));
-    }
-
-    if let [single] = arguments
-        && single.trim_start().starts_with('{')
-    {
-        let parsed = serde_json::from_str::<Value>(single).map_err(|error| {
-            CommandFailure::usage(format!("{command}: input is not valid JSON: {error}"))
-        })?;
-        if !parsed.is_object() {
-            return Err(CommandFailure::usage(format!(
-                "{command}: capability input must be a JSON object"
-            )));
-        }
-        return Ok(parsed);
-    }
-
-    let mut pairs = Vec::new();
-    let mut index = 0;
-    while index < arguments.len() {
-        let argument = arguments[index].as_str();
-        let Some(flag) = argument.strip_prefix("--") else {
-            return Err(CommandFailure::usage(format!(
-                "{command}: unexpected argument {argument:?}; pass capability input as --kebab-case flags or one JSON object"
-            )));
-        };
-        if flag.is_empty() {
-            return Err(CommandFailure::usage(format!(
-                "{command}: `--` is not a capability input flag"
-            )));
-        }
-
-        let key = to_camel_case(flag);
-        match arguments.get(index + 1) {
-            // A flag followed by another flag, or nothing, is a boolean present-flag.
-            None => {
-                pairs.push((key, Value::Bool(true)));
-                index += 1;
-            }
-            Some(next) if next.starts_with("--") => {
-                pairs.push((key, Value::Bool(true)));
-                index += 1;
-            }
-            Some(next) => {
-                pairs.push((key, scalar_from_token(next)));
-                index += 2;
-            }
-        }
-    }
-
-    Ok(object_from_pairs(pairs))
-}
-
-/// Converts one kebab-case flag name to camelCase.
-fn to_camel_case(flag: &str) -> String {
-    let mut output = String::with_capacity(flag.len());
-    let mut capitalize = false;
-    for character in flag.chars() {
-        if character == '-' || character == '_' {
-            capitalize = true;
-            continue;
-        }
-        if capitalize {
-            output.extend(character.to_uppercase());
-            capitalize = false;
-        } else {
-            output.push(character);
-        }
-    }
-    output
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{cell::Cell, collections::BTreeSet};
+    use std::{
+        cell::{Cell, RefCell},
+        collections::BTreeSet,
+    };
 
-    use serde_json::{Value, json};
+    use dekopon_core::SecretUseProposal;
+    use serde_json::Value;
 
-    use crate::{CapabilityCallResult, CapabilityInvoker, builtins};
+    use crate::{CapabilityCallResult, CapabilityInvoker, ExitCode, Interpreter, Limits};
 
-    use super::{Resolution, arguments_to_input, looks_like_capability, resolve, to_camel_case};
+    use super::{Resolution, resolve};
 
-    struct Granted;
+    /// A session granted two capability-shaped identifiers and one provider word, `probe`.
+    ///
+    /// It answers membership directly, counts every list it is asked to build, and records every
+    /// capability it is asked to invoke.
+    #[derive(Default)]
+    struct Session {
+        granted_lists: Cell<usize>,
+        word_lists: Cell<usize>,
+        invoked: RefCell<Vec<String>>,
+    }
 
-    impl CapabilityInvoker for Granted {
+    impl CapabilityInvoker for Session {
         fn granted(&self) -> Vec<String> {
-            vec![
-                "echo.echo".to_owned(),
-                "http-probe.fetch".to_owned(),
-                "with_underscore".to_owned(),
-            ]
+            self.granted_lists.set(self.granted_lists.get() + 1);
+            vec!["cli-probe.upper".to_owned(), "wikipedia_page".to_owned()]
+        }
+
+        fn is_granted(&self, capability: &str) -> bool {
+            matches!(capability, "cli-probe.upper" | "wikipedia_page")
+        }
+
+        fn command_words(&self) -> Vec<String> {
+            self.word_lists.set(self.word_lists.get() + 1);
+            vec!["probe".to_owned()]
+        }
+
+        fn has_command_word(&self, word: &str) -> bool {
+            word == "probe"
+        }
+
+        fn invoke(
+            &self,
+            capability: &str,
+            input: Value,
+            secret_use: Option<SecretUseProposal>,
+        ) -> CapabilityCallResult {
+            if secret_use.is_some() {
+                return crate::secret_use_unsupported();
+            }
+            self.invoked.borrow_mut().push(capability.to_owned());
+            CapabilityCallResult::Succeeded(input)
+        }
+    }
+
+    /// A session that only lists its command words, so membership goes through the trait default.
+    struct Words(&'static [&'static str]);
+
+    impl CapabilityInvoker for Words {
+        fn granted(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn command_words(&self) -> Vec<String> {
+            self.0.iter().map(|word| (*word).to_owned()).collect()
         }
 
         fn invoke(
             &self,
             _capability: &str,
-            input: Value,
-            secret_use: Option<dekopon_core::SecretUseProposal>,
+            _input: Value,
+            secret_use: Option<SecretUseProposal>,
         ) -> CapabilityCallResult {
             if secret_use.is_some() {
                 return crate::secret_use_unsupported();
             }
-            CapabilityCallResult::Succeeded(input)
+            CapabilityCallResult::NotFound
         }
-    }
-
-    fn arguments(items: &[&str]) -> Vec<String> {
-        items.iter().map(|item| (*item).to_owned()).collect()
     }
 
     #[test]
     fn resolution_follows_the_documented_priority_order() {
         let mut functions = BTreeSet::new();
         functions.insert("greet".to_owned());
+        let session = Session::default();
 
         assert!(matches!(
-            resolve("greet", &functions, &Granted),
-            Resolution::Function
-        ));
-        assert!(matches!(
-            resolve("jq", &functions, &Granted),
-            Resolution::Builtin(_)
-        ));
-        assert!(matches!(
-            resolve("echo.echo", &functions, &Granted),
-            Resolution::Capability
-        ));
-        assert!(matches!(
-            resolve("eval", &functions, &Granted),
+            resolve("eval", &functions, &session),
             Resolution::Rejected(_)
         ));
         assert!(matches!(
-            resolve("nothing.here", &functions, &Granted),
-            Resolution::NotFound
+            resolve("greet", &functions, &session),
+            Resolution::Function
         ));
         assert!(matches!(
-            resolve("unknown", &functions, &Granted),
+            resolve("jq", &functions, &session),
+            Resolution::Builtin(_)
+        ));
+        assert!(matches!(
+            resolve("probe", &functions, &session),
+            Resolution::ProviderCommand
+        ));
+        assert!(matches!(
+            resolve("unknown", &functions, &session),
             Resolution::NotFound
         ));
     }
 
-    /// An invoker that answers membership directly and counts every list it is asked to build.
-    #[derive(Default)]
-    struct Indexed {
-        granted_lists: Cell<usize>,
-        word_lists: Cell<usize>,
+    #[test]
+    fn a_granted_capability_identifier_is_not_a_command_word() {
+        let functions = BTreeSet::new();
+        let session = Session::default();
+        for word in ["wikipedia_page", "cli-probe.upper", "cli-probe.count"] {
+            assert!(
+                matches!(resolve(word, &functions, &session), Resolution::NotFound),
+                "{word} resolved to something other than command not found"
+            );
+        }
     }
 
-    impl CapabilityInvoker for Indexed {
-        fn granted(&self) -> Vec<String> {
-            self.granted_lists.set(self.granted_lists.get() + 1);
-            vec!["echo.echo".to_owned()]
+    #[test]
+    fn a_capability_shaped_word_exits_127_with_the_ordinary_not_found_message() {
+        let session = Session::default();
+        for (script, word) in [
+            ("wikipedia_page --title x", "wikipedia_page"),
+            ("cli-probe.upper --text x", "cli-probe.upper"),
+        ] {
+            let outcome = Interpreter::new(Limits::default()).run(script, &session);
+            assert_eq!(outcome.exit_code, ExitCode::NOT_FOUND, "{script}");
+            assert_eq!(
+                outcome.output,
+                format!("dekopon-shell: {word}: command not found"),
+                "{script}"
+            );
+            assert_eq!(outcome.capability_calls, 0, "{script}");
         }
-
-        fn is_granted(&self, capability: &str) -> bool {
-            capability == "echo.echo"
-        }
-
-        fn grants_namespace(&self, namespace: &str) -> bool {
-            namespace == "echo"
-        }
-
-        fn command_words(&self) -> Vec<String> {
-            self.word_lists.set(self.word_lists.get() + 1);
-            vec!["deploy".to_owned(), "echo.echo".to_owned()]
-        }
-
-        fn has_command_word(&self, word: &str) -> bool {
-            word == "deploy" || word == "echo.echo"
-        }
-
-        fn invoke(
-            &self,
-            _capability: &str,
-            input: Value,
-            secret_use: Option<dekopon_core::SecretUseProposal>,
-        ) -> CapabilityCallResult {
-            if secret_use.is_some() {
-                return crate::secret_use_unsupported();
-            }
-            CapabilityCallResult::Succeeded(input)
-        }
+        assert!(
+            session.invoked.borrow().is_empty(),
+            "a capability identifier typed as a command reached invoke"
+        );
     }
 
     #[test]
     fn resolution_asks_membership_instead_of_materializing_a_list_per_command() {
-        // Both queries run for every command word a script executes, so a loop of a thousand
-        // commands used to build, sort, and dedup the whole granted and command-word lists a
-        // thousand times over. An invoker that can answer directly must never be asked for them.
-        let invoker = Indexed::default();
+        // The query runs for every command word a script executes, so a loop of a thousand
+        // commands used to build, sort, and dedup the whole command-word list a thousand times
+        // over. An invoker that can answer directly must never be asked for it.
+        let session = Session::default();
         let functions = BTreeSet::new();
-        for word in [
-            "deploy",
-            "echo.echo",
-            "echo.other",
-            "nothing.here",
-            "unknown",
-        ] {
-            let _resolution = resolve(word, &functions, &invoker);
+        for word in ["probe", "wikipedia_page", "cli-probe.upper", "unknown"] {
+            let _resolution = resolve(word, &functions, &session);
         }
-        assert_eq!(invoker.granted_lists.get(), 0);
-        assert_eq!(invoker.word_lists.get(), 0);
+        assert_eq!(session.granted_lists.get(), 0);
+        assert_eq!(session.word_lists.get(), 0);
     }
 
     #[test]
-    fn a_provider_command_word_resolves_before_capability_fallback() {
-        // `Indexed` claims `echo.echo` as both a command word and a granted capability. The
-        // provider's rewrite wins, and the order that decides it is the documented one — moving
-        // the membership test must not reorder the steps around it.
-        let invoker = Indexed::default();
-        let functions = BTreeSet::new();
-        assert!(matches!(
-            resolve("echo.echo", &functions, &invoker),
-            Resolution::ProviderCommand
-        ));
-        assert!(matches!(
-            resolve("deploy", &functions, &invoker),
-            Resolution::ProviderCommand
-        ));
-        // A builtin still wins over a command word, and a function over both.
-        assert!(matches!(
-            resolve("jq", &functions, &invoker),
-            Resolution::Builtin(_)
-        ));
-        // A word in a held namespace that was not granted is still distinguished for telemetry.
-        assert!(matches!(
-            resolve("echo.other", &functions, &invoker),
-            Resolution::NotGranted
-        ));
-        assert!(matches!(
-            resolve("nothing.here", &functions, &invoker),
-            Resolution::NotFound
-        ));
-    }
-
-    #[test]
-    fn the_default_queries_answer_from_the_lists() {
-        // `Granted` overrides neither membership query, so both fall back to scanning. An embedder
+    fn the_default_membership_query_answers_from_the_list() {
+        // `Words` does not override `has_command_word`, so it falls back to scanning. An embedder
         // that has nothing cheaper must still resolve identically.
         let functions = BTreeSet::new();
+        let words = Words(&["probe"]);
         assert!(matches!(
-            resolve("echo.echo", &functions, &Granted),
-            Resolution::Capability
+            resolve("probe", &functions, &words),
+            Resolution::ProviderCommand
         ));
         assert!(matches!(
-            resolve("echo.missing", &functions, &Granted),
-            Resolution::NotGranted
-        ));
-        assert!(matches!(
-            resolve("other.missing", &functions, &Granted),
+            resolve("prob", &functions, &words),
             Resolution::NotFound
         ));
-        // A separator-free grant is its own namespace, the way the interpreter reads one.
-        assert!(matches!(
-            resolve("with_underscore", &functions, &Granted),
-            Resolution::Capability
-        ));
     }
 
     #[test]
-    fn a_function_takes_priority_over_a_granted_capability() {
+    fn a_builtin_wins_over_a_provider_word_and_a_function_over_both() {
         let mut functions = BTreeSet::new();
-        functions.insert("echo.echo".to_owned());
+        let words = Words(&["jq", "probe"]);
         assert!(matches!(
-            resolve("echo.echo", &functions, &Granted),
-            Resolution::Function
-        ));
-    }
-
-    #[test]
-    fn a_function_shadows_a_builtin_only_by_being_declared() {
-        let mut functions = BTreeSet::new();
-        assert!(matches!(
-            resolve("jq", &functions, &Granted),
+            resolve("jq", &functions, &words),
             Resolution::Builtin(_)
         ));
         functions.insert("jq".to_owned());
+        functions.insert("probe".to_owned());
         assert!(matches!(
-            resolve("jq", &functions, &Granted),
+            resolve("jq", &functions, &words),
             Resolution::Function
         ));
-    }
-
-    #[test]
-    fn builtin_and_capability_namespaces_are_disjoint() {
-        // Capability fallback demands a separator; builtin names have none. No word can satisfy
-        // both rules, so no builtin can ever be shadowed by a granted capability.
-        for name in builtins::names() {
-            assert!(
-                !looks_like_capability(name),
-                "builtin {name:?} is reachable through capability fallback"
-            );
-        }
-        assert!(looks_like_capability("echo.echo"));
-        assert!(looks_like_capability("http-probe.fetch"));
-        assert!(looks_like_capability("with_underscore"));
-        // Separator-free identifiers are valid capability IDs but stay out of fallback on purpose.
-        assert!(!looks_like_capability("echo"));
-        assert!(!looks_like_capability("Echo.Echo"));
-        assert!(!looks_like_capability("bad..id"));
-    }
-
-    #[test]
-    fn kebab_flags_become_camel_case_keys() {
-        assert_eq!(to_camel_case("post-id"), "postId");
-        assert_eq!(to_camel_case("include-body"), "includeBody");
-        assert_eq!(to_camel_case("id"), "id");
-        assert_eq!(to_camel_case("a-b-c"), "aBC");
-    }
-
-    #[test]
-    fn argv_converts_to_the_camel_case_input_object() {
-        assert_eq!(
-            arguments_to_input("cap", &arguments(&["--post-id", "7", "--include-body"]))
-                .expect("valid argv"),
-            json!({"postId": 7, "includeBody": true})
-        );
-        assert_eq!(
-            arguments_to_input("cap", &arguments(&["--message", "hello"])).expect("valid argv"),
-            json!({"message": "hello"})
-        );
-        assert_eq!(
-            arguments_to_input("cap", &arguments(&[])).expect("valid argv"),
-            json!({})
-        );
-    }
-
-    #[test]
-    fn a_single_json_argument_bypasses_flag_conversion() {
-        assert_eq!(
-            arguments_to_input("cap", &arguments(&[r#"{"postId": 7}"#])).expect("valid argv"),
-            json!({"postId": 7})
-        );
-        assert!(arguments_to_input("cap", &arguments(&["{not json}"])).is_err());
-        assert!(arguments_to_input("cap", &arguments(&["{\"a\": 1}", "extra"])).is_err());
-    }
-
-    #[test]
-    fn repeated_flags_fold_into_arrays() {
-        assert_eq!(
-            arguments_to_input("cap", &arguments(&["--tag", "a", "--tag", "b"]))
-                .expect("valid argv"),
-            json!({"tag": ["a", "b"]})
-        );
-    }
-
-    #[test]
-    fn positional_arguments_are_rejected_with_guidance() {
-        let failure =
-            arguments_to_input("cap", &arguments(&["bare"])).expect_err("bare words are rejected");
-        assert!(format!("{failure:?}").contains("kebab-case"), "{failure:?}");
+        assert!(matches!(
+            resolve("probe", &functions, &words),
+            Resolution::Function
+        ));
     }
 }
 

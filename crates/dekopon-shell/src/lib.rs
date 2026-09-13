@@ -10,7 +10,8 @@
 //! Exposing one model-facing tool schema per provider capability bloats a system prompt and forces
 //! a model into many small round trips. A single scripting tool lets a model express a multi-step
 //! plan — loops, conditionals, functions, JSON handling — in one tool call. The "commands" in that
-//! script are capability invocations, not operating-system processes.
+//! script are builtins and the command words loaded providers contribute, each of which proposes a
+//! capability invocation; none is an operating-system process.
 //!
 //! # Safety model
 //!
@@ -42,34 +43,61 @@
 //! # Observability
 //!
 //! Each script run opens one `shell.script` span carrying the totals for the whole run, and every
-//! command word inside it opens a `shell.command` span — no events — carrying the command name
-//! (from a fixed vocabulary, or `<withheld>`), its resolution kind, its argument count, its exit
-//! code, and a stable outcome label. A trace therefore reads as the ordered list of commands a
-//! script actually executed rather than as one opaque "a script ran" entry.
+//! command word inside it opens a `shell.command` span — no events — carrying the command word
+//! whoever wrote it, its resolution kind, its argv, the value piped into it, what it produced, its
+//! exit code, and a stable outcome label. The argv, stdin, and output are each bounded by
+//! `dekopon_core::bounded_attribute` beside a byte total. A trace therefore reads as the ordered
+//! list of commands a script actually executed rather than as one opaque "a script ran" entry.
 //!
 //! A model-authored `while` loop can execute tens of thousands of command words inside one tool
-//! call, so only the first few hundred spans are emitted at INFO; the rest drop to DEBUG, and the
-//! `shell.script` span's counters keep the totals in constant size either way.
+//! call, and every one of them gets its span; the `shell.script` span's counters give the totals in
+//! constant size beside them.
 //!
 //! This crate depends on `tracing` and nothing else for that. It knows no exporter, no collector,
-//! and no telemetry protocol; the embedding binary's own subscriber decides where these go, the
-//! same way `curl` here links no HTTP client and only assembles a request for one capability. The
+//! and no telemetry protocol; the embedding binary's own subscriber decides where these go. The
 //! dependency does not compromise the synchronous design constraint below — `tracing` imposes no
 //! async runtime and is routinely used from fully synchronous code — but it does mean spans may
-//! leave the process, so `interp::telemetry` documents exactly which fields a command may carry:
-//! never an argument value, and never a model-authored command word.
+//! leave the process, so `interp::telemetry` documents exactly which fields a command carries.
 //!
 //! # Example
 //!
 //! ```
-//! use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, Interpreter, Limits};
+//! use dekopon_shell::{CapabilityCallResult, CapabilityInvoker, CommandRun, Interpreter, Limits};
 //! use serde_json::{Value, json};
 //!
+//! /// One provider word, `probe`, whose `upper --text <s>` proposes `cli-probe.upper`.
 //! struct Fixture;
 //!
 //! impl CapabilityInvoker for Fixture {
 //!     fn granted(&self) -> Vec<String> {
-//!         vec!["echo.echo".to_owned()]
+//!         vec!["cli-probe.upper".to_owned()]
+//!     }
+//!
+//!     fn command_words(&self) -> Vec<String> {
+//!         vec!["probe".to_owned()]
+//!     }
+//!
+//!     fn run_command(
+//!         &self,
+//!         word: &str,
+//!         argv: &[String],
+//!         _stdin: Option<&str>,
+//!     ) -> Option<CommandRun> {
+//!         if word != "probe" {
+//!             return None;
+//!         }
+//!         Some(match argv {
+//!             [command, flag, text] if command == "upper" && flag == "--text" => {
+//!                 CommandRun::Proposed {
+//!                     capability: "cli-probe.upper".to_owned(),
+//!                     input: json!({ "text": text }),
+//!                     secret_use: None,
+//!                 }
+//!             }
+//!             _ => CommandRun::Failed {
+//!                 message: "usage: probe upper --text <text>".to_owned(),
+//!             },
+//!         })
 //!     }
 //!
 //!     fn invoke(
@@ -81,15 +109,16 @@
 //!         if secret_use.is_some() {
 //!             return dekopon_shell::secret_use_unsupported();
 //!         }
-//!         assert_eq!(capability, "echo.echo");
-//!         CapabilityCallResult::Succeeded(input)
+//!         assert_eq!(capability, "cli-probe.upper");
+//!         let text = input["text"].as_str().unwrap_or_default().to_uppercase();
+//!         CapabilityCallResult::Succeeded(json!({ "text": text }))
 //!     }
 //! }
 //!
 //! let outcome = Interpreter::new(Limits::default())
-//!     .run("echo.echo --message hi | jq -r .message", &Fixture);
+//!     .run("probe upper --text hi | jq -r .text", &Fixture);
 //! assert_eq!(outcome.exit_code.get(), 0);
-//! assert_eq!(outcome.output, "hi");
+//! assert_eq!(outcome.output, "HI");
 //! ```
 
 #![forbid(unsafe_code)]
@@ -116,14 +145,15 @@ pub use limits::{
 use dekopon_core::SecretUseProposal;
 
 /// Model-facing metadata for one capability, used by `cap --describe`.
+///
+/// There is no input schema here: a capability is used through the provider command word that
+/// proposes it, and that word's `--help` is where its arguments are documented.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilityDescription {
     /// Canonical capability identifier.
     pub capability: String,
     /// Human-readable operation description.
     pub description: String,
-    /// Object-shaped JSON Schema for the capability's input.
-    pub input_schema: Value,
 }
 
 /// The outcome of one capability invocation.
@@ -157,12 +187,18 @@ pub enum CapabilityCallResult {
 /// a run that never reached the provider's answer, which is not a usage error however it failed.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CommandRun {
-    /// The provider proposed a capability, authorized and charged exactly like a direct call.
+    /// The provider proposed a capability, authorized and charged like every capability call.
     Proposed {
         /// The capability identifier the provider chose.
         capability: String,
         /// The input it assembled from the argv and stdin.
         input: Value,
+        /// The public secret reference the provider's command asked this call to use, if any.
+        ///
+        /// Handed to [`CapabilityInvoker::invoke`] unchanged. It is intent, never authority: the
+        /// broker authorizes it separately from the capability, and an invoker with no broker
+        /// behind it refuses it with [`secret_use_unsupported`].
+        secret_use: Option<SecretUseProposal>,
     },
     /// The provider produced text of its own — help, a version, a usage error — and chose the
     /// exit status; no capability call is charged.
@@ -210,20 +246,6 @@ pub trait CapabilityInvoker {
         self.granted().iter().any(|granted| granted == capability)
     }
 
-    /// Reports whether this session holds any capability in one provider namespace.
-    ///
-    /// Asked only about a word that is *not* granted, to tell "the model typed nonsense" from "the
-    /// model keeps reaching for something we never granted". The default scans
-    /// [`CapabilityInvoker::granted`]; override it when a cheaper lookup exists.
-    fn grants_namespace(&self, namespace: &str) -> bool {
-        self.granted().iter().any(|granted| {
-            granted
-                .split('.')
-                .next()
-                .is_some_and(|candidate| candidate == namespace)
-        })
-    }
-
     /// Returns the command words loaded providers contribute, for dispatch and the prompt.
     ///
     /// Filtered by the embedder to providers this session already holds a grant on, so a principal
@@ -252,9 +274,10 @@ pub trait CapabilityInvoker {
     /// coming back means no loaded provider owns the word; otherwise the [`CommandRun`] says
     /// whether the provider proposed a capability, rendered text of its own, or declined.
     ///
-    /// Running the word grants nothing: a proposal is invoked on exactly the path a direct
-    /// capability word takes, with the same budget, denial, and telemetry behavior, and rendered
-    /// text is charged only against the script's value and output ceilings.
+    /// Running the word grants nothing: a proposal is invoked through the same budget, denial, and
+    /// telemetry path as every capability call, with its `secret_use` handed to
+    /// [`CapabilityInvoker::invoke`] unchanged, and rendered text is charged only against the
+    /// script's value and output ceilings.
     fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
         let _ = (word, argv, stdin);
         None
@@ -265,6 +288,18 @@ pub trait CapabilityInvoker {
         let _ = capability;
         None
     }
+
+    /// Hears that one script has finished running against this invoker.
+    ///
+    /// The runtime that ran the script calls it once, after the interpreter returns and before the
+    /// outcome reaches whoever asked for the script. It is the only point at which an invoker
+    /// learns nothing more is coming from that script: the interpreter follows a
+    /// [`CommandRun::Proposed`] answer with [`CapabilityInvoker::invoke`] only when the capability
+    /// is granted, the budget has a call left, and the deadline has not passed. An invoker that
+    /// reports each tool use as a started/finished pair finishes here whatever a proposal left
+    /// open. The default does nothing, which suits an invoker that keeps nothing per script; a
+    /// wrapper forwards it, or the invoker behind the wrapper never hears the script end.
+    fn script_finished(&self) {}
 
     /// Invokes one capability synchronously, carrying the optional typed secret-use intent.
     ///
@@ -316,10 +351,6 @@ impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
         self.as_ref().is_granted(capability)
     }
 
-    fn grants_namespace(&self, namespace: &str) -> bool {
-        self.as_ref().grants_namespace(namespace)
-    }
-
     fn command_words(&self) -> Vec<String> {
         self.as_ref().command_words()
     }
@@ -334,6 +365,10 @@ impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
 
     fn describe(&self, capability: &str) -> Option<CapabilityDescription> {
         self.as_ref().describe(capability)
+    }
+
+    fn script_finished(&self) {
+        self.as_ref().script_finished();
     }
 
     fn invoke(
@@ -363,7 +398,7 @@ impl ExitCode {
     pub const TIMEOUT: Self = Self(124);
     /// A capability was found but authorization refused it, matching bash's "cannot execute".
     pub const DENIED: Self = Self(126);
-    /// An unknown builtin, or a capability not granted to this session.
+    /// An unknown command word, or a proposed capability not granted to this session.
     pub const NOT_FOUND: Self = Self(127);
 
     /// Wraps a raw status, mirroring bash's `N mod 256` wraparound for `exit N`.
@@ -427,29 +462,13 @@ pub struct ScriptOutcome {
 #[derive(Clone, Debug, Default)]
 pub struct Interpreter {
     limits: Limits,
-    curl_capability: Option<String>,
 }
 
 impl Interpreter {
     /// Creates an interpreter under the given bounds.
     #[must_use]
     pub fn new(limits: Limits) -> Self {
-        Self {
-            limits,
-            curl_capability: None,
-        }
-    }
-
-    /// Selects the capability the `curl` builtin assembles requests for.
-    ///
-    /// `curl` speaks no HTTP itself. It is a flag parser that produces the
-    /// `{uri, method, headers, body}` shape and hands it to this one capability through the same
-    /// [`CapabilityInvoker::invoke`] path every other command uses. When no capability is
-    /// configured, `curl` reports "command not found" like any ungranted capability.
-    #[must_use]
-    pub fn with_curl_capability(mut self, capability: Option<String>) -> Self {
-        self.curl_capability = capability;
-        self
+        Self { limits }
     }
 
     /// Returns the configured bounds.
@@ -463,12 +482,7 @@ impl Interpreter {
     /// This never returns an error: a script failure is a script outcome. Parse errors and limit
     /// trips are reported through [`ScriptOutcome::output`] and [`ScriptOutcome::exit_code`].
     pub fn run(&self, script: &str, invoker: &dyn CapabilityInvoker) -> ScriptOutcome {
-        interp::run(
-            script,
-            invoker,
-            self.limits,
-            self.curl_capability.as_deref(),
-        )
+        interp::run(script, invoker, self.limits)
     }
 }
 
@@ -499,13 +513,17 @@ pub fn abandoned_filter_workers() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicU32, Ordering},
+    };
 
     use dekopon_core::{SecretDrn, SecretUseProposal};
     use serde_json::{Value, json};
 
     use super::{
         CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun, ExitCode,
+        Interpreter, Limits,
     };
 
     /// An invoker that overrides every defaulted method with an answer the default cannot give.
@@ -516,19 +534,17 @@ mod tests {
     #[derive(Default)]
     struct RecordingInvoker {
         secret_uses: Mutex<Vec<Option<SecretUseProposal>>>,
+        /// How many script ends reached this invoker, which the do-nothing default cannot count.
+        scripts_finished: AtomicU32,
     }
 
     impl CapabilityInvoker for RecordingInvoker {
         fn granted(&self) -> Vec<String> {
-            vec!["echo.echo".to_owned()]
+            vec!["cli-probe.upper".to_owned()]
         }
 
         fn is_granted(&self, capability: &str) -> bool {
             capability == "gh.pr-view"
-        }
-
-        fn grants_namespace(&self, namespace: &str) -> bool {
-            namespace == "gh"
         }
 
         fn command_words(&self) -> Vec<String> {
@@ -548,6 +564,7 @@ mod tests {
             Some(CommandRun::Proposed {
                 capability: word.to_owned(),
                 input: json!({ "argv": argv, "stdin": stdin }),
+                secret_use: None,
             })
         }
 
@@ -555,7 +572,6 @@ mod tests {
             Some(CapabilityDescription {
                 capability: capability.to_owned(),
                 description: "recorded".to_owned(),
-                input_schema: json!({"type": "object"}),
             })
         }
 
@@ -571,6 +587,10 @@ mod tests {
                 .push(secret_use);
             CapabilityCallResult::Succeeded(input)
         }
+
+        fn script_finished(&self) {
+            self.scripts_finished.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     fn proposal() -> SecretUseProposal {
@@ -584,8 +604,8 @@ mod tests {
     /// The pointer is what lets one broker leg be held by a shell pane and by that session's
     /// dispatch at once, so a proposal crossing it has to arrive whole.
     ///
-    /// A hand-written forwarder here once dropped the secret-use argument it could not see, and
-    /// the DRN a `curl --user USER:${drn:…}` produced was refused inside the process that made it.
+    /// A hand-written forwarder here once dropped the secret-use argument it could not see, and a
+    /// DRN proposal a broker-backed session made was refused inside the process that made it.
     /// The `Arc` blanket replaced that forwarder; nothing but this test now holds it to the same
     /// standard, its last other consumer having left with `dekopon-tui`.
     #[test]
@@ -616,12 +636,16 @@ mod tests {
     /// "nothing" about, so an omission fails rather than coinciding.
     #[test]
     fn an_arc_forwards_the_defaulted_methods_instead_of_inheriting_their_defaults() {
-        let shared: Arc<dyn CapabilityInvoker> = Arc::new(RecordingInvoker::default());
+        let inner = Arc::new(RecordingInvoker::default());
+        let shared: Arc<dyn CapabilityInvoker> = Arc::clone(&inner) as Arc<dyn CapabilityInvoker>;
 
-        assert_eq!(shared.granted(), vec!["echo.echo".to_owned()]);
+        // The default does nothing, so only the invoker behind the pointer can have counted it.
+        shared.script_finished();
+        assert_eq!(inner.scripts_finished.load(Ordering::Relaxed), 1);
+
+        assert_eq!(shared.granted(), vec!["cli-probe.upper".to_owned()]);
         // Not in `granted`: the default scan would refuse it.
         assert!(shared.is_granted("gh.pr-view"));
-        assert!(shared.grants_namespace("gh"));
         // The default is an empty list and, through it, an empty membership test.
         assert_eq!(shared.command_words(), vec!["gh".to_owned()]);
         assert!(shared.has_command_word("gh-extra"));
@@ -631,12 +655,87 @@ mod tests {
             Some(CommandRun::Proposed {
                 capability: "gh".to_owned(),
                 input: json!({"argv": ["pr"], "stdin": "piped"}),
+                secret_use: None,
             })
         );
         assert_eq!(
             shared.describe("gh.pr-view").map(|it| it.description),
             Some("recorded".to_owned())
         );
+    }
+
+    /// One provider word, `httpprobe`, whose proposal names the secret use it was built with.
+    struct ProposingInvoker {
+        secret_use: Option<SecretUseProposal>,
+        invocations: Mutex<Vec<(String, Value, Option<SecretUseProposal>)>>,
+    }
+
+    impl ProposingInvoker {
+        fn proposing(secret_use: Option<SecretUseProposal>) -> Self {
+            Self {
+                secret_use,
+                invocations: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CapabilityInvoker for ProposingInvoker {
+        fn granted(&self) -> Vec<String> {
+            vec!["http-probe.fetch".to_owned()]
+        }
+
+        fn command_words(&self) -> Vec<String> {
+            vec!["httpprobe".to_owned()]
+        }
+
+        fn run_command(
+            &self,
+            word: &str,
+            argv: &[String],
+            stdin: Option<&str>,
+        ) -> Option<CommandRun> {
+            (word == "httpprobe").then(|| CommandRun::Proposed {
+                capability: "http-probe.fetch".to_owned(),
+                input: json!({ "argv": argv, "stdin": stdin }),
+                secret_use: self.secret_use.clone(),
+            })
+        }
+
+        fn invoke(
+            &self,
+            capability: &str,
+            input: Value,
+            secret_use: Option<SecretUseProposal>,
+        ) -> CapabilityCallResult {
+            self.invocations
+                .lock()
+                .expect("recorded invocations")
+                .push((capability.to_owned(), input, secret_use));
+            CapabilityCallResult::Succeeded(json!({"status": 200}))
+        }
+    }
+
+    /// A provider command is the only way a script names a secret, so the funnel that turns its
+    /// proposal into an invocation must hand the reference on rather than drop it.
+    #[test]
+    fn a_provider_proposal_hands_its_secret_use_to_invoke() {
+        for secret_use in [Some(proposal()), None] {
+            let invoker = ProposingInvoker::proposing(secret_use.clone());
+            let outcome = Interpreter::new(Limits::default())
+                .run("httpprobe fetch --url https://x", &invoker);
+            assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
+            assert_eq!(outcome.output, r#"{"status":200}"#);
+            assert_eq!(outcome.capability_calls, 1);
+            assert_eq!(
+                *invoker.invocations.lock().expect("recorded invocations"),
+                vec![(
+                    "http-probe.fetch".to_owned(),
+                    json!({"argv": ["fetch", "--url", "https://x"], "stdin": null}),
+                    secret_use,
+                )],
+                "the proposal's secret use did not reach invoke unchanged"
+            );
+        }
     }
 
     #[test]
