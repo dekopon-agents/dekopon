@@ -185,18 +185,20 @@ pub enum ToolOutcome {
 
 /// What a person can act on when a session breaks.
 ///
-/// Derived from [`PromptError`] by [`FailureClass::of`], which names every variant, so a new error
-/// kind is a compile error rather than a silent [`FailureClass::Internal`].
+/// Exactly the classes [`FailureClass::of`] produces. A class no [`PromptError`] maps to would be
+/// a case every surface has to render and no session can ever reach, which is why a wall-clock
+/// bound and a provider failure are absent: a route's `maxDurationMs` is the embedder cancelling
+/// the session, and arrives as [`CancelSource::Budget`] rather than as a break, while a broker or
+/// provider failure reaches the loop as a script exit status the model reads and answers itself.
+///
+/// `of` names every error variant, so a new error kind is a compile error there rather than a
+/// silent [`FailureClass::Internal`] here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FailureClass {
     /// The model turn ceiling was reached without a final answer.
     StepBudget,
-    /// A wall-clock bound elapsed.
-    WallClock,
     /// The model failed, or produced something the loop cannot run.
     Model,
-    /// A provider or the broker failed.
-    Provider,
     /// The embedding surface asked for something impossible.
     Internal,
 }
@@ -253,12 +255,12 @@ pub enum CancelVia {
 }
 
 /// Which bound a budget cancellation spent.
+///
+/// One bound, because one bound cancels: a route's `maxDurationMs`. Running out of model turns is
+/// not a cancellation — the loop breaks and reports [`FailureClass::StepBudget`] — and the
+/// capability-call ceiling is a shell budget error the script reads and the model recovers from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BudgetLimit {
-    /// Model turns.
-    Steps,
-    /// Capability invocations.
-    CapabilityCalls,
     /// Wall clock since the session started.
     WallClock,
 }

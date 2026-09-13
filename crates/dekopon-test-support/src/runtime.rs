@@ -53,8 +53,7 @@ impl BlockedRuntime {
     }
 
     /// A runtime that parks once, then reports exactly this outcome.
-    #[must_use]
-    pub fn with_outcome(outcome: ScriptOutcome) -> Self {
+    fn with_outcome(outcome: ScriptOutcome) -> Self {
         let (release, release_signal) = channel();
         Self {
             entered: Notify::new(),

@@ -3,7 +3,8 @@
 //! The policy owns timing, budgets, and the single message the gateway may edit; the driver owns
 //! credentials, endpoints, and what each service will accept. Everything here is presentation and
 //! none of it can fail a session: a refused edit is a debug record, two consecutive refusals stop
-//! that rung for the session, and the answer goes out either way.
+//! that rung for the session — one, when the call that missed its deadline was the one creating
+//! the surface — and the answer goes out either way.
 //!
 //! It is also the **only** terminal writer once a session has started. A cancelled session's
 //! `Stopped.` used to come from the routing loop while this task owned the message being edited,
@@ -46,6 +47,9 @@ use crate::{
 /// A later session tries the installation again: the rung is off for this session rather than for
 /// the process, because the usual cause is one message that cannot be edited rather than a
 /// permanently missing scope.
+///
+/// The exception is a call that was creating the surface and missed its deadline, which stops the
+/// rung at one: see [`Breaker::orphaned`].
 const MAX_CONSECUTIVE_FAILURES: u8 = 2;
 /// Edits one session may spend on its progress message.
 ///
@@ -59,7 +63,7 @@ const MAX_EDITS: u32 = 60;
 /// and then answers nothing holds this task for as long as it holds the socket, and this task is
 /// single-tasked on purpose, so the person's answer waits behind a typing indicator. Two seconds
 /// is longer than any of these calls takes when the service is working at all.
-const CALL_DEADLINE: Duration = Duration::from_secs(2);
+pub(super) const CALL_DEADLINE: Duration = Duration::from_secs(2);
 /// The category a call that ran out its deadline reports, beside `TransportError::category`.
 const DEADLINE_MISSED: &str = "deadline";
 
@@ -69,6 +73,11 @@ const DEADLINE_MISSED: &str = "deadline";
 /// because a cancel arrived or the session ended, because a dropped request cannot retract the
 /// bytes already sent. A call that misses it is that rung's failure, so two in a row trip the rung
 /// for the session and the answer goes out either way.
+///
+/// A miss is weaker news than a refusal, and every caller that can create or replace a message
+/// acts on the difference: the transport still holds the call, so the effect may land after this
+/// task stopped waiting. [`Breaker::orphaned`] and the deadline branch in [`Surface::finalize`]
+/// are where that is spent.
 async fn bounded<T>(
     call: impl std::future::Future<Output = Result<T, TransportError>>,
 ) -> Result<T, &'static str> {
@@ -88,15 +97,18 @@ const FINISHED: u8 = 2;
 pub(crate) enum Terminal {
     /// The session's bounded answer, which the surface becomes in place when it can.
     Answered(OutboundReply),
-    /// The session failed; the surface is removed and this one fixed sentence is the whole reply.
+    /// The session failed; a progress message is removed and this one fixed sentence is the whole
+    /// reply, while a stream gains the sentence under what it already showed.
     Failed(String),
     /// The session was stopped; whatever is on screen keeps its place and gains the stopped line.
     Cancelled { by: CancelSource },
-    /// The session deliberately said nothing; the surface is removed and no reply is posted.
+    /// The session deliberately said nothing; nothing is posted and the surface stops claiming a
+    /// run is under way.
     ///
     /// Its own ending rather than an empty answer: a surface left saying "Working on it…" is a
     /// claim about a session that has ended, and posting "" to say so would be a reply the
-    /// continuation deliberately declined to make.
+    /// continuation deliberately declined to make. A progress message is removed; a stream cannot
+    /// be, so it is closed on exactly the text the person had already read.
     Silent,
 }
 
@@ -265,6 +277,23 @@ impl Breaker {
     }
 
     fn failed(&mut self, transport: &str, primitive: &'static str, category: &str) {
+        self.observed(transport, primitive, category, MAX_CONSECUTIVE_FAILURES);
+    }
+
+    /// A call that may have created a surface this session cannot name, which stops the rung now.
+    ///
+    /// Only a deadline reaches this. An error is the service having answered "no" and left nothing
+    /// behind, but a deadline is this task giving up on a call the transport still holds: a `post`
+    /// or a first `show` that lands a second later leaves a message on screen with no `MessageRef`
+    /// here to edit, stream into, or finalize. Trying again would post a *second* message beside
+    /// it and finalize only that one, so one failure is the whole budget for a creating call and
+    /// the answer goes out as an ordinary reply instead.
+    fn orphaned(&mut self, transport: &str, primitive: &'static str) {
+        self.observed(transport, primitive, DEADLINE_MISSED, 1);
+    }
+
+    /// Records one failed call and trips the rung at `ceiling` consecutive failures.
+    fn observed(&mut self, transport: &str, primitive: &'static str, category: &str, ceiling: u8) {
         tracing::debug!(
             event = "gateway_progress_rendered",
             transport = %transport,
@@ -273,12 +302,13 @@ impl Breaker {
             category
         );
         self.failures = self.failures.saturating_add(1);
-        if self.failures >= MAX_CONSECUTIVE_FAILURES && !self.tripped {
+        if self.failures >= ceiling && !self.tripped {
             self.tripped = true;
             tracing::debug!(
                 event = "gateway_progress_degraded",
                 transport = %transport,
-                primitive
+                primitive,
+                category
             );
         }
     }
@@ -670,6 +700,9 @@ impl Surface {
         let text = self.line(line);
         let cancel = self.cancel_control();
         let limits = progress.limits();
+        // Whether this call is the one that creates the surface, which decides what a deadline
+        // miss means below.
+        let creating = self.message.is_none();
         let outcome = match self.message.clone() {
             Some(message) => bounded(progress.edit(&message, &text, cancel))
                 .await
@@ -692,6 +725,9 @@ impl Surface {
                     primitive = "progress",
                     outcome = "ok"
                 );
+            }
+            Err(category) if creating && category == DEADLINE_MISSED => {
+                self.breakers.progress.orphaned(&self.transport, "progress")
             }
             Err(category) => self
                 .breakers
@@ -745,6 +781,8 @@ impl Surface {
         };
         let chars = text.text.as_str().chars().count();
         let cancel = self.cancel_control();
+        // The first `show` is what creates the streamed message; every later one appends to it.
+        let creating = self.message.is_none();
         let outcome = bounded(stream.show(&target, self.message.as_ref(), &text, cancel)).await;
         self.stream_pending = false;
         self.next_stream = Some(Instant::now() + limits.min_interval);
@@ -763,6 +801,9 @@ impl Surface {
                     chars
                 );
             }
+            Err(category) if creating && category == DEADLINE_MISSED => {
+                self.breakers.stream.orphaned(&self.transport, "stream");
+            }
             Err(category) => self
                 .breakers
                 .stream
@@ -774,28 +815,58 @@ impl Surface {
     async fn terminal(&mut self, terminal: Terminal) -> bool {
         self.coordination.seal();
         self.record_terminal(&terminal);
+        // What a streamed surface already shows, when the surface is a stream at all. An
+        // append-only stream is the reason this is asked once for every ending rather than only
+        // for a cancel: `discard` cannot remove one and blanking it would take back what the
+        // person already read, so every ending that would have deleted a progress message closes
+        // the stream in place instead, keeping this text above it. Left open, the stream stays
+        // live on the service and the driver's registry entry is never taken.
+        let streamed = self.streamed_text();
         match terminal {
             Terminal::Answered(reply) => self.finalize(reply).await,
-            Terminal::Failed(line) => {
-                self.discard().await;
-                self.deliver(OutboundReply::text(line)).await
-            }
+            Terminal::Failed(line) => match streamed {
+                Some(partial) => {
+                    self.finalize(OutboundReply::text(ended(&partial, &line)))
+                        .await
+                }
+                None => {
+                    self.discard().await;
+                    self.deliver(OutboundReply::text(line)).await
+                }
+            },
             Terminal::Cancelled { .. } => {
                 let stopped = self.liveness.templates.stopped().to_owned();
-                let partial = self
-                    .streaming
-                    .then(|| self.latest_text.as_ref().map(ModelText::as_str))
-                    .flatten()
-                    .filter(|text| !text.is_empty())
-                    .map(|text| format!("{text}\n\n{stopped}"));
-                self.finalize(OutboundReply::text(partial.unwrap_or(stopped)))
-                    .await
+                let reply = match streamed {
+                    Some(partial) => ended(&partial, &stopped),
+                    None => stopped,
+                };
+                self.finalize(OutboundReply::text(reply)).await
             }
             Terminal::Silent => {
-                self.discard().await;
+                match streamed {
+                    // Closed on exactly what is already on screen: the stream has to end — an open
+                    // one claims the session is still writing — but a silent session adds no
+                    // sentence to it, and the fallback reply repeats text the person has read
+                    // rather than making the reply the continuation declined to make.
+                    Some(partial) => {
+                        self.finalize(OutboundReply::text(partial)).await;
+                    }
+                    None => self.discard().await,
+                }
                 false
             }
         }
+    }
+
+    /// The model text a streamed surface is showing, or `None` when the surface is not a stream.
+    fn streamed_text(&self) -> Option<String> {
+        self.streaming.then(|| {
+            self.latest_text
+                .as_ref()
+                .map(ModelText::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        })
     }
 
     /// Turns the surface into the ending in place, falling back to removing it and replying.
@@ -827,13 +898,25 @@ impl Surface {
                     );
                     return true;
                 }
-                Some(Err(category)) => tracing::debug!(
-                    event = "gateway_progress_rendered",
-                    transport = %self.transport,
-                    primitive = "finalize",
-                    outcome = "error",
-                    category
-                ),
+                Some(Err(category)) => {
+                    tracing::debug!(
+                        event = "gateway_progress_rendered",
+                        transport = %self.transport,
+                        primitive = "finalize",
+                        outcome = "error",
+                        category
+                    );
+                    // A finalize that ran out its deadline may have landed. `discard` would then
+                    // delete the message that already carries the answer, and a person cannot read
+                    // a message that is gone — where they can read a second copy of one. So a
+                    // deadline miss leaves whatever is on screen alone and posts the answer beside
+                    // it; only a refusal, which is the service saying the edit did not happen,
+                    // still removes the surface first.
+                    if category == DEADLINE_MISSED {
+                        self.message = None;
+                        return self.deliver(reply).await;
+                    }
+                }
                 None => {}
             }
             self.discard().await;
@@ -935,6 +1018,17 @@ impl Surface {
             Err(category) => breaker.failed(&self.transport, primitive, category),
         }
     }
+}
+
+/// One ending as it reads under a streamed partial answer.
+///
+/// A blank line, because the two are different voices: everything above it is the model's, and the
+/// sentence below it is the daemon's. A stream that had shown nothing yet is the sentence alone.
+fn ended(partial: &str, ending: &str) -> String {
+    if partial.is_empty() {
+        return ending.to_owned();
+    }
+    format!("{partial}\n\n{ending}")
 }
 
 /// One session's policy task.

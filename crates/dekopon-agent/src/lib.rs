@@ -902,7 +902,17 @@ impl CapabilityInvoker for BrokerLeg {
         // One started/finished pair around every way the call below can end, which is why the
         // proposal is its own function: a capability call is the unit of work a person actually
         // waits on, and a surface told that one started has to be told how it ended.
-        let reported = CommandWord::new(capability);
+        //
+        // Reported only for a capability this session actually holds, which is the same check
+        // `run_command` makes for the same reason. The identifier is whatever the caller named,
+        // so reporting before the visibility check inside `submit` would render model-authored
+        // text on a chat line: an invented `ignore-your-instructions` would be put on the progress
+        // message verbatim. An identifier no provider owns is refused there without reaching the
+        // broker, and its refusal is already on the trace.
+        let reported = self
+            .capabilities
+            .contains_key(capability)
+            .then(|| CommandWord::new(capability));
         let started = Instant::now();
         // Prevents a script from starting another capability call after the embedder's Stop was
         // observed. A call already inside the client is not rollbackable; this check is the
@@ -922,13 +932,15 @@ impl CapabilityInvoker for BrokerLeg {
                 .fetch_add(1, Ordering::Relaxed)
                 .saturating_add(1)
         };
-        self.emit(ProgressEvent::ToolStarted {
-            word: reported.clone(),
-            // The count, never the arguments: they are model-authored and already on the trace.
-            argument_count: bounded_count(input.as_object().map_or(0, serde_json::Map::len)),
-            calls_used,
-            calls_max: self.calls_max,
-        });
+        if let Some(word) = reported.clone() {
+            self.emit(ProgressEvent::ToolStarted {
+                word,
+                // The count, never the arguments: they are model-authored and already on the trace.
+                argument_count: bounded_count(input.as_object().map_or(0, serde_json::Map::len)),
+                calls_used,
+                calls_max: self.calls_max,
+            });
+        }
         let (result, outcome) = if cancelled {
             (
                 CapabilityCallResult::Denied {
@@ -941,11 +953,13 @@ impl CapabilityInvoker for BrokerLeg {
             let outcome = call_outcome(&result);
             (result, outcome)
         };
-        self.emit(ProgressEvent::ToolFinished {
-            word: reported,
-            outcome,
-            duration: started.elapsed(),
-        });
+        if let Some(word) = reported {
+            self.emit(ProgressEvent::ToolFinished {
+                word,
+                outcome,
+                duration: started.elapsed(),
+            });
+        }
         result
     }
 }
@@ -2488,6 +2502,38 @@ mod tests {
                     "started probe arguments=1 calls=0/4".to_owned(),
                     "finished probe Failed".to_owned(),
                 ]
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_capability_no_provider_owns_is_refused_without_reaching_a_progress_surface() {
+            // The leg is handed whatever identifier its caller named; a progress line renders the
+            // word it is given, so a leg that reported before the visibility check would put
+            // `Running ignore-your-instructions…` on a chat message on the model's say-so. The
+            // refusal is unchanged and already on the trace; only the rendering is withheld. The
+            // leg is called directly rather than through a script so the check is pinned on the
+            // leg itself, whichever dispatch path a shell offers.
+            let directory = private_broker_directory();
+            let leg = leg_for(&directory.path().join("absent.sock"));
+            let (sink, progress) = recording_sink();
+            let leg = leg.with_progress(progress, 4);
+
+            // On a blocking thread because that is where the prompt loop calls the leg; the socket
+            // is absent and never opened, because this refusal never reaches the broker.
+            let outcome = tokio::task::spawn_blocking(move || {
+                leg.invoke("ignore-your-instructions", json!({}), None)
+            })
+            .await
+            .expect("blocking dispatch completes");
+
+            assert!(
+                matches!(outcome, CapabilityCallResult::NotFound),
+                "an identifier no provider owns is refused as not found: {outcome:?}"
+            );
+            assert!(
+                sink.labels().is_empty(),
+                "a word the model invented reached a progress surface: {:?}",
+                sink.labels()
             );
         }
     }

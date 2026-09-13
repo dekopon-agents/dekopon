@@ -98,6 +98,13 @@ pub enum TurnEvent {
 /// backend actually sends. Both wire formats are accepted — a Responses event names its `type` and
 /// a chat-completions chunk does not, which is the one difference that needs no guessing.
 ///
+/// It is `pub` for that reason alone and has no production caller: a running daemon reads a live
+/// body through [`ChatModel::complete`](crate::model::ChatModel::complete), never a recorded one.
+/// Its callers are this workspace's fixtures — `dekopon-test-support`'s scripted stream model, and
+/// the transport, prompt-loop, and progress tests that each need one real `ModelText`. The only
+/// alternative is a constructor turning an arbitrary string into model text, which is the hole
+/// [`ModelText`] exists to close, so the seam stays here beside the parser that fills it.
+///
 /// # Errors
 ///
 /// When the body is not a stream the matching parser accepts. For a recorded transcript that means

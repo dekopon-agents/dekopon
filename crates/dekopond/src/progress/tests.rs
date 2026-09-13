@@ -26,6 +26,7 @@ use crate::{
         KeepAlive, ProgressDetail, ProgressInputs, ProgressPolicy, Templates, Terminal,
         adapter::ProgressAdapter,
         cancel_label,
+        policy::CALL_DEADLINE,
         text::{RenderState, TemplateField},
     },
     session::{FAILURE_REPLY, STOPPED_REPLY, SessionCancellation},
@@ -51,6 +52,13 @@ enum Call {
     Reply(String),
 }
 
+/// How long a stalled call holds the policy, which has to be well past the policy's own deadline.
+///
+/// The point of a stall is that the transport still has the call when this task stops waiting for
+/// it, so a test advances past [`CALL_DEADLINE`] and nowhere near this: the call is in flight, its
+/// effect may land, and the surface it would have created is one the session cannot name.
+const STALL: Duration = Duration::from_secs(60);
+
 /// Everything the fake transport recorded, plus the failures a test injects.
 #[derive(Debug, Default)]
 struct Recorder {
@@ -59,6 +67,16 @@ struct Recorder {
     refuse_progress: AtomicU32,
     /// Finalize calls to refuse, counted down.
     refuse_finalize: AtomicU32,
+    /// Progress posts and edits to hold past the policy's call deadline, counted down.
+    stall_progress: AtomicU32,
+    /// Finalize calls to hold past it, counted down.
+    stall_finalize: AtomicU32,
+    /// Progress posts the policy attempted, including the ones that never answered.
+    ///
+    /// Separate from `posts`, which counts the ones that produced a `MessageRef`: "did the policy
+    /// try to post a second message" is the whole question a stalled post asks, and a call that
+    /// never answered leaves no other trace.
+    post_attempts: AtomicU32,
     posts: AtomicU32,
 }
 
@@ -92,6 +110,13 @@ impl Recorder {
                 remaining.checked_sub(1)
             })
             .is_ok()
+    }
+
+    /// Spends one injected stall, holding the caller past the policy's deadline when there is one.
+    async fn stalled(&self, counter: &AtomicU32) {
+        if self.counted(counter) {
+            tokio::time::sleep(STALL).await;
+        }
     }
 
     /// Everything the driver wrote into the conversation, in order.
@@ -190,6 +215,8 @@ impl ProgressMessage for Surfaces {
         text: &crate::progress::ProgressText,
         _cancel: bool,
     ) -> Result<MessageRef, TransportError> {
+        self.recorder.post_attempts.fetch_add(1, Ordering::Relaxed);
+        self.recorder.stalled(&self.recorder.stall_progress).await;
         if self.recorder.counted(&self.recorder.refuse_progress) {
             return Err(TransportError::Response);
         }
@@ -207,6 +234,7 @@ impl ProgressMessage for Surfaces {
         text: &crate::progress::ProgressText,
         _cancel: bool,
     ) -> Result<(), TransportError> {
+        self.recorder.stalled(&self.recorder.stall_progress).await;
         if self.recorder.counted(&self.recorder.refuse_progress) {
             return Err(TransportError::Response);
         }
@@ -224,6 +252,7 @@ impl ProgressMessage for Surfaces {
         _message: &MessageRef,
         reply: &OutboundReply,
     ) -> Result<(), TransportError> {
+        self.recorder.stalled(&self.recorder.stall_finalize).await;
         if self.recorder.counted(&self.recorder.refuse_finalize) {
             return Err(TransportError::Response);
         }
@@ -424,6 +453,35 @@ fn start_with(
         recorder,
         cancellation,
     }
+}
+
+/// Keeps this thread's workspace records, which is where the policy's own reasons are written.
+///
+/// Thread-local rather than global: the policy task runs on the `current_thread` runtime these
+/// tests drive, so it is polled on this thread, and a global subscriber would capture every other
+/// test in the binary alongside it.
+fn capture() -> (
+    dekopon_test_support::CaptureLayer,
+    tracing::subscriber::DefaultGuard,
+) {
+    use tracing_subscriber::prelude::*;
+
+    let capture = dekopon_test_support::CaptureLayer::workspace();
+    let guard = tracing_subscriber::registry()
+        .with(capture.clone())
+        .set_default();
+    (capture, guard)
+}
+
+/// Every record this thread wrote naming `event`, as its fields rendered.
+fn events_named(capture: &dekopon_test_support::CaptureLayer, event: &str) -> Vec<String> {
+    let rendered = format!("event=\"{event}\"");
+    capture
+        .events()
+        .into_iter()
+        .map(|(fields, _)| fields)
+        .filter(|fields| fields.contains(&rendered))
+        .collect()
 }
 
 /// Lets the policy task run every step it can take without moving the clock.
@@ -833,8 +891,14 @@ async fn a_refused_finalize_deletes_the_surface_and_replies() {
 
 /// Two consecutive refusals stop that surface for the session, so a message that cannot be edited
 /// does not become one failed call per event for the rest of the run.
+///
+/// The record is the assertion, not the call count. A rung that stopped for the wrong reason — a
+/// budget, a seal, a tripped sibling — makes exactly as few calls as one the service refused, and
+/// an operator reading the trace has only `gateway_progress_degraded` and the category on it to
+/// tell those apart.
 #[tokio::test(start_paused = true)]
 async fn two_consecutive_failures_stop_the_surface_for_the_session() {
+    let (capture, _guard) = capture();
     let harness = start_with(
         Offers::default(),
         ProgressDetail::Plain,
@@ -858,6 +922,145 @@ async fn two_consecutive_failures_stop_the_surface_for_the_session() {
         harness.recorder.refuse_progress.load(Ordering::Relaxed),
         1,
         "one injected refusal was left unspent, which is the call that was not attempted"
+    );
+    let degraded = events_named(&capture, "gateway_progress_degraded");
+    assert_eq!(
+        degraded.len(),
+        1,
+        "the rung stops once and says so once: {degraded:?}"
+    );
+    assert!(
+        degraded[0].contains("primitive=\"progress\"")
+            && degraded[0].contains("category=\"response\""),
+        "the record names the rung that stopped and the cause that stopped it: {degraded:?}"
+    );
+}
+
+/// A post that ran out its deadline may still land, so the surface stops rather than posting
+/// a second message the session would then finalize instead of the first.
+///
+/// A refusal says the service did nothing; a deadline says only that this task stopped waiting. A
+/// `post` held past it can leave a message on screen with no `MessageRef` here, and a rung that
+/// merely counted one failure would post again at the next trigger — leaving the first message
+/// saying "Working on it…" forever under an answer that landed in the second.
+#[tokio::test(start_paused = true)]
+async fn a_creating_post_that_misses_its_deadline_stops_the_surface_at_the_first_failure() {
+    let (capture, _guard) = capture();
+    let harness = start_with(
+        Offers::default(),
+        ProgressDetail::Plain,
+        liveness(false),
+        Duration::ZERO,
+        None,
+    );
+    harness.recorder.stall_progress.store(1, Ordering::Relaxed);
+    harness.sink.emit(started());
+    harness.sink.emit(answered_with_tool(1));
+    settle().await;
+    // The transport still has the post; the policy gives up on it at its own deadline.
+    advance(CALL_DEADLINE + Duration::from_secs(1)).await;
+
+    harness.sink.emit(answered_with_tool(2));
+    settle().await;
+    assert_eq!(
+        harness.recorder.post_attempts.load(Ordering::Relaxed),
+        1,
+        "a second trigger posted beside a message that may already exist: {:?}",
+        harness.recorder.calls()
+    );
+    let degraded = events_named(&capture, "gateway_progress_degraded");
+    assert_eq!(
+        degraded.len(),
+        1,
+        "one miss on a creating call is the whole budget: {degraded:?}"
+    );
+    assert!(
+        degraded[0].contains("primitive=\"progress\"")
+            && degraded[0].contains("category=\"deadline\""),
+        "the record says the deadline stopped it, not a refusal: {degraded:?}"
+    );
+}
+
+/// A finalize that ran out its deadline may still land, so the answer is posted beside the surface
+/// rather than after deleting it.
+///
+/// The delete is what makes this worth a branch of its own: an edit that landed a moment after
+/// this task gave up has already turned the message into the answer, and removing it takes the
+/// answer away. A duplicate answer is one a person can read twice; a deleted one is one they never
+/// read at all.
+#[tokio::test(start_paused = true)]
+async fn a_finalize_that_misses_its_deadline_replies_rather_than_deleting_the_surface() {
+    let mut harness = start(Offers::default(), ProgressDetail::Plain, liveness(false));
+    harness.sink.emit(started());
+    harness.sink.emit(answered_with_tool(1));
+    settle().await;
+    harness.recorder.stall_finalize.store(1, Ordering::Relaxed);
+
+    // Nothing else is runnable while the finalize is held, so the paused clock advances itself to
+    // the policy's deadline — which is the only timer short enough to fire before the stall.
+    let delivered = harness
+        .policy
+        .terminal(Terminal::Answered(OutboundReply::text("the answer")))
+        .await;
+
+    assert!(delivered, "the fallback reply is what delivered it");
+    let writes = harness.recorder.writes();
+    assert!(
+        !writes.contains(&Call::Delete),
+        "a finalize that may have landed must not have its message deleted: {writes:?}"
+    );
+    assert_eq!(
+        writes.last(),
+        Some(&Call::Reply("the answer".to_owned())),
+        "the answer is posted beside the surface instead: {writes:?}"
+    );
+}
+
+/// A failed session whose surface is a stream closes the stream instead of leaving it open.
+///
+/// An append-only stream has no delete, so the removal a failed progress message gets is not
+/// available: without this the stream stays live on the service, its registry entry is never
+/// taken, and the fixed failure sentence arrives as a second message under a partial answer that
+/// never ended. The close is the same shape a cancel takes, and for the same reason.
+#[tokio::test(start_paused = true)]
+async fn a_failed_streamed_session_closes_the_stream_under_the_partial_answer() {
+    let offers = Offers {
+        stream: true,
+        ..Offers::default()
+    };
+    let mut harness = start(offers, ProgressDetail::Plain, liveness(true));
+    harness.sink.emit(started());
+    let delta = recorded_delta();
+    harness.sink.emit(ProgressEvent::TextDelta {
+        turn: 1,
+        text: delta.clone(),
+        cumulative_chars: delta.as_str().chars().count(),
+    });
+    settle().await;
+    assert!(
+        !harness.recorder.texts().is_empty(),
+        "the stream has to be the surface for this to be about closing it: {:?}",
+        harness.recorder.calls()
+    );
+
+    let delivered = harness
+        .policy
+        .terminal(Terminal::Failed(FAILURE_REPLY.to_owned()))
+        .await;
+
+    assert!(delivered);
+    let writes = harness.recorder.writes();
+    assert_eq!(
+        writes.last(),
+        Some(&Call::StreamFinalize(format!(
+            "{}\n\n{FAILURE_REPLY}",
+            delta.as_str()
+        ))),
+        "the stream ends on what was read with the failure under it: {writes:?}"
+    );
+    assert!(
+        !writes.iter().any(|call| matches!(call, Call::Reply(_))),
+        "the failure must not arrive as a second message beside a stream left open: {writes:?}"
     );
 }
 

@@ -78,12 +78,6 @@ pub(crate) const fn cancel_label(source: CancelSource) -> &'static str {
         } => "user:stop-reply",
         CancelSource::Operator => "operator",
         CancelSource::Budget {
-            limit: BudgetLimit::Steps,
-        } => "budget:steps",
-        CancelSource::Budget {
-            limit: BudgetLimit::CapabilityCalls,
-        } => "budget:capability-calls",
-        CancelSource::Budget {
             limit: BudgetLimit::WallClock,
         } => "budget:wall-clock",
     }
