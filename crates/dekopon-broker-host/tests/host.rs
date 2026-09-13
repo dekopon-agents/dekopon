@@ -1390,7 +1390,7 @@ async fn an_actual_provider_v0_1_component_remains_compatible() {
 
     assert!(
         registry.command_words().is_empty(),
-        "the historical world has no resolve-command export"
+        "the historical world has no command export"
     );
     let capability = "provider-v0-1-compat.echo"
         .parse::<CapabilityId>()
@@ -1422,65 +1422,6 @@ async fn an_actual_provider_v0_1_component_remains_compatible() {
     assert!(
         matches!(error, BrokerHostError::UnknownCommandWord { ref word } if word == "gh"),
         "{error:?}"
-    );
-}
-
-/// A component generated against the immutable `dekopon:provider@0.2.0` `provider-commands`
-/// world loads, invokes, and runs its word through the legacy `resolve-command` export on the
-/// same path a `run-command` guest takes.
-#[tokio::test(flavor = "multi_thread")]
-async fn an_actual_provider_v0_2_component_remains_compatible() {
-    let registry = BrokerProviderRegistry::load(
-        [provider_fixture("provider-v0-2-compat-provider.wasm")],
-        BrokerHostLimits::default(),
-    )
-    .await
-    .expect("historical command-word provider component loads");
-
-    assert_eq!(registry.command_words(), vec!["compat".to_owned()]);
-    let capability = "provider-v0-2-compat.echo"
-        .parse::<CapabilityId>()
-        .expect("capability");
-    let output = registry
-        .invoke(
-            authorized_for(
-                "provider-v0-2-compat",
-                capability.clone(),
-                json!({"historical": true}),
-                ExecutionConstraints {
-                    timeout_ms: 5_000,
-                    max_output_bytes: 4_096,
-                    http: None,
-                    storage: None,
-                    secret_use: None,
-                },
-            ),
-            None,
-        )
-        .await
-        .expect("historical provider invokes");
-    assert_eq!(output.output, json!({"historical": true}));
-
-    // The legacy export has no stdin parameter: the piped value is dropped by contract, and the
-    // legacy `resolved` answer arrives as a proposal.
-    let outcome = registry
-        .run_command("compat", &["echo".to_owned()], Some("piped"))
-        .await
-        .expect("the historical rewrite still runs");
-    assert_eq!(
-        outcome,
-        CommandRunOutcome::Proposed {
-            capability,
-            input: json!({}),
-        }
-    );
-    let outcome = registry
-        .run_command("compat", &["bogus".to_owned()], None)
-        .await
-        .expect("a decline is an outcome, not a host error");
-    assert!(
-        matches!(outcome, CommandRunOutcome::Failed { ref error } if error.code == "usage"),
-        "{outcome:?}"
     );
 }
 
@@ -1744,7 +1685,7 @@ fn snapshot_storage_tree(root: &Path) -> Vec<(PathBuf, u32, u64, Vec<u8>)> {
 
 // Keep the adversarial core cleanup separate from a real Rust guest's allocator. Each export
 // returns a valid string before post-return traps or spins; a successful lift is not success.
-fn post_return_component(command_export: &str, cleanup: &str) -> tempfile::NamedTempFile {
+fn post_return_component(cleanup: &str) -> tempfile::NamedTempFile {
     use std::io::Write as _;
 
     let manifest = serde_json::to_string(&json!({
@@ -1776,14 +1717,8 @@ fn post_return_component(command_export: &str, cleanup: &str) -> tempfile::Named
             .concat(),
         )
     };
-    let (command_params, core_params) = match command_export {
-        "run-command" => (
-            "(param \"argv\" (list string)) (param \"stdin\" (option string))",
-            "i32 i32 i32 i32 i32",
-        ),
-        "resolve-command" => ("(param \"argv\" (list string))", "i32 i32"),
-        _ => panic!("unknown test export"),
-    };
+    let command_params = "(param \"argv\" (list string)) (param \"stdin\" (option string))";
+    let core_params = "i32 i32 i32 i32 i32";
     let wat = format!(
         r#"(component
             (core module $m
@@ -1804,7 +1739,7 @@ fn post_return_component(command_export: &str, cleanup: &str) -> tempfile::Named
             (func (export "invoke") (param "capability" string) (param "input" string) (result string)
                 (canon lift (core func $i "invoke") (memory (core memory $i "memory"))
                     (realloc (core func $i "realloc")) (post-return (core func $i "cleanup"))))
-            (func (export "{command_export}") {command_params} (result string)
+            (func (export "run-command") {command_params} (result string)
                 (canon lift (core func $i "command") (memory (core memory $i "memory"))
                     (realloc (core func $i "realloc")) (post-return (core func $i "cleanup"))))
         )"#,
@@ -1821,51 +1756,48 @@ fn post_return_component(command_export: &str, cleanup: &str) -> tempfile::Named
 
 #[tokio::test]
 async fn automatic_post_return_traps_remain_command_and_invocation_failures() {
-    for export in ["run-command", "resolve-command"] {
-        let component = post_return_component(export, "unreachable");
-        let registry =
-            BrokerProviderRegistry::load([component.path()], BrokerHostLimits::default())
-                .await
-                .expect("valid manifest loads without cleanup trap");
-        let error = registry
-            .run_command("cleanup", &[], None)
-            .await
-            .expect_err("cleanup trap must not become an output parsing failure");
-        let BrokerHostError::RunCommand { source, .. } = error else {
-            panic!("expected command failure, got {error:?}");
-        };
-        assert_eq!(
-            source.downcast_ref::<wasmtime::Trap>(),
-            Some(&wasmtime::Trap::UnreachableCodeReached)
-        );
-        let error = registry
-            .invoke(
-                authorized(
-                    "cleanup-probe.echo".parse().expect("capability"),
-                    json!({}),
-                    ExecutionConstraints {
-                        timeout_ms: 5_000,
-                        max_output_bytes: 1024,
-                        ..ExecutionConstraints::default()
-                    },
-                ),
-                None,
-            )
-            .await
-            .expect_err("cleanup trap must not return the lifted success response");
-        let BrokerHostError::Invoke { source, .. } = *error.error else {
-            panic!("expected invocation failure, got {error:?}");
-        };
-        assert_eq!(
-            source.downcast_ref::<wasmtime::Trap>(),
-            Some(&wasmtime::Trap::UnreachableCodeReached)
-        );
-    }
+    let component = post_return_component("unreachable");
+    let registry = BrokerProviderRegistry::load([component.path()], BrokerHostLimits::default())
+        .await
+        .expect("valid manifest loads without cleanup trap");
+    let error = registry
+        .run_command("cleanup", &[], None)
+        .await
+        .expect_err("cleanup trap must not become an output parsing failure");
+    let BrokerHostError::RunCommand { source, .. } = error else {
+        panic!("expected command failure, got {error:?}");
+    };
+    assert_eq!(
+        source.downcast_ref::<wasmtime::Trap>(),
+        Some(&wasmtime::Trap::UnreachableCodeReached)
+    );
+    let error = registry
+        .invoke(
+            authorized(
+                "cleanup-probe.echo".parse().expect("capability"),
+                json!({}),
+                ExecutionConstraints {
+                    timeout_ms: 5_000,
+                    max_output_bytes: 1024,
+                    ..ExecutionConstraints::default()
+                },
+            ),
+            None,
+        )
+        .await
+        .expect_err("cleanup trap must not return the lifted success response");
+    let BrokerHostError::Invoke { source, .. } = *error.error else {
+        panic!("expected invocation failure, got {error:?}");
+    };
+    assert_eq!(
+        source.downcast_ref::<wasmtime::Trap>(),
+        Some(&wasmtime::Trap::UnreachableCodeReached)
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
 async fn automatic_post_return_yields_to_the_deadline_and_releases_the_store() {
-    let component = post_return_component("run-command", "(loop $spin br $spin)");
+    let component = post_return_component("(loop $spin br $spin)");
     let limits = BrokerHostLimits {
         fuel: u64::MAX,
         max_timeout: Duration::from_millis(50),

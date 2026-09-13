@@ -58,12 +58,10 @@ pub struct ProviderManifest {
     pub capabilities: Vec<ProviderCapability>,
     /// Command words this provider contributes to the sandboxed shell.
     ///
-    /// Each is a bare word a model may type, run through [`Provider::run_command`] (or the
-    /// legacy [`Provider::resolve_command`] on a component exporting only `resolve-command`). A
-    /// manifest that declares one without the component exporting `run-command` or
-    /// `resolve-command` is refused at load, and a word colliding with a shell builtin, a refused
-    /// word, a control word, or another provider's is a startup failure naming every conflict at
-    /// once.
+    /// Each is a bare word a model may type, run through [`Provider::run_command`]. A manifest
+    /// that declares one without the component exporting `run-command` is refused at load, and a
+    /// word colliding with a shell builtin, a refused word, a control word, or another provider's
+    /// is a startup failure naming every conflict at once.
     ///
     /// Defaulted so a component built against `dekopon:provider@0.1.0` still loads, contributing
     /// none.
@@ -73,7 +71,7 @@ pub struct ProviderManifest {
 
 /// One prompt-visible capability exported by a provider component.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase", from = "CompatCapability")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProviderCapability {
     /// Stable capability identity.
     pub id: CapabilityId,
@@ -85,43 +83,6 @@ pub struct ProviderCapability {
     pub risk: RiskLevel,
     /// Object-shaped JSON Schema supplied to a model as function parameters.
     pub input_schema: Value,
-}
-
-/// The manifest shape a host decodes, which is the current one plus the retired `idempotency`
-/// string.
-///
-/// Every component released before the classification was deleted emits `idempotency`, and a
-/// component is a signed artifact rather than a source file an upgrade can edit: decoding
-/// [`ProviderCapability`] through this type is what keeps those artifacts loading for one release
-/// instead of failing at `describe`. The value is read and dropped — nothing in the tree acts on
-/// it. Every other unknown field is still refused, because `deny_unknown_fields` lives here now.
-/// Delete this type and the `from` attribute above in the release after the one that removes the
-/// field.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct CompatCapability {
-    id: CapabilityId,
-    description: String,
-    effect: EffectKind,
-    risk: RiskLevel,
-    #[serde(default)]
-    idempotency: Option<serde::de::IgnoredAny>,
-    input_schema: Value,
-}
-
-impl From<CompatCapability> for ProviderCapability {
-    fn from(value: CompatCapability) -> Self {
-        // Read once and discarded. The field exists so `deny_unknown_fields` accepts a component
-        // released before the classification was deleted; no decision anywhere consults it.
-        let _retired: Option<serde::de::IgnoredAny> = value.idempotency;
-        Self {
-            id: value.id,
-            description: value.description,
-            effect: value.effect,
-            risk: value.risk,
-            input_schema: value.input_schema,
-        }
-    }
 }
 
 /// Rust implementation contract for a provider component.
@@ -136,48 +97,36 @@ pub trait Provider {
     /// authorization.
     fn invoke(capability: &CapabilityId, input: Value) -> Result<Value, ProviderError>;
 
-    /// Rewrites one argv into a capability proposal.
+    /// Runs one command word's argv the way the upstream command-line tool would.
     ///
     /// This is where a provider implements the ergonomic spelling of its own capabilities —
     /// `gh pr view 7 -R owner/repo` becoming `gh.pull-request.read` with a typed input. The command
     /// word is selected before this call; `argv` contains only the arguments after it.
     ///
-    /// It is a **pure rewrite and grants nothing**. What it returns is a proposal, authorized on
-    /// exactly the path a direct `cap <id> {…}` call takes: constraint-set lookup, Cedar
-    /// evaluation, credential injection at the native HTTP boundary. Naming a capability the
-    /// caller was not granted produces a denial, not an escalation. It runs before authorization,
-    /// so it must not depend on host imports; a host may refuse a component that touches one here.
+    /// A [`CommandRun::Proposal`] is **pure and grants nothing**: it is authorized on exactly the
+    /// path a direct `cap <id> {…}` call takes — constraint-set lookup, Cedar evaluation,
+    /// credential injection at the native HTTP boundary — so naming a capability the caller was
+    /// not granted produces a denial, not an escalation. `--help`, `--version`, and usage errors
+    /// come back as [`CommandRun::Rendered`] text with an exit status, printed by the shell and
+    /// authorizing nothing. A decline is `Err(ProviderError)`, reported to the model as a usage
+    /// error.
+    ///
+    /// `stdin` is the value piped into the word, `None` when nothing was piped. The run happens
+    /// before authorization, so it must not depend on host imports; a host may refuse a component
+    /// that touches one here.
     ///
     /// The default refuses, which is correct for the majority of providers: one that declares no
     /// command words can never be asked.
-    fn resolve_command(argv: &[String]) -> Result<CommandInvocation, ProviderError> {
-        let _ = argv;
+    fn run_command(argv: &[String], stdin: Option<&str>) -> Result<CommandRun, ProviderError> {
+        let _ = (argv, stdin);
         Err(ProviderError::new(
             "unsupported-command",
             "this provider declares no command words",
         ))
     }
-
-    /// Runs one command word's argv the way the upstream command-line tool would.
-    ///
-    /// Where [`Provider::resolve_command`] can only rewrite or decline, this can also *render*:
-    /// `--help`, `--version`, and usage errors come back as [`CommandRun::Rendered`] text with an
-    /// exit status, printed by the shell and authorizing nothing. A [`CommandRun::Proposal`] is
-    /// the rewrite and travels the same authorization path as before. A decline is
-    /// `Err(ProviderError)`, reported to the model as a usage error.
-    ///
-    /// `stdin` is the value piped into the word, `None` when nothing was piped. The same rules as
-    /// the rewrite apply: pure, before authorization, no host imports.
-    ///
-    /// The default delegates to [`Provider::resolve_command`], which is what a provider written
-    /// against the legacy export gets when it moves to [`export_provider_with_cli!`] without
-    /// changing anything else. That contract has no stdin, so the default never forwards it.
-    fn run_command(argv: &[String], _stdin: Option<&str>) -> Result<CommandRun, ProviderError> {
-        Self::resolve_command(argv).map(CommandRun::Proposal)
-    }
 }
 
-/// One capability proposal produced by [`Provider::resolve_command`].
+/// One capability proposal produced by [`Provider::run_command`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct CommandInvocation {
     /// The capability the command word maps to.
@@ -300,28 +249,7 @@ pub struct ComponentFailure {
     pub message: String,
 }
 
-/// JSON result of a command-word rewrite, returned across the WIT boundary.
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(tag = "outcome", rename_all = "camelCase", deny_unknown_fields)]
-pub enum CommandResolution {
-    /// The argv maps to one capability proposal.
-    Resolved {
-        /// Capability the command word named.
-        capability: CapabilityId,
-        /// Input object assembled from the arguments.
-        input: Value,
-    },
-    /// The provider declined to rewrite this argv.
-    Failed {
-        /// Stable failure detail, reported to the model as a usage error.
-        error: ComponentFailure,
-    },
-}
-
 /// JSON result of a command-word run, returned across the `run-command` WIT boundary.
-///
-/// The superset of [`CommandResolution`]: a legacy `resolve-command` answer converts into it
-/// losslessly, so a host handles one type whichever export the component has.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "outcome", rename_all = "camelCase", deny_unknown_fields)]
 pub enum CommandRunOutcome {
@@ -348,17 +276,6 @@ pub enum CommandRunOutcome {
     },
 }
 
-impl From<CommandResolution> for CommandRunOutcome {
-    fn from(resolution: CommandResolution) -> Self {
-        match resolution {
-            CommandResolution::Resolved { capability, input } => {
-                Self::Proposed { capability, input }
-            }
-            CommandResolution::Failed { error } => Self::Failed { error },
-        }
-    }
-}
-
 #[doc(hidden)]
 pub mod __wit {
     wit_bindgen::generate!({
@@ -373,12 +290,6 @@ pub mod __wit {
 /// Hand-written because the failing operation is the encoder itself.
 /// `fallback_literals_decode_into_their_wire_types` pins it to the type.
 const INVOKE_SERIALIZATION_FALLBACK: &str = r#"{"outcome":"failed","error":{"code":"serialization-failed","message":"provider response could not be serialized"}}"#;
-
-/// Last-resort [`CommandResolution`] when the real one cannot be serialized.
-///
-/// Hand-written for the same reason as [`INVOKE_SERIALIZATION_FALLBACK`], and pinned by the same
-/// test.
-const RESOLVE_SERIALIZATION_FALLBACK: &str = r#"{"outcome":"failed","error":{"code":"serialization-failed","message":"command resolution could not be serialized"}}"#;
 
 /// Last-resort [`CommandRunOutcome`] when the real one cannot be serialized.
 ///
@@ -437,25 +348,6 @@ pub fn __invoke<P: Provider>(capability: String, input_json: String) -> String {
 
     serde_json::to_string(&response)
         .unwrap_or_else(|_error| INVOKE_SERIALIZATION_FALLBACK.to_owned())
-}
-
-#[doc(hidden)]
-pub fn __resolve_command<P: Provider>(argv: Vec<String>) -> String {
-    let resolution = match P::resolve_command(&argv) {
-        Ok(invocation) => CommandResolution::Resolved {
-            capability: invocation.capability,
-            input: invocation.input,
-        },
-        Err(error) => CommandResolution::Failed {
-            error: ComponentFailure {
-                code: error.code,
-                message: error.message,
-            },
-        },
-    };
-
-    serde_json::to_string(&resolution)
-        .unwrap_or_else(|_error| RESOLVE_SERIALIZATION_FALLBACK.to_owned())
 }
 
 #[doc(hidden)]
@@ -542,49 +434,13 @@ macro_rules! export_provider_with_bindings {
     };
 }
 
-/// Exports a [`Provider`] that also contributes command words, through caller-generated bindings.
-///
-/// The bindings module must describe a world including `dekopon:provider/provider-commands`, so it
-/// exports `resolve-command` alongside `describe` and `invoke`. Use this when the provider declares
-/// `commandWords` in its manifest; [`export_provider_with_bindings!`] is the right macro otherwise.
-#[macro_export]
-macro_rules! export_provider_with_commands {
-    ($provider:ty, $bindings:ident) => {
-        struct __DekoponProviderComponent;
-
-        impl $bindings::Guest for __DekoponProviderComponent {
-            fn describe() -> ::std::string::String {
-                $crate::__describe::<$provider>()
-            }
-
-            fn invoke(
-                capability: ::std::string::String,
-                input_json: ::std::string::String,
-            ) -> ::std::string::String {
-                $crate::__invoke::<$provider>(capability, input_json)
-            }
-
-            fn resolve_command(
-                argv: ::std::vec::Vec<::std::string::String>,
-            ) -> ::std::string::String {
-                $crate::__resolve_command::<$provider>(argv)
-            }
-        }
-
-        $bindings::export!(
-            __DekoponProviderComponent with_types_in $bindings
-        );
-    };
-}
-
 /// Exports a [`Provider`] whose command words behave like a command-line program, through
 /// caller-generated bindings.
 ///
 /// The bindings module must describe a world including `dekopon:provider/provider-cli`, so it
 /// exports `run-command` alongside `describe` and `invoke`. Use this when the provider declares
-/// `commandWords` and implements [`Provider::run_command`] — or keeps the default, which routes to
-/// [`Provider::resolve_command`]. [`export_provider_with_commands!`] remains for the legacy
-/// `provider-commands` world.
+/// `commandWords` and implements [`Provider::run_command`]; [`export_provider_with_bindings!`] is
+/// the right macro otherwise.
 #[macro_export]
 macro_rules! export_provider_with_cli {
     ($provider:ty, $bindings:ident) => {
@@ -621,10 +477,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        __describe, __invoke, __run_command, CapabilityId, CommandInvocation, CommandResolution,
-        CommandRun, CommandRunOutcome, ComponentFailure, ComponentResponse, EffectKind,
-        INVOKE_SERIALIZATION_FALLBACK, Provider, ProviderApiVersion, ProviderCapability,
-        ProviderError, ProviderManifest, RESOLVE_SERIALIZATION_FALLBACK,
+        __describe, __invoke, __run_command, CapabilityId, CommandRun, CommandRunOutcome,
+        ComponentFailure, ComponentResponse, EffectKind, INVOKE_SERIALIZATION_FALLBACK, Provider,
+        ProviderApiVersion, ProviderCapability, ProviderError, ProviderManifest,
         RUN_SERIALIZATION_FALLBACK, RiskLevel, describe_fallback,
     };
 
@@ -655,16 +510,6 @@ mod tests {
                 Ok(input)
             } else {
                 Err(ProviderError::new("unsupported", capability.to_string()))
-            }
-        }
-
-        fn resolve_command(argv: &[String]) -> Result<CommandInvocation, ProviderError> {
-            match argv {
-                [word] if word == "say" => Ok(CommandInvocation {
-                    capability: "echo.echo".parse().expect("valid capability fixture"),
-                    input: json!({}),
-                }),
-                _ => Err(ProviderError::new("usage", "echo say")),
             }
         }
     }
@@ -719,39 +564,10 @@ mod tests {
         assert_eq!(manifest.id.as_str(), "echo");
     }
 
-    /// A component built before the classification was deleted still describes itself.
-    ///
-    /// This is the whole reason [`CompatCapability`] exists: the `.wasm` is a signed artifact an
-    /// upgrade cannot edit, so the field is read and dropped for one release. The pinned
-    /// out-of-tree fixtures CI fetches exercise the same path end to end.
-    #[test]
-    fn a_manifest_carrying_the_retired_idempotency_field_decodes_without_it() {
-        let capability: ProviderCapability = serde_json::from_value(json!({
-            "id": "echo.echo",
-            "description": "Echoes input",
-            "effect": "read-only",
-            "risk": "Low",
-            "idempotency": "idempotent",
-            "inputSchema": {"type": "object"},
-        }))
-        .expect("a component released before the removal still loads");
-
-        assert_eq!(capability.effect, EffectKind::ReadOnly);
-        assert_eq!(capability.risk, RiskLevel::Low);
-        assert!(
-            !serde_json::to_value(&capability)
-                .expect("capability serializes")
-                .as_object()
-                .expect("a capability is an object")
-                .contains_key("idempotency"),
-            "the retired field must not survive a decode/encode round trip"
-        );
-    }
-
-    /// One retired field is accepted; nothing else is. The refusal names the field.
+    /// No unknown field is accepted, the retired `idempotency` included. The refusal names it.
     #[test]
     fn a_manifest_carrying_any_other_unknown_field_is_still_refused() {
-        for unknown in ["retries", "idempotencyKey"] {
+        for unknown in ["idempotency", "retries", "idempotencyKey"] {
             let error = serde_json::from_value::<ProviderCapability>(json!({
                 "id": "echo.echo",
                 "description": "Echoes input",
@@ -794,22 +610,15 @@ mod tests {
         assert!(matches!(response, ComponentResponse::Failed { .. }));
     }
 
-    /// A provider that only ever implemented the legacy rewrite gets the new export for free.
+    /// A provider that declares no command words can never be asked, so the default refuses.
     #[test]
-    fn the_default_run_command_delegates_to_the_legacy_rewrite() {
+    fn the_default_run_command_refuses() {
         assert_eq!(
-            run::<Echo>(&["say"], Some("ignored by contract")),
-            CommandRunOutcome::Proposed {
-                capability: "echo.echo".parse().expect("valid capability fixture"),
-                input: json!({}),
-            }
-        );
-        assert_eq!(
-            run::<Echo>(&["bogus"], None),
+            run::<Echo>(&["say"], Some("piped")),
             CommandRunOutcome::Failed {
                 error: ComponentFailure {
-                    code: "usage".to_owned(),
-                    message: "echo say".to_owned(),
+                    code: "unsupported-command".to_owned(),
+                    message: "this provider declares no command words".to_owned(),
                 },
             }
         );
@@ -868,29 +677,33 @@ mod tests {
         assert!(encoded.starts_with(r#"{"outcome":"failed","#), "{encoded}");
     }
 
+    /// The decode side of the same contract: a host accepts this shape and nothing adjacent to it.
     #[test]
-    fn a_legacy_resolution_converts_losslessly_into_a_run_outcome() {
-        let capability: CapabilityId = "echo.echo".parse().expect("valid capability fixture");
+    fn a_run_outcome_decodes_only_its_own_wire_shape() {
+        let outcome = serde_json::from_str::<CommandRunOutcome>(
+            r#"{"outcome":"rendered","stdout":"Usage: fixture\n","stderr":"","status":0}"#,
+        )
+        .expect("a rendered page parses");
         assert_eq!(
-            CommandRunOutcome::from(CommandResolution::Resolved {
-                capability: capability.clone(),
-                input: json!({"last": 5}),
-            }),
-            CommandRunOutcome::Proposed {
-                capability,
-                input: json!({"last": 5}),
+            outcome,
+            CommandRunOutcome::Rendered {
+                stdout: "Usage: fixture\n".to_owned(),
+                stderr: String::new(),
+                status: 0,
             }
         );
-        let error = ComponentFailure {
-            code: "usage".to_owned(),
-            message: "memory recent --last N".to_owned(),
-        };
-        assert_eq!(
-            CommandRunOutcome::from(CommandResolution::Failed {
-                error: error.clone()
-            }),
-            CommandRunOutcome::Failed { error }
-        );
+
+        let error = serde_json::from_str::<CommandRunOutcome>(
+            r#"{"outcome":"resolved","capability":"fixture.run","input":{}}"#,
+        )
+        .expect_err("the retired resolution tag is not a run outcome");
+        assert!(error.to_string().contains("resolved"), "{error}");
+
+        let error = serde_json::from_str::<CommandRunOutcome>(
+            r#"{"outcome":"rendered","stdout":"","stderr":"","status":0,"extra":1}"#,
+        )
+        .expect_err("unknown fields are refused");
+        assert!(error.to_string().contains("extra"), "{error}");
     }
 
     /// The manifest fallback must name why it exists.
@@ -933,18 +746,6 @@ mod tests {
                 error: ComponentFailure {
                     code: "serialization-failed".to_owned(),
                     message: "provider response could not be serialized".to_owned(),
-                },
-            }
-        );
-
-        let resolution = serde_json::from_str::<CommandResolution>(RESOLVE_SERIALIZATION_FALLBACK)
-            .expect("resolve fallback decodes as a command resolution");
-        assert_eq!(
-            resolution,
-            CommandResolution::Failed {
-                error: ComponentFailure {
-                    code: "serialization-failed".to_owned(),
-                    message: "command resolution could not be serialized".to_owned(),
                 },
             }
         );

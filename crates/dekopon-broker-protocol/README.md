@@ -2,8 +2,8 @@
 
 Versioned, length-delimited local broker messages and an unprivileged Unix-socket client.
 
-There is one operation per verb — `capabilities`, `runCommand`, `invoke`, `recordDeliveredTurn`, and
-`resolveCommand`. Whether a caller speaks as its own authenticated peer, on behalf of an external
+There is one operation per verb — `capabilities`, `runCommand`, `invoke`, and
+`recordDeliveredTurn`. Whether a caller speaks as its own authenticated peer, on behalf of an external
 subject, or inside a bounded chat scope is one optional `Attestation` field on the operation rather
 than an operation of its own; `scope` distinguishes a chat claim from a subject-only one, and
 `invocation` binds a claim to the proposal it accompanies on exactly the two operations that carry
@@ -28,10 +28,6 @@ authorizes nothing. The piped value is bounded twice: by the frame ceiling on th
 oversized value fails in the request phase before a byte is written, and by the broker host's input
 bound before a store exists. A guest failure is the stable `provider-error` code with an opaque
 message.
-
-`ResolveCommand` (`resolveCommand`) is the same operation in the shape an older client reads: a
-server answers it as a run with no piped value and reports rendered text as a decline carrying that
-text. This client sends `runCommand`, which an older broker refuses as `invalid-request`.
 
 Unix clients accept server-owned, single-link `0600` sockets and shared IPC `0660` sockets, and
 inspect the parent directory in both cases: it must be a server-owned, non-symlink directory,
@@ -146,7 +142,7 @@ message is human-facing and may change. Codes are exported as constants from
 | `invalid-request` | The request frame could not be decoded, or an attestation was malformed or mismatched to its operation or proposal. | Yes, once corrected. |
 | `broker-unavailable` | The broker could not complete the request and **no provider work began**. | Yes, under a fresh invocation identifier. |
 | `capacity-exhausted` | A bounded broker resource — the in-memory audit log of an embedding that serves `BrokerServer` over one — is full and does not evict. `dekopon-brokerd`'s own audit sink never fills. No provider work began. | Safe, and futile: it fails identically until an operator raises the bound. **Do not retry.** |
-| `provider-error` | A `runCommand` or `resolveCommand` run did not produce an answer: no loaded provider declares the word, the argv plus piped value exceeded the host's input bound, the guest failed, or its answer would not decode. **No invocation existed and nothing executed.** | Not without changing the word, its arguments, or the piped value; an identical retry fails identically. |
+| `provider-error` | A `runCommand` run did not produce an answer: no loaded provider declares the word, the argv plus piped value exceeded the host's input bound, the guest failed, or its answer would not decode. **No invocation existed and nothing executed.** | Not without changing the word, its arguments, or the piped value; an identical retry fails identically. |
 | `outcome-unaudited` | Provider work may already have completed and the broker did not record its outcome. | **No.** The external effect may have taken place. |
 | `storage-quota`, `storage-busy`, `storage-timeout`, `storage-corrupt`, `storage-io` | Broker-owned namespace/grant setup failed before provider execution. A `storage-corrupt` whose message says the storage was reset has already moved that conversation to fresh, empty storage. | Yes under a fresh identifier after correcting or reconciling the storage condition; after a reset, immediately. |
 

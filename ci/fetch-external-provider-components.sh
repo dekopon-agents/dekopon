@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Fetch exact standalone provider v0.1.0 release assets for tests, packaging, or image staging.
+# Fetch exact standalone provider release assets for tests, packaging, or image staging.
+# Each provider pins its own release tag, checksum, and size below.
 # Source and generated Wasm are intentionally not tracked in the Dekopon core repository.
 set -euo pipefail
 
@@ -83,34 +84,37 @@ trap cleanup EXIT
 
 fetch_provider() {
   local provider=$1
-  local repository asset expected_sha expected_size signer source_ref source_digest
+  local repository asset release expected_sha expected_size signer source_ref source_digest
   case "$provider" in
     echo)
       repository=dekopon-agents/dekopon-provider-echo
       asset=echo-provider.wasm
-      expected_sha=c15e88cf50726e8a80d1f73f8167563242d59ea80c1af026014e30054ac786b1
-      expected_size=150036
-      signer="$repository/.github/workflows/recover-v0.1.0.yml"
-      source_ref=refs/heads/main
-      source_digest=71efdf591285e4d9349e59e6fd62d7f9752696d9
+      release=v0.2.0
+      expected_sha=eb0605682303a0c1adaffd307a7fbece0d8a959c756c8909228bfa57fd020645
+      expected_size=150975
+      signer="$repository/.github/workflows/release.yml"
+      source_ref=refs/tags/v0.2.0
+      source_digest=61891bd8426d9f0cf2c89bf89666ec243a3f48ce
       ;;
     jsonplaceholder)
       repository=dekopon-agents/dekopon-provider-jsonplaceholder
       asset=jsonplaceholder-provider.wasm
-      expected_sha=9562744e6c209a447cafcfe09d11a50ea1926945a4b52099714c7328c2fd5e5d
-      expected_size=277153
+      release=v0.2.0
+      expected_sha=268d851747bfb4ddc33497dbb1009cf285537dd5001f9d39e8c44803fd3c14f8
+      expected_size=276060
       signer="$repository/.github/workflows/release.yml"
-      source_ref=refs/tags/v0.1.0
-      source_digest=dc925dd23240d2dbd3bd9c534347fd33552bbdf6
+      source_ref=refs/tags/v0.2.0
+      source_digest=bcfe89d36c394307be64d0493808377121740183
       ;;
     memory-chat)
       repository=dekopon-agents/dekopon-provider-memory-chat
       asset=memory-chat-provider.wasm
-      expected_sha=65f82d6a422b0500269333b79be06c4155d7793df1f80ced12a8b214acb53a6b
-      expected_size=248638
+      release=v0.2.0
+      expected_sha=417b9cd7a21f0cd5bf03f05ad159753f56463add6865860ecfeb33af8938776f
+      expected_size=253670
       signer="$repository/.github/workflows/release.yml"
-      source_ref=refs/tags/v0.1.0
-      source_digest=564abc55c8e01657ddb0e10938b9f62101e558ae
+      source_ref=refs/tags/v0.2.0
+      source_digest=5aa6eac2aa07b0691682a532cb16fc93144eb358
       ;;
     *)
       echo "error: unknown external provider: $provider" >&2
@@ -119,7 +123,7 @@ fetch_provider() {
   esac
 
   local provider_work="$work/$provider"
-  local base="https://github.com/$repository/releases/download/v0.1.0"
+  local base="https://github.com/$repository/releases/download/$release"
   mkdir -p "$provider_work"
   curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
     "$base/$asset" --output "$provider_work/$asset"
@@ -129,7 +133,7 @@ fetch_provider() {
   local published actual size
   published=$(awk 'NF == 2 { print $1 ":" $2 }' "$provider_work/$asset.sha256")
   [[ "$published" == "$expected_sha:$asset" ]] || {
-    echo "error: $repository v0.1.0 published an unexpected checksum sidecar" >&2
+    echo "error: $repository $release published an unexpected checksum sidecar" >&2
     exit 1
   }
   actual=$(digest_of "$provider_work/$asset")
@@ -151,8 +155,8 @@ fetch_provider() {
       --source-digest "$source_digest" >/dev/null
   fi
 
-  printf 'verified %s v0.1.0: %s bytes, sha256 %s\n' \
-    "$repository" "$size" "$expected_sha"
+  printf 'verified %s %s: %s bytes, sha256 %s\n' \
+    "$repository" "$release" "$size" "$expected_sha"
 }
 
 publish_provider() {
