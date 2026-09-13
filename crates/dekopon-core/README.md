@@ -12,7 +12,7 @@ opened without following a symlink, regular, single-link, owned by this process,
 ceiling, and at one of two named permission tiers — `PROVIDER_COMPONENT_EXTENSION`, the file
 extension the broker selects components by, and `RESERVED_COMMAND_WORDS`
 with `command_word_conflicts`, the shell-owned word list and the check that reports every reserved,
-capability-shaped, duplicated, or repeated provider command word at once, so the broker can refuse
+duplicated, or repeated provider command word at once, so the broker can refuse
 a conflicting manifest at startup without linking the interpreter.
 
 This crate contains no transport, CLI, async runtime, policy-engine, or provider-host dependencies.
