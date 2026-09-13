@@ -45,10 +45,10 @@ use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _
 const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
 
 const POLICY: &str = r#"
-@id("caller-echo")
+@id("caller-upper")
 permit(principal == Dekopon::Principal::"caller",
-       action == Dekopon::Action::"echo.echo",
-       resource == Dekopon::Provider::"echo")
+       action == Dekopon::Action::"cli-probe.upper",
+       resource == Dekopon::Provider::"cli-probe")
 when { context has agent && context.agent == "brokerd-test" }
 unless { context has via };
 "#;
@@ -110,24 +110,28 @@ fn limits() -> ServerLimits {
 /// already doomed when the provider runs.
 async fn broker(audit_bound: usize) -> Arc<Broker<InMemoryAuditLog>> {
     let registry = BrokerProviderRegistry::load(
-        [provider_fixture("echo-provider.wasm")],
+        [provider_fixture("cli-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
-    .expect("echo provider fixture loads");
+    .expect("cli-probe provider fixture loads");
     let world = PolicyWorld::new(
         ["caller".parse::<PrincipalId>().expect("valid principal")],
         [(
-            "echo.echo".parse::<CapabilityId>().expect("capability"),
-            "echo".parse::<ProviderId>().expect("provider"),
+            "cli-probe.upper"
+                .parse::<CapabilityId>()
+                .expect("capability"),
+            "cli-probe".parse::<ProviderId>().expect("provider"),
         )],
     )
     .expect("distinct fixtures build a world");
     let catalog = ConstraintCatalog::new([(
-        "echo.echo".parse::<CapabilityId>().expect("capability"),
+        "cli-probe.upper"
+            .parse::<CapabilityId>()
+            .expect("capability"),
         ConstraintSet {
             route: CapabilityRoute::Generic,
-            provider: "echo".parse::<ProviderId>().expect("provider"),
+            provider: "cli-probe".parse::<ProviderId>().expect("provider"),
             effect: EffectKind::ReadOnly,
             risk: RiskLevel::Low,
             credential: None,
@@ -235,6 +239,7 @@ async fn framing_audit_and_unmapped_peer_failures_name_their_cause() {
         "probe".to_owned(),
         vec!["upper".to_owned(), "-".to_owned()],
         Some("x".repeat(128 * 1024)),
+        TRACE_PARENT.parse().expect("valid traceparent fixture"),
     ))
     .expect("the oversized run frame serializes");
     assert!(oversized_run.len() > limits().frame.max_frame_bytes);
@@ -260,10 +265,12 @@ async fn framing_audit_and_unmapped_peer_failures_name_their_cause() {
         id: "invoke-unaudited"
             .parse::<InvocationId>()
             .expect("valid invocation"),
-        capability: "echo.echo".parse::<CapabilityId>().expect("capability"),
+        capability: "cli-probe.upper"
+            .parse::<CapabilityId>()
+            .expect("capability"),
         trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
         secret_use: None,
-        input: json!({"message": "hello through broker"}),
+        input: json!({"text": "hello through broker"}),
     };
     client
         .invoke(None, request)

@@ -189,6 +189,7 @@ async fn a_command_word_renders_its_help_page_and_proposes() {
     assert_eq!(
         outcome,
         CommandRunOutcome::Proposed {
+            secret_use: None,
             capability: "cli-probe.reverse".parse().expect("capability"),
             input: json!({"text": "abc"}),
         }
@@ -212,17 +213,17 @@ async fn a_command_word_renders_its_help_page_and_proposes() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_import_free_component_needs_no_storage() {
     let broker = FakeBroker::builder()
-        .component(provider_fixture("echo-provider.wasm"))
-        .provider("echo")
+        .component(provider_fixture("cli-probe-provider.wasm"))
+        .provider("cli-probe")
         .build()
         .await
-        .expect("echo loads");
+        .expect("cli-probe loads");
 
     let output = broker
-        .invoke("echo.echo", json!({"message": "hello"}))
+        .invoke("cli-probe.upper", json!({"text": "hello"}))
         .await
-        .expect("echo runs");
-    assert_eq!(output["message"], "hello");
+        .expect("cli-probe runs");
+    assert_eq!(output["text"], "HELLO");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -275,14 +276,14 @@ async fn a_missing_component_names_the_path() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_builder_missing_its_component_or_provider_says_which() {
     let error = FakeBroker::builder()
-        .provider("echo")
+        .provider("cli-probe")
         .build()
         .await
         .expect_err("no component");
     assert!(matches!(error, FakeBrokerError::NoComponent), "{error}");
 
     let error = FakeBroker::builder()
-        .component(provider_fixture("echo-provider.wasm"))
+        .component(provider_fixture("cli-probe-provider.wasm"))
         .build()
         .await
         .expect_err("no provider");
@@ -303,17 +304,17 @@ async fn a_compile_cache_directory_is_written_and_reused() {
 
     for attempt in ["first", "second"] {
         let broker = FakeBroker::builder()
-            .component(provider_fixture("echo-provider.wasm"))
-            .provider("echo")
+            .component(provider_fixture("cli-probe-provider.wasm"))
+            .provider("cli-probe")
             .compile_cache(cache.path())
             .build()
             .await
-            .expect("echo loads against a compile cache");
+            .expect("cli-probe loads against a compile cache");
         let output = broker
-            .invoke("echo.echo", json!({"message": attempt}))
+            .invoke("cli-probe.upper", json!({"text": attempt}))
             .await
-            .expect("echo runs");
-        assert_eq!(output["message"], attempt);
+            .expect("cli-probe runs");
+        assert_eq!(output["text"], attempt.to_uppercase());
     }
 
     assert!(
@@ -423,16 +424,16 @@ async fn authority_bound_continuity_is_selectable_and_holds_one_generation_here(
 async fn a_narrowed_fuel_ceiling_stops_the_guest() {
     // The control: the same component, the same builder, the default ceilings.
     FakeBroker::builder()
-        .component(provider_fixture("echo-provider.wasm"))
-        .provider("echo")
+        .component(provider_fixture("cli-probe-provider.wasm"))
+        .provider("cli-probe")
         .host_limits(BrokerHostLimits::default())
         .build()
         .await
-        .expect("echo loads under the default host limits");
+        .expect("cli-probe loads under the default host limits");
 
     let error = FakeBroker::builder()
-        .component(provider_fixture("echo-provider.wasm"))
-        .provider("echo")
+        .component(provider_fixture("cli-probe-provider.wasm"))
+        .provider("cli-probe")
         .host_limits(BrokerHostLimits {
             fuel: 1,
             ..BrokerHostLimits::default()

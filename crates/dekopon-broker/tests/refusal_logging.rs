@@ -40,8 +40,8 @@ const UNMAPPED_SUBJECT: &str = "slack.t0123abc.unobody";
 const POLICIES: &str = r#"
 @id("attested-reverse")
 permit(principal == Dekopon::Principal::"cpetersen",
-       action == Dekopon::Action::"echo.reverse",
-       resource == Dekopon::Provider::"echo")
+       action == Dekopon::Action::"cli-probe.reverse",
+       resource == Dekopon::Provider::"cli-probe")
 when { context has via && context.via == "gateway"
     && context has agent && context.agent == "some-agent" };
 
@@ -77,10 +77,12 @@ fn subject(canonical: &str) -> ExternalSubject {
 
 fn constraint_set() -> (CapabilityId, ConstraintSet) {
     (
-        "echo.reverse".parse().expect("valid capability fixture"),
+        "cli-probe.reverse"
+            .parse()
+            .expect("valid capability fixture"),
         ConstraintSet {
             route: CapabilityRoute::Generic,
-            provider: "echo"
+            provider: "cli-probe"
                 .parse::<ProviderId>()
                 .expect("valid provider fixture"),
             effect: EffectKind::ReadOnly,
@@ -94,16 +96,18 @@ fn constraint_set() -> (CapabilityId, ConstraintSet) {
 
 async fn broker() -> (Broker<InMemoryAuditLog>, Arc<InMemoryAuditLog>) {
     let registry = BrokerProviderRegistry::load(
-        [provider_fixture("echo-provider.wasm")],
+        [provider_fixture("cli-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
-    .expect("echo provider fixture loads");
+    .expect("cli-probe provider fixture loads");
     let world = PolicyWorld::new(
         [principal("cpetersen"), principal("gateway")],
         [(
-            "echo.reverse".parse::<CapabilityId>().expect("capability"),
-            "echo".parse::<ProviderId>().expect("provider"),
+            "cli-probe.reverse"
+                .parse::<CapabilityId>()
+                .expect("capability"),
+            "cli-probe".parse::<ProviderId>().expect("provider"),
         )],
     )
     .expect("the refusal world builds");
@@ -144,9 +148,11 @@ fn grant() -> AttestorGrant {
 fn proposal(id: &str) -> InvocationRequest {
     InvocationRequest {
         id: id.parse().expect("valid invocation fixture"),
-        capability: "echo.reverse".parse().expect("valid capability fixture"),
+        capability: "cli-probe.reverse"
+            .parse()
+            .expect("valid capability fixture"),
         trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
-        input: serde_json::json!({"message": "refused"}),
+        input: serde_json::json!({"text": "refused"}),
         secret_use: None,
     }
 }
@@ -333,7 +339,7 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
                 &gateway(),
                 Some(&grant()),
                 Some(&chat_claim(UNMAPPED_SUBJECT, "some-agent")),
-                "echo",
+                "probe",
                 &[],
                 None,
             )

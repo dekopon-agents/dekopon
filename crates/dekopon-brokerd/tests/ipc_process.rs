@@ -153,9 +153,9 @@ async fn ipc_process_boundary() {
     owned(&storage, server_uid, gid, 0o700, root);
     fs::write(storage.join("sentinel"), "private storage").unwrap();
     owned(&storage.join("sentinel"), server_uid, gid, 0o600, root);
-    let provider = private.join("echo.wasm");
+    let provider = private.join("cli-probe.wasm");
     fs::copy(
-        dekopon_test_support::provider_fixture("echo-provider.wasm"),
+        dekopon_test_support::provider_fixture("cli-probe-provider.wasm"),
         &provider,
     )
     .unwrap();
@@ -165,7 +165,7 @@ async fn ipc_process_boundary() {
         "credentials": [{"name": "fixture-token", "kind": "bearerToken", "scheme": "Bearer", "destinations": ["example.com"], "secret": "IPC-PRIVATE-SENTINEL"}]
     })).unwrap()).unwrap();
     let policy = private.join("policy.cedar");
-    fs::write(&policy, r#"permit(principal == Dekopon::Principal::"caller", action == Dekopon::Action::"echo.echo", resource == Dekopon::Provider::"echo");"#).unwrap();
+    fs::write(&policy, r#"permit(principal == Dekopon::Principal::"caller", action == Dekopon::Action::"cli-probe.upper", resource == Dekopon::Provider::"cli-probe");"#).unwrap();
     let socket = ipc.join("broker.sock");
     let config = private.join("broker.json");
     let mut identities = vec![
@@ -178,7 +178,7 @@ async fn ipc_process_boundary() {
         "apiVersion": "dekopon.dev/brokerd/v1alpha1", "socketPath": socket,
         "brokerPrincipal": "broker", "policyRevision": "ipc-test", "policiesPath": policy,
         "providers": [provider], "credentialsPath": credentials, "identities": identities,
-        "constraintSets": {"echo.echo": {"provider": "echo", "effect": "read-only", "risk": "Low", "constraints": {"timeoutMs": 30000, "maxOutputBytes": 1048576}}}
+        "constraintSets": {"cli-probe.upper": {"provider": "cli-probe", "effect": "read-only", "risk": "Low", "constraints": {"timeoutMs": 30000, "maxOutputBytes": 1048576}}}
     })).unwrap()).unwrap();
     for path in [&provider, &credentials, &policy, &config] {
         owned(path, server_uid, gid, 0o600, root);

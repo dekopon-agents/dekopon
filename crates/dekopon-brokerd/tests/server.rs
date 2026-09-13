@@ -48,12 +48,12 @@ fn context(principal: &str) -> AuthenticatedContext {
     .expect("trusted context binds")
 }
 
-/// The direct grant: `caller`, as the agent its peer identity carries, may `echo.echo`.
+/// The direct grant: `caller`, as the agent its peer identity carries, may `cli-probe.upper`.
 const DIRECT_POLICY: &str = r#"
-@id("caller-echo")
+@id("caller-upper")
 permit(principal == Dekopon::Principal::"caller",
-       action == Dekopon::Action::"echo.echo",
-       resource == Dekopon::Provider::"echo")
+       action == Dekopon::Action::"cli-probe.upper",
+       resource == Dekopon::Provider::"cli-probe")
 when { context has agent && context.agent == "brokerd-test" }
 unless { context has via };
 "#;
@@ -69,18 +69,18 @@ permit(principal == Dekopon::Principal::"cpetersen",
        resource == Dekopon::Agent::"chat-agent")
 when { context has via && context.via == "caller" };
 
-@id("chat-agent-echo")
+@id("chat-agent-upper")
 permit(principal == Dekopon::Principal::"cpetersen",
-       action == Dekopon::Action::"echo.echo",
-       resource == Dekopon::Provider::"echo")
+       action == Dekopon::Action::"cli-probe.upper",
+       resource == Dekopon::Provider::"cli-probe")
 when { context has via && context.via == "caller"
     && context has agent && context.agent == "chat-agent" };
 "#;
 
-fn echo_constraint_set() -> ConstraintSet {
+fn probe_constraint_set() -> ConstraintSet {
     ConstraintSet {
         route: CapabilityRoute::Generic,
-        provider: "echo"
+        provider: "cli-probe"
             .parse::<ProviderId>()
             .expect("valid provider fixture"),
         effect: EffectKind::ReadOnly,
@@ -91,27 +91,27 @@ fn echo_constraint_set() -> ConstraintSet {
     }
 }
 
-fn echo_catalog() -> ConstraintCatalog {
+fn probe_catalog() -> ConstraintCatalog {
     ConstraintCatalog::new([(
-        "echo.echo"
+        "cli-probe.upper"
             .parse::<CapabilityId>()
             .expect("valid capability fixture"),
-        echo_constraint_set(),
+        probe_constraint_set(),
     )])
     .expect("one capability builds a catalog")
 }
 
-fn echo_engine<'a>(policies: &str, principals: impl IntoIterator<Item = &'a str>) -> PolicyEngine {
+fn probe_engine<'a>(policies: &str, principals: impl IntoIterator<Item = &'a str>) -> PolicyEngine {
     let world = PolicyWorld::new(
         principals.into_iter().map(|name| {
             name.parse::<PrincipalId>()
                 .expect("valid principal fixture")
         }),
         [(
-            "echo.echo"
+            "cli-probe.upper"
                 .parse::<CapabilityId>()
                 .expect("valid capability fixture"),
-            "echo"
+            "cli-probe"
                 .parse::<ProviderId>()
                 .expect("valid provider fixture"),
         )],
@@ -125,12 +125,12 @@ fn request(id: &str) -> InvocationRequest {
         id: id
             .parse::<InvocationId>()
             .expect("valid invocation fixture"),
-        capability: "echo.echo"
+        capability: "cli-probe.upper"
             .parse::<CapabilityId>()
             .expect("valid capability fixture"),
         trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
         secret_use: None,
-        input: json!({"message": "hello through broker"}),
+        input: json!({"text": "hello through broker"}),
     }
 }
 
@@ -166,11 +166,11 @@ async fn broker_with_audit_bound(
     maximum: usize,
 ) -> (Arc<Broker<InMemoryAuditLog>>, Arc<InMemoryAuditLog>) {
     let registry = BrokerProviderRegistry::load(
-        [provider_fixture("echo-provider.wasm")],
+        [provider_fixture("cli-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
-    .expect("load echo fixture");
+    .expect("load cli-probe fixture");
     let audit = Arc::new(InMemoryAuditLog::new(maximum).expect("valid audit bound"));
     let broker = Arc::new(
         Broker::new(
@@ -179,8 +179,8 @@ async fn broker_with_audit_bound(
                 .parse::<PrincipalId>()
                 .expect("valid broker principal"),
             "policy-test".to_owned(),
-            echo_engine(DIRECT_POLICY, ["caller"]),
-            echo_catalog(),
+            probe_engine(DIRECT_POLICY, ["caller"]),
+            probe_catalog(),
             CredentialStore::empty(),
             IdentityDirectory::empty(),
             Arc::clone(&audit),
@@ -215,11 +215,11 @@ fn attestor_grant() -> AttestorGrant {
 /// mapping that turns the subject into a principal.
 async fn attested_broker() -> (Arc<Broker<InMemoryAuditLog>>, Arc<InMemoryAuditLog>) {
     let registry = BrokerProviderRegistry::load(
-        [provider_fixture("echo-provider.wasm")],
+        [provider_fixture("cli-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
-    .expect("load echo fixture");
+    .expect("load cli-probe fixture");
     let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
     let identities = IdentityDirectory::new([(
         subject(),
@@ -235,11 +235,11 @@ async fn attested_broker() -> (Arc<Broker<InMemoryAuditLog>>, Arc<InMemoryAuditL
                 .parse::<PrincipalId>()
                 .expect("valid broker principal"),
             "policy-test".to_owned(),
-            echo_engine(
+            probe_engine(
                 &format!("{DIRECT_POLICY}\n{ATTESTED_POLICY}"),
                 ["caller", "cpetersen"],
             ),
-            echo_catalog(),
+            probe_catalog(),
             CredentialStore::empty(),
             identities,
             Arc::clone(&audit),
@@ -261,77 +261,6 @@ fn server_limits() -> ServerLimits {
     }
 }
 
-/// The cli-probe twin of the echo grant: `probe` is the word, `cli-probe.upper` the capability.
-const CLI_PROBE_POLICY: &str = r#"
-@id("caller-upper")
-permit(principal == Dekopon::Principal::"caller",
-       action == Dekopon::Action::"cli-probe.upper",
-       resource == Dekopon::Provider::"cli-probe")
-when { context has agent && context.agent == "brokerd-test" }
-unless { context has via };
-"#;
-
-fn cli_probe_catalog() -> ConstraintCatalog {
-    ConstraintCatalog::new([(
-        "cli-probe.upper"
-            .parse::<CapabilityId>()
-            .expect("valid capability fixture"),
-        ConstraintSet {
-            provider: "cli-probe"
-                .parse::<ProviderId>()
-                .expect("valid provider fixture"),
-            ..echo_constraint_set()
-        },
-    )])
-    .expect("one capability builds a catalog")
-}
-
-fn cli_probe_engine() -> PolicyEngine {
-    let world = PolicyWorld::new(
-        ["caller"
-            .parse::<PrincipalId>()
-            .expect("valid principal fixture")],
-        [(
-            "cli-probe.upper"
-                .parse::<CapabilityId>()
-                .expect("valid capability fixture"),
-            "cli-probe"
-                .parse::<ProviderId>()
-                .expect("valid provider fixture"),
-        )],
-    )
-    .expect("distinct fixtures build a world");
-    PolicyEngine::new(CLI_PROBE_POLICY, &world).expect("fixture policy validates")
-}
-
-/// A broker over the clap-layer guest, so a socket test can drive a command word end to end.
-async fn cli_probe_broker() -> (Arc<Broker<InMemoryAuditLog>>, Arc<InMemoryAuditLog>) {
-    let registry = BrokerProviderRegistry::load(
-        [provider_fixture("cli-probe-provider.wasm")],
-        BrokerHostLimits::default(),
-    )
-    .await
-    .expect("load cli-probe fixture");
-    let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
-    let broker = Arc::new(
-        Broker::new(
-            registry,
-            "broker-test"
-                .parse::<PrincipalId>()
-                .expect("valid broker principal"),
-            "policy-test".to_owned(),
-            cli_probe_engine(),
-            cli_probe_catalog(),
-            CredentialStore::empty(),
-            IdentityDirectory::empty(),
-            Arc::clone(&audit),
-            BrokerLimits::default(),
-        )
-        .expect("broker starts"),
-    );
-    (broker, audit)
-}
-
 /// A command word answers over the socket as the tool it fronts: the help page at status 0
 /// decides nothing, and the proposal built from the piped value is what the next frame submits,
 /// so `echo hello | probe upper -` is one run and one authorized invocation.
@@ -341,7 +270,7 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
     let directory = private_directory();
     let socket_path = directory.path().join("broker.sock");
     let listener = bind_fixture(&socket_path);
-    let (broker, audit) = cli_probe_broker().await;
+    let (broker, audit) = broker().await;
     let mut identities = BTreeMap::new();
     identities.insert(
         uid,
@@ -363,7 +292,13 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
     assert_eq!(words, ["probe"]);
 
     match client
-        .run_command(None, "probe".to_owned(), vec!["--help".to_owned()], None)
+        .run_command(
+            None,
+            "probe".to_owned(),
+            vec!["--help".to_owned()],
+            None,
+            TRACE_PARENT.parse().expect("valid traceparent fixture"),
+        )
         .await
         .expect("the help page renders")
     {
@@ -389,11 +324,17 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
             "probe".to_owned(),
             vec!["upper".to_owned(), "-".to_owned()],
             Some("hello".to_owned()),
+            TRACE_PARENT.parse().expect("valid traceparent fixture"),
         )
         .await
         .expect("the piped value proposes")
     {
-        CommandRunOutcome::Proposed { capability, input } => (capability, input),
+        // cli-probe names no secret, so the proposal carries no secret use to forward.
+        CommandRunOutcome::Proposed {
+            capability,
+            input,
+            secret_use: None,
+        } => (capability, input),
         other => panic!("expected a proposal, got {other:?}"),
     };
     assert_eq!(capability.as_str(), "cli-probe.upper");
@@ -451,16 +392,13 @@ async fn authenticated_unix_peer_can_inspect_and_invoke_under_policy() {
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
     let capabilities = client.capabilities().await.expect("inspect capabilities");
     assert_eq!(capabilities.len(), 1);
-    assert_eq!(capabilities[0].capability.id.as_str(), "echo.echo");
+    assert_eq!(capabilities[0].capability.id.as_str(), "cli-probe.upper");
     let result = client
         .invoke(None, request("invoke-brokerd"))
         .await
         .expect("invoke");
     assert_eq!(result.outcome, InvocationOutcome::Succeeded);
-    assert_eq!(
-        result.output,
-        Some(json!({"message": "hello through broker"}))
-    );
+    assert_eq!(result.output, Some(json!({"text": "HELLO THROUGH BROKER"})));
     assert_eq!(audit.records().await.len(), 2);
 
     shutdown_send.send(()).expect("signal clean shutdown");
@@ -501,7 +439,7 @@ async fn unmapped_peer_receives_no_capability_information() {
     };
     assert_eq!(code, ERROR_UNAUTHENTICATED);
     // Not even the provider it would have been allowed to call, had it been mapped.
-    assert!(!message.contains("echo"), "{message}");
+    assert!(!message.contains("cli-probe"), "{message}");
     shutdown_send.send(()).expect("signal clean shutdown");
     task.await
         .expect("server task exits")
@@ -804,10 +742,7 @@ async fn an_attested_invoke_over_the_socket_succeeds_for_an_attestor_peer() {
         .await
         .expect("attested invocation completes");
     assert_eq!(result.outcome, InvocationOutcome::Succeeded);
-    assert_eq!(
-        result.output,
-        Some(json!({"message": "hello through broker"}))
-    );
+    assert_eq!(result.output, Some(json!({"text": "HELLO THROUGH BROKER"})));
 
     let records = audit.records().await;
     assert_eq!(records.len(), 2);
@@ -965,7 +900,7 @@ async fn attested_capabilities_over_the_socket() {
         .await
         .expect("an attestor peer may inspect the attested context");
     assert_eq!(capabilities.len(), 1);
-    assert_eq!(capabilities[0].capability.id.as_str(), "echo.echo");
+    assert_eq!(capabilities[0].capability.id.as_str(), "cli-probe.upper");
     // The peer's own listing is a different answer produced by a different rule, which is what
     // makes the two populations disjoint rather than merely ordered.
     let own = client
@@ -1032,14 +967,14 @@ async fn strict_startup_refuses_every_policy_that_names_something_absent() {
         "policyRevision": "policy-test",
         "policiesPath": &policies_path,
         "strict": true,
-        "providers": [provider_fixture("echo-provider.wasm")],
+        "providers": [provider_fixture("cli-probe-provider.wasm")],
         "identities": [{
             "uid": uid,
             "principal": "caller",
             "actor": {"type": "agent", "agent": "brokerd-test"}
         }],
         "constraintSets": {
-            "echo.echo": serde_json::to_value(echo_constraint_set())
+            "cli-probe.upper": serde_json::to_value(probe_constraint_set())
                 .expect("constraint set serializes")
         }
     });
@@ -1051,20 +986,20 @@ async fn strict_startup_refuses_every_policy_that_names_something_absent() {
     for (policies, label) in [
         (
             r#"permit(principal == Dekopon::Principal::"nobody",
-                      action == Dekopon::Action::"echo.echo",
-                      resource == Dekopon::Provider::"echo");"#,
+                      action == Dekopon::Action::"cli-probe.upper",
+                      resource == Dekopon::Provider::"cli-probe");"#,
             "an undeclared principal",
         ),
         (
             r#"permit(principal == Dekopon::Principal::"caller",
-                      action == Dekopon::Action::"echo.nonexistent",
-                      resource == Dekopon::Provider::"echo");"#,
+                      action == Dekopon::Action::"cli-probe.nonexistent",
+                      resource == Dekopon::Provider::"cli-probe");"#,
             "an unloaded capability",
         ),
         (
             r#"permit(principal == Dekopon::Principal::"caller",
-                      action == Dekopon::Action::"echo.reverse",
-                      resource == Dekopon::Provider::"echo");"#,
+                      action == Dekopon::Action::"cli-probe.reverse",
+                      resource == Dekopon::Provider::"cli-probe");"#,
             "a capability with no constraint set",
         ),
     ] {
@@ -1103,14 +1038,14 @@ async fn default_startup_tolerates_names_no_loaded_provider_declares() {
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "policiesPath": &policies_path,
-        "providers": [provider_fixture("echo-provider.wasm")],
+        "providers": [provider_fixture("cli-probe-provider.wasm")],
         "identities": [{
             "uid": uid,
             "principal": "caller",
             "actor": {"type": "agent", "agent": "brokerd-test"}
         }],
         "constraintSets": {
-            "echo.echo": serde_json::to_value(echo_constraint_set())
+            "cli-probe.upper": serde_json::to_value(probe_constraint_set())
                 .expect("constraint set serializes")
         }
     });
@@ -1122,21 +1057,21 @@ async fn default_startup_tolerates_names_no_loaded_provider_declares() {
     for (policies, label) in [
         (
             r#"permit(principal == Dekopon::Principal::"caller",
-                      action == Dekopon::Action::"echo.nonexistent",
-                      resource == Dekopon::Provider::"echo");"#,
+                      action == Dekopon::Action::"cli-probe.nonexistent",
+                      resource == Dekopon::Provider::"cli-probe");"#,
             "an unloaded capability",
         ),
         (
             r#"permit(principal == Dekopon::Principal::"caller",
-                      action == Dekopon::Action::"echo.reverse",
-                      resource == Dekopon::Provider::"echo");"#,
+                      action == Dekopon::Action::"cli-probe.reverse",
+                      resource == Dekopon::Provider::"cli-probe");"#,
             "a capability with no constraint set",
         ),
         (
             r#"permit(principal == Dekopon::Principal::"caller",
-                      action in [Dekopon::Action::"echo.echo",
-                                 Dekopon::Action::"echo.nonexistent"],
-                      resource == Dekopon::Provider::"echo");"#,
+                      action in [Dekopon::Action::"cli-probe.upper",
+                                 Dekopon::Action::"cli-probe.nonexistent"],
+                      resource == Dekopon::Provider::"cli-probe");"#,
             "a grant mixing a loaded and an unloaded capability",
         ),
     ] {
@@ -1150,8 +1085,8 @@ async fn default_startup_tolerates_names_no_loaded_provider_declares() {
     write_owner_only(
         &policies_path,
         r#"permit(principal == Dekopon::Principal::"nobody",
-                  action == Dekopon::Action::"echo.echo",
-                  resource == Dekopon::Provider::"echo");"#
+                  action == Dekopon::Action::"cli-probe.upper",
+                  resource == Dekopon::Provider::"cli-probe");"#
             .as_bytes(),
     );
     let error = run(&config_path, async {})

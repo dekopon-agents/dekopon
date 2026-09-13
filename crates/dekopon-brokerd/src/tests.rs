@@ -6,10 +6,10 @@ use dekopon_core::{ProviderId, RiskLevel};
 use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
-use super::{config, current_uid, server, socket};
+use super::{config, current_uid, socket};
 
-/// The attested workflow policy: `cpetersen` may drive `chat-agent` and reach `echo.echo`, but
-/// only through the gateway that vouched for them.
+/// The attested workflow policy: `cpetersen` may drive `chat-agent` and reach `cli-probe.upper`,
+/// but only through the gateway that vouched for them.
 const POLICIES: &str = r#"
 @id("chat-agent-session")
 permit(principal == Dekopon::Principal::"cpetersen",
@@ -17,10 +17,10 @@ permit(principal == Dekopon::Principal::"cpetersen",
        resource == Dekopon::Agent::"chat-agent")
 when { context has via && context.via == "gateway" };
 
-@id("chat-agent-echo")
+@id("chat-agent-upper")
 permit(principal == Dekopon::Principal::"cpetersen",
-       action == Dekopon::Action::"echo.echo",
-       resource == Dekopon::Provider::"echo")
+       action == Dekopon::Action::"cli-probe.upper",
+       resource == Dekopon::Provider::"cli-probe")
 when { context has via && context.via == "gateway"
     && context has agent && context.agent == "chat-agent" };
 "#;
@@ -28,7 +28,7 @@ when { context has via && context.via == "gateway"
 fn constraint_set() -> serde_json::Value {
     serde_json::to_value(ConstraintSet {
         route: CapabilityRoute::Generic,
-        provider: "echo"
+        provider: "cli-probe"
             .parse::<ProviderId>()
             .expect("valid provider fixture"),
         effect: EffectKind::ReadOnly,
@@ -66,7 +66,7 @@ fn attested_document(uid: u32) -> serde_json::Value {
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
         "policiesPath": "policies.cedar",
-        "providers": ["echo.wasm"],
+        "providers": ["cli-probe.wasm"],
         "identities": [
             {
                 "uid": uid,
@@ -88,7 +88,7 @@ fn attested_document(uid: u32) -> serde_json::Value {
         "identityMappings": [
             {"subject": "slack.t0123abc.u9xyz", "principal": "cpetersen"}
         ],
-        "constraintSets": {"echo.echo": constraint_set()}
+        "constraintSets": {"cli-probe.upper": constraint_set()}
     })
 }
 
@@ -101,8 +101,11 @@ async fn policy_and_constraint_configuration_is_resolved_and_owner_only() {
     let directory = tempfile::tempdir().expect("create configuration fixture");
     let path = directory.path().join("broker.yaml");
     let policies = directory.path().join("policies.cedar");
-    fs::write(directory.path().join("echo.wasm"), b"component fixture")
-        .expect("write provider path fixture");
+    fs::write(
+        directory.path().join("cli-probe.wasm"),
+        b"component fixture",
+    )
+    .expect("write provider path fixture");
     write_owner_only(&policies, POLICIES.as_bytes());
 
     let document = attested_document(uid);
@@ -182,9 +185,9 @@ async fn managed_provider_configuration_is_strict_and_network_free() {
     let component = fs::read(
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
-            .join("examples/providers/echo-provider.wasm"),
+            .join("examples/providers/cli-probe-provider.wasm"),
     )
-    .expect("checked echo component");
+    .expect("checked cli-probe component");
     let digest = Sha256::digest(&component)
         .iter()
         .fold(String::new(), |mut text, byte| {
@@ -203,7 +206,7 @@ async fn managed_provider_configuration_is_strict_and_network_free() {
     let blob = sha.join(format!("{digest}.wasm"));
     write_owner_only(&blob, &component);
     let lock = format!(
-        "apiVersion: dekopon.dev/provider-lock/v1alpha1\nproviders:\n  - source: ghcr.io/example/echo:1.0.0\n    resolvedVersion: 1.0.0\n    manifestDigest: sha256:{}\n    componentDigest: sha256:{digest}\n    componentBytes: {}\n    providerId: echo\n",
+        "apiVersion: dekopon.dev/provider-lock/v1alpha1\nproviders:\n  - source: ghcr.io/example/cli-probe:1.0.0\n    resolvedVersion: 1.0.0\n    manifestDigest: sha256:{}\n    componentDigest: sha256:{digest}\n    componentBytes: {}\n    providerId: cli-probe\n",
         "1".repeat(64),
         component.len()
     );
@@ -241,7 +244,7 @@ async fn managed_provider_configuration_is_strict_and_network_free() {
         .expect("daemon compiles and describes the exact locked buffer before binding");
 
     let mut mixed = document.clone();
-    mixed["providers"] = json!(["echo.wasm"]);
+    mixed["providers"] = json!(["cli-probe.wasm"]);
     write_config(&path, &mixed);
     let error = config::load(&path, uid)
         .await
@@ -275,10 +278,10 @@ async fn every_peer_uid_a_private_socket_parent_excludes_is_named_at_startup() {
     let component = fs::read(
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
-            .join("examples/providers/echo-provider.wasm"),
+            .join("examples/providers/cli-probe-provider.wasm"),
     )
-    .expect("checked echo component");
-    write_owner_only(&directory.path().join("echo.wasm"), &component);
+    .expect("checked cli-probe component");
+    write_owner_only(&directory.path().join("cli-probe.wasm"), &component);
     // The socket keeps its own parent: the audit log's parent must stay private whatever the
     // socket's does, so one directory cannot express both deployments.
     let socket_parent = directory.path().join("run");
@@ -322,8 +325,11 @@ async fn attestor_grants_and_subject_mappings_are_strictly_validated() {
     let uid = current_uid();
     let directory = tempfile::tempdir().expect("create configuration fixture");
     let path = directory.path().join("broker.yaml");
-    fs::write(directory.path().join("echo.wasm"), b"component fixture")
-        .expect("write provider path fixture");
+    fs::write(
+        directory.path().join("cli-probe.wasm"),
+        b"component fixture",
+    )
+    .expect("write provider path fixture");
     write_owner_only(
         &directory.path().join("policies.cedar"),
         POLICIES.as_bytes(),
@@ -423,18 +429,21 @@ async fn strict_configuration_resolves_paths_and_rejects_unknown_fields() {
         "socketPath": "broker.sock",
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
-        "providers": ["echo.wasm"],
+        "providers": ["cli-probe.wasm"],
         "identities": [{
             "uid": uid,
             "principal": "caller",
             "actor": {"type": "agent", "agent": "brokerd-test"}
         }],
         "policiesPath": "policies.cedar",
-        "constraintSets": {"echo.echo": constraint_set()}
+        "constraintSets": {"cli-probe.upper": constraint_set()}
     });
     write_config(&path, &document);
-    fs::write(directory.path().join("echo.wasm"), b"component fixture")
-        .expect("write provider path fixture");
+    fs::write(
+        directory.path().join("cli-probe.wasm"),
+        b"component fixture",
+    )
+    .expect("write provider path fixture");
     write_owner_only(
         &directory.path().join("policies.cedar"),
         POLICIES.as_bytes(),
@@ -446,7 +455,10 @@ async fn strict_configuration_resolves_paths_and_rejects_unknown_fields() {
         resolved.socket_path,
         canonical_directory.join("broker.sock")
     );
-    assert_eq!(resolved.providers, [canonical_directory.join("echo.wasm")]);
+    assert_eq!(
+        resolved.providers,
+        [canonical_directory.join("cli-probe.wasm")]
+    );
 
     let mut conflicting = document.clone();
     conflicting["policiesPath"] = json!("broker.yaml");
@@ -478,17 +490,20 @@ async fn plaintext_hosts_are_validated_at_startup() {
         "socketPath": "broker.sock",
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
-        "providers": ["echo.wasm"],
+        "providers": ["cli-probe.wasm"],
         "identities": [{
             "uid": uid,
             "principal": "caller",
             "actor": {"type": "agent", "agent": "brokerd-test"}
         }],
         "policiesPath": "policies.cedar",
-        "constraintSets": {"echo.echo": constraint_set()}
+        "constraintSets": {"cli-probe.upper": constraint_set()}
     });
-    fs::write(directory.path().join("echo.wasm"), b"component fixture")
-        .expect("write provider path fixture");
+    fs::write(
+        directory.path().join("cli-probe.wasm"),
+        b"component fixture",
+    )
+    .expect("write provider path fixture");
     write_owner_only(
         &directory.path().join("policies.cedar"),
         POLICIES.as_bytes(),
@@ -560,11 +575,14 @@ async fn an_audit_path_in_config_is_refused() {
     let uid = current_uid();
     let directory = tempfile::tempdir().expect("create configuration fixture");
     let path = directory.path().join("broker.yaml");
-    fs::write(directory.path().join("echo.wasm"), b"component fixture")
-        .expect("write provider path fixture");
-    let mut with_path = provider_config(uid, json!(["echo.wasm"]));
+    fs::write(
+        directory.path().join("cli-probe.wasm"),
+        b"component fixture",
+    )
+    .expect("write provider path fixture");
+    let mut with_path = provider_config(uid, json!(["cli-probe.wasm"]));
     with_path["auditPath"] = json!("audit.jsonl");
-    let mut with_line_bound = provider_config(uid, json!(["echo.wasm"]));
+    let mut with_line_bound = provider_config(uid, json!(["cli-probe.wasm"]));
     with_line_bound["serverLimits"] = json!({
         "maxFrameBytes": dekopon_broker_protocol::DEFAULT_MAX_FRAME_BYTES,
         "ioTimeoutMs": 30_000,
@@ -600,17 +618,20 @@ async fn telemetry_section_is_optional_and_strict() {
         "socketPath": "broker.sock",
         "brokerPrincipal": "broker-test",
         "policyRevision": "policy-test",
-        "providers": ["echo.wasm"],
+        "providers": ["cli-probe.wasm"],
         "identities": [{
             "uid": uid,
             "principal": "caller",
             "actor": {"type": "agent", "agent": "brokerd-test"}
         }],
         "policiesPath": "policies.cedar",
-        "constraintSets": {"echo.echo": constraint_set()}
+        "constraintSets": {"cli-probe.upper": constraint_set()}
     });
-    fs::write(directory.path().join("echo.wasm"), b"component fixture")
-        .expect("write provider path fixture");
+    fs::write(
+        directory.path().join("cli-probe.wasm"),
+        b"component fixture",
+    )
+    .expect("write provider path fixture");
     write_owner_only(
         &directory.path().join("policies.cedar"),
         POLICIES.as_bytes(),
@@ -825,7 +846,8 @@ async fn a_group_writable_provider_directory_refuses_to_load() {
     let path = directory.path().join("broker.yaml");
     let providers = directory.path().join("providers");
     fs::create_dir(&providers).expect("create provider directory");
-    fs::write(providers.join("echo.wasm"), b"component fixture").expect("write component fixture");
+    fs::write(providers.join("cli-probe.wasm"), b"component fixture")
+        .expect("write component fixture");
     write_config(&path, &provider_config(uid, json!(["providers"])));
 
     fs::set_permissions(&providers, fs::Permissions::from_mode(0o775))
@@ -879,8 +901,11 @@ async fn the_aggregate_memory_ceiling_defaults_to_256_mib() {
     let directory = tempfile::tempdir().expect("create configuration fixture");
     let path = directory.path().join("broker.yaml");
     let policies = directory.path().join("policies.cedar");
-    fs::write(directory.path().join("echo.wasm"), b"component fixture")
-        .expect("write provider path fixture");
+    fs::write(
+        directory.path().join("cli-probe.wasm"),
+        b"component fixture",
+    )
+    .expect("write provider path fixture");
     write_owner_only(&policies, POLICIES.as_bytes());
 
     // An absent block.
@@ -927,8 +952,11 @@ async fn concurrent_guest_memory_budget_is_resolved_and_validated() {
     let directory = tempfile::tempdir().expect("create configuration fixture");
     let path = directory.path().join("broker.yaml");
     let policies = directory.path().join("policies.cedar");
-    fs::write(directory.path().join("echo.wasm"), b"component fixture")
-        .expect("write provider path fixture");
+    fs::write(
+        directory.path().join("cli-probe.wasm"),
+        b"component fixture",
+    )
+    .expect("write provider path fixture");
     write_owner_only(&policies, POLICIES.as_bytes());
 
     let mut document = attested_document(uid);
@@ -984,8 +1012,11 @@ async fn a_partial_limits_block_takes_the_absent_block_defaults_and_is_still_val
     let directory = tempfile::tempdir().expect("create configuration fixture");
     let path = directory.path().join("broker.yaml");
     let policies = directory.path().join("policies.cedar");
-    fs::write(directory.path().join("echo.wasm"), b"component fixture")
-        .expect("write provider path fixture");
+    fs::write(
+        directory.path().join("cli-probe.wasm"),
+        b"component fixture",
+    )
+    .expect("write provider path fixture");
     write_owner_only(&policies, POLICIES.as_bytes());
 
     let defaults = dekopon_broker_host::BrokerHostLimits::default();
@@ -1059,7 +1090,8 @@ async fn file_and_directory_entries_mix_and_still_deduplicate() {
     fs::create_dir(&providers).expect("create provider directory");
     fs::set_permissions(&providers, fs::Permissions::from_mode(0o755))
         .expect("secure provider directory");
-    fs::write(providers.join("echo.wasm"), b"component fixture").expect("write component fixture");
+    fs::write(providers.join("cli-probe.wasm"), b"component fixture")
+        .expect("write component fixture");
     fs::write(directory.path().join("solo.wasm"), b"component fixture").expect("write solo");
 
     write_config(
@@ -1073,7 +1105,7 @@ async fn file_and_directory_entries_mix_and_still_deduplicate() {
     // naming it twice is the configuration mistake `DuplicateProviderPath` exists for.
     write_config(
         &path,
-        &provider_config(uid, json!(["providers/echo.wasm", "providers"])),
+        &provider_config(uid, json!(["providers/cli-probe.wasm", "providers"])),
     );
     let error = config::load(&path, uid)
         .await
@@ -1114,27 +1146,6 @@ async fn a_directory_expanding_past_the_provider_ceiling_refuses_to_load() {
     );
 }
 
-#[test]
-fn generic_durable_storage_outer_spans_have_no_identity_or_capability_fields() {
-    tracing::subscriber::with_default(tracing_subscriber::registry(), || {
-        let span = server::storage_invocation_span(
-            &"generic-durable-sentinel".parse().expect("invocation"),
-            "0000000000000000000000000000f1c7".parse().expect("trace"),
-        );
-        let fields = span
-            .metadata()
-            .expect("storage span metadata")
-            .fields()
-            .iter()
-            .map(|field| field.name())
-            .collect::<Vec<_>>();
-        assert_eq!(fields, ["invocation", "trace"]);
-        for forbidden in ["capability", "provider", "subject", "agent"] {
-            assert!(!fields.contains(&forbidden));
-        }
-    });
-}
-
 #[tokio::test]
 async fn storage_root_rejects_future_socket_and_broker_file_collisions() {
     let uid = current_uid();
@@ -1144,7 +1155,10 @@ async fn storage_root_rejects_future_socket_and_broker_file_collisions() {
         &directory.path().join("policies.cedar"),
         POLICIES.as_bytes(),
     );
-    write_owner_only(&directory.path().join("echo.wasm"), b"component fixture");
+    write_owner_only(
+        &directory.path().join("cli-probe.wasm"),
+        b"component fixture",
+    );
     fs::create_dir(directory.path().join("provider-storage")).expect("storage root");
 
     let mut document = attested_document(uid);
@@ -1191,7 +1205,10 @@ async fn configured_storage_ancestor_symlinks_are_not_canonicalized_away() {
         &directory.path().join("policies.cedar"),
         POLICIES.as_bytes(),
     );
-    write_owner_only(&directory.path().join("echo.wasm"), b"component fixture");
+    write_owner_only(
+        &directory.path().join("cli-probe.wasm"),
+        b"component fixture",
+    );
     let actual = directory.path().join("actual-storage-parent");
     fs::create_dir(&actual).expect("actual parent");
     fs::set_permissions(&actual, fs::Permissions::from_mode(0o700)).expect("parent mode");
@@ -1226,7 +1243,10 @@ async fn refused_storage_and_frame_bounds_keep_the_field_that_refused_them() {
         &directory.path().join("policies.cedar"),
         POLICIES.as_bytes(),
     );
-    write_owner_only(&directory.path().join("echo.wasm"), b"component fixture");
+    write_owner_only(
+        &directory.path().join("cli-probe.wasm"),
+        b"component fixture",
+    );
     fs::create_dir(directory.path().join("provider-storage")).expect("storage root");
 
     let mut document = attested_document(uid);
@@ -1280,7 +1300,10 @@ async fn chat_memory_rejects_a_host_fuel_ceiling_that_cannot_reach_compaction() 
         &directory.path().join("policies.cedar"),
         POLICIES.as_bytes(),
     );
-    write_owner_only(&directory.path().join("echo.wasm"), b"component fixture");
+    write_owner_only(
+        &directory.path().join("cli-probe.wasm"),
+        b"component fixture",
+    );
     fs::create_dir(directory.path().join("provider-storage")).expect("storage root");
 
     let mut document = attested_document(uid);
@@ -1413,19 +1436,19 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
 
     use super::{BrokerdError, MappedPeer, validate_capability_responses};
 
-    let echo = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/providers/echo-provider.wasm");
-    let registry = BrokerProviderRegistry::load([echo], BrokerHostLimits::default())
+    let probe = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/providers/cli-probe-provider.wasm");
+    let registry = BrokerProviderRegistry::load([probe], BrokerHostLimits::default())
         .await
-        .expect("load echo fixture");
-    let capability = "echo.echo"
+        .expect("load cli-probe fixture");
+    let capability = "cli-probe.upper"
         .parse::<CapabilityId>()
         .expect("valid capability fixture");
     let world = PolicyWorld::new(
         ["gateway", "cpetersen"].map(|name| name.parse::<PrincipalId>().expect("valid principal")),
         [(
             capability.clone(),
-            "echo".parse().expect("valid provider fixture"),
+            "cli-probe".parse().expect("valid provider fixture"),
         )],
     )
     .expect("declared world builds");

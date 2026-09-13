@@ -51,16 +51,17 @@ async fn a_broker_without_telemetry_records_every_decision_on_stdout() {
     let directory = tempfile::tempdir().expect("create fixture directory");
     let private = directory.path();
     fs::set_permissions(private, fs::Permissions::from_mode(0o700)).expect("private fixture");
-    let provider = private.join("echo-provider.wasm");
-    fs::copy(provider_fixture("echo-provider.wasm"), &provider).expect("copy provider fixture");
+    let provider = private.join("cli-probe-provider.wasm");
+    fs::copy(provider_fixture("cli-probe-provider.wasm"), &provider)
+        .expect("copy provider fixture");
     fs::set_permissions(&provider, fs::Permissions::from_mode(0o600)).expect("secure provider");
     let policies = private.join("policies.cedar");
     write_owner_only(
         &policies,
-        br#"@id("caller-echo")
+        br#"@id("caller-upper")
 permit(principal == Dekopon::Principal::"caller",
-       action == Dekopon::Action::"echo.echo",
-       resource == Dekopon::Provider::"echo");"#,
+       action == Dekopon::Action::"cli-probe.upper",
+       resource == Dekopon::Provider::"cli-probe");"#,
     );
     let socket = private.join("broker.sock");
     let config = private.join("broker.json");
@@ -81,8 +82,8 @@ permit(principal == Dekopon::Principal::"caller",
                 "actor": {"type": "agent", "agent": "brokerd-test"},
             }],
             "constraintSets": {
-                "echo.echo": {
-                    "provider": "echo",
+                "cli-probe.upper": {
+                    "provider": "cli-probe",
                     "effect": "read-only",
                     "risk": "Low",
                     "constraints": {"timeoutMs": 30000, "maxOutputBytes": 1048576},
@@ -127,7 +128,7 @@ permit(principal == Dekopon::Principal::"caller",
             None,
             InvocationRequest {
                 id: "invoke-stdout".parse().expect("invocation"),
-                capability: "echo.echo".parse().expect("capability"),
+                capability: "cli-probe.upper".parse().expect("capability"),
                 trace_parent: TraceParent::new(
                     CLIENT_TRACE_ID,
                     [0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7],
@@ -135,7 +136,7 @@ permit(principal == Dekopon::Principal::"caller",
                 )
                 .expect("valid W3C parent fixture"),
                 secret_use: None,
-                input: json!({"message": "hello through broker"}),
+                input: json!({"text": "hello through broker"}),
             },
         )
         .await
@@ -166,9 +167,9 @@ permit(principal == Dekopon::Principal::"caller",
         .iter()
         .find(|record| record["audit.event"] == "broker.decision")
         .expect("the decision reached stdout");
-    assert_eq!(decision["capability.id"], "echo.echo");
+    assert_eq!(decision["capability.id"], "cli-probe.upper");
     assert_eq!(decision["decision.allowed"], true);
-    assert_eq!(decision["policy.ids"], "caller-echo");
+    assert_eq!(decision["policy.ids"], "caller-upper");
     assert_eq!(decision["policy.revision"], "policy-test");
     assert!(decision["policy.digest"].is_string(), "{decision}");
     assert_eq!(decision["target"], "dekopon_broker::audit");
@@ -178,7 +179,7 @@ permit(principal == Dekopon::Principal::"caller",
         .find(|record| record["audit.event"] == "broker.execution")
         .expect("the outcome reached stdout");
     assert_eq!(execution["outcome"], "Succeeded");
-    assert_eq!(execution["provider"], "echo");
+    assert_eq!(execution["provider"], "cli-probe");
     assert!(execution["output.digest"].is_string(), "{execution}");
 
     // Documented, not accidental: without a tracer provider there is no native context to read, so

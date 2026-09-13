@@ -34,19 +34,20 @@ const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1
 
 const SLACK_SUBJECT: &str = "slack.t0123abc.u9xyz";
 
-/// `echo.echo` is direct-only; `echo.reverse` is attested-only; `agent.prompt` gates the session.
+/// `cli-probe.upper` is direct-only; `cli-probe.reverse` is attested-only; `agent.prompt` gates
+/// the session.
 const POLICIES: &str = r#"
-@id("direct-echo")
+@id("direct-upper")
 permit(principal == Dekopon::Principal::"direct-caller",
-       action == Dekopon::Action::"echo.echo",
-       resource == Dekopon::Provider::"echo")
+       action == Dekopon::Action::"cli-probe.upper",
+       resource == Dekopon::Provider::"cli-probe")
 when { context has agent && context.agent == "provider-test" }
 unless { context has via };
 
 @id("attested-reverse")
 permit(principal == Dekopon::Principal::"cpetersen",
-       action == Dekopon::Action::"echo.reverse",
-       resource == Dekopon::Provider::"echo")
+       action == Dekopon::Action::"cli-probe.reverse",
+       resource == Dekopon::Provider::"cli-probe")
 when { context has via && context.via == "gateway"
     && context has agent && context.agent == "some-agent" };
 
@@ -70,7 +71,7 @@ fn capability(name: &str) -> CapabilityId {
 }
 
 fn provider() -> ProviderId {
-    "echo".parse().expect("valid provider fixture")
+    "cli-probe".parse().expect("valid provider fixture")
 }
 
 fn subject() -> ExternalSubject {
@@ -93,7 +94,7 @@ const TABLE: &[Row] = &[
         principal: "direct-caller",
         agent: "provider-test",
         via: None,
-        capability: "echo.echo",
+        capability: "cli-probe.upper",
         allowed: true,
     },
     Row {
@@ -101,7 +102,7 @@ const TABLE: &[Row] = &[
         principal: "direct-caller",
         agent: "provider-test",
         via: None,
-        capability: "echo.reverse",
+        capability: "cli-probe.reverse",
         allowed: false,
     },
     Row {
@@ -109,7 +110,7 @@ const TABLE: &[Row] = &[
         principal: "cpetersen",
         agent: "some-agent",
         via: Some("gateway"),
-        capability: "echo.reverse",
+        capability: "cli-probe.reverse",
         allowed: true,
     },
     Row {
@@ -117,7 +118,7 @@ const TABLE: &[Row] = &[
         principal: "cpetersen",
         agent: "some-agent",
         via: Some("gateway"),
-        capability: "echo.echo",
+        capability: "cli-probe.upper",
         allowed: false,
     },
     Row {
@@ -125,7 +126,7 @@ const TABLE: &[Row] = &[
         principal: "cpetersen",
         agent: "some-agent",
         via: None,
-        capability: "echo.reverse",
+        capability: "cli-probe.reverse",
         allowed: false,
     },
     Row {
@@ -133,7 +134,7 @@ const TABLE: &[Row] = &[
         principal: "direct-caller",
         agent: "provider-test",
         via: Some("gateway"),
-        capability: "echo.echo",
+        capability: "cli-probe.upper",
         allowed: false,
     },
     Row {
@@ -141,7 +142,7 @@ const TABLE: &[Row] = &[
         principal: "cpetersen",
         agent: "other-agent",
         via: Some("gateway"),
-        capability: "echo.reverse",
+        capability: "cli-probe.reverse",
         allowed: false,
     },
     Row {
@@ -149,7 +150,7 @@ const TABLE: &[Row] = &[
         principal: "someone-else",
         agent: "provider-test",
         via: None,
-        capability: "echo.echo",
+        capability: "cli-probe.upper",
         allowed: false,
     },
 ];
@@ -178,8 +179,8 @@ fn policy_engine() -> PolicyEngine {
             principal("someone-else"),
         ],
         [
-            (capability("echo.echo"), provider()),
-            (capability("echo.reverse"), provider()),
+            (capability("cli-probe.upper"), provider()),
+            (capability("cli-probe.reverse"), provider()),
         ],
     )
     .expect("the workflow world builds");
@@ -188,18 +189,21 @@ fn policy_engine() -> PolicyEngine {
 
 async fn broker(mapped_principal: &str) -> Broker<InMemoryAuditLog> {
     let registry = BrokerProviderRegistry::load(
-        [provider_fixture("echo-provider.wasm")],
+        [provider_fixture("cli-probe-provider.wasm")],
         BrokerHostLimits::default(),
     )
     .await
-    .expect("echo provider fixture loads");
+    .expect("cli-probe provider fixture loads");
     Broker::new(
         registry,
         principal("broker-test"),
         "policy-decision-table".to_owned(),
         policy_engine(),
-        ConstraintCatalog::new([constraint_set("echo.echo"), constraint_set("echo.reverse")])
-            .expect("distinct capabilities build a catalog"),
+        ConstraintCatalog::new([
+            constraint_set("cli-probe.upper"),
+            constraint_set("cli-probe.reverse"),
+        ])
+        .expect("distinct capabilities build a catalog"),
         CredentialStore::empty(),
         IdentityDirectory::new([(subject(), principal(mapped_principal))])
             .expect("one mapping builds a directory"),
@@ -216,7 +220,7 @@ fn request(index: usize, capability_id: &str) -> InvocationRequest {
             .expect("valid invocation fixture"),
         capability: capability(capability_id),
         trace_parent: TRACE_PARENT.parse().expect("valid traceparent fixture"),
-        input: json!({"message": "decision table"}),
+        input: json!({"text": "decision table"}),
         secret_use: None,
     }
 }
@@ -328,7 +332,7 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
         "subject-only attestation grants no storage scope"
     );
 
-    let ordinary = request(98, "echo.reverse");
+    let ordinary = request(98, "cli-probe.reverse");
     let ordinary_result = broker
         .invoke(
             &gateway,
@@ -369,7 +373,7 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
 
     // The refusal is an audited denial rather than an error, and it names its own reason: the
     // attestation was honored, so `attestation-denied` would misattribute what was refused.
-    let proposal = request(99, "echo.reverse");
+    let proposal = request(99, "cli-probe.reverse");
     let refused = broker
         .invoke(
             &gateway,
