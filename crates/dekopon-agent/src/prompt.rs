@@ -787,6 +787,7 @@ where
                         model.turn = model_turns,
                         duration_ms = milliseconds(model_started.elapsed()),
                         outcome = "failed",
+                        error = %error,
                     },
                     "model turn failed"
                 );

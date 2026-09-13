@@ -34,7 +34,7 @@ Two events record calls that cost money or consume a rate limit:
 
 | Event | Emitted by | Carries |
 |---|---|---|
-| `accounting.model.turn` | `dekopond` | turn index, duration, message and tool-call counts, token usage, outcome |
+| `accounting.model.turn` | `dekopond` | turn index, duration, message and tool-call counts, token usage, outcome, and `error` when the outcome is `failed` |
 | `accounting.http.request` | `dekopon-http-host` | method, authority, status, accounted request/response bytes, outcome, and `error.code`/`error.message` on failure |
 
 Both duplicate span fields: the span answers "why was this request slow", the accounting record
@@ -328,8 +328,8 @@ Neither gateway span carries chat text or a subject identifier. `outcome` is the
 metadata level: `declined` means an optional owned-thread continuation produced no chat delivery,
 `unauthorized` means the broker's chat-scoped `capabilities` returned nothing and no model or
 liveness call was made, `busy` means admission control refused the message, `cancelled` means a
-stop won the race against terminal delivery, and `failed` names a category
-through the `gateway_session_failed` log event. The sender's canonical subject and the message text
+stop won the race against terminal delivery, and `failed` names a category and the `error` that
+produced it through the `gateway_session_failed` log event. The sender's canonical subject and the message text
 ride the `gateway.message.received` log event under the payload gate below. `agent.reply.declined`
 records only the model-turn number. `unreported-capability-work` is a stable failure category whose
 fixed chat warning directs the sender to audit before retrying.

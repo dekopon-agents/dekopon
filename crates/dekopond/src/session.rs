@@ -720,7 +720,8 @@ async fn session(
         Err(error) => {
             tracing::error!(
                 event = "gateway_session_failed",
-                category = error.category()
+                category = error.category(),
+                error = %error
             );
             answer(driver, message, FAILURE_REPLY).await;
             return "failed";
@@ -1085,7 +1086,8 @@ async fn session(
         Err(error) => {
             tracing::error!(
                 event = "gateway_session_failed",
-                category = error.category()
+                category = error.category(),
+                error = %error
             );
             (
                 Terminal::Failed(bound_outbound(liveness.templates.failed())),

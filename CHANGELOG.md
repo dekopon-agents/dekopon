@@ -229,6 +229,7 @@ All notable changes to Dekopon are documented here. The format is based on
   churn behind a package bump.
 
 ### Fixed
+- A streamed request that an `openaiCompatible` endpoint answers with a whole JSON document (a stub, a buffering proxy) now fails at once naming `stream: false` as the fix, instead of failing at the end of a stream that never was one. `accounting.model.turn` with `outcome = "failed"` and `gateway_session_failed` carry the `error` that produced them.
 
 - The Discord transport records why it dropped an inbound message as `drop.reason` on its
   `transport.receive` span, so a message the gateway never answers says so in its own trace

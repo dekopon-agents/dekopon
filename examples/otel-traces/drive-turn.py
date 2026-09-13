@@ -157,9 +157,11 @@ permit(principal == Dekopon::Principal::"smoke-user",
             "apiVersion": "dekopon.dev/dekopond/v1alpha1", "catalogPath": catalog,
             "broker": {"socketPath": str(directory / "broker.sock"), "serverUid": os.geteuid()},
             "transports": [{"name": "dev", "kind": "local", "socketPath": str(directory / "dev.sock")}],
+            # The stub answers one JSON completion and ignores `stream`, which is exactly the
+            # endpoint `stream: false` exists for; the default asks for an event stream.
             "models": [{"name": "stub", "kind": "openaiCompatible", "model": "smoke-model",
                 "endpoint": f"http://127.0.0.1:{model.server_port}/v1", "apiKeyEnv": "SMOKE_MODEL_KEY",
-                "timeoutMs": 15000, "classes": ["reasoning"]}],
+                "timeoutMs": 15000, "classes": ["reasoning"], "stream": False}],
             "routes": [{"transport": "dev", "conversation": {"kind": ["directMessage"]},
                 "agent": "chat-agent",
                 "limits": {"maxSteps": 4, "maxCapabilityCalls": 4}}],

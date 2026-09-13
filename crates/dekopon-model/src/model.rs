@@ -496,6 +496,27 @@ impl ChatModel for OpenAiChatModel {
                 .map_err(|error| ModelError::Response(error.to_string()))?;
             return turn_from_response(response);
         }
+        // An endpoint that ignores `stream: true` answers with one JSON document. Reading that as
+        // an event stream fails only at its end with "stream ended before [DONE]", which names
+        // neither the endpoint's behaviour nor the one-line fix, so the content type is checked
+        // first and the refusal names the key to write.
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !content_type.starts_with("text/event-stream") {
+            let shown = if content_type.is_empty() {
+                "no content type".to_owned()
+            } else {
+                format!("`{content_type}`")
+            };
+            return Err(ModelError::Response(format!(
+                "streaming was requested but the endpoint answered with {shown}; write \
+                 `stream: false` on this model for an endpoint that ignores `stream: true`"
+            )));
+        }
         read_chat_stream(response.into_parts().1.into_reader(), on_event)
     }
 }
@@ -1159,6 +1180,40 @@ mod tests {
         assert!(
             message.contains("Rate limit reached for gpt-test"),
             "{message}"
+        );
+    }
+
+    #[test]
+    fn an_endpoint_that_ignores_stream_true_is_refused_naming_the_key_to_write() {
+        // A whole JSON completion where an event stream was asked for: what a stub or a buffering
+        // proxy answers. The turn fails at once, and the error names `stream: false` rather than
+        // the end of a stream that never was one.
+        let server = MockServer::start(vec![MockResponse::json(
+            json!({"choices": [{"message": {"role": "assistant", "content": "hello"}}]}),
+        )]);
+        let model =
+            OpenAiChatModel::new(server.base_url(), "gpt-test", None, Duration::from_secs(2))
+                .expect("model client");
+        assert!(
+            model.stream,
+            "streaming is the default for a compatible endpoint"
+        );
+
+        let error = model
+            .complete(
+                &[ModelMessage::user("hello")],
+                &[],
+                &CompletionOptions::default(),
+                &mut ignored,
+            )
+            .expect_err("a JSON answer to a streamed request fails the turn");
+
+        let message = error.to_string();
+        assert!(message.contains("application/json"), "{message}");
+        assert!(message.contains("`stream: false`"), "{message}");
+        assert!(
+            !message.contains("[DONE]"),
+            "the refusal names the cause, not the symptom: {message}"
         );
     }
 
