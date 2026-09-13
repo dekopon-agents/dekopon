@@ -17,6 +17,10 @@ metadata:
   name: {{ include "dekopon.fullname" . }}
   labels:
     {{- include "dekopon.labels" . | nindent 4 }}
+  {{- with .Values.deploymentAnnotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   # Not configurable. Each seed-once ChatGPT credential rotates its refresh token, and two holders
   # of one family eventually revoke it for both.

@@ -476,6 +476,10 @@ drainBudget:
 nodeSelector: {}
 tolerations: []
 affinity: {}
+# Annotations on the Deployment object itself, for a controller that watches the workload rather
+# than the pod — a Secret-watching restarter such as Stakater Reloader reads its configuration
+# here. podAnnotations go on the pod template instead, where such a controller never looks.
+deploymentAnnotations: {}
 podAnnotations: {}
 podLabels: {}
 priorityClassName: ""
