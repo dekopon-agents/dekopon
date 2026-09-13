@@ -9,22 +9,31 @@
 //! never values, following the precedent `dekopon-telemetry` set for OTLP ingest credentials.
 
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env, io,
     net::SocketAddr,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
 use dekopon_agent::prompt::HistoryLimits;
 use dekopon_broker_protocol::{
-    BrokerSocketDiscovery, DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, ProtocolError,
-    ResolvedBrokerSocket,
+    BrokerSocketDiscovery, ChatTransportKind, ConversationKind, ConversationKindMatch,
+    ConversationMatch, ConversationMatchProblem, DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES,
+    FrameLimits, ProtocolError, ResolvedBrokerSocket,
 };
-use dekopon_core::{AgentId, CapabilityId, FileHygieneError, FileTier, read_trusted_file};
+use dekopon_core::{
+    AgentId, CapabilityId, ExternalSubject, FileHygieneError, FileTier, read_trusted_file,
+};
 use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
 use serde::Deserialize;
 use thiserror::Error;
+
+use crate::{
+    progress::{KeepAlive, ProgressDetail, Templates},
+    session::{FAILURE_REPLY, STOPPED_REPLY},
+};
 
 /// Exact configuration schema this daemon accepts.
 pub const CONFIG_API_VERSION: &str = "dekopon.dev/dekopond/v1alpha1";
@@ -50,6 +59,11 @@ pub const DEFAULT_CONVERSATION_MAX_TURNS: usize = 12;
 pub const DEFAULT_CONVERSATION_MAX_BYTES: usize = 64 * 1024;
 /// Default conversations this process tracks at once.
 pub const DEFAULT_MAX_CONVERSATIONS: usize = 1024;
+/// What a person types to stop a running session when an operator names no list.
+///
+/// Two words rather than one because a person who wants a run to stop tries the obvious thing and
+/// then the other obvious thing, and neither should be answered by the agent instead.
+pub const DEFAULT_STOP_WORDS: [&str; 2] = ["stop", "cancel"];
 /// The only non-loopback Slack origin this daemon will talk to.
 pub const SLACK_ENDPOINT: &str = "https://slack.com";
 /// The only non-loopback Discord REST origin this daemon will talk to.
@@ -65,14 +79,14 @@ pub enum ConfigApiVersion {
     V1Alpha1,
 }
 
-/// Whether a transport publishes native in-flight activity while an authorized session runs.
+/// Whether a transport publishes native in-flight liveness while an authorized session runs.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub enum ActivityMode {
-    /// Preserve the transport's current reply-only behavior.
+pub enum LivenessMode {
+    /// Preserve the transport's reply-only behavior: nothing is typed, posted, edited, or reacted.
     #[default]
     Off,
-    /// Use the service's native activity surface, with transport-specific fallback where configured.
+    /// Use whatever the service natively offers, with transport-specific fallback where configured.
     Native,
 }
 
@@ -93,7 +107,7 @@ pub enum SlackExperience {
 /// Visible fallback when Slack's Agent session status is unavailable.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub enum SlackActivityFallback {
+pub enum SlackLivenessFallback {
     /// Degrade to the final reply only.
     #[default]
     None,
@@ -101,23 +115,210 @@ pub enum SlackActivityFallback {
     Reaction,
 }
 
-/// In-flight activity settings for Discord and Telegram.
+/// Whether a transport posts one editable message saying what the session is doing.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct NativeActivityConfig {
-    #[serde(default)]
-    pub mode: ActivityMode,
+#[serde(rename_all = "camelCase")]
+pub enum ProgressSurface {
+    /// Typing, status, and the reaction only; nothing is posted.
+    #[default]
+    Off,
+    /// One message, posted late and edited in place, that becomes the answer at the end.
+    Message,
 }
 
-/// Slack-specific activity settings.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+/// When a running session says it is still alive.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct SlackActivityConfig {
+pub struct KeepAliveConfig {
+    /// Offsets from the moment the session started, in seconds.
+    #[serde(default = "default_keep_alive_at")]
+    pub at_seconds: Vec<u64>,
+    /// Period between ticks once those offsets are spent.
+    #[serde(default = "default_keep_alive_every")]
+    pub every_seconds: u64,
+    /// Ticks one session may write, because a run that never ends must not write forever.
+    #[serde(default = "default_keep_alive_max")]
+    pub max: u32,
+}
+
+impl Default for KeepAliveConfig {
+    fn default() -> Self {
+        Self {
+            at_seconds: default_keep_alive_at(),
+            every_seconds: default_keep_alive_every(),
+            max: default_keep_alive_max(),
+        }
+    }
+}
+
+fn default_keep_alive_at() -> Vec<u64> {
+    crate::progress::DEFAULT_KEEP_ALIVE_AT.to_vec()
+}
+
+const fn default_keep_alive_every() -> u64 {
+    crate::progress::DEFAULT_KEEP_ALIVE_EVERY
+}
+
+const fn default_keep_alive_max() -> u32 {
+    crate::progress::DEFAULT_KEEP_ALIVE_MAX
+}
+
+/// What this daemon shows on one transport while a session runs.
+///
+/// One block for every transport, because the surfaces are one vocabulary and the differences
+/// between services are which of them a driver implements. A setting a transport cannot honor is a
+/// startup refusal naming it rather than a field that silently does nothing.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct LivenessConfig {
+    /// Whether anything at all is published while an authorized session runs.
     #[serde(default)]
-    pub mode: ActivityMode,
-    /// Used by classic apps and when Agent status is unavailable for this installation.
+    pub mode: LivenessMode,
+    /// Used by classic Slack apps and when Agent status is unavailable for that installation.
     #[serde(default)]
-    pub classic_fallback: SlackActivityFallback,
+    pub classic_fallback: SlackLivenessFallback,
+    /// Whether one editable progress message is posted.
+    #[serde(default)]
+    pub progress: ProgressSurface,
+    /// Whether the model's answer is streamed into the surface as it is written.
+    #[serde(default)]
+    pub stream: bool,
+    /// Whether the surface carries the service's own stop control.
+    #[serde(default)]
+    pub cancel_button: bool,
+    #[serde(default)]
+    pub keep_alive: KeepAliveConfig,
+    /// Operator wording; an absent field keeps this daemon's own sentence.
+    #[serde(default)]
+    pub templates: TemplateOverrides,
+    /// Per-conversation-kind overlays on the block above.
+    ///
+    /// A direct message has one reader and a channel has a hundred, so what is worth streaming or
+    /// posting differs by *where*, not by which transport. Each key is optional and each field
+    /// inside one is optional; an absent key is the base block unchanged.
+    #[serde(default)]
+    pub conversations: BTreeMap<ConversationKind, LivenessOverride>,
+}
+
+/// What one conversation kind changes about a transport's liveness block.
+///
+/// Deliberately not the whole block. `mode`, `classicFallback`, and `templates` are transport
+/// facts and operator wording rather than budget knobs — what a service can render does not change
+/// because a message arrived in a thread — and `progressDetail` is the route's axis, so "detailed
+/// in DMs" is two routes rather than an override here.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct LivenessOverride {
+    /// Whether one editable progress message is posted.
+    pub progress: Option<ProgressSurface>,
+    /// Whether the model's answer is streamed into the surface as it is written.
+    pub stream: Option<bool>,
+    /// Whether the surface carries the service's own stop control.
+    pub cancel_button: Option<bool>,
+    /// Replaces the base block whole rather than per field: three offsets, a period, and a ceiling
+    /// are one cadence, and merging them field by field yields a cadence nobody authored.
+    pub keep_alive: Option<KeepAliveConfig>,
+}
+
+/// The authored `templates:` block.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct TemplateOverrides {
+    pub working: Option<String>,
+    pub tool: Option<String>,
+    pub keep_alive: Option<String>,
+    pub stopped: Option<String>,
+    pub failed: Option<String>,
+}
+
+/// The half of one transport's liveness block a driver needs, cheap enough to copy per session.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LivenessSettings {
+    pub mode: LivenessMode,
+    pub classic_fallback: SlackLivenessFallback,
+    pub progress: ProgressSurface,
+    pub stream: bool,
+    pub cancel_button: bool,
+}
+
+impl LivenessConfig {
+    /// The driver-facing settings, without the policy's own timing and wording.
+    #[must_use]
+    pub const fn settings(&self) -> LivenessSettings {
+        LivenessSettings {
+            mode: self.mode,
+            classic_fallback: self.classic_fallback,
+            progress: self.progress,
+            stream: self.stream,
+            cancel_button: self.cancel_button,
+        }
+    }
+}
+
+/// One transport's liveness settings after validation.
+#[derive(Debug)]
+pub(crate) struct ResolvedLiveness {
+    pub settings: LivenessSettings,
+    pub keep_alive: KeepAlive,
+    pub templates: Templates,
+    /// Per-kind overlays, already validated against what this transport can render.
+    pub conversations: BTreeMap<ConversationKind, LivenessOverride>,
+}
+
+impl ResolvedLiveness {
+    /// The base block overlaid by this kind's override, or the base when there is none.
+    pub(crate) fn for_kind(&self, kind: ConversationKind) -> (LivenessSettings, KeepAlive) {
+        let Some(override_for_kind) = self.conversations.get(&kind) else {
+            return (self.settings, self.keep_alive.clone());
+        };
+        let settings = LivenessSettings {
+            progress: override_for_kind.progress.unwrap_or(self.settings.progress),
+            stream: override_for_kind.stream.unwrap_or(self.settings.stream),
+            cancel_button: override_for_kind
+                .cancel_button
+                .unwrap_or(self.settings.cancel_button),
+            ..self.settings
+        };
+        let keep_alive = override_for_kind
+            .keep_alive
+            .as_ref()
+            .map_or_else(|| self.keep_alive.clone(), keep_alive_from);
+        (settings, keep_alive)
+    }
+}
+
+/// Resolves one authored keep-alive block into the policy's own cadence.
+fn keep_alive_from(config: &KeepAliveConfig) -> KeepAlive {
+    KeepAlive {
+        at: config
+            .at_seconds
+            .iter()
+            .map(|seconds| Duration::from_secs(*seconds))
+            .collect(),
+        every: Duration::from_secs(config.every_seconds),
+        max: config.max,
+    }
+}
+
+impl Default for ResolvedLiveness {
+    /// Reply-only, with this daemon's own sentences.
+    ///
+    /// Reached only by a session whose transport name is not in the resolved map, which startup
+    /// makes unreachable by building one entry per configured transport; it is the shape that
+    /// cannot show anything rather than a second set of defaults, so a future path that lost the
+    /// lookup degrades to today's behavior instead of inventing one.
+    fn default() -> Self {
+        // The shipped templates carry only placeholders their own fields render, so the problem
+        // list is empty by construction; a configuration's overrides are what validation is for.
+        let (templates, _) =
+            Templates::resolve(&TemplateOverrides::default(), STOPPED_REPLY, FAILURE_REPLY);
+        Self {
+            settings: LivenessSettings::default(),
+            keep_alive: KeepAlive::default(),
+            templates,
+            conversations: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -131,6 +332,14 @@ pub struct DekopondConfig {
     pub transports: Vec<TransportConfig>,
     pub models: Vec<ModelConfig>,
     pub routes: Vec<RouteConfig>,
+    /// What a person types to stop the session running in their conversation.
+    ///
+    /// An operator list rather than a fixed one: the people talking to a deployment do not all
+    /// speak English, and a word that means "stop" to them is the one that has to work. Matched
+    /// exactly, case-insensitively, after the bot mention and trailing punctuation are stripped,
+    /// so a stop word never swallows a sentence that merely contains it.
+    #[serde(default)]
+    pub stop_words: Option<Vec<String>>,
     #[serde(default)]
     pub sessions: SessionsConfig,
     /// Grace given to in-flight sessions before they are aborted at shutdown.
@@ -175,9 +384,9 @@ pub enum TransportConfig {
         /// Conversation and lifecycle model configured on the installed Slack app.
         #[serde(default)]
         experience: SlackExperience,
-        /// Best-effort native activity and its explicit classic/free-workspace fallback.
+        /// What a running session shows, and its explicit classic/free-workspace fallback.
         #[serde(default)]
-        activity: SlackActivityConfig,
+        liveness: LivenessConfig,
         /// Overridable only to `https://slack.com` or a literal loopback HTTP URL, for tests.
         #[serde(default)]
         endpoint: Option<String>,
@@ -186,9 +395,9 @@ pub enum TransportConfig {
     DiscordGateway {
         name: String,
         bot_token_env: String,
-        /// Best-effort renewable native typing while an authorized session runs.
+        /// What a running session shows on this transport.
         #[serde(default)]
-        activity: NativeActivityConfig,
+        liveness: LivenessConfig,
         /// Overridable only to `https://discord.com` or a literal loopback HTTP URL.
         #[serde(default)]
         endpoint: Option<String>,
@@ -205,6 +414,9 @@ pub enum TransportConfig {
         waba_id: String,
         phone_number_id: String,
         graph_api_version: String,
+        /// What a running session shows; WhatsApp has typing and nothing else.
+        #[serde(default)]
+        liveness: LivenessConfig,
         /// Overridable only to the pinned production origin or literal loopback HTTP for tests.
         #[serde(default)]
         graph_endpoint: Option<String>,
@@ -213,15 +425,23 @@ pub enum TransportConfig {
     TelegramLongPoll {
         name: String,
         bot_token_env: String,
-        /// Best-effort renewable native `typing` action while an authorized session runs.
+        /// What a running session shows on this transport.
         #[serde(default)]
-        activity: NativeActivityConfig,
+        liveness: LivenessConfig,
         /// Overridable only to `https://api.telegram.org` or a literal loopback HTTP URL.
         #[serde(default)]
         endpoint: Option<String>,
     },
     /// A development transport on an owner-only Unix socket that trusts its local caller.
-    Local { name: String, socket_path: PathBuf },
+    ///
+    /// The reference driver: it implements every surface, which is what lets the integration tests
+    /// read a whole session's progress off one line stream.
+    Local {
+        name: String,
+        socket_path: PathBuf,
+        #[serde(default)]
+        liveness: LivenessConfig,
+    },
 }
 
 impl TransportConfig {
@@ -234,6 +454,18 @@ impl TransportConfig {
             | Self::WhatsappCloudApi { name, .. }
             | Self::TelegramLongPoll { name, .. }
             | Self::Local { name, .. } => name,
+        }
+    }
+
+    /// The transport family the broker protocol names, which decides what conversations exist.
+    #[must_use]
+    pub const fn chat_kind(&self) -> ChatTransportKind {
+        match self {
+            Self::SlackSocketMode { .. } => ChatTransportKind::Slack,
+            Self::DiscordGateway { .. } => ChatTransportKind::Discord,
+            Self::WhatsappCloudApi { .. } => ChatTransportKind::Whatsapp,
+            Self::TelegramLongPoll { .. } => ChatTransportKind::Telegram,
+            Self::Local { .. } => ChatTransportKind::Local,
         }
     }
 
@@ -267,6 +499,17 @@ pub enum ModelConfig {
         #[serde(default)]
         api_key_env: Option<String>,
         timeout_ms: u64,
+        /// Whether this endpoint is asked to stream its answer.
+        ///
+        /// On by default, because streaming is what puts the answer on screen while it is being
+        /// written and what lets a stop interrupt a turn instead of waiting out `timeoutMs`. The
+        /// field exists for the endpoint that claims chat-completions compatibility and gets
+        /// `stream: true` wrong — a proxy that buffers the whole SSE body, a server that drops
+        /// `usage` — where the repair is one line of configuration rather than a second client.
+        /// `kind: chatgptSubscription` has no such field: that backend streams and cannot be
+        /// asked not to, so writing one there is the unknown-field refusal every other typo gets.
+        #[serde(default = "default_model_stream")]
+        stream: bool,
         /// Model classes this endpoint satisfies, matched against an agent's `modelClass`.
         #[serde(default)]
         classes: Vec<String>,
@@ -295,6 +538,11 @@ pub enum ModelConfig {
         #[serde(default)]
         modalities: Vec<Modality>,
     },
+}
+
+/// Streaming is the default: an endpoint that cannot do it is the exception an operator names.
+const fn default_model_stream() -> bool {
+    true
 }
 
 /// Something a model can be shown that is not text.
@@ -354,41 +602,53 @@ pub struct ProviderAttachmentsConfig {
     pub max_per_reply: u8,
 }
 
-/// Which conversations on a transport a route claims.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-#[serde(
-    tag = "kind",
-    deny_unknown_fields,
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
-pub enum RouteMatch {
-    /// One-to-one conversations with the bot.
-    ///
-    /// A struct variant with no fields rather than a unit variant, for the reason
-    /// [`ConversationConfig::OneShot`] is one: serde's internally tagged *unit* variants accept and
-    /// discard every key beside the tag, so `kind: directMessage` with a `channel` beside it would
-    /// decode cleanly and throw the channel away — leaving an operator believing they scoped a route
-    /// that in fact claims every direct message on the transport. An empty struct variant under
-    /// `deny_unknown_fields` makes that a startup failure with the field name in it.
-    DirectMessage {},
-    /// Channels the bot is summoned in: one named channel, or **any** of them when `channel` is
-    /// absent.
-    ///
-    /// The channel is optional because the alternative is one route per channel, enumerated by
-    /// service-native identifier and re-edited every time somebody creates a channel — a bot that
-    /// goes silent in the new channel until an operator notices and redeploys. An absent `channel`
-    /// says "wherever I am invited", which is the membership the chat service already controls.
-    ///
-    /// Widening *where* widens nothing about *who*. The bot must still be @-mentioned to be woken
-    /// at all, and every session still opens an attested broker leg that refuses a sender the owner
-    /// never mapped, before any model call. A catch-all route reaches exactly the people a named
-    /// one did.
-    Channel {
-        /// The one channel this route claims, or every channel when absent.
-        #[serde(default)]
-        channel: Option<String>,
-    },
+/// The authored `conversation:` block on a route.
+///
+/// The three [`ConversationMatch`] fields plus the five window keys that used to live under this
+/// name. An 0.13 file wrote `conversation: { mode: persistent, … }`, which is now the *match*
+/// block, so the retired keys are decoded and refused by name: serde's own "unknown field
+/// `mode`" says nothing about where the window went.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ConversationMatchConfig {
+    /// The word `any`, or a non-empty list of kinds.
+    pub kind: ConversationKindMatch,
+    /// One container, or every container when absent.
+    #[serde(default)]
+    pub container: Option<String>,
+    /// These conversation ids only (the parent id for threads), or every id when absent.
+    #[serde(default)]
+    pub ids: Option<Vec<String>>,
+    #[serde(default)]
+    mode: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    scope: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    idle_timeout_ms: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    max_turns: Option<serde::de::IgnoredAny>,
+    #[serde(default)]
+    max_bytes: Option<serde::de::IgnoredAny>,
+}
+
+impl ConversationMatchConfig {
+    /// Whether this block is an 0.13 memory window written under the match's name.
+    const fn is_retired_memory_block(&self) -> bool {
+        self.mode.is_some()
+            || self.scope.is_some()
+            || self.idle_timeout_ms.is_some()
+            || self.max_turns.is_some()
+            || self.max_bytes.is_some()
+    }
+
+    /// The selector itself, without the retired keys.
+    fn selector(&self) -> ConversationMatch {
+        ConversationMatch {
+            kind: self.kind.clone(),
+            container: self.container.clone(),
+            ids: self.ids.clone(),
+        }
+    }
 }
 
 /// Bounds one routed message's session.
@@ -399,6 +659,14 @@ pub struct RouteLimits {
     pub max_steps: u32,
     #[serde(default = "default_max_capability_calls")]
     pub max_capability_calls: u32,
+    /// Wall-clock bound on one session, counted from the moment the agent starts working.
+    ///
+    /// Optional because most deployments are bounded well enough by steps and calls; absent means
+    /// no wall-clock bound. It is counted from `Started` rather than from receipt, because waiting
+    /// for an admission slot is not the agent taking too long. Zero is refused: the way to run
+    /// nothing is to disable the route.
+    #[serde(default)]
+    pub max_duration_ms: Option<u64>,
 }
 
 impl Default for RouteLimits {
@@ -406,6 +674,7 @@ impl Default for RouteLimits {
         Self {
             max_steps: DEFAULT_MAX_STEPS,
             max_capability_calls: DEFAULT_MAX_CAPABILITY_CALLS,
+            max_duration_ms: None,
         }
     }
 }
@@ -424,7 +693,7 @@ const fn default_max_capability_calls() -> u32 {
 /// inbound message, or model response can never select it.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub enum ConversationScope {
+pub enum MemoryScope {
     /// Keep one history per authenticated transport subject.
     #[default]
     PrivateConversation,
@@ -446,7 +715,7 @@ pub enum ConversationScope {
     rename_all = "camelCase",
     rename_all_fields = "camelCase"
 )]
-pub enum ConversationConfig {
+pub enum MemoryConfig {
     /// Every message is an independent session that starts from an empty prompt.
     ///
     /// A struct variant with no fields rather than a unit variant, deliberately. serde's internally
@@ -458,7 +727,7 @@ pub enum ConversationConfig {
     Persistent {
         /// Who shares the replay window; private per authenticated subject when omitted.
         #[serde(default)]
-        scope: ConversationScope,
+        scope: MemoryScope,
         /// How long an untouched conversation survives.
         #[serde(default = "default_idle_timeout_ms")]
         idle_timeout_ms: u64,
@@ -471,7 +740,7 @@ pub enum ConversationConfig {
     },
 }
 
-impl Default for ConversationConfig {
+impl Default for MemoryConfig {
     fn default() -> Self {
         Self::OneShot {}
     }
@@ -494,8 +763,18 @@ const fn default_conversation_max_bytes() -> usize {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RouteConfig {
     pub transport: String,
-    #[serde(rename = "match")]
-    pub r#match: RouteMatch,
+    /// Which conversations on that transport this route claims.
+    ///
+    /// Replaces `match:`. The memory window that used to sit under this name is `memory:`.
+    pub conversation: ConversationMatchConfig,
+    /// Canonical subjects this route answers; every subject when absent.
+    ///
+    /// Accepted only on a `kind: [directMessage]` route. Routing only: it picks the agent that
+    /// hears the message, and authority stays the broker's subject mapping and Cedar. A per-person
+    /// *channel* route would read as an access-control list and be trusted as one, which is why it
+    /// is a startup refusal rather than a documented oddity.
+    #[serde(default)]
+    pub subjects: Option<Vec<ExternalSubject>>,
     pub agent: AgentId,
     /// Overrides model-class selection for this route.
     #[serde(default)]
@@ -516,11 +795,34 @@ pub struct RouteConfig {
     /// suggestion is a tagged log record an operator reads, never a change the daemon applies.
     #[serde(default)]
     pub improvement_suggestions: bool,
+    /// Offers the `inspect_agent_config` tool on this route's sessions.
+    ///
+    /// Default true keeps today's behavior. False removes the structured dump — description,
+    /// model class, limits, and the agent's standing orders verbatim — and nothing else: the
+    /// instructions are still the system prompt, so secrecy from a determined user is the model's
+    /// obedience rather than a gate.
+    #[serde(default = "default_true")]
+    pub inspect_agent_config: bool,
     #[serde(default)]
     pub limits: RouteLimits,
-    /// What this route remembers between messages; `oneShot` unless an operator says otherwise.
+    /// How much this route's progress surface says.
+    ///
+    /// Per route because the same event stream serves a family Discord and an operations channel.
+    /// Crate-visible: it selects a rendering, and nothing outside this daemon renders.
     #[serde(default)]
-    pub conversation: ConversationConfig,
+    pub(crate) progress_detail: ProgressDetail,
+    /// What this route remembers between messages; `oneShot` unless an operator says otherwise.
+    ///
+    /// Was `conversation:`, which is now the match.
+    #[serde(default)]
+    pub memory: MemoryConfig,
+    /// Retired: decoded so the refusal names `conversation:` beside every other problem.
+    #[serde(default, rename = "match", skip_serializing)]
+    pub retired_match: Option<serde::de::IgnoredAny>,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 /// A persistent route's bounds, with `idleTimeoutMs` already resolved to a [`Duration`].
@@ -529,9 +831,9 @@ pub struct RouteConfig {
 /// because they fail differently: twelve one-line exchanges and twelve paragraph-length ones are the
 /// same number of turns and very different prompts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ConversationWindow {
+pub struct MemoryWindow {
     /// Who shares the replay window, resolved from trusted route configuration.
-    pub scope: ConversationScope,
+    pub scope: MemoryScope,
     /// How long an untouched conversation survives before a lookup drops it.
     pub idle_timeout: Duration,
     /// What the replayed window holds.
@@ -540,17 +842,17 @@ pub struct ConversationWindow {
 
 /// What a route remembers, after validation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConversationPolicy {
+pub enum MemoryPolicy {
     /// No history: every message is an independent session, which is every route's default.
     OneShot,
     /// A bounded private or intentionally shared history, replayed ahead of each new message.
-    Persistent(ConversationWindow),
+    Persistent(MemoryWindow),
 }
 
-impl ConversationPolicy {
+impl MemoryPolicy {
     /// The window this route replays, or `None` when it remembers nothing.
     #[must_use]
-    pub const fn window(self) -> Option<ConversationWindow> {
+    pub const fn window(self) -> Option<MemoryWindow> {
         match self {
             Self::OneShot => None,
             Self::Persistent(window) => Some(window),
@@ -562,7 +864,10 @@ impl ConversationPolicy {
 #[derive(Clone, Debug)]
 pub struct ResolvedRoute {
     pub transport: String,
-    pub r#match: RouteMatch,
+    /// Which conversations on that transport this route claims.
+    pub conversation: ConversationMatch,
+    /// Canonical subjects this route answers; every subject when absent.
+    pub subjects: Option<Vec<ExternalSubject>>,
     pub agent: AgentId,
     /// Overrides model-class selection for this route.
     pub model: Option<String>,
@@ -572,8 +877,13 @@ pub struct ResolvedRoute {
     pub chat_asset_inputs: Vec<CapabilityId>,
     /// Whether this route's sessions may record improvement suggestions.
     pub improvement_suggestions: bool,
+    /// Whether this route's sessions are offered `inspect_agent_config`.
+    pub inspect_agent_config: bool,
     pub limits: RouteLimits,
-    pub conversation: ConversationPolicy,
+    /// How much this route's progress surface says.
+    pub(crate) progress_detail: ProgressDetail,
+    /// What this route remembers between messages.
+    pub memory: MemoryPolicy,
 }
 
 /// Process-wide session admission bounds.
@@ -654,6 +964,14 @@ pub struct ResolvedConfig {
     pub transports: Vec<TransportConfig>,
     pub models: Vec<ModelConfig>,
     pub routes: Vec<ResolvedRoute>,
+    /// Each transport's validated liveness settings, by transport name.
+    ///
+    /// Resolved once here rather than re-derived per session: the templates are validated at
+    /// startup, so a placeholder nobody can render is a refusal instead of a line that reads wrong
+    /// in a chat window an hour later.
+    pub(crate) liveness: BTreeMap<String, Arc<ResolvedLiveness>>,
+    /// The words that stop a running session, lowercased.
+    pub(crate) stop_words: Vec<String>,
     pub sessions: SessionsConfig,
     pub shutdown_grace: Duration,
     pub telemetry: Option<ResolvedTelemetry>,
@@ -692,14 +1010,35 @@ pub async fn load(
             source: insecure,
         },
     })?;
-    let config = serde_yaml::from_slice::<DekopondConfig>(&bytes)
-        .map_err(|source| ConfigError::Decode { source })?;
+    let config = decode(&bytes)?;
     resolve(
         config,
         path,
         &BrokerSocketDiscovery::from_process(None),
         expected_uid,
     )
+}
+
+/// What serde writes when strict decoding meets the block this release replaced.
+///
+/// The whole match: `deny_unknown_fields` has no case for a key that used to exist, so the name in
+/// the decoder's own refusal is the only trace a retired block leaves.
+const RETIRED_ACTIVITY_FIELD: &str = "unknown field `activity`";
+
+/// Strictly decodes one gateway configuration, naming the block this release replaced.
+///
+/// Nothing here reads what an `activity:` block contained, and no field accepts one: the decoder
+/// refuses the key, and this maps that refusal onto the sentence that says what to write instead.
+/// serde's own sentence lists the fields a transport does accept, which tells an operator that
+/// `activity` is not among them and nothing about where it went.
+fn decode(document: &[u8]) -> Result<DekopondConfig, ConfigError> {
+    serde_yaml::from_slice::<DekopondConfig>(document).map_err(|source| {
+        if source.to_string().contains(RETIRED_ACTIVITY_FIELD) {
+            ConfigError::RetiredActivityBlock { source }
+        } else {
+            ConfigError::Decode { source }
+        }
+    })
 }
 
 fn absolute(path: &Path) -> Result<PathBuf, ConfigError> {
@@ -751,10 +1090,14 @@ pub(crate) fn resolve(
     // resolves, which is exactly why `dekopon-config` leaves duplicates out of `drops_resource`.
     let mut transports_incomplete = config.transports.is_empty();
     let mut transport_names = BTreeSet::new();
+    // The family each configured transport belongs to, which is what a route's selector and a
+    // liveness override are validated against.
+    let mut transport_kinds: BTreeMap<String, ChatTransportKind> = BTreeMap::new();
     // Transports that cannot carry an attachment at all, recorded before validation so the route
     // pairing check below does not pass merely because this transport had a problem of its own.
     let mut text_only_transports = BTreeSet::new();
     let mut transports = Vec::with_capacity(config.transports.len());
+    let mut liveness_settings = BTreeMap::new();
     for transport in config.transports {
         let name = transport.name().to_owned();
         if name.trim().is_empty() {
@@ -766,46 +1109,39 @@ pub(crate) fn resolve(
             problems.push(ConfigProblem::DuplicateTransport { name });
             continue;
         }
+        transport_kinds.insert(name.clone(), transport.chat_kind());
         if matches!(transport, TransportConfig::WhatsappCloudApi { .. }) {
-            text_only_transports.insert(name);
+            text_only_transports.insert(name.clone());
         }
+        liveness_settings.insert(
+            name.clone(),
+            Arc::new(resolve_liveness(&transport, &mut problems)),
+        );
         transports.push(match transport {
             TransportConfig::SlackSocketMode {
                 name,
                 app_token_env,
                 bot_token_env,
                 experience,
-                activity,
+                liveness,
                 endpoint,
             } => {
                 check_env_name(&app_token_env, &mut problems);
                 check_env_name(&bot_token_env, &mut problems);
-                let activity_is_meaningful = match (experience, activity.mode) {
-                    (_, ActivityMode::Off) => {
-                        activity.classic_fallback == SlackActivityFallback::None
-                    }
-                    (SlackExperience::Classic, ActivityMode::Native) => {
-                        activity.classic_fallback == SlackActivityFallback::Reaction
-                    }
-                    (SlackExperience::Agent, ActivityMode::Native) => true,
-                };
-                if !activity_is_meaningful {
-                    problems.push(ConfigProblem::InvalidSlackActivity { name: name.clone() });
-                }
                 let endpoint = checked_endpoint(endpoint, SLACK_ENDPOINT, &mut problems);
                 TransportConfig::SlackSocketMode {
                     name,
                     app_token_env,
                     bot_token_env,
                     experience,
-                    activity,
+                    liveness,
                     endpoint: Some(endpoint),
                 }
             }
             TransportConfig::DiscordGateway {
                 name,
                 bot_token_env,
-                activity,
+                liveness,
                 endpoint,
             } => {
                 check_env_name(&bot_token_env, &mut problems);
@@ -813,7 +1149,7 @@ pub(crate) fn resolve(
                 TransportConfig::DiscordGateway {
                     name,
                     bot_token_env,
-                    activity,
+                    liveness,
                     endpoint: Some(endpoint),
                 }
             }
@@ -827,6 +1163,7 @@ pub(crate) fn resolve(
                 waba_id,
                 phone_number_id,
                 graph_api_version,
+                liveness,
                 graph_endpoint,
             } => {
                 check_env_name(&app_secret_env, &mut problems);
@@ -859,13 +1196,14 @@ pub(crate) fn resolve(
                     waba_id,
                     phone_number_id,
                     graph_api_version,
+                    liveness,
                     graph_endpoint: Some(graph_endpoint),
                 }
             }
             TransportConfig::TelegramLongPoll {
                 name,
                 bot_token_env,
-                activity,
+                liveness,
                 endpoint,
             } => {
                 check_env_name(&bot_token_env, &mut problems);
@@ -873,13 +1211,18 @@ pub(crate) fn resolve(
                 TransportConfig::TelegramLongPoll {
                     name,
                     bot_token_env,
-                    activity,
+                    liveness,
                     endpoint: Some(endpoint),
                 }
             }
-            TransportConfig::Local { name, socket_path } => TransportConfig::Local {
+            TransportConfig::Local {
+                name,
+                socket_path,
+                liveness,
+            } => TransportConfig::Local {
                 name,
                 socket_path: resolve_path(socket_path),
+                liveness,
             },
         });
     }
@@ -910,11 +1253,53 @@ pub(crate) fn resolve(
     }
 
     let mut routes = Vec::with_capacity(config.routes.len());
-    for route in config.routes {
+    for (index, route) in config.routes.into_iter().enumerate() {
         if !transports_incomplete && !transport_names.contains(&route.transport) {
             problems.push(ConfigProblem::UnknownRouteTransport {
                 transport: route.transport.clone(),
             });
+        }
+        // Retired names first, because everything below reads the block they were written into and
+        // would otherwise blame a selector the operator never meant to write.
+        if route.retired_match.is_some() {
+            problems.push(ConfigProblem::RetiredRouteMatch { route: index });
+        }
+        if route.conversation.is_retired_memory_block() {
+            problems.push(ConfigProblem::RetiredMemoryBlock { route: index });
+        }
+        let conversation = route.conversation.selector();
+        // A selector is only meaningful against a transport family: `container` exists on Slack
+        // and not on Telegram, and `groupDirectMessage` is a shape Discord never produces.
+        if let Some(chat_kind) = transport_kinds.get(&route.transport) {
+            for problem in conversation.validate(*chat_kind) {
+                problems.push(ConfigProblem::InvalidRouteConversation {
+                    route: index,
+                    problem,
+                });
+            }
+        }
+        let direct_message_only = conversation.kind
+            == ConversationKindMatch::Kinds(vec![ConversationKind::DirectMessage]);
+        if route.subjects.is_some() && !direct_message_only {
+            problems.push(ConfigProblem::SubjectsOnNonDmRoute { route: index });
+        }
+        if route
+            .subjects
+            .as_ref()
+            .is_some_and(|subjects| subjects.is_empty())
+        {
+            problems.push(ConfigProblem::EmptyRouteSubjects { route: index });
+        }
+        if direct_message_only
+            && matches!(
+                route.memory,
+                MemoryConfig::Persistent {
+                    scope: MemoryScope::SharedConversation,
+                    ..
+                }
+            )
+        {
+            problems.push(ConfigProblem::SharedMemoryOnDmRoute { route: index });
         }
         if let Some(model) = &route.model
             && !models_incomplete
@@ -947,23 +1332,30 @@ pub(crate) fn resolve(
                 agent: route.agent.to_string(),
             });
         }
+        // A bound of zero cancels the session in the same instant it starts, which is a route that
+        // can only ever answer `Stopped.`; the way to run nothing is to remove the route.
+        if route.limits.max_duration_ms == Some(0) {
+            problems.push(ConfigProblem::InvalidRouteDuration {
+                agent: route.agent.to_string(),
+            });
+        }
         // A bound of zero is a bound nobody meant to write, exactly as a zero step budget already
         // is. The other half of this check — a window setting on a `oneShot` route — is a decode
         // failure rather than a check here, because there is no field it could have landed in.
-        let conversation = match route.conversation {
-            ConversationConfig::OneShot {} => ConversationPolicy::OneShot,
-            ConversationConfig::Persistent {
+        let memory = match route.memory {
+            MemoryConfig::OneShot {} => MemoryPolicy::OneShot,
+            MemoryConfig::Persistent {
                 scope,
                 idle_timeout_ms,
                 max_turns,
                 max_bytes,
             } => {
                 if idle_timeout_ms == 0 || max_turns == 0 || max_bytes == 0 {
-                    problems.push(ConfigProblem::InvalidConversationBounds {
+                    problems.push(ConfigProblem::InvalidMemoryBounds {
                         agent: route.agent.to_string(),
                     });
                 }
-                ConversationPolicy::Persistent(ConversationWindow {
+                MemoryPolicy::Persistent(MemoryWindow {
                     scope,
                     idle_timeout: Duration::from_millis(idle_timeout_ms),
                     limits: HistoryLimits {
@@ -975,7 +1367,8 @@ pub(crate) fn resolve(
         };
         routes.push(ResolvedRoute {
             transport: route.transport,
-            r#match: route.r#match,
+            conversation,
+            subjects: route.subjects,
             agent: route.agent,
             model: route.model,
             provider_attachments: route
@@ -983,10 +1376,29 @@ pub(crate) fn resolve(
                 .map_or(0, |attachments| attachments.max_per_reply),
             chat_asset_inputs: route.chat_asset_inputs,
             improvement_suggestions: route.improvement_suggestions,
+            inspect_agent_config: route.inspect_agent_config,
             limits: route.limits,
-            conversation,
+            progress_detail: route.progress_detail,
+            memory,
         });
     }
+
+    // Lowercased once here so the matcher in `dispatch` compares two values that were normalized
+    // the same way, rather than lowercasing the operator's list on every inbound message.
+    let stop_words = match config.stop_words {
+        Some(words) if words.is_empty() || words.iter().any(|word| word.trim().is_empty()) => {
+            problems.push(ConfigProblem::InvalidStopWords);
+            Vec::new()
+        }
+        Some(words) => words
+            .iter()
+            .map(|word| word.trim().to_lowercase())
+            .collect(),
+        None => DEFAULT_STOP_WORDS
+            .iter()
+            .map(|word| (*word).to_owned())
+            .collect(),
+    };
 
     if config.sessions.max_concurrent == 0 {
         problems.push(ConfigProblem::InvalidSessionLimits);
@@ -1064,6 +1476,8 @@ pub(crate) fn resolve(
                 transports,
                 models: config.models,
                 routes,
+                liveness: liveness_settings,
+                stop_words,
                 sessions: config.sessions,
                 shutdown_grace,
                 telemetry,
@@ -1075,6 +1489,166 @@ pub(crate) fn resolve(
             path: source,
             problems,
         }),
+    }
+}
+
+/// Validates one transport's `liveness:` block, recording every setting it cannot honor.
+///
+/// Every setting rather than the first, and a value comes back either way: the caller is
+/// collecting a whole file's problems and will refuse the configuration itself.
+fn resolve_liveness(
+    transport: &TransportConfig,
+    problems: &mut Vec<ConfigProblem>,
+) -> ResolvedLiveness {
+    let name = transport.name().to_owned();
+    let (liveness, experience) = match transport {
+        TransportConfig::SlackSocketMode {
+            liveness,
+            experience,
+            ..
+        } => (liveness, Some(*experience)),
+        TransportConfig::DiscordGateway { liveness, .. }
+        | TransportConfig::TelegramLongPoll { liveness, .. }
+        | TransportConfig::WhatsappCloudApi { liveness, .. }
+        | TransportConfig::Local { liveness, .. } => (liveness, None),
+    };
+
+    // A surface configured under `mode: off` is a setting that can never take effect, which is far
+    // more likely a forgotten `mode:` than an intention.
+    if liveness.mode == LivenessMode::Off {
+        for surface in [
+            (liveness.progress != ProgressSurface::Off).then_some("progress"),
+            liveness.stream.then_some("stream"),
+            liveness.cancel_button.then_some("cancelButton"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            problems.push(ConfigProblem::LivenessSurfaceWithoutMode {
+                transport: name.clone(),
+                surface,
+            });
+        }
+    }
+
+    // The same refusal wording for the base block and for every override, because a setting a
+    // transport cannot honor is the same mistake wherever it was written.
+    let whatsapp = matches!(transport, TransportConfig::WhatsappCloudApi { .. });
+    let slack_agent = experience == Some(SlackExperience::Agent);
+    /// Records every surface this transport cannot honor, for the base block or one override.
+    fn unsupported_surfaces(
+        problems: &mut Vec<ConfigProblem>,
+        transport: &str,
+        whatsapp: bool,
+        slack_agent: bool,
+        stream: bool,
+        cancel_button: bool,
+    ) {
+        if whatsapp {
+            for surface in [
+                stream.then_some("stream"),
+                cancel_button.then_some("cancelButton"),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                problems.push(ConfigProblem::UnsupportedLivenessSurface {
+                    transport: transport.to_owned(),
+                    surface,
+                    reason:
+                        "WhatsApp messages cannot be edited and carry no interactive components",
+                });
+            }
+        }
+        if slack_agent && cancel_button {
+            problems.push(ConfigProblem::UnsupportedLivenessSurface {
+                transport: transport.to_owned(),
+                surface: "cancelButton",
+                reason: "Slack's Agent experience renders its own Stop control",
+            });
+        }
+    }
+    unsupported_surfaces(
+        problems,
+        &name,
+        whatsapp,
+        slack_agent,
+        liveness.stream,
+        liveness.cancel_button,
+    );
+    let chat_kind = transport.chat_kind();
+    for (kind, overlay) in &liveness.conversations {
+        if !chat_kind.produces(*kind) {
+            problems.push(ConfigProblem::ImpossibleLivenessConversation {
+                transport: name.clone(),
+                kind: kind.as_str(),
+            });
+        }
+        unsupported_surfaces(
+            problems,
+            &name,
+            whatsapp,
+            slack_agent,
+            overlay.stream == Some(true),
+            overlay.cancel_button == Some(true),
+        );
+        if let Some(keep_alive) = &overlay.keep_alive
+            && (keep_alive.every_seconds == 0 || keep_alive.at_seconds.contains(&0))
+        {
+            problems.push(ConfigProblem::InvalidKeepAlive {
+                transport: name.clone(),
+            });
+        }
+    }
+
+    match experience {
+        // Carried over unchanged: the fallback is the classic app's only signal, and a native
+        // Agent installation that loses status falls back to it.
+        Some(experience) => {
+            let coherent = match (experience, liveness.mode) {
+                (_, LivenessMode::Off) => liveness.classic_fallback == SlackLivenessFallback::None,
+                (SlackExperience::Classic, LivenessMode::Native) => {
+                    liveness.classic_fallback == SlackLivenessFallback::Reaction
+                }
+                (SlackExperience::Agent, LivenessMode::Native) => true,
+            };
+            if !coherent {
+                problems.push(ConfigProblem::InvalidSlackLiveness {
+                    transport: name.clone(),
+                });
+            }
+        }
+        None if liveness.classic_fallback != SlackLivenessFallback::None => {
+            problems.push(ConfigProblem::UnsupportedLivenessFallback {
+                transport: name.clone(),
+            });
+        }
+        None => {}
+    }
+
+    // A zero period is a render loop rather than a keep-alive, and a tick at zero seconds is the
+    // post at `Started` this design deliberately does not make.
+    if liveness.keep_alive.every_seconds == 0 || liveness.keep_alive.at_seconds.contains(&0) {
+        problems.push(ConfigProblem::InvalidKeepAlive {
+            transport: name.clone(),
+        });
+    }
+
+    let (templates, template_problems) =
+        Templates::resolve(&liveness.templates, STOPPED_REPLY, FAILURE_REPLY);
+    for problem in template_problems {
+        problems.push(ConfigProblem::InvalidLivenessTemplate {
+            transport: name.clone(),
+            field: problem.field.key(),
+            placeholder: problem.placeholder,
+        });
+    }
+
+    ResolvedLiveness {
+        settings: liveness.settings(),
+        keep_alive: keep_alive_from(&liveness.keep_alive),
+        templates,
+        conversations: liveness.conversations.clone(),
     }
 }
 
@@ -1204,9 +1778,11 @@ fn is_loopback_authority(authority: &str) -> bool {
 
 /// Strict configuration failure.
 ///
-/// Only the four ways a file can be unusable before it is understood stop at the first error. Every
+/// Only the ways a file can be unusable before it is understood stop at the first error. Every
 /// semantic problem in a file that decoded is reported together through [`ConfigError::Invalid`],
-/// which is the shape `dekopon-config` already refuses a catalog with.
+/// which is the shape `dekopon-config` already refuses a catalog with. A file that still carries
+/// the retired `activity:` block stops there too: strict decoding refuses the key, and the refusal
+/// names the replacement instead of listing the fields a transport does accept.
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("could not determine the current directory")]
@@ -1236,6 +1812,14 @@ pub enum ConfigError {
     TooLarge { length: u64, maximum: usize },
     #[error("gateway configuration is not strict valid YAML/JSON")]
     Decode {
+        #[source]
+        source: serde_yaml::Error,
+    },
+    #[error(
+        "gateway configuration declares activity:, which this release replaced; write liveness: instead, with classicFallback where the old activity block had it"
+    )]
+    RetiredActivityBlock {
+        /// The decoder's own refusal, which carries where in the file the block was written.
         #[source]
         source: serde_yaml::Error,
     },
@@ -1275,9 +1859,46 @@ pub enum ConfigProblem {
     #[error("model {name:?} must have a timeout greater than zero")]
     InvalidModelTimeout { name: String },
     #[error(
-        "Slack transport {name:?} has an activity fallback that cannot take effect; off requires fallback none, and classic native activity requires fallback reaction"
+        "Slack transport {transport:?} has a liveness fallback that cannot take effect; off requires fallback none, and a classic app with native liveness requires fallback reaction"
     )]
-    InvalidSlackActivity { name: String },
+    InvalidSlackLiveness { transport: String },
+    #[error(
+        "transport {transport:?} sets liveness.{surface} while liveness.mode is off, where it can never take effect"
+    )]
+    LivenessSurfaceWithoutMode {
+        transport: String,
+        surface: &'static str,
+    },
+    #[error("transport {transport:?} cannot use liveness.{surface}: {reason}")]
+    UnsupportedLivenessSurface {
+        transport: String,
+        surface: &'static str,
+        reason: &'static str,
+    },
+    #[error(
+        "transport {transport:?} sets liveness.classicFallback, which only a slackSocketMode transport has"
+    )]
+    UnsupportedLivenessFallback { transport: String },
+    #[error(
+        "transport {transport:?} has a liveness.keepAlive bound of zero; everySeconds must be greater than zero and no offset may be zero"
+    )]
+    InvalidKeepAlive { transport: String },
+    #[error(
+        "transport {transport:?} liveness template {field} uses {{{placeholder}}}, which it cannot render"
+    )]
+    InvalidLivenessTemplate {
+        transport: String,
+        field: &'static str,
+        placeholder: String,
+    },
+    #[error(
+        "stopWords must not be empty and no word may be blank; omit the key to keep the default list"
+    )]
+    InvalidStopWords,
+    #[error(
+        "route for agent {agent:?} sets limits.maxDurationMs to 0, which cancels every session the instant it starts; omit it for no wall-clock bound"
+    )]
+    InvalidRouteDuration { agent: String },
     #[error("WhatsApp transport {name:?} must bind an explicit nonzero port")]
     InvalidWhatsappBind { name: String },
     #[error("WhatsApp transport {name:?} must use canonical positive WABA and phone-number IDs")]
@@ -1301,9 +1922,60 @@ pub enum ConfigProblem {
     #[error("session bounds must be greater than zero")]
     InvalidSessionLimits,
     #[error(
-        "route for agent {agent:?} declares a persistent conversation with a zero bound; its idle timeout, turn window, and byte window must each be greater than zero"
+        "route for agent {agent:?} declares a persistent memory window with a zero bound; its idle timeout, turn window, and byte window must each be greater than zero"
     )]
-    InvalidConversationBounds { agent: String },
+    InvalidMemoryBounds { agent: String },
+    #[error(
+        "routes[{route}]: `match` is no longer a route field; write `conversation: {{ kind: [channel, thread], ids: [...] }}`"
+    )]
+    RetiredRouteMatch {
+        /// Position of the offending route in the file.
+        route: usize,
+    },
+    #[error(
+        "routes[{route}]: `conversation:` is the match now; the memory window is `memory:` with the same fields"
+    )]
+    RetiredMemoryBlock {
+        /// Position of the offending route in the file.
+        route: usize,
+    },
+    #[error("routes[{route}]: conversation selector is invalid: {problem}")]
+    InvalidRouteConversation {
+        /// Position of the offending route in the file.
+        route: usize,
+        /// What is wrong with the selector.
+        problem: ConversationMatchProblem,
+    },
+    #[error(
+        "routes[{route}]: `subjects:` is accepted only beside `conversation: {{ kind: [directMessage] }}`; a per-person channel route is an access-control list by another name, and authority is the broker's subject mapping and policy"
+    )]
+    SubjectsOnNonDmRoute {
+        /// Position of the offending route in the file.
+        route: usize,
+    },
+    #[error(
+        "routes[{route}]: `subjects:` is empty, which answers nobody; omit it to answer every subject"
+    )]
+    EmptyRouteSubjects {
+        /// Position of the offending route in the file.
+        route: usize,
+    },
+    #[error(
+        "routes[{route}]: `memory.scope: sharedConversation` on a `kind: [directMessage]` route shares nothing; the direct message already is the subject"
+    )]
+    SharedMemoryOnDmRoute {
+        /// Position of the offending route in the file.
+        route: usize,
+    },
+    #[error(
+        "transport {transport:?} overrides liveness for conversation kind {kind}, which it never produces"
+    )]
+    ImpossibleLivenessConversation {
+        /// The transport whose block carries the impossible key.
+        transport: String,
+        /// The kind it named.
+        kind: &'static str,
+    },
     #[error(
         "sessions.maxConversations must be greater than zero; a zero ceiling evicts every conversation immediately and turns a persistent route into an expensive one-shot one"
     )]
@@ -1356,4 +2028,273 @@ pub(crate) fn render_problems<P: std::error::Error>(problems: &[P]) -> String {
         }
     }
     rendered
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use dekopon_broker_protocol::BrokerSocketDiscovery;
+
+    use super::{
+        ConfigError, LivenessMode, ModelConfig, ProgressDetail, ProgressSurface,
+        SlackLivenessFallback, resolve,
+    };
+    use crate::progress::{DEFAULT_KEEP_ALIVE_MAX, KeepAlive};
+
+    /// Everything a configuration needs before the field under test is added to it.
+    const PREAMBLE: &str = "apiVersion: dekopon.dev/dekopond/v1alpha1\n\
+         catalogPath: dekopon.yaml\n\
+         broker: { socketPath: /run/dekopon/broker.sock, serverUid: 501 }\n\
+         models:\n\
+         \x20 - name: m\n\
+         \x20   kind: openaiCompatible\n\
+         \x20   endpoint: http://127.0.0.1:11434/v1\n\
+         \x20   model: q\n\
+         \x20   timeoutMs: 1000\n\
+         \x20   classes: [reasoning]\n";
+
+    fn resolved(document: &str) -> Result<super::ResolvedConfig, ConfigError> {
+        let config =
+            super::decode(format!("{PREAMBLE}{document}").as_bytes()).expect("the fixture decodes");
+        resolve(
+            config,
+            PathBuf::from("/tmp/dekopond.yaml"),
+            &BrokerSocketDiscovery::new(None, None, Some(PathBuf::from("/run/user/501")), None),
+            501,
+        )
+    }
+
+    /// An operator with nine mistakes in one file fixes nine and restarts once. Each of these is a
+    /// setting that decodes cleanly and could never take effect, which is exactly the class this
+    /// file's strict validation exists to refuse out loud rather than absorb.
+    #[test]
+    fn every_liveness_conflict_in_one_file_is_reported_together() {
+        let error = resolved(
+            "transports:\n\
+             \x20 - name: slack\n\
+             \x20   kind: slackSocketMode\n\
+             \x20   appTokenEnv: A\n\
+             \x20   botTokenEnv: B\n\
+             \x20   experience: agent\n\
+             \x20   liveness: { mode: native, cancelButton: true }\n\
+             \x20 - name: wa\n\
+             \x20   kind: whatsappCloudApi\n\
+             \x20   appSecretEnv: C\n\
+             \x20   verifyTokenEnv: D\n\
+             \x20   accessTokenEnv: E\n\
+             \x20   bind: 0.0.0.0:9080\n\
+             \x20   callbackPath: /hook\n\
+             \x20   wabaId: \"1\"\n\
+             \x20   phoneNumberId: \"2\"\n\
+             \x20   graphApiVersion: v23.0\n\
+             \x20   liveness: { mode: native, stream: true, cancelButton: true }\n\
+             \x20 - name: tg\n\
+             \x20   kind: telegramLongPoll\n\
+             \x20   botTokenEnv: F\n\
+             \x20   liveness:\n\
+             \x20     mode: \"off\"\n\
+             \x20     progress: message\n\
+             \x20     classicFallback: reaction\n\
+             \x20     keepAlive: { everySeconds: 0 }\n\
+             \x20     templates: { working: \"Busy with {word}\" }\n\
+             stopWords: []\n\
+             routes:\n\
+             \x20 - transport: slack\n\
+             \x20   conversation: { kind: [directMessage] }\n\
+             \x20   agent: reviewer\n\
+             \x20   limits: { maxDurationMs: 0 }\n",
+        )
+        .expect_err("a file this broken must not resolve");
+
+        let rendered = error.to_string();
+        for expected in [
+            "transport \"slack\" cannot use liveness.cancelButton",
+            "transport \"wa\" cannot use liveness.stream",
+            "transport \"wa\" cannot use liveness.cancelButton",
+            "transport \"tg\" sets liveness.progress while liveness.mode is off",
+            "transport \"tg\" sets liveness.classicFallback",
+            "transport \"tg\" has a liveness.keepAlive bound of zero",
+            "liveness template working uses {word}",
+            "stopWords must not be empty",
+            "limits.maxDurationMs to 0",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "every conflict is reported together; {expected:?} is missing from:\n{rendered}"
+            );
+        }
+    }
+
+    /// A file written for the previous release is told what replaced its block, not which keys a
+    /// transport happens to accept.
+    ///
+    /// Strict decoding is what refuses it — no field of any transport accepts `activity` — so this
+    /// is the one refusal that cannot be collected beside the file's other problems, and the
+    /// sentence carries the whole migration on its own.
+    #[test]
+    fn a_retired_activity_block_is_refused_by_name() {
+        let document = format!(
+            "{PREAMBLE}{}",
+            "transports:\n\
+             \x20 - name: slack\n\
+             \x20   kind: slackSocketMode\n\
+             \x20   appTokenEnv: A\n\
+             \x20   botTokenEnv: B\n\
+             \x20   activity: { mode: native, classicFallback: reaction }\n\
+             routes:\n\
+             \x20 - transport: slack\n\
+             \x20   conversation: { kind: [directMessage] }\n\
+             \x20   agent: reviewer\n"
+        );
+        let error = super::decode(document.as_bytes())
+            .expect_err("a file that still carries the retired block must not decode");
+
+        let rendered = error.to_string();
+        for expected in [
+            "declares activity:",
+            "write liveness: instead",
+            "classicFallback",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "the refusal has to carry the migration; {expected:?} is missing from:\n{rendered}"
+            );
+        }
+    }
+
+    /// The shipped shape, so a deployment that writes the block and nothing else gets the schedule
+    /// and the sentences this daemon documents rather than an empty one.
+    #[test]
+    fn a_liveness_block_resolves_to_the_documented_defaults() {
+        let config = resolved(
+            "transports:\n\
+             \x20 - name: dev\n\
+             \x20   kind: local\n\
+             \x20   socketPath: dev.sock\n\
+             \x20   liveness: { mode: native, progress: message }\n\
+             routes:\n\
+             \x20 - transport: dev\n\
+             \x20   conversation: { kind: [directMessage] }\n\
+             \x20   agent: reviewer\n",
+        )
+        .expect("a well-formed configuration resolves");
+
+        assert_eq!(
+            config.stop_words,
+            vec!["stop".to_owned(), "cancel".to_owned()],
+            "the default list is what an operator gets by writing nothing"
+        );
+        let route = config.routes.first().expect("one route");
+        assert_eq!(route.progress_detail, ProgressDetail::Plain);
+        assert_eq!(route.limits.max_duration_ms, None);
+        let liveness = config.liveness.get("dev").expect("the transport resolved");
+        assert_eq!(liveness.settings.mode, LivenessMode::Native);
+        assert_eq!(liveness.settings.progress, ProgressSurface::Message);
+        assert_eq!(
+            liveness.settings.classic_fallback,
+            SlackLivenessFallback::None
+        );
+        assert!(!liveness.settings.stream && !liveness.settings.cancel_button);
+        assert_eq!(liveness.keep_alive, KeepAlive::default());
+        assert_eq!(liveness.keep_alive.max, DEFAULT_KEEP_ALIVE_MAX);
+        assert_eq!(liveness.templates.stopped(), super::STOPPED_REPLY);
+        assert_eq!(liveness.templates.failed(), super::FAILURE_REPLY);
+    }
+
+    /// Stop words are normalized once, where the list is read, rather than on every inbound
+    /// message: the matcher compares two values that were lowercased the same way.
+    #[test]
+    fn configured_stop_words_are_normalized_once() {
+        let config = resolved(
+            "transports:\n\
+             \x20 - name: dev\n\
+             \x20   kind: local\n\
+             \x20   socketPath: dev.sock\n\
+             stopWords: [\"  STOP \", Basta]\n\
+             routes:\n\
+             \x20 - transport: dev\n\
+             \x20   conversation: { kind: [directMessage] }\n\
+             \x20   agent: reviewer\n",
+        )
+        .expect("a well-formed configuration resolves");
+
+        assert_eq!(
+            config.stop_words,
+            vec!["stop".to_owned(), "basta".to_owned()]
+        );
+    }
+
+    /// Everything a two-model fixture needs around its `models:` block.
+    const HEAD: &str = "apiVersion: dekopon.dev/dekopond/v1alpha1\n\
+         catalogPath: dekopon.yaml\n\
+         broker: { socketPath: /run/dekopon/broker.sock, serverUid: 501 }\n";
+    const TAIL: &str = "transports:\n\
+         \x20 - name: dev\n\
+         \x20   kind: local\n\
+         \x20   socketPath: dev.sock\n\
+         routes:\n\
+         \x20 - transport: dev\n\
+         \x20   conversation: { kind: [directMessage] }\n\
+         \x20   agent: reviewer\n";
+
+    /// Only the kind that has a choice about streaming carries the switch, and its default is on.
+    ///
+    /// The default is the half worth pinning: a model block written before streaming existed
+    /// decodes into a streaming client, which is what makes `stream:` the repair for one endpoint
+    /// that gets `stream: true` wrong rather than a switch every deployment has to find.
+    /// `kind: chatgptSubscription` streams and cannot be asked not to, so the field written there
+    /// is refused by name instead of being accepted and ignored.
+    #[test]
+    fn only_an_openai_compatible_model_chooses_whether_it_streams() {
+        let document = format!(
+            "{HEAD}{}{TAIL}",
+            "models:\n\
+             \x20 - name: default\n\
+             \x20   kind: openaiCompatible\n\
+             \x20   endpoint: http://127.0.0.1:11434/v1\n\
+             \x20   model: q\n\
+             \x20   timeoutMs: 1000\n\
+             \x20 - name: buffered-proxy\n\
+             \x20   kind: openaiCompatible\n\
+             \x20   endpoint: http://127.0.0.1:11435/v1\n\
+             \x20   model: q\n\
+             \x20   timeoutMs: 1000\n\
+             \x20   stream: false\n"
+        );
+        let config = super::decode(document.as_bytes()).expect("the fixture decodes");
+
+        let streaming: Vec<bool> = config
+            .models
+            .iter()
+            .filter_map(|model| match model {
+                ModelConfig::OpenaiCompatible { stream, .. } => Some(*stream),
+                ModelConfig::ChatgptSubscription { .. } => None,
+            })
+            .collect();
+        assert_eq!(
+            streaming,
+            vec![true, false],
+            "a model block that says nothing streams; the one that says so does not"
+        );
+
+        let subscription = format!(
+            "{HEAD}{}{TAIL}",
+            "models:\n\
+             \x20 - name: codex\n\
+             \x20   kind: chatgptSubscription\n\
+             \x20   model: gpt-5\n\
+             \x20   timeoutMs: 1000\n\
+             \x20   stream: false\n"
+        );
+        let error = super::decode(subscription.as_bytes())
+            .expect_err("the subscription backend has no streaming switch to set");
+        let cause = std::error::Error::source(&error)
+            .map(ToString::to_string)
+            .expect("the decoder's own refusal is the cause");
+        assert!(
+            cause.contains("unknown field `stream`"),
+            "the refusal names the field the kind does not have: {cause}"
+        );
+    }
 }

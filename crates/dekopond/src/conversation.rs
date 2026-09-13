@@ -38,7 +38,7 @@ use dekopon_core::{AgentId, ExternalSubject};
 use crate::{
     asset::{AssetAccess, AssetFence},
     cache_key,
-    config::ConversationWindow,
+    config::MemoryWindow,
 };
 
 /// The audience discriminant on a remembered transcript.
@@ -167,7 +167,7 @@ impl ConversationLease<'_> {
     /// recreates an absent slot and never overwrites a replacement generation.
     pub fn commit(
         mut self,
-        window: ConversationWindow,
+        window: MemoryWindow,
         turn: ConversationTurn,
         declared_cache_key: &str,
         now: Instant,
@@ -289,7 +289,7 @@ impl ConversationStore {
         &self,
         key: &ConversationKey,
         granted: &[String],
-        window: ConversationWindow,
+        window: MemoryWindow,
         now: Instant,
     ) -> ConversationSeed<'_> {
         let mut state = self.state.lock().expect("conversation store");

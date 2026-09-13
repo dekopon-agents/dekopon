@@ -16,6 +16,17 @@ use std::{
 };
 
 pub use dekopon_capability::{InvocationOutcome, InvocationResult};
+
+mod conversation;
+
+pub use conversation::{
+    Conversation, ConversationKind, ConversationKindMatch, ConversationMatch,
+    ConversationMatchProblem,
+};
+use conversation::{
+    bounded_scope_part, canonical_meta_decimal, canonical_positive_service_decimal,
+    canonical_signed_decimal, canonical_slack_timestamp, canonical_unsigned_decimal,
+};
 use dekopon_core::{
     AgentId, CapabilityId, ExternalSubject, InvocationId, ProviderId, SecretUseProposal, TraceId,
     TraceIdError, TransportId,
@@ -320,16 +331,16 @@ impl fmt::Display for ChatTransportKind {
     }
 }
 
-/// Bounded transport-derived channel and conversation scope.
+/// Bounded transport-derived conversation scope.
+///
+/// The conversation is minted canonical by the transport that authenticated the message, so this
+/// claim carries the exact values a grant and a Cedar policy compare against.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ChatScopeClaim {
     pub transport: TransportId,
     pub kind: ChatTransportKind,
-    #[serde(deserialize_with = "deserialize_scope_part")]
-    pub channel: String,
-    #[serde(deserialize_with = "deserialize_scope_part")]
-    pub conversation: String,
+    pub conversation: Conversation,
 }
 
 impl fmt::Debug for ChatScopeClaim {
@@ -342,83 +353,8 @@ impl ChatScopeClaim {
     /// Defensive wire bounds common to every service-specific canonical form.
     #[must_use]
     pub fn is_bounded(&self) -> bool {
-        bounded_scope_part(&self.channel) && bounded_scope_part(&self.conversation)
+        self.conversation.is_bounded()
     }
-
-    /// Whether channel and conversation are the exact forms the claimed transport mints.
-    ///
-    /// One definition of the chat-scope grammar: the broker's grant validation, its
-    /// subject correlation, and [`DeliveryIdentity::is_canonical_for`] all decide the same
-    /// shapes here, so no layer can accept a scope another rejects. Structural only — it
-    /// consults no grant and decides nothing about authority — and it fails closed on any
-    /// value outside the wire bounds.
-    #[must_use]
-    pub fn is_canonical_shape(&self) -> bool {
-        if !self.is_bounded() {
-            return false;
-        }
-        match self.kind {
-            ChatTransportKind::Slack => {
-                lowercase_token(&self.channel)
-                    && (self.conversation == self.channel
-                        || self
-                            .conversation
-                            .split_once(':')
-                            .is_some_and(|(channel, timestamp)| {
-                                channel == self.channel && canonical_slack_timestamp(timestamp)
-                            }))
-            }
-            ChatTransportKind::Discord => {
-                // A Discord native thread is itself the channel used for routing and replies.
-                // There is no second thread identifier, so accepting two different decimals
-                // would create an alias for one transport-derived conversation.
-                self.conversation == self.channel && canonical_unsigned_decimal(&self.channel)
-            }
-            ChatTransportKind::Telegram => {
-                canonical_signed_decimal(&self.channel)
-                    && (self.conversation == self.channel
-                        || self
-                            .conversation
-                            .strip_prefix(&format!("{}:topic:", self.channel))
-                            .is_some_and(canonical_positive_service_decimal))
-            }
-            ChatTransportKind::Whatsapp => {
-                let mut parts = self.channel.split(':');
-                let canonical = parts.next().is_some_and(canonical_meta_decimal)
-                    && parts.next().is_some_and(canonical_meta_decimal)
-                    && parts.next().is_some_and(canonical_meta_decimal)
-                    && parts.next().is_none();
-                canonical && self.conversation == self.channel
-            }
-            ChatTransportKind::Local => {
-                lowercase_scope_value(&self.channel) && lowercase_scope_value(&self.conversation)
-            }
-        }
-    }
-}
-
-fn lowercase_token(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-}
-
-fn lowercase_scope_value(value: &str) -> bool {
-    !value.is_empty()
-        && value.bytes().all(|byte| {
-            byte.is_ascii_lowercase()
-                || byte.is_ascii_digit()
-                || matches!(byte, b'.' | b'-' | b'_' | b':')
-        })
-}
-
-fn bounded_scope_part(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 256
-        && value.trim() == value
-        && !value.bytes().any(|byte| byte.is_ascii_control())
-        && !value.contains(['/', '\\'])
 }
 
 fn deserialize_scope_part<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -627,14 +563,23 @@ impl fmt::Debug for DeliveryIdentity {
 }
 
 impl DeliveryIdentity {
+    /// Whether this delivery belongs to the conversation the claim separately attested.
+    ///
+    /// Service coordinates only: a Slack timestamp cannot be replayed under a Discord snowflake,
+    /// and a message in one conversation cannot be answered as a message in another. The
+    /// conversation's own grammar is [`Conversation::is_canonical_for`]'s job and is not repeated
+    /// here; this decides the join between the two.
     #[must_use]
     pub fn is_canonical_for(&self, scope: &ChatScopeClaim) -> bool {
+        let conversation = &scope.conversation;
         match (self, scope.kind) {
             (Self::Slack { channel, timestamp }, ChatTransportKind::Slack) => {
-                channel == &scope.channel && canonical_slack_timestamp(timestamp)
+                channel == &conversation.id && canonical_slack_timestamp(timestamp)
             }
             (Self::Discord { channel, message }, ChatTransportKind::Discord) => {
-                channel == &scope.channel
+                // A Discord thread *is* the channel its messages are posted in, so the delivery
+                // names the thread while the conversation's `id` names the parent.
+                channel == conversation.api_channel(ChatTransportKind::Discord)
                     && canonical_unsigned_decimal(channel)
                     && canonical_unsigned_decimal(message)
             }
@@ -646,12 +591,9 @@ impl DeliveryIdentity {
                 },
                 ChatTransportKind::Telegram,
             ) => {
-                let expected_topic = scope
-                    .conversation
-                    .strip_prefix(&format!("{}:topic:", scope.channel));
-                chat == &scope.channel
+                chat == &conversation.id
                     && canonical_signed_decimal(chat)
-                    && topic.as_deref() == expected_topic
+                    && topic.as_deref() == conversation.thread.as_deref()
                     && topic
                         .as_deref()
                         .is_none_or(canonical_positive_service_decimal)
@@ -665,13 +607,7 @@ impl DeliveryIdentity {
                 },
                 ChatTransportKind::Whatsapp,
             ) => {
-                let mut parts = scope.channel.split(':');
-                let canonical = parts.next() == Some(waba.as_str())
-                    && parts.next() == Some(phone_number.as_str())
-                    && parts.next().is_some_and(canonical_meta_decimal)
-                    && parts.next().is_none();
-                canonical
-                    && scope.conversation == scope.channel
+                conversation.container.as_deref() == Some(&format!("{waba}:{phone_number}"))
                     && canonical_meta_decimal(waba)
                     && canonical_meta_decimal(phone_number)
                     && canonical_whatsapp_message_id(message)
@@ -679,7 +615,7 @@ impl DeliveryIdentity {
             (
                 Self::Local {
                     transport,
-                    conversation,
+                    conversation: named,
                     boot_nonce,
                     connection,
                     sequence,
@@ -687,7 +623,7 @@ impl DeliveryIdentity {
                 ChatTransportKind::Local,
             ) => {
                 transport == &scope.transport
-                    && conversation == &scope.conversation
+                    && named == &conversation.key()
                     && boot_nonce.len() == 32
                     && boot_nonce
                         .bytes()
@@ -722,13 +658,6 @@ where
     canonical_meta_decimal(&value)
         .then_some(value)
         .ok_or_else(|| serde::de::Error::custom("identifier is not a canonical Meta decimal"))
-}
-
-fn canonical_meta_decimal(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && !value.starts_with('0')
-        && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn deserialize_positive_service_decimal<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -789,34 +718,6 @@ where
     }
 
     deserializer.deserialize_option(OptionalServiceDecimal)
-}
-
-fn canonical_slack_timestamp(value: &str) -> bool {
-    value.split_once('.').is_some_and(|(seconds, fraction)| {
-        seconds.len() == 10
-            && fraction.len() == 6
-            && !seconds.starts_with('0')
-            && seconds.bytes().all(|byte| byte.is_ascii_digit())
-            && fraction.bytes().all(|byte| byte.is_ascii_digit())
-    })
-}
-
-fn canonical_unsigned_decimal(value: &str) -> bool {
-    value
-        .parse::<u64>()
-        .is_ok_and(|number| number != 0 && number.to_string() == value)
-}
-
-fn canonical_positive_service_decimal(value: &str) -> bool {
-    value
-        .parse::<i64>()
-        .is_ok_and(|number| number > 0 && number.to_string() == value)
-}
-
-fn canonical_signed_decimal(value: &str) -> bool {
-    value
-        .parse::<i64>()
-        .is_ok_and(|number| number != 0 && number.to_string() == value)
 }
 
 /// Exact turn accepted by a transport and proposed once for model-hidden recording.

@@ -140,8 +140,9 @@ permit(principal == Dekopon::Principal::"smoke-user",
             "identities": [{"uid": os.geteuid(), "principal": "dekopond-gateway",
                 "actor": {"type": "service", "principal": "dekopond-gateway"},
                 "attestor": {"namespaces": ["tel"], "chatScopes": [{
-                    "breadth": "exactConversation", "kind": "local", "transport": "dev",
-                    "channel": "dev", "conversation": "dev", "localSubjectService": "tel"}]}}],
+                    "kind": "local", "transport": "dev",
+                    "conversation": {"kind": "any", "ids": ["dev"]},
+                    "localSubjectService": "tel"}]}}],
             "identityMappings": [{"subject": "tel.16034700182", "principal": "smoke-user"}],
             "constraintSets": {"echo.echo": {"provider": "echo", "effect": "read-only",
                 "risk": "Low",
@@ -156,10 +157,13 @@ permit(principal == Dekopon::Principal::"smoke-user",
             "apiVersion": "dekopon.dev/dekopond/v1alpha1", "catalogPath": catalog,
             "broker": {"socketPath": str(directory / "broker.sock"), "serverUid": os.geteuid()},
             "transports": [{"name": "dev", "kind": "local", "socketPath": str(directory / "dev.sock")}],
+            # The stub answers one JSON completion and ignores `stream`, which is exactly the
+            # endpoint `stream: false` exists for; the default asks for an event stream.
             "models": [{"name": "stub", "kind": "openaiCompatible", "model": "smoke-model",
                 "endpoint": f"http://127.0.0.1:{model.server_port}/v1", "apiKeyEnv": "SMOKE_MODEL_KEY",
-                "timeoutMs": 15000, "classes": ["reasoning"]}],
-            "routes": [{"transport": "dev", "match": {"kind": "directMessage"}, "agent": "chat-agent",
+                "timeoutMs": 15000, "classes": ["reasoning"], "stream": False}],
+            "routes": [{"transport": "dev", "conversation": {"kind": ["directMessage"]},
+                "agent": "chat-agent",
                 "limits": {"maxSteps": 4, "maxCapabilityCalls": 4}}],
             "sessions": {"maxConcurrent": 1}, "shutdownGraceMs": 15000, "telemetry": telemetry})
         gateway = start("dekopond", gateway_config, {"SMOKE_MODEL_KEY": CREDENTIAL})
@@ -167,7 +171,9 @@ permit(principal == Dekopon::Principal::"smoke-user",
         with socket.socket(socket.AF_UNIX) as client:
             client.settimeout(60)
             client.connect(str(path))
-            client.sendall((json.dumps({"subject": "tel.16034700182", "channel": "dev", "text": PAYLOAD}) + "\n").encode())
+            client.sendall((json.dumps({"subject": "tel.16034700182",
+                "conversation": {"kind": "directMessage", "id": "dev"},
+                "text": PAYLOAD}) + "\n").encode())
             with client.makefile("rb") as reader:
                 line = reader.readline(65537)
             assert len(line) <= 65536 and line.endswith(b"\n"), "response line bound"

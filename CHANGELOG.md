@@ -9,6 +9,99 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Added
 
+- One vocabulary for everything a waiting person is shown while a session runs, mapped down to each
+  transport's own surfaces. `ChatDriver` replaces `ChatReplier` and `ChatActivity`, and exposes
+  typing, native status, an editable progress message, a streamed answer, an inbound reaction, and a
+  cancel button as capability objects a transport either implements or does not. One per-session
+  policy task owns timing, budgets, and the single message the gateway may edit: a reaction and a
+  typing lease at t=0, a progress message posted on the first text delta, capability call, or
+  15-second keep-alive tick and never on a fast one-turn answer, keep-alives at 15 s, 45 s and then
+  every 60 s up to ten, edits coalesced inside each transport's minimum interval and bounded at 60
+  per session, and the answer finalized into that same message at the end.
+- `liveness:` per transport, with `progress`, `stream`, `cancelButton`, `keepAlive`, and five
+  operator `templates`; `progressDetail` per route (`off`, `plain`, `detailed`); top-level
+  `stopWords:` (default `[stop, cancel]`); and `limits.maxDurationMs` per route. Every setting a
+  transport cannot honor is a startup refusal naming it, reported together with every other problem
+  in the file.
+- Stopping a run on every transport, not only the ones with a native Stop. A stop word in the
+  conversation, a cancel button on the progress message where the service has components, an
+  operator shutdown, and the new wall-clock budget all reach one cooperative decision; only the
+  subject who started a session may stop it, and another person's press is acknowledged and ignored.
+  Partial streamed text stays on screen with the stopped line after it, and a stop that arrives once
+  the loop already has an answer is refused as `already-ended` rather than landing underneath it.
+- `gateway.progress` on the message's own trace, one record per event, carrying counters, durations,
+  and the provider's own command word and never a prompt, an argument, a provider result, or model
+  text. `gateway_progress_rendered`, `gateway_progress_degraded`, `gateway_progress_budget_exhausted`
+  and `gateway_progress_dropped` are its debug-level rendering counterparts.
+- `dekopon-agent` reports what a session is doing: `progress::ProgressEvent` and `ProgressSink`,
+  installed with `prompt::SessionInputs::with_progress` and `BrokerLeg::with_progress`. The loop
+  reports each model turn, each streamed fragment, each answer, and how the session ended; the
+  broker leg reports each command word, capability call, and accepted attachment. An absent sink
+  is a no-op at every seam.
+- `docs/chat-progress.md`: the design of record for chat progress, liveness, streaming, and
+  cancellation — the vocabulary, the driver trait, the policy's rendering and terminal rules, and
+  the limits that are accepted rather than solved.
+- The development transport is the reference chat driver: typing, native status, an editable
+  progress message, a streamed answer, a reaction, and a cancel acknowledgement each arrive as one
+  JSON line, and an inbound `{"stop": true}` line cancels the run on that conversation.
+- Discord shows what a session is doing: a typing lease renewed inside its ten-second window, a
+  tangerine reaction on the question, an editable progress message carrying a danger-styled Stop
+  button, the answer streamed by cumulative edits, and the answer finalized in place when it fits
+  one message.
+- Pressing Stop on Discord is acknowledged in the transport reader with a type 7 `UPDATE_MESSAGE`
+  that rewrites the message and removes the button, before the press reaches the routing loop.
+- A streamed answer the policy had to cut ends with `…` on Discord and on the development
+  transport, so the text on screen says it is not the whole answer yet.
+- Slack sessions now show what they are doing: a progress message posted as a thread reply, edited
+  in place, and finalized as the answer; the model's answer streamed through
+  `chat.startStream`/`appendStream`/`stopStream`, carrying a `…` once the answer is cut to fit the
+  stream while the closing message still holds it whole; and a Block Kit Stop button on classic
+  apps whose press arrives as `block_actions` over Socket Mode.
+- Telegram sessions show an editable progress message, stream the answer into it by cumulative
+  `editMessageText`, react to the message being answered, and carry an inline Stop button whose
+  press is acknowledged inside the long-poll reader before the cancel request reaches the gateway.
+  A stream is cut at 4,000 Unicode scalars rather than at the Bot API's 4,096 UTF-16 units, which
+  leaves room for the ellipsis a cut render ends in: an edited message that simply stops looks
+  finished.
+- WhatsApp sessions show Meta's typing indicator, fused with the read receipt on the message being
+  answered and re-posted every 20 seconds while the session runs; whether re-posting renews Meta's
+  25-second dismissal is unverified against the Graph API.
+- Shared chat-progress test scaffolding in `dekopon-test-support`: a script runtime that parks
+  inside `run_script`, a streaming model that hands out one recorded event per release and can hold
+  a silent phase open to a caller-chosen deadline, a chat driver whose capability objects are
+  switched on per test with per-object failure injection, recorded OpenAI chat-completions and
+  Codex Responses SSE transcripts, and a capture layer that records each event's whole enclosing
+  span scope rather than only its immediate parent.
+- Streaming model turns. `ChatModel::complete` takes an event callback and reports a turn's
+  visible answer text as it arrives; returning `ControlFlow::Break` drops the response body,
+  closes the connection, and answers `ModelError::Interrupted`. New `dekopon_model::ModelText` and
+  `dekopon_model::TurnEvent`; `ModelText` can be filled from bytes only inside `dekopon-model`, so
+  nothing else can put reasoning, tool-call arguments, or tool output on a chat surface.
+- `stream` on `kind: openaiCompatible` models, default `true`. Streaming requests send `stream:
+  true` and `stream_options.include_usage`; `stream: false` omits both fields and reports no
+  events, for an endpoint or proxy that gets event streams wrong. `kind: chatgptSubscription`
+  always streams and has no such field.
+- `inspectAgentConfig: false` on a route withholds `inspect_agent_config` from that route's
+  sessions: the tool is absent from the model's list and a scripted call to it is an unknown tool.
+  Default `true` keeps today's behavior. It removes the structured dump — description, model class,
+  limits, and the agent's standing orders verbatim — and nothing else; the instructions are still
+  the system prompt, so secrecy from a determined user is the model's obedience rather than a gate.
+- A Cedar `context.conversation` record — `kind`, optional `container`, `id`, optional `thread` —
+  replaces the `context.channel` and `context.conversation` strings on every action. `container`
+  and `thread` are optional in the schema, so a policy reading either without a
+  `context.conversation has …` guard fails strict validation when the broker loads it. A stale
+  `context has channel && context.channel == …` does *not* fail: Cedar types the guard as false and
+  short-circuits, so the statement loads and silently stops matching — grep for it.
+- Per-conversation-kind liveness overrides: `liveness.conversations.<kind>` overlays `progress`,
+  `stream`, `cancelButton`, and `keepAlive` (which replaces the base block whole) on the transport's
+  own settings. `mode`, `classicFallback`, and `templates` are transport facts rather than budget
+  knobs and are not overridable, and `progressDetail` stays the route's axis. A key naming a kind
+  the transport never produces, or an override a transport cannot honor, is a startup refusal with
+  the base block's own wording.
+- Durable-memory namespaces now derive from the conversation: `channel := conversation.id` and
+  `conversation := conversation.key()`. Slack and non-thread Discord namespaces are byte-identical
+  to 0.13; WhatsApp, Telegram topics, and Discord threads rotate and start empty, with no migration
+  ([`docs/upgrading.md`](docs/upgrading.md) names the three).
 - `http.plaintextHosts` in `broker.yaml` opts exact hostnames out of the native HTTP host's
   loopback-only plaintext rule. Plaintext `http://` is still refused to everything else, because a
   credential injected into a request that crosses a network in the clear is a credential on that
@@ -26,8 +119,82 @@ All notable changes to Dekopon are documented here. The format is based on
   destination in `allowedHosts` and still needs that set's `allowPlaintextLoopback`. Default empty,
   which is the previous behavior exactly.
 
+### Changed
+
+- **Breaking (configuration).** Routes match a `conversation` — a kind list or the word `any`, an
+  optional `container`, and optional `ids` — and `chatScopes` grants in `broker.yaml` use the same
+  selector. `match:` and `breadth:` are gone, and a file still carrying either refuses to start
+  naming `conversation:`. Threads under a routed channel now answer: a route or a grant naming a
+  parent claims the threads under it when its kind list includes `thread`, where before a Discord
+  thread was a separate channel id that matched nothing. Slack multi-person DMs, which used to
+  arrive as `channel`, are `groupDirectMessage`, so a Slack route that should keep answering them
+  writes `kind: any` or lists the kind. `exactConversation` has no replacement: a grant names a
+  parent conversation, never one thread. [`docs/upgrading.md`](docs/upgrading.md) has the migration.
+- **Breaking (configuration).** The route's memory window, which was also spelled `conversation:`,
+  is `memory:` with the same fields. A `mode:`, `scope:`, `idleTimeoutMs:`, `maxTurns:`, or
+  `maxBytes:` key under `conversation:` is a startup refusal naming the rename rather than an
+  unknown-field message about the match block it landed in.
+- **Breaking (configuration).** `activity:` is replaced by `liveness:`. No transport has an
+  `activity` field any more, so a configuration that still carries one no longer decodes, and the
+  refusal names `liveness:` and where `classicFallback` goes instead of listing the keys a transport
+  does accept. `mode` and `classicFallback` keep their meanings and values, so a rename alone
+  reproduces the previous behavior: [`docs/upgrading.md`](docs/upgrading.md) has the migration.
+- **Breaking (API).** `ChatTransport::driver()` replaces `replier()` and `activity()`;
+  `TransportEvent::CancelRequested` replaces `SessionStopped`; and `InboundMessage.liveness` replaces
+  `.activity`. Every session now registers for cancellation, where previously only a transport with a
+  native Stop control did.
+- The session's policy task is the only writer of a terminal message once a session has started, so
+  `Stopped.` can no longer land ahead of the partial answer it follows.
+- The prompt loop streams every model turn through `ChatModel::complete`'s per-event callback: it
+  forwards visible text as it arrives, bounded at 8 KiB of cumulative text per turn, and stops the
+  turn between events when the cancellation probe fires. `prompt.model_turn` gains `stream.deltas`
+  and `stream.first_delta_ms`; an interrupted turn records `agent.model.answer` with the partial
+  text and `stream.interrupted = true`, and `accounting.model.turn` with `outcome = interrupted`
+  and no usage.
+- `prompt::CancellationProbe` gains a defaulted `cancel_source`, so an embedder that knows whether
+  a person, a shutdown, or a budget asked for the stop can say so; the default reports the
+  embedder itself.
+- `attachment::strip_attachments` answers with the accepted attachment sizes alongside the
+  refusals, and `attachment::ATTACHMENT_MEDIA_TYPE` is public: a progress surface names the file
+  that arrived before the reply carrying it is posted.
+- Slack's Agent session status and `:tangerine:` reaction moved behind the new driver capability
+  objects, and the reaction stays strictly the fallback: it is offered to a classic app, or to an
+  Agent installation only after Slack has permanently refused it a native status, never beside a
+  working spinner. Every transient Slack call — status, reaction, progress, stream — shares one
+  429 cooldown and is never retried, because Tier 3 is counted per app per workspace across
+  sessions.
+- Telegram's typing action, reactions, progress edits, and button acknowledgments share one
+  two-second deadline and one server-directed cooldown, and a cooldown is now reported as a
+  failure with its cause rather than as a silent success.
+- Both model backends read server-sent events through one parser bounded at 16 MiB, and the
+  chat-completions accumulator tolerates what compatible endpoints actually send: `delta.content`
+  null, `usage` null, a whole tool call in one fragment, and every call of a batch reported at
+  index 0. A streamed turn equals the non-streaming parse of the same completion; a stream cut off
+  before `[DONE]` or a finish reason fails naming that rather than passing a half answer off as
+  the whole one.
+- The gateway's end-to-end test model now answers as a server-sent event stream rather than one
+  JSON document, because that is the path the model client takes by default.
+- `ci/fetch-external-provider-components.sh` pins a release tag, checksum, and size per provider
+  rather than `v0.1.0` for all three. Echo, JSONPlaceholder, and memory-chat all move to `v0.2.0`,
+  their first builds on `dekopon-provider-sdk` 0.13.0 — the `v0.1.0` assets emit `idempotency`, so
+  they no longer load.
+- `gateway_progress_degraded` carries the `category` of the failure that stopped the rung.
+
 ### Removed
 
+- **Breaking.** `crates/dekopond/src/activity.rs` and every name it owned: `ChatActivity`,
+  `ChatReplier`, `ActivityTarget`, `ActivityMode`, `NativeActivityConfig`, `SlackActivityConfig`,
+  `SlackActivityFallback`, `ActivityLease`, `ActivityControl`, `SessionStop`, `StopReply`,
+  `TransportEvent::SessionStopped`, `ChatTransport::replier`, `ChatTransport::activity`, and
+  `InboundMessage.activity`. Nothing is aliased, deprecated, or kept behind a flag.
+- **Breaking.** `ChatModel::complete_with` and the two-argument `ChatModel::complete`.
+  Implementations now define one `complete` taking `options` and an event callback; one that cannot
+  stream calls the callback zero times and returns the whole turn.
+- The producer-less `FailureClass::WallClock` and `FailureClass::Provider` variants, and
+  `BudgetLimit::Steps` and `BudgetLimit::CapabilityCalls` with their `budget:steps` and
+  `budget:capability-calls` cancellation labels. A route's `maxDurationMs` is the only budget that
+  cancels a session; step exhaustion is `Failed { class: StepBudget }`, and the capability-call
+  ceiling is a shell budget error the model reads and recovers from.
 - **Breaking.** Deleted every pre-0.13 provider compatibility path. A provider component must now
   be built on `dekopon-provider-sdk` 0.13.0 or later, and the whole fleet must be rebuilt and
   re-pinned before the broker is upgraded; see
@@ -61,12 +228,43 @@ All notable changes to Dekopon are documented here. The format is based on
   host-side and guest-side machinery is the whole breaking change, with no second round of fleet
   churn behind a package bump.
 
-### Changed
+### Fixed
+- A streamed request that an `openaiCompatible` endpoint answers with a whole JSON document (a stub, a buffering proxy) now fails at once naming `stream: false` as the fix, instead of failing at the end of a stream that never was one. `accounting.model.turn` with `outcome = "failed"` and `gateway_session_failed` carry the `error` that produced them.
 
-- `ci/fetch-external-provider-components.sh` pins a release tag, checksum, and size per provider
-  rather than `v0.1.0` for all three. Echo, JSONPlaceholder, and memory-chat all move to `v0.2.0`,
-  their first builds on `dekopon-provider-sdk` 0.13.0 — the `v0.1.0` assets emit `idempotency`, so
-  they no longer load.
+- The Discord transport records why it dropped an inbound message as `drop.reason` on its
+  `transport.receive` span, so a message the gateway never answers says so in its own trace
+  instead of vanishing.
+- A capability identifier a model invents — `cap <anything>` in a script — no longer reaches the
+  progress line. The broker leg reports `ToolStarted` and `ToolFinished` only for a capability the
+  session holds, the same check bare-word dispatch already made; an unheld identifier is refused
+  exactly as before, and its refusal stays on the trace.
+- A progress `post` or first stream render that misses its two-second deadline stops that rung for
+  the session instead of posting a second message beside one the gateway cannot name, and a
+  `finalize` that misses it is no longer followed by a delete: the answer is posted beside the
+  surface rather than replacing a message that may already carry it.
+- A session that fails or declines while its answer is streaming closes the stream in place, with
+  the partial answer above the failure sentence, instead of leaving the stream open and posting
+  that sentence as a second message.
+- A Slack or Discord Stop button carries the exact conversation key the session registry holds. A
+  press in a real (uppercase) Slack channel, and a press in a Discord thread, previously routed a
+  second spelling of that key and stopped nothing.
+- A Slack `app_mention` carries no `channel_type`, so the gateway resolves the conversation's kind
+  through one bounded, cached `conversations.info` call. A mention in a direct message or a
+  multi-person DM was minted as a `channel` before, and matched no `directMessage` or
+  `groupDirectMessage` route. Both Slack app manifests gain `channels:read`, `groups:read`,
+  `im:read`, and `mpim:read`, and the classic manifest enables interactivity so a Stop press
+  reaches the gateway; reinstall the app.
+- The Slack message that opens a thread is no longer read as a thread under itself: a `thread_ts`
+  equal to the message's own `ts` is the opening post, and it keeps the kind of the conversation it
+  was posted in.
+- Every line on the development transport is addressed, so a local `channel`, `thread`, or
+  `groupDirectMessage` line reaches its route; the owner-only socket is the authentication.
+- Telegram treats `message_thread_id` as a forum topic only when `is_topic_message` says so, so an
+  ordinary reply in a non-forum supergroup or a private chat no longer becomes a conversation of
+  its own. A topic id the Bot API would never mint drops that one update instead of abandoning the
+  rest of the acknowledged poll batch.
+- A WhatsApp delivery is answered only when one of its own `contacts` is the message's sender, and
+  each dropped message records its own reason instead of overwriting the delivery's shared trace.
 
 ## [dekopon-chart-0.6.0] - 2026-09-12
 

@@ -1,4 +1,4 @@
-use std::{fmt, io::Read as _, time::Duration};
+use std::{fmt, io::Read as _, ops::ControlFlow, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dekopon_core::Redacted;
@@ -7,6 +7,11 @@ use serde::{Deserialize, Serialize, Serializer};
 use serde_json::Value;
 use thiserror::Error;
 use ureq::{Agent, http};
+
+use crate::{
+    sse::{SseError, SseEvent, SseReader},
+    stream::{ModelText, TurnEvent},
+};
 
 /// A model-facing tool definition.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -328,34 +333,31 @@ impl CompletionOptions {
 }
 
 /// Synchronous model boundary used by the immediate prompt loop.
-pub trait ChatModel {
-    /// Requests the next assistant turn.
+pub trait ChatModel: Send + Sync {
+    /// Requests the next assistant turn, reporting what arrives while it arrives.
+    ///
+    /// One method, not two. Streaming is not a mode a caller opts into here: an implementation
+    /// that cannot stream — a test double, an endpoint configured with `stream: false` — calls
+    /// `on_event` zero times and returns the same [`AssistantTurn`] it always did. A caller
+    /// therefore never has two paths to keep in agreement, which is what a second entry point
+    /// costs in practice.
+    ///
+    /// `on_event` runs on this thread, in arrival order, between reads. Returning
+    /// [`ControlFlow::Break`] stops the turn: the response body is dropped, which closes the
+    /// connection rather than returning it to the pool, and the call answers
+    /// [`ModelError::Interrupted`]. Whatever text had already been delivered is the caller's — the
+    /// turn itself is gone, and nothing partial is returned in its place.
+    ///
+    /// What cannot be interrupted is a read that is waiting on a silent socket. `Break` is
+    /// observed between events, so a backend in a phase that emits none — the Codex reasoning
+    /// phase, tens of seconds of it — stops only when the client's global deadline fires.
     fn complete(
         &self,
         messages: &[ModelMessage],
         tools: &[ModelTool],
-    ) -> Result<AssistantTurn, ModelError>;
-
-    /// Requests the next assistant turn with request-scoped routing metadata.
-    ///
-    /// Provided rather than required so that adding routing metadata does not force every
-    /// implementation — most of which are test doubles — to grow a parameter it has no use for.
-    /// The default discards `options` and calls [`ChatModel::complete`], which is the safe
-    /// degradation: an implementation that never learned about a field behaves exactly as it did
-    /// before, because nothing in [`CompletionOptions`] is required for a correct answer.
-    ///
-    /// Transports that do act on options should override this method and define `complete` as
-    /// delegating to it with [`CompletionOptions::default`], so one request-building path serves
-    /// both entry points and the two cannot drift apart.
-    fn complete_with(
-        &self,
-        messages: &[ModelMessage],
-        tools: &[ModelTool],
         options: &CompletionOptions,
-    ) -> Result<AssistantTurn, ModelError> {
-        let _ = options;
-        self.complete(messages, tools)
-    }
+        on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
+    ) -> Result<AssistantTurn, ModelError>;
 }
 
 /// OpenAI-compatible chat-completions client.
@@ -364,6 +366,7 @@ pub struct OpenAiChatModel {
     endpoint: String,
     model: String,
     bearer_token: Option<Redacted<String>>,
+    stream: bool,
 }
 
 impl OpenAiChatModel {
@@ -408,7 +411,21 @@ impl OpenAiChatModel {
             endpoint: completion_url(&endpoint),
             model,
             bearer_token,
+            stream: true,
         })
+    }
+
+    /// Chooses whether this endpoint is asked to stream its answer. Streaming is the default.
+    ///
+    /// The escape hatch for an endpoint that claims chat-completions compatibility and gets
+    /// `stream: true` wrong — a proxy that buffers the whole SSE body, a server that drops
+    /// `usage`. With streaming off the request omits the field entirely rather than sending
+    /// `false`, so such an endpoint receives the request it received before streaming existed, and
+    /// the turn's callback is never called.
+    #[must_use]
+    pub fn with_streaming(mut self, stream: bool) -> Self {
+        self.stream = stream;
+        self
     }
 }
 
@@ -417,21 +434,15 @@ impl ChatModel for OpenAiChatModel {
         &self,
         messages: &[ModelMessage],
         tools: &[ModelTool],
-    ) -> Result<AssistantTurn, ModelError> {
-        self.complete_with(messages, tools, &CompletionOptions::default())
-    }
-
-    fn complete_with(
-        &self,
-        messages: &[ModelMessage],
-        tools: &[ModelTool],
         options: &CompletionOptions,
+        on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
     ) -> Result<AssistantTurn, ModelError> {
         let span = tracing::info_span!(
             "model.complete",
             model = %self.model,
             message.count = messages.len(),
-            tool.count = tools.len()
+            tool.count = tools.len(),
+            model.stream = self.stream
         );
         let _entered = span.enter();
 
@@ -449,12 +460,22 @@ impl ChatModel for OpenAiChatModel {
             tools: &tools,
             tool_choice: "auto",
             prompt_cache_key: options.prompt_cache_key(),
+            stream: self.stream.then_some(true),
+            // Without this a streamed turn reports no usage at all, and a call whose cost the
+            // provider did not report is a call Dekopon cannot price.
+            stream_options: self.stream.then_some(StreamOptions {
+                include_usage: true,
+            }),
         };
 
-        let mut request = self
-            .agent
-            .post(&self.endpoint)
-            .header("accept", "application/json");
+        let mut request = self.agent.post(&self.endpoint).header(
+            "accept",
+            if self.stream {
+                "text/event-stream"
+            } else {
+                "application/json"
+            },
+        );
         if let Some(token) = &self.bearer_token {
             // One of the few places a credential leaves its wrapper, and it goes straight onto the
             // wire rather than into a variable that could later be formatted somewhere else.
@@ -468,29 +489,62 @@ impl ChatModel for OpenAiChatModel {
             let detail = read_error_body(response);
             return Err(ModelError::Request(format!("HTTP {status}: {detail}")));
         }
-        let response = response
-            .body_mut()
-            .read_json::<ChatResponse>()
-            .map_err(|error| ModelError::Response(error.to_string()))?;
-        let choice = response
-            .choices
-            .into_iter()
-            .next()
-            .ok_or(ModelError::NoChoices)?;
-
-        let tool_calls = choice
-            .message
-            .tool_calls
-            .into_iter()
-            .map(ModelToolCall::try_from)
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(AssistantTurn {
-            content: choice.message.content,
-            tool_calls,
-            usage: response.usage.map(ModelUsage::from),
-            replay_items: Vec::new(),
-        })
+        if !self.stream {
+            let response = response
+                .body_mut()
+                .read_json::<ChatResponse>()
+                .map_err(|error| ModelError::Response(error.to_string()))?;
+            return turn_from_response(response);
+        }
+        // An endpoint that ignores `stream: true` answers with one JSON document. Reading that as
+        // an event stream fails only at its end with "stream ended before [DONE]", which names
+        // neither the endpoint's behaviour nor the one-line fix, so the content type is checked
+        // first and the refusal names the key to write.
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !content_type.starts_with("text/event-stream") {
+            let shown = if content_type.is_empty() {
+                "no content type".to_owned()
+            } else {
+                format!("`{content_type}`")
+            };
+            return Err(ModelError::Response(format!(
+                "streaming was requested but the endpoint answered with {shown}; write \
+                 `stream: false` on this model for an endpoint that ignores `stream: true`"
+            )));
+        }
+        read_chat_stream(response.into_parts().1.into_reader(), on_event)
     }
+}
+
+/// The one place a finished chat-completions response becomes a turn.
+///
+/// Shared with the streaming accumulator's own conversion by the table test that asserts the two
+/// agree: a streamed turn and the non-streaming parse of the same completion are the same value,
+/// and the only way to keep that true is for the rules about what `content` and `tool_calls` mean
+/// to have one home each.
+fn turn_from_response(response: ChatResponse) -> Result<AssistantTurn, ModelError> {
+    let choice = response
+        .choices
+        .into_iter()
+        .next()
+        .ok_or(ModelError::NoChoices)?;
+    let tool_calls = choice
+        .message
+        .tool_calls
+        .into_iter()
+        .map(ModelToolCall::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(AssistantTurn {
+        content: choice.message.content,
+        tool_calls,
+        usage: response.usage.map(ModelUsage::from),
+        replay_items: Vec::new(),
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -503,6 +557,17 @@ struct ChatRequest<'a> {
     /// before the field existed. Compatible endpoints that have never heard of it ignore it.
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_cache_key: Option<&'a str>,
+    /// `Some(true)` or absent, never `Some(false)`: an endpoint that does not stream is asked the
+    /// question it was asked before the field existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 /// One message as the chat-completions wire wants it.
@@ -709,6 +774,242 @@ impl TryFrom<WireToolCall> for ModelToolCall {
     }
 }
 
+/// Reads a streamed chat-completions turn, reporting text and tool calls as they arrive.
+///
+/// The reader is a local, so every return drops it — which is what makes [`ControlFlow::Break`] a
+/// cancellation rather than a request to ignore the rest: the body is dropped mid-response and the
+/// connection closes instead of going back to the pool with an unread answer in it.
+pub(crate) fn read_chat_stream(
+    reader: impl std::io::Read,
+    on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
+) -> Result<AssistantTurn, ModelError> {
+    let mut events = SseReader::new(reader);
+    let mut state = ChatStream::default();
+    while let Some(event) = events.next_event()? {
+        let SseEvent::Data(data) = event else {
+            state.finished = true;
+            break;
+        };
+        let chunk = serde_json::from_str::<ChatChunk>(data)
+            .map_err(|error| ModelError::Response(format!("invalid stream chunk: {error}")))?;
+        if state.apply(chunk, on_event)?.is_break() {
+            return Err(ModelError::Interrupted);
+        }
+    }
+    if !state.finished {
+        return Err(ModelError::Response(
+            "stream ended before [DONE] or a finish reason".to_owned(),
+        ));
+    }
+    state.into_turn()
+}
+
+/// One `data:` chunk of a chat-completions stream.
+///
+/// Every field is optional and every absence is tolerated, because "OpenAI-compatible" is a claim
+/// rather than a specification: llama.cpp, Ollama, vLLM, and a dozen proxies each omit or null a
+/// different one, and a turn that arrived intact must not fail on the shape of a field nobody
+/// reads.
+#[derive(Debug, Deserialize)]
+struct ChatChunk {
+    #[serde(default)]
+    choices: Vec<ChunkChoice>,
+    /// Present on the final chunk when `stream_options.include_usage` was sent, `null` on every
+    /// earlier chunk from endpoints that send the field unconditionally.
+    #[serde(default)]
+    usage: Option<WireChatUsage>,
+    /// Some endpoints report a mid-stream failure as an event instead of a status, the response
+    /// having already been committed with a 200.
+    #[serde(default)]
+    error: Option<ChunkError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChunkError {
+    #[serde(default)]
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChunkChoice {
+    #[serde(default)]
+    delta: Option<ChunkDelta>,
+    /// `stop`, `tool_calls`, `length`; the one signal that this choice is complete.
+    #[serde(default)]
+    finish_reason: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ChunkDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ChunkToolCall>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChunkToolCall {
+    /// Which call this fragment belongs to. Absent means the first: an endpoint that reports one
+    /// call at a time has nothing to number.
+    #[serde(default)]
+    index: Option<u64>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    function: Option<ChunkFunction>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ChunkFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+/// A tool call being assembled from fragments.
+#[derive(Debug)]
+struct StreamedCall {
+    index: u64,
+    id: String,
+    kind: String,
+    name: String,
+    arguments: String,
+}
+
+/// The turn a chat-completions stream is building.
+#[derive(Debug, Default)]
+struct ChatStream {
+    content: String,
+    calls: Vec<StreamedCall>,
+    usage: Option<ModelUsage>,
+    finished: bool,
+}
+
+impl ChatStream {
+    /// Folds one chunk in, reporting what it contained.
+    fn apply(
+        &mut self,
+        chunk: ChatChunk,
+        on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
+    ) -> Result<ControlFlow<()>, ModelError> {
+        if let Some(error) = chunk.error {
+            return Err(ModelError::Request(format!(
+                "stream reported an error: {}",
+                sanitize_diagnostic(error.message.as_deref().unwrap_or("no message"))
+            )));
+        }
+        // Last report wins, which is the final usage-only chunk on an endpoint that sends one and
+        // the last running total on an endpoint that repeats it.
+        if let Some(usage) = chunk.usage {
+            self.usage = Some(ModelUsage::from(usage));
+        }
+        for choice in chunk.choices {
+            if choice.finish_reason.is_some() {
+                self.finished = true;
+            }
+            let delta = choice.delta.unwrap_or_default();
+            if let Some(text) = delta.content.filter(|text| !text.is_empty()) {
+                self.content.push_str(&text);
+                if on_event(TurnEvent::TextDelta(ModelText::from_model(text))).is_break() {
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+            for fragment in delta.tool_calls.unwrap_or_default() {
+                if let Some(index) = self.merge_call(fragment)
+                    && on_event(TurnEvent::ToolCallStarted { index }).is_break()
+                {
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+        }
+        Ok(ControlFlow::Continue(()))
+    }
+
+    /// Merges one tool-call fragment, answering the turn position of a call it started.
+    fn merge_call(&mut self, fragment: ChunkToolCall) -> Option<u32> {
+        let index = fragment.index.unwrap_or(0);
+        let function = fragment.function.unwrap_or_default();
+        let name = function.name.filter(|name| !name.is_empty());
+        let arguments = function.arguments.unwrap_or_default();
+
+        let slot = self.calls.iter().rposition(|call| call.index == index);
+        let slot = match slot {
+            // Ollama reports every call of a parallel batch at index 0. A fragment that names a
+            // function when the call already at that index has one is a second call, not more of
+            // the first; anything else is a continuation, which is what OpenAI sends.
+            Some(position) if name.is_some() && !self.calls[position].name.is_empty() => None,
+            other => other,
+        };
+        let Some(position) = slot else {
+            self.calls.push(StreamedCall {
+                index,
+                id: fragment.id.unwrap_or_default(),
+                kind: fragment.kind.unwrap_or_default(),
+                name: name.unwrap_or_default(),
+                arguments,
+            });
+            return Some(u32::try_from(self.calls.len() - 1).unwrap_or(u32::MAX));
+        };
+        let call = &mut self.calls[position];
+        if let Some(id) = fragment.id.filter(|id| !id.is_empty()) {
+            call.id = id;
+        }
+        if let Some(kind) = fragment.kind.filter(|kind| !kind.is_empty()) {
+            call.kind = kind;
+        }
+        if let Some(name) = name {
+            call.name = name;
+        }
+        // llama.cpp has answered with the whole argument document in one fragment and OpenAI sends
+        // it a few characters at a time; appending is the same operation for both.
+        call.arguments.push_str(&arguments);
+        None
+    }
+
+    fn into_turn(self) -> Result<AssistantTurn, ModelError> {
+        let tool_calls = self
+            .calls
+            .into_iter()
+            .map(|call| {
+                // An endpoint that omits `type` on its fragments means the only kind these
+                // requests can produce; one that names another kind is refused exactly as the
+                // non-streaming parser refuses it.
+                if !call.kind.is_empty() && call.kind != "function" {
+                    return Err(ModelError::UnsupportedToolKind(call.kind));
+                }
+                Ok(ModelToolCall {
+                    id: call.id,
+                    kind: "function".to_owned(),
+                    function: ModelFunctionCall {
+                        name: call.name,
+                        arguments: call.arguments,
+                    },
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(AssistantTurn {
+            content: (!self.content.is_empty()).then_some(self.content),
+            tool_calls,
+            usage: self.usage,
+            replay_items: Vec::new(),
+        })
+    }
+}
+
+impl From<SseError> for ModelError {
+    fn from(error: SseError) -> Self {
+        match &error {
+            SseError::TooLarge => Self::Response(error.to_string()),
+            // A socket that died mid-body is a failed request, not a malformed answer, and the
+            // caller acts on that difference.
+            SseError::Read { source } => Self::Request(format!("{error}: {source}")),
+        }
+    }
+}
+
 /// Whether a bearer token may accompany requests to this endpoint.
 ///
 /// The connection host must be derived exactly as the transport derives it. `Uri::host` excludes
@@ -764,6 +1065,13 @@ pub enum ModelError {
     /// The model returned a tool kind Dekopon's prompt loop does not execute.
     #[error("model returned unsupported tool kind {0:?}")]
     UnsupportedToolKind(String),
+    /// The caller's event callback asked to stop, and the response body was dropped.
+    ///
+    /// A cancellation, not a failure: the request was fine and the answer was on its way. The
+    /// caller keeps whatever text it was handed before it said stop; this crate keeps nothing,
+    /// because half a turn is not a turn and must never reach a conversation history.
+    #[error("model turn interrupted by its caller")]
+    Interrupted,
 }
 
 /// Converts an assistant turn into replayable conversation state.
@@ -822,11 +1130,28 @@ mod tests {
 
     use super::{
         AssistantTurn, ChatModel, ChatRequest, ChatResponse, CompletionOptions, ContentPart,
-        ModelError, ModelFunctionCall, ModelMessage, ModelTool, ModelToolCall, ModelUsage,
-        OpenAiChatModel, OpenAiTool, WireFunctionCall, WireMessage, WireToolCall,
-        assistant_message, completion_url,
+        ControlFlow, ModelError, ModelFunctionCall, ModelMessage, ModelTool, ModelToolCall,
+        ModelUsage, OpenAiChatModel, OpenAiTool, StreamOptions, TurnEvent, WireFunctionCall,
+        WireMessage, WireToolCall, assistant_message, completion_url, read_chat_stream,
+        turn_from_response,
     };
     use crate::mock::{MockResponse, MockServer};
+
+    /// The callback for a turn whose deltas are not what the test is about.
+    fn ignored(_event: TurnEvent) -> ControlFlow<()> {
+        ControlFlow::Continue(())
+    }
+
+    /// Every event a turn reported, in order, rendered so a test can assert on them.
+    fn recorded(events: &[TurnEvent]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| match event {
+                TurnEvent::TextDelta(text) => format!("text:{}", text.as_str()),
+                TurnEvent::ToolCallStarted { index } => format!("call:{index}"),
+            })
+            .collect()
+    }
 
     /// `ureq`'s own status error renders as `http status: 429` and discards the body, which is the
     /// only part of a failure that says whether the model name is wrong, the context is too long,
@@ -842,7 +1167,12 @@ mod tests {
                 .expect("model client");
 
         let error = model
-            .complete(&[ModelMessage::user("hello")], &[])
+            .complete(
+                &[ModelMessage::user("hello")],
+                &[],
+                &CompletionOptions::default(),
+                &mut ignored,
+            )
             .expect_err("a 429 must fail the turn");
 
         let message = error.to_string();
@@ -850,6 +1180,40 @@ mod tests {
         assert!(
             message.contains("Rate limit reached for gpt-test"),
             "{message}"
+        );
+    }
+
+    #[test]
+    fn an_endpoint_that_ignores_stream_true_is_refused_naming_the_key_to_write() {
+        // A whole JSON completion where an event stream was asked for: what a stub or a buffering
+        // proxy answers. The turn fails at once, and the error names `stream: false` rather than
+        // the end of a stream that never was one.
+        let server = MockServer::start(vec![MockResponse::json(
+            json!({"choices": [{"message": {"role": "assistant", "content": "hello"}}]}),
+        )]);
+        let model =
+            OpenAiChatModel::new(server.base_url(), "gpt-test", None, Duration::from_secs(2))
+                .expect("model client");
+        assert!(
+            model.stream,
+            "streaming is the default for a compatible endpoint"
+        );
+
+        let error = model
+            .complete(
+                &[ModelMessage::user("hello")],
+                &[],
+                &CompletionOptions::default(),
+                &mut ignored,
+            )
+            .expect_err("a JSON answer to a streamed request fails the turn");
+
+        let message = error.to_string();
+        assert!(message.contains("application/json"), "{message}");
+        assert!(message.contains("`stream: false`"), "{message}");
+        assert!(
+            !message.contains("[DONE]"),
+            "the refusal names the cause, not the symptom: {message}"
         );
     }
 
@@ -1025,6 +1389,10 @@ mod tests {
                     tools: &tools,
                     tool_choice: "auto",
                     prompt_cache_key: None,
+                    stream: Some(true),
+                    stream_options: Some(StreamOptions {
+                        include_usage: true,
+                    }),
                 })
                 .expect("serialize chat request"),
             );
@@ -1096,6 +1464,10 @@ mod tests {
                 tools: &tools,
                 tool_choice: "auto",
                 prompt_cache_key,
+                stream: Some(true),
+                stream_options: Some(StreamOptions {
+                    include_usage: true,
+                }),
             })
             .expect("serialize chat request")
         };
@@ -1144,18 +1516,20 @@ mod tests {
     }
 
     #[test]
-    fn a_model_that_only_implements_complete_still_answers_through_complete_with() {
-        // The whole reason `complete_with` is a provided method: a third-party or test model that
-        // never heard of routing metadata keeps compiling, and ignoring the options costs it a
-        // cache hit rather than an answer. This double is what the six test doubles elsewhere in
-        // the workspace look like, and none of them had to change.
-        struct KeylessModel;
+    fn an_implementation_that_cannot_stream_answers_without_reporting_an_event() {
+        // Streaming is not optional at the trait, so this is the contract every non-streaming
+        // implementation honors — the test doubles elsewhere in the workspace, and this crate's
+        // own client with `stream: false`. It calls `on_event` zero times and returns the whole
+        // turn, so a caller never needs a second code path for "this one does not stream".
+        struct WholeTurnModel;
 
-        impl ChatModel for KeylessModel {
+        impl ChatModel for WholeTurnModel {
             fn complete(
                 &self,
                 messages: &[ModelMessage],
                 _tools: &[ModelTool],
+                _options: &CompletionOptions,
+                _on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
             ) -> Result<AssistantTurn, ModelError> {
                 Ok(AssistantTurn {
                     content: messages.last().and_then(|message| {
@@ -1168,15 +1542,23 @@ mod tests {
             }
         }
 
-        let turn = KeylessModel
-            .complete_with(
+        let mut events = Vec::new();
+        let mut sink = |event: TurnEvent| -> ControlFlow<()> {
+            events.push(event);
+            ControlFlow::Continue(())
+        };
+
+        let turn = WholeTurnModel
+            .complete(
                 &[ModelMessage::user("hello")],
                 &[],
                 &CompletionOptions::default().with_prompt_cache_key("session-7"),
+                &mut sink,
             )
-            .expect("a keyless implementation still answers");
+            .expect("a model that cannot stream still answers");
 
         assert_eq!(turn.content.as_deref(), Some("HELLO"));
+        assert!(recorded(&events).is_empty());
     }
 
     #[test]
@@ -1280,6 +1662,325 @@ mod tests {
             !debugged.contains("80, 78, 71"),
             "raw bytes leaked: {debugged}"
         );
+    }
+
+    /// Frames chunk bodies the way an endpoint puts them on the wire.
+    fn frames(chunks: &[&str]) -> String {
+        chunks
+            .iter()
+            .map(|chunk| format!("data: {chunk}\n\n"))
+            .collect()
+    }
+
+    /// One recorded turn from a chat-completions endpoint.
+    struct Recorded {
+        name: &'static str,
+        stream: String,
+        expected: Expected,
+    }
+
+    enum Expected {
+        /// The body the same endpoint answers with when it is not asked to stream. The streamed
+        /// turn must equal the parse of this, value for value.
+        Completion(&'static str),
+        /// The stream failed, and the surfaced cause must contain this.
+        Failure(&'static str),
+    }
+
+    /// Transcripts recorded from the endpoints this client actually meets.
+    ///
+    /// "OpenAI-compatible" is a claim, not a specification, so the awkward ones are here on
+    /// purpose: llama.cpp answering with a whole tool call in one fragment, Ollama numbering every
+    /// call of a batch `0`, a proxy splitting one chunk across two `data:` lines, an endpoint
+    /// nulling `usage` on every chunk but the last.
+    fn recorded_turns() -> Vec<Recorded> {
+        vec![
+            Recorded {
+                name: "a plain text answer",
+                stream: frames(&[
+                    r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}"#,
+                    r#"{"choices":[{"index":0,"delta":{"content":"PR #7 "},"finish_reason":null}]}"#,
+                    r#"{"choices":[{"index":0,"delta":{"content":"is merged."},"finish_reason":null}]}"#,
+                    r#"{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+                    r#"{"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":30,"total_tokens":150,"prompt_tokens_details":{"cached_tokens":100},"completion_tokens_details":{"reasoning_tokens":7}}}"#,
+                    "[DONE]",
+                ]),
+                expected: Expected::Completion(
+                    r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"PR #7 is merged."},"finish_reason":"stop"}],"usage":{"prompt_tokens":120,"completion_tokens":30,"total_tokens":150,"prompt_tokens_details":{"cached_tokens":100},"completion_tokens_details":{"reasoning_tokens":7}}}"#,
+                ),
+            },
+            Recorded {
+                name: "one tool call, arguments in fragments, content null throughout",
+                stream: frames(&[
+                    r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":""}}]},"finish_reason":null}]}"#,
+                    r#"{"choices":[{"index":0,"delta":{"content":null,"tool_calls":[{"index":0,"function":{"arguments":"{\"script\":"}}]},"finish_reason":null}]}"#,
+                    r#"{"choices":[{"index":0,"delta":{"content":null,"tool_calls":[{"index":0,"function":{"arguments":"\"ls | wc -l\"}"}}]},"finish_reason":null}]}"#,
+                    r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+                    r#"{"choices":[],"usage":{"prompt_tokens":80,"completion_tokens":12,"total_tokens":92}}"#,
+                    "[DONE]",
+                ]),
+                expected: Expected::Completion(
+                    r#"{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"script\":\"ls | wc -l\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":80,"completion_tokens":12,"total_tokens":92}}"#,
+                ),
+            },
+            Recorded {
+                name: "two parallel tool calls interleaved by index",
+                stream: frames(&[
+                    r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":""}}]}}]}"#,
+                    r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_2","type":"function","function":{"name":"inspect_agent_config","arguments":""}}]}}]}"#,
+                    r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"script\":\"date\"}"}}]}}]}"#,
+                    r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{}"}}]}}]}"#,
+                    r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+                    "[DONE]",
+                ]),
+                expected: Expected::Completion(
+                    r#"{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"bash","arguments":"{\"script\":\"date\"}"}},{"id":"call_2","type":"function","function":{"name":"inspect_agent_config","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+                ),
+            },
+            Recorded {
+                name: "llama.cpp: a whole tool call in one fragment, and no [DONE]",
+                stream: frames(&[
+                    r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_9","type":"function","function":{"name":"bash","arguments":"{\"script\":\"uname -a\"}"}}]},"finish_reason":null}]}"#,
+                    r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+                ]),
+                expected: Expected::Completion(
+                    r#"{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_9","type":"function","function":{"name":"bash","arguments":"{\"script\":\"uname -a\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+                ),
+            },
+            Recorded {
+                name: "Ollama: every call of a batch reported at index 0",
+                stream: frames(&[
+                    r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"bash","arguments":"{\"script\":\"date\"}"}}]}}]}"#,
+                    r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_b","type":"function","function":{"name":"inspect_agent_config","arguments":"{}"}}]}}]}"#,
+                    r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+                    "[DONE]",
+                ]),
+                expected: Expected::Completion(
+                    r#"{"choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_a","type":"function","function":{"name":"bash","arguments":"{\"script\":\"date\"}"}},{"id":"call_b","type":"function","function":{"name":"inspect_agent_config","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+                ),
+            },
+            Recorded {
+                name: "one chunk split across two data lines, usage null until the last",
+                stream: format!(
+                    "data: {}\ndata: {}\n\n{}",
+                    r#"{"choices":[{"index":0,"delta":{"content":"one"}}],"#,
+                    r#""usage":null}"#,
+                    frames(&[
+                        r#"{"choices":[{"index":0,"delta":{"content":" two"},"finish_reason":"stop"}],"usage":null}"#,
+                        r#"{"choices":[],"usage":{"prompt_tokens":8,"completion_tokens":2,"total_tokens":10}}"#,
+                        "[DONE]",
+                    ]),
+                ),
+                expected: Expected::Completion(
+                    r#"{"choices":[{"index":0,"message":{"role":"assistant","content":"one two"},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":2,"total_tokens":10}}"#,
+                ),
+            },
+            Recorded {
+                name: "a stream the endpoint cut off mid-answer",
+                stream: frames(&[
+                    r#"{"choices":[{"index":0,"delta":{"content":"PR #7 "}}]}"#,
+                    r#"{"choices":[{"index":0,"delta":{"content":"is"}}]}"#,
+                ]),
+                expected: Expected::Failure("stream ended before [DONE] or a finish reason"),
+            },
+            Recorded {
+                name: "a failure reported as an event after the 200",
+                stream: frames(&[
+                    r#"{"choices":[{"index":0,"delta":{"content":"PR #7 "}}]}"#,
+                    r#"{"error":{"message":"context length exceeded","type":"invalid_request_error"}}"#,
+                ]),
+                expected: Expected::Failure("context length exceeded"),
+            },
+        ]
+    }
+
+    #[test]
+    fn a_streamed_turn_equals_the_non_streaming_parse_of_the_same_completion() {
+        // The property the whole feature rests on: whether or not a caller watched the deltas, the
+        // turn handed back is the same value, so tool-call execution, history, and accounting
+        // never learn that streaming exists. The two cut-off transcripts are here for the other
+        // half of it — a turn that did not finish is a failure that names its cause, never a
+        // shorter answer that looks complete.
+        for case in recorded_turns() {
+            match case.expected {
+                Expected::Completion(completion) => {
+                    let streamed = read_chat_stream(case.stream.as_bytes(), &mut ignored)
+                        .unwrap_or_else(|error| panic!("{}: {error}", case.name));
+                    let response = serde_json::from_str::<ChatResponse>(completion)
+                        .unwrap_or_else(|error| panic!("{}: {error}", case.name));
+                    let parsed = turn_from_response(response)
+                        .unwrap_or_else(|error| panic!("{}: {error}", case.name));
+
+                    assert_eq!(streamed, parsed, "{}", case.name);
+                }
+                Expected::Failure(cause) => {
+                    let error = read_chat_stream(case.stream.as_bytes(), &mut ignored)
+                        .expect_err(case.name);
+
+                    assert!(
+                        error.to_string().contains(cause),
+                        "{}: {error} does not name {cause}",
+                        case.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_streamed_turn_reports_its_text_and_tool_calls_as_they_arrive() {
+        let stream = frames(&[
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"Checking"}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":" now."}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"bash","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_2","type":"function","function":{"name":"bash","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+            "[DONE]",
+        ]);
+        let mut events = Vec::new();
+        let mut sink = |event: TurnEvent| -> ControlFlow<()> {
+            events.push(event);
+            ControlFlow::Continue(())
+        };
+
+        let turn = read_chat_stream(stream.as_bytes(), &mut sink).expect("a streamed turn");
+
+        assert_eq!(turn.content.as_deref(), Some("Checking now."));
+        assert_eq!(
+            recorded(&events),
+            vec!["text:Checking", "text: now.", "call:0", "call:1"],
+            "an event carries a fragment of the answer or a counter, and nothing else"
+        );
+    }
+
+    #[test]
+    fn a_callback_that_breaks_abandons_the_streamed_turn_rather_than_shortening_it() {
+        // Failure path: the caller stopped the turn between events. Half a turn is not a turn, so
+        // the answer is an interruption the caller can act on and not a truncated `AssistantTurn`
+        // that would reach a conversation history looking complete.
+        let stream = frames(&[
+            r#"{"choices":[{"index":0,"delta":{"content":"half an"}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":" answer"},"finish_reason":"stop"}]}"#,
+            "[DONE]",
+        ]);
+        let mut events = Vec::new();
+        let mut sink = |event: TurnEvent| -> ControlFlow<()> {
+            events.push(event);
+            ControlFlow::Break(())
+        };
+
+        let error = read_chat_stream(stream.as_bytes(), &mut sink).expect_err("the caller stopped");
+
+        assert_eq!(error, ModelError::Interrupted);
+        assert_eq!(
+            error.to_string(),
+            "model turn interrupted by its caller",
+            "a stopped turn must not read as an endpoint failure"
+        );
+        assert_eq!(
+            recorded(&events),
+            vec!["text:half an"],
+            "reading continued past the break"
+        );
+    }
+
+    /// The JSON body of a recorded request.
+    ///
+    /// Parsed rather than string-matched: `ureq` serializes a body with
+    /// `serde_json::to_vec_pretty`, so `"stream": true` reaches the wire carrying whitespace a
+    /// substring assertion would miss. The claim is about the field, not about its spelling.
+    fn request_body(request: &str) -> Value {
+        let (_, body) = request
+            .split_once("\r\n\r\n")
+            .expect("a recorded request with a body");
+        serde_json::from_str(body).expect("a JSON request body")
+    }
+
+    #[test]
+    fn a_streaming_request_asks_for_usage_and_reads_the_answer_as_an_event_stream() {
+        let server = MockServer::start(vec![MockResponse::sse(&frames(&[
+            r#"{"choices":[{"index":0,"delta":{"role":"assistant","content":"Merged"}}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":" already."},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":8,"completion_tokens":2,"total_tokens":10}}"#,
+            "[DONE]",
+        ]))]);
+        let model =
+            OpenAiChatModel::new(server.base_url(), "gpt-test", None, Duration::from_secs(2))
+                .expect("model client");
+        let mut events = Vec::new();
+        let mut sink = |event: TurnEvent| -> ControlFlow<()> {
+            events.push(event);
+            ControlFlow::Continue(())
+        };
+
+        let turn = model
+            .complete(
+                &[ModelMessage::user("is it merged?")],
+                &[],
+                &CompletionOptions::default(),
+                &mut sink,
+            )
+            .expect("a streamed turn");
+
+        assert_eq!(turn.content.as_deref(), Some("Merged already."));
+        assert_eq!(
+            turn.usage.and_then(|usage| usage.total_tokens),
+            Some(10),
+            "without stream_options.include_usage a streamed call reports no cost at all"
+        );
+        assert_eq!(recorded(&events), vec!["text:Merged", "text: already."]);
+        let requests = server.requests();
+        let request = &requests[0];
+        let body = request_body(request);
+        assert_eq!(body["stream"], json!(true), "{request}");
+        assert_eq!(
+            body["stream_options"],
+            json!({"include_usage": true}),
+            "{request}"
+        );
+        assert!(request.contains("accept: text/event-stream"), "{request}");
+    }
+
+    #[test]
+    fn an_endpoint_with_streaming_off_gets_the_request_it_received_before_streaming_existed() {
+        // The escape hatch has to be a true no-op on the wire: `stream: false` is not sent, the
+        // field is absent, and a proxy that has never heard of it sees the request it always saw.
+        let server = MockServer::start(vec![MockResponse::json(json!({
+            "choices": [{"message": {"content": "Merged already."}}],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 2, "total_tokens": 10}
+        }))]);
+        let model =
+            OpenAiChatModel::new(server.base_url(), "gpt-test", None, Duration::from_secs(2))
+                .expect("model client")
+                .with_streaming(false);
+        let mut events = Vec::new();
+        let mut sink = |event: TurnEvent| -> ControlFlow<()> {
+            events.push(event);
+            ControlFlow::Continue(())
+        };
+
+        let turn = model
+            .complete(
+                &[ModelMessage::user("is it merged?")],
+                &[],
+                &CompletionOptions::default(),
+                &mut sink,
+            )
+            .expect("a whole turn");
+
+        assert_eq!(turn.content.as_deref(), Some("Merged already."));
+        assert!(
+            recorded(&events).is_empty(),
+            "an endpoint that is not streaming must report no events at all"
+        );
+        let requests = server.requests();
+        let request = &requests[0];
+        assert!(
+            !request.contains(r#""stream""#),
+            "a non-streaming request must not carry the field at all: {request}"
+        );
+        assert!(!request.contains("stream_options"), "{request}");
+        assert!(request.contains("accept: application/json"), "{request}");
     }
 
     #[test]

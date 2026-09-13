@@ -335,9 +335,9 @@ identities:
     attestor:
       namespaces: [slack.t0123abc]     # segment-boundary prefixes, service name first
       chatScopes:                      # required by chat-scoped gateway operations
-        - breadth: transportWide
-          kind: slack
+        - kind: slack
           transport: scientist-slack
+          conversation: { kind: any }   # or a kind list with `container`/`ids`
 identityMappings:
   - subject: slack.t0123abc.u9xyz      # canonical: lowercase dotted segments
     principal: maintainer              # the only place a subject becomes a principal
@@ -781,11 +781,12 @@ Startup accounts the worst-case JSON escaping of a bounded search query and prov
 decoded files plus canonical-ABI compaction copies and fixed allocator headroom fit the independent
 Wasm linear-memory ceiling.
 
-The gateway peer's attestor additionally needs `chatScopes`. Breadth is an explicit tagged value:
-`transportWide`, `exactChannel`, or `exactConversation`; each names transport kind and configured
-transport ID, and narrower forms name canonical channel and conversation. A local transport must
-also name `localSubjectService`. Subject namespace authority remains independently required. Scope
-fields enter Cedar as optional `transportKind`, `transport`, `channel`, and `conversation`.
+The gateway peer's attestor additionally needs `chatScopes`. Each entry names the transport kind and
+the configured transport ID, plus a `conversation:` selector — the word `any` or a list of kinds,
+with an optional `container` and an optional `ids` list — written exactly as a gateway route writes
+it. A local transport must also name `localSubjectService`. Subject namespace authority remains
+independently required. Scope fields enter Cedar as the optional `transportKind` and `transport`
+strings and the optional `conversation` record `{kind, container, id, thread}`.
 
 ```yaml
 identities:
@@ -795,11 +796,9 @@ identities:
     attestor:
       namespaces: [slack.t0123abc]
       chatScopes:
-        - breadth: exactConversation
-          kind: slack
+        - kind: slack
           transport: scientist-slack
-          channel: c0123abc
-          conversation: c0123abc:1712345678.000100
+          conversation: { kind: [channel, thread], ids: [c0123abc] }
 ```
 
 Filesystem cancellation cannot guarantee a stuck native `fsync` returns by a hard deadline. The

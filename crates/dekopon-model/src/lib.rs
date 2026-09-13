@@ -15,6 +15,12 @@ pub mod chatgpt;
 mod mock;
 /// Generic chat-model contract and OpenAI-compatible transport.
 pub mod model;
+/// The one Server-Sent Events reader both transports read their streams with.
+mod sse;
+/// What a turn reports while it is still arriving.
+pub mod stream;
+
+pub use stream::{ModelText, TurnEvent, events_from_transcript};
 
 /// Builds the one HTTP agent shape every transport in this crate uses.
 ///

@@ -4,24 +4,33 @@
 //! with no reachable model is a configuration mistake, and finding it when the daemon starts beats
 //! finding it in a chat reply an hour later.
 
-use std::{collections::BTreeSet, sync::Arc};
+use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use dekopon_agent::prompt::PromptLimits;
+use dekopon_broker_protocol::ConversationMatch;
 use dekopon_config::{LocalCatalog, Skill};
-use dekopon_core::AgentId;
+use dekopon_core::{AgentId, ExternalSubject};
 use thiserror::Error;
 
 use crate::{
     cache_key,
-    config::{ConversationPolicy, ModelConfig, ResolvedConfig, RouteMatch, render_problems},
-    transport::ConversationKind,
+    config::{MemoryPolicy, ModelConfig, ResolvedConfig, render_problems},
+    progress::ProgressDetail,
+    transport::InboundMessage,
 };
 
 /// One route after its agent and model were resolved.
 #[derive(Clone, Debug)]
 pub(crate) struct BoundRoute {
     pub transport: String,
-    pub r#match: RouteMatch,
+    /// Which conversations on that transport this route claims.
+    pub conversation: ConversationMatch,
+    /// Canonical subjects this route answers; every subject when absent.
+    ///
+    /// Only a `kind: [directMessage]` route may carry one, which configuration enforces. It
+    /// restricts and never widens: a subject listed here still reaches the broker as an ordinary
+    /// attested claim, and an unmapped one is refused before any model call.
+    pub subjects: Option<Vec<ExternalSubject>>,
     pub agent: AgentId,
     /// Operator-authored purpose safe to expose through credential-free introspection.
     pub description: String,
@@ -44,9 +53,19 @@ pub(crate) struct BoundRoute {
     pub chat_asset_inputs: Arc<[String]>,
     /// Whether this route's sessions may record improvement suggestions.
     pub improvement_suggestions: bool,
+    /// Whether this route's sessions are offered `inspect_agent_config`.
+    pub inspect_agent_config: bool,
     pub limits: PromptLimits,
+    /// Wall-clock bound on one session, counted from the moment the agent starts working.
+    ///
+    /// Absent means no wall-clock bound: the step and capability-call budgets are what most
+    /// deployments need, and a bound that cancels a working session is worth choosing rather than
+    /// inheriting.
+    pub max_duration: Option<Duration>,
+    /// How much this route's progress surface says.
+    pub progress_detail: ProgressDetail,
     /// What this route remembers between messages.
-    pub conversation: ConversationPolicy,
+    pub memory: MemoryPolicy,
     /// The provider cache lane a message on this route uses when it has no conversation of its own.
     ///
     /// Minted once here, at bind time, and shared by every sender the route answers. That reads
@@ -137,7 +156,8 @@ impl RoutingTable {
             };
             routes.push(BoundRoute {
                 transport: route.transport.clone(),
-                r#match: route.r#match.clone(),
+                conversation: route.conversation.clone(),
+                subjects: route.subjects.clone(),
                 agent: route.agent.clone(),
                 description: agent.spec.description.clone(),
                 model_class: agent.spec.model_class.clone(),
@@ -151,11 +171,14 @@ impl RoutingTable {
                     .map(ToString::to_string)
                     .collect(),
                 improvement_suggestions: route.improvement_suggestions,
+                inspect_agent_config: route.inspect_agent_config,
                 limits: PromptLimits {
                     max_steps: route.limits.max_steps,
                     max_capability_calls: route.limits.max_capability_calls,
                 },
-                conversation: route.conversation,
+                max_duration: route.limits.max_duration_ms.map(Duration::from_millis),
+                progress_detail: route.progress_detail,
+                memory: route.memory,
                 cache_key: cache_key::for_route(),
             });
         }
@@ -189,16 +212,14 @@ impl RoutingTable {
     ///
     /// A catch-all is not a wakeup on its own. `dispatch` still requires channel traffic to address
     /// the bot before any of this becomes a session.
-    pub fn route(&self, transport: &str, conversation: &ConversationKind) -> Option<&BoundRoute> {
+    pub fn route(&self, message: &InboundMessage) -> Option<&BoundRoute> {
         self.routes.iter().find(|route| {
-            route.transport == transport
-                && match (&route.r#match, conversation) {
-                    (RouteMatch::DirectMessage {}, ConversationKind::DirectMessage) => true,
-                    (RouteMatch::Channel { channel }, ConversationKind::Channel(actual)) => {
-                        channel.as_ref().is_none_or(|channel| channel == actual)
-                    }
-                    _ => false,
-                }
+            route.transport == message.transport
+                && route.conversation.matches(&message.conversation)
+                && route
+                    .subjects
+                    .as_ref()
+                    .is_none_or(|subjects| subjects.contains(&message.subject))
         })
     }
 

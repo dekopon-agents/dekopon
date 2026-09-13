@@ -10,7 +10,8 @@ use std::{
 use dekopon_broker::{
     Attestation, AttestorGrant, AuditEvent, AuthenticatedContext, Broker, BrokerBuildError,
     BrokerError, BrokerLimits, CapabilityRoute, ChatMemoryConfig, ChatScopeGrant,
-    ChatTransportKind, ConstraintCatalog, ConstraintSet, CredentialStore, DeliveredTurnRequest,
+    ChatTransportKind, ConstraintCatalog, ConstraintSet, Conversation, ConversationKind,
+    ConversationKindMatch, ConversationMatch, CredentialStore, DeliveredTurnRequest,
     DeliveryIdentity, IdentityDirectory, InMemoryAuditLog, PolicyEngine, PolicyWorld,
     RouteConflict,
 };
@@ -245,8 +246,7 @@ async fn build_broker_with_principal(
         when { context has via && context.via == "gateway"
             && context has transportKind && context.transportKind == "slack"
             && context has transport && context.transport == "scientist-slack"
-            && context has channel && context.channel == "c0123abc"
-            && context has conversation };
+            && context has conversation && context.conversation.id == "c0123abc" };
 
         @id("memory")
         permit(principal == Dekopon::Principal::"$PRINCIPAL",
@@ -258,8 +258,7 @@ async fn build_broker_with_principal(
             && context has agent && context.agent == "reviewer"
             && context has transportKind && context.transportKind == "slack"
             && context has transport && context.transport == "scientist-slack"
-            && context has channel && context.channel == "c0123abc"
-            && context has conversation };
+            && context has conversation && context.conversation.id == "c0123abc" };
         "#
     .replace("$PRINCIPAL", mapped_principal);
     if permit_generic_storage {
@@ -338,6 +337,21 @@ fn claim() -> Attestation {
     claim_for("c0123abc:1712345678.000100")
 }
 
+/// Splits a `channel:thread` key back into the conversation a Slack transport would have minted.
+fn slack_conversation(key: &str) -> Conversation {
+    let (id, thread) = key
+        .split_once(':')
+        .map_or((key, None), |(id, thread)| (id, Some(thread.to_owned())));
+    Conversation {
+        // A Slack message with a root timestamp beside it is a thread under the channel; the whole
+        // fixture corpus is threaded, which is what every `channel:ts` key here means.
+        kind: ConversationKind::Thread,
+        container: Some("t0123abc".to_owned()),
+        id: id.to_owned(),
+        thread,
+    }
+}
+
 fn claim_for(conversation: &str) -> Attestation {
     Attestation::for_chat(
         "slack.t0123abc.u9xyz"
@@ -347,8 +361,7 @@ fn claim_for(conversation: &str) -> Attestation {
         ChatScopeClaim {
             transport: "scientist-slack".parse::<TransportId>().expect("transport"),
             kind: ChatTransportKind::Slack,
-            channel: "c0123abc".to_owned(),
-            conversation: conversation.to_owned(),
+            conversation: slack_conversation(conversation),
         },
     )
 }
@@ -357,19 +370,38 @@ fn grant() -> AttestorGrant {
     grant_for(&["c0123abc:1712345678.000100"])
 }
 
+/// One grant over the parent channel and the threads under it.
+///
+/// Grants never name a thread (S31), so the conversations these fixtures distinguish share one
+/// grant; what keeps them apart is the storage namespace, which is derived from the conversation
+/// key rather than from the grant.
 fn grant_for(conversations: &[&str]) -> AttestorGrant {
+    let mut ids = conversations
+        .iter()
+        .map(|conversation| {
+            conversation
+                .split_once(':')
+                .map_or(*conversation, |(id, _)| id)
+                .to_owned()
+        })
+        .collect::<Vec<_>>();
+    ids.dedup();
     AttestorGrant {
         namespaces: vec!["slack.t0123abc".to_owned()],
-        chat_scopes: conversations
-            .iter()
-            .map(|conversation| ChatScopeGrant::ExactConversation {
-                kind: ChatTransportKind::Slack,
-                transport: "scientist-slack".parse().expect("transport"),
-                channel: "c0123abc".to_owned(),
-                conversation: (*conversation).to_owned(),
-                local_subject_service: None,
-            })
-            .collect(),
+        chat_scopes: vec![ChatScopeGrant {
+            kind: ChatTransportKind::Slack,
+            transport: "scientist-slack".parse().expect("transport"),
+            conversation: ConversationMatch {
+                kind: ConversationKindMatch::Kinds(vec![
+                    ConversationKind::Channel,
+                    ConversationKind::Thread,
+                ]),
+                container: None,
+                ids: Some(ids),
+            },
+            local_subject_service: None,
+            breadth: None,
+        }],
     }
 }
 
@@ -1205,11 +1237,17 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
 
     let mut swaps = Vec::new();
     let mut swapped = claim.clone();
-    swapped.scope.as_mut().expect("chat scope").channel = "c999999".to_owned();
+    swapped.scope.as_mut().expect("chat scope").conversation.id = "c999999".to_owned();
     swaps.push(swapped);
+    // The kind is part of the selector, and this grant lists `[channel, thread]`: the same channel
+    // claimed as a direct message is a claim the grant does not cover.
     let mut swapped = claim.clone();
-    swapped.scope.as_mut().expect("chat scope").conversation =
-        "c0123abc:1712345678.999999".to_owned();
+    swapped
+        .scope
+        .as_mut()
+        .expect("chat scope")
+        .conversation
+        .kind = ConversationKind::DirectMessage;
     swaps.push(swapped);
     let mut swapped = claim.clone();
     swapped.scope.as_mut().expect("chat scope").transport =
@@ -1226,9 +1264,27 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
             broker
                 .capability_surface(&gateway(), Some(&grant), Some(&swapped))
                 .is_none(),
-            "every independently swapped scope field denies"
+            "every independently swapped selector field denies"
         );
     }
+    // The thread is the one coordinate a grant deliberately does not name. A different thread under
+    // the same granted parent is the same claim as far as authority is concerned — that is what
+    // makes a grant on a channel cover the threads under it without a second line — while the
+    // storage namespace still keys on the whole conversation, so the two threads never share
+    // memory. Swapping it must therefore *not* deny.
+    let mut sibling_thread = claim.clone();
+    sibling_thread
+        .scope
+        .as_mut()
+        .expect("chat scope")
+        .conversation
+        .thread = Some("1712345678.999999".to_owned());
+    assert!(
+        broker
+            .capability_surface(&gateway(), Some(&grant), Some(&sibling_thread))
+            .is_some(),
+        "a grant names a parent conversation, so its threads are covered by it"
+    );
     assert_eq!(
         fs::read_dir(root.join("namespaces"))
             .expect("namespace root")

@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use async_trait::async_trait;
 use axum::{
     Router,
     body::to_bytes,
@@ -19,7 +20,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use dekopon_broker_protocol::ChatTransportKind;
+use dekopon_broker_protocol::{ChatTransportKind, Conversation, ConversationKind};
 use dekopon_core::{ExternalSubject, Redacted};
 use futures_util::{StreamExt as _, future::BoxFuture};
 use hmac::{Hmac, KeyInit as _, Mac as _};
@@ -29,10 +30,13 @@ use sha2::Sha256;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::{Instrument as _, Span};
 
-use crate::transport::{
-    ChatReplier, ChatTransport, ConversationKind, InboundMessage, OutboundReply, ReplyTarget,
-    SeenIds, TextUnit, TransportError, TransportEvent, TransportIdentity, bound_inbound,
-    credential_client, receive_span, split_message,
+use crate::{
+    config::{LivenessMode, LivenessSettings},
+    transport::{
+        ChatDriver, ChatTransport, InboundMessage, LivenessTarget, OutboundReply, ReplyTarget,
+        SeenIds, TextUnit, TransportError, TransportEvent, TransportIdentity, TypingLease,
+        bound_inbound, credential_client, receive_span, record_conversation, split_message,
+    },
 };
 
 const MAX_WEBHOOK_BODY_BYTES: usize = 256 * 1024;
@@ -54,6 +58,13 @@ const WEBHOOK_QUEUE: usize = 64;
 const MAX_WEBHOOK_CONCURRENCY: usize = 16;
 const WEBHOOK_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const GRAPH_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+/// Deadline on one cosmetic Graph call. Liveness decorates an answer; it never delays one.
+const LIVENESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+/// How often the typing indicator is re-posted while a session runs.
+///
+/// Meta dismisses it after 25 seconds; this sits under that with room for one slow call. Whether
+/// re-posting actually restarts that timer is the open question [`TypingLease::renew`] states.
+const TYPING_RENEW_INTERVAL: Duration = Duration::from_secs(20);
 const MAX_GRAPH_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_WHATSAPP_TEXT_CHARS: usize = 4096;
 /// One refusal reason is reported at most this often, with the count it stands for.
@@ -71,7 +82,7 @@ pub(crate) struct WhatsappTransport {
     state: WebhookState,
     receiver: mpsc::Receiver<QueuedDelivery>,
     pending: VecDeque<QueuedDelivery>,
-    replier: Arc<WhatsappReplier>,
+    driver: Arc<WhatsappDriver>,
     server: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -82,6 +93,14 @@ struct WebhookState {
     verify_token: Arc<Redacted<String>>,
     waba_id: String,
     phone_number_id: String,
+    /// `liveness.mode: native` — an inbound message carries coordinates for the typing indicator.
+    ///
+    /// One decision, because the Cloud API has exactly one liveness surface: there is no message
+    /// edit, no stream, and no button inside the 24-hour service window. Configuration refuses
+    /// `liveness.stream` and `liveness.cancelButton` on this transport, so neither reaches here;
+    /// `liveness.progress: message` is accepted and does nothing at run time, because the driver
+    /// answers `None` for the progress surface rather than switching on a flag.
+    native: bool,
     sender: mpsc::Sender<QueuedDelivery>,
     dedup: Arc<Mutex<ClaimedIds>>,
     refusals: Arc<Mutex<RefusalLog>>,
@@ -243,12 +262,13 @@ impl WhatsappTransport {
         app_secret: String,
         verify_token: String,
         access_token: String,
+        liveness: LivenessSettings,
     ) -> Result<Self, TransportError> {
         let (sender, receiver) = mpsc::channel(WEBHOOK_QUEUE);
         let http = credential_client(GRAPH_REQUEST_TIMEOUT)
             .build()
             .map_err(|source| TransportError::Request(Box::new(source)))?;
-        let replier = Arc::new(WhatsappReplier {
+        let driver = Arc::new(WhatsappDriver {
             transport: name.clone(),
             endpoint: graph_endpoint,
             version: graph_api_version,
@@ -266,6 +286,7 @@ impl WhatsappTransport {
                 verify_token: Arc::new(Redacted::new(verify_token)),
                 waba_id,
                 phone_number_id,
+                native: liveness.mode == LivenessMode::Native,
                 sender,
                 dedup: Arc::new(Mutex::new(ClaimedIds::new())),
                 refusals: Arc::new(Mutex::new(RefusalLog::new())),
@@ -274,7 +295,7 @@ impl WhatsappTransport {
             },
             receiver,
             pending: VecDeque::new(),
-            replier,
+            driver,
             server: None,
         })
     }
@@ -417,8 +438,13 @@ impl ChatTransport for WhatsappTransport {
         })
     }
 
-    fn replier(&self) -> Arc<dyn ChatReplier> {
-        Arc::clone(&self.replier) as Arc<dyn ChatReplier>
+    /// One handle for replying and for the one liveness surface the Cloud API has.
+    ///
+    /// What the capability objects advertise is what WhatsApp implements, not what this deployment
+    /// asked for: `liveness.mode: off` withholds the target on the inbound message instead, so the
+    /// policy has nothing to render against and the transport is reply-only exactly as before.
+    fn driver(&self) -> Arc<dyn ChatDriver> {
+        Arc::clone(&self.driver) as Arc<dyn ChatDriver>
     }
 }
 
@@ -621,7 +647,8 @@ fn parse_delivery(
             let Some(messages) = value.get("messages").and_then(Value::as_array) else {
                 continue;
             };
-            for message in messages {
+            let contacts = value.get("contacts").and_then(Value::as_array);
+            for (index, message) in messages.iter().enumerate() {
                 if message.get("type").and_then(Value::as_str) != Some("text") {
                     continue;
                 }
@@ -632,6 +659,32 @@ fn parse_delivery(
                 ) else {
                     continue;
                 };
+                // An individual message, positively: the delivery's `contacts` name the human the
+                // Cloud API would send a reply to, and on an individual message exactly one of
+                // them is `from`. A group payload names the group in `from` — with the human in
+                // `group_id`/`participant`, which are kept as the two checks that say so outright
+                // — and no contact matches it, so a shape Meta adds later that this gateway cannot
+                // answer is dropped rather than answered as if the group were a person.
+                let individual = contacts.is_some_and(|contacts| {
+                    contacts
+                        .iter()
+                        .any(|contact| contact.get("wa_id").and_then(Value::as_str) == Some(sender))
+                });
+                if !individual
+                    || message.get("group_id").is_some()
+                    || message.get("participant").is_some()
+                {
+                    // On an event rather than on `received`: one span covers the whole delivery,
+                    // so a `drop.reason` recorded there is overwritten by the next message's and
+                    // stains the trace of an accepted message beside it.
+                    tracing::debug!(
+                        event = "gateway_message_ignored",
+                        transport = %state.name,
+                        reason = "group-unsupported",
+                        message.index = index
+                    );
+                    continue;
+                }
                 if !canonical_whatsapp_message_id(id)
                     || sender.is_empty()
                     || sender.len() > 64
@@ -648,25 +701,36 @@ fn parse_delivery(
                 if accepted.len() == MAX_MESSAGES_PER_DELIVERY {
                     return Err(());
                 }
-                let conversation =
-                    format!("{}:{}:{}", state.waba_id, state.phone_number_id, sender);
+                // The business account and phone number Meta signed this delivery under are the
+                // container; the sender is the conversation, because an individual message has
+                // nothing else it could be addressed to.
+                let conversation = Conversation {
+                    kind: ConversationKind::DirectMessage,
+                    container: Some(format!("{}:{}", state.waba_id, state.phone_number_id)),
+                    id: sender.to_owned(),
+                    thread: None,
+                };
+                record_conversation(received, &conversation);
                 accepted.push(InboundMessage {
                     transport: state.name.clone(),
                     transport_kind: ChatTransportKind::Whatsapp,
                     subject,
-                    channel: conversation.clone(),
-                    thread: None,
-                    conversation_id: conversation,
+                    conversation,
                     message_id: id.to_owned(),
                     text: bound_inbound(text),
                     assets: Vec::new(),
-                    conversation: ConversationKind::DirectMessage,
                     addressed: None,
                     thread_continuation: None,
                     reply: ReplyTarget::WhatsApp {
                         recipient: sender.to_owned(),
                     },
-                    activity: None,
+                    // The typing indicator is addressed to the message it answers rather than to
+                    // the conversation: the one Graph call that shows it also marks that message
+                    // read, and the read is what carries the identifier.
+                    liveness: state.native.then(|| LivenessTarget::WhatsApp {
+                        recipient: sender.to_owned(),
+                        inbound_message_id: id.to_owned(),
+                    }),
                     receive_span: received.clone(),
                 });
             }
@@ -794,7 +858,8 @@ fn text_response(status: StatusCode, body: String) -> Response {
     response
 }
 
-struct WhatsappReplier {
+/// The answering half of the transport, plus the one liveness surface the Cloud API has.
+struct WhatsappDriver {
     transport: String,
     endpoint: String,
     version: String,
@@ -803,7 +868,15 @@ struct WhatsappReplier {
     http: reqwest::Client,
 }
 
-impl WhatsappReplier {
+impl WhatsappDriver {
+    /// The one Graph endpoint this transport posts to, for answers and for liveness alike.
+    fn messages_url(&self) -> String {
+        format!(
+            "{}/{}/{}/messages",
+            self.endpoint, self.version, self.phone_number_id
+        )
+    }
+
     /// One text message, sent exactly once and never retried.
     async fn send_text(&self, recipient: &str, body: &str) -> Result<(), TransportError> {
         #[allow(
@@ -821,10 +894,7 @@ impl WhatsappReplier {
         .map_err(|_| TransportError::Response)?;
         let response = self
             .http
-            .post(format!(
-                "{}/{}/{}/messages",
-                self.endpoint, self.version, self.phone_number_id
-            ))
+            .post(self.messages_url())
             .bearer_auth(self.access_token.expose())
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(payload)
@@ -854,46 +924,122 @@ impl WhatsappReplier {
     }
 }
 
-impl ChatReplier for WhatsappReplier {
-    fn reply(
+#[async_trait]
+impl TypingLease for WhatsappDriver {
+    fn renew_every(&self) -> Duration {
+        TYPING_RENEW_INTERVAL
+    }
+
+    /// Shows the typing indicator by marking the inbound message read, which is one call.
+    ///
+    /// The Cloud API has no separate typing endpoint: the indicator rides the `status: read`
+    /// message-status call as `typing_indicator`, so a run that shows it also delivers the blue
+    /// ticks, and a run with liveness off delivers neither. That fusion is Meta's, not a choice
+    /// made here.
+    ///
+    /// **The renewal is unverified against the Graph API.** Meta documents the indicator as
+    /// dismissed after 25 seconds or when the reply lands, and documents nothing about re-posting
+    /// it; re-posting every 20 seconds is this transport's bet that a second call restarts that
+    /// timer. Only a real WhatsApp Business number and a person watching the conversation can
+    /// settle it, so the loopback test below pins the *request* and not Meta's behavior. If the
+    /// bet is wrong the cost is dead air after 25 seconds, which the design already accepted.
+    async fn renew(&self, target: &LivenessTarget) -> Result<(), TransportError> {
+        let LivenessTarget::WhatsApp {
+            inbound_message_id, ..
+        } = target
+        else {
+            return Err(TransportError::Response);
+        };
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "serializing a serde_json::Value cannot fail: it holds no non-string map keys \
+                      and serde_json::Number rejects non-finite floats"
+        )]
+        let payload = serde_json::to_vec(&json!({
+            "messaging_product": "whatsapp",
+            "status": "read",
+            "message_id": inbound_message_id,
+            "typing_indicator": { "type": "text" }
+        }))
+        .map_err(|_| TransportError::Response)?;
+        let response = self
+            .http
+            .post(self.messages_url())
+            .bearer_auth(self.access_token.expose())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(payload)
+            .timeout(LIVENESS_REQUEST_TIMEOUT)
+            .send()
+            .await
+            .map_err(|source| TransportError::Request(Box::new(source)))?;
+        let status = response.status();
+        let bytes = bounded_response(response).await?;
+        if !status.is_success() {
+            return Err(TransportError::Service {
+                code: format!("http-{}", status.as_u16()),
+            });
+        }
+        let value: Value =
+            serde_json::from_slice(&bytes).map_err(TransportError::MalformedResponse)?;
+        if value.get("success").and_then(Value::as_bool) != Some(true) {
+            return Err(TransportError::Response);
+        }
+        Ok(())
+    }
+}
+
+/// Typing is the whole of WhatsApp's liveness.
+///
+/// The other accessors keep the trait's `None`, and that is the honest answer rather than a gap:
+/// the Cloud API has no message edit, so there is no progress message and no stream to grow, and
+/// an interactive button needs a template outside the 24-hour service window, so there is no
+/// cancel control either. Configuration refuses `liveness.stream` and `liveness.cancelButton` on
+/// this transport for those reasons, so neither reaches this driver. `liveness.progress: message`
+/// is not refused: it resolves like anywhere else and does nothing here, because the surface it
+/// asks for is one of the trait defaults this impl leaves alone.
+#[async_trait]
+impl ChatDriver for WhatsappDriver {
+    async fn reply(
         &self,
-        target: ReplyTarget,
+        target: &ReplyTarget,
         reply: OutboundReply,
-    ) -> BoxFuture<'_, Result<(), TransportError>> {
-        Box::pin(async move {
-            let ReplyTarget::WhatsApp { recipient } = target else {
-                return Err(TransportError::Response);
-            };
-            let OutboundReply { text, images } = reply;
-            if !images.is_empty() {
-                // Configuration refuses provider attachments on a WhatsApp route, so reaching here
-                // means the two disagree. Say which one rather than dropping bytes silently:
-                // sending an image needs Meta's media upload, which this transport does not have.
-                tracing::error!(
-                    event = "gateway_whatsapp_image_unsupported",
-                    transport = %self.transport,
-                );
-                return Err(TransportError::Response);
-            }
-            let mut accepted = 0_usize;
-            for chunk in split_message(&text, MAX_WHATSAPP_TEXT_CHARS, TextUnit::Scalar) {
-                match self.send_text(&recipient, &chunk).await {
-                    Ok(()) => accepted += 1,
-                    // Name the cause here: the session only learns that a split answer arrived in
-                    // part, and the service code behind that is otherwise discarded.
-                    Err(error) if accepted > 0 => {
-                        tracing::warn!(
-                            event = "gateway_whatsapp_reply_partial",
-                            category = error.category(),
-                            delivered = accepted,
-                        );
-                        return Err(TransportError::PartialDelivery);
-                    }
-                    Err(error) => return Err(error),
+    ) -> Result<(), TransportError> {
+        let ReplyTarget::WhatsApp { recipient } = target else {
+            return Err(TransportError::Response);
+        };
+        let OutboundReply { text, images } = reply;
+        if !images.is_empty() {
+            // Configuration refuses provider attachments on a WhatsApp route, so reaching here
+            // means the two disagree. Say which one rather than dropping bytes silently:
+            // sending an image needs Meta's media upload, which this transport does not have.
+            tracing::error!(
+                event = "gateway_whatsapp_image_unsupported",
+                transport = %self.transport,
+            );
+            return Err(TransportError::Response);
+        }
+        let mut accepted = 0_usize;
+        for chunk in split_message(&text, MAX_WHATSAPP_TEXT_CHARS, TextUnit::Scalar) {
+            match self.send_text(recipient, &chunk).await {
+                Ok(()) => accepted += 1,
+                // Name the cause here: the session only learns that a split answer arrived in
+                // part, and the service code behind that is otherwise discarded.
+                Err(error) if accepted > 0 => {
+                    tracing::warn!(
+                        event = "gateway_whatsapp_reply_partial",
+                        category = error.category(),
+                        delivered = accepted,
+                    );
+                    return Err(TransportError::PartialDelivery);
                 }
+                Err(error) => return Err(error),
             }
-            (accepted > 0).then_some(()).ok_or(TransportError::Response)
-        })
+        }
+        (accepted > 0).then_some(()).ok_or(TransportError::Response)
+    }
+
+    fn typing(&self) -> Option<&dyn TypingLease> {
+        Some(self)
     }
 }
 
@@ -935,6 +1081,7 @@ mod tests {
                 verify_token: Arc::new(Redacted::new("verify".to_owned())),
                 waba_id: "123".to_owned(),
                 phone_number_id: "456".to_owned(),
+                native: true,
                 sender,
                 dedup: Arc::new(Mutex::new(ClaimedIds::new())),
                 refusals: Arc::new(Mutex::new(RefusalLog::new())),
@@ -1019,6 +1166,7 @@ mod tests {
             "object":"whatsapp_business_account",
             "entry":[{"id":"123","changes":[{"field":"messages","value":{
                 "messaging_product":"whatsapp","metadata":{"phone_number_id":"456"},
+                "contacts":[{"wa_id":"1603"}],
                 "messages":[{"id":"same","from":"1603","type":"text","text":{"body":"hello ✓"}}]
             }}]}]
         }))
@@ -1115,6 +1263,7 @@ mod tests {
             "object":"whatsapp_business_account",
             "entry":[{"id":"123","changes":[{"field":"messages","value":{
                 "messaging_product":"whatsapp","metadata":{"phone_number_id":"456"},
+                "contacts":[{"wa_id":"1603"}],
                 "messages":[{"id":"retry-me","from":"1603","type":"text","text":{"body":"hello"}}]
             }}]}]
         }))
@@ -1177,6 +1326,7 @@ mod tests {
                       "statuses":[{"id":"status"}] }},
                     {"field":"messages","value":{"messaging_product":"whatsapp",
                       "metadata":{"phone_number_id":"456","display_phone_number":"+1 999"},
+                      "contacts":[{"wa_id":"1603"},{"wa_id":"01603"},{"wa_id":"1999"}],
                       "messages":[
                         {"id":"one","from":"1603","type":"image"},
                         {"id":"bad-sender","from":"01603","type":"text","text":{"body":"ignore"}},
@@ -1191,7 +1341,82 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].message_id, "two");
         assert_eq!(messages[0].subject.canonical(), "whatsapp.1603");
-        assert_eq!(messages[0].channel, "123:456:1603");
+        assert_eq!(
+            messages[0].conversation.container.as_deref(),
+            Some("123:456")
+        );
+        assert_eq!(messages[0].conversation.id, "1603");
+        assert_eq!(messages[0].conversation.key(), "1603");
+        assert_eq!(
+            messages[0].liveness,
+            Some(LivenessTarget::WhatsApp {
+                recipient: "1603".to_owned(),
+                inbound_message_id: "two".to_owned(),
+            }),
+            "the typing indicator is addressed to the message it answers"
+        );
+    }
+
+    /// Only a message whose sender is one of the delivery's own contacts is answered.
+    ///
+    /// Two shapes at once, because the rule is positive rather than a list of things to refuse: a
+    /// group payload, where `from` is the group and the contact is the human inside it, and a
+    /// delivery naming no contact for its sender at all — a shape this gateway cannot answer even
+    /// though it carries neither of the two group keys.
+    #[test]
+    fn a_message_whose_sender_is_not_a_contact_of_the_delivery_is_dropped() {
+        let group = json!({
+            "object": "whatsapp_business_account",
+            "entry": [{"id":"123","changes":[{"field":"messages","value":{
+                "messaging_product":"whatsapp","metadata":{"phone_number_id":"456"},
+                "contacts":[{"wa_id":"1603"}],
+                "messages":[{
+                    "id":"group-one","from":"120363000000000000","group_id":"120363000000000000",
+                    "participant":"1603","type":"text","text":{"body":"hello everyone"}
+                }]
+            }}]}]
+        });
+        let uncontacted = json!({
+            "object": "whatsapp_business_account",
+            "entry": [{"id":"123","changes":[{"field":"messages","value":{
+                "messaging_product":"whatsapp","metadata":{"phone_number_id":"456"},
+                "contacts":[{"wa_id":"1603"}],
+                "messages":[{
+                    "id":"elsewhere","from":"1700","type":"text","text":{"body":"hello"}
+                }]
+            }}]}]
+        });
+
+        assert!(
+            parse_delivery(&state(), &group, &received())
+                .expect("delivery")
+                .is_empty(),
+            "the Cloud API's individual-message path cannot answer a group"
+        );
+        assert!(
+            parse_delivery(&state(), &uncontacted, &received())
+                .expect("delivery")
+                .is_empty(),
+            "a reply has nowhere to go when no contact in the delivery is the sender"
+        );
+    }
+
+    /// `liveness.mode: off` leaves the transport exactly as reply-only as it was.
+    #[test]
+    fn liveness_off_withholds_the_target_rather_than_the_capability() {
+        let mut state = state();
+        state.native = false;
+        let payload = json!({
+            "object": "whatsapp_business_account",
+            "entry": [{"id":"123","changes":[{"field":"messages","value":{
+                "messaging_product":"whatsapp","metadata":{"phone_number_id":"456"},
+                "contacts":[{"wa_id":"1603"}],
+                "messages":[{"id":"one","from":"1603","type":"text","text":{"body":"hello"}}]
+            }}]}]
+        });
+        let messages = parse_delivery(&state, &payload, &received()).expect("delivery");
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].liveness.is_none());
     }
 
     #[test]
@@ -1202,6 +1427,7 @@ mod tests {
                 "object":"whatsapp_business_account",
                 "entry":[{"id":"123","changes":[{"field":"messages","value":{
                     "messaging_product":"whatsapp","metadata":{"phone_number_id":"456"},
+                    "contacts":[{"wa_id":"1603"}],
                     "messages":[{"id":"same","from":"1603","type":"text","text":{"body":"hello"}}]
                 }}]}]
             }),
@@ -1229,6 +1455,10 @@ mod tests {
             "secret".to_owned(),
             "verify".to_owned(),
             "access".to_owned(),
+            LivenessSettings {
+                mode: LivenessMode::Native,
+                ..LivenessSettings::default()
+            },
         )
         .expect("transport");
         transport.connect().await.expect("connect");
@@ -1247,6 +1477,7 @@ mod tests {
             "object":"whatsapp_business_account",
             "entry":[{"id":"123","changes":[{"field":"messages","value":{
                 "messaging_product":"whatsapp","metadata":{"phone_number_id":"456"},
+                "contacts":[{"wa_id":"1603"}],
                 "messages":[{"id":"wamid.loopback","from":"1603","type":"text","text":{"body":"hello"}}]
             }}]}]
         })).expect("body");
@@ -1283,6 +1514,10 @@ mod tests {
             "secret".to_owned(),
             "verify".to_owned(),
             "access".to_owned(),
+            LivenessSettings {
+                mode: LivenessMode::Native,
+                ..LivenessSettings::default()
+            },
         )
         .expect("transport");
         assert!(blocked.connect().await.is_err());
@@ -1299,6 +1534,10 @@ mod tests {
             "secret".to_owned(),
             "verify".to_owned(),
             "access".to_owned(),
+            LivenessSettings {
+                mode: LivenessMode::Native,
+                ..LivenessSettings::default()
+            },
         )
         .expect("transport");
         running.connect().await.expect("listener starts");
@@ -1353,7 +1592,7 @@ mod tests {
             stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 66\r\nConnection: close\r\n\r\n{\"messaging_product\":\"whatsapp\",\"messages\":[{\"id\":\"wamid.reply\"}]}").await.expect("write");
             request
         });
-        let replier = WhatsappReplier {
+        let driver = WhatsappDriver {
             transport: "wa".to_owned(),
             endpoint: format!("http://{address}"),
             version: "v23.0".to_owned(),
@@ -1365,9 +1604,9 @@ mod tests {
                 .build()
                 .expect("client"),
         };
-        replier
+        driver
             .reply(
-                ReplyTarget::WhatsApp {
+                &ReplyTarget::WhatsApp {
                     recipient: "1603".to_owned(),
                 },
                 OutboundReply::text("hello"),
@@ -1416,7 +1655,7 @@ mod tests {
                 .await
                 .expect("write");
         });
-        let replier = WhatsappReplier {
+        let driver = WhatsappDriver {
             transport: "wa".to_owned(),
             endpoint: format!("http://{address}"),
             version: "v23.0".to_owned(),
@@ -1428,7 +1667,7 @@ mod tests {
                 .build()
                 .expect("client"),
         };
-        let error = replier
+        let error = driver
             .send_text("1603", "hello")
             .await
             .expect_err("HTML is not a Graph response");
@@ -1459,7 +1698,7 @@ mod tests {
             let _ = stream.read(&mut bytes).await;
             tokio::time::sleep(Duration::from_millis(200)).await;
         });
-        let replier = WhatsappReplier {
+        let driver = WhatsappDriver {
             transport: "wa".to_owned(),
             endpoint: format!("http://{address}"),
             version: "v23.0".to_owned(),
@@ -1471,9 +1710,9 @@ mod tests {
                 .expect("client"),
         };
         assert!(
-            replier
+            driver
                 .reply(
-                    ReplyTarget::WhatsApp {
+                    &ReplyTarget::WhatsApp {
                         recipient: "1603".to_owned()
                     },
                     OutboundReply::text("hello"),
@@ -1567,7 +1806,7 @@ mod tests {
             }
             bodies
         });
-        let replier = WhatsappReplier {
+        let driver = WhatsappDriver {
             transport: "wa".to_owned(),
             endpoint: format!("http://{address}"),
             version: "v23.0".to_owned(),
@@ -1582,9 +1821,9 @@ mod tests {
         // The session's own outbound bound is twice the WhatsApp ceiling, so this length is
         // reachable from an ordinary answer rather than only from abuse.
         let answer = format!("BEGIN{}END", "x".repeat(MAX_WHATSAPP_TEXT_CHARS));
-        replier
+        driver
             .reply(
-                ReplyTarget::WhatsApp {
+                &ReplyTarget::WhatsApp {
                     recipient: "1603".to_owned(),
                 },
                 OutboundReply::text(answer.clone()),
@@ -1669,5 +1908,197 @@ mod tests {
             classify_accept(&io::Error::from(io::ErrorKind::InvalidInput)),
             AcceptFailure::Fatal
         );
+    }
+
+    /// A loopback Graph endpoint that answers `count` requests and hands back what it was sent.
+    ///
+    /// Hand-rolled like the reply mocks above: what is under test is the exact request Meta
+    /// receives, and a real socket carrying real bytes is the only thing that proves one.
+    fn graph_mock(
+        count: usize,
+        status: u16,
+        response: &'static str,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind mock");
+        let address = listener.local_addr().expect("address");
+        listener.set_nonblocking(true).expect("mock is pollable");
+        let listener = tokio::net::TcpListener::from_std(listener).expect("mock adopts");
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..count {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                loop {
+                    let read = stream.read(&mut buffer).await.expect("read");
+                    assert!(read > 0, "complete request");
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(split) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        let header_end = split + 4;
+                        let headers = String::from_utf8_lossy(&request[..header_end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                line.to_ascii_lowercase()
+                                    .strip_prefix("content-length: ")
+                                    .and_then(|value| value.parse::<usize>().ok())
+                            })
+                            .expect("content length");
+                        if request.len() >= header_end + length {
+                            break;
+                        }
+                    }
+                }
+                let reason = if status == 200 { "OK" } else { "Bad Request" };
+                let head = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.len()
+                );
+                stream.write_all(head.as_bytes()).await.expect("write head");
+                stream
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write body");
+                requests.push(String::from_utf8(request).expect("utf8 request"));
+            }
+            requests
+        });
+        (format!("http://{address}"), server)
+    }
+
+    fn driver(endpoint: String) -> WhatsappDriver {
+        WhatsappDriver {
+            transport: "wa".to_owned(),
+            endpoint,
+            version: "v23.0".to_owned(),
+            phone_number_id: "456".to_owned(),
+            access_token: Redacted::new("access-secret".to_owned()),
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(5))
+                .build()
+                .expect("client"),
+        }
+    }
+
+    fn typing_target() -> LivenessTarget {
+        LivenessTarget::WhatsApp {
+            recipient: "1603".to_owned(),
+            inbound_message_id: "wamid.inbound".to_owned(),
+        }
+    }
+
+    /// The body of one request, as the Graph endpoint parsed it.
+    fn body(request: &str) -> Value {
+        serde_json::from_str(request.split("\r\n\r\n").nth(1).expect("body")).expect("json body")
+    }
+
+    /// Meta has no typing endpoint: the indicator rides the read receipt, so one call does both.
+    #[tokio::test]
+    async fn typing_is_the_read_receipt_and_the_indicator_in_one_call() {
+        let (endpoint, server) = graph_mock(1, 200, r#"{"success":true}"#);
+        let driver = driver(endpoint);
+        assert_eq!(driver.renew_every(), Duration::from_secs(20));
+        driver
+            .renew(&typing_target())
+            .await
+            .expect("the typing indicator is shown");
+        let requests = server.await.expect("server");
+        assert!(requests[0].starts_with("POST /v23.0/456/messages HTTP/1.1\r\n"));
+        assert!(
+            requests[0]
+                .to_ascii_lowercase()
+                .contains("authorization: bearer access-secret\r\n")
+        );
+        let sent = body(&requests[0]);
+        assert_eq!(sent["messaging_product"], "whatsapp");
+        assert_eq!(sent["status"], "read");
+        assert_eq!(
+            sent["message_id"], "wamid.inbound",
+            "the read receipt is what carries the identifier, so the indicator rides it"
+        );
+        assert_eq!(sent["typing_indicator"], json!({ "type": "text" }));
+    }
+
+    /// Meta documents no renewal, so what this pins is the request rather than the outcome: every
+    /// 20 seconds the same call goes out again, and whether it restarts Meta's 25-second dismissal
+    /// is the one thing only a live WhatsApp Business number can answer.
+    #[tokio::test]
+    async fn a_running_session_re_posts_the_same_indicator_request() {
+        let (endpoint, server) = graph_mock(2, 200, r#"{"success":true}"#);
+        let driver = driver(endpoint);
+        for _ in 0..2 {
+            driver
+                .renew(&typing_target())
+                .await
+                .expect("the indicator is re-posted");
+        }
+        let requests = server.await.expect("server");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            body(&requests[0]),
+            body(&requests[1]),
+            "renewal is the identical call, not a different one"
+        );
+    }
+
+    /// A message identifier Meta will not accept is the likely live failure, and it arrives as a
+    /// 400 rather than as a body to interpret.
+    #[tokio::test]
+    async fn a_refused_indicator_surfaces_the_graph_status() {
+        let (endpoint, server) = graph_mock(
+            1,
+            400,
+            r#"{"error":{"message":"Unsupported post request","code":100}}"#,
+        );
+        let driver = driver(endpoint);
+        let error = driver
+            .renew(&typing_target())
+            .await
+            .expect_err("a rejected indicator is not a shown one");
+        assert!(
+            matches!(&error, TransportError::Service { code } if code == "http-400"),
+            "{error:?}"
+        );
+        server.await.expect("server");
+    }
+
+    /// A 200 whose body does not say `success` is the Graph API disagreeing with itself; the
+    /// indicator was not shown, so the call did not succeed.
+    #[tokio::test]
+    async fn an_indicator_is_not_shown_unless_graph_says_so() {
+        let (endpoint, server) = graph_mock(1, 200, r#"{"messaging_product":"whatsapp"}"#);
+        let driver = driver(endpoint);
+        let error = driver
+            .renew(&typing_target())
+            .await
+            .expect_err("a 200 without success is not a shown indicator");
+        assert!(matches!(&error, TransportError::Response), "{error:?}");
+        server.await.expect("server");
+    }
+
+    /// `Some` means implemented, so the three surfaces WhatsApp lacks have to answer `None`.
+    #[tokio::test]
+    async fn whatsapp_offers_typing_and_nothing_else() {
+        let driver = driver("http://127.0.0.1:1".to_owned());
+        assert!(driver.typing().is_some());
+        assert!(
+            driver.progress().is_none(),
+            "the Cloud API cannot edit a message it sent, so a route that resolved \
+             `liveness.progress: message` — which configuration accepts here — gets nothing"
+        );
+        assert!(
+            driver.stream().is_none(),
+            "a stream is an edited message, which is the same missing endpoint"
+        );
+        assert!(
+            driver.cancel_button().is_none(),
+            "an interactive button needs a template outside the service window"
+        );
+        assert!(driver.status().is_none());
+        assert!(driver.reaction().is_none());
     }
 }

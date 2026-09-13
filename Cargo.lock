@@ -1138,6 +1138,10 @@ dependencies = [
 name = "dekopon-test-support"
 version = "0.13.0"
 dependencies = [
+ "dekopon-agent",
+ "dekopon-model",
+ "dekopon-shell",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]
@@ -1146,6 +1150,7 @@ dependencies = [
 name = "dekopond"
 version = "0.13.0"
 dependencies = [
+ "async-trait",
  "axum",
  "base64 0.23.1",
  "clap",

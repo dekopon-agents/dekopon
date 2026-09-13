@@ -14,6 +14,7 @@ Read in this order:
 4. [`architecture.md`](architecture.md) — how the design maps to crate boundaries and the two-process deployment.
 5. [`cli.md`](cli.md) and [`dekopond.md`](dekopond.md) — the operator command surfaces and the long-running gateway.
    [`catalog.md`](catalog.md) is the field-by-field contract for the resources they all read, including which fields are load-bearing and which are reserved.
+   [`chat-progress.md`](chat-progress.md) is the design of record for what a waiting person is shown while a session runs and for every way one is stopped.
    [`chatgpt-credential.md`](chatgpt-credential.md) follows the ChatGPT subscription credential from a local login to a pod.
 6. [`inference.md`](inference.md) — exact model request types and wire shape, prompt-cache optimization and retention caveats, bounded chat history, durable on-demand chat turns, and the broader memory design space.
 7. [`observability.md`](observability.md) — gateway and broker OTLP traces, the broker audit record and where it goes, what telemetry excludes, and the OpenObserve development example.
@@ -64,6 +65,7 @@ Keep the host, SDK, HTTP and storage facades, provider WIT, HTTP WIT, storage WI
 | Model request types, ChatGPT wire JSON, prompt caching, provider retention, chat memory, or memory frameworks | [`inference.md`](inference.md) | Separates request and cache hints, bounded replay, and durable on-demand turns from undocumented subscription behavior and exploratory memory. |
 | Prompt tools and sandboxed scripts | [`dekopon-agent`](../crates/dekopon-agent/README.md) and [`dekopon-shell`](../crates/dekopon-shell/README.md) | Shared orchestration, language, limits, and authority-free dispatch. |
 | Chat transports, gateway configuration, routing, agent sessions, or conversation history | [`dekopond.md`](dekopond.md) | Records the daemon's configuration, transport semantics, session bounds, attested authorization flow, and the conversation contract. |
+| What a running session shows, streamed answers, keep-alives, or stopping a run | [`chat-progress.md`](chat-progress.md) | Records the progress vocabulary, the per-session policy that owns the one editable message, what each transport can natively show, and the cancellation paths. |
 | Daemon tracing, OTLP logs, OpenObserve, telemetry exclusions, model-token totals | [`observability.md`](observability.md) | Records signal semantics, exported accounting, configuration, what telemetry excludes, and end-to-end validation. |
 | Skills, `read_skill`, improvement suggestions, or evaluating a changed instruction before it ships | [`improvement.md`](improvement.md) | Records the two operator-driven improvement mechanisms, how they compose into one loop, and the store, rewriter, grader, and cross-session memory that are absent. |
 | Public DRNs, private source maps, secret-use policy, source adapters, path-bound Basic/Bearer sinks, or mounted secret and config files | [`secrets.md`](secrets.md) | Defines the complete secret-reference and resolution contract. |

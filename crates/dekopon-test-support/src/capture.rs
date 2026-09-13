@@ -28,6 +28,14 @@ pub enum Record {
         fields: String,
         /// The enclosing span's name, when there was one.
         parent: Option<String>,
+        /// Every enclosing span's name, outermost first.
+        ///
+        /// Separate from `parent` because "this record rides that trace" and "this record was
+        /// written inside that span" are different claims, and only the first one is stable: a
+        /// record the gateway writes from its prompt loop is nested two or three spans deep, and
+        /// an assertion that read only the immediate parent would be pinned to whichever span the
+        /// loop happened to be inside rather than to the session the trace belongs to.
+        scope: Vec<&'static str>,
     },
     /// One span, at creation or when a later field was recorded onto it.
     Span {
@@ -260,13 +268,20 @@ where
     fn on_event(&self, event: &tracing::Event<'_>, context: Context<'_, S>) {
         let mut fields = String::new();
         event.record(&mut Visitor(&mut fields));
+        let attributed = context.event_span(event);
         self.push(Record::Event {
             level: event.metadata().level().as_str(),
             target: event.metadata().target().to_owned(),
             fields,
-            parent: context
-                .event_span(event)
+            parent: attributed
+                .as_ref()
                 .map(|span| span.metadata().name().to_owned()),
+            scope: attributed.map_or_else(Vec::new, |span| {
+                span.scope()
+                    .from_root()
+                    .map(|ancestor| ancestor.metadata().name())
+                    .collect()
+            }),
         });
     }
 }

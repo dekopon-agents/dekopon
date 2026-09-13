@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use dekopon_config::LocalCatalog;
 use dekopond::{
-    ActivityMode, DekopondConfig, SlackActivityConfig, SlackActivityFallback, SlackExperience,
+    DekopondConfig, LivenessConfig, LivenessMode, SlackExperience, SlackLivenessFallback,
 };
 
 fn example(name: &str) -> PathBuf {
@@ -55,9 +55,10 @@ fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
         transport,
         dekopond::TransportConfig::SlackSocketMode {
             experience: SlackExperience::Agent,
-            activity: SlackActivityConfig {
-                mode: ActivityMode::Native,
-                classic_fallback: SlackActivityFallback::Reaction,
+            liveness: LivenessConfig {
+                mode: LivenessMode::Native,
+                classic_fallback: SlackLivenessFallback::Reaction,
+                ..
             },
             ..
         }
@@ -83,9 +84,9 @@ fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
     // The walkthrough demonstrates a remembered conversation, which is the mode a reader has to
     // opt into: writing a window bound next to `mode: oneShot` would not decode at all.
     assert_eq!(
-        route.conversation,
-        dekopond::ConversationConfig::Persistent {
-            scope: dekopond::ConversationScope::PrivateConversation,
+        route.memory,
+        dekopond::MemoryConfig::Persistent {
+            scope: dekopond::MemoryScope::PrivateConversation,
             idle_timeout_ms: 900_000,
             max_turns: 12,
             max_bytes: 65_536,

@@ -43,7 +43,8 @@ use dekopon_broker_host::{
 };
 pub use dekopon_broker_protocol::{
     Attestation, AvailableCapability, ChatMemorySurface, ChatScopeClaim, ChatTransportKind,
-    DeliveredTurnRequest, DeliveryIdentity, InvocationRequest,
+    Conversation, ConversationKind, ConversationKindMatch, ConversationMatch,
+    ConversationMatchProblem, DeliveredTurnRequest, DeliveryIdentity, InvocationRequest,
 };
 use dekopon_capability::{
     AuthorizationError, DecisionReference, EffectKind, Evidence, ExecutionConstraints,
@@ -56,7 +57,9 @@ use dekopon_core::{
     SubjectService, TraceId, error_chain,
 };
 pub use dekopon_policy::{AGENT_PROMPT_ACTION, PolicyBuildError, PolicyEngine, PolicyWorld};
-use dekopon_policy::{PolicyContext, PolicyDecision, PolicyRequest, PolicyTarget};
+use dekopon_policy::{
+    PolicyContext, PolicyConversation, PolicyDecision, PolicyRequest, PolicyTarget,
+};
 use dekopon_storage_host::{
     ContinuityPolicy, StorageEvidence, StorageGrantPreparation, StorageGrantRequest,
     StorageScopeCommitment,
@@ -1269,39 +1272,45 @@ impl SecretCatalog {
     }
 }
 
-/// Explicit breadth of one owner-authored chat-scope grant.
+/// A retired configuration key, decoded only so a refusal can name what replaced it.
+///
+/// Its own type rather than `serde::de::IgnoredAny` because the grants it sits in derive `Eq`, and
+/// `IgnoredAny` implements only `PartialEq`. It remembers nothing but presence, which is all a
+/// refusal needs.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
+#[serde(from = "serde::de::IgnoredAny")]
+pub struct RetiredKey;
+
+impl From<serde::de::IgnoredAny> for RetiredKey {
+    fn from(_ignored: serde::de::IgnoredAny) -> Self {
+        Self
+    }
+}
+
+/// One owner-authored chat-scope grant: a transport, and the conversations on it.
+///
+/// The same [`ConversationMatch`] a gateway route is written with, so the attestor entry and the
+/// route file read as one table. Default-deny stays intact because `conversation` is required and
+/// `kind: any` is a word an owner types rather than an omission they fall into.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(
-    tag = "breadth",
-    deny_unknown_fields,
-    rename_all = "camelCase",
-    rename_all_fields = "camelCase"
-)]
-pub enum ChatScopeGrant {
-    /// Every canonical channel/conversation on one configured transport.
-    TransportWide {
-        kind: ChatTransportKind,
-        transport: dekopon_core::TransportId,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        local_subject_service: Option<String>,
-    },
-    /// Every canonical conversation in one exact channel.
-    ExactChannel {
-        kind: ChatTransportKind,
-        transport: dekopon_core::TransportId,
-        channel: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        local_subject_service: Option<String>,
-    },
-    /// One exact canonical conversation.
-    ExactConversation {
-        kind: ChatTransportKind,
-        transport: dekopon_core::TransportId,
-        channel: String,
-        conversation: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        local_subject_service: Option<String>,
-    },
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ChatScopeGrant {
+    /// Transport family this grant covers.
+    pub kind: ChatTransportKind,
+    /// The configured transport name, which is what a claim carries.
+    pub transport: dekopon_core::TransportId,
+    /// The conversations on it. Required; `{ kind: any }` is how an owner says "all of them".
+    pub conversation: ConversationMatch,
+    /// Required exactly for `kind: local`, where the subject service is not implied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_subject_service: Option<String>,
+    /// The retired `breadth:` tag, decoded only so the refusal can name its replacement.
+    ///
+    /// Kept as an ignored field rather than deleted outright: `deny_unknown_fields` would refuse an
+    /// 0.13 file with serde's own "unknown field" sentence, which tells an operator nothing about
+    /// what to write instead.
+    #[serde(default, skip_serializing)]
+    pub breadth: Option<RetiredKey>,
 }
 
 impl fmt::Debug for ChatScopeGrant {
@@ -1312,96 +1321,43 @@ impl fmt::Debug for ChatScopeGrant {
 
 impl ChatScopeGrant {
     fn validate(&self) -> Result<(), BrokerBuildError> {
-        let (kind, scope, local_service) = match self {
-            Self::TransportWide {
-                kind,
-                local_subject_service,
-                ..
-            } => (*kind, None, local_subject_service),
-            Self::ExactChannel {
-                kind,
-                channel,
-                local_subject_service,
-                ..
-            } => (*kind, Some((channel.as_str(), None)), local_subject_service),
-            Self::ExactConversation {
-                kind,
-                channel,
-                conversation,
-                local_subject_service,
-                ..
-            } => (
-                *kind,
-                Some((channel.as_str(), Some(conversation.as_str()))),
-                local_subject_service,
-            ),
-        };
-        if kind == ChatTransportKind::Local {
-            let Some(service) = local_service else {
+        if self.breadth.is_some() {
+            return Err(BrokerBuildError::RetiredChatScopeBreadth);
+        }
+        if self.kind == ChatTransportKind::Local {
+            let Some(service) = &self.local_subject_service else {
                 return Err(BrokerBuildError::InvalidChatScope);
             };
             service
                 .parse::<SubjectService>()
                 .map_err(|source| BrokerBuildError::InvalidChatScopeService { source })?;
-        } else if local_service.is_some() {
+        } else if self.local_subject_service.is_some() {
             return Err(BrokerBuildError::InvalidChatScope);
         }
-        if let Some((channel, conversation)) = scope {
-            let claim = ChatScopeClaim {
-                transport: self.transport().clone(),
-                kind,
-                channel: channel.to_owned(),
-                conversation: conversation.unwrap_or(channel).to_owned(),
-            };
-            if !claim.is_canonical_shape() {
-                return Err(BrokerBuildError::InvalidChatScope);
-            }
-        }
-        Ok(())
-    }
-
-    fn transport(&self) -> &dekopon_core::TransportId {
-        match self {
-            Self::TransportWide { transport, .. }
-            | Self::ExactChannel { transport, .. }
-            | Self::ExactConversation { transport, .. } => transport,
+        let problems = self.conversation.validate(self.kind);
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(BrokerBuildError::InvalidChatScopeConversation { problems })
         }
     }
 
     fn permits(&self, subject: &ExternalSubject, scope: &ChatScopeClaim) -> bool {
-        let (kind, transport, channel, conversation, local_service) = match self {
-            Self::TransportWide {
-                kind,
-                transport,
-                local_subject_service,
-            } => (*kind, transport, None, None, local_subject_service),
-            Self::ExactChannel {
-                kind,
-                transport,
-                channel,
-                local_subject_service,
-            } => (*kind, transport, Some(channel), None, local_subject_service),
-            Self::ExactConversation {
-                kind,
-                transport,
-                channel,
-                conversation,
-                local_subject_service,
-            } => (
-                *kind,
-                transport,
-                Some(channel),
-                Some(conversation),
-                local_subject_service,
-            ),
-        };
-        kind == scope.kind
-            && transport == &scope.transport
-            && channel.is_none_or(|value| value == &scope.channel)
-            && conversation.is_none_or(|value| value == &scope.conversation)
-            && (kind != ChatTransportKind::Local
-                || local_service.as_deref() == Some(subject.service().as_str()))
+        self.kind == scope.kind
+            && self.transport == scope.transport
+            && self.conversation.matches(&scope.conversation)
+            && (self.kind != ChatTransportKind::Local
+                || self.local_subject_service.as_deref() == Some(subject.service().as_str()))
     }
+}
+
+/// Renders every selector problem in one sentence, semicolon separated.
+fn render_conversation_problems(problems: &[ConversationMatchProblem]) -> String {
+    problems
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// One peer's authority to attest external subjects, scoped to canonical namespaces.
@@ -1464,7 +1420,7 @@ impl AttestorGrant {
     #[must_use]
     pub fn permits_chat(&self, subject: &ExternalSubject, scope: &ChatScopeClaim) -> bool {
         self.permits(subject)
-            && canonical_chat_scope(subject, scope)
+            && scope.conversation.is_canonical_for(scope.kind, subject)
             && self
                 .chat_scopes
                 .iter()
@@ -1566,8 +1522,12 @@ fn policy_context(context: &AuthenticatedContext) -> PolicyContext {
         transport: context
             .chat_scope()
             .map(|scope| scope.transport.to_string()),
-        channel: context.chat_scope().map(|scope| scope.channel.clone()),
-        conversation: context.chat_scope().map(|scope| scope.conversation.clone()),
+        conversation: context.chat_scope().map(|scope| PolicyConversation {
+            kind: scope.conversation.kind.as_str().to_owned(),
+            container: scope.conversation.container.clone(),
+            id: scope.conversation.id.clone(),
+            thread: scope.conversation.thread.clone(),
+        }),
     }
 }
 
@@ -1683,21 +1643,6 @@ fn memory_prompt_note(max_lookback_turns: u32) -> String {
          search --query TEXT`. Searches inspect at most {max_lookback_turns} prior turns. Do not \
          claim recall without retrieving it."
     )
-}
-
-fn canonical_chat_scope(subject: &ExternalSubject, scope: &ChatScopeClaim) -> bool {
-    let subject_matches = match (scope.kind, subject.service()) {
-        (ChatTransportKind::Slack, SubjectService::Slack)
-        | (ChatTransportKind::Discord, SubjectService::Discord)
-        | (ChatTransportKind::Telegram, SubjectService::Telegram) => true,
-        (ChatTransportKind::Whatsapp, SubjectService::Whatsapp) => scope
-            .channel
-            .rsplit_once(':')
-            .is_some_and(|(_, sender)| sender == subject.subject()),
-        (ChatTransportKind::Local, _) => true,
-        _ => false,
-    };
-    subject_matches && scope.is_canonical_shape()
 }
 
 /// One thing wrong with the deployment's declared capability routes.
@@ -1923,6 +1868,24 @@ pub enum BrokerBuildError {
     /// An owner-authored chat scope grant was noncanonical, overbroad, or malformed.
     #[error("attestor chat scope is invalid")]
     InvalidChatScope,
+    /// A chat scope grant still carries the 0.13 `breadth:` tag.
+    ///
+    /// Its own variant because the fix is one sentence an operator can act on: the breadths are
+    /// gone, and the selector that replaces all three is the same one the gateway's routes use.
+    #[error(
+        "attestor chat scope still names `breadth`, which is gone; write \
+         `conversation: {{ kind: [channel], ids: [...] }}` (or `kind: any`) instead"
+    )]
+    RetiredChatScopeBreadth,
+    /// An owner-authored `conversation:` selector could never name a real conversation.
+    ///
+    /// Carries every problem rather than the first: a selector with a duplicate kind and two
+    /// unusable ids is one refusal naming all three.
+    #[error("attestor chat scope conversation is invalid: {}", render_conversation_problems(.problems))]
+    InvalidChatScopeConversation {
+        /// Every problem the selector has, in the order they were found.
+        problems: Vec<ConversationMatchProblem>,
+    },
     /// A local chat scope grant named a service the external subject grammar does not define.
     ///
     /// Separate from [`Self::InvalidChatScope`] because it is the one chat-scope rejection whose
@@ -3256,8 +3219,8 @@ where
             subject.clone(),
             scope.kind.to_string(),
             scope.transport.to_string(),
-            scope.channel.clone(),
-            scope.conversation.clone(),
+            scope.conversation.id.clone(),
+            scope.conversation.key(),
             if memory_route {
                 self.chat_memory
                     .as_ref()

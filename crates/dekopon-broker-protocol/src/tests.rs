@@ -6,10 +6,26 @@ use tokio::io::{AsyncWriteExt as _, duplex};
 
 use super::{
     Attestation, BrokerRequest, ChatScopeClaim, ChatTransportKind, CommandRunOutcome,
-    ComponentFailure, DeliveredTurnRequest, DeliveryIdentity, FrameLimits, InvocationRequest,
-    PROTOCOL_VERSION, ProtocolError, ProtocolVersion, RequestEnvelope, ResponseEnvelope,
-    TraceParent, TraceParentError, read_frame, write_frame,
+    ComponentFailure, Conversation, ConversationKind, ConversationKindMatch, ConversationMatch,
+    ConversationMatchProblem, DeliveredTurnRequest, DeliveryIdentity, FrameLimits,
+    InvocationRequest, PROTOCOL_VERSION, ProtocolError, ProtocolVersion, RequestEnvelope,
+    ResponseEnvelope, TraceParent, TraceParentError, read_frame, write_frame,
 };
+
+/// One conversation fixture, spelled the way a transport mints it.
+fn conversation(
+    kind: ConversationKind,
+    container: Option<&str>,
+    id: &str,
+    thread: Option<&str>,
+) -> Conversation {
+    Conversation {
+        kind,
+        container: container.map(str::to_owned),
+        id: id.to_owned(),
+        thread: thread.map(str::to_owned),
+    }
+}
 
 fn subject() -> dekopon_core::ExternalSubject {
     "slack.t0123abc.u9xyz"
@@ -25,8 +41,12 @@ fn scope() -> ChatScopeClaim {
     ChatScopeClaim {
         transport: "scientist-slack".parse().expect("valid transport fixture"),
         kind: ChatTransportKind::Slack,
-        channel: "c0123abc".to_owned(),
-        conversation: "c0123abc:1712345678.000100".to_owned(),
+        conversation: conversation(
+            ConversationKind::Channel,
+            Some("t0123abc"),
+            "c0123abc",
+            Some("1712345678.000100"),
+        ),
     }
 }
 
@@ -586,12 +606,7 @@ fn protocol_version_constant_wire_form_and_display_agree() {
 
 #[test]
 fn chat_scope_turn_and_attestation_debug_are_fully_redacted_and_bounded() {
-    let scope = ChatScopeClaim {
-        transport: "scientist-slack".parse().expect("transport"),
-        kind: ChatTransportKind::Slack,
-        channel: "c0123abc".to_owned(),
-        conversation: "c0123abc:1712345678.000100".to_owned(),
-    };
+    let scope = scope();
     let session = Attestation::for_chat(
         "slack.t0123abc.u9xyz".parse().expect("subject"),
         "reviewer".parse().expect("agent"),
@@ -613,6 +628,7 @@ fn chat_scope_turn_and_attestation_debug_are_fully_redacted_and_bounded() {
     assert!(scope.is_bounded() && turn.is_bounded());
     for rendered in [
         format!("{scope:?}"),
+        format!("{:?}", scope.conversation),
         format!("{session:?}"),
         format!("{attestation:?}"),
         format!("{turn:?}"),
@@ -624,7 +640,12 @@ fn chat_scope_turn_and_attestation_debug_are_fully_redacted_and_bounded() {
     }
 
     let oversized = ChatScopeClaim {
-        channel: "x".repeat(257),
+        conversation: conversation(
+            ConversationKind::Channel,
+            Some("t0123abc"),
+            &"x".repeat(257),
+            None,
+        ),
         ..scope
     };
     assert!(!oversized.is_bounded());
@@ -637,74 +658,514 @@ fn chat_scope_turn_and_attestation_debug_are_fully_redacted_and_bounded() {
 }
 
 #[test]
-fn one_canonical_chat_scope_shape_decides_every_transport() {
-    let claim = |kind, channel: &str, conversation: &str| ChatScopeClaim {
-        transport: "scientist-slack".parse().expect("valid transport fixture"),
-        kind,
-        channel: channel.to_owned(),
-        conversation: conversation.to_owned(),
-    };
+fn one_canonical_conversation_form_decides_every_transport() {
+    let sender =
+        |value: &str| -> dekopon_core::ExternalSubject { value.parse().expect("subject fixture") };
+    let slack_user = sender("slack.t0123abc.u9xyz");
+    let discord_user = sender("discord.578258790881951745");
+    let telegram_user = sender("telegram.5551234");
+    let whatsapp_user = sender("whatsapp.16034700182");
 
-    for (kind, channel, conversation) in [
-        (ChatTransportKind::Slack, "c0123abc", "c0123abc"),
+    // Every accepted row of the derivation table, with the key each one is filed under.
+    for (transport, subject, conversation, key) in [
         (
             ChatTransportKind::Slack,
-            "c0123abc",
-            "c0123abc:1712345678.000100",
+            &slack_user,
+            conversation(
+                ConversationKind::DirectMessage,
+                Some("t0123abc"),
+                "d0123abc",
+                None,
+            ),
+            "d0123abc",
         ),
-        (ChatTransportKind::Discord, "123", "123"),
-        (ChatTransportKind::Telegram, "-1001", "-1001"),
-        (ChatTransportKind::Telegram, "-1001", "-1001:topic:7"),
-        (
-            ChatTransportKind::Whatsapp,
-            "123:456:16034700182",
-            "123:456:16034700182",
-        ),
-        (ChatTransportKind::Local, "cli.session-1", "cli.session-1:2"),
-    ] {
-        assert!(
-            claim(kind, channel, conversation).is_canonical_shape(),
-            "{kind} {channel} {conversation} is the form the transport mints"
-        );
-    }
-
-    for (kind, channel, conversation) in [
-        // Uppercase, a foreign channel prefix, and a short fraction are three ways to spell one
-        // Slack conversation; exactly one of them is canonical.
-        (ChatTransportKind::Slack, "C0123ABC", "C0123ABC"),
         (
             ChatTransportKind::Slack,
-            "c0123abc",
+            &slack_user,
+            conversation(
+                ConversationKind::DirectMessage,
+                Some("t0123abc"),
+                "d0123abc",
+                Some("1712345678.000100"),
+            ),
+            "d0123abc:1712345678.000100",
+        ),
+        // A multi-person DM is `G…` on older workspaces and `C…` on newer ones: both are just
+        // lowercase tokens here, which is what F15 asked for.
+        (
+            ChatTransportKind::Slack,
+            &slack_user,
+            conversation(
+                ConversationKind::GroupDirectMessage,
+                Some("t0123abc"),
+                "g0123abc",
+                Some("1712345678.000100"),
+            ),
+            "g0123abc:1712345678.000100",
+        ),
+        (
+            ChatTransportKind::Slack,
+            &slack_user,
+            conversation(
+                ConversationKind::GroupDirectMessage,
+                Some("t0123abc"),
+                "c0999zzz",
+                Some("1712345678.000100"),
+            ),
             "c0999zzz:1712345678.000100",
         ),
         (
             ChatTransportKind::Slack,
-            "c0123abc",
-            "c0123abc:1712345678.1",
+            &slack_user,
+            conversation(
+                ConversationKind::Channel,
+                Some("t0123abc"),
+                "c0123abc",
+                Some("1712345678.000100"),
+            ),
+            "c0123abc:1712345678.000100",
         ),
-        (ChatTransportKind::Discord, "00123", "00123"),
-        (ChatTransportKind::Discord, "123", "456"),
-        (ChatTransportKind::Telegram, "-1001", "-1001:topic:00"),
         (
-            ChatTransportKind::Telegram,
-            "-1001",
-            "-1001:topic:9223372036854775808",
+            ChatTransportKind::Slack,
+            &slack_user,
+            conversation(
+                ConversationKind::Thread,
+                Some("t0123abc"),
+                "c0123abc",
+                Some("1712345600.000100"),
+            ),
+            "c0123abc:1712345600.000100",
         ),
-        (ChatTransportKind::Whatsapp, "123:456", "123:456"),
         (
-            ChatTransportKind::Whatsapp,
-            "123:456:16034700182",
+            ChatTransportKind::Discord,
+            &discord_user,
+            conversation(ConversationKind::DirectMessage, None, "123", None),
+            "123",
+        ),
+        (
+            ChatTransportKind::Discord,
+            &discord_user,
+            conversation(ConversationKind::Channel, Some("999"), "123", None),
+            "123",
+        ),
+        (
+            ChatTransportKind::Discord,
+            &discord_user,
+            conversation(ConversationKind::Thread, Some("999"), "123", Some("456")),
             "123:456",
         ),
-        (ChatTransportKind::Local, "CLI", "CLI"),
-        // Outside the wire bounds the grammar never runs: an unbounded part fails closed.
-        (ChatTransportKind::Local, "a", &"b".repeat(257)),
+        // The private chat id *is* the sender's user id, which is the correlation S25 pins.
+        (
+            ChatTransportKind::Telegram,
+            &telegram_user,
+            conversation(ConversationKind::DirectMessage, None, "5551234", None),
+            "5551234",
+        ),
+        (
+            ChatTransportKind::Telegram,
+            &telegram_user,
+            conversation(ConversationKind::DirectMessage, None, "5551234", Some("7")),
+            "5551234:7",
+        ),
+        (
+            ChatTransportKind::Telegram,
+            &telegram_user,
+            conversation(ConversationKind::Channel, None, "-1001", None),
+            "-1001",
+        ),
+        (
+            ChatTransportKind::Telegram,
+            &telegram_user,
+            conversation(ConversationKind::Thread, None, "-1001", Some("7")),
+            "-1001:7",
+        ),
+        (
+            ChatTransportKind::Whatsapp,
+            &whatsapp_user,
+            conversation(
+                ConversationKind::DirectMessage,
+                Some("123:456"),
+                "16034700182",
+                None,
+            ),
+            "16034700182",
+        ),
+        (
+            ChatTransportKind::Local,
+            &telegram_user,
+            conversation(ConversationKind::DirectMessage, None, "dev", None),
+            "dev",
+        ),
+        (
+            ChatTransportKind::Local,
+            &telegram_user,
+            conversation(ConversationKind::Thread, Some("cli"), "dev.1", None),
+            "dev.1",
+        ),
     ] {
         assert!(
-            !claim(kind, channel, conversation).is_canonical_shape(),
-            "{kind} {channel} {conversation} is an alias for a canonical scope"
+            conversation.is_canonical_for(transport, subject),
+            "{transport} {conversation:?} is the form the transport mints"
+        );
+        assert_eq!(conversation.key(), key);
+    }
+
+    for (transport, subject, conversation, why) in [
+        (
+            ChatTransportKind::Slack,
+            &slack_user,
+            conversation(
+                ConversationKind::Channel,
+                Some("t0123abc"),
+                "C0123ABC",
+                Some("1712345678.000100"),
+            ),
+            "Slack ids are lowercase tokens",
+        ),
+        (
+            ChatTransportKind::Slack,
+            &slack_user,
+            conversation(
+                ConversationKind::Channel,
+                Some("t0123abc"),
+                "c0123abc",
+                None,
+            ),
+            "a channel message always answers in a thread",
+        ),
+        (
+            ChatTransportKind::Slack,
+            &slack_user,
+            conversation(
+                ConversationKind::Channel,
+                None,
+                "c0123abc",
+                Some("1712345678.000100"),
+            ),
+            "the Slack team is required",
+        ),
+        (
+            ChatTransportKind::Slack,
+            &slack_user,
+            conversation(
+                ConversationKind::DirectMessage,
+                Some("t0123abc"),
+                "d0123abc",
+                Some("1712345678.1"),
+            ),
+            "a short fraction is not a Slack timestamp",
+        ),
+        (
+            ChatTransportKind::Discord,
+            &discord_user,
+            conversation(ConversationKind::DirectMessage, Some("999"), "123", None),
+            "a Discord direct message has no guild",
+        ),
+        (
+            ChatTransportKind::Discord,
+            &discord_user,
+            conversation(ConversationKind::Channel, None, "123", None),
+            "a guild channel has a guild",
+        ),
+        (
+            ChatTransportKind::Discord,
+            &discord_user,
+            conversation(ConversationKind::Thread, Some("999"), "123", None),
+            "a thread names the thread it answers in",
+        ),
+        (
+            ChatTransportKind::Discord,
+            &discord_user,
+            conversation(ConversationKind::GroupDirectMessage, None, "123", None),
+            "Discord group DMs are never routed",
+        ),
+        (
+            ChatTransportKind::Discord,
+            &discord_user,
+            conversation(ConversationKind::Channel, Some("999"), "00123", None),
+            "a snowflake carries no leading zero",
+        ),
+        (
+            ChatTransportKind::Telegram,
+            &telegram_user,
+            conversation(ConversationKind::DirectMessage, None, "5559999", None),
+            "a Telegram direct message is the sender's own chat",
+        ),
+        (
+            ChatTransportKind::Telegram,
+            &telegram_user,
+            conversation(ConversationKind::DirectMessage, Some("t"), "5551234", None),
+            "Telegram has no container",
+        ),
+        (
+            ChatTransportKind::Telegram,
+            &telegram_user,
+            conversation(ConversationKind::Channel, None, "1001", None),
+            "a Telegram group id is negative",
+        ),
+        (
+            ChatTransportKind::Telegram,
+            &telegram_user,
+            conversation(ConversationKind::Thread, None, "-1001", Some("0")),
+            "a topic id is a positive decimal",
+        ),
+        (
+            ChatTransportKind::Whatsapp,
+            &whatsapp_user,
+            conversation(
+                ConversationKind::DirectMessage,
+                Some("123:456"),
+                "16039999999",
+                None,
+            ),
+            "a WhatsApp conversation is its sender",
+        ),
+        (
+            ChatTransportKind::Whatsapp,
+            &whatsapp_user,
+            conversation(
+                ConversationKind::DirectMessage,
+                Some("123:456:16034700182"),
+                "16034700182",
+                None,
+            ),
+            "the 0.13 three-part channel is not a container",
+        ),
+        (
+            ChatTransportKind::Whatsapp,
+            &whatsapp_user,
+            conversation(
+                ConversationKind::Channel,
+                Some("123:456"),
+                "16034700182",
+                None,
+            ),
+            "WhatsApp produces no channels",
+        ),
+        (
+            ChatTransportKind::Local,
+            &telegram_user,
+            conversation(ConversationKind::DirectMessage, None, "DEV", None),
+            "local scope values are lowercase",
+        ),
+        (
+            ChatTransportKind::Local,
+            &telegram_user,
+            conversation(ConversationKind::DirectMessage, None, "dev", Some("1")),
+            "the local transport has no threads",
+        ),
+        // Outside the wire bounds the grammar never runs: an unbounded part fails closed.
+        (
+            ChatTransportKind::Local,
+            &telegram_user,
+            conversation(
+                ConversationKind::DirectMessage,
+                None,
+                &"b".repeat(257),
+                None,
+            ),
+            "an unbounded id fails closed",
+        ),
+        (
+            ChatTransportKind::Slack,
+            &discord_user,
+            conversation(
+                ConversationKind::Channel,
+                Some("t0123abc"),
+                "c0123abc",
+                Some("1712345678.000100"),
+            ),
+            "a Discord subject cannot have sent a Slack message",
+        ),
+    ] {
+        assert!(
+            !conversation.is_canonical_for(transport, subject),
+            "{transport} {conversation:?}: {why}"
         );
     }
+}
+
+/// The kind word is one spelling: the YAML list entry, the Cedar string, and the trace attribute.
+#[test]
+fn every_conversation_kind_has_exactly_one_spelling() {
+    for kind in [
+        ConversationKind::DirectMessage,
+        ConversationKind::GroupDirectMessage,
+        ConversationKind::Channel,
+        ConversationKind::Thread,
+    ] {
+        assert_eq!(
+            serde_json::to_value(kind).expect("kind serializes"),
+            json!(kind.as_str())
+        );
+        assert_eq!(
+            serde_json::from_value::<ConversationKind>(json!(kind.as_str())).expect("kind decodes"),
+            kind
+        );
+        assert_eq!(kind.to_string(), kind.as_str());
+    }
+}
+
+/// A Discord thread is itself a channel; every other service threads inside one.
+#[test]
+fn the_api_channel_is_the_thread_only_where_a_thread_is_a_channel() {
+    let discord = conversation(ConversationKind::Thread, Some("999"), "123", Some("456"));
+    assert_eq!(discord.api_channel(ChatTransportKind::Discord), "456");
+    let slack = conversation(
+        ConversationKind::Thread,
+        Some("t0123abc"),
+        "c0123abc",
+        Some("1712345678.000100"),
+    );
+    assert_eq!(slack.api_channel(ChatTransportKind::Slack), "c0123abc");
+    assert_eq!(
+        conversation(ConversationKind::Channel, Some("999"), "123", None)
+            .api_channel(ChatTransportKind::Discord),
+        "123"
+    );
+}
+
+/// A selector reports every problem at once, and `kind` is a list or the word `any`.
+#[test]
+fn a_conversation_selector_reports_every_problem_at_once() {
+    let bad = ConversationMatch {
+        kind: ConversationKindMatch::Kinds(vec![
+            ConversationKind::Channel,
+            ConversationKind::Channel,
+            ConversationKind::GroupDirectMessage,
+        ]),
+        container: Some("nine hundred".to_owned()),
+        ids: Some(vec!["123:456".to_owned(), "00123".to_owned()]),
+    };
+    let problems = bad.validate(ChatTransportKind::Discord);
+    assert_eq!(
+        problems,
+        vec![
+            ConversationMatchProblem::DuplicateKind {
+                kind: ConversationKind::Channel
+            },
+            ConversationMatchProblem::ImpossibleKind {
+                kind: ConversationKind::GroupDirectMessage,
+                transport: ChatTransportKind::Discord,
+            },
+            ConversationMatchProblem::NonCanonicalContainer {
+                container: "nine hundred".to_owned()
+            },
+            ConversationMatchProblem::ThreadFormId {
+                id: "123:456".to_owned()
+            },
+            ConversationMatchProblem::NonCanonicalId {
+                id: "00123".to_owned()
+            },
+        ]
+    );
+    assert!(
+        problems[3]
+            .to_string()
+            .contains("selectors name the parent conversation")
+    );
+
+    assert_eq!(
+        ConversationMatch {
+            kind: ConversationKindMatch::Kinds(Vec::new()),
+            container: None,
+            ids: Some(Vec::new()),
+        }
+        .validate(ChatTransportKind::Slack),
+        vec![
+            ConversationMatchProblem::EmptyKindList,
+            ConversationMatchProblem::EmptyIds
+        ]
+    );
+    assert_eq!(
+        ConversationMatch {
+            kind: ConversationKindMatch::Any,
+            container: Some("t0123abc".to_owned()),
+            ids: None,
+        }
+        .validate(ChatTransportKind::Telegram),
+        vec![ConversationMatchProblem::ContainerNotSupported {
+            transport: ChatTransportKind::Telegram
+        }]
+    );
+    assert!(
+        ConversationMatch {
+            kind: ConversationKindMatch::Any,
+            container: None,
+            ids: None,
+        }
+        .validate(ChatTransportKind::Whatsapp)
+        .is_empty()
+    );
+
+    // `kind: channel` reads as though it claimed the threads under the channel too, so the decoder
+    // refuses it by name rather than accepting a narrower rule than it looks.
+    let bare = serde_json::from_value::<ConversationMatch>(json!({"kind": "channel"}))
+        .expect_err("a bare kind word is refused");
+    assert!(bare.to_string().contains("kind: [channel]"), "{bare}");
+    assert_eq!(
+        serde_json::from_value::<ConversationMatch>(json!({"kind": "any"})).expect("any decodes"),
+        ConversationMatch {
+            kind: ConversationKindMatch::Any,
+            container: None,
+            ids: None
+        }
+    );
+}
+
+/// A selector names the parent; the kind list decides whether its threads come with it.
+#[test]
+fn a_selector_matches_kind_container_and_id_but_never_a_thread() {
+    let selector = ConversationMatch {
+        kind: ConversationKindMatch::Kinds(vec![
+            ConversationKind::Channel,
+            ConversationKind::Thread,
+        ]),
+        container: Some("999".to_owned()),
+        ids: Some(vec!["123".to_owned()]),
+    };
+    assert!(selector.matches(&conversation(
+        ConversationKind::Channel,
+        Some("999"),
+        "123",
+        None
+    )));
+    assert!(selector.matches(&conversation(
+        ConversationKind::Thread,
+        Some("999"),
+        "123",
+        Some("456")
+    )));
+    assert!(!selector.matches(&conversation(
+        ConversationKind::Thread,
+        Some("999"),
+        "456",
+        Some("789")
+    )));
+    assert!(!selector.matches(&conversation(
+        ConversationKind::Channel,
+        Some("111"),
+        "123",
+        None
+    )));
+    assert!(!selector.matches(&conversation(
+        ConversationKind::DirectMessage,
+        None,
+        "123",
+        None
+    )));
+
+    let channels_only = ConversationMatch {
+        kind: ConversationKindMatch::Kinds(vec![ConversationKind::Channel]),
+        container: None,
+        ids: None,
+    };
+    assert!(!channels_only.matches(&conversation(
+        ConversationKind::Thread,
+        Some("999"),
+        "123",
+        Some("456")
+    )));
 }
 
 #[test]
@@ -712,8 +1173,12 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
     let slack = ChatScopeClaim {
         transport: "scientist-slack".parse().expect("transport"),
         kind: ChatTransportKind::Slack,
-        channel: "c0123abc".to_owned(),
-        conversation: "c0123abc:1712345678.000100".to_owned(),
+        conversation: conversation(
+            ConversationKind::Channel,
+            Some("t0123abc"),
+            "c0123abc",
+            Some("1712345678.000100"),
+        ),
     };
     assert!(
         DeliveryIdentity::Slack {
@@ -742,9 +1207,29 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
     let discord = ChatScopeClaim {
         transport: "discord".parse().expect("transport"),
         kind: ChatTransportKind::Discord,
-        channel: "123".to_owned(),
-        conversation: "123".to_owned(),
+        conversation: conversation(ConversationKind::Channel, Some("999"), "123", None),
     };
+    // A thread is its own channel on Discord, so the delivery names the thread and the
+    // conversation names the parent.
+    let discord_thread = ChatScopeClaim {
+        transport: "discord".parse().expect("transport"),
+        kind: ChatTransportKind::Discord,
+        conversation: conversation(ConversationKind::Thread, Some("999"), "123", Some("456")),
+    };
+    assert!(
+        DeliveryIdentity::Discord {
+            channel: "456".to_owned(),
+            message: "789".to_owned(),
+        }
+        .is_canonical_for(&discord_thread)
+    );
+    assert!(
+        !DeliveryIdentity::Discord {
+            channel: "123".to_owned(),
+            message: "789".to_owned(),
+        }
+        .is_canonical_for(&discord_thread)
+    );
     for (channel, message) in [("0123", "456"), ("123", "0"), ("123", "0456")] {
         assert!(
             !DeliveryIdentity::Discord {
@@ -758,8 +1243,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
     let telegram = ChatScopeClaim {
         transport: "tg".parse().expect("transport"),
         kind: ChatTransportKind::Telegram,
-        channel: "-1001".to_owned(),
-        conversation: "-1001:topic:42".to_owned(),
+        conversation: conversation(ConversationKind::Thread, None, "-1001", Some("42")),
     };
     assert!(
         DeliveryIdentity::Telegram {
@@ -797,8 +1281,12 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
     let telegram_max = ChatScopeClaim {
         transport: "tg".parse().expect("transport"),
         kind: ChatTransportKind::Telegram,
-        channel: i64::MIN.to_string(),
-        conversation: format!("{}:topic:{}", i64::MIN, i64::MAX),
+        conversation: conversation(
+            ConversationKind::Thread,
+            None,
+            &i64::MIN.to_string(),
+            Some(&i64::MAX.to_string()),
+        ),
     };
     assert!(
         DeliveryIdentity::Telegram {
@@ -813,8 +1301,12 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
     let whatsapp = ChatScopeClaim {
         transport: "support-whatsapp".parse().expect("transport"),
         kind: ChatTransportKind::Whatsapp,
-        channel: "123:456:16034700182".to_owned(),
-        conversation: "123:456:16034700182".to_owned(),
+        conversation: conversation(
+            ConversationKind::DirectMessage,
+            Some("123:456"),
+            "16034700182",
+            None,
+        ),
     };
     let whatsapp_delivery = DeliveryIdentity::Whatsapp {
         waba: "123".to_owned(),
@@ -847,8 +1339,7 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
     let local = ChatScopeClaim {
         transport: "dev".parse().expect("transport"),
         kind: ChatTransportKind::Local,
-        channel: "conversation".to_owned(),
-        conversation: "conversation".to_owned(),
+        conversation: conversation(ConversationKind::DirectMessage, None, "conversation", None),
     };
     let local_identity = |boot_nonce: &str, connection, sequence| DeliveryIdentity::Local {
         transport: "dev".parse().expect("transport"),
@@ -886,8 +1377,7 @@ fn delivered_turn_strings_are_rejected_during_deserialization_at_their_field_bou
     let scope = serde_json::json!({
         "transport": "scientist-slack",
         "kind": "slack",
-        "channel": "c0123abc",
-        "conversation": "x".repeat(257)
+        "conversation": {"kind": "channel", "id": "x".repeat(257)}
     });
     assert!(serde_json::from_value::<ChatScopeClaim>(scope).is_err());
 
@@ -1133,7 +1623,12 @@ fn a_claim_binds_to_its_proposal_and_holds_no_identifier_without_one() {
             subject(),
             agent(),
             ChatScopeClaim {
-                channel: "x".repeat(257),
+                conversation: conversation(
+                    ConversationKind::Channel,
+                    Some("t0123abc"),
+                    &"x".repeat(257),
+                    None
+                ),
                 ..scope()
             }
         )

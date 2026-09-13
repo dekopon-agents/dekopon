@@ -249,24 +249,35 @@ impl PolicyWorld {
     /// Renders the Cedar schema this world implies.
     fn schema_json(&self) -> serde_json::Value {
         // Every action's context record starts from the same routing facts: who the request
-        // arrived as, and over what transport. All optional — a direct call has no channel and no
-        // conversation — but all declared, because Cedar's strict validator rejects a policy that
-        // reads an attribute the schema never mentions, and "only from Slack" has to be sayable.
-        const ROUTING: [&str; 7] = [
-            "via",
-            "subject",
-            "agent",
-            "transportKind",
-            "transport",
-            "channel",
-            "conversation",
-        ];
-        let routing_attributes = serde_json::Map::from_iter(ROUTING.map(|name| {
+        // arrived as, and over what transport. All optional — a direct call has no conversation —
+        // but all declared, because Cedar's strict validator rejects a policy that reads an
+        // attribute the schema never mentions, and "only from Slack" has to be sayable.
+        const ROUTING: [&str; 5] = ["via", "subject", "agent", "transportKind", "transport"];
+        let mut routing_attributes = serde_json::Map::from_iter(ROUTING.map(|name| {
             (
                 name.to_owned(),
                 json!({ "type": "String", "required": false }),
             )
         }));
+        // The conversation is a record rather than two strings, because where a message was posted
+        // is four facts that only make sense together and a policy that wants "the Lange guild"
+        // must be able to say so without parsing one of them out of a joined value. `container`
+        // and `thread` are optional inside it, so strict validation refuses
+        // `context.conversation.container == x` without a `context.conversation has container`
+        // guard — the operator trap worth failing at load rather than at authorization time.
+        routing_attributes.insert(
+            "conversation".to_owned(),
+            json!({
+                "type": "Record",
+                "required": false,
+                "attributes": {
+                    "kind": { "type": "String" },
+                    "container": { "type": "String", "required": false },
+                    "id": { "type": "String" },
+                    "thread": { "type": "String", "required": false },
+                },
+            }),
+        );
         // What an action adds on top is *required*: those are facts the broker stamps on the
         // request itself, so a policy that reads one must never find it absent.
         let context = |required: &[&str]| {
@@ -410,10 +421,25 @@ pub struct PolicyContext {
     pub transport_kind: Option<String>,
     /// Owner-configured transport identifier, absent for legacy operations.
     pub transport: Option<String>,
-    /// Canonical service channel, absent for legacy operations.
-    pub channel: Option<String>,
-    /// Canonical service conversation, absent for legacy operations.
-    pub conversation: Option<String>,
+    /// Where the message was posted, absent for a direct peer with no chat scope.
+    pub conversation: Option<PolicyConversation>,
+}
+
+/// Where one authorized message was posted, as a policy reads it.
+///
+/// The same four values the transport minted and the broker checked against a grant. `kind` is the
+/// serde spelling of `ConversationKind` — `directMessage`, `groupDirectMessage`, `channel`,
+/// `thread` — so the word in a Cedar statement is the word in the route file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyConversation {
+    /// Where the message was posted.
+    pub kind: String,
+    /// The workspace, guild, or WhatsApp business account above it, when the service has one.
+    pub container: Option<String>,
+    /// The conversation the service names; the parent channel for a thread.
+    pub id: String,
+    /// The thread the answer joins, when there is one.
+    pub thread: Option<String>,
 }
 
 /// One authorization question.
@@ -794,12 +820,32 @@ impl PolicyEngine {
             ("agent", context.agent),
             ("transportKind", context.transport_kind),
             ("transport", context.transport),
-            ("channel", context.channel),
-            ("conversation", context.conversation),
         ] {
             if let Some(value) = value {
                 pairs.push((name.to_owned(), RestrictedExpression::new_string(value)));
             }
+        }
+        // Only the fields the transport actually minted: an absent `container` must stay absent so
+        // that a policy reading it without a `has` guard fails validation rather than silently
+        // comparing against an invented empty string.
+        if let Some(conversation) = context.conversation {
+            let fields = [
+                Some(("kind", conversation.kind)),
+                conversation.container.map(|value| ("container", value)),
+                Some(("id", conversation.id)),
+                conversation.thread.map(|value| ("thread", value)),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|(name, value)| (name.to_owned(), RestrictedExpression::new_string(value)));
+            pairs.push((
+                "conversation".to_owned(),
+                RestrictedExpression::new_record(fields).map_err(|source| {
+                    RequestError::Context {
+                        message: source.to_string(),
+                    }
+                })?,
+            ));
         }
         let context = Context::from_pairs(pairs).map_err(|source| RequestError::Context {
             message: source.to_string(),

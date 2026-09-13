@@ -23,10 +23,12 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   written to the local protocol without entering prompts or memory. A route listing
   `chatAssetInputs` does the reverse for those capabilities, expanding a `chat-asset:<N>` input
   marker into a data URL before proposing.
-- **Activity** — after fresh authorization, Discord typing and Telegram chat actions renew under
-  their native leases; Slack Agent sessions use `processing`/`active` and an authenticated Stop
-  event, with an opt-in fixed `:tangerine:` reaction fallback for classic/free workspaces. Cosmetic
-  failures never alter the terminal reply.
+- **Liveness** — after fresh authorization, one policy task per session shows what the transport
+  can: a reaction and a typing lease at once, the service's own working status, then one editable
+  progress message posted on the first capability call, text delta, or 15-second keep-alive tick,
+  edited in place and finalized as the answer. `progressDetail` picks how much it says per route,
+  `stream` grows the answer in place as the model writes it, and a stop word, a cancel button, or
+  `limits.maxDurationMs` ends a run early. Cosmetic failures never alter the terminal reply.
 - **Sessions** — a process-wide concurrency ceiling plus per-conversation serialization,
   bounded model turns, bounded capability calls, cooperative Stop checks, and one fixed line on
   failure. An unaddressed owned-thread follow-up also offers `decline_chat_reply`, which ends a
@@ -55,7 +57,8 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   `agent.improvement.suggested`, which is why the route flag is off by default: the record
   carries model-authored text, and setting the flag is that consent. A suggestion is advisory by construction — no instruction, skill, limit, or grant
   moves because a model asked — and the gateway never relays it to chat.
-- **Self-inspection** — every authorized session offers `inspect_agent_config`, returning its
+- **Self-inspection** — every authorized session on a route that has not written
+  `inspectAgentConfig: false` offers `inspect_agent_config`, returning its
   standing prompt, mounted skills by name, description, and resource file paths (never their
   text; `skills` is absent when nothing is mounted), route limits, and fresh subject-specific
   effective Cedar grants. The fixed shape omits raw policy, identity, endpoints, broker paths,

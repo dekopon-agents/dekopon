@@ -3,7 +3,8 @@
 This document follows a Slack message from `dekopond` into the ChatGPT subscription transport: what Dekopon caches, what it remembers, and what reaches the wire.
 
 **Status: Current, except where marked Exploration.** Dekopon sends cache-affinity hints, preserves
-append-only model turns, reports provider-declared cache usage, keeps a bounded conversation in
+append-only model turns, reports provider-declared cache usage, streams a turn's visible text to its
+caller as it arrives and can stop a turn mid-answer, keeps a bounded conversation in
 gateway memory, delivers bounded provider-produced attachments on opted-in routes, and optionally
 stores and retrieves namespace-isolated durable chat turns through a JSONL provider. It does not
 cache completed answers, request extended provider retention, use provider-managed conversation
@@ -38,7 +39,8 @@ Slack event
   -> prompt loop builds ModelMessage values and ModelTool definitions
   -> ChatGptCodexModel builds a Responses-shaped serde_json::Value
   -> POST https://chatgpt.com/backend-api/codex/responses
-  -> SSE events become AssistantTurn
+  -> SSE events stream visible text back to the caller and become AssistantTurn
+       caller says stop -> the body is dropped, the connection closes, the turn is Interrupted
   -> tool call? append opaque replay items + tool output and call the model again
        a result carrying `attachments`? bounded PNGs leave through a byte-free output slot
   -> exact bounded text plus any accepted attachments receive complete Slack transport acceptance
@@ -48,6 +50,55 @@ Slack event
 ```
 
 The broker authorization leg is new for every Slack message. Neither remembered text nor a prompt cache key enters Cedar policy or grants a capability.
+
+## Streaming and interruption
+
+Every turn is streamed. `ChatModel::complete` is the single entry point and takes a callback,
+`&mut dyn FnMut(TurnEvent) -> ControlFlow<()>`, which runs on the calling thread between socket
+reads, in arrival order. It sees two things and can see no others: `TurnEvent::TextDelta`, carrying
+a fragment of the visible answer in a `ModelText`, and `TurnEvent::ToolCallStarted { index }`, a
+counter. Reasoning, tool-call arguments, tool output, and attachment bytes have no variant to
+travel in, and `ModelText` can be constructed from bytes only inside `dekopon-model`, so the rule
+that only answer text reaches a chat surface is enforced by the types rather than by review.
+
+The `AssistantTurn` a call returns is the same value whether or not anyone watched the deltas. Both
+backends read the wire through one parser, `sse.rs`, bounded at 16 MiB for either of them; a table
+of recorded transcripts is parsed as a stream and compared against the non-streaming completion the
+same endpoint answers with, so tool-call execution, conversation history, and accounting never
+learn that streaming exists.
+
+Returning `ControlFlow::Break(())` stops the turn. The response body is dropped, which closes the
+connection rather than returning it to the pool, and the call answers `ModelError::Interrupted`. No
+shortened `AssistantTurn` is returned: half a turn would reach history and accounting looking
+complete. Whatever text the callback was already handed belongs to the caller, which is what the
+gateway keeps on screen after a stop.
+
+A stop is observed between events, so a backend that is silent cannot be stopped. During the Codex
+reasoning phase the endpoint sends no events at all — tens of seconds of it on gpt-5-class models —
+and a stop raised in that window takes effect only when the next event arrives, or when the HTTP
+client's `timeout_global` — the model's configured `timeoutMs` — fires. Nothing here can interrupt
+a blocked read on a socket that is delivering nothing: `ureq` exposes no cancel token and no socket
+shutdown, so an event-boundary check and that deadline are the only two levers. The person who
+pressed stop is told so immediately by the gateway rather than when the turn ends.
+
+Per backend:
+
+- `chatgptSubscription` always streams. The Codex Responses endpoint is event-stream-only, the
+  request has carried `"stream": true` since before any of this, and the configuration has no
+  `stream` field to set — one that could be written but not honored would be worse than none.
+- `openaiCompatible` streams by default and takes `stream: false` for an endpoint that gets it
+  wrong: a proxy that buffers the whole event stream, or a server that drops `usage` when asked to
+  stream. With streaming on, the request adds `stream: true` and
+  `stream_options: {"include_usage": true}`, without which a streamed call reports no token usage
+  at all. With it off, neither field is sent — the endpoint receives the request it received before
+  streaming existed — and the callback is never called.
+
+"Compatible" is a claim rather than a specification, so the chat-completions accumulator tolerates
+what those endpoints actually send: `delta.content` null, `usage` null on every chunk before the
+last, a whole tool call delivered in one fragment (llama.cpp), every call of a parallel batch
+reported at `index: 0` (Ollama), a chunk split across two `data:` lines, and a missing `[DONE]`
+when a chunk already carried a finish reason. A stream that ends before either is a truncated turn
+and fails naming that, rather than passing a half answer off as the whole one.
 
 ## What is optimized today
 
@@ -61,8 +112,10 @@ Five intentional cache-friendly properties:
 
 The source contracts are in:
 
-- [`crates/dekopon-model/src/model.rs`](../crates/dekopon-model/src/model.rs) — `ModelMessage`, `ModelTool`, `CompletionOptions`, `AssistantTurn`, `ModelUsage`, and `ChatModel`;
-- [`crates/dekopon-model/src/chatgpt.rs`](../crates/dekopon-model/src/chatgpt.rs) — the subscription request builder, SSE parser, and prefix-stability tests;
+- [`crates/dekopon-model/src/model.rs`](../crates/dekopon-model/src/model.rs) — `ModelMessage`, `ModelTool`, `CompletionOptions`, `AssistantTurn`, `ModelUsage`, `ChatModel`, and the chat-completions stream accumulator;
+- [`crates/dekopon-model/src/stream.rs`](../crates/dekopon-model/src/stream.rs) — `ModelText` and `TurnEvent`, the two types a turn reports itself with;
+- [`crates/dekopon-model/src/sse.rs`](../crates/dekopon-model/src/sse.rs) — the one event-stream reader and its 16 MiB bound;
+- [`crates/dekopon-model/src/chatgpt.rs`](../crates/dekopon-model/src/chatgpt.rs) — the subscription request builder, Responses event handling, and prefix-stability tests;
 - [`crates/dekopon-agent/src/prompt.rs`](../crates/dekopon-agent/src/prompt.rs) — the bounded model/tool loop;
 - [`crates/dekopon-agent/src/prompt/history.rs`](../crates/dekopon-agent/src/prompt/history.rs) — compacted cross-message history; and
 - [`crates/dekopond/src/cache_key.rs`](../crates/dekopond/src/cache_key.rs), [`conversation.rs`](../crates/dekopond/src/conversation.rs), and [`session.rs`](../crates/dekopond/src/session.rs) — key lifetime, history lifetime, and Slack-session assembly.
@@ -157,7 +210,7 @@ One long-lived optimization is in place: `dekopond` shares one model client per 
 
 ## How scoped conversation memory works
 
-A route opts in with a `conversation:` block, and [`dekopond.md`](dekopond.md#conversations) owns its
+A route opts in with a `memory:` block, and [`dekopond.md`](dekopond.md#conversations) owns its
 keys, bounds, and eviction. What matters at the wire is what enters the prompt.
 
 `oneShot` is the route default and sends no history at all. A persistent route seeds the prompt with
@@ -278,7 +331,7 @@ use dekopon_model::{
     },
 };
 use serde_json::json;
-use std::{path::Path, time::Duration};
+use std::{ops::ControlFlow, path::Path, time::Duration};
 
 let model = ChatGptCodexModel::new(
     "gpt-5.6-sol",
@@ -327,10 +380,14 @@ let options = CompletionOptions::default().with_prompt_cache_key(
     "dekopond-conversation-7e91c87d8d6a4c13",
 );
 
-let first_turn: AssistantTurn = model.complete_with(&messages, &tools, &options)?;
+// The callback ignores the deltas here; `dekopond` forwards them to the waiting conversation and
+// returns `ControlFlow::Break(())` when the sender has pressed stop.
+let first_turn: AssistantTurn = model.complete(&messages, &tools, &options, &mut |_event| {
+    ControlFlow::Continue(())
+})?;
 ```
 
-`ModelMessage` is the backend-neutral transcript. `ModelTool` is the model-facing function schema. `CompletionOptions` carries routing metadata without changing the prompt. `ChatGptCodexModel` turns those values into private wire JSON, and `AssistantTurn` normalizes text, function calls, replay state, and usage from SSE.
+`ModelMessage` is the backend-neutral transcript. `ModelTool` is the model-facing function schema. `CompletionOptions` carries routing metadata without changing the prompt. `ChatGptCodexModel` turns those values into private wire JSON, and `AssistantTurn` normalizes text, function calls, replay state, and usage from SSE — the same value the callback's deltas added up to.
 
 The gateway-only types around them are `ConversationKey`, `ConversationSeed`, `ConversationStore`, and `BoundRoute`. They are crate-private because transports should not manufacture or serialize conversation state directly.
 
@@ -470,7 +527,9 @@ messages.push(ModelMessage::tool(
     ),
 ));
 
-let second_turn = model.complete_with(&messages, &tools, &options)?;
+let second_turn = model.complete(&messages, &tools, &options, &mut |_event| {
+    ControlFlow::Continue(())
+})?;
 ```
 
 All top-level fields remain the same. The exact `input` immediately before the second call is:

@@ -24,9 +24,24 @@ The reusable agent session layer consumed by `dekopond` and external embeddings 
   exhausting the turn budget there returns a distinct error so the embedder can warn against retry.
 - `prompt::ModelUsageObserver` — an optional informational callback invoked for every decoded model response, including an explicit absence of provider usage; it cannot influence the session.
 - `prompt::CancellationProbe` — optional cooperative cancellation checked before and after model
-  calls and before each tool/script boundary. It prevents subsequent work but cannot roll back a
-  provider request or effect already accepted elsewhere; embedders decide whether a cancelled turn
-  enters their durable or in-memory history.
+  calls, between the events of one streamed model turn, and before each tool/script boundary. It
+  prevents subsequent work but cannot roll back a provider request or effect already accepted
+  elsewhere; embedders decide whether a cancelled turn enters their durable or in-memory history.
+  A probe that tracks *what* asked for the stop overrides `cancel_source`, and the answer reaches
+  the progress sink; the default reports the embedder itself. What a probe cannot interrupt is a
+  read waiting on a silent socket: the callback runs between events, so a backend in a phase that
+  emits none stops only at the model client's own deadline.
+- `progress::ProgressSink` — optional, synchronous, and the only observer whose output a person
+  sees. `SessionInputs::with_progress` installs one; an absent sink is a no-op at every seam. The
+  loop reports `ModelTurn`, `TextDelta`, `Answered`, and one of `Cancelled`, `Failed`, or
+  `Finished`; the broker leg reports `ToolStarted`, `ToolFinished`, and `Attachment` from
+  `BrokerLeg::with_progress`, which also takes the session's capability-call ceiling because the
+  leg cannot derive it. Every event is metadata except `TextDelta`, which carries
+  `dekopon_model::ModelText` — model-authored visible text only, bounded at 8 KiB of cumulative
+  text per turn — and `CommandWord`, the provider-authored word bounded to 32 characters for
+  display. Prompts, shell arguments, tool output, and provider results have no field to travel in.
+  `FailureClass::of` classifies a `PromptError` by naming every variant, and answers `None` for a
+  cancellation, which is an outcome rather than a failure.
 - `prompt::run_prompt_with_history_and_options` — that same continuation carrying a
   `CompletionOptions` to every model call it makes. The options are request-scoped routing
   metadata such as a prompt cache key: they change how a provider routes the request, never
