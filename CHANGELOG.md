@@ -7,6 +7,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-09-13
+
 ### Added
 
 - `dekopon-brokerd` opens `broker.command_run` for every `runCommand`, beneath the client's
@@ -38,7 +40,7 @@ All notable changes to Dekopon are documented here. The format is based on
   in the same set. A component built on `dekopon:provider@0.1.0` or `0.2.0`, or on the `provider`
   world alone, has no `run-command` export and cannot declare a word, so it no longer loads; this
   reverses 0.14.0's note that a component exporting only `describe` and `invoke` keeps loading.
-  [`docs/upgrading.md`](docs/upgrading.md#providers-run-on-argv-only-0150-unreleased) names the
+  [`docs/upgrading.md`](docs/upgrading.md#providers-run-on-argv-only-0150) names the
   fleet releases that declare a word.
 - **Breaking (`dekopon-provider-sdk`).** `Provider::run_command` has no default: every provider
   implements it and exports through `export_provider_with_cli!`.
@@ -74,11 +76,6 @@ All notable changes to Dekopon are documented here. The format is based on
   a provider command whose `--help` accepts one. It no longer teaches capability identifiers as
   commands, `--kebab-case` flag-to-JSON input, `cap <id>` invocation, `cap --describe` schemas, or
   the `curl` builtin.
-- `dekopon-chart`: the default `broker.config.inline` loads
-  `/opt/dekopon/providers/cli-probe-provider.wasm` and authorizes exactly `cli-probe.upper` for the
-  pod's own UID (policy `@id("pod-probe")`), replacing the echo example. It starts only on an image
-  that ships `cli-probe`, and a values file that still names `echo-provider.wasm` or `echo.echo`
-  fails broker startup.
 - The `http-probe` test fixture answers the `httpprobe` command word: `httpprobe fetch`,
   `httpprobe conditional-write`, and `httpprobe purge`, one subcommand per capability and one
   kebab-case flag per input field, each building the input object the capability read before.
@@ -92,7 +89,7 @@ All notable changes to Dekopon are documented here. The format is based on
 
 - **Breaking (`dekopon-shell`).** Agent-facing JSON invocation. Argv through a provider command word
   is the only way a script reaches a provider; see
-  [`docs/upgrading.md`](docs/upgrading.md#providers-run-on-argv-only-0150-unreleased).
+  [`docs/upgrading.md`](docs/upgrading.md#providers-run-on-argv-only-0150).
 
   - The shell no longer rewrites `--kebab-case` flags into a camelCase JSON object. A provider
     parses its own argv, so a snake_case provider no longer receives keys it refuses.
@@ -133,6 +130,22 @@ All notable changes to Dekopon are documented here. The format is based on
 - The `provider-v0-1-compat` fixture, source and component, with the WIT package workflow's
   inspection of it. A two-export `dekopon:provider@0.1.0` component cannot declare a command word,
   so nothing loads one.
+
+## [dekopon-chart-0.8.0] - 2026-09-13
+
+### Added
+
+- `deploymentAnnotations` renders on the Deployment object's own `metadata:`, which is where a
+  Secret-watching restarter such as Stakater Reloader reads its configuration. `podAnnotations`
+  goes on the pod template, where such a controller never looks, so the two are separate values.
+  The default is empty and a release that sets neither renders exactly as it did.
+
+### Changed
+
+- The default `broker.config.inline` loads `/opt/dekopon/providers/cli-probe-provider.wasm` and
+  authorizes exactly `cli-probe.upper` for the pod's own UID (policy `@id("pod-probe")`), replacing
+  the echo example. It starts only on an image that ships `cli-probe`, and a values file that still
+  names `echo-provider.wasm` or `echo.echo` fails broker startup.
 
 ## [0.14.0] - 2026-09-13
 
@@ -2201,7 +2214,14 @@ snapshot is only a comparison marker; no authenticated `v0.1.0` tag exists._
 - Added owner-only hash-linked audit records with checkpoint recovery and payload-redacted
   telemetry, and updated Wasmtime to 36.0.13 for RUSTSEC-2026-0222 (#23, #27, #32).
 
-[Unreleased]: https://github.com/dekopon-agents/dekopon/compare/v0.11.1...HEAD
+[Unreleased]: https://github.com/dekopon-agents/dekopon/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/dekopon-agents/dekopon/compare/v0.14.0...v0.15.0
+[dekopon-chart-0.8.0]: https://github.com/dekopon-agents/dekopon/compare/dekopon-chart-0.7.0...dekopon-chart-0.8.0
+[0.14.0]: https://github.com/dekopon-agents/dekopon/compare/v0.13.0...v0.14.0
+[dekopon-chart-0.7.0]: https://github.com/dekopon-agents/dekopon/compare/dekopon-chart-0.6.0...dekopon-chart-0.7.0
+[dekopon-chart-0.6.0]: https://github.com/dekopon-agents/dekopon/compare/dekopon-chart-0.5.0...dekopon-chart-0.6.0
+[0.13.0]: https://github.com/dekopon-agents/dekopon/compare/v0.12.0...v0.13.0
+[0.12.0]: https://github.com/dekopon-agents/dekopon/compare/v0.11.1...v0.12.0
 [dekopon-chart-0.4.0]: https://github.com/dekopon-agents/dekopon/compare/dekopon-chart-0.3.0...dekopon-chart-0.4.0
 [0.11.1]: https://github.com/dekopon-agents/dekopon/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/dekopon-agents/dekopon/compare/v0.10.0...v0.11.0

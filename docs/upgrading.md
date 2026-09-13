@@ -113,7 +113,7 @@ Two things stop working:
   the published `0.3.0` package text — published versions are immutable — but nothing calls them.
 
 A component that exports only `describe` and `invoke` no longer loads either, whatever SDK built it:
-0.15.0 also [refuses a provider with capabilities and no command word](#providers-run-on-argv-only-0150-unreleased).
+0.15.0 also [refuses a provider with capabilities and no command word](#providers-run-on-argv-only-0150).
 
 `gh` 0.3.0, `curl` 0.2.0, `turso-sql` 0.2.0, `memory-chat` 0.2.0, `gpt-image` 0.1.0, and
 `openobserve` 0.1.0 satisfy both rules; pin those versions or later ones. `mediawiki`,
@@ -139,7 +139,7 @@ Embedders lose the machinery with it:
   with `invalid-request`. It was kept for one release for a client predating `runCommand`; no
   in-tree client has sent it since 0.13.0. Send `runCommand` and match the `CommandRunOutcome`.
 
-## Providers run on argv only (0.15.0, unreleased)
+## Providers run on argv only (0.15.0)
 
 **Breaking.** A script reaches a provider only through that provider's command word, and the broker
 refuses to start with a provider that declares capabilities and no word. There is no shim, no dual
@@ -372,7 +372,7 @@ could not instantiate broker provider component <path>: component imports instan
 
 Upgrade the broker before installing such a provider. Components that do not import the clock load
 unchanged on this release; from 0.15.0 a component also needs
-[a command word](#providers-run-on-argv-only-0150-unreleased). A provider that reads the clock
+[a command word](#providers-run-on-argv-only-0150). A provider that reads the clock
 outside `invoke` — from `describe` or `run-command` — now fails that
 call as `DescribeUsedHostImport` or `RunCommandUsedHostImport`.
 

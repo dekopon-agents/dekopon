@@ -495,7 +495,7 @@ They move for different reasons. A templating fix ships as a `dekopon-chart-*` t
 publish only the chart. That is the whole reason for two tag namespaces — a chart bug must not
 force an application release, and an application release must not republish an unchanged chart.
 
-`appVersion` is `0.14.0`. It is not decorative: `dekopon.labels` renders it as
+`appVersion` is `0.15.0`. It is not decorative: `dekopon.labels` renders it as
 `app.kubernetes.io/version` on every object, so an `appVersion` behind the image is a cluster
 answering `kubectl get pods -l app.kubernetes.io/version` with a version nothing is running, and
 every dashboard and alert built on that label reporting the same wrong number. It has to move in
@@ -506,7 +506,7 @@ The image workflow publishes under the Git tag, so the tag carries a `v`. An emp
 therefore renders `v` + `appVersion`:
 
 ```
-ghcr.io/dekopon-agents/dekopon:v0.14.0
+ghcr.io/dekopon-agents/dekopon:v0.15.0
 ```
 
 There is no `latest`. Prefer `image.digest`; it pins across the
@@ -663,6 +663,17 @@ there so you can install the chart and watch a broker become ready before you gi
 matters. Replace it. Its `serverLimits` is all-or-nothing: when present every field is required.
 `brokerLimits` and `hostLimits` instead default each field independently. `gateway.enabled` is `false` by default because a gateway needs a chat token, a
 model endpoint, and an agent catalog, and the chart can invent none of them.
+
+Two annotation maps ship, and they are not interchangeable:
+
+| Value | Rendered on | Read by |
+|---|---|---|
+| `deploymentAnnotations` | the Deployment object's own `metadata.annotations` | a controller that watches the workload object, such as a Secret-watching restarter — Stakater Reloader's `reloader.stakater.com/*` keys belong here |
+| `podAnnotations` | the pod template, so every pod the Deployment creates carries them | anything that reads a running pod: scrapers, meshes, admission webhooks |
+
+An annotation on the pod template is invisible to a controller watching Deployments, and one on the
+Deployment never reaches a pod, so a restarter configured through the wrong one silently does
+nothing. Both default to empty and neither changes a rendered manifest until it is set.
 
 `gateway.service` optionally creates a ClusterIP Service and matching named gateway container port.
 The chart does not create an Ingress: the operator must route only the configured
