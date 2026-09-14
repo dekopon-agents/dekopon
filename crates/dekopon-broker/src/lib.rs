@@ -52,9 +52,9 @@ use dekopon_capability::{
     StorageAccess, StorageInterface, StorageNamespace, broker::AuthorizationGate,
 };
 use dekopon_core::{
-    Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId,
-    RiskLevel, SecretBytes, SecretDrn, SecretSinkKind, SecretUseProposal, SubjectError,
-    SubjectService, TraceId, error_chain,
+    Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId,
+    ProviderFailureDetail, ProviderId, RiskLevel, SecretBytes, SecretDrn, SecretSinkKind,
+    SecretUseProposal, SubjectError, SubjectService, TraceId, error_chain,
 };
 pub use dekopon_policy::{AGENT_PROMPT_ACTION, PolicyBuildError, PolicyEngine, PolicyWorld};
 use dekopon_policy::{
@@ -2062,6 +2062,14 @@ pub enum AuditEvent {
         /// Stable public failure class.
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
+        /// The provider's own failure code and message, when `error` classified one.
+        ///
+        /// Metadata the provider wrote about its own refusal, not provider output: an operator
+        /// reconstructing a run from the trace alone otherwise reads `provider-failure` and has
+        /// nowhere to learn that the upstream returned HTTP 400 for moderation. Bounded on both
+        /// construction and decode, and absent for every failure no provider reported.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_detail: Option<ProviderFailureDetail>,
         /// Digest of successful provider output; output itself is never audited.
         #[serde(skip_serializing_if = "Option::is_none")]
         output_digest: Option<String>,
@@ -3467,6 +3475,8 @@ where
             storage.reset = tracing::field::Empty,
             outcome = tracing::field::Empty,
             error = tracing::field::Empty,
+            error.code = tracing::field::Empty,
+            error.message = tracing::field::Empty,
         );
         if set.constraints.storage.is_some() {
             execute.record("storage", true);
@@ -3569,6 +3579,8 @@ where
             outcome: InvocationOutcome::Denied,
             output: None,
             error: Some(wire.to_owned()),
+            // A refusal is the broker's own answer; no provider ran to report one.
+            detail: None,
             evidence: vec![Evidence {
                 kind: "policy-decision".to_owned(),
                 digest,
@@ -3611,6 +3623,8 @@ where
             InvocationOutcome::Failed,
             0,
             Some(reason.to_owned()),
+            // The provider never ran, so there is no failure of its own to carry.
+            None,
             None,
             Vec::new(),
             None,
@@ -3631,6 +3645,7 @@ where
             outcome: InvocationOutcome::Failed,
             output: None,
             error: Some(reason.to_owned()),
+            detail: None,
             evidence: vec![policy_evidence],
         })
     }
@@ -4012,6 +4027,7 @@ where
                     InvocationOutcome::Succeeded,
                     duration_ms,
                     None,
+                    None,
                     Some(output_digest),
                     output.http_calls,
                     storage_scope_commitment.clone(),
@@ -4024,6 +4040,7 @@ where
                         outcome: InvocationOutcome::Succeeded,
                         output: Some(output.output),
                         error: None,
+                        detail: None,
                         evidence,
                     },
                     event,
@@ -4031,6 +4048,9 @@ where
             }
             Err(failure) => {
                 let error = public_host_error(&failure.error, set.route).to_owned();
+                // The classification says which class of thing went wrong; this says what the
+                // provider itself reported, which is the only copy of the upstream refusal.
+                let detail = provider_failure_detail(&failure.error);
                 // A failure can follow calls that already left the host; their sanitized
                 // metadata belongs in the terminal record exactly as it would on success.
                 let mut evidence = vec![policy_evidence];
@@ -4069,6 +4089,7 @@ where
                     InvocationOutcome::Failed,
                     duration_ms,
                     Some(error.clone()),
+                    detail.clone(),
                     None,
                     failure.http_calls,
                     storage_scope_commitment.clone(),
@@ -4081,6 +4102,7 @@ where
                         outcome: InvocationOutcome::Failed,
                         output: None,
                         error: Some(error),
+                        detail,
                         evidence,
                     },
                     event,
@@ -4102,6 +4124,12 @@ where
         );
         if let Some(error) = result.error.as_deref() {
             execution.record("error", error);
+        }
+        // Beside the classification, never instead of it: `provider-failure` alone cannot say
+        // which refusal this was, and the trace is where an operator reconstructs the run.
+        if let Some(detail) = result.detail.as_ref() {
+            execution.record("error.code", detail.code.as_str());
+            execution.record("error.message", detail.message.as_str());
         }
 
         self.record_audit(audit_event).await.map_err(|source| {
@@ -4595,6 +4623,7 @@ fn emit_audit_event(event: &AuditEvent) {
             outcome,
             duration_ms,
             error,
+            error_detail,
             output_digest,
             http_calls,
             storage_scope_commitment,
@@ -4626,6 +4655,8 @@ fn emit_audit_event(event: &AuditEvent) {
                 outcome = ?outcome,
                 duration_ms = duration_ms,
                 error = error.as_deref(),
+                error.code = error_detail.as_ref().map(|detail| detail.code.as_str()),
+                error.message = error_detail.as_ref().map(|detail| detail.message.as_str()),
                 output.digest = output_digest.as_deref(),
                 http.calls = rendered(http_calls),
                 storage.scope_commitment = storage_scope_commitment
@@ -4702,6 +4733,7 @@ fn execution_event(
     outcome: InvocationOutcome,
     duration_ms: u64,
     error: Option<String>,
+    error_detail: Option<ProviderFailureDetail>,
     output_digest: Option<String>,
     http_calls: Vec<HttpCallEvidence>,
     storage_scope_commitment: Option<StorageScopeCommitment>,
@@ -4737,10 +4769,25 @@ fn execution_event(
         outcome,
         duration_ms,
         error,
+        error_detail,
         output_digest,
         http_calls,
         storage_scope_commitment,
         storage,
+    }
+}
+
+/// Returns the provider's own failure code and message, for the one host failure that has them.
+///
+/// Every other `BrokerHostError` is the host's or the broker's account of what went wrong, and
+/// inventing a provider sentence for it would make the field a lie. The pair is bounded here, at
+/// the boundary the provider's untrusted text crosses.
+fn provider_failure_detail(error: &BrokerHostError) -> Option<ProviderFailureDetail> {
+    match error {
+        BrokerHostError::ProviderFailure { code, message, .. } => {
+            Some(ProviderFailureDetail::new(code, message))
+        }
+        _ => None,
     }
 }
 

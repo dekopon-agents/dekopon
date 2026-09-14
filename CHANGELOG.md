@@ -7,6 +7,21 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- A provider's own failure reaches the audit record and the model instead of being dropped at the
+  broker boundary. A typed `ComponentResponse::Failed` still classifies to `provider-failure`, and
+  the provider's `code` and `message` now travel beside that classification: as `detail` on the
+  failed `InvocationResult`, as `error.code` and `error.message` on the `broker.execution` audit
+  record and the `broker.execute` span, and as the tail of the shell's failure line, which becomes
+  `gpt-image.edit: failed: provider-failure: upstream-rejected: the image route refused the request
+  with HTTP 400 (moderation_blocked)`. Previously only the classification survived, so an upstream
+  refusal existed nowhere in the trace and the model had nothing to relay. Both values are
+  provider-authored and bounded — `dekopon_core::ProviderFailureDetail` cuts the code at 128 bytes
+  and the message at 1024 on construction and again on decode. **Upgrade both daemons together:**
+  the result is strict-decoded, so a 0.15.0 `dekopond` cannot read a 0.15.1 broker's failed result
+  ([`docs/upgrading.md`](docs/upgrading.md#a-failed-invocation-carries-the-providers-own-code-and-message-0151)).
+
 ## [0.15.0] - 2026-09-13
 
 ### Added

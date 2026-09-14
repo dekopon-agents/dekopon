@@ -53,8 +53,8 @@
 use std::fmt;
 
 use dekopon_core::{
-    Actor, CapabilityId, InvocationId, PrincipalId, ProviderId, SecretDrn, SecretSinkKind,
-    SecretUseProposal, TraceId,
+    Actor, CapabilityId, InvocationId, PrincipalId, ProviderFailureDetail, ProviderId, SecretDrn,
+    SecretSinkKind, SecretUseProposal, TraceId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -662,8 +662,17 @@ pub struct InvocationResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<Value>,
     /// Concise failure reason when available.
+    ///
+    /// The broker's own stable classification, and the only failure field a caller branches on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The provider's own failure code and message, when [`Self::error`] classified one.
+    ///
+    /// Present only for a typed provider failure; a host, transport, or storage failure has no
+    /// provider sentence to carry. It explains the classification rather than replacing it, so a
+    /// caller reads `error` to decide and this to say why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<ProviderFailureDetail>,
     /// Evidence records collected during the invocation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<Evidence>,

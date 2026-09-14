@@ -37,6 +37,7 @@ impl CapabilityInvoker for Fixture {
             "http-probe.fetch".to_owned(),
             "policy.denied".to_owned(),
             "provider.broken".to_owned(),
+            "provider.refused".to_owned(),
         ]
     }
 
@@ -84,6 +85,7 @@ impl CapabilityInvoker for Fixture {
             ["fetch"] => proposal("http-probe.fetch", json!({})),
             ["denied"] => proposal("policy.denied", json!({})),
             ["broken"] => proposal("provider.broken", json!({})),
+            ["refused"] => proposal("provider.refused", json!({})),
             ["ungranted"] => proposal("nothing.granted", json!({})),
             ["decline"] => CommandRun::Failed {
                 message: "probe: declined".to_owned(),
@@ -124,6 +126,7 @@ impl CapabilityInvoker for Fixture {
                 }
                 None => CapabilityCallResult::Failed {
                     error: "input must be {\"text\": <string>}".to_owned(),
+                    detail: None,
                 },
             },
             "fixture.object" => CapabilityCallResult::Succeeded(input),
@@ -132,6 +135,16 @@ impl CapabilityInvoker for Fixture {
             },
             "provider.broken" => CapabilityCallResult::Failed {
                 error: "provider trapped".to_owned(),
+                detail: None,
+            },
+            // What a typed provider failure looks like once the broker has classified it: the
+            // class the exit status comes from, and the provider's own sentence beside it.
+            "provider.refused" => CapabilityCallResult::Failed {
+                error: "provider-failure".to_owned(),
+                detail: Some(dekopon_core::ProviderFailureDetail::new(
+                    "upstream-rejected",
+                    "the image route refused the request with HTTP 400 (moderation_blocked)",
+                )),
             },
             "http-probe.fetch" => CapabilityCallResult::Succeeded(json!({
                 "status": 200,
@@ -646,6 +659,30 @@ fn a_capability_shaped_word_is_an_ordinary_unknown_command() {
         "a capability-shaped word invoked a capability"
     );
     assert_eq!(outcome.capability_calls, 0);
+}
+
+/// The classification alone cannot say which refusal this was, so the provider's own code and
+/// message are appended to it. Without them a model reads `failed: provider-failure` and invents a
+/// reason for an upstream moderation refusal it was never told about.
+#[test]
+fn a_typed_provider_failure_renders_its_code_and_message_after_the_classification() {
+    let outcome = Interpreter::new(Limits::default()).run("probe refused", &Fixture::default());
+
+    assert_eq!(
+        outcome.output,
+        "provider.refused: failed: provider-failure: upstream-rejected: the image route refused \
+         the request with HTTP 400 (moderation_blocked)"
+    );
+    assert_eq!(outcome.exit_code, ExitCode::FAILURE);
+}
+
+/// A failure no provider reported keeps the line it always had; nothing is appended to invent one.
+#[test]
+fn a_failure_without_a_provider_detail_renders_the_classification_alone() {
+    let outcome = Interpreter::new(Limits::default()).run("probe broken", &Fixture::default());
+
+    assert_eq!(outcome.output, "provider.broken: failed: provider trapped");
+    assert_eq!(outcome.exit_code, ExitCode::FAILURE);
 }
 
 #[test]
@@ -2066,9 +2103,9 @@ cap --list | jq length";
     assert!(outcome.output.contains("1-0"), "{}", outcome.output);
     assert!(outcome.output.contains("3-2"), "{}", outcome.output);
     assert!(outcome.output.contains("10"), "{}", outcome.output);
-    // The fixture grants five capabilities.
+    // The fixture grants six capabilities.
     assert!(
-        outcome.output.trim_end().ends_with('5'),
+        outcome.output.trim_end().ends_with('6'),
         "{}",
         outcome.output
     );

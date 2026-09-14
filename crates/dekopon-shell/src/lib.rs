@@ -142,7 +142,7 @@ pub use limits::{
     Limits,
 };
 
-use dekopon_core::SecretUseProposal;
+use dekopon_core::{ProviderFailureDetail, SecretUseProposal};
 
 /// Model-facing metadata for one capability, used by `cap --describe`.
 ///
@@ -172,8 +172,15 @@ pub enum CapabilityCallResult {
     },
     /// The capability ran and failed.
     Failed {
-        /// Failure detail.
+        /// The stable failure classification, such as `provider-failure` or `provider-timeout`.
         error: String,
+        /// The provider's own failure code and message, when the classification came from one.
+        ///
+        /// Rendered after the classification rather than in place of it. A class alone tells a
+        /// model only that the call failed; the provider's sentence is what says whether it should
+        /// change the request, wait, or stop — and for an upstream refusal it is the refusal
+        /// itself, which nothing else in the run holds.
+        detail: Option<ProviderFailureDetail>,
     },
     /// No such capability is reachable from this session.
     NotFound,
@@ -758,7 +765,8 @@ mod tests {
         );
         assert_eq!(
             ExitCode::from_capability_result(&CapabilityCallResult::Failed {
-                error: "boom".to_owned()
+                error: "boom".to_owned(),
+                detail: None
             }),
             ExitCode::FAILURE
         );

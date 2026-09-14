@@ -20,10 +20,19 @@ const TRUNCATION_MARKER: &str = "\u{2026}[truncated]";
 /// value, so a reader can tell a cut value from one that happened to end there.
 #[must_use]
 pub fn bounded_attribute(value: &str) -> Cow<'_, str> {
-    if value.len() <= MAX_ATTRIBUTE_BYTES {
+    bounded_text(value, MAX_ATTRIBUTE_BYTES)
+}
+
+/// Applies the same cut as [`bounded_attribute`] at a caller-chosen bound.
+///
+/// A provider-reported failure code and message are carried on the wire and in the audit record
+/// rather than only on a span, so they take tighter bounds than a span attribute. The truncation
+/// rule itself stays in one place so the two cannot disagree about where a value ends.
+pub(crate) fn bounded_text(value: &str, maximum: usize) -> Cow<'_, str> {
+    if value.len() <= maximum {
         return Cow::Borrowed(value);
     }
-    let prefix = &value[..value.floor_char_boundary(MAX_ATTRIBUTE_BYTES)];
+    let prefix = &value[..value.floor_char_boundary(maximum)];
     Cow::Owned(format!("{prefix}{TRUNCATION_MARKER}"))
 }
 

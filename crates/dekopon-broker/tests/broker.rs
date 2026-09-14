@@ -12,8 +12,9 @@ use dekopon_broker_host::BoundCredential;
 use dekopon_broker_host::{BrokerHostLimits, BrokerProviderRegistry, CommandRunOutcome};
 use dekopon_capability::{EffectKind, ExecutionConstraints, HttpConstraints, HttpPathRule};
 use dekopon_core::{
-    Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, ProviderId, Redacted,
-    RiskLevel, SecretDrn, SecretSinkKind, SecretUseProposal,
+    Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId,
+    ProviderFailureDetail, ProviderId, Redacted, RiskLevel, SecretDrn, SecretSinkKind,
+    SecretUseProposal,
 };
 use dekopon_test_support::{LoopbackServer, provider_fixture};
 use serde_json::{Value, json};
@@ -898,6 +899,16 @@ async fn failed_execution_audits_the_external_write_that_already_landed() {
         dekopon_capability::InvocationOutcome::Failed
     );
     assert_eq!(result.error.as_deref(), Some("provider-failure"));
+    // The class stays the class; the provider's own answer rides beside it, which is the only
+    // thing in the result that says what the endpoint actually did.
+    assert_eq!(
+        result.detail,
+        Some(ProviderFailureDetail::new(
+            "invalid-response",
+            "endpoint returned an invalid post"
+        )),
+        "a typed provider failure carries the provider's own code and message on the wire"
+    );
     assert!(
         result
             .evidence
@@ -910,6 +921,8 @@ async fn failed_execution_audits_the_external_write_that_already_landed() {
     assert_eq!(records.len(), 2);
     let AuditEvent::Execution {
         outcome,
+        error,
+        error_detail,
         http_calls,
         ..
     } = &records[1]
@@ -917,6 +930,15 @@ async fn failed_execution_audits_the_external_write_that_already_landed() {
         panic!("the terminal record is an execution event");
     };
     assert_eq!(*outcome, dekopon_capability::InvocationOutcome::Failed);
+    assert_eq!(error.as_deref(), Some("provider-failure"));
+    // An operator reconstructing this run from the trace alone reads the class and the provider's
+    // sentence in the same record, rather than the class and nothing.
+    assert_eq!(
+        error_detail
+            .as_ref()
+            .map(|detail| (detail.code.as_str(), detail.message.as_str())),
+        Some(("invalid-response", "endpoint returned an invalid post"))
+    );
     assert_eq!(
         http_calls.len(),
         1,

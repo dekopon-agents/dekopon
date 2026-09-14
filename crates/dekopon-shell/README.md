@@ -37,6 +37,13 @@ A command word resolves in a fixed order. A word this shell refuses outright (`e
 
 A loaded provider can contribute bare words — `gh pr view 12` — and each behaves like its own command-line program run through `run_command`. `<word> --help` renders on stdout at whatever status the provider chose (`0` for help, `2` for a usage error by `clap` convention), so `h=$(gh --help)` captures the page like any other value. A `CommandRun::Rendered` answer charges no capability call; its bytes are charged against the value ceiling and both streams then obey the output ceilings, and its stderr goes to the diagnostic stream, so it escapes a `$( )` capture unless the script says `2>&1`. A `CommandRun::Failed` answer is a usage error at exit `2`. A run that never reached the provider's answer is not: `CommandRun::Errored` (the broker was unreachable, the host refused the input or trapped, the task did not complete) is reported like a capability that ran and errored, at exit `1`, and `CommandRun::Denied` (the session was cancelled underneath the run) like a refused capability, at exit `126`, so the model reads them as "retry later" or "stop" rather than "fix your argv". A `CommandRun::Proposed` answer is invoked through the same budget, denial, and telemetry path as every capability call, and one naming a capability this session was not granted exits `127` naming it, because the provider proposes without knowing what was granted. A proposal may also carry `secret_use`, the typed intent to use one public DRN the provider's command named. It reaches `CapabilityInvoker::invoke` unchanged, the broker authorizes it separately as documented in [`docs/secrets.md`](../../docs/secrets.md), and an invoker with no broker behind it refuses it.
 
+A capability that ran and failed reports `<id>: failed: <classification>` at exit `1`, and when
+the broker's classification came from the provider's own typed failure its code and message follow:
+`gpt-image.edit: failed: provider-failure: upstream-rejected: the image route refused the request
+with HTTP 400 (moderation_blocked)`. The classification is what the exit status means; the tail is
+the provider's sentence, and it is how an upstream refusal reaches the model at all rather than
+being guessed at.
+
 The piped value reaches the provider as text under the display rule above: a string verbatim, anything else as compact JSON, and `None` when nothing was piped, so `echo hello | gh issue create -` and `jq -n '{a:1}' | gh issue create -` read as the script would have printed them.
 
 ## Value model

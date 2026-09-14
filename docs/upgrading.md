@@ -139,6 +139,41 @@ Embedders lose the machinery with it:
   with `invalid-request`. It was kept for one release for a client predating `runCommand`; no
   in-tree client has sent it since 0.13.0. Send `runCommand` and match the `CommandRunOutcome`.
 
+## A failed invocation carries the provider's own code and message (0.15.1)
+
+**Upgrade both daemons together.** A failed `InvocationResult` gains `detail`, a `{ code, message }`
+object, whenever the broker's classification came from a provider's own typed failure. The result is
+strict-decoded in both directions, so a 0.15.0 `dekopond` reading a 0.15.1 broker's failed result
+cannot decode it — exactly as [`runCommand` couples in 0.15.0](#providers-run-on-argv-only-0150).
+There is no tolerant read and no default: a gateway that quietly dropped the field would discard the
+only record of why a provider refused. The protocol version stays `dekopon.dev/broker/v1alpha2`.
+
+Nothing in the configuration changes, and no policy, capability, or credential moves.
+
+What an operator sees change:
+
+- **The classification is unchanged.** `error` is still `provider-failure`, `provider-timeout`,
+  `storage-quota`, and the rest. Alerts, dashboards, and the chat-memory category allowlist that
+  group on it keep working exactly as they did. `detail` is additional, not a replacement.
+- **`broker.execution` and `broker.execute` gain `error.code` and `error.message`**, present only
+  for a typed provider failure. Provider-authored text, bounded at 128 and 1024 bytes and cut on a
+  character boundary with `…[truncated]`, so retention grows by at most about a kilobyte per failed
+  invocation. See [`observability.md`](observability.md#the-broker-audit-record).
+- **A script's failure line grew.** `gpt-image.edit: failed: provider-failure` becomes
+  `gpt-image.edit: failed: provider-failure: upstream-rejected: the image route refused the request
+  with HTTP 400 (moderation_blocked)`. The exit status is unchanged. Anything parsing that line by
+  splitting on `: ` past the classification sees more fields; the model reading it now relays the
+  upstream refusal instead of inventing one.
+
+### Embedder steps
+
+- `dekopon_capability::InvocationResult` gains `detail: Option<ProviderFailureDetail>`, and
+  `dekopon_shell::CapabilityCallResult::Failed` gains the same field. A struct literal or exhaustive
+  pattern has to name it.
+- `dekopon_core::ProviderFailureDetail`, `MAX_FAILURE_CODE_BYTES`, and `MAX_FAILURE_MESSAGE_BYTES`
+  are the one definition of the pair and its bounds; `dekopon-broker-protocol` re-exports the type.
+- `dekopon_broker::AuditEvent::Execution` gains `error_detail`, serialized as `errorDetail`.
+
 ## Providers run on argv only (0.15.0)
 
 **Breaking.** A script reaches a provider only through that provider's command word, and the broker
