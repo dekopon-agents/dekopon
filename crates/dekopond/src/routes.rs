@@ -62,6 +62,12 @@ pub(crate) struct BoundRoute {
     /// deployments need, and a bound that cancels a working session is worth choosing rather than
     /// inheriting.
     pub max_duration: Option<Duration>,
+    /// Wall-clock deadline one script this route's sessions run under.
+    ///
+    /// Always present, unlike `max_duration`: a script has a deadline whether or not an operator
+    /// chose one, and the route is where that number now comes from rather than `dekopon-shell`'s
+    /// own default.
+    pub script_timeout: Duration,
     /// How much this route's progress surface says.
     pub progress_detail: ProgressDetail,
     /// What this route remembers between messages.
@@ -177,6 +183,7 @@ impl RoutingTable {
                     max_capability_calls: route.limits.max_capability_calls,
                 },
                 max_duration: route.limits.max_duration_ms.map(Duration::from_millis),
+                script_timeout: route.limits.script_timeout(),
                 progress_detail: route.progress_detail,
                 memory: route.memory,
                 cache_key: cache_key::for_route(),

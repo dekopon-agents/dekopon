@@ -49,9 +49,9 @@ use crate::{
     asset::{self, AssetAccess, AssetSourceRef, AssetStore, PendingAsset, SessionAssets},
     cache_key,
     config::{
-        self, ConfigError, ConfigProblem, LivenessConfig, LivenessMode, LivenessOverride,
-        LivenessSettings, MemoryPolicy, MemoryScope, MemoryWindow, ModelConfig, ProgressSurface,
-        ResolvedBroker, ResolvedLiveness, SlackExperience, SlackLivenessFallback,
+        self, ConfigError, ConfigProblem, DEFAULT_SCRIPT_TIMEOUT_MS, LivenessConfig, LivenessMode,
+        LivenessOverride, LivenessSettings, MemoryPolicy, MemoryScope, MemoryWindow, ModelConfig,
+        ProgressSurface, ResolvedBroker, ResolvedLiveness, SlackExperience, SlackLivenessFallback,
     },
     conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
     progress::{KeepAlive, ProgressDetail, ProgressText},
@@ -2911,6 +2911,9 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         // No wall clock by default: a route that does not name one is not on a timer, and every
         // budget test says its own number rather than inheriting a fixture's.
         max_duration: None,
+        // What a route that writes no `scriptTimeoutMs` resolves to, so a fixture script runs under
+        // the same deadline the shipped default gives it.
+        script_timeout: Duration::from_millis(DEFAULT_SCRIPT_TIMEOUT_MS),
         progress_detail: ProgressDetail::Plain,
         memory: MemoryPolicy::OneShot,
         // Minted the way `RoutingTable::bind` mints it, so a test that reuses one bound route
@@ -3685,6 +3688,40 @@ async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
     let tool = tool_message(&models, 1);
     assert!(tool.contains("Usage: probe <COMMAND>"), "{tool}");
     assert!(tool.contains("[exit code: 0]"), "{tool}");
+}
+
+/// The route's `limits.scriptTimeoutMs` is the deadline the shell actually runs under, rather than
+/// `dekopon-shell`'s own 30-second default.
+///
+/// Written as a loop because the failure this pins is a script that is *slow* rather than long: a
+/// deadline that never reached the shell would let this run to the step budget instead, and the
+/// line the model reads would name the wrong bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_routes_script_deadline_is_what_the_shell_runs_under() {
+    let directory = temporary();
+    let (broker, _observed) = stub_broker(directory.path(), vec![probe_listing()]).await;
+    let models = ModelScript::new([script_call("while true; do :; done"), answer("done")]);
+    let driver = Arc::new(RecordingDriver::default());
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let route = crate::routes::BoundRoute {
+        script_timeout: Duration::from_millis(1),
+        ..route(model_config())
+    };
+
+    run_session(
+        runner,
+        route,
+        message("loop forever"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+
+    assert_eq!(driver.replies(), ["done"]);
+    let tool = tool_message(&models, 1);
+    assert!(
+        tool.contains("dekopon-shell: script exceeded its 1ms deadline"),
+        "the route's number is the one the script ended on: {tool}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

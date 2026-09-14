@@ -853,8 +853,13 @@ async fn session(
         images_supported,
         registered.fetchable,
     ));
+    // The route owns the script deadline; every other shell bound is the crate's own default. A
+    // provider call still in flight when it fires is abandoned with the script, which is why the
+    // number is configurable at all: a slow capability needs more than the 30 seconds a script got
+    // before the route could say otherwise.
     let shell = ShellLimits {
         max_capability_calls: limits.max_capability_calls,
+        timeout: route.script_timeout,
         ..ShellLimits::default()
     };
     // Request-scoped and built here rather than handed to `ModelFactory::build`, which is what lets
