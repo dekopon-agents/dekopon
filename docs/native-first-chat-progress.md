@@ -82,9 +82,12 @@ enum MessageSurface {
 ```
 
 A session may have one ambient indicator and one message surface. Only explicit Message policy
-permits progress prose beside a working native indicator. A stream never contains a synthetic
-working line. The policy task remains the sole writer and terminal owner; adapters retain API
-mapping, target validation, limits, availability, and service-specific error classification.
+or an explicitly requested message-backed Stop control permits progress prose beside a working
+ambient indicator. A stream never contains a synthetic working line. Proposed presentation and
+terminal ownership stays with the policy task; readers acknowledge interactions before queueing,
+but must not mutate shared text or controls before cancellation authorization. Discord currently
+violates that separation (see below). Adapters retain API mapping, target validation, limits,
+availability, and service-specific error classification.
 
 ```text
 authorized session + effective settings + available capability objects
@@ -105,17 +108,22 @@ authorized session + effective settings + available capability objects
 Resolve effective transport settings and conversation-kind overrides once, then apply the route's
 prose detail. Select only capabilities eligible for this authenticated target and installation.
 Availability may change on service refusal; successful establishment, not `Some`, decides whether
-the session has an indicator.
+the session has an indicator. Distinguish accepted, unavailable, and skipped/cooldown outcomes:
+Discord's current `TypingLease::renew` can return `Ok(())` without sending, which cannot establish
+or renew visible state. A skipped call honors the bounded cooldown; it is neither success nor a
+rapid-retry trigger.
 
 | Choice and available surface | While running | Answer delivery |
 |---|---|---|
 | Auto, Complete, native status accepted | Working/Stop only | Fresh reply |
 | Auto, Complete, typing or reaction accepted | One ambient indicator | Fresh reply |
-| Auto, Complete, no ambient surface accepted | Delayed progress message if supported | Finalize that message |
-| Message, Complete | Explicit editable progress plus selected ambient indicator | Finalize progress |
+| Auto, Complete, no ambient surface accepted | Delayed progress if supported and detail permits | Finalize if created; otherwise fresh reply |
+| Message, Complete, editable surface available | Explicit delayed prose if detail permits, plus ambient indicator | Finalize if created; otherwise fresh reply |
+| Message, Complete, editable surface absent | Record degradation; ambient indicator only | Fresh reply |
 | Off, Complete | Selected ambient indicator only | Fresh reply |
 | Any prose policy, Stream supported | Ambient indicator, then actual model text in a stream | Finalize stream |
-| Stream requested but unavailable for the target | Record degradation and use Complete rules | Complete answer |
+| Stream supported by transport but unavailable for target | Record degradation and use Complete rules | Complete answer |
+| Stream or button unsupported by transport (WhatsApp) | Aggregate startup refusal, including overrides | No session |
 
 For Auto + Stream, reserve the one message surface for the answer from session start: do not post
 a placeholder while waiting for the first text delta, even if no ambient indicator exists. This
@@ -146,8 +154,12 @@ A deadline is ambiguous: the service may have accepted the request. Track cleanu
 an attempted durable native status separately from `ActiveIndicator`, so an uncertain Working call
 still receives a bounded Idle cleanup attempt. Do not disable the capability transport-wide on a
 transient error. Temporary overlap with a fallback after ambiguous acceptance is an accepted limit,
-not a claim of exactly-once presentation. Reactions retain the adapter's existing ownership rule:
-remove only a reaction that this generation knows it added.
+not a claim of exactly-once presentation. Remove only a reaction this generation knows it added.
+This is a proposed eligibility requirement, not existing Telegram/Discord ownership: their set/remove
+APIs and `InboundReaction` implementations do not distinguish a preexisting bot reaction. Select
+reaction fallback only when safe ownership and cleanup can be established; otherwise record the
+missing eligibility and try the next permitted surface. Do not infer ownership from HTTP success
+or clear another generation's reaction. Preserve Slack's existing ownership rule.
 
 Selection state must not be reconstructed from capability accessors at cleanup time: another
 session may have changed installation availability. Retain the target and required cleanup action.
@@ -164,8 +176,10 @@ existing acceptance rules.
 
 Stop remains authenticated through the transport envelope and the initiating subject's existing
 atomic terminal decision. Keep native Stop, stop words, budgets, stale-answer suppression, and
-cooperative cancellation unchanged. No-reply completion clears indicators without posting anything.
-Failure and cancellation retain the existing fixed terminal replies and partial-stream handling;
+cooperative cancellation unchanged. Seal before terminal delivery and cease typing renewals;
+`TypingLease` has no clear operation. No-reply completion attempts owned durable-indicator cleanup
+without posting anything; typing may linger until service expiry. Failure and cancellation retain
+the existing fixed terminal replies and partial-stream handling;
 operator shutdown retains its no-new-message behavior. None of these paths gains broker authority.
 
 On classic transports a Stop button needs a real message. An explicit `cancelButton: true` with
@@ -173,7 +187,11 @@ Auto therefore opts into a message-backed control when the delayed surface opens
 or a reaction works. With progress Off and Complete, reject that configuration rather than silently
 hiding the button. With Stream it may attach to the first answer stream render where supported.
 Slack Agent mode continues to reject a separate cancel button because Slack owns native Stop.
-Stop words remain available before any message-backed button exists.
+Stop words remain available before any message-backed button exists. Also reject Complete plus a
+message-backed button when effective route detail is Off, including Auto and Message: do not
+silently override Off or invent a control-only message. Validate these effective route/transport
+combinations together. If target-level Stream degradation would leave a requested button without
+an eligible Complete surface, report that degradation too; stop words remain, not a hidden post.
 
 Do not promise that every platform supports silent messages, nor that users will receive exactly
 one notification. Auto with native status avoids submitting placeholder chat messages; a fresh
@@ -183,6 +201,139 @@ notify on initial creation and may not notify on final edits. Their trade-off mu
 Native Working/Idle is not rich tool progress. Arbitrary phase text or provider-call descriptions
 would require a separately demonstrated native API capability, not a new Status string or a fake
 message adapter. No such capability is proposed here.
+
+## Telegram, Discord, and WhatsApp styles
+
+**Exploration, not implemented.** These are applications of the same policy, not three new
+configuration dialects. `classicFallback` remains Slack-specific. None of these drivers exposes
+`NativeStatus` or native Working/Stop; native typing is not editable prose, rich tool status, or
+answer streaming. All choices below assume enabled liveness; absent/master Off stays reply-only.
+Current `config.rs::ProgressSurface` accepts only Off/Message (default Off), stream/button default
+false, and `policy.rs::{streams,writes_progress}` still couples both message modes to detail.
+
+### Telegram
+
+**Current evidence:** [`transport/telegram.rs`](../crates/dekopond/src/transport/telegram.rs),
+`ChatDriver`, `TypingLease::renew`, `InboundReaction::set`, `post_text`, `edit_text`,
+`finalize_in_place`, and `reply_markup` implement these surfaces:
+
+| Surface | Current adapter contract |
+|---|---|
+| Ambient | `sendChatAction(action=typing)`, four-second renewal; fixed 👀 via `setMessageReaction`, empty reaction list on removal |
+| Editable prose | `sendMessage` / `editMessageText` / `deleteMessage`; 4,096 UTF-16 units, three-second edit floor; unchanged-message refusal counts as success |
+| Answer stream | Cumulative replacement of one message, not native append; 4,000-scalar policy ceiling plus the UTF-16 wire bound |
+| Stop | Inline keyboard with conversation-bound callback; `answerCallbackQuery` attempted before queueing, without removing the keyboard; successful terminal edit sends an empty keyboard |
+
+**Proposed style:** Auto + Complete selects typing, then safely owned reaction if typing's breaker
+opens, then delayed editable prose only if no ambient rung works and detail permits. Healthy typing
+means no placeholder and a fresh complete answer. Off + Complete uses the same ambient selection
+but never prose. Message + Complete explicitly allows delayed working/tool/keep-alive prose beside
+the selected indicator. Each of Auto/Off/Message + Stream instead reserves the message for the
+first nonempty actual answer text, even with detail Off; no synthetic line precedes it. Apply the
+shared button-forcing/refusal rules, including no button before the first stream render.
+
+Retain authenticated chat/topic coordinates: `pressed` and inbound routing accept a positive
+`message_thread_id` only with `is_topic_message`. New messages/photos/actions carry that topic;
+edits and cleanup use the retained reference, never a reconstructed or invented topic. Only the
+initiating subject may cancel. Current callback acknowledgment shares cosmetic cooldown and can
+fail or be suppressed; queueing cancellation must still proceed, not claim acknowledgment receipt.
+
+Preserve the three-second coalescing and two-second cosmetic deadline. The repository records a
+five-second typing expiry, not a live visibility measurement; latency and serial cosmetic calls
+can consume the one-second renewal margin. Terminal cleanup stops renewals and removes only an
+owned reaction. Fitting text finalizes in place with controls removed; oversize/images explicitly
+refuse in-place finalization and use ordinary split text/photo delivery, with partial acceptance
+preserved. Telegram's UTF-16-only stream cut can currently be unmarked; visibly marking every cut
+is an implementation acceptance requirement, not a claim that the scalar headroom solves it.
+
+### Discord
+
+**Current evidence:** [`transport/discord.rs`](../crates/dekopond/src/transport/discord.rs),
+`ChatDriver`, `TypingLease::renew`, `InboundReaction::set`, `liveness_body`, `TextStream::show`,
+`finalize_in_place`, and `CancelButton::ack` own the mappings:
+
+| Surface | Current adapter contract |
+|---|---|
+| Ambient | POST channel `/typing`, eight-second renewal; fixed 🍊 PUT/DELETE on inbound message reaction `/@me`, without generation ownership |
+| Editable prose | POST/PATCH/DELETE one reply-referenced message; 2,000 UTF-16 units and two-second edit floor |
+| Answer stream | Cumulative PATCH of actual text; 1,900-scalar policy ceiling, then UTF-16 splitting; final single-message text removes components |
+| Stop | Danger-style component carrying `stop:<conversation-key>`; reader acknowledges before queueing even when the eventual subject check rejects the press |
+
+**Proposed style:** The same six Telegram combinations apply: Auto/Complete prefers typing then
+eligible owned reaction then delayed prose; Off/Complete forbids prose; Message/Complete opts in;
+all three Stream combinations show actual answer text only. Auto + button permits a delayed
+message even while typing works; Off/Complete + button and Complete/detail-Off + button refuse.
+There is no native Stop to substitute. DM, channel, and thread use the same policy; the current
+reader retains `parent:thread` as the thread conversation key and the thread channel as REST
+destination. Use that source contract, not conflicting parent/thread wording in older prose.
+
+**Current exception and proposed gate:** `CancelButton::ack` uses a type-7 update to replace content
+with `Stopping…` and clear components *before* subject authorization. Thus a foreign press cannot
+cancel but can erase displayed partial text/controls today. It bypasses cosmetic cooldown, uses the
+interaction token without bot authorization, and has a two-second deadline. Preserve fast reader
+acknowledgment before a potentially blocked queue, not the destructive side effect: the proposal
+requires non-mutating pre-authorization acknowledgment, followed by session-owned authorized
+mutation under the atomic terminal decision. Demonstrating that acknowledgment mapping and a
+foreign-press partial-stream-preservation test is a gate before shipping the proposed button handling.
+Acknowledgment failure must still route cancellation; it grants no cancellation authority.
+
+The repository records a ten-second typing lease; the eight-second cadence does not prove continuous
+visibility or client dismissal. Preserve cooldowns, breakers, and two-second coalescing, with skipped
+typing explicitly distinguished from acceptance. Stop renewal on every terminal path. Fitting text
+finalizes with empty components; images/oversize use ordinary lossless split delivery and its
+partial-delivery classification. `shown_text` marks scalar cuts, but `one_message` can cut again at
+the UTF-16 boundary and lose that marker: test visible truncation for astral text, not only ASCII.
+
+### WhatsApp Cloud
+
+**Current evidence:** [`transport/whatsapp.rs`](../crates/dekopond/src/transport/whatsapp.rs),
+`TypingLease::renew`, `ChatDriver`, and tests `typing_is_the_read_receipt_and_the_indicator_in_one_call`,
+`a_running_session_re_posts_the_same_indicator_request`, and `whatsapp_offers_typing_and_nothing_else`.
+Only typing is exposed: one messages-endpoint request couples `status: read`, the inbound message ID,
+and `typing_indicator: {type: text}`, requiring HTTP success and JSON `success: true`. There is no
+implemented reaction, native status, editable prose, stream, or button. `config.rs` rejects stream
+and cancelButton in base settings and overrides, but accepts Message as a no-op.
+
+**Proposed style:** Auto/Complete and Off/Complete attempt that coupled typing/read request, then
+stay silent until a fresh complete answer; exhausted typing cannot fall back to a nonexistent
+surface. Progress Off does not suppress the gateway's read-receipt request; master Off does.
+Message/Complete remains accepted for compatibility, but reports missing editable-surface degradation
+once and behaves ambient-only. Never manufacture append-only working/keep-alive posts or dummy
+references. Auto/Off/Message + Stream and any cancelButton remain aggregate startup refusals, not
+runtime Complete degradation. Authenticated initiating-subject stop words remain available.
+
+Retain the twenty-second renewal cadence and bounded failures. Source records Meta's twenty-five-
+second/reply-arrival dismissal but explicitly leaves renewal unverified: the repeat-request test
+proves neither scheduling nor renewed client visibility. Seal and stop renewals on answer, silence,
+failure, cancellation, delivery failure, and shutdown; cleanup cannot retract the read receipt or
+send Idle. Silence/shutdown submits no cleanup message; fixed failure/stopped replies remain.
+Complete delivery is text-only, split at 4,096 scalars with no blind send retry and explicit partial
+delivery. The repository records service-window restrictions and no template fallback; neither
+read/typing activity extending that window nor API-wide edit/interactive impossibility is established
+by this review. The implemented capability absence, not such universal claims, justifies rejection.
+
+### Notifications and retained surfaces
+
+**Current requests, not observed client behavior:** Telegram `post_text`/`send_text` omit
+`disable_notification`. Discord `liveness_body` and ordinary replies suppress parsed/user/role/reply
+mentions but send no silent-notification flag; mention suppression is not notification suppression.
+WhatsApp implements no silent-progress send. None exposes a notification-policy setting.
+
+**Proposed:** retain those request defaults; no silent-send feature is added here. Telegram's
+`disable_notification` is a candidate API option, not a verified silent-delivery contract; Discord
+silent-flag support and WhatsApp silent-send support likewise remain externally unverified by these
+bounded source reports. API request support, service acceptance, and observed push/sound behavior
+are distinct. Omitting placeholders reduces submitted messages, not necessarily notifications;
+final edits may not notify, and a long complete answer may require multiple sends. Reaction
+eligibility, recipient settings, typing dismissal, and actual notification behavior require
+separately authorized live checks, not loopback assertions.
+
+Preserve `policy.rs::discard`: ordinary progress can be deleted on fallback, but partial streams
+are retained even on Telegram/Discord, despite their message-delete APIs. Success removes controls
+when finalization succeeds; failure/cancellation preserve existing partial-text terminal treatment.
+Shutdown does not rewrite the last surface. Failed or ambiguous cleanup can leave controls or text
+behind, and finalization timeout must never delete a possibly accepted answer. This proposal adds
+no durable reconciliation or universal immediate-clear guarantee.
 
 ## Proposed configuration and migration
 
@@ -225,7 +376,7 @@ read-only review; do not advance with unresolved material findings or failing re
 | Milestone | Dependencies and scope | Acceptance gate | Stop condition |
 |---|---|---|---|
 | Typed resolution | Existing config parser and driver traits; enums, defaults, overrides, detail/stream independence | Strict parser, aggregate-conflict, effective-config and policy matrix tests | Ambiguous legacy migration or an enum with no runtime consumer |
-| Session presentation | First gate passed; selection, establishment outcome, fallback, cleanup and terminal writer | Fake-driver lifecycle tests plus loopback Slack HTTP assertions | Duplicate Auto placeholder, lost cleanup, unbounded fallback, or altered delivery acceptance |
+| Session presentation | First gate passed; selection, establishment outcome, fallback, cleanup and terminal writer | Fake-driver lifecycle tests plus Slack/Telegram/Discord/WhatsApp loopback assertions below | Duplicate Auto placeholder, unsafe reaction ownership or acknowledgment mutation, lost cleanup, unbounded fallback, or altered delivery acceptance |
 | Release contract | Second gate passed; operator docs/examples and focused cross-transport regression coverage | Package gates, exact-head required CI, fresh review, authorized live smoke before deployment | Mock success used as notification proof, formatting regression, or unresolved cancellation failure |
 
 Required behavior cases for implementation:
@@ -252,12 +403,27 @@ Required behavior cases for implementation:
 - Config tests pin absent versus enabled defaults, explicit legacy values, conversation overrides,
   route detail, introspection, and multiple simultaneous conflicts.
 
+Additional transport acceptance cases for the implementation PR (not tests added or run here):
+
+| Test boundary | Required observable result |
+|---|---|
+| Telegram/Discord policy matrix | All six progress/answer combinations, all detail levels, absent/enabled defaults and per-kind overrides; healthy Auto/Complete sends typing but zero reaction/placeholder requests; Stream sends only cumulative model text |
+| Fallback and ownership | Paused-time typing errors/cooldowns open only bounded fallback; skipped calls never establish a lease; unsafe/preexisting reaction is neither selected nor removed; owned cleanup cannot erase another generation |
+| Telegram addressing and limits | Topic/non-topic actions, photos, edits and Stop keys stay exact; spoofed/nonpositive topic refused; unchanged edits succeed; astral text cuts visibly and never exceeds UTF-16 bounds |
+| Discord addressing and Stop | DM/channel/thread REST targets and cancellation keys stay exact; non-mutating ack occurs before blocked queue; foreign press preserves partial text/components; initiating press wins once; ack failure still routes cancellation |
+| Message/control resolution | Auto/button forces delayed prose only where permitted; Off/Complete/button and Auto/Message + Complete/detail-Off/button report all conflicts; successful terminal edits remove keyboard/components; Stream attaches only at first text |
+| WhatsApp restrictions and lease | Exact coupled read/typing body; master Off sends neither; Message degrades once with zero placeholder calls; all Stream/button conflicts in base/overrides aggregate; paused time schedules twenty-second renewals without claiming remote visibility |
+| Terminal and failure paths | Success, failed model, declined reply, cancellation, shutdown, failed final send and partial delivery cease renewal; retained streams versus deletable progress follow existing rules; stale answer/history suppressed after Stop |
+| Refusal and ambiguity | HTTP refusal, malformed success and timeout retain cause; no repeated ambiguous creation, no deletion after ambiguous finalization; oversized/image fallback preserves every supported part and partial-delivery accounting |
+
 Run package-scoped validation first (`cargo test -p dekopond --locked` and relevant gateway
 integration tests), then the repository's required scope gates. Loopback HTTP assertions prove API
-selection, not Slack notification delivery. A controlled live Slack check must separately inspect
-native Working/Stop, absence of placeholder notifications, final-answer rendering/notification under
-known client settings, and cancellation. Streaming table-formatting work is a separate prerequisite
-for deployments that currently disable streaming for that reason; this proposal does not fix it.
+selection, not notification delivery. Separately authorized live checks must inspect Slack native
+Working/Stop, Telegram/Discord typing and reaction eligibility, WhatsApp renewal, absence of
+placeholder posts, final-answer rendering/notification under known client settings, and cancellation.
+Unverified public silent-send API options must not be advertised as supported gateway features.
+Streaming table-formatting work is a separate prerequisite for deployments that currently disable
+streaming for that reason; this proposal does not fix it.
 
 Before builds and between milestones, measure worktree target size and physical free space. After
 exact-head validation and with no builds or executables using it, remove only that worktree's
