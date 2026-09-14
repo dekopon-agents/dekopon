@@ -45,6 +45,12 @@ pub const DEFAULT_MAX_CONCURRENT_SESSIONS: usize = 4;
 pub const DEFAULT_MAX_STEPS: u32 = 8;
 /// Default capability invocations one routed message may drive.
 pub const DEFAULT_MAX_CAPABILITY_CALLS: u32 = 16;
+/// Default wall-clock deadline for one script a routed message's model runs.
+///
+/// `dekopon-shell`'s own default, restated here because this is now the value a route may replace
+/// and an operator reading the gateway's defaults should not have to open another crate to learn
+/// what the unwritten field means.
+pub const DEFAULT_SCRIPT_TIMEOUT_MS: u64 = 30_000;
 /// Default grace given to in-flight sessions at shutdown.
 pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(120);
 /// Default life of an untouched persistent conversation.
@@ -667,6 +673,15 @@ pub struct RouteLimits {
     /// nothing is to disable the route.
     #[serde(default)]
     pub max_duration_ms: Option<u64>,
+    /// Wall-clock deadline for one script the model runs, rather than for the whole session.
+    ///
+    /// Absent is [`DEFAULT_SCRIPT_TIMEOUT_MS`], which is what every route ran under before this
+    /// field existed. It bounds one `dekopon-shell` run: a capability call still in flight when it
+    /// fires is abandoned, so the number has to cover the slowest provider a script may drive.
+    /// Zero is refused, and so is a value above `maxDurationMs`, which the session bound would
+    /// always reach first.
+    #[serde(default)]
+    pub script_timeout_ms: Option<u64>,
 }
 
 impl Default for RouteLimits {
@@ -675,7 +690,22 @@ impl Default for RouteLimits {
             max_steps: DEFAULT_MAX_STEPS,
             max_capability_calls: DEFAULT_MAX_CAPABILITY_CALLS,
             max_duration_ms: None,
+            script_timeout_ms: None,
         }
+    }
+}
+
+impl RouteLimits {
+    /// The deadline one script on this route runs under, with the omitted default resolved.
+    ///
+    /// One definition of what an unwritten `scriptTimeoutMs` means, so the gateway cannot disagree
+    /// with the documentation about which number a route without the field gets.
+    #[must_use]
+    pub const fn script_timeout(self) -> Duration {
+        Duration::from_millis(match self.script_timeout_ms {
+            Some(milliseconds) => milliseconds,
+            None => DEFAULT_SCRIPT_TIMEOUT_MS,
+        })
     }
 }
 
@@ -1339,6 +1369,26 @@ pub(crate) fn resolve(
                 agent: route.agent.to_string(),
             });
         }
+        // A script that must finish in no time is a route whose every script ends with the shell's
+        // deadline line; omitting the field is how an operator asks for the default.
+        if route.limits.script_timeout_ms == Some(0) {
+            problems.push(ConfigProblem::InvalidScriptTimeout {
+                agent: route.agent.to_string(),
+            });
+        }
+        // A script deadline above the session bound can never fire: the session is cancelled first,
+        // so the pair reads as a longer allowance than the route actually grants. Both numbers are
+        // named, because which one to move is the operator's choice rather than this daemon's.
+        if let (Some(script_timeout_ms), Some(max_duration_ms)) =
+            (route.limits.script_timeout_ms, route.limits.max_duration_ms)
+            && script_timeout_ms > max_duration_ms
+        {
+            problems.push(ConfigProblem::ScriptTimeoutAboveDuration {
+                agent: route.agent.to_string(),
+                script_timeout_ms,
+                max_duration_ms,
+            });
+        }
         // A bound of zero is a bound nobody meant to write, exactly as a zero step budget already
         // is. The other half of this check — a window setting on a `oneShot` route — is a decode
         // failure rather than a check here, because there is no field it could have landed in.
@@ -1899,6 +1949,18 @@ pub enum ConfigProblem {
         "route for agent {agent:?} sets limits.maxDurationMs to 0, which cancels every session the instant it starts; omit it for no wall-clock bound"
     )]
     InvalidRouteDuration { agent: String },
+    #[error(
+        "route for agent {agent:?} sets limits.scriptTimeoutMs to 0, which ends every script the instant it starts; omit it for the {DEFAULT_SCRIPT_TIMEOUT_MS}ms default"
+    )]
+    InvalidScriptTimeout { agent: String },
+    #[error(
+        "route for agent {agent:?} sets limits.scriptTimeoutMs to {script_timeout_ms} above limits.maxDurationMs {max_duration_ms}; the session bound is reached first, so that script deadline can never take effect"
+    )]
+    ScriptTimeoutAboveDuration {
+        agent: String,
+        script_timeout_ms: u64,
+        max_duration_ms: u64,
+    },
     #[error("WhatsApp transport {name:?} must bind an explicit nonzero port")]
     InvalidWhatsappBind { name: String },
     #[error("WhatsApp transport {name:?} must use canonical positive WABA and phone-number IDs")]
@@ -2037,8 +2099,8 @@ mod tests {
     use dekopon_broker_protocol::BrokerSocketDiscovery;
 
     use super::{
-        ConfigError, LivenessMode, ModelConfig, ProgressDetail, ProgressSurface,
-        SlackLivenessFallback, resolve,
+        ConfigError, DEFAULT_SCRIPT_TIMEOUT_MS, Duration, LivenessMode, ModelConfig,
+        ProgressDetail, ProgressSurface, SlackLivenessFallback, resolve,
     };
     use crate::progress::{DEFAULT_KEEP_ALIVE_MAX, KeepAlive};
 
@@ -2296,5 +2358,81 @@ mod tests {
             cause.contains("unknown field `stream`"),
             "the refusal names the field the kind does not have: {cause}"
         );
+    }
+
+    /// The route owns the script deadline, and a route that writes no number keeps the one every
+    /// route ran under before the field existed.
+    ///
+    /// Both halves matter: an image edit needs more than 30 seconds, and an operator who never
+    /// heard of the field must not discover that their scripts started ending somewhere new.
+    #[test]
+    fn a_route_script_deadline_is_read_and_otherwise_defaults() {
+        let config = resolved(
+            "transports:\n\
+             \x20 - name: dev\n\
+             \x20   kind: local\n\
+             \x20   socketPath: dev.sock\n\
+             routes:\n\
+             \x20 - transport: dev\n\
+             \x20   conversation: { kind: [directMessage] }\n\
+             \x20   agent: reviewer\n\
+             \x20 - transport: dev\n\
+             \x20   conversation: { kind: [channel, thread] }\n\
+             \x20   agent: reviewer\n\
+             \x20   limits: { scriptTimeoutMs: 240000, maxDurationMs: 300000 }\n",
+        )
+        .expect("a well-formed configuration resolves");
+
+        let written = config.routes.first().expect("the route without the field");
+        assert_eq!(written.limits.script_timeout_ms, None);
+        assert_eq!(
+            written.limits.script_timeout(),
+            Duration::from_millis(DEFAULT_SCRIPT_TIMEOUT_MS),
+            "an omitted deadline resolves to the documented 30 seconds"
+        );
+        let named = config.routes.get(1).expect("the route that named one");
+        assert_eq!(named.limits.script_timeout_ms, Some(240_000));
+        assert_eq!(
+            named.limits.script_timeout(),
+            Duration::from_millis(240_000)
+        );
+    }
+
+    /// Two script deadlines that decode cleanly and could never take effect, refused together.
+    ///
+    /// The second is the one worth naming both numbers for: a script deadline above the session
+    /// bound reads as the longer allowance an operator wrote, and is not, because the session is
+    /// cancelled first.
+    #[test]
+    fn script_deadlines_that_cannot_take_effect_are_reported_together() {
+        let error = resolved(
+            "transports:\n\
+             \x20 - name: dev\n\
+             \x20   kind: local\n\
+             \x20   socketPath: dev.sock\n\
+             routes:\n\
+             \x20 - transport: dev\n\
+             \x20   conversation: { kind: [directMessage] }\n\
+             \x20   agent: reviewer\n\
+             \x20   limits: { scriptTimeoutMs: 0 }\n\
+             \x20 - transport: dev\n\
+             \x20   conversation: { kind: [channel, thread] }\n\
+             \x20   agent: other-reviewer\n\
+             \x20   limits: { scriptTimeoutMs: 300000, maxDurationMs: 120000 }\n",
+        )
+        .expect_err("neither route may start");
+
+        let rendered = error.to_string();
+        for expected in [
+            "sets limits.scriptTimeoutMs to 0",
+            "omit it for the 30000ms default",
+            "sets limits.scriptTimeoutMs to 300000 above limits.maxDurationMs 120000",
+            "can never take effect",
+        ] {
+            assert!(
+                rendered.contains(expected),
+                "both problems are reported at once; {expected:?} is missing from:\n{rendered}"
+            );
+        }
     }
 }

@@ -139,6 +139,33 @@ Embedders lose the machinery with it:
   with `invalid-request`. It was kept for one release for a client predating `runCommand`; no
   in-tree client has sent it since 0.13.0. Send `runCommand` and match the `CommandRunOutcome`.
 
+## A route may set the script deadline (0.15.2)
+
+Optional, and nothing has to change: a route that writes no `limits.scriptTimeoutMs` keeps the 30
+second deadline every script has always run under. Write one where a capability is genuinely slow.
+Before this release the number was `dekopon-shell`'s own default and no configuration reached it, so
+an image edit through `gpt-image.edit` — which routinely needs more than 30 seconds, where a generate
+finishes in about 24 — was killed at exactly 30 with `dekopon-shell: script exceeded its 30000ms
+deadline`, and the provider call still in flight was abandoned with the script.
+
+```yaml
+routes:
+  - transport: workspace-slack
+    conversation: { kind: [directMessage] }
+    agent: image-editor
+    limits:
+      maxSteps: 8
+      maxCapabilityCalls: 16
+      maxDurationMs: 300000      # unchanged: the whole session's wall clock
+      scriptTimeoutMs: 240000    # new: one script's deadline, default 30000
+```
+
+Two startup refusals come with it, each of a setting that decodes cleanly and could never take
+effect: a `scriptTimeoutMs` of `0`, like every other zero bound in this file, and a
+`scriptTimeoutMs` greater than the same route's `maxDurationMs`, where the session is cancelled
+first. That second refusal names both numbers, because which of the two to move is the operator's
+choice. `maxDurationMs` is unchanged and remains the session bound.
+
 ## A failed invocation carries the provider's own code and message (0.15.1)
 
 **Upgrade both daemons together.** A failed `InvocationResult` gains `detail`, a `{ code, message }`

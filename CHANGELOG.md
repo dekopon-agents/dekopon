@@ -7,6 +7,18 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- A route may set `limits.scriptTimeoutMs`, the wall-clock deadline one `dekopon-shell` script runs
+  under, in the same block as `maxSteps`, `maxCapabilityCalls`, and `maxDurationMs`. It was
+  `dekopon-shell`'s own 30-second default and no configuration reached it, so every script on every
+  route ended at 30 seconds whatever the route's `maxDurationMs` said: a `gpt-image.edit` call the
+  image route had accepted was killed at exactly 30000ms and the broker call in flight was abandoned
+  with the script. Omitting the field keeps that 30000ms default. Startup refuses `0`, and refuses a
+  `scriptTimeoutMs` greater than the same route's `maxDurationMs` naming both values, because the
+  session bound is reached first and that script deadline could never take effect
+  ([`docs/upgrading.md`](docs/upgrading.md#a-route-may-set-the-script-deadline-0152)).
+
 ## [0.15.1] - 2026-09-14
 
 ### Fixed

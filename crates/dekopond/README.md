@@ -30,7 +30,8 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   `stream` grows the answer in place as the model writes it, and a stop word, a cancel button, or
   `limits.maxDurationMs` ends a run early. Cosmetic failures never alter the terminal reply.
 - **Sessions** — a process-wide concurrency ceiling plus per-conversation serialization,
-  bounded model turns, bounded capability calls, cooperative Stop checks, and one fixed line on
+  bounded model turns, bounded capability calls, a per-script wall-clock deadline a route sets with
+  `limits.scriptTimeoutMs` (default 30000), cooperative Stop checks, and one fixed line on
   failure. An unaddressed owned-thread follow-up also offers `decline_chat_reply`, which ends a
   no-work session without sending anything to chat instead of making the agent take the last word.
 - **Authorization** — every session opens an *attested* broker leg naming the sender's
