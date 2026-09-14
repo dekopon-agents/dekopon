@@ -1089,10 +1089,14 @@ impl BrokerLeg {
                         .error
                         .unwrap_or_else(|| "authorization refused this invocation".to_owned()),
                 },
+                // The classification decides the exit status and what a model may retry; the
+                // provider's own code and message travel beside it so the script output carries
+                // the upstream refusal rather than only its class.
                 InvocationOutcome::Failed => CapabilityCallResult::Failed {
                     error: result
                         .error
                         .unwrap_or_else(|| "the broker reported a failed invocation".to_owned()),
+                    detail: result.detail,
                 },
             },
             // An unmapped peer — or, for an attested leg, a refused attestation — is an
@@ -1118,8 +1122,11 @@ impl BrokerLeg {
             // Every `ClientError` renders without the socket path, so a script cannot learn where
             // the broker lives — the interpreter refuses to read the process environment, and this
             // is the one path that could otherwise leak `DEKOPON_BROKER_SOCKET` back into it.
+            // A transport failure is the client's own account of what went wrong; no provider
+            // reported anything.
             Err(error) => CapabilityCallResult::Failed {
                 error: error.to_string(),
+                detail: None,
             },
         }
     }
@@ -1456,7 +1463,9 @@ mod tests {
             write_frame,
         };
         use dekopon_capability::DecisionReference;
-        use dekopon_core::{AgentId, ExternalSubject, SecretDrn, SecretUseProposal};
+        use dekopon_core::{
+            AgentId, ExternalSubject, ProviderFailureDetail, SecretDrn, SecretUseProposal,
+        };
         use dekopon_process::CancelSignal;
         use dekopon_shell::{
             CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun, ExitCode,
@@ -1510,6 +1519,7 @@ mod tests {
                 output: matches!(outcome, InvocationOutcome::Succeeded)
                     .then(|| json!({"status": 200})),
                 error: error.map(str::to_owned),
+                detail: None,
                 evidence: Vec::new(),
             }
         }
@@ -1905,7 +1915,36 @@ mod tests {
             assert_eq!(
                 invoke(leg, CAPABILITY).await,
                 CapabilityCallResult::Failed {
-                    error: "provider trapped".to_owned()
+                    error: "provider trapped".to_owned(),
+                    detail: None
+                }
+            );
+        }
+
+        /// The classification is what the exit status and any retry decision come from, so it
+        /// stays the `error`; the provider's own refusal travels beside it to the script the model
+        /// reads back, rather than being dropped at this seam.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_typed_provider_failure_reaches_the_script_with_its_code_and_message() {
+            let directory = private_broker_directory();
+            let detail = ProviderFailureDetail::new(
+                "upstream-rejected",
+                "the image route refused the request with HTTP 400 (moderation_blocked)",
+            );
+            let leg = stub_leg(
+                directory.path(),
+                vec![ResponseEnvelope::invocation(InvocationResult {
+                    detail: Some(detail.clone()),
+                    ..result(InvocationOutcome::Failed, Some("provider-failure"))
+                })],
+            )
+            .await;
+
+            assert_eq!(
+                invoke(leg, CAPABILITY).await,
+                CapabilityCallResult::Failed {
+                    error: "provider-failure".to_owned(),
+                    detail: Some(detail)
                 }
             );
         }
@@ -2264,7 +2303,7 @@ mod tests {
             let socket = directory.path().join("dekopon-secret-broker.sock");
             let leg = leg_for(&socket);
 
-            let CapabilityCallResult::Failed { error } = invoke(leg, CAPABILITY).await else {
+            let CapabilityCallResult::Failed { error, .. } = invoke(leg, CAPABILITY).await else {
                 panic!("a missing broker socket is an infrastructure failure");
             };
             assert!(!error.contains("dekopon-secret-broker"), "{error}");

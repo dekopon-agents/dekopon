@@ -99,7 +99,7 @@ therefore inside the caller's trace. Two events carry the whole record:
 | Event | Level | Emitted by | Carries |
 |---|---|---|---|
 | `broker.decision` | info | `dekopon-broker` | `invocation.id`, `capability.id`, `decision.id`, `decision.allowed`, `decision.reason` on a denial, `principal`, `actor.kind`/`actor.id`, `via`, `subject`, `provider`, `authorized.by`, `policy.revision`, `policy.ids`, `policy.digest`, `secret`/`secret.sink` when a public DRN was proposed, and `storage.scope_commitment`/`storage.evidence` on a storage-routed decision |
-| `broker.execution` | info | `dekopon-broker` | everything `broker.decision` carries except the decision verdict, plus `effect`, `risk`, `credential` — the symbolic name only — `outcome`, `duration_ms`, `error` and `output.digest` when there is one, and `http.calls`: the sanitized `HttpCallEvidence` array, method, authority, status, accounted bytes, and `credentialInjected` |
+| `broker.execution` | info | `dekopon-broker` | everything `broker.decision` carries except the decision verdict, plus `effect`, `risk`, `credential` — the symbolic name only — `outcome`, `duration_ms`, `error` and `output.digest` when there is one, `error.code` and `error.message` when the provider reported the failure itself, and `http.calls`: the sanitized `HttpCallEvidence` array, method, authority, status, accounted bytes, and `credentialInjected` |
 
 Both ride the `dekopon_broker::audit` target. An optional field is absent rather than null when the
 record does not carry it, so a present field always means the broker knew it. A storage-routed
@@ -116,6 +116,16 @@ and crate set, as the spans ([Broker export](#broker-export)). Without one, audi
 whatever keeps the process's stdout — `kubectl logs` for a pod — so a deployment that needs audit
 past a pod restart configures `telemetry`. `RUST_LOG` filters the stdout copy only: a level stricter
 than `info` on the `dekopon_broker::audit` target drops the records from it.
+
+`error` is the broker's own classification — `provider-failure`, `provider-timeout`,
+`storage-quota` — and is the field to alert and group on. `error.code` and `error.message` are the
+provider's own answer, present only when the component returned a typed failure and absent for every
+host, transport, or storage failure no provider reported. They explain the class rather than
+replacing it: `provider-failure` cannot separate an upstream moderation refusal from a malformed
+argument, and without them the reason a run failed exists nowhere in the trace. Both are
+provider-authored, so both are bounded — the code at 128 bytes, the message at 1024, cut on a
+character boundary and suffixed `…[truncated]` like every other bounded value. They are metadata the
+provider wrote about its own refusal, never provider output, which stays a digest.
 
 Nothing here can carry secret bytes. `secret` and `credential` are the symbolic names owner
 configuration already holds, and the HTTP evidence is the same sanitized set the `http.request`
@@ -480,7 +490,7 @@ migration is implemented here.
 | `broker.command_run` | `dekopon-brokerd` | `word` and `outcome` (`proposed`, `rendered`, `failed`, `error`); opened once per `runCommand` beneath the client's `traceParent` |
 | `provider.run_command` | `dekopon-broker-host` | provider, `word`, `command.export` (`run-command`), `command.arguments` and `command.arguments.bytes`, `command.stdin` and `command.stdin.bytes` when a value was piped, `command.output` and `command.output.bytes`, `stores`, `instantiations`, `fuel.consumed`; nests under `broker.command_run` |
 | `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `policy-error`, `secret-denied`, `unconstrained-capability`, `agent-denied`, `attestation-denied`, `unmapped-subject`, `chat-attestation-denied`, `chat-scope-required`, `record-operation-required`, `memory-unavailable`, `invalid-memory-input`, `invalid-turn`), `policy.errors_present`; `subject` and `via` on attested proposals |
-| `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one; `outcome` (`succeeded`, `failed`, `decision-unaudited`, `outcome-unaudited`) and `error` — the same classified reason the terminal audit record carries; on a storage-backed invocation also `storage = true`, `storage.namespace`, and `storage.reset` |
+| `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one; `outcome` (`succeeded`, `failed`, `decision-unaudited`, `outcome-unaudited`) and `error` — the same classified reason the terminal audit record carries — with `error.code` and `error.message` beside it on a typed provider failure; on a storage-backed invocation also `storage = true`, `storage.namespace`, and `storage.reset` |
 | `broker.credential.refresh` | `dekopon-brokerd` | the symbolic `credential` name, and `outcome` (`current`, `adopted`, `rotated`, `rotated-unsaved`, `failed`); emitted once per invocation that selects a credential the broker renews per use, and never any token, account identifier, or file content. `chatgpt.refresh` from `dekopon-model` nests inside it |
 | `provider.invoke` | `dekopon-broker-host` | capability, provider, `input`, `stores`, `instantiations`, `fuel.consumed`; `storage = true` on a storage-backed invocation |
 | `http.request` | `dekopon-http-host` | `http.request.method`, `server.address`, `http.response.status_code`, `dekopon.http.request.accounted_bytes`, `dekopon.http.response.accounted_bytes`, `outcome`; `error.code` and `error.message` on failure |

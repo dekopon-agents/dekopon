@@ -1,10 +1,12 @@
+use dekopon_broker_host::BrokerHostError;
 use dekopon_broker_host::BrokerHostLimits;
 use dekopon_capability::{
     ExecutionConstraints, HttpConstraints, StorageAccess, StorageConstraints, StorageInterface,
     StorageNamespace,
 };
 use dekopon_core::{
-    Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, PrincipalId, TraceId,
+    Actor, AgentId, CapabilityId, ExternalSubject, InvocationId, MAX_FAILURE_MESSAGE_BYTES,
+    PrincipalId, ProviderFailureDetail, ProviderId, TraceId,
 };
 
 use super::{
@@ -13,6 +15,7 @@ use super::{
     ChatScopeGrant, ChatTransportKind, ConstraintSet, ContextError, Conversation, ConversationKind,
     ConversationKindMatch, ConversationMatch, InMemoryAuditLog, encode_capability_authority,
     encode_execution_constraints, encode_host_limits, encode_memory_config, encode_storage_limits,
+    provider_failure_detail, public_host_error,
 };
 
 fn decision(invocation: &str, allowed: bool) -> AuditEvent {
@@ -1183,4 +1186,73 @@ fn per_agent_credentials_decode_validate_their_keys_and_select_by_actor() {
             .contains("credentialByAgent"),
         "an empty override map must stay off the wire"
     );
+}
+
+/// The provider's own answer travels with the class, never instead of it. A model and an operator
+/// both need the class to decide what to do; only the provider's sentence says what actually
+/// happened, and `provider-failure` on its own has never been able to say.
+#[test]
+fn a_typed_provider_failure_keeps_its_classification_and_carries_the_providers_own_code() {
+    let failure = BrokerHostError::ProviderFailure {
+        provider: "gpt-image".parse::<ProviderId>().expect("valid provider"),
+        capability: "gpt-image.edit"
+            .parse::<CapabilityId>()
+            .expect("valid capability"),
+        code: "upstream-rejected".to_owned(),
+        message: "the image route refused the request with HTTP 400 (moderation_blocked: the \
+                  request was rejected)"
+            .to_owned(),
+    };
+
+    assert_eq!(
+        public_host_error(&failure, CapabilityRoute::Generic),
+        "provider-failure"
+    );
+    assert_eq!(
+        provider_failure_detail(&failure),
+        Some(ProviderFailureDetail::new(
+            "upstream-rejected",
+            "the image route refused the request with HTTP 400 (moderation_blocked: the request \
+             was rejected)"
+        ))
+    );
+}
+
+/// The pair crosses a trust boundary: the message is provider-authored text, so it is cut here
+/// rather than wherever it is later rendered.
+#[test]
+fn a_provider_message_past_its_bound_is_cut_before_it_leaves_the_broker() {
+    let failure = BrokerHostError::ProviderFailure {
+        provider: "gpt-image".parse::<ProviderId>().expect("valid provider"),
+        capability: "gpt-image.edit"
+            .parse::<CapabilityId>()
+            .expect("valid capability"),
+        code: "upstream-rejected".to_owned(),
+        message: "m".repeat(MAX_FAILURE_MESSAGE_BYTES + 1),
+    };
+
+    let detail = provider_failure_detail(&failure).expect("a typed provider failure has a detail");
+
+    assert_eq!(
+        detail.message,
+        format!(
+            "{}\u{2026}[truncated]",
+            "m".repeat(MAX_FAILURE_MESSAGE_BYTES)
+        )
+    );
+}
+
+/// Only a failure the provider itself reported has a provider sentence. Every other host failure
+/// is the host's or the broker's account, and inventing one for it would make the field a lie.
+#[test]
+fn a_host_failure_no_provider_reported_carries_no_detail() {
+    for failure in [
+        BrokerHostError::Timeout {
+            operation: "invoke gpt-image.edit".to_owned(),
+            timeout_ms: 30_000,
+        },
+        BrokerHostError::StorageDisabled,
+    ] {
+        assert_eq!(provider_failure_detail(&failure), None);
+    }
 }

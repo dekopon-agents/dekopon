@@ -5,15 +5,17 @@
 //! keeping transport, command-line, async-runtime, and policy concerns out of this crate.
 //!
 //! It also holds the helpers that separate processes must not disagree about — the `accept()` retry
-//! classification, `error_chain`, the span-attribute bound [`bounded_attribute`], and the
-//! trusted-file predicate behind [`read_trusted_file`] — because a fact split across five crates
-//! drifts, and the file-permission mask already had.
+//! classification, `error_chain`, the span-attribute bound [`bounded_attribute`], the bounded
+//! provider failure pair [`ProviderFailureDetail`], and the trusted-file predicate behind
+//! [`read_trusted_file`] — because a fact split across five crates drifts, and the
+//! file-permission mask already had.
 
 #![forbid(unsafe_code)]
 
 mod accept;
 mod attribute;
 mod diagnostics;
+mod failure;
 mod redaction;
 mod skill;
 mod subject;
@@ -29,6 +31,7 @@ use thiserror::Error;
 pub use accept::{ACCEPT_BACKOFF_MS, MAX_ACCEPT_BACKOFF_MS, retryable_accept_error};
 pub use attribute::{MAX_ATTRIBUTE_BYTES, bounded_attribute};
 pub use diagnostics::error_chain;
+pub use failure::{MAX_FAILURE_CODE_BYTES, MAX_FAILURE_MESSAGE_BYTES, ProviderFailureDetail};
 pub use redaction::{REDACTION_MARKER, Redacted, redaction_marker, serialize_exposed};
 pub use skill::{MAX_SKILL_NAME_LENGTH, SkillId, SkillIdError};
 pub use subject::{ExternalSubject, SubjectError, SubjectService};

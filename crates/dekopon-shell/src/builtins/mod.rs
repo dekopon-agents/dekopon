@@ -162,11 +162,16 @@ impl BuiltinContext<'_> {
                     status,
                 });
             }
-            CapabilityCallResult::Failed { error } => {
-                return Err(CommandFailure::Status {
-                    message: format!("{capability}: failed: {error}"),
-                    status,
-                });
+            // The classification first, because that is what the exit status means, then the
+            // provider's own sentence when it wrote one. A model that reads only
+            // `gpt-image.edit: failed: provider-failure` has no way to learn that the upstream
+            // refused the image for moderation, and guesses instead of relaying.
+            CapabilityCallResult::Failed { error, detail } => {
+                let message = match detail {
+                    Some(detail) => format!("{capability}: failed: {error}: {detail}"),
+                    None => format!("{capability}: failed: {error}"),
+                };
+                return Err(CommandFailure::Status { message, status });
             }
             CapabilityCallResult::NotFound => {
                 return Err(CommandFailure::Status {
@@ -399,6 +404,7 @@ mod tests {
             }
             CapabilityCallResult::Failed {
                 error: "curl reached a capability".to_owned(),
+                detail: None,
             }
         }
     }

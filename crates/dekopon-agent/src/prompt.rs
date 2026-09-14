@@ -3300,6 +3300,7 @@ mod tests {
                 },
                 "broken.thing" => CapabilityCallResult::Failed {
                     error: "upstream boom".to_owned(),
+                    detail: None,
                 },
                 _ => CapabilityCallResult::NotFound,
             }

@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use dekopon_capability::DecisionReference;
 use dekopon_core::{CapabilityId, InvocationId, SecretUseProposal};
 use serde_json::json;
 use tokio::io::{AsyncWriteExt as _, duplex};
@@ -8,8 +9,9 @@ use super::{
     Attestation, BrokerRequest, ChatScopeClaim, ChatTransportKind, CommandRunOutcome,
     ComponentFailure, Conversation, ConversationKind, ConversationKindMatch, ConversationMatch,
     ConversationMatchProblem, DeliveredTurnRequest, DeliveryIdentity, FrameLimits,
-    InvocationRequest, PROTOCOL_VERSION, ProtocolError, ProtocolVersion, RequestEnvelope,
-    ResponseEnvelope, TraceParent, TraceParentError, read_frame, write_frame,
+    InvocationOutcome, InvocationRequest, InvocationResult, PROTOCOL_VERSION, ProtocolError,
+    ProtocolVersion, ProviderFailureDetail, RequestEnvelope, ResponseEnvelope, TraceParent,
+    TraceParentError, read_frame, write_frame,
 };
 
 /// One conversation fixture, spelled the way a transport mints it.
@@ -2126,4 +2128,94 @@ fn retired_reporting_operations_are_refused() {
         let value = json!({"apiVersion": PROTOCOL_VERSION, "request": {"operation": operation}});
         assert!(serde_json::from_value::<RequestEnvelope>(value).is_err());
     }
+}
+
+/// One failed result fixture carrying the provider's own answer.
+fn failed_with_detail() -> InvocationResult {
+    InvocationResult {
+        invocation: "invoke-gpt-image-edit"
+            .parse::<InvocationId>()
+            .expect("valid invocation fixture"),
+        decision: DecisionReference {
+            decision_id: "decision-gpt-image".to_owned(),
+            authorized_by: "broker".parse().expect("valid principal fixture"),
+            policy_revision: "policy-1".to_owned(),
+        },
+        outcome: InvocationOutcome::Failed,
+        output: None,
+        error: Some("provider-failure".to_owned()),
+        detail: Some(ProviderFailureDetail::new(
+            "upstream-rejected",
+            "the image route refused the request with HTTP 400 (moderation_blocked)",
+        )),
+        evidence: Vec::new(),
+    }
+}
+
+/// The wire spells the pair `detail: { code, message }` in camelCase like every other field, and a
+/// result with no provider answer keeps exactly the shape it had.
+#[tokio::test]
+async fn a_failed_invocation_round_trips_the_providers_own_code_and_message() {
+    let limits = FrameLimits {
+        max_frame_bytes: 4 * 1024,
+        io_timeout: Duration::from_secs(1),
+    };
+    let expected = ResponseEnvelope::invocation(failed_with_detail());
+    let document = serde_json::to_value(&expected).expect("the response serializes");
+    assert_eq!(
+        document["response"]["result"]["detail"],
+        json!({
+            "code": "upstream-rejected",
+            "message": "the image route refused the request with HTTP 400 (moderation_blocked)",
+        })
+    );
+
+    let (mut writer, mut reader) = duplex(8 * 1024);
+    let write = tokio::spawn({
+        let expected = expected.clone();
+        async move { write_frame(&mut writer, &expected, limits).await }
+    });
+    let actual = read_frame::<_, ResponseEnvelope>(&mut reader, limits)
+        .await
+        .expect("a failed result carrying a provider detail decodes");
+    write
+        .await
+        .expect("writer task exits")
+        .expect("frame writes");
+
+    assert_eq!(actual, expected);
+}
+
+/// A failure no provider reported leaves the field off the wire entirely, so nothing about a
+/// success, a denial, or a host failure changes shape.
+#[test]
+fn a_result_without_a_provider_detail_keeps_the_field_off_the_wire() {
+    let result = InvocationResult {
+        error: Some("provider-timeout".to_owned()),
+        detail: None,
+        ..failed_with_detail()
+    };
+
+    let document = serde_json::to_string(&ResponseEnvelope::invocation(result.clone()))
+        .expect("the response serializes");
+
+    assert!(!document.contains("detail"), "{document}");
+    assert_eq!(
+        serde_json::from_str::<ResponseEnvelope>(&document).expect("it decodes"),
+        ResponseEnvelope::invocation(result)
+    );
+}
+
+/// The coupling is lockstep by construction: the result refuses a field it does not know, so a
+/// gateway one release behind fails loudly on a detail it cannot read rather than silently
+/// dropping the only record of why the provider refused.
+#[test]
+fn an_unknown_sibling_of_the_provider_detail_is_refused_rather_than_ignored() {
+    let mut document = serde_json::to_value(failed_with_detail()).expect("the result serializes");
+    document
+        .as_object_mut()
+        .expect("result object")
+        .insert("providerDetail".to_owned(), json!({"code": "x"}));
+
+    assert!(serde_json::from_value::<InvocationResult>(document).is_err());
 }

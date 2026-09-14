@@ -7,7 +7,8 @@ authored for another client loads here unchanged and one authored here loads the
 
 It also holds the small helpers that separate processes must not disagree about: the `accept()`
 retry classification with its backoff bounds, `error_chain`, which renders a failure and its sources
-as one line, `read_trusted_file`, the one definition of what makes a local file trusted input —
+as one line, `ProviderFailureDetail`, the bounded `{ code, message }` pair a provider's own typed
+failure travels as from the broker to the audit record and the model, `read_trusted_file`, the one definition of what makes a local file trusted input —
 opened without following a symlink, regular, single-link, owned by this process, within a byte
 ceiling, and at one of two named permission tiers — `PROVIDER_COMPONENT_EXTENSION`, the file
 extension the broker selects components by, and `RESERVED_COMMAND_WORDS`

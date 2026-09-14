@@ -16,6 +16,7 @@ use std::{
 };
 
 pub use dekopon_capability::{InvocationOutcome, InvocationResult};
+pub use dekopon_core::ProviderFailureDetail;
 
 mod conversation;
 

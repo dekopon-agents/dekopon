@@ -18,7 +18,7 @@ The gateway owns chat and model credentials, bounded agent sessions, and proposa
 
 Crate boundaries:
 
-- `dekopon-core`: validated identifiers and dependency-light domain enums — the canonical public `SecretDrn`, the typed inert `SecretUseProposal`, and the `SkillId` grammar a mounted skill's directory and front matter must share. It also owns three facts separate processes must not disagree about: where `bounded_attribute` cuts a span attribute value, what makes a local file trusted input, and which permission tier — private, or merely not world-writable — a file is held to.
+- `dekopon-core`: validated identifiers and dependency-light domain enums — the canonical public `SecretDrn`, the typed inert `SecretUseProposal`, and the `SkillId` grammar a mounted skill's directory and front matter must share. It also owns four facts separate processes must not disagree about: where `bounded_attribute` cuts a span attribute value, how a provider's own typed failure is spelled and bounded (`ProviderFailureDetail`), what makes a local file trusted input, and which permission tier — private, or merely not world-writable — a file is held to.
 - `dekopon-capability`: capability metadata and the proposal and authorization invocation states.
 - `dekopon-protocol`: strict `dekopon.dev/v1alpha1` resources and list responses.
 - `dekopon-config`: discovery, parsing, duplicate detection, reference validation, and the bounded in-memory `Skill` loader for `SKILL.md` directories. The catalog runs that loader at load time, so a session never touches the filesystem for a skill.
