@@ -7,6 +7,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.15.1] - 2026-09-14
+
 ### Fixed
 
 - A provider's own failure reaches the audit record and the model instead of being dropped at the
@@ -21,6 +23,15 @@ All notable changes to Dekopon are documented here. The format is based on
   and the message at 1024 on construction and again on decode. **Upgrade both daemons together:**
   the result is strict-decoded, so a 0.15.0 `dekopond` cannot read a 0.15.1 broker's failed result
   ([`docs/upgrading.md`](docs/upgrading.md#a-failed-invocation-carries-the-providers-own-code-and-message-0151)).
+
+## [dekopon-chart-0.8.1] - 2026-09-14
+
+### Changed
+
+- `appVersion` names `0.15.1`, the application release this chart deploys, so
+  `app.kubernetes.io/version` and a default `image.tag` stop reporting `0.15.0` on pods running a
+  later one. Nothing else moved: no template, default, or rendered field changed between chart
+  0.8.0 and this one.
 
 ## [0.15.0] - 2026-09-13
 
@@ -2229,7 +2240,9 @@ snapshot is only a comparison marker; no authenticated `v0.1.0` tag exists._
 - Added owner-only hash-linked audit records with checkpoint recovery and payload-redacted
   telemetry, and updated Wasmtime to 36.0.13 for RUSTSEC-2026-0222 (#23, #27, #32).
 
-[Unreleased]: https://github.com/dekopon-agents/dekopon/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/dekopon-agents/dekopon/compare/v0.15.1...HEAD
+[0.15.1]: https://github.com/dekopon-agents/dekopon/compare/v0.15.0...v0.15.1
+[dekopon-chart-0.8.1]: https://github.com/dekopon-agents/dekopon/compare/dekopon-chart-0.8.0...dekopon-chart-0.8.1
 [0.15.0]: https://github.com/dekopon-agents/dekopon/compare/v0.14.0...v0.15.0
 [dekopon-chart-0.8.0]: https://github.com/dekopon-agents/dekopon/compare/dekopon-chart-0.7.0...dekopon-chart-0.8.0
 [0.14.0]: https://github.com/dekopon-agents/dekopon/compare/v0.13.0...v0.14.0
