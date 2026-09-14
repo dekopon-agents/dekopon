@@ -7,6 +7,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.15.2] - 2026-09-14
+
 ### Added
 
 - A route may set `limits.scriptTimeoutMs`, the wall-clock deadline one `dekopon-shell` script runs
@@ -18,6 +20,15 @@ All notable changes to Dekopon are documented here. The format is based on
   `scriptTimeoutMs` greater than the same route's `maxDurationMs` naming both values, because the
   session bound is reached first and that script deadline could never take effect
   ([`docs/upgrading.md`](docs/upgrading.md#a-route-may-set-the-script-deadline-0152)).
+
+## [dekopon-chart-0.8.2] - 2026-09-14
+
+### Changed
+
+- `appVersion` names `0.15.2`, the application release this chart deploys, so
+  `app.kubernetes.io/version` and a default `image.tag` stop reporting `0.15.1` on pods running a
+  later one. Nothing else moved: no template, default, or rendered field changed between chart
+  0.8.1 and this one.
 
 ## [0.15.1] - 2026-09-14
 
@@ -2252,7 +2263,9 @@ snapshot is only a comparison marker; no authenticated `v0.1.0` tag exists._
 - Added owner-only hash-linked audit records with checkpoint recovery and payload-redacted
   telemetry, and updated Wasmtime to 36.0.13 for RUSTSEC-2026-0222 (#23, #27, #32).
 
-[Unreleased]: https://github.com/dekopon-agents/dekopon/compare/v0.15.1...HEAD
+[Unreleased]: https://github.com/dekopon-agents/dekopon/compare/v0.15.2...HEAD
+[0.15.2]: https://github.com/dekopon-agents/dekopon/compare/v0.15.1...v0.15.2
+[dekopon-chart-0.8.2]: https://github.com/dekopon-agents/dekopon/compare/dekopon-chart-0.8.1...dekopon-chart-0.8.2
 [0.15.1]: https://github.com/dekopon-agents/dekopon/compare/v0.15.0...v0.15.1
 [dekopon-chart-0.8.1]: https://github.com/dekopon-agents/dekopon/compare/dekopon-chart-0.8.0...dekopon-chart-0.8.1
 [0.15.0]: https://github.com/dekopon-agents/dekopon/compare/v0.14.0...v0.15.0

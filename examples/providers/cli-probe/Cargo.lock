@@ -60,7 +60,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "dekopon-capability"
-version = "0.15.1"
+version = "0.15.2"
 dependencies = [
  "dekopon-core",
  "serde",
@@ -79,7 +79,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-core"
-version = "0.15.1"
+version = "0.15.2"
 dependencies = [
  "libc",
  "serde",
@@ -88,7 +88,7 @@ dependencies = [
 
 [[package]]
 name = "dekopon-provider-sdk"
-version = "0.15.1"
+version = "0.15.2"
 dependencies = [
  "clap",
  "dekopon-capability",
