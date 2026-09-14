@@ -49,8 +49,9 @@ Public results carry an inert decision ID, broker and policy reference, and dige
 
 Audit records contain identities, routing and policy metadata — `policy_ids`, the policies that
 determined the decision, and `policy_digest`, a fingerprint of the evaluated set — stable outcomes,
-timings, output digests, and sanitized HTTP call metadata. They never contain invocation input,
-provider output, paths, queries, headers, bodies, cookies, authorization values, or credentials.
+timings, output digests, and sanitized HTTP call metadata, plus the provider's own bounded failure
+code and message on a typed provider failure. They never contain invocation input, provider output,
+paths, queries, headers, bodies, cookies, authorization values, or credentials.
 
 The record is a structured `tracing` event on target `dekopon_broker::audit`, emitted inside the span
 that made the decision: `broker.decision` for an allow or deny, `broker.execution` for a terminal
