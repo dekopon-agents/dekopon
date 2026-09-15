@@ -55,10 +55,10 @@ The fixtures under `examples/providers/` are separate Cargo workspaces that root
 - Do not commit credentials, real private endpoints, generated coverage data, or local configuration.
 - Reject unknown authored fields unless a documented compatibility need overrides that default.
 - Treat model tool arguments and provider responses as untrusted; providers validate their capability-specific input.
-- Add behavior-focused tests, including failure paths and stable CLI output where relevant.
+- Name tests for the behavior they pin and keep them beside the owning crate. Failure-path tests assert the surfaced error or log carries the cause; validation tests construct at least two simultaneous conflicts and assert both are reported. Mock network peers on loopback; never read another application's credential store. Cover stable CLI output where relevant.
 - Record user-visible changes under `[Unreleased]` in [`CHANGELOG.md`](CHANGELOG.md) using Keep a Changelog categories; pull-request CI validates the file's shape ([details](docs/development.md#dependencies-crates-ci-or-releases)).
 - Avoid `unsafe`, panics on user input, unnecessary async dependencies, and public APIs based on `anyhow`.
-- Use conventional commit subjects when practical, for example `feat(config): detect duplicate agents`.
+- Use conventional commit subjects when practical, for example `feat(config): detect duplicate agents`. Preserve `Co-Authored-By:` and `Claude-Session:` trailers added by the agent harness; model and session identifiers belong nowhere else in source or documentation.
 
 ## Pull requests
 
