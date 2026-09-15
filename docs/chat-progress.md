@@ -9,6 +9,10 @@ rather than solved.
 are what the services documented at the time of writing; the ones marked as open are recorded
 under [Accepted limits](#accepted-limits).
 
+**Exploration:** [Native-first chat progress](native-first-chat-progress.md) proposes selecting a
+coherent experience from these capabilities, separating answer streaming from progress prose, and
+preferring native status over placeholder messages. It is not implemented by this document.
+
 ## The shape in one paragraph
 
 The prompt loop threads synchronous observers through `dekopon_agent::prompt::SessionInputs`. A
@@ -24,8 +28,11 @@ already had.
 
 ## Three rules every production chat bot converges on
 
-1. **Progress never notifies.** Reactions, in-place edits, and platform status fields sit outside
-   message history. A new message is the floor, used once, only where nothing else exists.
+1. **Prefer progress that does not notify.** Native status and reactions avoid a new message;
+   in-place edits avoid another message but remain in history. Current message-based progress can
+   notify on its initial post, even beside native status. The
+   [native-first proposal](native-first-chat-progress.md) addresses that gap; silent progress is
+   not a guarantee of the current implementation.
 2. **Progress is ephemeral and id-addressed; only the answer is durable.** The progress surface is
    finalized into the answer or deleted; nothing about it survives a restart.
 3. **Keep-alive is a lease renewal, not prose.** Typing indicators expire in seconds and are
