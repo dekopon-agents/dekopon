@@ -26,11 +26,13 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   up to 5,000,000 bytes, with lazy pinned-host downloads and Graph media upload/image-ID replies.
   Editing uses the existing `gpt-image.edit` route opt-in and an image-capable model; the provider
   and its credential remain broker-owned.
-- **Liveness** — after fresh authorization, one policy task per session shows what the transport
-  can: a reaction and a typing lease at once, the service's own working status, then one editable
-  progress message posted on the first capability call, text delta, or 15-second keep-alive tick,
-  edited in place and finalized as the answer. `progressDetail` picks how much it says per route,
-  `stream` grows the answer in place as the model writes it, and a stop word, a cancel button, or
+- **Liveness** — disabled unless opted in, and only after fresh authorization. Default `progress: auto`
+  prefers native status, then typing/reaction, avoiding redundant progress messages; explicit
+  `progress: message` retains one delayed editable surface finalized as the answer. Auto also permits
+  that surface for an explicit Stop button or when no indicator works. `progressDetail` controls
+  prose only: explicitly requested `stream` remains independent of progress/detail Off. WhatsApp
+  stays typing-only. See [presentation limits](../../docs/dekopond.md#liveness-progress-and-stopping-a-run).
+  A stop word, a cancel button, or
   `limits.maxDurationMs` ends a run early. Cosmetic failures never alter the terminal reply.
 - **Sessions** — a process-wide concurrency ceiling plus per-conversation serialization,
   bounded model turns, bounded capability calls, a per-script wall-clock deadline a route sets with

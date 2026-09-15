@@ -45,7 +45,7 @@ transports:
     liveness:                                 # optional; absent means off
       mode: native                            # off | native
       classicFallback: reaction               # none (default) | reaction; slackSocketMode only
-      progress: message                       # off (default) | message
+      progress: auto                          # auto (default) | off | message
       stream: true                            # default false; refused on whatsappCloudApi
       cancelButton: false                     # default false; refused on whatsappCloudApi and experience: agent
       keepAlive: { atSeconds: [15, 45], everySeconds: 60, max: 10 }   # optional; defaults shown
@@ -181,7 +181,7 @@ A gateway that starts and then refuses everything is worse than one that does no
 - an unknown Slack experience, liveness mode/fallback, or field inside those strict blocks; an off
   Slack liveness with a reaction fallback, or a classic app with native liveness and no reaction
   fallback, is also refused because the configured fallback could never take effect;
-- `liveness.progress`, `liveness.stream`, or `liveness.cancelButton` set while `liveness.mode` is
+- `liveness.progress: message`, `liveness.stream: true`, or `liveness.cancelButton: true` while `liveness.mode` is
   `off`, where none of them could ever take effect; each one is named;
 - `liveness.stream` or `liveness.cancelButton` on `whatsappCloudApi`, which can neither edit a
   message nor carry an interactive component, and `liveness.cancelButton` on a Slack transport with
@@ -582,9 +582,22 @@ is an edit, a streamed answer grows in place, and the answer finalizes the same 
 never a second gateway message beside it, which is why `stream: true` means the stream *is* the
 surface and no separate progress line is posted.
 
-**What is shown, in order.** At the moment a session is authorized: the transport's reaction on the
-inbound message, its typing lease, and its native status, whichever of the three the driver
-implements. A progress message is posted on the first of a text delta, a capability call starting, a
+**Native-first by default.** An absent liveness block or `mode: off` still disables all intermediate
+presentation. With `mode: native`, omitted `progress` means `auto`: prefer native status, then typing,
+then the configured/implemented reaction. Healthy Slack Agent status or Telegram/Discord typing
+therefore needs no placeholder message; the complete answer is a fresh reply. WhatsApp remains
+typing-only. Slack's definitive native-status refusal exposes its configured reaction fallback in
+the same session without changing the configured conversation experience. Transient errors do not
+disable native status for future sessions.
+
+Auto permits delayed progress only without a working indicator and where an editable surface exists.
+Explicit `progress: message` keeps message progress alongside the ambient indicators; `progress: off`
+forbids progress prose, not indicators or answer streaming. An explicit `cancelButton: true` with Auto
+also permits a message-backed Stop control alongside the indicator. Startup refuses that control
+with progress Off and no stream, or on a detail-Off route without streaming, including effective
+conversation-kind overrides. Existing transport-specific button/stream refusals remain.
+
+**When prose appears.** An eligible progress message is posted on the first of a text delta, a capability call starting, a
 turn that drove one, or the 15-second keep-alive tick — never on the first model turn alone, so a
 fast one-turn answer never leaves a "Working on it…" message behind the reply that obsoleted it a
 second later. With the stream off the text itself is never shown, so the first delta posts the
@@ -597,12 +610,18 @@ Discord and an operations channel:
 
 | Level | What the message says |
 |---|---|
-| `off` | Nothing is posted or edited. The reaction, typing, and native status still run. |
+| `off` | No progress prose. Native indicators and explicitly requested answer streaming remain enabled. |
 | `plain` | The verbs only — `Working on it…`, `Running gpt-image…` — with elapsed seconds on keep-alive ticks, where the number is fresh by construction rather than frozen since the last event. |
 | `detailed` | The same verbs plus turn, capability-call, and elapsed counters on every edit. |
 
-Every driver renders every level. A level a transport truly cannot show is a no-op there, never an
-error, so a route is not configured per transport.
+Detail controls only eligible progress prose, not the answer stream. A transport without an editable
+surface shows no prose at any level.
+
+**Limits.** Auto avoids submitting placeholder messages, not a guarantee of notification delivery.
+Message progress and streaming may notify on creation and may not notify on final edits. Existing
+Discord typing cooldowns can report success without a wire send, temporarily suppressing Auto's
+message fallback even when no typing is visible. Lease visibility and actual notifications are not
+verified by loopback tests; no cooldown or reaction-ownership redesign is included.
 
 **Keep-alive.** `keepAlive: { atSeconds: [15, 45], everySeconds: 60, max: 10 }` is the default: two
 early ticks that answer "did it hear me", then one a minute, ten times, then silence. Each tick is
@@ -626,7 +645,7 @@ refusal naming it. The rendered command word is a provider manifest's own, bound
 no prompt, capability argument, provider result, or model text can reach a progress line, because
 the type the drivers receive is built only from these templates and the session's numbers.
 
-**Streaming.** With `stream: true` and a driver that implements it, the model's answer appears as it
+**Streaming.** With enabled liveness, `stream: true` and a driver that implements it, the model's answer appears as it
 is written, cut to the transport's own character ceiling with a trailing `…` where it was cut, and
 finalized in place when the turn ends. That is the transport half; the model half is `stream:` on
 an `openaiCompatible` model, which is on by default and is also what lets a stop interrupt a turn

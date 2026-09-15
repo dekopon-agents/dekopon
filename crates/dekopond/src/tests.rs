@@ -7845,6 +7845,146 @@ async fn slack_agent_status_uses_thread_sessions_and_explicit_lifecycle_states()
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn slack_auto_posts_only_the_answer_and_uses_same_session_native_refusal_fallback() {
+    use crate::progress::{ProgressInputs, ProgressPolicy, Terminal};
+    use dekopon_agent::{ProgressEvent, ProgressSink};
+
+    for refused in [false, true] {
+        let socket = spawn_socket_mock(vec![events_envelope(
+            "envelope-1",
+            direct_message("u9xyz", "1700000000.000001", "handle this"),
+        )]);
+        let socket_url = socket.url.clone();
+        let http = spawn_http_mock(move |path, _body| match path {
+            "/api/auth.test" => json!({"ok": true, "user_id": BOT_USER, "team_id": TEAM}),
+            "/api/apps.connections.open" => json!({"ok": true, "url": socket_url.clone()}),
+            "/api/agents.sessions.setStatus" if refused => {
+                json!({"ok": false, "error": "feature_disabled"})
+            }
+            "/api/agents.sessions.setStatus" | "/api/reactions.add" | "/api/reactions.remove" => {
+                json!({"ok": true})
+            }
+            "/api/chat.postMessage" => {
+                json!({"ok": true, "channel": "d0123abc", "ts": "1700000000.000002"})
+            }
+            _ => json!({"ok": false, "error": "unknown_method"}),
+        });
+        let settings = LivenessConfig {
+            mode: LivenessMode::Native,
+            classic_fallback: SlackLivenessFallback::Reaction,
+            ..LivenessConfig::default()
+        };
+        let mut transport = slack_with(&http.base, SlackExperience::Agent, settings.clone());
+        transport.connect().await.expect("Slack connects");
+        let message = next_message(&mut transport).await;
+        let keep_alive = KeepAlive {
+            at: vec![Duration::from_millis(20)],
+            every: Duration::from_millis(20),
+            max: 2,
+        };
+        let liveness = Arc::new(ResolvedLiveness {
+            settings: settings.settings(),
+            keep_alive: keep_alive.clone(),
+            ..ResolvedLiveness::default()
+        });
+        let (mut policy, sink) = ProgressPolicy::start(ProgressInputs {
+            driver: transport.driver(),
+            target: message.liveness,
+            reply: message.reply,
+            transport: "slack".to_owned(),
+            detail: ProgressDetail::Plain,
+            settings: settings.settings(),
+            keep_alive,
+            liveness,
+            cancellation: crate::session::SessionCancellation::new(),
+            max_duration: None,
+        });
+        sink.emit(ProgressEvent::Started {
+            agent: "tester".to_owned(),
+            max_steps: 8,
+        });
+        for turn in 1..=4 {
+            sink.emit(ProgressEvent::Answered {
+                turn,
+                tool_calls: 1,
+                duration: Duration::from_millis(1),
+                first_delta: None,
+            });
+        }
+        let established = if refused {
+            "/api/reactions.add"
+        } else {
+            "/api/agents.sessions.setStatus"
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !http.calls().iter().any(|(path, _)| path == established) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("native indicator or configured fallback starts in this session");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !http
+                .calls()
+                .iter()
+                .any(|(path, _)| path == "/api/chat.postMessage")
+        );
+        assert!(
+            policy
+                .terminal(Terminal::Answered(OutboundReply::text("complete answer")))
+                .await
+        );
+        let cleaned = if refused {
+            "/api/reactions.remove"
+        } else {
+            "/api/agents.sessions.setStatus"
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let count = http
+                    .calls()
+                    .iter()
+                    .filter(|(path, _)| path == cleaned)
+                    .count();
+                if count == if refused { 1 } else { 2 } {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("indicator cleanup completes");
+        let calls = http.calls();
+        let posts = calls
+            .iter()
+            .filter(|(path, _)| path == "/api/chat.postMessage")
+            .collect::<Vec<_>>();
+        assert_eq!(posts.len(), 1, "{calls:?}");
+        let answer: Value = serde_json::from_str(&posts[0].1).expect("JSON answer");
+        assert_eq!(answer["text"], "complete answer");
+        assert_eq!(answer["thread_ts"], "1700000000.000001");
+        assert!(!calls.iter().any(|(path, _)| path == "/api/chat.update"));
+        if refused {
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|(path, _)| path == "/api/agents.sessions.setStatus")
+                    .count(),
+                1
+            );
+            assert!(transport.driver().status().is_none());
+        } else {
+            assert!(
+                !calls
+                    .iter()
+                    .any(|(path, _)| path.starts_with("/api/reactions."))
+            );
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn slack_permanently_degrades_agent_status_to_owned_tangerine_reactions() {
     let socket = spawn_socket_mock(vec![
         events_envelope(
