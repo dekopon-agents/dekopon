@@ -5,7 +5,7 @@ wakeup, routes each authenticated message to a named agent from the catalog, run
 session with the sandboxed shell plus safe on-demand meta tools, and replies with the answer.
 
 - **Transports** — Slack Socket Mode and Discord Gateway over outbound WebSockets, Telegram long
-  polling, a raw-body-HMAC-authenticated text-only WhatsApp Cloud API webhook with pinned Graph
+  polling, a raw-body-HMAC-authenticated text/image WhatsApp Cloud API webhook with pinned Graph
   replies, and an owner-only Unix development socket. WhatsApp is the only public wakeup surface;
   it expects operator-owned TLS termination and exact-path routing.
 - **Routing** — first match wins on (transport, direct message or channel), and a channel
@@ -14,15 +14,18 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   its own traffic. Unmatched traffic is ignored, and a channel initially requires the bot to be
   @-mentioned. In Slack Agent mode, fresh authorization claims that exact sender/thread so later
   unmentioned follow-ups can continue; every other ambient channel message remains ignored.
-- **Chat assets** — Slack, Discord, and Telegram photos/files become numbered, bounded references
+- **Chat assets** — Slack, Discord, and Telegram photos/files plus WhatsApp PNG/JPEG photos become bounded references
   that a model opens on demand. Discord signed CDN URLs are host-checked, streamed under the same
   8 MiB ceiling, and refreshed from the exact source message after expiry.
 - **Provider attachments** — a route with `providerAttachments` delivers the PNGs an authorized
   capability returned: the reserved `attachments` result key is stripped before the shell sees it,
-  each entry validated at up to 8 MiB, and the bytes uploaded natively on Slack/Discord/Telegram or
+  each entry validated at up to 8 MiB, and the bytes uploaded natively on Slack/Discord/Telegram/WhatsApp or
   written to the local protocol without entering prompts or memory. A route listing
   `chatAssetInputs` does the reverse for those capabilities, expanding a `chat-asset:<N>` input
-  marker into a data URL before proposing.
+  marker into a data URL before proposing. WhatsApp accepts inbound PNG/JPEG and outgoing PNG
+  up to 5,000,000 bytes, with lazy pinned-host downloads and Graph media upload/image-ID replies.
+  Editing uses the existing `gpt-image.edit` route opt-in and an image-capable model; the provider
+  and its credential remain broker-owned.
 - **Liveness** — disabled unless opted in, and only after fresh authorization. Default `progress: auto`
   prefers native status, then typing/reaction, avoiding redundant progress messages; explicit
   `progress: message` retains one delayed editable surface finalized as the answer. Auto also permits

@@ -1125,9 +1125,6 @@ pub(crate) fn resolve(
     // The family each configured transport belongs to, which is what a route's selector and a
     // liveness override are validated against.
     let mut transport_kinds: BTreeMap<String, ChatTransportKind> = BTreeMap::new();
-    // Transports that cannot carry an attachment at all, recorded before validation so the route
-    // pairing check below does not pass merely because this transport had a problem of its own.
-    let mut text_only_transports = BTreeSet::new();
     let mut transports = Vec::with_capacity(config.transports.len());
     let mut liveness_settings = BTreeMap::new();
     for transport in config.transports {
@@ -1142,9 +1139,6 @@ pub(crate) fn resolve(
             continue;
         }
         transport_kinds.insert(name.clone(), transport.chat_kind());
-        if matches!(transport, TransportConfig::WhatsappCloudApi { .. }) {
-            text_only_transports.insert(name.clone());
-        }
         liveness_settings.insert(
             name.clone(),
             Arc::new(resolve_liveness(&transport, &mut problems)),
@@ -1375,13 +1369,6 @@ pub(crate) fn resolve(
         {
             problems.push(ConfigProblem::InvalidProviderAttachments {
                 agent: route.agent.to_string(),
-            });
-        }
-        // A provider attachment on a text-only transport would be authorized, paid for, and then
-        // dropped on the way out. Refusing the pair at startup is the only place that is legible.
-        if route.provider_attachments.is_some() && text_only_transports.contains(&route.transport) {
-            problems.push(ConfigProblem::UnsupportedRouteProviderAttachments {
-                transport: route.transport.clone(),
             });
         }
         if route.limits.max_steps == 0 || route.limits.max_capability_calls == 0 {
@@ -2023,8 +2010,6 @@ pub enum ConfigProblem {
         "route for agent {agent:?} declares providerAttachments with maxPerReply 0; omit the block to deliver none"
     )]
     InvalidProviderAttachments { agent: String },
-    #[error("transport {transport:?} is text-only and cannot deliver a provider attachment")]
-    UnsupportedRouteProviderAttachments { transport: String },
     #[error("route for agent {agent:?} must allow at least one step and one capability call")]
     InvalidRouteLimits { agent: String },
     #[error("session bounds must be greater than zero")]

@@ -7,6 +7,14 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- WhatsApp PNG/JPEG photo/caption inputs now use the scoped lazy chat-asset flow for broker-authorized
+  image editing, and provider PNG output uses bounded Graph media upload and image-ID replies.
+  Existing `chatAssetInputs` and `providerAttachments` opt-ins apply; the gateway never holds an
+  image-provider credential. WhatsApp enforces a 5,000,000-byte image ceiling, pinned media hosts,
+  caption bounds, and partial-message acceptance without automatic retries.
+
 ### Changed
 
 - Enabled gateway liveness now defaults to `progress: auto`, preferring native status or
