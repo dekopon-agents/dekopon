@@ -125,8 +125,10 @@ pub enum SlackLivenessFallback {
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum ProgressSurface {
-    /// Typing, status, and the reaction only; nothing is posted.
+    /// Prefer native status or typing/reaction; post progress only without a working indicator.
     #[default]
+    Auto,
+    /// No progress prose; native indicators and explicitly requested answer streaming remain.
     Off,
     /// One message, posted late and edited in place, that becomes the answer at the end.
     Message,
@@ -1308,6 +1310,31 @@ pub(crate) fn resolve(
                 });
             }
         }
+        // Detail Off cannot silently hide an explicitly requested message-backed Stop control.
+        if route.progress_detail == ProgressDetail::Off
+            && let (Some(liveness), Some(chat_kind)) = (
+                liveness_settings.get(&route.transport),
+                transport_kinds.get(&route.transport),
+            )
+            && [
+                ConversationKind::DirectMessage,
+                ConversationKind::GroupDirectMessage,
+                ConversationKind::Channel,
+                ConversationKind::Thread,
+            ]
+            .into_iter()
+            .filter(|kind| chat_kind.produces(*kind) && conversation.kind.contains(*kind))
+            .any(|kind| {
+                let (settings, _) = liveness.for_kind(kind);
+                settings.cancel_button && !settings.stream
+            })
+        {
+            problems.push(ConfigProblem::UnsupportedLivenessSurface {
+                transport: route.transport.clone(),
+                surface: "cancelButton",
+                reason: "progressDetail: off requires streaming for a message-backed Stop control",
+            });
+        }
         let direct_message_only = conversation.kind
             == ConversationKindMatch::Kinds(vec![ConversationKind::DirectMessage]);
         if route.subjects.is_some() && !direct_message_only {
@@ -1567,7 +1594,7 @@ fn resolve_liveness(
     // more likely a forgotten `mode:` than an intention.
     if liveness.mode == LivenessMode::Off {
         for surface in [
-            (liveness.progress != ProgressSurface::Off).then_some("progress"),
+            (liveness.progress == ProgressSurface::Message).then_some("progress"),
             liveness.stream.then_some("stream"),
             liveness.cancel_button.then_some("cancelButton"),
         ]
@@ -1694,12 +1721,31 @@ fn resolve_liveness(
         });
     }
 
-    ResolvedLiveness {
+    let resolved = ResolvedLiveness {
         settings: liveness.settings(),
         keep_alive: keep_alive_from(&liveness.keep_alive),
         templates,
         conversations: liveness.conversations.clone(),
+    };
+    if [
+        ConversationKind::DirectMessage,
+        ConversationKind::GroupDirectMessage,
+        ConversationKind::Channel,
+        ConversationKind::Thread,
+    ]
+    .into_iter()
+    .filter(|kind| chat_kind.produces(*kind))
+    .any(|kind| {
+        let (settings, _) = resolved.for_kind(kind);
+        settings.cancel_button && !settings.stream && settings.progress == ProgressSurface::Off
+    }) {
+        problems.push(ConfigProblem::UnsupportedLivenessSurface {
+            transport: name,
+            surface: "cancelButton",
+            reason: "a message-backed Stop control requires progress or streaming",
+        });
     }
+    resolved
 }
 
 /// Records an invalid environment variable name rather than abandoning the rest of the scan.
@@ -2186,6 +2232,105 @@ mod tests {
                 "every conflict is reported together; {expected:?} is missing from:\n{rendered}"
             );
         }
+    }
+
+    #[test]
+    fn auto_defaults_preserve_disabled_liveness_and_explicit_overrides() {
+        use dekopon_broker_protocol::ConversationKind;
+        for (block, mode, progress) in [
+            ("", LivenessMode::Off, ProgressSurface::Auto),
+            (
+                "liveness: { mode: native }",
+                LivenessMode::Native,
+                ProgressSurface::Auto,
+            ),
+            (
+                "liveness: { mode: native, progress: message }",
+                LivenessMode::Native,
+                ProgressSurface::Message,
+            ),
+            (
+                "liveness: { mode: native, progress: off }",
+                LivenessMode::Native,
+                ProgressSurface::Off,
+            ),
+            (
+                "liveness: { mode: native, progress: auto, conversations: { directMessage: { progress: message } } }",
+                LivenessMode::Native,
+                ProgressSurface::Message,
+            ),
+            (
+                "liveness: { mode: native, progress: message, conversations: { directMessage: { progress: auto } } }",
+                LivenessMode::Native,
+                ProgressSurface::Auto,
+            ),
+        ] {
+            let config = resolved(&format!(
+                "transports:\n  - name: dev\n    kind: local\n    socketPath: dev.sock\n    {block}\nroutes:\n  - transport: dev\n    conversation: {{ kind: [directMessage] }}\n    agent: reviewer\n"
+            )).expect("defaults and explicit settings resolve");
+            let (settings, _) = config.liveness["dev"].for_kind(ConversationKind::DirectMessage);
+            assert_eq!(settings.mode, mode, "{block}");
+            assert_eq!(settings.progress, progress, "{block}");
+            assert!(!settings.stream);
+        }
+    }
+
+    #[test]
+    fn stop_controls_require_an_effective_message_surface() {
+        for (block, detail, valid) in [
+            ("progress: auto, cancelButton: true", "plain", true),
+            (
+                "progress: off, cancelButton: true, conversations: { directMessage: { progress: message }, groupDirectMessage: { progress: message }, channel: { progress: message }, thread: { progress: message } }",
+                "plain",
+                true,
+            ),
+            ("progress: off, cancelButton: true", "plain", false),
+            ("progress: auto, cancelButton: true", "off", false),
+            ("progress: message, cancelButton: true", "off", false),
+            (
+                "progress: off, cancelButton: true, stream: true",
+                "off",
+                true,
+            ),
+            (
+                "progress: auto, conversations: { directMessage: { cancelButton: true } }",
+                "off",
+                false,
+            ),
+            (
+                "progress: auto, cancelButton: true, conversations: { directMessage: { progress: off } }",
+                "plain",
+                false,
+            ),
+            (
+                "progress: auto, cancelButton: true, conversations: { directMessage: { stream: true } }",
+                "off",
+                true,
+            ),
+        ] {
+            let result = resolved(&format!(
+                "transports:\n  - name: dev\n    kind: local\n    socketPath: dev.sock\n    liveness: {{ mode: native, {block} }}\nroutes:\n  - transport: dev\n    conversation: {{ kind: [directMessage] }}\n    agent: reviewer\n    progressDetail: {detail}\n"
+            ));
+            assert_eq!(result.is_ok(), valid, "{block} / {detail}: {result:?}");
+            if let Err(error) = result {
+                assert!(
+                    error.to_string().contains("message-backed Stop control"),
+                    "{error}"
+                );
+            }
+        }
+        let error = resolved(
+            "transports:\n  - name: dev\n    kind: local\n    socketPath: dev.sock\n    liveness: { mode: native, progress: off, cancelButton: true }\nroutes:\n  - transport: dev\n    conversation: { kind: [directMessage] }\n    agent: reviewer\n    progressDetail: off\n"
+        ).expect_err("both incompatible settings must be reported");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("requires progress or streaming"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("progressDetail: off requires streaming"),
+            "{rendered}"
+        );
     }
 
     /// A file written for the previous release is told what replaced its block, not which keys a

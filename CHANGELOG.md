@@ -7,6 +7,16 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- Enabled gateway liveness now defaults to `progress: auto`, preferring native status or
+  typing/reaction over redundant progress messages. Explicit `message` remains supported;
+  progress/detail Off no longer suppresses requested answer streaming. Auto preserves explicit
+  message-backed Stop controls, and configurations that would hide them are refused. Slack's
+  definitive native-status refusal tries its configured fallback in the same session; WhatsApp
+  remains typing-only. Absent/master-Off liveness stays disabled
+  ([migration](docs/upgrading.md#native-first-progress-unreleased)).
+
 ## [0.15.2] - 2026-09-14
 
 ### Added

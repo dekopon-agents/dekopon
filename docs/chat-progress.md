@@ -159,8 +159,14 @@ value once per minimum interval, which is what it would do anyway, and no coales
 
 Rendering, for whichever capability objects the driver returns, at the route's detail level:
 
-1. Reaction and typing at `Started`; native status `Working` at `Started` and `Idle` at terminal.
-2. A progress message posted on the first of `TextDelta`, `ToolStarted`, `Answered` with tool
+1. With enabled liveness, default `progress: auto` prefers native status, then typing, then the
+   existing reaction fallback at `Started`. A successful indicator suppresses Auto progress prose;
+   Slack's definitive status refusal allows its configured reaction in that same session.
+   Explicit `message`/`off` retain additive ambient indicators. Terminal cleanup returns attempted
+   durable indicators to rest; typing renewals stop.
+2. Where Auto has no working indicator (or an explicit message-backed Stop button is requested),
+   or with explicit `progress: message`, an editable progress message is posted on the first of
+   `TextDelta`, `ToolStarted`, `Answered` with tool
    calls, or the 15 s keep-alive tick — never on `ModelTurn { turn: 1 }` alone, so a fast one-turn
    answer never gets one.
 3. Every later event edits that message, coalesced to the latest state under the driver's minimum
@@ -168,7 +174,8 @@ Rendering, for whichever capability objects the driver returns, at the route's d
 4. Keep-alive at 15 s, 45 s, then every 60 s, always an edit and never a new post.
 5. With streaming on and a `TextStream` present, the stream is the surface.
 
-Detail levels are per route: `off` renders nothing but typing, status, and reaction; `plain` shows
+Detail levels are per route: `off` suppresses progress prose but not explicitly requested answer
+streaming or ambient indicators; `plain` shows
 verbs only, with elapsed reaching it on keep-alive ticks and nowhere else; `detailed` adds turn and
 call counts, and elapsed on every edit. The defaults are what `plain` is shaped around: a counter
 frozen between edits reads as a hang, which is the opposite of what the surface is for, and turn and
@@ -291,7 +298,7 @@ transports:
     liveness:
       mode: native                 # off | native   (typing, status, reaction)
       classicFallback: reaction    # Slack classic only
-      progress: message            # off | message
+      progress: auto               # auto (default) | off | message
       stream: true                 # default false
       cancelButton: true           # default false
       keepAlive: { atSeconds: [15, 45], everySeconds: 60, max: 10 }
@@ -302,10 +309,19 @@ routes:
     limits: { maxSteps: 12, maxCapabilityCalls: 16, maxDurationMs: 300000 }
 ```
 
-Validation refuses `progress`, `stream`, or `cancelButton` with `mode: off`; `stream` or
+Absent/master-Off liveness stays disabled even though progress defaults to Auto.
+Validation refuses `progress: message`, `stream: true`, or `cancelButton: true` with `mode: off`; `stream` or
 `cancelButton` on a transport with no edit surface; a cancel button on a transport whose service
 already owns a stop control; an unknown template placeholder; and a zero `maxDurationMs`, like every
-other zero bound.
+other zero bound. A message-backed Stop control requires progress or streaming; effective
+`progressDetail: off` routes require streaming to carry that control. Streaming takes precedence
+over every prose choice and does not start a synthetic working message.
+
+Auto without a message delivers a fresh complete reply. Explicit Message retains in-place
+finalization. Neither implies exactly one notification: a message's creation may notify when its
+final edit does not. Discord's existing typing cooldown may return success without sending, so
+Auto can temporarily suppress fallback prose without visible typing. WhatsApp still offers only
+typing/read receipt; no editable progress, stream, reaction, or button is added here.
 
 The block this replaces was renamed rather than extended, and nothing reads the old spelling:
 writing it is a startup refusal naming `liveness:` — no alias, no migration read, no
