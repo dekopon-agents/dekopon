@@ -30,8 +30,8 @@ transports:
     liveness:
       mode: native
       classicFallback: reaction
-      # One editable message says what the session is doing and becomes the answer at the end.
-      progress: message
+      # Prefer native status/reaction, then a fresh answer. Use message for editable progress.
+      progress: auto
 
 models:
   - name: local-reasoning

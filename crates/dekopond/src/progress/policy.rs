@@ -367,6 +367,9 @@ struct Surface {
     next_stream: Option<Instant>,
     stream_pending: bool,
     breakers: Breakers,
+    indicator_active: bool,
+    status_attempted: bool,
+    reaction_attempted: bool,
 }
 
 impl Surface {
@@ -405,6 +408,9 @@ impl Surface {
             next_stream: None,
             stream_pending: false,
             breakers: Breakers::default(),
+            indicator_active: false,
+            status_attempted: false,
+            reaction_attempted: false,
         }
     }
 
@@ -419,17 +425,20 @@ impl Surface {
     /// what keeps "which message does the answer land in" a question with one answer, and Slack's
     /// append-only stream cannot be the second message beside a status line.
     fn streams(&self) -> bool {
-        self.native()
-            && self.detail != ProgressDetail::Off
-            && self.settings.stream
-            && self.driver.stream().is_some()
+        self.native() && self.settings.stream && self.driver.stream().is_some()
     }
 
     /// Whether a progress message may be posted or edited.
     fn writes_progress(&self) -> bool {
         self.native()
             && self.detail != ProgressDetail::Off
-            && self.settings.progress == ProgressSurface::Message
+            && match self.settings.progress {
+                ProgressSurface::Off => false,
+                ProgressSurface::Message => true,
+                ProgressSurface::Auto => {
+                    !self.indicator_active || self.message.is_some() || self.cancel_control()
+                }
+            }
             && !self.streams()
     }
 
@@ -499,7 +508,8 @@ impl Surface {
         }
     }
 
-    /// The t=0 ladder: the cheapest signal first, so something changes before the model answers.
+    /// Prefer native status, then typing, then the existing reaction fallback in Auto.
+    /// Explicit Message/Off retain their additive ambient indicators.
     async fn open(&mut self) {
         if !self.native() {
             return;
@@ -508,18 +518,42 @@ impl Surface {
             return;
         };
         let driver = Arc::clone(&self.driver);
-        if let Some(reaction) = driver.reaction() {
-            let outcome = bounded(reaction.set(&target, true)).await;
-            self.observe(outcome, "reaction");
-        }
-        if let Some(typing) = driver.typing() {
-            let outcome = bounded(typing.renew(&target)).await;
-            self.observe(outcome, "typing");
-            self.next_typing = Some(Instant::now() + typing.renew_every());
+        let auto = self.settings.progress == ProgressSurface::Auto;
+        if !auto {
+            self.open_reaction().await;
+            self.renew_typing().await;
         }
         if let Some(status) = driver.status() {
+            self.status_attempted = true;
             let outcome = bounded(status.set(&target, Status::Working)).await;
+            self.indicator_active = outcome.is_ok();
             self.observe(outcome, "status");
+            if auto && self.indicator_active {
+                return;
+            }
+        }
+        if auto && driver.typing().is_some() {
+            self.renew_typing().await;
+            // Give the existing typing breaker its bounded renewal attempt before falling
+            // back. Failed establishment does not suppress Auto's delayed message surface.
+            return;
+        }
+        // Slack may expose this only after the status call permanently refused the installation.
+        if !self.reaction_attempted {
+            self.open_reaction().await;
+        }
+    }
+
+    async fn open_reaction(&mut self) {
+        let Some(target) = self.target.clone() else {
+            return;
+        };
+        let driver = Arc::clone(&self.driver);
+        if let Some(reaction) = driver.reaction() {
+            self.reaction_attempted = true;
+            let outcome = bounded(reaction.set(&target, true)).await;
+            self.indicator_active |= outcome.is_ok();
+            self.observe(outcome, "reaction");
         }
     }
 
@@ -615,7 +649,14 @@ impl Surface {
             return;
         };
         let outcome = bounded(typing.renew(&target)).await;
+        if self.settings.progress == ProgressSurface::Auto && outcome.is_ok() {
+            self.indicator_active = true;
+        }
         self.observe(outcome, "typing");
+        if self.settings.progress == ProgressSurface::Auto && !self.breakers.typing.allows() {
+            self.indicator_active = false;
+            self.open_reaction().await;
+        }
         self.next_typing = self
             .breakers
             .typing
@@ -987,11 +1028,15 @@ impl Surface {
             return;
         };
         let driver = Arc::clone(&self.driver);
-        if let Some(status) = driver.status() {
+        if self.status_attempted
+            && let Some(status) = driver.status()
+        {
             let outcome = bounded(status.set(&target, Status::Idle)).await;
             self.observe(outcome, "status");
         }
-        if let Some(reaction) = driver.reaction() {
+        if self.reaction_attempted
+            && let Some(reaction) = driver.reaction()
+        {
             let outcome = bounded(reaction.set(&target, false)).await;
             self.observe(outcome, "reaction");
         }
