@@ -177,7 +177,7 @@ A gateway that starts and then refuses everything is worse than one that does no
 - `subjects:` beside anything but `kind: [directMessage]`, an empty `subjects:` list, or `memory.scope: sharedConversation` on a `[directMessage]`-only route, where the direct message already is the subject;
 - a `liveness.conversations.<kind>` key for a kind the transport never produces;
 - a missing or blank chat or bound-route model credential environment variable. A model's `apiKeyEnv` is optional and absent means "this endpoint needs no key", which a loopback llama.cpp genuinely does not; naming a variable that is unset or exported blank is the opposite claim, and this process cannot see one exported after it started;
-- a route naming `providerAttachments` on a text-only transport, which today means `whatsappCloudApi`, or one whose `providerAttachments.maxPerReply` is `0` (omit the block instead);
+- a route whose `providerAttachments.maxPerReply` is `0` (omit the block instead);
 - an unknown Slack experience, liveness mode/fallback, or field inside those strict blocks; an off
   Slack liveness with a reaction fallback, or a classic app with native liveness and no reaction
   fallback, is also refused because the configured fallback could never take effect;
@@ -296,11 +296,9 @@ attachment with the answer text as the first upload's `initial_comment`, every a
 first multipart Create Message, one Telegram multipart `sendPhoto` per attachment with the caption on
 the first, and a base64 `images` array on the local socket that is omitted entirely for a text-only
 reply. Filenames are gateway-owned and carry the attachment's position, so two files in one reply do
-not arrive under one name. WhatsApp has no path here — the Cloud API transport is text-only, and
-sending an image through it would need Meta's separate media upload — so a route that names
-`providerAttachments` on a `whatsappCloudApi` transport is a startup failure. Discovering that at
-reply time would mean authorizing and paying for a PNG and then dropping it. A successful `reply`
-covers the complete text/attachment reply. If Slack, Telegram, or a split Discord reply accepts only part,
+not arrive under one name. WhatsApp uploads each PNG to Graph media and sends the returned image ID;
+its smaller 5,000,000-byte ceiling is checked before any part of the reply is sent. A successful `reply`
+covers the complete text/attachment reply. If Slack, Telegram, WhatsApp, or a split Discord reply accepts only part,
 the session is `reply-failed` and performs no durable record. Persistent history remembers only final
 text; referring to prior pixels requires a fresh invocation.
 
@@ -390,7 +388,7 @@ Discord Gateway v10 is another outbound WebSocket transport. The daemon discover
 
 ## Chat assets
 
-A screenshot is part of the message that carried it. Slack, Discord, and Telegram deliver it by reference rather than by value, so the gateway resolves that reference in order to hear the whole request. Slack and Telegram require the bot token they already terminate here — and on Slack the `files:read` scope, without which Slack withholds the file's id and URL and the upload is reported as one the gateway cannot open; Discord CDN downloads do not receive it. This grants no policy, no provider credential, and no way to write anything.
+A screenshot is part of the message that carried it. Slack, Discord, Telegram, and WhatsApp deliver it by reference rather than by value, so the gateway resolves that reference in order to hear the whole request. Slack, Telegram, and WhatsApp require the bot token they already terminate here — and on Slack the `files:read` scope, without which Slack withholds the file's id and URL and the upload is reported as one the gateway cannot open; Discord CDN downloads do not receive it. This grants no policy, no provider credential, and no way to write anything.
 
 What it does not do is read every file that arrives. Bytes cost tokens on every turn they appear in, and most turns do not need them. So each attachment is *named* in the prompt and fetched only if the model decides the answer depends on it:
 
@@ -452,8 +450,8 @@ logs are content-free.
 Only `object=whatsapp_business_account`, `field=messages`, `messaging_product=whatsapp` events for
 the configured exact WABA/receiving-phone tuple may produce sessions. Every entry, change, and
 message in a signed batch is inspected. Status-only, unknown, malformed non-message, unsupported
-message type, wrong-destination, and self/echo messages are acknowledged and ignored. Ordinary text
-uses signed `messages[].from` both as reply target and as the sole identity source; profile names,
+message type, wrong-destination, and self/echo messages are acknowledged and ignored. Text and image messages
+use signed `messages[].from` both as reply target and as the sole identity source; profile names,
 display phone numbers, message text, WABA IDs, and phone-number IDs cannot assert the sender. A
 message is answered only when one of the delivery's own `contacts[]` names that sender in `wa_id` —
 an individual message is the shape where exactly one does, while a group payload names the group in
@@ -465,11 +463,42 @@ Canonical subject is `whatsapp.<wa_id>`. The WABA, receiving phone number, and s
 transport-derived chat scope as `<waba>:<phone-number-id>:<wa_id>`.
 
 The handler claims signed `messages[].id` values in a 4,096-entry process-local set and atomically
-enqueues one bounded delivery before returning HTTP 200. One delivery carries at most 128 text
+enqueues one bounded delivery before returning HTTP 200. One delivery carries at most 128 text/image
 messages, and the queue admits at most 512 messages across 64 delivery slots. Duplicates seen by
 that running process are acknowledged without another session. Restart forgets the claims, and a
 crash after the 200 but before queue drain loses the accepted work. Queue saturation returns 503 and
 rolls back new claims so Meta can redeliver.
+
+PNG/JPEG photos carry one lazy media-ID reference; webhook URLs are ignored. Captions become the
+bounded user text, including an absent/empty caption (the session then receives the reference note).
+No download occurs before routing and fresh session authorization. An image-capable route model
+(`modalities: [image]`) is required to expose numbered references. To edit, also enable
+`chatAssetInputs: [gpt-image.edit]` and `providerAttachments: { maxPerReply: 1 }`, install the external
+GPT-image provider in the broker, and grant its narrow capability there. The model proposes an input
+such as `{"prompt":"Make the sky purple","images":["chat-asset:1"]}`; the existing courier expands it
+before broker authorization. The gateway never receives the GPT-image credential.
+
+At fetch time, Graph `GET /{version}/{media-id}?phone_number_id={phone-number-id}` resolves the
+opaque ID. Metadata JSON is capped at 16 KiB; media ID, MIME, and numeric/string `file_size` must
+match the source and download. Only exact HTTPS `lookaside.fbsbx.com:443` with path
+`/whatsapp_business/attachments/` may receive the bearer token for download. Userinfo, fragments,
+other hosts/ports/paths, redirects, and ambient proxies are refused. This is a conservative support
+policy, not a claim that Meta guarantees an exhaustive CDN list; unknown CDN URLs fail closed.
+The process-owned client resolves only Graph and that host, with a 5-second DNS deadline and at
+most 32 public addresses bound to the actual connection (no second unchecked lookup). Each Graph
+or download request has a 15-second deadline; session admission and existing fetch/expansion budgets
+bound concurrency and total work. Downloads enforce the smaller of the caller's bound and
+5,000,000 bytes while streaming, then verify the declared length and PNG/JPEG signature. There is
+no image decoding, dimension/color-space guarantee, transcoding, URL caching, or automatic retry.
+
+Provider PNG replies use multipart `POST /{version}/{phone-number-id}/media` with
+`messaging_product=whatsapp` and a gateway-named `file` part of type `image/png`, then an ordinary
+image message with `image.id` (never a model-selected URL). The same 5,000,000-byte ceiling applies;
+a larger PNG accepted by the generic 8 MiB slot is refused before uploading or sending any reply
+part. Text of at most 1,024 Unicode scalars captions the first image; longer text is sent in full as
+split text after all images, and empty captions are omitted. Upload acceptance alone is not message
+acceptance, and a message ID is not proof of human delivery. There is no media deletion subsystem;
+Meta's uploaded-media retention applies.
 
 Replies are bounded JSON POSTs to the pinned
 `https://graph.facebook.com/{version}/{phone-number-id}/messages` endpoint with the gateway-held
@@ -480,10 +509,10 @@ as consecutive messages rather than truncated — the same rule the Discord tran
 failure after the first chunk is `partial-delivery`: the answer arrived in part, the underlying
 service category is logged once as `gateway_whatsapp_reply_partial`, and no delivered turn is
 recorded. No send is retried: a timeout after request transmission is outcome-unknown and blindly
-resending could duplicate a visible answer. After Graph accepts every chunk, the signed inbound
+resending could duplicate a visible answer. After Graph accepts every image and text chunk, the signed inbound
 message ID becomes the service-typed delivery identity for optional durable chat memory, bound to
 the WABA and receiving phone number in the attested scope. Failed or outcome-unknown replies record
-no delivered turn. Free-form text remains subject to Meta's customer-service window; there is no
+no delivered turn. Free-form replies remain subject to Meta's customer-service window; there is no
 template fallback.
 
 Refusals are visible without being a megaphone. Every refused request emits
@@ -497,7 +526,7 @@ ignored, descriptor or buffer exhaustion is warned and retried after a short pau
 listening socket that can never serve again stops the loop with
 `gateway_whatsapp_listener_stopped`.
 
-Media, templates, interactive messages, reactions, progress messages, status processing, business-management
+Video, documents, stickers, templates, interactive messages, reactions, progress messages, status processing, business-management
 APIs, embedded signup, webhook multiplexing, and daemon TLS termination are outside this transport;
 the project-wide list is [non-goals](design.md#non-goals). See
 [`../examples/whatsapp/`](../examples/whatsapp/README.md) for placeholder-only setup.
@@ -845,7 +874,7 @@ Chat text and canonical subject identifiers reach telemetry as the `gateway.mess
 
 `gateway.session` carries `conversation.turns` and `conversation.bytes` — how much history this message replayed, as a count and a byte total and never as text; both are zero on a `oneShot` route and on the first message of any conversation. `gateway_conversation_evicted` is in the lifecycle events below with a reason of `idle`, `capacity`, or `grant-changed`. On a seeded session `message.count` counts the replayed window plus this exchange rather than this exchange alone. [`observability.md`](observability.md#what-conversation-history-changes) has the dashboard consequences.
 
-Lifecycle events on stdout as structured JSON (this is the lifecycle subset, not every `gateway_*` record the daemon emits): `gateway_broker_ready`, `gateway_transport_connected`, `gateway_started` (transport and route counts), `gateway_session_rejected`, `gateway_session_failed`, `gateway_session_cancelled`, `gateway_session_stop_requested`, `gateway_progress_degraded`, `gateway_conversation_evicted`, `gateway_transport_disconnected`, `gateway_transport_silent` (transport and phase), `gateway_transport_stopped`, `gateway_transport_jitter_unavailable` (an operating system that refused the entropy every reconnect delay is jittered with), `gateway_cache_key_entropy_unavailable`, `gateway_transports_degraded` (dead and configured counts plus the configured names, repeated every 60 seconds for as long as any transport stays dead), `gateway_stopped` (`shutdown` or `transports-lost`). Beyond lifecycle: `gateway_message_ignored` (debug for an unrouted or unaddressed message, and for a WhatsApp group payload, which carries `reason` and its `message.index` inside the delivery) and `gateway_local_request_rejected` (debug); `gateway_reply_failed`, `gateway_memory_record_failed`, `gateway_session_stop_ignored` (debug), `gateway_session_registry_conflict`; `gateway_transport_poll_failed` and `gateway_transport_reconnect_failed`; `gateway_sessions_abandoned` and `gateway_session_task_failed` (shutdown grace expired, or a session task panicked); `gateway_whatsapp_accept_failed` and `gateway_whatsapp_image_unsupported`, plus the `gateway_whatsapp_webhook_refused`, `gateway_whatsapp_reply_partial`, and `gateway_whatsapp_listener_stopped` records named in that transport's section; `gateway_signal_failed`; and at exit `gateway_exit` and `gateway_telemetry_shutdown_failed` — see [`observability.md`](observability.md#daemon-exit-and-shutdown-records). Progress-call outcomes are debug-level `gateway_progress_rendered` records carrying the transport, the primitive, the outcome, and — for a stream render — how many characters were on screen; `gateway_progress_degraded` says which primitive stopped, `gateway_progress_budget_exhausted` that a session spent its edits, and `gateway_progress_dropped` that the policy's queue overflowed. Neither includes a subject, target identifier, status text, raw service response, or credential. Other failure events likewise carry stable categories, and an eviction carries a reason and nothing about the conversation it forgot. An optional no-reply decision closes `gateway.message` with `outcome=declined`; its `agent.reply.declined` record carries only the model-turn number and no text or thread coordinate.
+Lifecycle events on stdout as structured JSON (this is the lifecycle subset, not every `gateway_*` record the daemon emits): `gateway_broker_ready`, `gateway_transport_connected`, `gateway_started` (transport and route counts), `gateway_session_rejected`, `gateway_session_failed`, `gateway_session_cancelled`, `gateway_session_stop_requested`, `gateway_progress_degraded`, `gateway_conversation_evicted`, `gateway_transport_disconnected`, `gateway_transport_silent` (transport and phase), `gateway_transport_stopped`, `gateway_transport_jitter_unavailable` (an operating system that refused the entropy every reconnect delay is jittered with), `gateway_cache_key_entropy_unavailable`, `gateway_transports_degraded` (dead and configured counts plus the configured names, repeated every 60 seconds for as long as any transport stays dead), `gateway_stopped` (`shutdown` or `transports-lost`). Beyond lifecycle: `gateway_message_ignored` (debug for an unrouted or unaddressed message, and for a WhatsApp group payload, which carries `reason` and its `message.index` inside the delivery) and `gateway_local_request_rejected` (debug); `gateway_reply_failed`, `gateway_memory_record_failed`, `gateway_session_stop_ignored` (debug), `gateway_session_registry_conflict`; `gateway_transport_poll_failed` and `gateway_transport_reconnect_failed`; `gateway_sessions_abandoned` and `gateway_session_task_failed` (shutdown grace expired, or a session task panicked); `gateway_whatsapp_accept_failed` and `gateway_whatsapp_media_refused`, plus the `gateway_whatsapp_webhook_refused`, `gateway_whatsapp_reply_partial`, and `gateway_whatsapp_listener_stopped` records named in that transport's section; `gateway_signal_failed`; and at exit `gateway_exit` and `gateway_telemetry_shutdown_failed` — see [`observability.md`](observability.md#daemon-exit-and-shutdown-records). Progress-call outcomes are debug-level `gateway_progress_rendered` records carrying the transport, the primitive, the outcome, and — for a stream render — how many characters were on screen; `gateway_progress_degraded` says which primitive stopped, `gateway_progress_budget_exhausted` that a session spent its edits, and `gateway_progress_dropped` that the policy's queue overflowed. Neither includes a subject, target identifier, status text, raw service response, or credential. Other failure events likewise carry stable categories, and an eviction carries a reason and nothing about the conversation it forgot. An optional no-reply decision closes `gateway.message` with `outcome=declined`; its `agent.reply.declined` record carries only the model-turn number and no text or thread coordinate.
 
 ## Current process boundary
 

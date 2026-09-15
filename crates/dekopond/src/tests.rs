@@ -474,30 +474,11 @@ async fn whatsapp_configuration_is_explicit_strict_and_pinned() {
         );
     }
 
-    // The transport is text-only. A route that pairs it with provider attachments would authorize
-    // and pay for a PNG this transport has no way to deliver, so the pair is refused at startup
-    // rather than dropped at reply time.
     let mut with_images = document.clone();
     with_images["routes"][0]["providerAttachments"] = json!({"maxPerReply": 1});
-    let error = load(directory.path(), &with_images)
+    load(directory.path(), &with_images)
         .await
-        .expect_err("a text-only transport cannot carry a provider attachment");
-    assert!(
-        reports(&error, |problem| matches!(
-            problem,
-            ConfigProblem::UnsupportedRouteProviderAttachments { .. }
-        )),
-        "the refusal must name the transport pairing: {error:?}"
-    );
-    let rendered = error.to_string();
-    assert!(
-        rendered.contains("text-only"),
-        "the refusal names why: {rendered}"
-    );
-    assert!(
-        rendered.contains("support-whatsapp"),
-        "the refusal names the transport: {rendered}"
-    );
+        .expect("WhatsApp supports PNG replies");
 }
 
 #[tokio::test]
@@ -12242,4 +12223,198 @@ async fn a_route_that_withholds_self_inspection_offers_no_such_tool() {
         "the withheld tool is absent from the model's list: {tools:?}"
     );
     assert_eq!(driver.replies(), vec!["Nothing to show.".to_owned()]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_signed_whatsapp_photo_expands_for_edit_and_returns_png_without_transcript_bytes() {
+    use crate::transport::whatsapp::tests_media::{
+        JPEG, MediaPeer, PNG, accepted, admitted_photo, bytes_reply, json_reply, metadata,
+    };
+    for (mime, bytes, caption) in [
+        ("image/jpeg", JPEG, Some("Make the sky purple")),
+        ("image/png", PNG, None),
+    ] {
+        let peer = MediaPeer::new(move |origin, index| match index {
+            0 => metadata(origin, mime, bytes),
+            1 => bytes_reply(bytes),
+            2 => json_reply(json!({"id":"987"})),
+            3 => accepted(),
+            _ => panic!("no retry or extra media calls"),
+        })
+        .await;
+        let (transport, inbound) = admitted_photo(&peer.origin, mime, caption).await;
+        assert!(
+            peer.requests.lock().expect("requests").is_empty(),
+            "admission must be lazy"
+        );
+        let directory = temporary();
+        let (broker,mut observed)=stub_broker(directory.path(),vec![
+            ResponseEnvelope::capabilities(vec![capability("gpt-image.edit")],vec!["gpt-image".to_owned()]),
+            ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed","capability":"gpt-image.edit","input":{"prompt":"purple sky","images":["chat-asset:1"]}})).expect("edit proposal")),
+            ResponseEnvelope::invocation(record_output(json!({"attachments":[{"mediaType":"image/png","base64":STANDARD.encode(PNG)}]}))),
+        ]).await;
+        let models = ModelScript::new([
+            script_call("gpt-image edit --prompt 'purple sky' --image chat-asset:1"),
+            answer("Edited image."),
+        ]);
+        let mut runner = runner(broker, Arc::clone(&models), 4);
+        Arc::get_mut(&mut runner)
+            .expect("unique runner")
+            .asset_fetchers
+            .insert("wa".to_owned(), transport.asset_fetcher().expect("fetcher"));
+        let mut model = model_config();
+        if let ModelConfig::OpenaiCompatible { modalities, .. } = &mut model {
+            *modalities = vec![crate::config::Modality::Image];
+        }
+        let mut route = route(model);
+        route.transport = "wa".to_owned();
+        route.provider_attachments = 1;
+        route.chat_asset_inputs = Arc::from(vec!["gpt-image.edit".to_owned()]);
+        run_session(runner, route, inbound, transport.driver()).await;
+        assert_eq!(models.requests(), 2);
+        let first = models.prompt(0);
+        assert!(
+            first.iter().any(|(_, text)| text.contains("Chat Asset #1")),
+            "{first:?}"
+        );
+        let tool = tool_message(&models, 1);
+        assert!(tool.contains("attached"), "{tool}");
+        for index in 0..2 {
+            for (_, text) in models.prompt(index) {
+                assert!(
+                    !text.contains(&STANDARD.encode(bytes))
+                        && !text.contains(&STANDARD.encode(PNG)),
+                    "bytes in model transcript"
+                );
+            }
+        }
+        let _listing = observed.recv().await.expect("capabilities");
+        let _command = observed.recv().await.expect("command");
+        let BrokerRequest::Invoke {
+            invocation,
+            attestation: Some(claim),
+        } = observed.recv().await.expect("proposal").request
+        else {
+            panic!("attested proposal")
+        };
+        assert_eq!(invocation.capability.as_str(), "gpt-image.edit");
+        assert_eq!(
+            invocation.input["images"][0],
+            format!("data:{mime};base64,{}", STANDARD.encode(bytes))
+        );
+        assert_eq!(claim.subject.canonical(), "whatsapp.15550000001");
+        assert_eq!(claim.scope.expect("scope").transport.as_str(), "wa");
+        {
+            let requests = peer.requests.lock().expect("requests");
+            assert_eq!(requests.len(), 4);
+            assert!(
+                requests[2]
+                    .body
+                    .windows(PNG.len())
+                    .any(|window| window == PNG)
+            );
+            let sent: Value = serde_json::from_slice(&requests[3].body).expect("image send");
+            assert_eq!(sent["image"], json!({"id":"987","caption":"Edited image."}));
+        }
+        peer.finish().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn unauthorized_and_unrouted_whatsapp_photos_fetch_nothing() {
+    use crate::transport::whatsapp::tests_media::{MediaPeer, admitted_photo};
+    for routed in [true, false] {
+        let peer = MediaPeer::new(|_, _| {
+            panic!("denied or unrouted photo must fetch no metadata or bytes")
+        })
+        .await;
+        let (transport, inbound) = admitted_photo(&peer.origin, "image/png", None).await;
+        let directory = temporary();
+        let (broker, mut observed) = stub_broker(
+            directory.path(),
+            if routed {
+                vec![ResponseEnvelope::capabilities(Vec::new(), Vec::new())]
+            } else {
+                Vec::new()
+            },
+        )
+        .await;
+        let models = ModelScript::forbidden();
+        let mut runner = runner(broker, Arc::clone(&models), 4);
+        Arc::get_mut(&mut runner)
+            .expect("unique")
+            .asset_fetchers
+            .insert("wa".to_owned(), transport.asset_fetcher().expect("fetcher"));
+        if routed {
+            let mut route = route(model_config());
+            route.transport = "wa".to_owned();
+            run_session(runner, route, inbound, Arc::new(RecordingDriver::default())).await;
+            assert!(matches!(
+                observed.recv().await.expect("auth check").request,
+                BrokerRequest::Capabilities { .. }
+            ));
+        } else {
+            let mut sessions = tokio::task::JoinSet::new();
+            crate::dispatch(
+                &runner,
+                &Arc::new(RoutingTable::default()),
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &[],
+                &mut sessions,
+                inbound,
+            );
+            assert!(sessions.is_empty());
+            assert!(observed.try_recv().is_err());
+        }
+        assert_eq!(models.requests(), 0);
+        assert!(peer.requests.lock().expect("requests").is_empty());
+        peer.finish().await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn whatsapp_asset_numbers_cannot_cross_conversations_or_retired_generations() {
+    use crate::transport::whatsapp::tests_media::{MediaPeer, admitted_photo};
+    use dekopon_agent::attachment::ChatAssetSource as _;
+    let peer = MediaPeer::new(|_, _| panic!("invalid scope cannot start media fetch")).await;
+    let (transport, inbound) = admitted_photo(&peer.origin, "image/png", None).await;
+    let store = Arc::new(asset_store());
+    let conversations = ConversationStore::new(8);
+    let key = private_conversation_key("wa", "one", "whatsapp.15550000001");
+    let seed = conversations.begin(
+        &key,
+        &granted(&["gpt-image.edit"]),
+        window(),
+        Instant::now(),
+    );
+    let registered = store.assets_for_access(&seed.assets, inbound.assets, true, Instant::now());
+    assert_eq!(registered.arrived, vec![1]);
+    let accesses = [
+        AssetAccess::one_shot(private_conversation_key(
+            "wa",
+            "other",
+            "whatsapp.15550000001",
+        )),
+        seed.assets.clone(),
+    ];
+    assert!(
+        !conversations.remove(&key, crate::conversation::EvictionReason::GrantChanged),
+        "pending-only state is retired but has no committed history"
+    );
+    for access in accesses {
+        let assets = SessionAssets::new(
+            Arc::clone(&store),
+            access,
+            transport.asset_fetcher(),
+            tokio::runtime::Handle::current(),
+            true,
+            true,
+        );
+        tokio::task::spawn_blocking(move || assert!(assets.fetch_for_capability(1).is_err()))
+            .await
+            .expect("scope check");
+    }
+    assert!(peer.requests.lock().expect("requests").is_empty());
+    peer.finish().await;
 }

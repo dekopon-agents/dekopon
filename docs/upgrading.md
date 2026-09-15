@@ -896,7 +896,8 @@ update looks like a working deployment with no Working UI.
   configuration using `localhost` for a test override is a startup failure.
 - **A route naming an image generator on the text-only WhatsApp transport is a startup failure**
   rather than a paid-for PNG with no delivery path. (The `imageGenerator:` block itself was removed
-  after 0.12.0; the equivalent refusal now covers `providerAttachments`.)
+  after 0.12.0. Current WhatsApp routes support `providerAttachments` and bounded image editing;
+  see the [current transport contract](dekopond.md#meta-whatsapp-cloud-api).)
 - **Provider storage and durable chat memory are opt-in and all-or-nothing.** Adding the `storage`
   or `chatMemory` section to `broker.yaml` requires every field in it; omitting the section leaves
   the broker exactly as it was.
