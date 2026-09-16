@@ -26,6 +26,7 @@ use futures_util::future::BoxFuture;
 use thiserror::Error;
 
 pub(crate) mod discord;
+mod hydration;
 pub(crate) mod local;
 pub(crate) mod slack;
 pub(crate) mod telegram;
@@ -683,6 +684,8 @@ pub(crate) trait AssetFetcher: Send + Sync {
 pub enum TransportError {
     #[error("{0}")]
     Attachment(#[from] dekopon_model::asset::BlobError),
+    #[error("attachment hydration task failed ({reason}); provider already executed")]
+    AttachmentTask { reason: &'static str },
     #[error("credential environment variable {name} is not set")]
     MissingCredential { name: String },
     #[error("credential environment variable {name} is set to an empty value")]
@@ -720,6 +723,7 @@ impl TransportError {
     pub const fn category(&self) -> &'static str {
         match self {
             Self::Attachment(_) => "attachment-storage",
+            Self::AttachmentTask { .. } => "attachment-task",
             Self::MissingCredential { .. } => "missing-credential",
             Self::EmptyCredential { .. } => "empty-credential",
             Self::NonUtf8Credential { .. } => "non-utf8-credential",

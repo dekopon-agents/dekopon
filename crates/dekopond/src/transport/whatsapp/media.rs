@@ -4,6 +4,7 @@ use std::{net::IpAddr, time::Instant};
 
 use tracing::Instrument as _;
 
+use crate::transport::hydration::HydratedImage;
 use dekopon_agent::attachment::GeneratedImage;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
@@ -142,10 +143,9 @@ impl WhatsappDriver {
         &self,
         recipient: &str,
         caption: Option<&str>,
-        image: GeneratedImage,
-        index: usize,
+        image: HydratedImage,
     ) -> Result<(), TransportError> {
-        let bytes = image.len();
+        let bytes = image.bytes.len();
         let upload = tracing::info_span!(
             "whatsapp.image_upload",
             bytes,
@@ -155,8 +155,8 @@ impl WhatsappDriver {
         );
         let started = Instant::now();
         let result = async {
-            let filename = image.filename(index);
-            let part = reqwest::multipart::Part::bytes(image.bytes()?)
+            let filename = image.filename;
+            let part = reqwest::multipart::Part::bytes(image.bytes)
                 .file_name(filename)
                 .mime_str("image/png")
                 .map_err(request_failed)?;

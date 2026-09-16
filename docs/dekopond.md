@@ -435,8 +435,13 @@ The model then calls `fetch_chat_asset(1)`. Because a tool result cannot carry a
   An unlinked file still reads through its original descriptor while a lease owns it. No storage
   failure triggers an automatic network fallback or paid-call retry. A provider-result spool refusal
   explicitly says the capability already executed and its attachment was not delivered; existing
-  complete/partial transport acceptance rules remain in force. Local file IO is synchronous and
-  bounded by the file ceiling; cancellation releases ownership when the active syscall returns.
+  complete/partial transport acceptance rules remain in force. Outbound transports transfer all
+  reply leases to a trace-contextual blocking task before delivery; reads and normal disposal do
+  not occupy async workers. Cancelling the wait does not stop that task: it releases ownership
+  when IO returns. Blocking model consumers retain the synchronous API. Local image answers use
+  a separate reply instead of in-place progress/stream finalization; text-only answers still finalize
+  in place. An unpolled transport future or runtime shutdown before queued work starts can still
+  drop leases on the calling thread; this is not a general asynchronous cleanup service.
 - **Disk backing is an operator requirement.** The chart uses disk-backed gateway `/tmp`, separately
   sized by `volumeSizes.gatewayTmp`; broker scratch stays tmpfs. Other installations must provide
   a disk-backed temporary directory, not a memory-backed `emptyDir` or `TMPDIR`. Existing deployed

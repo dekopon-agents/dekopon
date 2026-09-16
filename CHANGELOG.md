@@ -7,6 +7,12 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- Outbound image hydration and owned scratch disposal now run off async workers with the delivery
+  trace context. Local image answers use the existing separate-reply fallback rather than
+  finalizing a progress/stream line in place; text-only finalization is unchanged.
+
 ### Changed
 
 - Chat images, PDFs and provider reply PNGs now retain private temporary-file leases instead of

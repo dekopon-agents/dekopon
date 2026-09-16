@@ -1038,14 +1038,15 @@ impl ChatDriver for WhatsappDriver {
         target: &ReplyTarget,
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
+        let OutboundReply { text, images } = reply;
+        let images = super::hydration::hydrate_images(images).await?;
         let ReplyTarget::WhatsApp { recipient } = target else {
             return Err(TransportError::Response);
         };
-        let OutboundReply { text, images } = reply;
         // Refuse every locally knowable failure before uploading or sending any part.
         if images
             .iter()
-            .any(|image| image.len() > media::MAX_IMAGE_BYTES)
+            .any(|image| image.bytes.len() > media::MAX_IMAGE_BYTES)
         {
             return Err(media::failure("image-too-large"));
         }
@@ -1053,7 +1054,7 @@ impl ChatDriver for WhatsappDriver {
         let mut accepted = 0_usize;
         for (index, image) in images.into_iter().enumerate() {
             let caption = (caption_fits && index == 0 && !text.is_empty()).then_some(text.as_str());
-            if let Err(error) = self.send_image(recipient, caption, image, index).await {
+            if let Err(error) = self.send_image(recipient, caption, image).await {
                 return Err(self.reply_failure(error, accepted));
             }
             accepted += 1;
