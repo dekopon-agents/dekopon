@@ -136,3 +136,12 @@ already-dispatched blocking jobs drain; no later filesystem step starts after ex
 storage-backed `provider.invoke` span records the capability, provider, and input every other
 invocation span records, plus `storage = true`; storage evidence carries operation, sync, and quota
 counts and the exact bytes read and written.
+
+## Memory observations
+
+Each invocation that obtains a store emits one payload-free `provider.memory` summary on its
+`provider.invoke` span, including instantiation. It reports the largest **individual** linear-memory
+observation, its completeness and the configured per-memory cap, not aggregate use or RSS.
+See [operator sizing and limitations](../../docs/observability.md#provider-linear-memory-sizing),
+including the distinction from concurrent-store admission reservations. Describe and command-run
+stores are excluded; enforcement is unchanged.

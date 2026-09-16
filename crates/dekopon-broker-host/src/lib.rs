@@ -41,6 +41,7 @@ use wasmtime::{Engine, Store};
 
 mod clock;
 mod http;
+mod memory;
 mod metadata;
 mod storage;
 use clock::ClockState;
@@ -106,7 +107,7 @@ pub const DEFAULT_MAX_TOTAL_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 /// Broker-owned ceilings that authorization may narrow but never widen.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrokerHostLimits {
-    /// Maximum linear memory in one fresh store.
+    /// Maximum size of each linear memory in one fresh store.
     pub max_memory_bytes: usize,
     /// Maximum elements in each Wasm table.
     pub max_table_elements: usize,
@@ -489,7 +490,7 @@ impl Runtime {
         let mut store = Store::new(
             &self.engine,
             StoreState {
-                limits: self.limits.store_bounds().store_limits(),
+                limits: memory::MemoryLimiter::new(self.limits.store_bounds()),
                 http,
                 storage,
                 clock,
@@ -525,7 +526,7 @@ impl Runtime {
 }
 
 struct StoreState {
-    limits: wasmtime::StoreLimits,
+    limits: memory::MemoryLimiter,
     http: HttpState,
     storage: storage::StorageState,
     /// Granted only in an invocation's store; descriptions and command runs are pure.
@@ -979,6 +980,10 @@ impl BrokerWasmProvider {
         let mut store = self
             .runtime
             .store(http, storage_state, ClockState::invoke())?;
+        store
+            .data_mut()
+            .limits
+            .observe_invocation(self.manifest.id.as_str(), capability.as_str());
         // The store outlives the guest on every path, including the one where the timeout drops
         // the operation future, so evidence for dispatched calls is harvested exactly once and
         // reaches the caller whether the invocation succeeded or failed.
@@ -1005,6 +1010,19 @@ impl BrokerWasmProvider {
             executed = Err(BrokerHostError::Storage { source });
         }
         record_store_outcome(&store, self.runtime.limits.fuel);
+        store.data_mut().limits.finish(match &executed {
+            Ok(_) => "succeeded",
+            Err(BrokerHostError::ProviderFailure { .. }) => "provider-error",
+            Err(BrokerHostError::Timeout { .. }) => "timeout",
+            Err(BrokerHostError::Invoke { source, .. })
+                if source.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::OutOfFuel) =>
+            {
+                "fuel-exhausted"
+            }
+            Err(BrokerHostError::Invoke { .. }) => "trap",
+            Err(BrokerHostError::Instantiate { .. }) => "instantiation-error",
+            Err(_) => "host-error",
+        });
         let mut data = store.into_data();
         let storage = data.storage.take_evidence();
         let http_calls = data.http.into_evidence();
@@ -1043,6 +1061,7 @@ impl BrokerWasmProvider {
                     source,
                 })?;
             store.data_mut().instantiations += 1;
+            store.data_mut().limits.instantiated();
             bindings
                 .call_invoke(&mut *store, capability.as_str(), input_json)
                 .await
