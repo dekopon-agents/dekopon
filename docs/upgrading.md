@@ -8,7 +8,7 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
-## Native-first progress (Unreleased)
+## Native-first progress (0.16.0)
 
 An absent liveness block and `mode: off` remain disabled. Inside enabled liveness, omitted
 `progress` now means `auto`: native status or typing/reaction avoids redundant placeholder posts,
