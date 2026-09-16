@@ -9,6 +9,10 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Fixed
 
+- Pin `tracing-core` to the exact revision of upstream tracing PR #3614, fixing lost cold-callsite
+  events/spans when the sole registered dispatcher is scoped to another thread. Direct and
+  transitive tracing consumers share the patched core; test assertions and parallelism are unchanged.
+
 - Validate inbound WhatsApp PNG signatures without unaccounted scratch writes. Completed asset
   downloads that exceed retention limits now remain unavailable without silently redownloading;
   known-oversized inputs still refuse before transport IO.

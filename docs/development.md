@@ -154,6 +154,19 @@ Never edit `.wasm` files directly. Each in-tree source directory is a separate C
 
 ### Dependencies, crates, CI, or releases
 
+The root workspace temporarily patches `tracing-core` to commit
+`2b696a18454a04df9c9a60569b6fb73a22415296` from the
+[`dekopon-agents/tracing` fork](https://github.com/dekopon-agents/tracing), the source
+selected from [upstream PR #3614](https://github.com/tokio-rs/tracing/pull/3614). This fixes
+cold-callsite loss with a thread-local subscriber; patching the shared core also covers transitive
+`tracing` consumers without changing the facade or subscriber versions. The full revision, not a
+moving branch, pins the source. `deny.toml` permits only this Git repository in addition to crates.io.
+Remove the patch and its Git-source allowance when a crates.io release includes the fix, regenerate
+the lockfile, and rerun normal-parallel gateway and telemetry tests. Cargo patches are workspace-root
+settings: separate provider workspaces and downstream consumers do not inherit this override.
+Packaged/published library consumers resolve their own tracing dependencies; a crates.io build must
+not be advertised as containing this unreleased Git fix merely because the workspace tests use it.
+
 Declare shared versions and path dependencies in the root `Cargo.toml`; commit `Cargo.lock`. Changing a dependency closure changes those workspaces' `Cargo.lock` files: regenerate them with Cargo, never hand-edit them, then return to `--locked` validation. This includes a new edge between existing workspace crates. New publishable crates also require a meaningful tested responsibility, packaging validation, architecture/roadmap updates, and an entry in the dependency-ordered plan in `.github/release-crates.txt`. Update workspace membership, `design.md` component ownership, the repository map, the crate README, and the changelog too. Pull-request CI and release validation compare that plan with Cargo metadata and reject omissions, private or unknown entries, duplicates, and any normal, build, or dev dependency published after its consumer—`cargo package` resolves all three while verifying an archive.
 
 [`../CHANGELOG.md`](../CHANGELOG.md) is required release metadata. Keep pending work under `[Unreleased]`; an application release must promote completed bullets into a dated `[VERSION]` section, while an independently versioned chart release uses `[dekopon-chart-<VERSION>]`. `.github/scripts/verify_changelog.py` requires exactly one Unreleased heading and a non-placeholder bullet under a Keep a Changelog category. Pull-request CI compares both the workspace and chart versions with those headings, and the corresponding tag workflow repeats the check before publication.
