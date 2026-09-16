@@ -296,9 +296,12 @@ the receive span measures receipt and dispatch rather than the session it starte
 Telegram `message_id`, a WhatsApp `wamid`, the development transport's boot-scoped counter — and is
 recorded once the payload has been parsed far enough to carry one. A receipt that routes nothing
 closes without it, which is the trace that answers "why did the bot not reply"; so does a refused
-WhatsApp delivery. A WhatsApp delivery carrying more than one message leaves it unset and parents
-every message's `gateway.message` under the one delivery. Neither the sender nor the message text
-goes on this span: those stay on the `gateway.message.received` log event below.
+WhatsApp delivery. Each accepted WhatsApp message has a distinct `transport.receive` child under
+the signed delivery span, carrying its native `message.id` and conversation coordinates. Execution
+nests under that message receipt; for a collected burst, it nests under the lead receipt and links
+to every constituent receipt. This preserves distinguishable input and disposition evidence even
+when one webhook delivers several messages. Neither the sender nor the message text goes on these
+spans: those stay on the `gateway.message.received` log event below.
 
 The four `conversation.*` attributes say *where* an accepted message was posted: its kind
 (`directMessage`, `groupDirectMessage`, `channel`, `thread`), the container above it (a Slack team,
