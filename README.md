@@ -2,7 +2,7 @@
 
 Dekopon is an extensible runtime for self-hosted AI agents. Providers are WebAssembly components; the model proposes, a separate broker authorizes and executes; and provider credentials can never reach the model. The three goals that decide what belongs here are the [constitution](docs/design.md#constitution).
 
-> **Status:** not production-ready. Both daemons are Unix-only. `dekopon-brokerd` maps configured peer UIDs to trusted context under the [current local process boundary](docs/security-model.md#current-local-process-boundary); `dekopond` holds chat and model credentials and no broker authority.
+> **Status:** pre-1.0 and in active production use. The one known production deployment is the maintainer's Raspberry Pi homelab: Kubernetes on a home fiber connection, serving Discord, Slack, and WhatsApp. This is not a general production-readiness guarantee. Both daemons are Unix-only. `dekopon-brokerd` maps configured peer UIDs to trusted context under the [current local process boundary](docs/security-model.md#current-local-process-boundary); `dekopond` holds chat and model credentials and no broker authority.
 
 ## Design documentation
 
