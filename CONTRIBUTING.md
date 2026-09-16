@@ -2,7 +2,7 @@
 
 A change is judged by the three goals in the [constitution](docs/design.md#constitution); a subsystem that serves none of them is a deletion candidate. Small, reviewable changes with explicit trust assumptions beat speculative framework code.
 
-Read [`docs/design.md`](docs/design.md) before changing behavior or architecture. Then read [`docs/development.md`](docs/development.md) for the repository map, generated artifacts, separate provider workspace, validation matrix, and PR workflow. Area-specific contracts are indexed in [`docs/README.md`](docs/README.md).
+For behavior or architecture changes, read the relevant sections of [`docs/design.md`](docs/design.md). Select the applicable [change map](docs/development.md#change-maps) and [validation group](docs/development.md#validation), using the [repository map](docs/development.md#repository-map) to locate source and tests. Other contracts are routed by the [area index](docs/README.md#change-a-specific-area); reading every manual is not a prerequisite.
 
 ## Development setup
 
@@ -52,13 +52,27 @@ The fixtures under `examples/providers/` are separate Cargo workspaces that root
 
 - Open an issue or draft pull request before a large architectural change.
 - Keep model proposals, broker authorization, storage grants, and effect execution distinct in APIs and documentation.
-- Do not commit credentials, real private endpoints, generated coverage data, or local configuration.
+- Do not commit credentials, real private endpoints, local paths, generated coverage data, or local configuration.
 - Reject unknown authored fields unless a documented compatibility need overrides that default.
 - Treat model tool arguments and provider responses as untrusted; providers validate their capability-specific input.
-- Add behavior-focused tests, including failure paths and stable CLI output where relevant.
+- Name tests for the behavior they pin and keep them beside the owning crate. Failure-path tests assert the surfaced error or log carries the cause; validation tests construct at least two simultaneous conflicts and assert both are reported. Mock network peers on loopback; never read another application's credential store. Cover stable CLI output where relevant.
 - Record user-visible changes under `[Unreleased]` in [`CHANGELOG.md`](CHANGELOG.md) using Keep a Changelog categories; pull-request CI validates the file's shape ([details](docs/development.md#dependencies-crates-ci-or-releases)).
 - Avoid `unsafe`, panics on user input, unnecessary async dependencies, and public APIs based on `anyhow`.
-- Use conventional commit subjects when practical, for example `feat(config): detect duplicate agents`.
+- Use conventional commit subjects when practical, for example `feat(config): detect duplicate agents`. Preserve `Co-Authored-By:` and `Claude-Session:` trailers added by the agent harness; model and session identifiers belong nowhere else in source or documentation.
+
+## Review checklist
+
+These recurring failure patterns are review requirements, not just lint suggestions:
+
+- Preserve error causes in a returned error naming the failed check or a tracing event at the discard site carrying the cause kind or errno. This includes `map_err(|_| …)`, `let _ = fallible()`, and bool/Option results from multi-cause checks. Emit every refusal or failure cause once.
+- Classify errors on the axis callers act on: retryable versus permanent and executed versus not-executed. Never report permanent exhaustion as transient, completed work as timed out, or exit successfully with daemon work dead.
+- Report every validation conflict together, then fail; never stop at the first conflict or use last-wins duplicate keys.
+- Never hold `Entered`/`EnteredSpan` guards across `.await`; use `.instrument(span)` or `in_scope`.
+- Bound everything that grows or blocks and give it an owner. Enforce peer-claimed lengths rather than preallocating from them; deduplicate or evict state retained across turns; give spawned threads, connections, and network reads deadlines and exit observers.
+- Construct expensive HTTP/model clients, Wasmtime engines, linkers, compiled components, and workers once at process or session scope, not per request or invocation.
+- Every new public item, dependency, config field, and error variant needs a non-test consumer in the same PR; otherwise make it private or delete it. Parsed-but-unread config and unreachable variants are not scaffolding to retain.
+- Keep one definition per fact. A validator or constant mirroring an authority must share the definition or carry an equality-pinning test; a mirror must not accept what the authority rejects.
+- Preserve the lints defined in [`Cargo.toml`](Cargo.toml) and [`clippy.toml`](clippy.toml), including the bans on `dbg!`, `todo!`, and `unimplemented!`. Any justified allowance is site-scoped with a reason explaining why it is safe, never widened to a module or crate.
 
 ## Pull requests
 
