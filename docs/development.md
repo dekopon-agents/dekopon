@@ -1,6 +1,6 @@
 # Development guide
 
-Read [`design.md`](design.md) before this guide. The design defines authority; this document maps common changes to source, tests, generated artifacts, and validation commands.
+The [constitution](design.md#constitution) and relevant design sections define authority; this guide maps common changes to source, tests, generated artifacts, and validation commands. Select the sections needed for the task rather than reading the whole guide.
 
 ## Start here
 
@@ -8,7 +8,7 @@ From the repository root (`Cargo.toml`, `AGENTS.md`, and `docs/` should be prese
 
 1. Run `git status --short --branch` and preserve unrelated work.
 2. Classify the change as **Current**, **Committed direction**, or **Exploration** ([`design.md`](design.md#constitution)).
-3. Read the area document selected by [`../AGENTS.md`](../AGENTS.md).
+3. Select the relevant contracts from the [area index](README.md#change-a-specific-area); identify which process owns the data and which owns the authority.
 4. Find the implementation and its nearest tests before editing.
 5. Check whether the change crosses the root workspace, a separate provider workspace, a generated artifact, or a mirrored contract.
 
@@ -56,7 +56,7 @@ Scaffolding that more than one suite needs lives in `dekopon-test-support` inste
 
 ### Catalog resources or validation
 
-Update protocol types first, then config validation, surviving typed gateway/agent consumers, examples, schemas, and docs as applicable. Authored fields are strict: unknown fields fail rather than being silently ignored. Parse config once; command handlers should consume typed resources, not YAML values.
+Update protocol types first, then config validation, surviving typed gateway/agent consumers, examples, schemas, and docs as applicable. Authored fields are strict: unknown fields fail rather than being silently ignored. Parse config once; command handlers should consume typed resources, not YAML values. A config field or CLI flag also updates its owning contract (`catalog.md`, `dekopond.md`, or `cli.md`), crate README, example, changelog, parser tests, and black-box CLI tests.
 
 Skills are catalog resources too. `Agent.spec.skills` (`dekopon-protocol`) names directories, resolved relative to the catalog file unless absolute; `SkillId` in `crates/dekopon-core/src/skill.rs` owns the name grammar; `crates/dekopon-config/src/skill.rs` reads each directory into memory at load time under its size, depth, and count bounds, so no session touches the filesystem; and the catalog loader reports every unmountable or same-named skill in one refusal (`CatalogProblem::Skill`, `CatalogProblem::DuplicateSkill`) and serves the loaded set through `LocalCatalog::agent_skills`.
 
@@ -79,6 +79,8 @@ Skills and the `suggest_improvement` tool live beside the prompt loop in `dekopo
 Provider JSON Schemas are exposed to the model, but there is no general JSON Schema validator in the host. The host requires an object-shaped schema and object invocation input; each provider must validate its own capability-specific fields and constraints.
 
 ### Provider contract or host
+
+A capability or provider change also updates the catalog example, owner-authored constraint set and Cedar policy, `catalog.md`, `security-model.md`, and the relevant fixture/build script and import-inspection tests.
 
 The SDK and host provider WIT files are mirrored and must remain byte-identical:
 
@@ -152,7 +154,7 @@ Never edit `.wasm` files directly. Each in-tree source directory is a separate C
 
 ### Dependencies, crates, CI, or releases
 
-Declare shared versions and path dependencies in the root `Cargo.toml`; commit `Cargo.lock`. Changing a dependency closure changes those workspaces' `Cargo.lock` files, which are committed. New publishable crates also require a meaningful tested responsibility, packaging validation, architecture/roadmap updates, and an entry in the dependency-ordered plan in `.github/release-crates.txt`. Pull-request CI and release validation compare that plan with Cargo metadata and reject omissions, private or unknown entries, duplicates, and any normal, build, or dev dependency published after its consumer—`cargo package` resolves all three while verifying an archive.
+Declare shared versions and path dependencies in the root `Cargo.toml`; commit `Cargo.lock`. Changing a dependency closure changes those workspaces' `Cargo.lock` files: regenerate them with Cargo, never hand-edit them, then return to `--locked` validation. This includes a new edge between existing workspace crates. New publishable crates also require a meaningful tested responsibility, packaging validation, architecture/roadmap updates, and an entry in the dependency-ordered plan in `.github/release-crates.txt`. Update workspace membership, `design.md` component ownership, the repository map, the crate README, and the changelog too. Pull-request CI and release validation compare that plan with Cargo metadata and reject omissions, private or unknown entries, duplicates, and any normal, build, or dev dependency published after its consumer—`cargo package` resolves all three while verifying an archive.
 
 [`../CHANGELOG.md`](../CHANGELOG.md) is required release metadata. Keep pending work under `[Unreleased]`; an application release must promote completed bullets into a dated `[VERSION]` section, while an independently versioned chart release uses `[dekopon-chart-<VERSION>]`. `.github/scripts/verify_changelog.py` requires exactly one Unreleased heading and a non-placeholder bullet under a Keep a Changelog category. Pull-request CI compares both the workspace and chart versions with those headings, and the corresponding tag workflow repeats the check before publication.
 
@@ -198,6 +200,16 @@ See [`dekopond.md`](dekopond.md) for the user-facing contract, [`observability.m
 ## Validation
 
 Use `--locked` for reproducible validation. Start with `git diff --check`. Targeted checks are encouraged during development; run every relevant group before opening a PR.
+
+Check target size and free disk space before expensive builds and between validation milestones. After validation, remove inactive build artifacts by default; retain them only for a named near-term check with a cleanup trigger. Before removal, verify the exact path, ownership, ignored/rebuildable contents, and that no concurrent build or running executable uses it. Do not clean another worktree's or a shared active target, or shared sccache; avoid routine `cargo clean`. Report cleanup, retention, and free space before/after at handoff.
+
+Two permission tests assume a non-root user: `dekopon-brokerd`'s `a_secret_file_that_cannot_be_opened_still_names_its_errno` and `dekopon-model`'s `a_rotated_credential_completes_the_turn_when_the_write_fails`. Under root, their unreadable-file/unwritable-directory setup does not establish the failure condition; report that verification gap rather than treating it as a regression.
+
+### Verification claims
+
+Record the exact tested head or artifact, the commands and outcomes actually observed, and remaining verification gaps. Verify required remote checks on the exact submitted head; local success does not prove remote CI passed. Never describe future behavior as tested or an unobserved remote operation as successful.
+
+For deployment diagnosis, inspect the deployed runtime version/ref and provider component digest, not checkout HEAD or an old report. Browser, fixture, native-host, provider-loading, and live-provider-request acceptance exercise different boundaries; none proves the others. State precisely which boundary and bytes were exercised. Use the [area index](README.md#change-a-specific-area) for deployment and operational contracts.
 
 ### Root workspace
 
@@ -280,7 +292,7 @@ python3 .github/scripts/check_docs_duplicates.py docs README.md AGENTS.md crates
 The other gate is inline in [`../.github/workflows/ci.yml`](../.github/workflows/ci.yml): every
 `audit.event` name emitted under `crates/` must appear in [`observability.md`](observability.md),
 and an extraction that reads nothing fails rather than passing silently. Emitting a new name
-therefore means adding it, backticked, to that document in the same change, which is why
+therefore means adding it, backticked, to that document in the same change. Grep `docs/` and `crates/*/README.md` for every event identifier renamed or removed. This is why
 `agent.skill.read`, `agent.skill.refused`, `agent.improvement.suggested`, and
 `agent.improvement.refused` appear there.
 
@@ -490,6 +502,6 @@ group- or world-writable, or `dekopon-brokerd` refuses to start.
 - Rebase or branch from current `main`; do not stack accidentally on an already merged feature branch.
 - Keep the diff scoped and preserve generated/source consistency.
 - Update current-behavior docs in the same change; do not edit the roadmap as proof of implementation.
-- Describe user-visible behavior, security implications, validation run, and known limitations.
+- Follow the [PR template](../.github/pull_request_template.md): summary, security impact, validation actually run, and limitations/follow-ups.
 - Use a conventional commit subject where practical.
 - Push the branch, open the PR, and verify the required checks rather than assuming local success implies remote success.
