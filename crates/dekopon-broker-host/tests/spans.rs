@@ -572,7 +572,7 @@ fn memory_component(body: &str, failed: bool) -> tempfile::NamedTempFile {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn memory_summary_is_once_per_invocation_including_failures_without_payloads() {
+async fn memory_and_fuel_summary_is_once_per_invocation_including_failures_without_payloads() {
     let _sequential = SEQUENTIAL.lock().await;
     let capture = capture();
     for (body, failed, outcome, peak, denied) in [
@@ -665,15 +665,30 @@ async fn memory_summary_is_once_per_invocation_including_failures_without_payloa
             !fields.contains("private-"),
             "memory event must not copy any payload"
         );
-        assert_eq!(
-            recorded(&capture, "provider.invoke", "fuel.consumed").len(),
-            1
+        let consumed = recorded(&capture, "provider.invoke", "fuel.consumed");
+        assert_eq!(consumed.len(), 1);
+        assert!(consumed[0] > 0, "the synthetic invocation burns fuel");
+        assert!(fields.contains("fuel.initial=100000"), "{fields}");
+        assert!(
+            fields.contains(&format!("fuel.consumed={}", consumed[0])),
+            "{fields}"
         );
+        assert!(
+            fields.contains(&format!("fuel.remaining={}", 100_000 - consumed[0])),
+            "{fields}"
+        );
+        if outcome == "fuel-exhausted" {
+            assert_eq!(
+                consumed[0], 100_000,
+                "exhaustion consumes the entire balance"
+            );
+            assert!(fields.contains("fuel.remaining=0"), "{fields}");
+        }
     }
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn memory_summary_survives_timeout_and_caller_cancellation() {
+async fn memory_and_fuel_summary_survives_timeout_and_caller_cancellation() {
     let _sequential = SEQUENTIAL.lock().await;
     let capture = capture();
     let component = memory_component("i32.const 1 memory.grow drop (loop $spin br $spin)", false);
@@ -723,5 +738,26 @@ async fn memory_summary_survives_timeout_and_caller_cancellation() {
             fields.contains("memory.max_individual_observed_bytes=131072"),
             "{fields}"
         );
+        assert!(
+            fields.contains(&format!("fuel.initial={}", u64::MAX)),
+            "{fields}"
+        );
+        if cancel {
+            // Drop can report the initial balance but cannot query its owning Store.
+            assert!(!fields.contains("fuel.remaining="), "{fields}");
+            assert!(!fields.contains("fuel.consumed="), "{fields}");
+        } else {
+            let consumed = recorded(&capture, "provider.invoke", "fuel.consumed");
+            assert_eq!(consumed.len(), 1);
+            assert!(consumed[0] > 0);
+            assert!(
+                fields.contains(&format!("fuel.consumed={}", consumed[0])),
+                "{fields}"
+            );
+            assert!(
+                fields.contains(&format!("fuel.remaining={}", u64::MAX - consumed[0])),
+                "{fields}"
+            );
+        }
     }
 }

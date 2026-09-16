@@ -25,6 +25,8 @@ struct Report {
     provider: String,
     capability: String,
     outcome: &'static str,
+    initial_fuel: Option<u64>,
+    remaining_fuel: Option<u64>,
 }
 
 impl MemoryLimiter {
@@ -41,13 +43,26 @@ impl MemoryLimiter {
         }
     }
 
-    pub(super) fn observe_invocation(&mut self, provider: &str, capability: &str) {
+    pub(super) fn observe_invocation(
+        &mut self,
+        provider: &str,
+        capability: &str,
+        initial_fuel: Option<u64>,
+    ) {
         self.report = Some(Report {
             span: tracing::Span::current(),
             provider: provider.to_owned(),
             capability: capability.to_owned(),
             outcome: "cancelled",
+            initial_fuel,
+            remaining_fuel: None,
         });
+    }
+
+    pub(super) fn record_remaining_fuel(&mut self, remaining: Option<u64>) {
+        if let Some(report) = &mut self.report {
+            report.remaining_fuel = remaining;
+        }
     }
 
     pub(super) fn instantiated(&mut self) {
@@ -140,6 +155,10 @@ impl Drop for MemoryLimiter {
                 provider = %report.provider,
                 capability = %report.capability,
                 outcome = report.outcome,
+                fuel.initial = report.initial_fuel,
+                fuel.remaining = report.remaining_fuel,
+                fuel.consumed = report.initial_fuel.zip(report.remaining_fuel)
+                    .and_then(|(initial, remaining)| initial.checked_sub(remaining)),
                 memory.max_individual_observed_bytes = self.observed_peak().map(|bytes| bytes as u64),
                 memory.observation_complete = self.complete(),
                 memory.per_memory_limit_bytes = self.per_memory_limit as u64,
@@ -291,7 +310,10 @@ mod tests {
             for initialized in [false, true] {
                 let mut limiter = MemoryLimiter::new(StoreLimits::default());
                 let span = tracing::info_span!("provider.invoke");
-                span.in_scope(|| limiter.observe_invocation("probe", "probe.run"));
+                span.in_scope(|| {
+                    limiter.observe_invocation("probe", "probe.run", initialized.then_some(200))
+                });
+                limiter.record_remaining_fuel(Some(50));
                 assert!(limiter.memory_growing(0, PAGE, None).unwrap());
                 if initialized {
                     limiter.instantiated();
@@ -331,6 +353,12 @@ mod tests {
         );
         assert!(events[1].0.contains("outcome=\"succeeded\""));
         assert!(events[1].0.contains("memory.growth_failed=1"));
+        // Fuel is independently observable even when memory is incomplete.
+        assert!(!events[0].0.contains("fuel.initial="));
+        assert!(!events[0].0.contains("fuel.consumed="));
+        assert!(events[1].0.contains("fuel.initial=200"));
+        assert!(events[1].0.contains("fuel.remaining=50"));
+        assert!(events[1].0.contains("fuel.consumed=150"));
     }
 
     #[test]

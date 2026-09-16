@@ -10,9 +10,11 @@ All notable changes to Dekopon are documented here. The format is based on
 ### Added
 
 - Broker provider invocations emit a payload-free linear-memory sizing summary with the largest
-  observed individual memory, per-memory cap, completeness, denied/failed growth and outcome.
-  Observations include instantiation and survive normal errors, timeouts and cancellation; they
-  are not live heap/RSS or aggregate RAM measurements. Enforcement and reservations are unchanged.
+  observed individual memory, per-memory cap, completeness, denied/failed growth and outcome,
+  alongside actual initial, remaining and consumed Wasmtime fuel when observable. Observations
+  include instantiation and survive normal errors and timeouts; cancellation reports omit fuel
+  consumption when no final reading exists. Memory is not live heap/RSS or aggregate RAM.
+  Enforcement, fuel budgets and reservations are unchanged.
 
 ## [0.16.0] - 2026-09-15
 

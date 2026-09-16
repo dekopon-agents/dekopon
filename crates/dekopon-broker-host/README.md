@@ -141,7 +141,9 @@ counts and the exact bytes read and written.
 
 Each invocation that obtains a store emits one payload-free `provider.memory` summary on its
 `provider.invoke` span, including instantiation. It reports the largest **individual** linear-memory
-observation, its completeness and the configured per-memory cap, not aggregate use or RSS.
+observation, its completeness and the configured per-memory cap, not aggregate use or RSS. The same
+summary carries actual initial, remaining and consumed Wasmtime fuel when observable; unavailable
+readings are omitted, not zero. Fuel budgets and metering policy are unchanged.
 See [operator sizing and limitations](../../docs/observability.md#provider-linear-memory-sizing),
 including the distinction from concurrent-store admission reservations. Describe and command-run
 stores are excluded; enforcement is unchanged.
