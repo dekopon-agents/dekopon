@@ -1,6 +1,6 @@
 # Development guide
 
-Read [`design.md`](design.md) before this guide. The design defines authority; this document maps common changes to source, tests, generated artifacts, and validation commands.
+The [constitution](design.md#constitution) and relevant design sections define authority; this guide maps common changes to source, tests, generated artifacts, and validation commands. Select the sections needed for the task rather than reading the whole guide.
 
 ## Start here
 
@@ -8,7 +8,7 @@ From the repository root (`Cargo.toml`, `AGENTS.md`, and `docs/` should be prese
 
 1. Run `git status --short --branch` and preserve unrelated work.
 2. Classify the change as **Current**, **Committed direction**, or **Exploration** ([`design.md`](design.md#constitution)).
-3. Read the area document selected by [`../AGENTS.md`](../AGENTS.md).
+3. Select the relevant contracts from the [area index](README.md#change-a-specific-area); identify which process owns the data and which owns the authority.
 4. Find the implementation and its nearest tests before editing.
 5. Check whether the change crosses the root workspace, a separate provider workspace, a generated artifact, or a mirrored contract.
 
@@ -201,9 +201,15 @@ See [`dekopond.md`](dekopond.md) for the user-facing contract, [`observability.m
 
 Use `--locked` for reproducible validation. Start with `git diff --check`. Targeted checks are encouraged during development; run every relevant group before opening a PR.
 
-Check target size and free disk space before expensive builds and between validation milestones. After validation, remove inactive build artifacts by default; retain them only for a named near-term check with a cleanup trigger. Before removal, verify the exact path, ownership, ignored/rebuildable contents, and that no concurrent build or running executable uses it. Do not clean another worktree's or a shared active target; report retention and free space at handoff.
+Check target size and free disk space before expensive builds and between validation milestones. After validation, remove inactive build artifacts by default; retain them only for a named near-term check with a cleanup trigger. Before removal, verify the exact path, ownership, ignored/rebuildable contents, and that no concurrent build or running executable uses it. Do not clean another worktree's or a shared active target, or shared sccache; avoid routine `cargo clean`. Report cleanup, retention, and free space before/after at handoff.
 
 Two permission tests assume a non-root user: `dekopon-brokerd`'s `a_secret_file_that_cannot_be_opened_still_names_its_errno` and `dekopon-model`'s `a_rotated_credential_completes_the_turn_when_the_write_fails`. Under root, their unreadable-file/unwritable-directory setup does not establish the failure condition; report that verification gap rather than treating it as a regression.
+
+### Verification claims
+
+Record the exact tested head or artifact, the commands and outcomes actually observed, and remaining verification gaps. Verify required remote checks on the exact submitted head; local success does not prove remote CI passed. Never describe future behavior as tested or an unobserved remote operation as successful.
+
+For deployment diagnosis, inspect the deployed runtime version/ref and provider component digest, not checkout HEAD or an old report. Browser, fixture, native-host, provider-loading, and live-provider-request acceptance exercise different boundaries; none proves the others. State precisely which boundary and bytes were exercised. Use the [area index](README.md#change-a-specific-area) for deployment and operational contracts.
 
 ### Root workspace
 
@@ -496,6 +502,6 @@ group- or world-writable, or `dekopon-brokerd` refuses to start.
 - Rebase or branch from current `main`; do not stack accidentally on an already merged feature branch.
 - Keep the diff scoped and preserve generated/source consistency.
 - Update current-behavior docs in the same change; do not edit the roadmap as proof of implementation.
-- Describe user-visible behavior, security implications, validation run, and known limitations.
+- Follow the [PR template](../.github/pull_request_template.md): summary, security impact, validation actually run, and limitations/follow-ups.
 - Use a conventional commit subject where practical.
 - Push the branch, open the PR, and verify the required checks rather than assuming local success implies remote success.

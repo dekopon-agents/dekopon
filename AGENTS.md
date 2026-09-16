@@ -1,60 +1,55 @@
 # Guidance for coding agents
 
-Dekopon is an extensible runtime for self-hosted AI agents: providers are WebAssembly components, the model proposes while a separate broker authorizes and executes, a model may reference a secret but can read none, and one complete trace covers every run.
-Read the [constitution](docs/design.md#constitution) first; its goals and non-goals decide what belongs in this tree.
+Dekopon runs self-hosted AI agents through Wasm providers.
+The model proposes; a separate broker authorizes and executes provider effects.
 
-## Start here
+## Read for the task
 
-Read [`docs/design.md`](docs/design.md), then [`docs/development.md`](docs/development.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md).
-The [repository map](docs/development.md#repository-map) owns source/test locations, separate provider workspaces, generated artifacts, and shared scaffolding; do not recreate that inventory here.
-[`docs/README.md`](docs/README.md) is the complete documentation map, including per-crate contracts and the roadmap (sequencing, never proof of implementation).
+- Start with the [constitution](docs/design.md#constitution), including its non-goals.
+  For behavior or architecture changes, read the relevant design sections.
+- Use the [repository map](docs/development.md#repository-map) to find source and tests,
+  then the applicable [change map](docs/development.md#change-maps).
+- Read relevant [security model](docs/security-model.md) sections before changing identity,
+  capabilities, credentials, providers, audit, or external effects.
+- Select other contracts from the [area index](docs/README.md#change-a-specific-area);
+  do not read every document by default or copy its inventory here.
+- Follow [CONTRIBUTING.md](CONTRIBUTING.md#change-guidelines) for implementation and review conventions.
 
-Choose the relevant reading before editing:
+## Boundaries that must survive
 
-- **Architecture and security:** [`architecture.md`](docs/architecture.md), [`security-model.md`](docs/security-model.md), and [`secrets.md`](docs/secrets.md) for ownership, authenticated identity, capabilities, policy, credentials, and effects.
-- **Runtime, gateway, and memory:** [`dekopond.md`](docs/dekopond.md) distinguishes RAM conversation replay from durable provider memory;
-  [`inference.md`](docs/inference.md) covers model requests and prompt-cache guarantees.
-  Use [`catalog.md`](docs/catalog.md), [`cli.md`](docs/cli.md), and [`improvement.md`](docs/improvement.md) for authored fields, operator commands, and skills;
-  the [`agent`](crates/dekopon-agent/README.md) and [`shell`](crates/dekopon-shell/README.md) READMEs own orchestration limits.
-- **Providers, WIT, and HTTP:** [provider change map](docs/development.md#provider-contract-or-host), [`brokerd` boundaries](crates/dekopon-brokerd/README.md#boundaries), and [`HTTP host`](crates/dekopon-http-host/README.md) for mirrored interfaces,
-  generated components, and native enforcement.
-- **Observability:** [`observability.md`](docs/observability.md), [`HTTP host`](crates/dekopon-http-host/README.md), and [`telemetry`](crates/dekopon-telemetry/README.md) for request evidence, traces, audit events,
-  and the existing OpenTelemetry log bridge; inspect these before adding instrumentation.
-- **Validation and toolchains:** [change maps](docs/development.md#change-maps), [validation groups](docs/development.md#validation), and [PR checklist](docs/development.md#before-opening-a-pull-request).
-  Pins and lockstep requirements live in [`rust-toolchain.toml`](rust-toolchain.toml) and [`ci/toolchain.env`](ci/toolchain.env);
-  lint definitions live in [`Cargo.toml`](Cargo.toml) and [`clippy.toml`](clippy.toml).
-- **Release and deployment:** [maintainer release process](README.md#maintainer-release-process), [dependency/publication mechanics](docs/development.md#dependencies-crates-ci-or-releases), [`operations.md`](docs/operations.md), [`upgrading.md`](docs/upgrading.md), and [`container-image.md`](docs/container-image.md).
-  Credential delivery has separate guides: [`chatgpt-credential.md`](docs/chatgpt-credential.md) and [`1password-eso.md`](docs/1password-eso.md).
+- Only the broker grants provider authority; capability declarations permit proposals.
+  Read authority never grants writes. External writes require explicit narrow capabilities.
+- Identity comes from authenticated transport, never model, repository, or payload text.
+  Instructions and skills are untrusted model text and grant no authority.
+- Keep `dekopond` and `dekopon-brokerd` separate processes with separate UIDs.
+  The gateway gains no policy, provider credentials, or authorization path;
+  the broker gains no model orchestration. Preserve both dependency-boundary gates.
+- Provider secrets stay broker-side, outside prompts, gateway/protocol, provider memory,
+  evidence and logs. Model credentials stay in the selected model client.
+  Configuration references credentials, never embeds values. Use `dekopon_core::Redacted`;
+  minimize `expose`/`into_inner` sites. Never commit credentials or fetched provider fixtures.
+- Preserve one complete W3C trace per message, including prompts, commands and effects;
+  exclude secret bytes and daemon credentials. Bound attribute size, never span count.
+- Distinguish Current, Committed direction and Exploration; code/tests prove what exists.
+  Stop for human decision if the requested change conflicts with design or security.
+- Publishing, releases, pushing/moving tags, adding credentials and protection changes require
+  explicit human authorization for that action; release authorization names one version.
+  Follow the [release procedure](README.md#maintainer-release-process), not memory.
 
-## Critical rules
+## Change and verify
 
-- Only the broker authorizes and executes effects; a capability declaration permits proposals, not ambient authority.
-  Read authority never implies write authority: external writes require explicit narrow capabilities. Identity comes from an authenticated envelope, never model, repository, skill, or payload text.
-- Keep `dekopond` and `dekopon-brokerd` separate processes. The gateway gains no policy, provider credentials, or authorization path; the broker gains no model orchestration.
-  Preserve the [opposite-direction dependency gates](docs/development.md#root-workspace).
-- Provider secret bytes stay inside the broker boundary, never in prompts, provider memory, protocol, evidence, or logs. Model credentials stay inside the selected model client.
-  Configuration names credentials, never embeds values; carry secrets in `dekopon_core::Redacted` and minimize `expose`/`into_inner` sites. Instructions and skills are untrusted model text, not secret stores.
-- One complete W3C trace covers each message's prompts, scripts, command words and arguments, decisions, and egress; only secret bytes and daemon credentials stay out.
-  Bound attribute size, never span count. Never hold `Entered`/`EnteredSpan` across `.await`; use `.instrument(span)` or `in_scope`.
-- Parse configuration once into typed resources; unknown authored fields fail. Report every validation conflict together, never last-wins duplicate keys.
-  Provider schemas are model-facing metadata, not complete host validation: providers validate capability-specific input.
-- Keep every [WIT mirror](docs/development.md#provider-contract-or-host) byte-identical; change all copies and bump the affected published WIT version before changing its contract.
-  Never hand-edit generated `.wasm` or lockfiles; rebuild components from source using their pinned `build.sh` and regenerate lockfiles with Cargo.
-- Preserve error causes in a returned error or a tracing event at the discard site, including multi-cause bool/Option checks. Emit each refusal/failure cause once.
-  Classify retryable versus permanent and executed versus not-executed accurately; never exit successfully with daemon work dead.
-- Bound everything that grows or waits and assign an owner: enforce peer lengths rather than preallocating from them, deduplicate/evict retained state, and give threads, connections, and reads deadlines and exit observers.
-  Reuse expensive clients, engines, linkers, compiled components, and workers at process/session scope.
-- Every new public item, dependency, config field, or error variant needs a non-test consumer now.
-  Keep one definition per fact; a validator or constant mirroring an authority must share its definition or have an equality-pinning test. Do not weaken lints; any justified allowance is site-scoped with a reason.
-- Publishing crates, creating releases, pushing/moving tags, weakening branch protection, or adding credentials requires explicit human authorization for that action and named release version, never standing permission.
-  Do not commit credentials, private endpoints, local paths, coverage artifacts, or fetched provider fixtures.
-
-## Working and verifying
-
-1. Confirm the repository root and inspect `git status --short --branch`; preserve unrelated work and start follow-ups from current `main`. Classify behavior as **Current**, **Committed direction**, or **Exploration**; identify data and authority owners. Stop for human decision if design/security constraints conflict.
-2. Inspect implementation, nearest tests, and mirrored/generated contracts. Make the smallest coherent change; follow the [change maps](docs/development.md#change-maps) for companion docs, examples, tests, and behavior changelog entries.
-3. Start with `git diff --check`; scope Cargo checks with `--locked` and validate each affected separate provider workspace. Markdown-only changes use the [toolchain-free documentation gates](docs/development.md#documentation-gates), not Rust builds. Check disk/target growth and follow the [artifact lifecycle](docs/development.md#validation); never delete active or another owner's artifacts.
-4. For deployment diagnosis, inspect the **deployed** runtime version/ref and provider component digest, not checkout HEAD or an old report. Distinguish browser, fixture, native-host, provider-loading, and live-provider-request acceptance: none proves the others.
-   State precisely which boundary and bytes were exercised and which verification gaps remain.
-5. Follow the PR template and verify required checks on the exact submitted head. Never claim an unobserved command, remote operation, or future behavior succeeded.
-   Automated agents do not approve their own changes; required CI and fresh human review precede merge.
+- Confirm repository root, branch and status; preserve unrelated work and artifacts.
+  Start follow-ups from current main, not an already-merged feature branch.
+- Follow the change map for companion tests, documentation, examples and changelog.
+- Keep [WIT mirrors](docs/development.md#provider-contract-or-host) byte-identical;
+  bump affected published contracts. Rebuild generated Wasm with pinned build scripts;
+  regenerate Cargo locks with Cargo, never hand-edit them.
+- Start with `git diff --check`, then the applicable [validation](docs/development.md#validation).
+  Use `--locked`; root Cargo commands do not cover separate provider workspaces.
+  Markdown-only work uses [documentation gates](docs/development.md#documentation-gates), not Rust builds.
+- Check disk before expensive builds; follow the documented artifact lifecycle.
+  Never delete active builds or another owner's artifacts.
+- Report checks actually observed, exact head/artifact tested and verification gaps.
+  Local tests do not prove deployed behavior or remote CI; never claim otherwise.
+- Follow the [PR checklist](docs/development.md#before-opening-a-pull-request); required CI and human review precede merge.
+  Automated agents never approve their own changes.
