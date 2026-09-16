@@ -346,8 +346,15 @@ ride the `gateway.message.received` log event below. `agent.reply.declined`
 records only the model-turn number. `unreported-capability-work` is a stable failure category whose
 fixed chat warning directs the sender to audit before retrying.
 
-Every transport reconnects on one jittered exponential backoff, and the jitter comes from the
-operating system. `gateway_transport_jitter_unavailable` is the warn-level record of an OS that
+Every transport uses the shared [bounded recovery policy](dekopond.md#connection-recovery).
+`gateway_transport_recovering` carries the configured `transport`, stable error `category`,
+episode `failure` count and `delay_ms`, never credentials or raw response bodies.
+`gateway_transport_connected` records successful initial and recovered connections.
+`gateway_stopped` with `reason=transport-failed`, followed by `gateway_exit`, means any one reader
+exhausted recovery, failed permanently or panicked; healthy peers no longer mask a dead transport.
+Additional reader failures discovered while joining aborted peers emit `gateway_transport_stopped`
+(name and category) or `gateway_transport_task_failed` (task error).
+The exponential backoff jitter comes from the operating system. `gateway_transport_jitter_unavailable` is the warn-level record of an OS that
 refused entropy, carrying the `getrandom` failure and nothing else; that attempt's delay falls back
 to its unjittered step, which costs a fleet its de-synchronization rather than its reconnect. Two
 other records name the same refusal at their own sites: `session_trace_entropy_unavailable` (warn)

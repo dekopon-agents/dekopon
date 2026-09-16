@@ -1866,3 +1866,99 @@ async fn the_trace_carries_one_progress_record_per_event_and_no_prompt_script_or
         .unwrap_or_else(|| panic!("the answer is on the trace: {records:#?}"));
     assert!(answered.contains("Upper-cased."), "{answered}");
 }
+
+/// A subprocess guard: a failed assertion must not leave a gateway running after this test.
+struct GatewayChild(std::process::Child);
+
+impl Drop for GatewayChild {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.kill() {
+            eprintln!("test gateway kill: {error}");
+        }
+        if let Err(error) = self.0.wait() {
+            eprintln!("test gateway wait: {error}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_healthy_chat_serves_during_peer_recovery_then_fatal_failure_exits_nonzero() {
+    let fixture = boot(vec![final_answer("Healthy transport answered.")]).await;
+    let directory = fixture.directory.path();
+    let mut config: Value =
+        serde_json::from_slice(&fs::read(directory.join("dekopond.json")).expect("gateway config"))
+            .expect("config JSON");
+    let healthy = directory.join("second.sock");
+    let missing_parent = directory.join("not-yet-created");
+    let recovering = missing_parent.join("recovering.sock");
+    config["transports"][0]["socketPath"] = json!(healthy);
+    config["transports"]
+        .as_array_mut()
+        .expect("transports")
+        .push(json!({
+            "name": "recovering", "kind": "local", "socketPath": recovering,
+        }));
+    config["shutdownGraceMs"] = json!(100);
+    let path = directory.join("recovery.json");
+    write_owner_only(
+        &path,
+        &serde_json::to_vec(&config).expect("config serializes"),
+    );
+    let log_path = directory.join("child.log");
+    let mut child = GatewayChild(
+        std::process::Command::new(env!("CARGO_BIN_EXE_dekopond"))
+            .arg("--config")
+            .arg(&path)
+            .stdout(fs::File::create(&log_path).expect("log file"))
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("gateway subprocess"),
+    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !healthy.exists() {
+            assert!(
+                child.0.try_wait().expect("child status").is_none(),
+                "gateway must stay alive during recovery"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("healthy listener starts independently");
+    let reply = tokio::task::spawn_blocking(move || {
+        ask(&healthy, MAPPED_SUBJECT, "answer while the peer retries")
+    })
+    .await
+    .expect("healthy request");
+    assert_eq!(reply, "Healthy transport answered.");
+
+    // Turn a retryable missing parent into a permanent protected-path refusal. The same fatal
+    // supervision path handles bounded retry exhaustion (covered with paused time in unit tests).
+    fs::create_dir(&missing_parent).expect("create missing parent");
+    write_owner_only(&recovering, b"protected non-socket");
+    let status = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if let Some(status) = child.0.try_wait().expect("child status") {
+                break status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("fatal transport failure exits promptly despite a healthy peer");
+    assert_eq!(status.code(), Some(1));
+    let logs = fs::read_to_string(log_path).expect("subprocess logs");
+    for event in [
+        "gateway_transport_recovering",
+        "gateway_stopped",
+        "gateway_exit",
+    ] {
+        assert!(logs.contains(event), "missing {event}: {logs}");
+    }
+    assert!(logs.contains("transport-failed") && logs.contains("recovering"));
+    assert_eq!(
+        fs::read(&recovering).expect("protected file survives"),
+        b"protected non-socket"
+    );
+    fixture.shutdown().await;
+}

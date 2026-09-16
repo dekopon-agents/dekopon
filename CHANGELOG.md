@@ -7,6 +7,13 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- Recover startup and established chat-transport failures through one bounded exponential-backoff
+  extension across Slack, Discord, Telegram, WhatsApp and local. Healthy transports serve during
+  recovery; flapping spends a finite budget, and any terminal failure drains the gateway and exits
+  nonzero for a supervisor restart without replaying outbound effects.
+
 ## [0.16.0] - 2026-09-15
 
 ### Added

@@ -75,11 +75,6 @@ const MAX_GRAPH_RESPONSE_BYTES: usize = 16 * 1024;
 const MAX_WHATSAPP_TEXT_CHARS: usize = 4096;
 /// One refusal reason is reported at most this often, with the count it stands for.
 const REFUSAL_LOG_WINDOW: Duration = Duration::from_secs(60);
-/// How long the accept loop waits after running out of descriptors or socket buffers.
-///
-/// Shared with the broker's two accept loops so a wait tuned in one place is not silently
-/// different here.
-const ACCEPT_BACKOFF: Duration = Duration::from_millis(dekopon_core::ACCEPT_BACKOFF_MS);
 
 pub(crate) struct WhatsappTransport {
     name: String,
@@ -346,9 +341,8 @@ impl ChatTransport for WhatsappTransport {
                         accepted = listener.accept() => {
                             let stream = match accepted {
                                 Ok((stream, _peer)) => stream,
-                                // One failed accept is not a failed listener. Ending the loop here
-                                // is permanent — nothing restarts a transport reader — so only a
-                                // socket that can never serve again may end it.
+                                // Peer-local errors do not disturb the listener. Resource exhaustion
+                                // and listener failure go through bounded shared recovery.
                                 Err(error) => match classify_accept(&error) {
                                     AcceptFailure::Connection => {
                                         tracing::debug!(
@@ -366,8 +360,7 @@ impl ChatTransport for WhatsappTransport {
                                             kind = "exhausted",
                                             error = %error,
                                         );
-                                        tokio::time::sleep(ACCEPT_BACKOFF).await;
-                                        continue;
+                                        return;
                                     }
                                     AcceptFailure::Fatal => {
                                         tracing::error!(
@@ -1912,7 +1905,7 @@ mod tests {
     }
 
     #[test]
-    fn only_an_unusable_listening_socket_ends_the_accept_loop() {
+    fn accept_failures_distinguish_peer_errors_resource_exhaustion_and_listener_loss() {
         for kind in [
             io::ErrorKind::ConnectionAborted,
             io::ErrorKind::ConnectionReset,

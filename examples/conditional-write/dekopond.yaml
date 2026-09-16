@@ -16,6 +16,8 @@ broker:
   socketPath: /home/xavier/.local/run/dekopon/broker.sock
   serverUid: 501
 
+# Each adapter connects independently with bounded exponential recovery; a terminal failure
+# drains and exits the gateway nonzero. No extra recovery configuration is required.
 transports:
   - name: workspace-slack
     kind: slackSocketMode
