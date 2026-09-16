@@ -36,11 +36,11 @@ The operator surface on top:
 
 - Strict YAML and JSON agent resources, with duplicate, invalid-name and unknown-field detection reported in one refusal.
 - Isolated model-account authentication through `dekopond auth`, with table, wide, JSON, YAML, and name status output.
-- A chat gateway over Slack Socket Mode, Discord Gateway, Telegram long polling, a signed text-only Meta WhatsApp Cloud API webhook, and an owner-only local socket. Authenticated messages route to catalog agents while the broker remains the only authority.
+- A chat gateway over Slack Socket Mode, Discord Gateway, Telegram long polling, a signed Meta WhatsApp Cloud API webhook with bounded PNG/JPEG photo inputs, and an owner-only local socket. Authenticated messages route to catalog agents while the broker remains the only authority.
 - Attachments a person sends: an image or document becomes a numbered chat asset named in the prompt, which a model opens on demand rather than carrying on every turn, under media-type, byte, attempt, and per-conversation limits.
-- Opt-in native liveness after fresh authorization: a typing lease, a reaction, one editable progress message that becomes the answer in place, and an optionally streamed answer, driven by one per-session policy task, with Slack Agent Working/Stop sessions and a classic `:tangerine:` reaction fallback. A liveness failure never changes the answer, and a stop — a native Stop, a cancel button, a configured stop word, an operator shutdown, or a wall-clock bound — is cooperative rather than rollback.
+- Opt-in native liveness after fresh authorization: automatic progress prefers native status or a typing/reaction indicator over redundant progress messages; explicit editable progress and optional answer streaming remain available, driven by one per-session policy task, with Slack Agent Working/Stop sessions and a classic `:tangerine:` reaction fallback. A liveness failure never changes the answer, and a stop — a native Stop, a cancel button, a configured stop word, an operator shutdown, or a wall-clock bound — is cooperative rather than rollback.
 - Slack Agent channel threads owned per authenticated sender after fresh authorization: that sender continues without repeating the mention, and the optional `decline_chat_reply` decision lets the agent post nothing when a reply would only take the last word. Ambient channel history never reaches routing or inference.
-- Image generation is a broker-authorized provider effect, not a gateway model tool. Route-scoped `providerAttachments` delivers bounded provider-produced PNGs to Slack, Discord, Telegram, or the local socket; `chatAssetInputs` lets listed capabilities receive an inbound attachment by reference. Neither direction passes attachment bytes through the model.
+- Image generation is a broker-authorized provider effect, not a gateway model tool. Route-scoped `providerAttachments` delivers bounded provider-produced PNGs to Slack, Discord, Telegram, WhatsApp, or the local socket; `chatAssetInputs` lets listed capabilities receive an inbound attachment by reference. Neither direction passes attachment bytes through the model.
 
 ## What does not work yet
 
@@ -71,12 +71,12 @@ From there, [`examples/conditional-write`](examples/conditional-write/README.md)
 Three provenance-attested archives — macOS on ARM64, and Linux on ARM64 and x86-64 — are attached to each [GitHub release](https://github.com/dekopon-agents/dekopon/releases). Each carries the daemon executables, the example component, and the broker and gateway configuration contracts, with a `.sha256` sidecar beside it:
 
 ```console
-gh release download v0.15.2 --repo dekopon-agents/dekopon \
-  --pattern 'dekopon-0.15.2-aarch64-apple-darwin.tar.gz*'
-shasum -a 256 -c dekopon-0.15.2-aarch64-apple-darwin.tar.gz.sha256
+gh release download v0.16.0 --repo dekopon-agents/dekopon \
+  --pattern 'dekopon-0.16.0-aarch64-apple-darwin.tar.gz*'
+shasum -a 256 -c dekopon-0.16.0-aarch64-apple-darwin.tar.gz.sha256
 gh attestation verify --repo dekopon-agents/dekopon \
-  dekopon-0.15.2-aarch64-apple-darwin.tar.gz
-tar xzf dekopon-0.15.2-aarch64-apple-darwin.tar.gz
+  dekopon-0.16.0-aarch64-apple-darwin.tar.gz
+tar xzf dekopon-0.16.0-aarch64-apple-darwin.tar.gz
 ```
 
 ### crates.io
