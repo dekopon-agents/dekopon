@@ -5,7 +5,7 @@ use std::{net::IpAddr, time::Instant};
 use tracing::Instrument as _;
 
 use crate::transport::hydration::HydratedImage;
-use dekopon_agent::attachment::GeneratedImage;
+use dekopon_agent::attachment::validate_png;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
 use super::*;
@@ -299,7 +299,7 @@ impl AssetFetcher for WhatsappDriver {
             }
             // Match the existing courier's signature-level validation, not full image decoding.
             let valid = match mime.as_str() {
-                "image/png" => GeneratedImage::from_png(bytes.clone()).is_ok(),
+                "image/png" => validate_png(&bytes).is_ok(),
                 "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
                 _ => false,
             };

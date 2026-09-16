@@ -1050,6 +1050,13 @@ impl AssetStore {
                     .retention
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
+                // Record the completed download before any fallible size, cleanup or admission
+                // check: successfully downloaded inputs must never silently fetch twice.
+                entries
+                    .get_mut(key)
+                    .and_then(|entry| entry.assets.iter_mut().find(|asset| asset.id == id))
+                    .ok_or(BlobError::Unauthorized)?
+                    .fetched = true;
                 retention.check_size(id, bytes.len())?;
                 // Retired/expired inventories lose cache residency, but active pins stay charged until
                 // a later blocking admission can safely dispose their sole remaining cache owner.
@@ -1072,8 +1079,6 @@ impl AssetStore {
                     .get_mut(key)
                     .and_then(|entry| entry.assets.iter_mut().find(|asset| asset.id == id))
                     .ok_or(BlobError::Unauthorized)?;
-                // Mark even a failed retention attempt: a downloaded input is never silently fetched twice.
-                asset.fetched = true;
                 let data = retention.admit((key.clone(), id), bytes)?;
                 asset.size = data.len() as u64;
                 Ok(data)
@@ -1320,6 +1325,166 @@ mod retention_tests {
             Box::pin(async { Ok(b"aaa".to_vec()) })
         }
     }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn downloaded_oversize_with_unknown_or_underreported_size_never_redownloads() {
+        for reported_size in [0, 1] {
+            let store = store(2);
+            let access = access("one");
+            let id = store
+                .assets_for_access(
+                    &access,
+                    vec![PendingAsset {
+                        name: "input.png".into(),
+                        mime: "image/png".into(),
+                        size: reported_size,
+                        source: Some(AssetSourceRef::Telegram {
+                            file_id: "file".into(),
+                        }),
+                    }],
+                    true,
+                    Instant::now(),
+                )
+                .arrived[0];
+            let fetcher = Arc::new(Fetcher(std::sync::atomic::AtomicUsize::new(0)));
+            let session = SessionAssets::new(
+                store.clone(),
+                access,
+                Some(fetcher.clone()),
+                Handle::current(),
+                true,
+                true,
+            );
+            tokio::task::spawn_blocking(move || {
+                let first = session.fetch(id).unwrap_err();
+                assert!(
+                    first.contains("attachment exceeds the byte limit"),
+                    "{first}"
+                );
+                assert_eq!(fetcher.0.load(Ordering::Relaxed), 1);
+                let second = session.fetch(id).unwrap_err();
+                assert!(
+                    second.contains("released") && second.contains("ask the user to resend"),
+                    "{second}"
+                );
+                assert!(second.contains("No automatic refetch"), "{second}");
+                assert_eq!(
+                    session.fetch_for_capability(id).unwrap_err(),
+                    ChatAssetRefusal::Reclaimed
+                );
+                assert_eq!(fetcher.0.load(Ordering::Relaxed), 1);
+                let cache = store.retention.lock().unwrap();
+                assert_eq!(cache.bytes, 0);
+                assert!(cache.resident.is_empty());
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn metadata_oversize_refuses_before_transport_download() {
+        let store = store(2);
+        let access = access("one");
+        let id = register(&store, &access); // Reported three bytes cannot fit the two-byte budget.
+        let fetcher = Arc::new(Fetcher(std::sync::atomic::AtomicUsize::new(0)));
+        let session = SessionAssets::new(
+            store.clone(),
+            access.clone(),
+            Some(fetcher.clone()),
+            Handle::current(),
+            true,
+            true,
+        );
+        tokio::task::spawn_blocking(move || {
+            for _ in 0..2 {
+                assert!(
+                    session
+                        .fetch(id)
+                        .unwrap_err()
+                        .contains("attachment exceeds the byte limit")
+                );
+            }
+            assert_eq!(fetcher.0.load(Ordering::Relaxed), 0);
+            assert!(store.pin(&access, id, false).unwrap().is_none());
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn whatsapp_png_validation_does_not_spool_outside_a_full_pinned_budget() {
+        use crate::transport::{
+            ChatTransport as _,
+            whatsapp::tests_media::{MediaPeer, PNG, admitted_photo, bytes_reply, metadata},
+        };
+        use tracing_subscriber::prelude::*;
+
+        let peer = MediaPeer::new(|origin, index| match index {
+            0 => metadata(origin, "image/png", PNG),
+            1 => bytes_reply(PNG),
+            _ => panic!("unexpected redownload"),
+        })
+        .await;
+        let (transport, message) = admitted_photo(&peer.origin, "image/png", None).await;
+        let store = store(PNG.len());
+        let access = access("one");
+        let pinned_id = register(&store, &access);
+        let id = store
+            .assets_for_access(&access, message.assets, true, Instant::now())
+            .arrived[0];
+        let session = SessionAssets::new(
+            store.clone(),
+            access.clone(),
+            transport.asset_fetcher(),
+            Handle::current(),
+            true,
+            true,
+        );
+        tokio::task::spawn_blocking(move || {
+            let capture = dekopon_test_support::CaptureLayer::workspace();
+            let _guard = tracing_subscriber::registry()
+                .with(capture.clone())
+                .set_default();
+            let pin = store.admit(&access, pinned_id, PNG).unwrap();
+            let is_write = |record: &dekopon_test_support::Record| {
+                matches!(record,
+                dekopon_test_support::Record::Span { name: "asset.spool", fields, .. }
+                if fields.contains("write"))
+            };
+            assert!(
+                capture.records().iter().any(is_write),
+                "capture must observe actual spool writes"
+            );
+            let before = capture.records().len();
+            assert!(
+                session
+                    .fetch(id)
+                    .unwrap_err()
+                    .contains("scratch capacity exhausted")
+            );
+            assert!(
+                !capture.records()[before..].iter().any(is_write),
+                "PNG validation must not spool before budget admission"
+            );
+            assert_eq!(store.retention.lock().unwrap().bytes, PNG.len());
+            assert_eq!(pin.read().unwrap(), PNG);
+            assert!(
+                session
+                    .fetch(id)
+                    .unwrap_err()
+                    .contains("ask the user to resend")
+            );
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            peer.requests.lock().unwrap().len(),
+            2,
+            "one metadata lookup and one download"
+        );
+        peer.finish().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn fetch_once_reclaimed_provider_and_model_refuse_without_redownload() {
         let store = store(3);

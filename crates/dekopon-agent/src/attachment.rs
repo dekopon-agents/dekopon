@@ -36,6 +36,21 @@ pub const ATTACHMENT_MEDIA_TYPE: &str = "image/png";
 
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 
+/// Checks the shared PNG byte ceiling and signature without creating a scratch file.
+///
+/// # Errors
+/// Returns [`AttachmentRefusal::TooLarge`] or [`AttachmentRefusal::UnsupportedMedia`].
+/// This is signature validation only, not full image decoding.
+pub fn validate_png(data: &[u8]) -> Result<(), AttachmentRefusal> {
+    if data.len() > MAX_ATTACHMENT_BYTES {
+        return Err(AttachmentRefusal::TooLarge);
+    }
+    if !data.starts_with(PNG_SIGNATURE) {
+        return Err(AttachmentRefusal::UnsupportedMedia);
+    }
+    Ok(())
+}
+
 /// Expansions one invocation's input may make.
 ///
 /// Three because that is what a remix of a handful of reference images needs, and because each one
@@ -101,12 +116,7 @@ impl GeneratedImage {
     /// [`AttachmentRefusal::UnsupportedMedia`] when the bytes do not carry the PNG signature,
     /// whatever media type the producer declared.
     pub fn from_png(data: Vec<u8>) -> Result<Self, AttachmentRefusal> {
-        if data.len() > MAX_ATTACHMENT_BYTES {
-            return Err(AttachmentRefusal::TooLarge);
-        }
-        if !data.starts_with(PNG_SIGNATURE) {
-            return Err(AttachmentRefusal::UnsupportedMedia);
-        }
+        validate_png(&data)?;
         Ok(Self {
             data: DiskBlob::from_bytes(&data).map_err(AttachmentRefusal::Storage)?,
         })
@@ -427,12 +437,7 @@ fn accept(
         .decode(&attachment.base64)
         .map_err(|_| AttachmentRefusal::InvalidEncoding)?;
     let bytes = data.len();
-    if bytes > MAX_ATTACHMENT_BYTES {
-        return Err(AttachmentRefusal::TooLarge);
-    }
-    if !data.starts_with(PNG_SIGNATURE) {
-        return Err(AttachmentRefusal::UnsupportedMedia);
-    }
+    validate_png(&data)?;
     let mut images = slot
         .images
         .lock()

@@ -9,6 +9,10 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Fixed
 
+- Validate inbound WhatsApp PNG signatures without unaccounted scratch writes. Completed asset
+  downloads that exceed retention limits now remain unavailable without silently redownloading;
+  known-oversized inputs still refuse before transport IO.
+
 - Collect media-first WhatsApp bursts before admission (`debounceMs: 3000` by default, `0` for
   immediate behavior) and Telegram native media groups in a separate fixed 3-second window.
   Bounded, actor-isolated inputs share one lead reply and causally linked execution; fixed-window
