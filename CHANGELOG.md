@@ -7,6 +7,32 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-09-15
+
+### Added
+
+- WhatsApp PNG/JPEG photo/caption inputs now use the scoped lazy chat-asset flow for broker-authorized
+  image editing, and provider PNG output uses bounded Graph media upload and image-ID replies.
+  Existing `chatAssetInputs` and `providerAttachments` opt-ins apply; the gateway never holds an
+  image-provider credential. WhatsApp enforces a 5,000,000-byte image ceiling, pinned media hosts,
+  caption bounds, and partial-message acceptance without automatic retries.
+
+### Changed
+
+- Enabled gateway liveness now defaults to `progress: auto`, preferring native status or
+  typing/reaction over redundant progress messages. Explicit `message` remains supported;
+  progress/detail Off no longer suppresses requested answer streaming. Auto preserves explicit
+  message-backed Stop controls, and configurations that would hide them are refused. Slack's
+  definitive native-status refusal tries its configured fallback in the same session; WhatsApp
+  remains typing-only. Absent/master-Off liveness stays disabled
+  ([migration](docs/upgrading.md#native-first-progress-0160)).
+
+### Fixed
+
+- Update the locked `rustls` dependency to 0.23.45 (and its required `rustls-webpki` dependency to
+  0.103.15), fixing TLS 1.3 handshake messages accepted across encryption-level boundaries
+  ([RUSTSEC-2026-0285](https://rustsec.org/advisories/RUSTSEC-2026-0285)).
+
 ## [0.15.2] - 2026-09-14
 
 ### Added

@@ -8,6 +8,21 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Native-first progress (0.16.0)
+
+An absent liveness block and `mode: off` remain disabled. Inside enabled liveness, omitted
+`progress` now means `auto`: native status or typing/reaction avoids redundant placeholder posts,
+with delayed message fallback only where supported. Explicit `progress: message` is unchanged;
+change it to `auto` to prefer the native indicator and a fresh complete answer. `progress: off`
+suppresses prose only.
+
+`progressDetail: off` no longer suppresses explicitly requested answer streaming. Set `stream: false`
+if that coupling previously kept answers unstreamed. Streaming still requires enabled liveness and
+an implemented stream surface. Explicit Auto cancel buttons retain message-backed controls; a
+button with progress Off and no stream, or an effective detail-Off route without streaming, now
+refuses startup rather than silently hiding the button. WhatsApp stream/button refusals remain.
+See [current presentation behavior and limitations](dekopond.md#liveness-progress-and-stopping-a-run).
+
 ## `activity:` becomes `liveness:` (0.14.0)
 
 Rename the `activity:` block on every transport in the gateway configuration to `liveness:` before
@@ -28,13 +43,14 @@ arrives on its own instead of beside every other problem in the file.
     liveness:
       mode: native                 # off | native, unchanged
       classicFallback: reaction    # unchanged; slackSocketMode only, and refused elsewhere
-      progress: message            # new; off by default, so nothing new is posted until you ask
+      progress: message            # explicit editable progress
       stream: false                # new; refused on whatsappCloudApi
       cancelButton: false          # new; refused on whatsappCloudApi and on experience: agent
 ```
 
 `mode` and `classicFallback` keep their meanings and their values, so a rename alone reproduces
-today's behavior exactly: `progress`, `stream`, and `cancelButton` all default off. The block is now
+the reply-only behavior with `mode: off`. With `mode: native`, progress now defaults to Auto;
+`stream` and `cancelButton` still default off. The block is now
 accepted on `whatsappCloudApi` and `local` too, which previously had none.
 
 Three settings are new and optional:
@@ -896,7 +912,8 @@ update looks like a working deployment with no Working UI.
   configuration using `localhost` for a test override is a startup failure.
 - **A route naming an image generator on the text-only WhatsApp transport is a startup failure**
   rather than a paid-for PNG with no delivery path. (The `imageGenerator:` block itself was removed
-  after 0.12.0; the equivalent refusal now covers `providerAttachments`.)
+  after 0.12.0. Current WhatsApp routes support `providerAttachments` and bounded image editing;
+  see the [current transport contract](dekopond.md#meta-whatsapp-cloud-api).)
 - **Provider storage and durable chat memory are opt-in and all-or-nothing.** Adding the `storage`
   or `chatMemory` section to `broker.yaml` requires every field in it; omitting the section leaves
   the broker exactly as it was.

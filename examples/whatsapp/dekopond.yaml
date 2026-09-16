@@ -12,15 +12,18 @@ transports:
     callbackPath: /webhooks/whatsapp
     wabaId: "REPLACE_WITH_CANONICAL_NUMERIC_WABA_ID"
     phoneNumberId: "REPLACE_WITH_CANONICAL_NUMERIC_RECEIVING_PHONE_NUMBER_ID"
-    graphApiVersion: v23.0
+    graphApiVersion: v25.0
 models:
   - name: local
     kind: openaiCompatible
     endpoint: http://127.0.0.1:11434/v1
-    model: qwen3
+    model: REPLACE_WITH_IMAGE_CAPABLE_MODEL
+    modalities: [image]
     timeoutMs: 120000
     classes: [reasoning]
 routes:
   - transport: support-whatsapp
     conversation: { kind: [directMessage] }
-    agent: reviewer
+    agent: image-editor
+    chatAssetInputs: [gpt-image.edit]
+    providerAttachments: { maxPerReply: 1 }

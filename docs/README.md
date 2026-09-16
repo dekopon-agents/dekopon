@@ -15,6 +15,7 @@ Read in this order:
 5. [`cli.md`](cli.md) and [`dekopond.md`](dekopond.md) — the operator command surfaces and the long-running gateway.
    [`catalog.md`](catalog.md) is the field-by-field contract for the resources they all read, including which fields are load-bearing and which are reserved.
    [`chat-progress.md`](chat-progress.md) is the design of record for what a waiting person is shown while a session runs and for every way one is stopped.
+   [`native-first-chat-progress.md`](native-first-chat-progress.md) is an **Exploration** proposing native-first selection, independent answer streaming, and bounded fallback; it is not implemented.
    [`chatgpt-credential.md`](chatgpt-credential.md) follows the ChatGPT subscription credential from a local login to a pod.
 6. [`inference.md`](inference.md) — exact model request types and wire shape, prompt-cache optimization and retention caveats, bounded chat history, durable on-demand chat turns, and the broader memory design space.
 7. [`observability.md`](observability.md) — gateway and broker OTLP traces, the broker audit record and where it goes, what telemetry excludes, and the OpenObserve development example.

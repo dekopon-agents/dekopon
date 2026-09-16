@@ -823,6 +823,177 @@ async fn a_stream_is_the_surface_and_no_progress_message_is_posted() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn auto_selects_existing_indicators_and_only_falls_back_to_supported_messages() {
+    // Capability shapes, not transport-name branching: Slack Agent/classic, Telegram/Discord,
+    // WhatsApp, an editable-only transport, and a reply-only transport.
+    for (name, status, typing, reaction, progress, expected) in [
+        (
+            "slack-agent",
+            true,
+            false,
+            false,
+            true,
+            Some(Call::Status(Status::Working)),
+        ),
+        (
+            "slack-classic",
+            false,
+            false,
+            true,
+            true,
+            Some(Call::Reaction(true)),
+        ),
+        (
+            "telegram-discord",
+            false,
+            true,
+            true,
+            true,
+            Some(Call::Typing),
+        ),
+        ("whatsapp", false, true, false, false, Some(Call::Typing)),
+        ("editable-only", false, false, false, true, None),
+        ("reply-only", false, false, false, false, None),
+    ] {
+        let mut config = ticking();
+        Arc::get_mut(&mut config)
+            .expect("unshared fixture")
+            .settings
+            .progress = ProgressSurface::Auto;
+        let mut harness = start(
+            Offers {
+                status,
+                typing,
+                reaction,
+                progress,
+                stream: false,
+                cancel_button: false,
+            },
+            ProgressDetail::Plain,
+            config,
+        );
+        harness.sink.emit(started());
+        settle().await;
+        assert_eq!(
+            harness.recorder.calls(),
+            expected.clone().into_iter().collect::<Vec<_>>(),
+            "{name}"
+        );
+        for turn in 1..=4 {
+            harness.sink.emit(answered_with_tool(turn));
+        }
+        advance(Duration::from_secs(16)).await;
+        let message_expected = expected.is_none() && progress;
+        assert_eq!(
+            !harness.recorder.texts().is_empty(),
+            message_expected,
+            "{name}"
+        );
+        assert!(
+            harness
+                .policy
+                .terminal(Terminal::Answered(OutboundReply::text("done")))
+                .await
+        );
+        settle().await;
+        assert_eq!(
+            harness.recorder.writes().last(),
+            Some(&if message_expected {
+                Call::Finalize("done".to_owned())
+            } else {
+                Call::Reply("done".to_owned())
+            }),
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn answer_streaming_is_independent_of_progress_and_detail_off() {
+    for progress in [
+        ProgressSurface::Auto,
+        ProgressSurface::Off,
+        ProgressSurface::Message,
+    ] {
+        let mut config = liveness(true);
+        Arc::get_mut(&mut config)
+            .expect("unshared fixture")
+            .settings
+            .progress = progress;
+        let mut harness = start(
+            Offers {
+                stream: true,
+                ..Offers::default()
+            },
+            ProgressDetail::Off,
+            config,
+        );
+        harness.sink.emit(started());
+        harness.sink.emit(answered_with_tool(1));
+        settle().await;
+        assert!(harness.recorder.writes().is_empty());
+        let text = recorded_delta();
+        harness.sink.emit(ProgressEvent::TextDelta {
+            turn: 1,
+            cumulative_chars: text.as_str().chars().count(),
+            text: text.clone(),
+        });
+        settle().await;
+        assert_eq!(
+            harness.recorder.writes(),
+            vec![Call::Stream(text.as_str().to_owned())]
+        );
+        assert!(
+            harness
+                .policy
+                .terminal(Terminal::Answered(OutboundReply::text("done")))
+                .await
+        );
+        assert_eq!(
+            harness.recorder.writes().last(),
+            Some(&Call::StreamFinalize("done".to_owned()))
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn auto_preserves_explicit_buttons_and_disabled_liveness() {
+    for (mode, button, expect_message) in [
+        (LivenessMode::Native, true, true),
+        (LivenessMode::Off, false, false),
+    ] {
+        let mut config = liveness(false);
+        let settings = &mut Arc::get_mut(&mut config)
+            .expect("unshared fixture")
+            .settings;
+        settings.progress = ProgressSurface::Auto;
+        settings.mode = mode;
+        settings.cancel_button = button;
+        let mut harness = start(
+            Offers {
+                cancel_button: button,
+                ..Offers::default()
+            },
+            ProgressDetail::Plain,
+            config,
+        );
+        harness.sink.emit(started());
+        harness.sink.emit(answered_with_tool(1));
+        settle().await;
+        assert_eq!(!harness.recorder.texts().is_empty(), expect_message);
+        if mode == LivenessMode::Off {
+            assert!(harness.recorder.calls().is_empty());
+        }
+        assert!(
+            harness
+                .policy
+                .terminal(Terminal::Answered(OutboundReply::text("done")))
+                .await
+        );
+    }
+}
+
 /// Past the surface's ceiling the stream shows a bounded prefix and says it was cut.
 ///
 /// The policy owns the cut and the flag; the driver owns the marker. Both halves are asserted here

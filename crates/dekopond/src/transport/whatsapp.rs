@@ -1,8 +1,12 @@
-//! Meta WhatsApp Cloud API webhook and text reply transport.
+//! Meta WhatsApp Cloud API webhook and text/image reply transport.
 //!
 //! TLS terminates outside this daemon. The listener verifies Meta's signature over the exact raw
 //! body before parsing, claims message IDs in a bounded process-local set, enqueues a whole delivery
 //! atomically, and acknowledges before any session or model work begins.
+
+mod media;
+#[cfg(test)]
+pub(crate) mod tests_media;
 
 use std::{
     collections::VecDeque,
@@ -31,11 +35,13 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tracing::{Instrument as _, Span};
 
 use crate::{
+    asset::{AssetSourceRef, PendingAsset},
     config::{LivenessMode, LivenessSettings},
     transport::{
-        ChatDriver, ChatTransport, InboundMessage, LivenessTarget, OutboundReply, ReplyTarget,
-        SeenIds, TextUnit, TransportError, TransportEvent, TransportIdentity, TypingLease,
-        bound_inbound, credential_client, receive_span, record_conversation, split_message,
+        AssetFetcher, ChatDriver, ChatTransport, InboundMessage, LivenessTarget, OutboundReply,
+        ReplyTarget, SeenIds, TextUnit, TransportError, TransportEvent, TransportIdentity,
+        TypingLease, bound_inbound, credential_client, receive_span, record_conversation,
+        split_message,
     },
 };
 
@@ -266,8 +272,9 @@ impl WhatsappTransport {
     ) -> Result<Self, TransportError> {
         let (sender, receiver) = mpsc::channel(WEBHOOK_QUEUE);
         let http = credential_client(GRAPH_REQUEST_TIMEOUT)
+            .dns_resolver(Arc::new(media::WhatsappResolver))
             .build()
-            .map_err(|source| TransportError::Request(Box::new(source)))?;
+            .map_err(|source| TransportError::Request(Box::new(source.without_url())))?;
         let driver = Arc::new(WhatsappDriver {
             transport: name.clone(),
             endpoint: graph_endpoint,
@@ -436,6 +443,10 @@ impl ChatTransport for WhatsappTransport {
                 }
             }
         })
+    }
+
+    fn asset_fetcher(&self) -> Option<Arc<dyn AssetFetcher>> {
+        Some(Arc::clone(&self.driver) as Arc<dyn AssetFetcher>)
     }
 
     /// One handle for replying and for the one liveness surface the Cloud API has.
@@ -649,15 +660,39 @@ fn parse_delivery(
             };
             let contacts = value.get("contacts").and_then(Value::as_array);
             for (index, message) in messages.iter().enumerate() {
-                if message.get("type").and_then(Value::as_str) != Some("text") {
-                    continue;
-                }
-                let (Some(id), Some(sender), Some(text)) = (
+                let (Some(id), Some(sender)) = (
                     message.get("id").and_then(Value::as_str),
                     message.get("from").and_then(Value::as_str),
-                    message.pointer("/text/body").and_then(Value::as_str),
                 ) else {
                     continue;
+                };
+                let (text, assets) = match message.get("type").and_then(Value::as_str) {
+                    Some("text") => {
+                        let Some(text) = message.pointer("/text/body").and_then(Value::as_str)
+                        else {
+                            continue;
+                        };
+                        if text.trim().is_empty() {
+                            continue;
+                        }
+                        (text, Vec::new())
+                    }
+                    Some("image") => {
+                        let Some(asset) = media::inbound_image(&message["image"]) else {
+                            tracing::debug!(
+                                event = "gateway_message_ignored",
+                                reason = "image-metadata"
+                            );
+                            continue;
+                        };
+                        let caption = match message["image"].get("caption") {
+                            None => "",
+                            Some(Value::String(caption)) => caption,
+                            Some(_) => continue,
+                        };
+                        (caption, vec![asset])
+                    }
+                    _ => continue,
                 };
                 // An individual message, positively: the delivery's `contacts` name the human the
                 // Cloud API would send a reply to, and on an individual message exactly one of
@@ -690,7 +725,6 @@ fn parse_delivery(
                     || sender.len() > 64
                     || sender.starts_with('0')
                     || !sender.bytes().all(|byte| byte.is_ascii_digit())
-                    || text.trim().is_empty()
                     || own_number.as_deref() == Some(sender)
                 {
                     continue;
@@ -718,7 +752,7 @@ fn parse_delivery(
                     conversation,
                     message_id: id.to_owned(),
                     text: bound_inbound(text),
-                    assets: Vec::new(),
+                    assets,
                     addressed: None,
                     thread_continuation: None,
                     reply: ReplyTarget::WhatsApp {
@@ -900,7 +934,7 @@ impl WhatsappDriver {
             .body(payload)
             .send()
             .await
-            .map_err(|source| TransportError::Request(Box::new(source)))?;
+            .map_err(|source| TransportError::Request(Box::new(source.without_url())))?;
         let status = response.status();
         let bytes = bounded_response(response).await?;
         if !status.is_success() {
@@ -971,7 +1005,7 @@ impl TypingLease for WhatsappDriver {
             .timeout(LIVENESS_REQUEST_TIMEOUT)
             .send()
             .await
-            .map_err(|source| TransportError::Request(Box::new(source)))?;
+            .map_err(|source| TransportError::Request(Box::new(source.without_url())))?;
         let status = response.status();
         let bytes = bounded_response(response).await?;
         if !status.is_success() {
@@ -1008,31 +1042,29 @@ impl ChatDriver for WhatsappDriver {
             return Err(TransportError::Response);
         };
         let OutboundReply { text, images } = reply;
-        if !images.is_empty() {
-            // Configuration refuses provider attachments on a WhatsApp route, so reaching here
-            // means the two disagree. Say which one rather than dropping bytes silently:
-            // sending an image needs Meta's media upload, which this transport does not have.
-            tracing::error!(
-                event = "gateway_whatsapp_image_unsupported",
-                transport = %self.transport,
-            );
-            return Err(TransportError::Response);
+        // Refuse every locally knowable failure before uploading or sending any part.
+        if images
+            .iter()
+            .any(|image| image.bytes().len() > media::MAX_IMAGE_BYTES)
+        {
+            return Err(media::failure("image-too-large"));
         }
+        let caption_fits = !images.is_empty() && text.chars().count() <= media::MAX_CAPTION_CHARS;
         let mut accepted = 0_usize;
+        for (index, image) in images.into_iter().enumerate() {
+            let caption = (caption_fits && index == 0 && !text.is_empty()).then_some(text.as_str());
+            if let Err(error) = self.send_image(recipient, caption, image, index).await {
+                return Err(self.reply_failure(error, accepted));
+            }
+            accepted += 1;
+        }
+        if caption_fits {
+            return Ok(());
+        }
         for chunk in split_message(&text, MAX_WHATSAPP_TEXT_CHARS, TextUnit::Scalar) {
             match self.send_text(recipient, &chunk).await {
                 Ok(()) => accepted += 1,
-                // Name the cause here: the session only learns that a split answer arrived in
-                // part, and the service code behind that is otherwise discarded.
-                Err(error) if accepted > 0 => {
-                    tracing::warn!(
-                        event = "gateway_whatsapp_reply_partial",
-                        category = error.category(),
-                        delivered = accepted,
-                    );
-                    return Err(TransportError::PartialDelivery);
-                }
-                Err(error) => return Err(error),
+                Err(error) => return Err(self.reply_failure(error, accepted)),
             }
         }
         (accepted > 0).then_some(()).ok_or(TransportError::Response)
@@ -1053,7 +1085,8 @@ async fn bounded_response(response: reqwest::Response) -> Result<Vec<u8>, Transp
     let mut bytes = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|source| TransportError::Request(Box::new(source)))?;
+        let chunk =
+            chunk.map_err(|source| TransportError::Request(Box::new(source.without_url())))?;
         if bytes.len().saturating_add(chunk.len()) > MAX_GRAPH_RESPONSE_BYTES {
             return Err(TransportError::Response);
         }
@@ -1072,7 +1105,7 @@ mod tests {
         state_and_receiver().0
     }
 
-    fn state_and_receiver() -> (WebhookState, mpsc::Receiver<QueuedDelivery>) {
+    pub(super) fn state_and_receiver() -> (WebhookState, mpsc::Receiver<QueuedDelivery>) {
         let (sender, receiver) = mpsc::channel(4);
         (
             WebhookState {
@@ -1103,7 +1136,7 @@ mod tests {
         format!("sha256={hex}")
     }
 
-    fn signed_request(body: &[u8]) -> Request {
+    pub(super) fn signed_request(body: &[u8]) -> Request {
         Request::builder()
             .method("POST")
             .header("x-hub-signature-256", signature(b"secret", body))
