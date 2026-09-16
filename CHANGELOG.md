@@ -9,6 +9,12 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Fixed
 
+- Collect media-first WhatsApp bursts before admission (`debounceMs: 3000` by default, `0` for
+  immediate behavior) and Telegram native media groups in a separate fixed 3-second window.
+  Bounded, actor-isolated inputs share one lead reply and causally linked execution; fixed-window
+  expiry attempts admission immediately, never queues behind active sessions. Oversized native
+  Slack/Discord arrays are explicitly refused instead of silently truncated.
+
 - Outbound image hydration and owned scratch disposal now run off async workers with the delivery
   trace context. Local image answers use the existing separate-reply fallback rather than
   finalizing a progress/stream line in place; text-only finalization is unchanged.

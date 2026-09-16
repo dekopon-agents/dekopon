@@ -2971,6 +2971,10 @@ fn message(text: &str) -> InboundMessage {
         // No transport ran, so there is no receipt to hang this message's trace from. A test that
         // asserts on the trace root drives a real transport instead.
         receive_span: tracing::Span::none(),
+        received_at: tokio::time::Instant::now(),
+        native_group: None,
+        constituents: Vec::new(),
+        asset_overflow: false,
     }
 }
 
@@ -3048,6 +3052,10 @@ fn owned_slack_message(text: &str, inherited: bool) -> InboundMessage {
         },
         liveness: None,
         receive_span: tracing::Span::none(),
+        received_at: tokio::time::Instant::now(),
+        native_group: None,
+        constituents: Vec::new(),
+        asset_overflow: false,
     }
 }
 
@@ -6406,6 +6414,7 @@ async fn losing_every_transport_ends_the_daemon_as_a_failure() {
         receiver,
         std::future::pending(),
         Duration::from_secs(1),
+        crate::collection::Collector::new(&[], 4),
     )
     .await;
 
@@ -6427,6 +6436,7 @@ async fn a_requested_shutdown_ends_the_daemon_successfully() {
         receiver,
         std::future::ready(()),
         Duration::from_secs(1),
+        crate::collection::Collector::new(&[], 4),
     )
     .await;
 
@@ -6473,6 +6483,7 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
         &repliers,
         NO_STOP_WORDS,
         &mut sessions,
+        &mut crate::collection::Collector::new(&[], 4),
         ambient,
     );
     assert_eq!(
@@ -6498,6 +6509,7 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
         &repliers,
         NO_STOP_WORDS,
         &mut sessions,
+        &mut crate::collection::Collector::new(&[], 4),
         structurally_unaddressed,
     );
     assert_eq!(sessions.len(), 0, "structured addressing must win");
@@ -6517,6 +6529,7 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
         &repliers,
         NO_STOP_WORDS,
         &mut sessions,
+        &mut crate::collection::Collector::new(&[], 4),
         elsewhere,
     );
     assert_eq!(
@@ -6539,6 +6552,7 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
         &repliers,
         NO_STOP_WORDS,
         &mut sessions,
+        &mut crate::collection::Collector::new(&[], 4),
         addressed,
     );
     assert_eq!(sessions.len(), 1, "an addressed message starts one session");
@@ -6586,6 +6600,7 @@ async fn a_transport_owned_thread_continuation_bypasses_only_the_repeat_mention(
         &repliers,
         NO_STOP_WORDS,
         &mut sessions,
+        &mut crate::collection::Collector::new(&[], 4),
         continuation,
     );
     assert_eq!(
@@ -6643,6 +6658,7 @@ async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
         &repliers,
         NO_STOP_WORDS,
         &mut sessions,
+        &mut crate::collection::Collector::new(&[], 4),
         ambient,
     );
     assert_eq!(
@@ -6667,6 +6683,7 @@ async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
         &repliers,
         NO_STOP_WORDS,
         &mut sessions,
+        &mut crate::collection::Collector::new(&[], 4),
         addressed,
     );
     assert_eq!(sessions.len(), 1, "and being summoned in one is");
@@ -6741,6 +6758,7 @@ async fn a_local_channel_line_reaches_its_route_without_a_mention() {
         &repliers,
         NO_STOP_WORDS,
         &mut sessions,
+        &mut crate::collection::Collector::new(&[], 4),
         message,
     );
 
@@ -10470,6 +10488,7 @@ async fn a_telegram_photo_is_routed_with_its_largest_size() {
             "from": {"id": 16034700182_i64, "is_bot": false},
             "chat": {"id": 4242, "type": "private"},
             "caption": "what does this say?",
+            "media_group_id": "native-album-1",
             "photo": [
                 {"file_id": "thumb", "file_size": 900},
                 {"file_id": "full", "file_size": 214_000}
@@ -10482,6 +10501,7 @@ async fn a_telegram_photo_is_routed_with_its_largest_size() {
 
     let message = next_message(&mut transport).await;
     assert_eq!(message.text, "what does this say?");
+    assert_eq!(message.native_group.as_deref(), Some("native-album-1"));
     assert_eq!(
         message.assets,
         vec![PendingAsset {
@@ -12642,6 +12662,7 @@ async fn unauthorized_and_unrouted_whatsapp_photos_fetch_nothing() {
                 &BTreeMap::new(),
                 &[],
                 &mut sessions,
+                &mut crate::collection::Collector::new(&[], 4),
                 inbound,
             );
             assert!(sessions.is_empty());
@@ -12697,4 +12718,507 @@ async fn whatsapp_asset_numbers_cannot_cross_conversations_or_retired_generation
     }
     assert!(peer.requests.lock().expect("requests").is_empty());
     peer.finish().await;
+}
+
+fn burst_collector(millis: Option<u64>) -> crate::collection::Collector {
+    let mut value = json!({
+        "kind": "whatsappCloudApi", "name": "dev", "appSecretEnv": "APP_SECRET",
+        "verifyTokenEnv": "VERIFY_TOKEN", "accessTokenEnv": "ACCESS_TOKEN",
+        "bind": "127.0.0.1:9080", "callbackPath": "/webhooks/whatsapp", "wabaId": "123",
+        "phoneNumberId": "456", "graphApiVersion": "v25.0"
+    });
+    if let Some(millis) = millis {
+        value["debounceMs"] = json!(millis);
+    }
+    let transport: crate::TransportConfig = serde_json::from_value(value).expect("typed transport");
+    crate::collection::Collector::new(&[transport], 4)
+}
+
+fn burst_photo(text: &str) -> InboundMessage {
+    let mut message = message(text);
+    message.transport_kind = dekopon_broker_protocol::ChatTransportKind::Whatsapp;
+    message.assets = vec![pending("reference.png", "image/png", 12)];
+    message
+}
+
+#[test]
+fn whatsapp_debounce_is_unsigned_strict_and_defaults_to_three_seconds() {
+    use crate::collection::Offered;
+    for (configured, expected) in [(None, 3000), (Some(900), 900), (Some(0), 0)] {
+        let mut collector = burst_collector(configured);
+        let photo = burst_photo("");
+        let start = photo.received_at;
+        let result = collector.offer(0, photo);
+        if expected == 0 {
+            assert!(matches!(result, Offered::Immediate(_)));
+            assert!(collector.deadline().is_none());
+        } else {
+            assert!(matches!(result, Offered::Pending));
+            assert_eq!(
+                collector.deadline(),
+                Some(start + Duration::from_millis(expected))
+            );
+        }
+    }
+    for malformed in [
+        json!(-1),
+        json!(1.5),
+        json!("3000"),
+        json!(null),
+        json!(u64::from(u32::MAX) + 1),
+        json!(u64::MAX),
+    ] {
+        let value = json!({"kind":"whatsappCloudApi", "name":"wa", "appSecretEnv":"APP", "verifyTokenEnv":"VERIFY", "accessTokenEnv":"ACCESS", "bind":"127.0.0.1:9080", "callbackPath":"/wa", "wabaId":"123", "phoneNumberId":"456", "graphApiVersion":"v25.0", "debounceMs":malformed});
+        assert!(serde_json::from_value::<crate::TransportConfig>(value).is_err());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn photo_burst_three_references_and_edit_prompt_make_one_authorized_model_turn() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+        )],
+    )
+    .await;
+    let models = ModelScript::new([answer("Edited together.")]);
+    let driver = Arc::new(RecordingDriver::default());
+    let mut collector = burst_collector(None);
+    for (index, caption) in ["first reference", "", "third reference"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut photo = burst_photo(caption);
+        photo.assets = vec![pending(&format!("reference-{index}.png"), "image/png", 12)];
+        assert!(matches!(
+            collector.offer(0, photo),
+            crate::collection::Offered::Pending
+        ));
+    }
+    let mut prompt = burst_photo("edit these three together");
+    prompt.assets.clear();
+    assert!(matches!(
+        collector.offer(0, prompt),
+        crate::collection::Offered::Pending
+    ));
+    assert_eq!(models.requests(), 0);
+    assert!(
+        observed.try_recv().is_err(),
+        "collection performs no broker work"
+    );
+    let ready = collector.take_due(collector.deadline().unwrap());
+    assert_eq!(ready.len(), 1);
+    let mut model = model_config();
+    if let ModelConfig::OpenaiCompatible { modalities, .. } = &mut model {
+        *modalities = vec![crate::config::Modality::Image];
+    }
+    run_session(
+        runner(broker, Arc::clone(&models), 4),
+        route(model),
+        ready.into_iter().next().unwrap(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(models.requests(), 1);
+    assert_eq!(driver.replies(), ["Edited together."]);
+    let prompt = models
+        .prompt(0)
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    for needle in [
+        "Chat Asset #1",
+        "Chat Asset #2",
+        "Chat Asset #3",
+        "edit these three together",
+        "first reference",
+        "third reference",
+    ] {
+        assert!(prompt.contains(needle), "missing {needle}: {prompt}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn photo_burst_busy_at_fixed_deadline_is_disposed_even_when_busy_replies_disabled() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(directory.path(), Vec::new()).await;
+    let models = ModelScript::forbidden();
+    let mut runner = runner(broker, Arc::clone(&models), 1);
+    Arc::get_mut(&mut runner).unwrap().reply_on_busy = false;
+    let photo = burst_photo("");
+    let active = runner
+        .gate
+        .admit((photo.transport.clone(), photo.conversation.key()))
+        .expect("active run");
+    let mut collector = burst_collector(None);
+    assert!(matches!(
+        collector.offer(0, photo),
+        crate::collection::Offered::Pending
+    ));
+    let ready = collector.take_due(collector.deadline().unwrap()).remove(0);
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        Arc::clone(&runner),
+        route(model_config()),
+        ready,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), [BUSY_REPLY]);
+    drop(active);
+    assert!(
+        collector
+            .take_due(tokio::time::Instant::now() + Duration::from_secs(60))
+            .is_empty()
+    );
+    assert_eq!(models.requests(), 0);
+    assert!(observed.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn photo_burst_refreshes_authorization_at_admission_and_registers_no_refused_assets() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(Vec::new(), Vec::new())],
+    )
+    .await;
+    let models = ModelScript::forbidden();
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let mut collector = burst_collector(None);
+    assert!(matches!(
+        collector.offer(0, burst_photo("edit")),
+        crate::collection::Offered::Pending
+    ));
+    assert!(observed.try_recv().is_err());
+    let ready = collector.take_due(collector.deadline().unwrap()).remove(0);
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        runner,
+        route(model_config()),
+        ready,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), [UNAUTHORIZED_REPLY]);
+    assert_eq!(models.requests(), 0);
+    assert!(matches!(
+        observed.recv().await.unwrap().request,
+        BrokerRequest::Capabilities { .. }
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn photo_burst_serve_flushes_at_fixed_deadline_with_one_lead_reply() {
+    let directory = temporary();
+    let mut doc = document(directory.path());
+    doc["models"][0]["modalities"] = json!(["image"]);
+    let config = resolved(directory.path(), &doc).await;
+    let routes = Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+        )],
+    )
+    .await;
+    let models = ModelScript::new([answer("One answer.")]);
+    let driver = Arc::new(RecordingDriver::default());
+    let drivers = Arc::new(BTreeMap::from([(
+        "dev".to_owned(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )]));
+    let (sender, receiver) = mpsc::channel(8);
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let service = tokio::spawn(crate::serve(
+        runner(broker, Arc::clone(&models), 4),
+        routes,
+        Arc::new(BTreeMap::new()),
+        drivers,
+        Arc::new(vec!["stop".into()]),
+        receiver,
+        async move {
+            stopped.await.unwrap();
+        },
+        Duration::from_secs(5),
+        burst_collector(None),
+    ));
+    for index in 0..3 {
+        let mut photo = burst_photo("");
+        photo.assets = vec![pending(&format!("reference-{index}.png"), "image/png", 12)];
+        sender
+            .send(TransportEvent::Message(Box::new(photo)))
+            .await
+            .unwrap();
+    }
+    while sender.capacity() != 8 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_millis(2999)).await;
+    let mut prompt = burst_photo("please edit all three");
+    prompt.assets.clear();
+    sender
+        .send(TransportEvent::Message(Box::new(prompt)))
+        .await
+        .unwrap();
+    while sender.capacity() != 8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(models.requests(), 0);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    // Model execution uses a real blocking worker; keep the deterministic Tokio clock fixed while
+    // yielding until that worker returns, with an independent wall-clock test failure bound.
+    let bound = std::time::Instant::now() + Duration::from_secs(10);
+    while driver.replies().is_empty() {
+        assert!(
+            std::time::Instant::now() < bound,
+            "shared session did not answer"
+        );
+        tokio::task::yield_now().await;
+    }
+    shutdown.send(()).unwrap();
+    assert_eq!(service.await.unwrap(), crate::ServeOutcome::Shutdown);
+    assert_eq!(models.requests(), 1);
+    assert_eq!(driver.replies(), ["One answer."]);
+    let prompt = models
+        .prompt(0)
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(prompt.contains("Chat Asset #3"));
+    assert!(prompt.contains("please edit all three"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn photo_burst_dispatch_stop_disposes_owned_pending_input_without_starting_a_session() {
+    let directory = temporary();
+    let (runner, routes) = idle_routing_loop(directory.path()).await;
+    let driver = Arc::new(RecordingDriver::default());
+    let drivers = BTreeMap::from([("dev".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
+    let mut collector = burst_collector(None);
+    let mut sessions = tokio::task::JoinSet::new();
+    let identities = BTreeMap::new();
+    let stop_words = vec!["stop".to_owned()];
+    crate::dispatch(
+        &runner,
+        &routes,
+        &identities,
+        &drivers,
+        &stop_words,
+        &mut sessions,
+        &mut collector,
+        burst_photo(""),
+    );
+    assert!(collector.deadline().is_some());
+    assert!(sessions.is_empty());
+    let mut stop = burst_photo("stop");
+    stop.assets.clear();
+    crate::dispatch(
+        &runner,
+        &routes,
+        &identities,
+        &drivers,
+        &stop_words,
+        &mut sessions,
+        &mut collector,
+        stop,
+    );
+    assert!(collector.deadline().is_none());
+    while let Some(result) = sessions.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(driver.replies(), [crate::session::STOPPED_REPLY]);
+    assert!(
+        collector
+            .take_due(tokio::time::Instant::now() + Duration::from_secs(60))
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn photo_burst_native_slack_and_discord_arrays_are_atomic_or_wholly_refused() {
+    use crate::collection::Offered;
+    for count in [3, 11] {
+        let files: Vec<_> = (0..count).map(|index| json!({
+            "id": format!("F{index}"), "name": format!("reference-{index}.png"), "mimetype":"image/png", "size":12,
+            "url_private_download": format!("https://files.slack.com/f/F{index}/image.png")
+        })).collect();
+        let socket = spawn_socket_mock(vec![events_envelope(
+            "array",
+            json!({
+                "type":"message", "subtype":"file_share", "channel":"d0123abc", "channel_type":"im",
+                "user":"u9xyz", "ts":"1700000000.000001", "text":"edit references", "files":files
+            }),
+        )]);
+        let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+        let mut slack = slack(&http.base);
+        slack.connect().await.unwrap();
+        let message = next_message(&mut slack).await;
+        let mut collector = burst_collector(None);
+        match collector.offer(0, message) {
+            Offered::Immediate(message) if count == 3 => assert_eq!(message.assets.len(), 3),
+            Offered::Refused(_, "input-limit") if count == 11 => {}
+            _ => panic!("Slack native array was split or queued"),
+        }
+
+        let mut event = discord_message(
+            "300000000000000099",
+            "200000000000000099",
+            None,
+            DISCORD_USER,
+            false,
+            "edit references",
+        );
+        event["attachments"] = json!((0..count).map(|index| json!({
+            "id": format!("4000000000000000{index:02}"), "filename":format!("reference-{index}.png"),
+            "content_type":"image/png", "size":12, "url":format!("https://cdn.discordapp.com/attachments/200000000000000099/4000000000000000{index:02}/image.png")
+        })).collect::<Vec<_>>());
+        let socket =
+            spawn_discord_socket_mock(vec![discord_dispatch(2, "MESSAGE_CREATE", event)], None);
+        let http = spawn_http_mock(discord_handler(socket.url.clone()));
+        let mut discord = crate::transport::discord::DiscordTransport::new(
+            "discord".into(),
+            http.base.clone(),
+            "test-token".into(),
+            liveness_settings(LivenessMode::Off),
+        )
+        .unwrap();
+        discord.connect().await.unwrap();
+        let message = next_message(&mut discord).await;
+        match collector.offer(0, message) {
+            Offered::Immediate(message) if count == 3 => assert_eq!(message.assets.len(), 3),
+            Offered::Refused(_, "input-limit") if count == 11 => {}
+            _ => panic!("Discord native array was split or queued"),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native_lead() {
+    let directory = temporary();
+    let mut doc = document(directory.path());
+    doc["transports"][0] =
+        json!({"kind":"telegramLongPoll", "name":"dev", "botTokenEnv":"TELEGRAM_TEST_TOKEN"});
+    doc["routes"][0]["conversation"]["kind"] = json!(["thread"]);
+    let config = resolved(directory.path(), &doc).await;
+    let routes = Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
+    let (broker, _observed) = stub_broker(directory.path(), Vec::new()).await;
+    let runner = runner(broker, ModelScript::forbidden(), 4);
+    let drivers = BTreeMap::from([(
+        "dev".to_owned(),
+        Arc::new(RecordingDriver::default()) as Arc<dyn ChatDriver>,
+    )]);
+    let identities = BTreeMap::from([(
+        "dev".to_owned(),
+        TransportIdentity {
+            user_id: Some("123".into()),
+            handle: Some("test_bot".into()),
+        },
+    )]);
+    let mut collector = crate::collection::Collector::new(&[], 4);
+    let mut sessions = tokio::task::JoinSet::new();
+    let mut member = burst_photo("");
+    member.transport_kind = dekopon_broker_protocol::ChatTransportKind::Telegram;
+    member.subject = ExternalSubject::telegram("123456").unwrap();
+    member.conversation = Conversation {
+        kind: ConversationKind::Thread,
+        container: None,
+        id: "-100123".into(),
+        thread: Some("42".into()),
+    };
+    member.native_group = Some("native-group".into());
+    member.reply = ReplyTarget::Telegram {
+        chat_id: -100123,
+        reply_to: Some(1),
+        message_thread_id: Some(42),
+    };
+    // Before an addressed lead, even a valid native member cannot wake the bot.
+    crate::dispatch(
+        &runner,
+        &routes,
+        &identities,
+        &drivers,
+        &[],
+        &mut sessions,
+        &mut collector,
+        member.clone(),
+    );
+    assert!(collector.deadline().is_none());
+    let mut lead = member.clone();
+    lead.text = "@test_bot edit these references".into();
+    crate::dispatch(
+        &runner,
+        &routes,
+        &identities,
+        &drivers,
+        &[],
+        &mut sessions,
+        &mut collector,
+        lead,
+    );
+    assert!(collector.deadline().is_some());
+    assert!(
+        !collector.is_native_continuation(1, &member),
+        "different bound route"
+    );
+    for axis in 0..3 {
+        let mut outsider = member.clone();
+        match axis {
+            0 => outsider.subject = ExternalSubject::telegram("654321").unwrap(),
+            1 => outsider.native_group = Some("other-group".into()),
+            _ => outsider.conversation.thread = Some("43".into()),
+        }
+        assert!(!collector.is_native_continuation(0, &outsider));
+        crate::dispatch(
+            &runner,
+            &routes,
+            &identities,
+            &drivers,
+            &[],
+            &mut sessions,
+            &mut collector,
+            outsider,
+        );
+    }
+    for id in [2, 3] {
+        member.message_id = id.to_string();
+        member.reply = ReplyTarget::Telegram {
+            chat_id: -100123,
+            reply_to: Some(id),
+            message_thread_id: Some(42),
+        };
+        crate::dispatch(
+            &runner,
+            &routes,
+            &identities,
+            &drivers,
+            &[],
+            &mut sessions,
+            &mut collector,
+            member.clone(),
+        );
+    }
+    assert!(sessions.is_empty(), "collection starts no effects");
+    let ready = collector.take_due(collector.deadline().unwrap());
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].assets.len(), 3);
+    assert_eq!(ready[0].constituents.len(), 3);
+    assert_eq!(
+        ready[0].reply,
+        ReplyTarget::Telegram {
+            chat_id: -100123,
+            reply_to: Some(1),
+            message_thread_id: Some(42)
+        }
+    );
+    assert!(
+        !collector.is_native_continuation(0, &member),
+        "sealed group cannot lend addressing"
+    );
 }

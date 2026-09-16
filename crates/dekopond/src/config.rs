@@ -422,6 +422,12 @@ pub enum TransportConfig {
         waba_id: String,
         phone_number_id: String,
         graph_api_version: String,
+        /// Fixed media-first collection window; zero bypasses collection.
+        #[serde(
+            default = "default_whatsapp_debounce_ms",
+            deserialize_with = "deserialize_debounce_ms"
+        )]
+        debounce_ms: u32,
         /// What a running session shows; WhatsApp has typing and nothing else.
         #[serde(default)]
         liveness: LivenessConfig,
@@ -450,6 +456,25 @@ pub enum TransportConfig {
         #[serde(default)]
         liveness: LivenessConfig,
     },
+}
+
+const fn default_whatsapp_debounce_ms() -> u32 {
+    3000
+}
+
+fn deserialize_debounce_ms<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u32, D::Error> {
+    let millis = u32::deserialize(deserializer)?;
+    if std::time::Instant::now()
+        .checked_add(Duration::from_millis(u64::from(millis)))
+        .is_none()
+    {
+        return Err(serde::de::Error::custom(
+            "debounceMs cannot be represented as a timer deadline",
+        ));
+    }
+    Ok(millis)
 }
 
 impl TransportConfig {
@@ -1189,6 +1214,7 @@ pub(crate) fn resolve(
                 waba_id,
                 phone_number_id,
                 graph_api_version,
+                debounce_ms,
                 liveness,
                 graph_endpoint,
             } => {
@@ -1222,6 +1248,7 @@ pub(crate) fn resolve(
                     waba_id,
                     phone_number_id,
                     graph_api_version,
+                    debounce_ms,
                     liveness,
                     graph_endpoint: Some(graph_endpoint),
                 }

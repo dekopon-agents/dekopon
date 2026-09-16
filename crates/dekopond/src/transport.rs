@@ -92,6 +92,8 @@ pub(crate) struct InboundMessage {
     pub text: String,
     /// What the sender attached, described but not yet numbered or fetched.
     pub assets: Vec<PendingAsset>,
+    /// Native array exceeded its transport ceiling; refuse the whole envelope.
+    pub asset_overflow: bool,
     /// Whether authenticated structured transport metadata says the bot was addressed.
     ///
     /// Discord supplies `Some` from its `mentions` array, including `Some(false)` so presentation
@@ -119,8 +121,15 @@ pub(crate) struct InboundMessage {
     /// Built by [`receive_span`] before the payload was parsed, so the acknowledgment, the
     /// signature check, and the routing decision are already inside it. [`crate::session::run_session`]
     /// takes it, parents `gateway.message` under it, and drops it — which is what keeps
-    /// `transport.receive` measuring receipt and dispatch rather than the whole session it started.
+    /// `transport.receive` measuring receipt and dispatch for ordinary messages. Collection retains
+    /// constituent receipt handles until their shared terminal disposition.
     pub receive_span: tracing::Span,
+    /// Receipt time, before the shared collector can buffer this envelope.
+    pub received_at: tokio::time::Instant,
+    /// Authenticated Telegram media_group_id, never inferred from text.
+    pub native_group: Option<String>,
+    /// Original receipt traces retained only for a collected input (at most eight).
+    pub constituents: Vec<tracing::Span>,
 }
 
 /// Opens the trace one inbound message rides, at the moment its transport received it.

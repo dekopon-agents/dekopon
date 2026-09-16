@@ -953,3 +953,15 @@ occupied **200 KiB** of signal payload — **148 KiB of traces** and **52 KiB of
 OpenObserve `stream/` tree **1.22 MiB**, indexes, metadata, and directory overhead included. These
 are allocated filesystem blocks and a point-in-time development sample, not a per-prompt storage
 guarantee.
+
+### Collected media inputs
+
+`gateway.message.received` records every routed constituent in its original receipt trace, before
+collection. A collected `gateway.message` is parented by the lead receipt and carries exported
+OpenTelemetry links to all original receipts (including the lead), with `batch.members` bounded
+at eight. Each receipt gets `gateway_input_disposition` with the shared terminal outcome, or a
+local refusal, stop, shutdown or abandonment. No service album ID or synthetic delivery identity
+is invented. Following a constituent's causal link reaches the one model/provider/progress and
+reply execution; it is not duplicated across traces. Non-payload counts/outcomes describe
+membership while original text stays on its own input audit event. Delivery failures remain
+in that shared execution's trace. A single-message, uncollected input keeps its ordinary trace.

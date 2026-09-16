@@ -337,6 +337,13 @@ impl TelegramTransport {
                 message_id,
             }),
             receive_span: received.clone(),
+            received_at: tokio::time::Instant::now(),
+            native_group: message
+                .get("media_group_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            constituents: Vec::new(),
+            asset_overflow: false,
         }))
     }
 

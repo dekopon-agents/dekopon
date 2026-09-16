@@ -288,6 +288,10 @@ impl LocalTransport {
                     reply: ReplyTarget::Local { connection },
                     liveness: native.then_some(LivenessTarget::Local { connection }),
                     receive_span: received,
+                    received_at: tokio::time::Instant::now(),
+                    native_group: None,
+                    constituents: Vec::new(),
+                    asset_overflow: false,
                 };
                 if inbound
                     .send(TransportEvent::Message(Box::new(message)))

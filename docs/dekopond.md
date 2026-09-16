@@ -65,6 +65,7 @@ transports:
     liveness: { mode: native, progress: message, cancelButton: true }
   - name: whatsapp
     kind: whatsappCloudApi
+    debounceMs: 3000                      # fixed media-first window; 0 bypasses collection
     appSecretEnv: DEKOPOND_WHATSAPP_APP_SECRET
     verifyTokenEnv: DEKOPOND_WHATSAPP_VERIFY_TOKEN
     accessTokenEnv: DEKOPOND_WHATSAPP_ACCESS_TOKEN
@@ -248,6 +249,55 @@ no capability-call budget, grants nothing, and creates no durable broker audit r
 standing instructions visible to any sender authorized to use that agent. Those instructions were
 already model input and must never contain credentials; operators should not treat a system prompt
 as a secret from its users.
+
+## Multi-message media inputs
+
+The shared gateway collects **media-first** inputs after routing/address checks and before
+session admission. WhatsApp `debounceMs` is an unsigned 32-bit millisecond duration (`0..=4294967295`, default `3000`);
+`0` disables collection entirely and preserves immediate admission/busy behavior. Invalid types,
+negative/out-of-range integers and durations that cannot form a timer deadline are refused by
+configuration decoding. A nonzero window starts at the first media receipt and never slides:
+later photos, captions and standalone text can join that actor's open compatible burst, but do not
+extend its deadline. Text arriving first remains immediate. These are heuristic bursts, not
+WhatsApp albums; webhook payload boundaries are not album identities.
+
+Telegram uses a separate fixed **3-second** window only for authenticated `media_group_id`
+members, because Telegram supplies no group-end marker. Member captions join; ordinary text and
+ungrouped Telegram media remain immediate and cannot claim membership. Different native groups
+never merge: a competing group for the same pending actor/audience is visibly refused. WhatsApp's
+setting never changes Telegram timing. In groups/topics, unaddressed native members may inherit
+addressing only from an already-open addressed lead with the exact same actor, route, full scope,
+reply audience and native group ID. Members arriving before that addressed lead (or after expiry)
+remain ignored unless individually addressed; there is no pre-address buffer or grant inheritance.
+Slack/Discord native attachment arrays remain indivisible
+and immediate; local text remains immediate. Their existing 10-attachment parser ceiling now
+refuses an oversized native envelope instead of accepting a truncated subset.
+
+Collection is isolated by canonical authenticated subject, exact bound route, configured transport,
+complete conversation/container/thread and reply audience, even on shared-history routes. Each
+batch retains at most **8 envelopes, 32 assets and 16 KiB of rendered text**, including the source
+boundary/caption-presence labels added for multiple inputs. Limits reject only the incoming
+envelope, visibly and with a traced cause; already collected members remain intact. Native arrays
+are never split. There is at most one collecting batch per compatible actor key and globally at
+most `sessions.maxConcurrent` batches, independently of execution permits.
+
+At the fixed deadline, the batch attempts normal admission immediately. An active conversation or
+exhausted execution capacity produces a visible busy reply (also when `replyOnBusy` is false for
+ordinary messages) and disposes the batch. There is **no execution queue**, no waiting for an
+active session, no replay and no cancellation of paid effects. Late media starts a new bounded
+collection; late standalone text has ordinary immediate/busy behavior. Neither heuristic bursts
+nor native groups guarantee completion when members arrive beyond the fixed window. Collection
+latency is the configured window (3 seconds by default), not 30 seconds plus admission waiting;
+normal inference and transport time remain additional.
+
+Fresh broker authorization and generation selection happen only after admission; collection does
+not fetch assets, contact the model/provider or publish progress. One lead message owns progress,
+reply target and native delivery identity; other message IDs are not fabricated into an album ID.
+An authenticated stop removes only that actor's pending work and preserves the existing ownership
+rules for active sessions. Shutdown discards pending batches without starting them. Original
+receipt traces retain their input and terminal disposition; the lead-parented execution exports
+causal links to every constituent (see [observability](observability.md)). Asset leases, history
+scope, generation fences and on-demand fetch budgets are unchanged.
 
 ## Provider attachments and chat-asset inputs
 

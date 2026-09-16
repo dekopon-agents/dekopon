@@ -40,7 +40,7 @@ use crate::{conversation::ConversationKey, transport::AssetFetcher};
 /// A ceiling rather than a timer, matching [`crate::conversation::ConversationStore`]: the insert
 /// that would exceed it is the one that evicts. Someone who pastes a long screenshot thread keeps
 /// the recent ones addressable, which is what a follow-up question is ever about.
-const MAX_ASSETS_PER_CONVERSATION: usize = 32;
+pub(crate) const MAX_ASSETS_PER_CONVERSATION: usize = 32;
 
 /// One attachment, as the gateway knows it before anyone asks for the bytes.
 ///

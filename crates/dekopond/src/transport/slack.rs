@@ -573,6 +573,12 @@ impl SlackTransport {
                 conversation_id,
             }),
             receive_span: received.clone(),
+            received_at: tokio::time::Instant::now(),
+            native_group: None,
+            constituents: Vec::new(),
+            asset_overflow: event["files"]
+                .as_array()
+                .is_some_and(|files| files.len() > MAX_ATTACHMENTS),
         }))
     }
 

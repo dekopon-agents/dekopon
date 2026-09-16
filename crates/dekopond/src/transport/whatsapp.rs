@@ -766,6 +766,10 @@ fn parse_delivery(
                         inbound_message_id: id.to_owned(),
                     }),
                     receive_span: received.clone(),
+                    received_at: tokio::time::Instant::now(),
+                    native_group: None,
+                    constituents: Vec::new(),
+                    asset_overflow: false,
                 });
             }
         }
