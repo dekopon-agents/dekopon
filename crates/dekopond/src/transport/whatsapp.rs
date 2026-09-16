@@ -589,12 +589,6 @@ async fn process_webhook(
     if accepted.is_empty() {
         return content_free(StatusCode::OK);
     }
-    // Meta sends one message per delivery in practice and the parser tolerates a batch, so the
-    // identifier is recorded only when the delivery is the one message this span describes. A
-    // batched delivery leaves it unset and parents every message's `gateway.message` here.
-    if let [only] = accepted.as_slice() {
-        received.record("message.id", only.message_id.as_str());
-    }
     let permit_count = u32::try_from(accepted.len()).expect("delivery bound fits u32");
     // Only the claimed IDs are needed to undo the claim, so the messages themselves move into the
     // delivery rather than being held a second time for a path that usually does not run.
@@ -744,7 +738,11 @@ fn parse_delivery(
                     id: sender.to_owned(),
                     thread: None,
                 };
-                record_conversation(received, &conversation);
+                // A delivery may carry several messages with different terminal dispositions.
+                // Keep their receipt identities distinct while retaining the signed delivery parent.
+                let receipt = received.in_scope(|| receive_span(ChatTransportKind::Whatsapp));
+                receipt.record("message.id", id);
+                record_conversation(&receipt, &conversation);
                 accepted.push(InboundMessage {
                     transport: state.name.clone(),
                     transport_kind: ChatTransportKind::Whatsapp,
@@ -765,7 +763,7 @@ fn parse_delivery(
                         recipient: sender.to_owned(),
                         inbound_message_id: id.to_owned(),
                     }),
-                    receive_span: received.clone(),
+                    receive_span: receipt,
                     received_at: tokio::time::Instant::now(),
                     native_group: None,
                     constituents: Vec::new(),

@@ -13,7 +13,9 @@ All notable changes to Dekopon are documented here. The format is based on
   immediate behavior) and Telegram native media groups in a separate fixed 3-second window.
   Bounded, actor-isolated inputs share one lead reply and causally linked execution; fixed-window
   expiry attempts admission immediately, never queues behind active sessions. Oversized native
-  Slack/Discord arrays are explicitly refused instead of silently truncated.
+  Slack/Discord arrays are explicitly refused instead of silently truncated. Multi-message
+  WhatsApp webhooks retain distinct receipt identities; pending stops acknowledge even while an
+  earlier answer completes. Immediate inputs retain their existing text truncation behavior.
 
 - Outbound image hydration and owned scratch disposal now run off async workers with the delivery
   trace context. Local image answers use the existing separate-reply fallback rather than

@@ -424,11 +424,11 @@ fn dispatch(
         let pending_cancelled = collector.cancel(&request);
         let active_outcome = runner.active_sessions.cancel(&request);
         if pending_cancelled {
-            // An owned active run already has a progress/delivery owner for its stopped ending.
-            // Only a pending-only cancellation needs a separate acknowledgment.
+            // A cancelled active run already has a progress/delivery owner for its stopped ending.
+            // Normal completion owns an answer, not a stopped ending for the removed batch.
             if matches!(
                 active_outcome,
-                CancelOutcome::NoSession | CancelOutcome::OtherSubject
+                CancelOutcome::NoSession | CancelOutcome::OtherSubject | CancelOutcome::Completing
             ) && let Some(driver) = drivers.get(&message.transport).cloned()
             {
                 let receipt = message.receive_span.clone();
@@ -452,7 +452,7 @@ fn dispatch(
             }
             // The session existed and this sender owned it; it simply finished first. Routing the
             // word as a question would answer a message that was never one.
-            outcome @ CancelOutcome::AlreadyEnded => {
+            outcome @ (CancelOutcome::AlreadyCancelled | CancelOutcome::Completing) => {
                 tracing::debug!(
                     event = "gateway_session_stop_ignored",
                     transport = %request.transport,

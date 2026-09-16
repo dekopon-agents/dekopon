@@ -65,10 +65,7 @@ impl Collector {
     }
 
     pub(crate) fn offer(&mut self, route: usize, message: InboundMessage) -> Offered {
-        if message.asset_overflow
-            || message.assets.len() > MAX_ASSETS_PER_CONVERSATION
-            || message.text.len() > MAX_INBOUND_TEXT_BYTES
-        {
+        if message.asset_overflow || message.assets.len() > MAX_ASSETS_PER_CONVERSATION {
             message.receive_span.in_scope(|| record_received(&message));
             return Offered::Refused(message, "input-limit");
         }
@@ -110,6 +107,9 @@ impl Collector {
             return Offered::Immediate(message);
         }
         message.receive_span.in_scope(|| record_received(&message));
+        if message.text.len() > MAX_INBOUND_TEXT_BYTES {
+            return Offered::Refused(message, "input-limit");
+        }
         if self.pending.len() == self.capacity {
             return Offered::Refused(message, "collection-full");
         }
@@ -391,6 +391,60 @@ mod tests {
                 .unwrap();
             assert_eq!(group.assets.len(), 2);
         }
+    }
+
+    #[test]
+    fn immediate_truncated_text_bypasses_collection_limits_but_not_native_overflow() {
+        let text = crate::transport::bound_inbound(&"é".repeat(MAX_INBOUND_TEXT_BYTES));
+        assert!(text.len() > MAX_INBOUND_TEXT_BYTES);
+        assert!(text.ends_with("[message truncated by the gateway]"));
+        for millis in [0, 3000] {
+            for kind in [
+                ChatTransportKind::Local,
+                ChatTransportKind::Slack,
+                ChatTransportKind::Discord,
+                ChatTransportKind::Telegram,
+                ChatTransportKind::Whatsapp,
+            ] {
+                let mut collector = collector(millis, 4);
+                let mut input = message(0, &text);
+                input.transport_kind = kind;
+                assert!(matches!(
+                    collector.offer(0, input.clone()),
+                    Offered::Immediate(message) if message.text == text
+                ));
+                input.assets = message(3, "").assets;
+                if kind != ChatTransportKind::Whatsapp || millis == 0 {
+                    assert!(matches!(
+                        collector.offer(0, input.clone()),
+                        Offered::Immediate(message) if message.text == text && message.assets.len() == 3
+                    ));
+                } else {
+                    assert!(matches!(
+                        collector.offer(0, input.clone()),
+                        Offered::Refused(_, "input-limit")
+                    ));
+                }
+                input.asset_overflow = true;
+                assert!(matches!(
+                    collector.offer(0, input),
+                    Offered::Refused(_, "input-limit")
+                ));
+                assert!(collector.deadline().is_none());
+            }
+        }
+        let mut collector = collector(3000, 4);
+        assert!(matches!(
+            collector.offer(0, message(1, "")),
+            Offered::Pending
+        ));
+        assert!(matches!(
+            collector.offer(0, message(0, &text)),
+            Offered::Refused(_, "batch-limit")
+        ));
+        let ready = collector.take_due(collector.deadline().unwrap());
+        assert_eq!(ready[0].assets.len(), 1);
+        assert!(ready[0].text.is_empty());
     }
 
     #[test]

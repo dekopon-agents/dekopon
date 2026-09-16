@@ -422,9 +422,9 @@ struct ActiveSession {
 
 /// What a cancel request found.
 ///
-/// Four answers rather than a bool because the caller acts differently on each: a stop word with no
-/// session behind it is an ordinary message to answer, another person's press is acknowledged and
-/// ignored, and a session that already finished needs nothing done about it.
+/// A stop word with no session behind it is an ordinary message to answer. An already-cancelled
+/// session owns its stopped ending; a normally completing session cannot acknowledge a pending
+/// batch cancelled alongside it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CancelOutcome {
     /// This request won the race; the session's own policy task writes the ending.
@@ -433,8 +433,10 @@ pub(crate) enum CancelOutcome {
     NoSession,
     /// A session is running, but somebody else started it.
     OtherSubject,
-    /// The session had already finished or already been stopped.
-    AlreadyEnded,
+    /// The session had already been stopped and owns its stopped ending.
+    AlreadyCancelled,
+    /// The session claimed normal completion and will not deliver a stopped ending.
+    Completing,
 }
 
 impl CancelOutcome {
@@ -447,7 +449,7 @@ impl CancelOutcome {
             Self::Cancelled => None,
             Self::NoSession => Some("no-session"),
             Self::OtherSubject => Some("other-subject"),
-            Self::AlreadyEnded => Some("already-ended"),
+            Self::AlreadyCancelled | Self::Completing => Some("already-ended"),
         }
     }
 }
@@ -520,8 +522,10 @@ impl ActiveSessions {
             .cancel(CancelSource::User { via: request.via })
         {
             CancelOutcome::Cancelled
+        } else if session.cancellation.is_cancelled() {
+            CancelOutcome::AlreadyCancelled
         } else {
-            CancelOutcome::AlreadyEnded
+            CancelOutcome::Completing
         }
     }
 }

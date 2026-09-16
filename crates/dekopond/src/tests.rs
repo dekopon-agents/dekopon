@@ -4210,7 +4210,7 @@ async fn a_native_stop_wins_the_race_and_suppresses_answer_history_and_durable_r
         runner
             .active_sessions
             .cancel(&cancel(SUBJECT, CancelVia::StopReply)),
-        CancelOutcome::AlreadyEnded
+        CancelOutcome::AlreadyCancelled
     );
     model.release();
     session.await.expect("the cancelled session exits");
@@ -11466,6 +11466,199 @@ async fn a_whatsapp_delivery_opens_its_trace_around_the_signature_check() {
 }
 
 #[tokio::test]
+async fn whatsapp_multi_message_webhook_exports_distinct_receipts_links_and_mixed_dispositions() {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::{
+        error::OTelSdkResult,
+        trace::{SdkTracerProvider, SpanData, SpanExporter},
+    };
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone, Debug, Default)]
+    struct Exported(Arc<Mutex<Vec<SpanData>>>);
+    impl SpanExporter for Exported {
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            self.0.lock().unwrap().extend(batch);
+            Ok(())
+        }
+    }
+    let exported = Exported::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exported.clone())
+        .build();
+    let _subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("whatsapp-ingress-test")))
+        .set_default();
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = probe.local_addr().unwrap();
+    drop(probe);
+    let mut transport = crate::transport::whatsapp::WhatsappTransport::new(
+        "dev".into(),
+        address,
+        "/wa".into(),
+        "123".into(),
+        "456".into(),
+        "v23.0".into(),
+        "http://127.0.0.1:9".into(),
+        "secret".into(),
+        "verify".into(),
+        "access".into(),
+        liveness_settings(LivenessMode::Off),
+    )
+    .unwrap();
+    transport.connect().await.unwrap();
+    let body = serde_json::to_vec(&json!({
+        "object": "whatsapp_business_account",
+        "entry": [{"id": "123", "changes": [{"field": "messages", "value": {
+            "messaging_product": "whatsapp", "metadata": {"phone_number_id": "456"},
+            "contacts": [{"wa_id": "16034700182"}],
+            "messages": (0..9).map(|index| json!({
+                "id": format!("wamid.burst-{index}"), "from": "16034700182", "type": "image",
+                "image": {"id": format!("{}", index + 1), "mime_type": "image/png", "caption": format!("reference {index}")}
+            })).collect::<Vec<_>>()
+        }}]}]
+    })).unwrap();
+    let digest = crate::transport::whatsapp::hmac_sha256(b"secret", &body);
+    let signature: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    let response = reqwest::Client::new()
+        .post(format!("http://{address}/wa"))
+        .header("x-hub-signature-256", format!("sha256={signature}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    drop(response);
+
+    let directory = temporary();
+    let config = resolved(directory.path(), &document(directory.path())).await;
+    let routes = Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+        )],
+    )
+    .await;
+    let models = ModelScript::new([answer("Collected answer.")]);
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let driver = Arc::new(RecordingDriver::default());
+    let drivers = BTreeMap::from([("dev".into(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
+    let mut collector = burst_collector(None);
+    let mut sessions = tokio::task::JoinSet::new();
+    for _ in 0..9 {
+        let input = next_message(&mut transport).await;
+        crate::dispatch(
+            &runner,
+            &routes,
+            &BTreeMap::new(),
+            &drivers,
+            &[],
+            &mut sessions,
+            &mut collector,
+            input,
+        );
+    }
+    while let Some(result) = sessions.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(models.requests(), 0);
+    assert_eq!(driver.replies().len(), 1, "only the ninth input is refused");
+    let batch = collector.take_due(collector.deadline().unwrap()).remove(0);
+    assert_eq!(batch.assets.len(), 8);
+    run_session(runner, route(model_config()), batch, driver).await;
+    assert_eq!(models.requests(), 1);
+    drop(transport);
+    provider.force_flush().unwrap();
+    {
+        let spans = exported.0.lock().unwrap();
+        let attribute = |span: &SpanData, key: &str| {
+            span.attributes
+                .iter()
+                .find(|item| item.key.as_str() == key)
+                .map(|item| item.value.to_string())
+        };
+        let execution = spans
+            .iter()
+            .find(|span| span.name == "gateway.message")
+            .expect("exported execution");
+        assert_eq!(execution.links.links.len(), 8);
+        let mut receipt_ids = std::collections::HashSet::new();
+        let mut delivery_id = None;
+        for index in 0..9 {
+            let id = format!("wamid.burst-{index}");
+            let receipt = spans
+                .iter()
+                .find(|span| {
+                    span.name == "transport.receive"
+                        && attribute(span, "message.id").as_deref() == Some(&id)
+                })
+                .expect("message receipt");
+            assert!(
+                receipt_ids.insert(receipt.span_context.span_id()),
+                "every message has its own receipt"
+            );
+            assert_eq!(
+                *delivery_id.get_or_insert(receipt.parent_span_id),
+                receipt.parent_span_id
+            );
+            assert_eq!(
+                receipt.span_context.trace_id(),
+                execution.span_context.trace_id()
+            );
+            assert_eq!(
+                execution
+                    .links
+                    .links
+                    .iter()
+                    .any(|link| link.span_context == receipt.span_context),
+                index < 8
+            );
+            if index == 0 {
+                assert_eq!(execution.parent_span_id, receipt.span_context.span_id());
+            }
+            let outcomes: Vec<_> = receipt
+                .events
+                .events
+                .iter()
+                .flat_map(|event| &event.attributes)
+                .filter(|item| item.key.as_str() == "outcome")
+                .map(|item| item.value.to_string())
+                .collect();
+            assert_eq!(
+                outcomes,
+                [if index < 8 { "answered" } else { "batch-limit" }],
+                "{id}"
+            );
+            assert!(
+                receipt
+                    .events
+                    .events
+                    .iter()
+                    .any(|event| event
+                        .attributes
+                        .iter()
+                        .any(|item| item.key.as_str() == "audit.event"
+                            && item.value.to_string() == "gateway.message.received")),
+                "original input event for {id}"
+            );
+        }
+        let delivery = spans
+            .iter()
+            .find(|span| Some(span.span_context.span_id()) == delivery_id)
+            .expect("signed delivery parent exported");
+        assert_eq!(delivery.name, "transport.receive");
+        assert_eq!(
+            delivery.parent_span_id,
+            opentelemetry::trace::SpanId::INVALID
+        );
+        assert!(attribute(delivery, "message.id").is_none());
+    }
+    provider.shutdown().unwrap();
+}
+
+#[tokio::test]
 async fn a_local_request_opens_its_trace_on_the_line_it_arrived_on() {
     use tokio::io::AsyncWriteExt as _;
 
@@ -12139,7 +12332,7 @@ async fn no_origin_takes_back_an_answer_that_is_already_being_delivered() {
         if let Some(outcome) = origin.deliver(&runner, &session) {
             assert_eq!(
                 outcome,
-                CancelOutcome::AlreadyEnded,
+                CancelOutcome::Completing,
                 "completion already claimed the one decision a session gets: {origin:?}"
             );
         }
@@ -13039,6 +13232,104 @@ async fn photo_burst_dispatch_stop_disposes_owned_pending_input_without_starting
             .take_due(tokio::time::Instant::now() + Duration::from_secs(60))
             .is_empty()
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_batch_stop_acknowledges_normal_completion_but_not_an_owned_stopped_ending() {
+    for already_cancelled in [false, true] {
+        let directory = temporary();
+        let config = resolved(directory.path(), &document(directory.path())).await;
+        let routes =
+            Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
+        let (broker, _observed) = stub_broker(
+            directory.path(),
+            vec![ResponseEnvelope::capabilities(
+                vec![capability("cli-probe.upper")],
+                Vec::new(),
+            )],
+        )
+        .await;
+        let model = BlockedModel::new("the earlier answer");
+        let runner = runner_with(broker, Arc::new(Arc::clone(&model)), 4);
+        let earlier = Arc::new(ParkedReplyDriver::default());
+        let session = tokio::spawn(run_session(
+            Arc::clone(&runner),
+            route(model_config()),
+            message("answer me"),
+            Arc::clone(&earlier) as Arc<dyn ChatDriver>,
+        ));
+        model.wait_until_entered().await;
+        if already_cancelled {
+            assert_eq!(
+                runner
+                    .active_sessions
+                    .cancel(&cancel(SUBJECT, CancelVia::StopReply)),
+                CancelOutcome::Cancelled
+            );
+        } else {
+            model.release();
+        }
+        tokio::time::timeout(Duration::from_secs(10), earlier.delivering.notified())
+            .await
+            .expect("earlier terminal delivery is blocked");
+
+        let acknowledgments = Arc::new(RecordingDriver::default());
+        let drivers = BTreeMap::from([(
+            "dev".to_owned(),
+            Arc::clone(&acknowledgments) as Arc<dyn ChatDriver>,
+        )]);
+        let mut collector = burst_collector(None);
+        let mut sessions = tokio::task::JoinSet::new();
+        for text in ["", "stop", "stop"] {
+            let mut input = burst_photo(text);
+            if !text.is_empty() {
+                input.assets.clear();
+            }
+            crate::dispatch(
+                &runner,
+                &routes,
+                &BTreeMap::new(),
+                &drivers,
+                &["stop".into()],
+                &mut sessions,
+                &mut collector,
+                input,
+            );
+        }
+        assert!(collector.deadline().is_none());
+        while let Some(result) = sessions.join_next().await {
+            result.unwrap();
+        }
+        assert_eq!(
+            acknowledgments.replies(),
+            if already_cancelled {
+                vec![]
+            } else {
+                vec![crate::session::STOPPED_REPLY]
+            }
+        );
+        if already_cancelled {
+            model.release();
+        }
+        earlier.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), session)
+            .await
+            .expect("earlier session drains")
+            .unwrap();
+        assert_eq!(
+            wait_for_delivery(&earlier).await,
+            [if already_cancelled {
+                crate::session::STOPPED_REPLY
+            } else {
+                "the earlier answer"
+            }]
+        );
+        assert!(
+            collector
+                .take_due(tokio::time::Instant::now() + Duration::from_secs(60))
+                .is_empty()
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]

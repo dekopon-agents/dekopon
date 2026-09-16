@@ -1171,6 +1171,8 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "reqwest",
  "rustix",
  "serde",
@@ -1182,6 +1184,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
 ]
 

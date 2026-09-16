@@ -116,10 +116,11 @@ pub(crate) struct InboundMessage {
     /// Absent for transports or messages with no configured liveness surface. These values come
     /// only from the transport envelope and are never model-controlled.
     pub liveness: Option<LivenessTarget>,
-    /// The span the transport opened when this message arrived, and the root of its trace.
+    /// The span the transport opened for this message's receipt.
     ///
-    /// Built by [`receive_span`] before the payload was parsed, so the acknowledgment, the
-    /// signature check, and the routing decision are already inside it. [`crate::session::run_session`]
+    /// Built by [`receive_span`]; WhatsApp messages get distinct children of the signed delivery
+    /// span, so the acknowledgment and signature check remain in their ancestry.
+    /// [`crate::session::run_session`]
     /// takes it, parents `gateway.message` under it, and drops it — which is what keeps
     /// `transport.receive` measuring receipt and dispatch for ordinary messages. Collection retains
     /// constituent receipt handles until their shared terminal disposition.
