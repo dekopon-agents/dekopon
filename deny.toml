@@ -66,4 +66,5 @@ skip-tree = [
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
+# Exact revision is pinned in Cargo.toml for tokio-rs/tracing#3614.
+allow-git = ["https://github.com/dekopon-agents/tracing"]

@@ -129,3 +129,10 @@ record failure cannot change an already delivered answer. Receipts do not prove 
 `dekopond auth chatgpt {login,status,logout,export}` runs before gateway configuration,
 telemetry, transports, or runtime creation. It uses only Dekopon's isolated model credential;
 ordinary serving requires `--config PATH`. See [`docs/cli.md`](../../docs/cli.md) for auth-only flags, output, exit codes and both export guards.
+
+Asset retention is process-wide: `sessions.assetRetentionBytes` defaults to 268435456 bytes on
+private disk scratch. Zero disables asset retention and attachment delivery, not the bound;
+text-only sessions remain usable. Weak model references cannot prevent LRU reclamation. Generated
+PNG results publish gateway-owned `chat-asset:<N>` markers for successive edits; availability is
+not delivery confirmation. See [chat assets](../../docs/dekopond.md#chat-assets) for lifecycle,
+limits, explicit release notices and no-refetch/no-blind-retry behavior.

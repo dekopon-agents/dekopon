@@ -40,6 +40,16 @@ pub use install::{
     TelemetryGuard, optional_logger_provider, optional_tracer_provider,
 };
 
+/// Adds an exported causal link to an original receipt when several inputs share execution.
+/// Without an installed OTel layer there is no context to link.
+pub fn link_span(execution: &tracing::Span, receipt: &tracing::Span) {
+    let context = receipt.context();
+    let span = context.span();
+    if span.span_context().is_valid() {
+        execution.add_link(span.span_context().clone());
+    }
+}
+
 /// Wire transport used to reach an OTLP receiver.
 ///
 /// Both are first-class, and both reach an `https://` endpoint through WebPKI roots. A receiver
@@ -759,5 +769,76 @@ mod tests {
         assert_eq!(span_context.trace_id().to_bytes(), parts.trace_id);
         assert_eq!(span_context.span_id().to_bytes(), parts.span_id);
         assert_eq!(span_context.trace_flags().to_u8(), 1);
+    }
+}
+
+#[cfg(test)]
+mod aggregation_tests {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::{
+        error::OTelSdkResult,
+        trace::{SdkTracerProvider, SpanData, SpanExporter},
+    };
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone, Debug, Default)]
+    struct Exported(Arc<Mutex<Vec<SpanData>>>);
+    impl SpanExporter for Exported {
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            self.0.lock().expect("exported spans").extend(batch);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn collected_execution_exports_lead_parent_and_every_constituent_link() {
+        let exported = Exported::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exported.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("aggregation-test")));
+        tracing::subscriber::with_default(subscriber, || {
+            let lead = tracing::info_span!(parent: None, "receipt.lead");
+            let second = tracing::info_span!(parent: None, "receipt.second");
+            let third = tracing::info_span!(parent: None, "receipt.third");
+            let execution = tracing::info_span!(parent: &lead, "gateway.message");
+            for receipt in [&lead, &second, &third] {
+                super::link_span(&execution, receipt);
+            }
+        });
+        provider.force_flush().expect("flush");
+        let spans = exported.0.lock().expect("exported spans");
+        let execution = spans
+            .iter()
+            .find(|span| span.name == "gateway.message")
+            .expect("execution exported");
+        let receipts: Vec<_> = spans
+            .iter()
+            .filter(|span| span.name.starts_with("receipt."))
+            .collect();
+        assert_eq!(receipts.len(), 3);
+        assert_eq!(execution.links.links.len(), 3);
+        for receipt in &receipts {
+            assert!(
+                execution
+                    .links
+                    .links
+                    .iter()
+                    .any(|link| link.span_context == receipt.span_context)
+            );
+        }
+        let lead = receipts
+            .iter()
+            .find(|span| span.name == "receipt.lead")
+            .expect("lead");
+        assert_eq!(execution.parent_span_id, lead.span_context.span_id());
+        assert_eq!(
+            execution.span_context.trace_id(),
+            lead.span_context.trace_id()
+        );
+        drop(spans);
+        provider.shutdown().expect("shutdown");
     }
 }

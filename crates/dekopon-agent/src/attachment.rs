@@ -9,7 +9,7 @@
 //!
 //! - **Out.** A successful capability result may carry a top-level `attachments` key holding
 //!   `{mediaType, base64}` objects. The session's broker leg removes it, validates each entry, puts
-//!   the accepted bytes in [`ReplyAttachments`] — a request-local slot that is never a model
+//!   the accepted disk leases in [`ReplyAttachments`] — a request-local slot that is never a model
 //!   message — and leaves the model metadata only.
 //! - **In.** A capability input may carry the marker `chat-asset:<N>`, naming an attachment the
 //!   sender put on their message. For the capabilities a route lists, the leg expands each marker to
@@ -22,8 +22,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 
-/// Maximum decoded attachment retained in memory or handed to a chat transport.
-pub const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum decoded attachment spooled or handed to a chat transport.
+pub use dekopon_model::asset::MAX_ATTACHMENT_BYTES;
+use dekopon_model::asset::{BlobError, DiskBlob};
 
 /// The one media type a delivered attachment may declare.
 ///
@@ -34,6 +35,21 @@ pub const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
 pub const ATTACHMENT_MEDIA_TYPE: &str = "image/png";
 
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+
+/// Checks the shared PNG byte ceiling and signature without creating a scratch file.
+///
+/// # Errors
+/// Returns [`AttachmentRefusal::TooLarge`] or [`AttachmentRefusal::UnsupportedMedia`].
+/// This is signature validation only, not full image decoding.
+pub fn validate_png(data: &[u8]) -> Result<(), AttachmentRefusal> {
+    if data.len() > MAX_ATTACHMENT_BYTES {
+        return Err(AttachmentRefusal::TooLarge);
+    }
+    if !data.starts_with(PNG_SIGNATURE) {
+        return Err(AttachmentRefusal::UnsupportedMedia);
+    }
+    Ok(())
+}
 
 /// Expansions one invocation's input may make.
 ///
@@ -88,7 +104,7 @@ struct ResultAttachment {
 /// several megabytes; formatting it into a model transcript or telemetry record would be both a data
 /// leak and an unbounded operational cost.
 pub struct GeneratedImage {
-    data: Vec<u8>,
+    data: DiskBlob,
 }
 
 impl GeneratedImage {
@@ -100,13 +116,10 @@ impl GeneratedImage {
     /// [`AttachmentRefusal::UnsupportedMedia`] when the bytes do not carry the PNG signature,
     /// whatever media type the producer declared.
     pub fn from_png(data: Vec<u8>) -> Result<Self, AttachmentRefusal> {
-        if data.len() > MAX_ATTACHMENT_BYTES {
-            return Err(AttachmentRefusal::TooLarge);
-        }
-        if !data.starts_with(PNG_SIGNATURE) {
-            return Err(AttachmentRefusal::UnsupportedMedia);
-        }
-        Ok(Self { data })
+        validate_png(&data)?;
+        Ok(Self {
+            data: DiskBlob::from_bytes(&data).map_err(AttachmentRefusal::Storage)?,
+        })
     }
 
     /// IANA media type fixed by validation rather than by what the provider claimed.
@@ -130,16 +143,32 @@ impl GeneratedImage {
         }
     }
 
-    /// Raw PNG bytes for the final transport upload.
-    #[must_use]
-    pub fn bytes(&self) -> &[u8] {
-        &self.data
+    /// Materializes raw PNG bytes for the final transport upload.
+    ///
+    /// # Errors
+    /// Returns a sanitized scratch IO failure; the provider effect has already executed.
+    pub fn bytes(&self) -> Result<Vec<u8>, BlobError> {
+        self.data.read()
     }
 
-    /// Consumes the image into its raw PNG bytes.
+    /// Byte count without materializing the payload.
     #[must_use]
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.data
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Whether the validated payload is empty (a PNG never is).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    /// Consumes the image into a transient upload buffer.
+    ///
+    /// # Errors
+    /// Returns a sanitized scratch IO failure; the provider effect has already executed.
+    pub fn into_bytes(self) -> Result<Vec<u8>, BlobError> {
+        self.data.read()
     }
 }
 
@@ -160,6 +189,9 @@ impl fmt::Debug for GeneratedImage {
 /// answer around it. [`Self::reason`] is the stable audit value and [`Self::note`] the sentence.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum AttachmentRefusal {
+    /// The provider executed, but the gateway could not retain its attachment.
+    #[error("{0}")]
+    Storage(BlobError),
     /// The route does not carry provider attachments at all.
     #[error("this route does not deliver provider attachments")]
     RouteDisabled,
@@ -183,6 +215,7 @@ impl AttachmentRefusal {
     #[must_use]
     pub const fn reason(&self) -> &'static str {
         match self {
+            Self::Storage(_) => "storage",
             Self::RouteDisabled => "route-disabled",
             Self::InvalidEncoding => "invalid-encoding",
             Self::UnsupportedMedia => "unsupported-media",
@@ -198,6 +231,9 @@ impl AttachmentRefusal {
     #[must_use]
     pub const fn note(&self) -> &'static str {
         match self {
+            Self::Storage(_) => {
+                "The capability executed, but the gateway could not store its file. It was not delivered. Answer in text; do not repeat the paid call to recover the file."
+            }
             Self::RouteDisabled => {
                 "This conversation cannot carry attachments, so the file this capability produced \
                  was discarded. Answer in text."
@@ -228,10 +264,31 @@ impl AttachmentRefusal {
 /// history. An embedder takes the slot only after a successful session and drops it on failure or
 /// cancellation, which keeps provider-produced content out of transcripts, persistent history, and
 /// accidental `Debug` output.
-#[derive(Debug)]
 pub struct ReplyAttachments {
     max_per_reply: usize,
     images: Mutex<Vec<GeneratedImage>>,
+    registrar: Option<Arc<dyn GeneratedAssetStore>>,
+}
+
+/// Gateway registration of an already validated PNG; the store owns capacity and filenames.
+pub trait GeneratedAssetStore: Send + Sync {
+    /// Reserves storage before writing, and returns a fresh scoped ID with a temporary delivery pin.
+    ///
+    /// # Errors
+    /// Returns retention failure after a provider effect; never authorizes a retry.
+    fn register(
+        &self,
+        bytes: &[u8],
+        capability: &str,
+        invocation: &str,
+    ) -> Result<(u64, DiskBlob), BlobError>;
+}
+impl fmt::Debug for ReplyAttachments {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReplyAttachments")
+            .field("max_per_reply", &self.max_per_reply)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ReplyAttachments {
@@ -241,7 +298,15 @@ impl ReplyAttachments {
         Self {
             max_per_reply: max_per_reply as usize,
             images: Mutex::new(Vec::new()),
+            registrar: None,
         }
+    }
+
+    /// Registers validated outputs with the embedding gateway before queueing their delivery pin.
+    #[must_use]
+    pub fn with_store(mut self, store: Arc<dyn GeneratedAssetStore>) -> Self {
+        self.registrar = Some(store);
+        self
     }
 
     /// Removes everything this session accepted, oldest first.
@@ -287,9 +352,23 @@ pub fn strip_attachments(
     output: &mut Value,
     slot: Option<&ReplyAttachments>,
 ) -> (Vec<u64>, Vec<AttachmentRefusal>) {
+    strip_attachments_for_invocation(output, slot, "", "")
+}
+
+/// Strips successful provider outputs while associating gateway assets with their invocation.
+pub fn strip_attachments_for_invocation(
+    output: &mut Value,
+    slot: Option<&ReplyAttachments>,
+    capability: &str,
+    invocation: &str,
+) -> (Vec<u64>, Vec<AttachmentRefusal>) {
     let Some(object) = output.as_object_mut() else {
         return (Vec::new(), Vec::new());
     };
+    // These keys are reserved even without an attachments offer; a provider cannot publish a
+    // forged gateway identity or delivery claim by supplying its own metadata.
+    object.remove(ATTACHED_KEY);
+    object.remove(ATTACHMENT_NOTE_KEY);
     let Some(offered) = object.remove(ATTACHMENTS_KEY) else {
         return (Vec::new(), Vec::new());
     };
@@ -305,13 +384,16 @@ pub fn strip_attachments(
                 Err(_shape) => refusals.push(AttachmentRefusal::InvalidEncoding),
                 Ok(attachments) => {
                     for attachment in attachments {
-                        match accept(slot, &attachment) {
-                            Ok(bytes) => {
+                        match accept(slot, &attachment, capability, invocation) {
+                            Ok((bytes, id)) => {
                                 delivered.push(bytes as u64);
-                                accepted.push(serde_json::json!({
-                                    "mediaType": ATTACHMENT_MEDIA_TYPE,
-                                    "bytes": bytes,
-                                }));
+                                let mut metadata = serde_json::json!({"mediaType": ATTACHMENT_MEDIA_TYPE, "bytes": bytes});
+                                if let Some(id) = id {
+                                    metadata["asset"] = Value::String(format!("chat-asset:{id}"));
+                                    metadata["retained"] = Value::Bool(true);
+                                    metadata["delivered"] = Value::Bool(false);
+                                }
+                                accepted.push(metadata);
                             }
                             Err(refusal) => refusals.push(refusal),
                         }
@@ -334,7 +416,9 @@ pub fn strip_attachments(
 fn accept(
     slot: &ReplyAttachments,
     attachment: &ResultAttachment,
-) -> Result<usize, AttachmentRefusal> {
+    capability: &str,
+    invocation: &str,
+) -> Result<(usize, Option<u64>), AttachmentRefusal> {
     if attachment.media_type != ATTACHMENT_MEDIA_TYPE {
         return Err(AttachmentRefusal::UnsupportedMedia);
     }
@@ -353,13 +437,35 @@ fn accept(
         .decode(&attachment.base64)
         .map_err(|_| AttachmentRefusal::InvalidEncoding)?;
     let bytes = data.len();
-    slot.store(GeneratedImage::from_png(data)?)?;
-    Ok(bytes)
+    validate_png(&data)?;
+    let mut images = slot
+        .images
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if images.len() >= slot.max_per_reply {
+        return Err(AttachmentRefusal::PerReplyLimit);
+    }
+    let (image, id) = if let Some(store) = &slot.registrar {
+        let (id, data) = store
+            .register(&data, capability, invocation)
+            .map_err(AttachmentRefusal::Storage)?;
+        (GeneratedImage { data }, Some(id))
+    } else {
+        (GeneratedImage::from_png(data)?, None)
+    };
+    images.push(image);
+    Ok((bytes, id))
 }
 
 /// Why one `chat-asset:<N>` marker could not be expanded into a capability input.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ChatAssetRefusal {
+    /// Previously retained bytes were reclaimed; no transport refetch is allowed.
+    #[error("the asset was released; ask the user to resend it or select another asset")]
+    Reclaimed,
+    /// The original audience or generation no longer authorizes this reference.
+    #[error("the asset is unavailable in this conversation generation")]
+    Unauthorized,
     /// No attachment in this conversation carries that number.
     #[error("the conversation has no attachment with that number")]
     UnknownAsset,
@@ -387,6 +493,8 @@ impl ChatAssetRefusal {
     #[must_use]
     pub const fn reason(&self) -> &'static str {
         match self {
+            Self::Reclaimed => "reclaimed",
+            Self::Unauthorized => "unauthorized",
             Self::UnknownAsset => "unknown-asset",
             Self::UnsupportedMedia => "unsupported-media",
             Self::PerInvocationLimit => "per-invocation-limit",
@@ -404,6 +512,10 @@ impl ChatAssetRefusal {
     #[must_use]
     pub const fn note(&self) -> &'static str {
         match self {
+            Self::Reclaimed => {
+                "the requested asset was released from disk retention; ask the user to resend it or choose another asset. No call was submitted and no original image was substituted"
+            }
+            Self::Unauthorized => "that reference is not available in this conversation generation",
             Self::UnknownAsset => {
                 "no chat attachment in this conversation carries that number, and the reference \
                  lines above name the ones there are"
@@ -441,7 +553,7 @@ pub trait ChatAssetSource: Send + Sync {
     /// # Errors
     ///
     /// Returns the stable reason the attachment cannot be handed to a capability.
-    fn fetch_for_capability(&self, id: u64) -> Result<(String, Vec<u8>), ChatAssetRefusal>;
+    fn fetch_for_capability(&self, id: u64) -> Result<(String, DiskBlob), ChatAssetRefusal>;
 }
 
 /// One route's chat-asset input expansion: which capabilities opted in, and where bytes come from.
@@ -506,9 +618,22 @@ impl ChatAssetInputs {
     /// Returns the first refusal. The input is then abandoned rather than half-expanded: a proposal
     /// carrying one of three requested images is not the call the model asked for.
     pub fn expand(&self, input: &mut Value) -> Result<usize, ChatAssetRefusal> {
+        self.expand_pinned(input).map(|(count, _pins)| count)
+    }
+
+    /// Expands all requested inputs atomically and returns request-local pins for submission.
+    ///
+    /// # Errors
+    /// Any unavailable member refuses the whole proposal; the original input is unchanged.
+    pub fn expand_pinned(
+        &self,
+        input: &mut Value,
+    ) -> Result<(usize, Vec<DiskBlob>), ChatAssetRefusal> {
         let mut budget = ExpansionBudget::default();
-        self.walk(input, &mut budget)?;
-        Ok(budget.expanded)
+        let mut expanded = input.clone();
+        self.walk(&mut expanded, &mut budget)?;
+        *input = expanded;
+        Ok((budget.expanded, budget.pins))
     }
 
     fn walk(
@@ -559,13 +684,19 @@ impl ChatAssetInputs {
         }
         budget.bytes = spent;
         budget.expanded += 1;
-        Ok(format!("data:{mime};base64,{}", STANDARD.encode(&data)))
+        let encoded = STANDARD.encode(
+            data.read()
+                .map_err(|_error| ChatAssetRefusal::Unavailable)?,
+        );
+        budget.pins.push(data);
+        Ok(format!("data:{mime};base64,{encoded}"))
     }
 }
 
 /// What one invocation has already spent expanding markers.
 #[derive(Default)]
 struct ExpansionBudget {
+    pins: Vec<DiskBlob>,
     expanded: usize,
     bytes: usize,
 }
@@ -594,9 +725,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AttachmentRefusal, ChatAssetInputs, ChatAssetRefusal, GeneratedImage, MAX_ATTACHMENT_BYTES,
-        MAX_CHAT_ASSET_EXPANSIONS_PER_SESSION, MAX_CHAT_ASSET_INPUT_BYTES, ReplyAttachments,
-        chat_asset_marker, strip_attachments,
+        AttachmentRefusal, ChatAssetInputs, ChatAssetRefusal, DiskBlob, GeneratedImage,
+        MAX_ATTACHMENT_BYTES, MAX_CHAT_ASSET_EXPANSIONS_PER_SESSION, MAX_CHAT_ASSET_INPUT_BYTES,
+        ReplyAttachments, chat_asset_marker, strip_attachments,
     };
 
     fn png() -> Vec<u8> {
@@ -660,11 +791,14 @@ mod tests {
     }
 
     impl super::ChatAssetSource for FixedAssets {
-        fn fetch_for_capability(&self, id: u64) -> Result<(String, Vec<u8>), ChatAssetRefusal> {
+        fn fetch_for_capability(&self, id: u64) -> Result<(String, DiskBlob), ChatAssetRefusal> {
             if id > 8 {
                 return Err(ChatAssetRefusal::UnknownAsset);
             }
-            Ok((self.mime.to_owned(), vec![b'x'; self.bytes]))
+            Ok((
+                self.mime.to_owned(),
+                DiskBlob::from_bytes(&vec![b'x'; self.bytes]).expect("spool"),
+            ))
         }
     }
 
@@ -823,7 +957,52 @@ mod tests {
         assert!(output.get("attachments").is_none());
         assert!(output.get("attachmentNote").is_none());
         assert_eq!(output["image"]["generationId"], "gen-1");
-        assert_eq!(slot.take().len(), 1);
+        let delivered = slot.take();
+        assert_eq!(delivered.len(), 1);
+        drop(slot);
+        assert_eq!(
+            delivered.into_iter().next().unwrap().into_bytes().unwrap(),
+            png()
+        );
+    }
+
+    #[test]
+    fn provider_success_followed_by_spool_failure_is_attachment_refusal_not_invocation_failure() {
+        const CHILD: &str = "DEKOPON_TEST_SPOOL_FAILURE";
+        if std::env::var_os(CHILD).is_none() {
+            // A separate process supplies an unusable TMPDIR without mutating concurrent tests'
+            // environment. No real disk exhaustion or permissions bypass is required.
+            let directory = tempfile::tempdir().expect("fixture");
+            let not_directory = directory.path().join("not-a-directory");
+            std::fs::write(&not_directory, b"not a directory").expect("fixture");
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", "attachment::tests::provider_success_followed_by_spool_failure_is_attachment_refusal_not_invocation_failure", "--nocapture"])
+                .env(CHILD, "1").env("TMPDIR", &not_directory).env("TMP", &not_directory).env("TEMP", &not_directory)
+                .output().expect("child test");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let slot = ReplyAttachments::new(1);
+        let mut output = json!({"executed": true, "attachments": [{"mediaType": "image/png", "base64": STANDARD.encode(png())}]});
+        let (accepted, refused) = strip_attachments(&mut output, Some(&slot));
+        assert!(accepted.is_empty());
+        assert!(matches!(
+            refused.as_slice(),
+            [AttachmentRefusal::Storage(_)]
+        ));
+        assert_eq!(output["executed"], true);
+        assert!(output.get("attachments").is_none());
+        assert!(
+            output["attachmentNote"]
+                .as_str()
+                .unwrap()
+                .contains("capability executed")
+        );
+        assert!(slot.take().is_empty());
     }
 
     #[test]

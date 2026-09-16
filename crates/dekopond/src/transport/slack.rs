@@ -16,7 +16,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use dekopon_agent::{CancelVia, attachment::GeneratedImage};
+use dekopon_agent::CancelVia;
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, ConversationKind};
 use dekopon_core::{ExternalSubject, Redacted};
 use futures_util::{SinkExt as _, StreamExt as _, future::BoxFuture};
@@ -573,6 +573,12 @@ impl SlackTransport {
                 conversation_id,
             }),
             receive_span: received.clone(),
+            received_at: tokio::time::Instant::now(),
+            native_group: None,
+            constituents: Vec::new(),
+            asset_overflow: event["files"]
+                .as_array()
+                .is_some_and(|files| files.len() > MAX_ATTACHMENTS),
         }))
     }
 
@@ -892,10 +898,11 @@ impl ChatDriver for SlackReplier {
         target: &ReplyTarget,
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
+        let OutboundReply { text, images } = reply;
+        let images = super::hydration::hydrate_images(images).await?;
         let ReplyTarget::Slack { channel, thread_ts } = target else {
             return Err(TransportError::Response);
         };
-        let OutboundReply { text, images } = reply;
         if !images.is_empty() {
             return self
                 .upload_attachments(channel.clone(), thread_ts.clone(), text, images)
@@ -1397,7 +1404,7 @@ impl SlackReplier {
         channel: String,
         thread_ts: Option<String>,
         text: String,
-        images: Vec<GeneratedImage>,
+        images: Vec<super::hydration::HydratedImage>,
     ) -> Result<(), TransportError> {
         let mut accepted = false;
         for (index, image) in images.into_iter().enumerate() {
@@ -1405,7 +1412,7 @@ impl SlackReplier {
                 .then_some(text.as_str())
                 .filter(|text| !text.is_empty());
             match self
-                .upload_attachment(&channel, thread_ts.as_deref(), comment, image, index)
+                .upload_attachment(&channel, thread_ts.as_deref(), comment, image)
                 .await
             {
                 Ok(()) => accepted = true,
@@ -1424,11 +1431,10 @@ impl SlackReplier {
         channel: &str,
         thread_ts: Option<&str>,
         initial_comment: Option<&str>,
-        image: GeneratedImage,
-        index: usize,
+        image: super::hydration::HydratedImage,
     ) -> Result<(), TransportError> {
-        let filename = image.filename(index);
-        let length = image.bytes().len().to_string();
+        let filename = image.filename;
+        let length = image.bytes.len().to_string();
         let described = check_ok(
             self.http
                 .post(format!("{}/api/files.getUploadURLExternal", self.endpoint))
@@ -1456,8 +1462,8 @@ impl SlackReplier {
         let uploaded = self
             .http
             .post(upload_url)
-            .header("content-type", image.media_type())
-            .body(image.into_bytes())
+            .header("content-type", image.media_type)
+            .body(image.bytes)
             .send()
             .await
             .map_err(|source| TransportError::Request(Box::new(source)))?;

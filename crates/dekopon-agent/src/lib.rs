@@ -60,7 +60,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use thiserror::Error;
 
 #[cfg(unix)]
-use crate::attachment::{ChatAssetInputs, ChatAssetRefusal, ReplyAttachments, strip_attachments};
+use crate::attachment::{
+    ChatAssetInputs, ChatAssetRefusal, ReplyAttachments, strip_attachments_for_invocation,
+};
 use crate::{meta::EffectiveCapabilityView, prompt::ScriptRuntime};
 
 pub mod attachment;
@@ -673,24 +675,27 @@ impl BrokerLeg {
     /// deliberate: `chat-asset:3` is a plain string until an owner says a capability may be handed
     /// attachment bytes, and the provider is the one that decides what to do with a string it did
     /// not expect.
-    fn expanded(&self, capability: &str, input: Value) -> Result<Value, ChatAssetRefusal> {
+    fn expanded(
+        &self,
+        capability: &str,
+        input: Value,
+    ) -> Result<(Value, Vec<dekopon_model::asset::DiskBlob>), ChatAssetRefusal> {
         let Some(inputs) = self
             .asset_inputs
             .as_ref()
             .filter(|it| it.covers(capability))
         else {
-            return Ok(input);
+            return Ok((input, Vec::new()));
         };
         let mut input = input;
-        match inputs.expand(&mut input) {
-            Ok(0) => Ok(input),
-            Ok(expanded) => {
+        match inputs.expand_pinned(&mut input) {
+            Ok((expanded, pins)) => {
                 tracing::debug!(
                     command.leg = "broker",
                     chat_asset.expansions = expanded,
                     "chat asset inputs expanded"
                 );
-                Ok(input)
+                Ok((input, pins))
             }
             Err(refusal) => {
                 tracing::warn!(
@@ -714,8 +719,13 @@ impl BrokerLeg {
     ///
     /// Acceptance is where a progress surface learns a file is coming: the reply that carries it is
     /// posted whole minutes later, and until then the only thing to say is that the picture exists.
-    fn deliver_attachments(&self, output: &mut Value) {
-        let (accepted, refusals) = strip_attachments(output, self.attachments.as_deref());
+    fn deliver_attachments(&self, output: &mut Value, capability: &str, invocation: &str) {
+        let (accepted, refusals) = strip_attachments_for_invocation(
+            output,
+            self.attachments.as_deref(),
+            capability,
+            invocation,
+        );
         for bytes in accepted {
             self.emit(ProgressEvent::Attachment {
                 index: self.attachments_accepted.fetch_add(1, Ordering::Relaxed),
@@ -1039,7 +1049,7 @@ impl BrokerLeg {
         }
         // The last point at which the proposal's JSON is still this process's to edit: a command
         // word's `run-command` proposal arrives here after the interpreter checked the grant.
-        let input = match self.expanded(capability, input) {
+        let (input, asset_pins) = match self.expanded(capability, input) {
             Ok(input) => input,
             // A refusal here is permanent and the call never happened, which is the interpreter's
             // `Denied` — exit 126, its one non-retryable status — rather than a `Failed` the model
@@ -1071,14 +1081,17 @@ impl BrokerLeg {
         // Safe specifically because this runs on a `spawn_blocking` thread rather than a runtime
         // worker: `Handle::block_on` from a worker would deadlock the executor, and from the
         // blocking pool it is the ordinary bridge back into async code.
+        let invocation = request.id.to_string();
         let submitted = self
             .runtime
             .block_on(async { self.client.invoke(self.attestation.clone(), request).await });
+        // The provider request is over. Release its transient input pins before admitting outputs.
+        drop(asset_pins);
         match submitted {
             Ok(result) => match result.outcome {
                 InvocationOutcome::Succeeded => {
                     let mut output = result.output.unwrap_or(Value::Null);
-                    self.deliver_attachments(&mut output);
+                    self.deliver_attachments(&mut output, capability, &invocation);
                     CapabilityCallResult::Succeeded(output)
                 }
                 // A refusal has to stay a refusal all the way to the script's exit code. The
@@ -2029,11 +2042,17 @@ mod tests {
         struct OneAsset;
 
         impl ChatAssetSource for OneAsset {
-            fn fetch_for_capability(&self, id: u64) -> Result<(String, Vec<u8>), ChatAssetRefusal> {
+            fn fetch_for_capability(
+                &self,
+                id: u64,
+            ) -> Result<(String, dekopon_model::asset::DiskBlob), ChatAssetRefusal> {
                 if id != 1 {
                     return Err(ChatAssetRefusal::UnknownAsset);
                 }
-                Ok(("image/png".to_owned(), b"PNG".to_vec()))
+                Ok((
+                    "image/png".to_owned(),
+                    dekopon_model::asset::DiskBlob::from_bytes(b"PNG").expect("spool"),
+                ))
             }
         }
 
@@ -2105,7 +2124,7 @@ mod tests {
         /// A refusal is permanent and the call never happened, so it comes back as the
         /// interpreter's one non-retryable status rather than as an error to try again.
         #[tokio::test(flavor = "multi_thread")]
-        async fn an_unexpandable_marker_submits_no_proposal() {
+        async fn one_unavailable_member_of_multiple_inputs_submits_no_proposal() {
             let directory = private_broker_directory();
             let (leg, mut observed) = stub_leg_observing(directory.path(), Vec::new(), None).await;
             let leg = leg.with_chat_asset_inputs(ChatAssetInputs::new(
@@ -2114,7 +2133,7 @@ mod tests {
             ));
 
             let CapabilityCallResult::Denied { reason } =
-                invoke_with(leg, json!({"images": ["chat-asset:9"]})).await
+                invoke_with(leg, json!({"images": ["chat-asset:1", "chat-asset:9"]})).await
             else {
                 panic!("an unknown attachment number is a refusal, not a failed call");
             };

@@ -7,6 +7,40 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- Pin `tracing-core` to the exact revision of upstream tracing PR #3614, fixing lost cold-callsite
+  events/spans when the sole registered dispatcher is scoped to another thread. Direct and
+  transitive tracing consumers share the patched core; test assertions and parallelism are unchanged.
+
+- Validate inbound WhatsApp PNG signatures without unaccounted scratch writes. Completed asset
+  downloads that exceed retention limits now remain unavailable without silently redownloading;
+  known-oversized inputs still refuse before transport IO.
+
+- Collect media-first WhatsApp bursts before admission (`debounceMs: 3000` by default, `0` for
+  immediate behavior) and Telegram native media groups in a separate fixed 3-second window.
+  Bounded, actor-isolated inputs share one lead reply and causally linked execution; fixed-window
+  expiry attempts admission immediately, never queues behind active sessions. Oversized native
+  Slack/Discord arrays are explicitly refused instead of silently truncated. Multi-message
+  WhatsApp webhooks retain distinct receipt identities; pending stops acknowledge even while an
+  earlier answer completes. Immediate inputs retain their existing text truncation behavior.
+
+- Outbound image hydration and owned scratch disposal now run off async workers with the delivery
+  trace context. Local image answers use the existing separate-reply fallback rather than
+  finalizing a progress/stream line in place; text-only finalization is unchanged.
+
+### Changed
+
+- Chat assets now use one gateway-owned disk LRU, configured by `sessions.assetRetentionBytes`
+  (256 MiB default; zero disables asset retention/delivery). Model history holds weak references;
+  reclaimed images become explicit release notices, and unavailable provider inputs refuse the
+  entire edit without refetch or original-image fallback. Validated generated PNGs receive reusable
+  scoped `chat-asset` IDs for successive edits and share their stored bytes with outbound delivery.
+  Temporary request pins count toward the same budget; storage failure preserves already-executed
+  provider outcomes and never retries the paid call.
+- Gateway Helm scratch is disk-backed `emptyDir` with separate `volumeSizes.gatewayTmp` (320Mi
+  default). Existing `volumeSizes.tmp` overrides now affect only broker scratch, still tmpfs.
+  Operators must verify deployed scratch mounts separately; no rollout is implied.
 ### Added
 
 - Broker provider invocations emit a payload-free linear-memory sizing summary with the largest

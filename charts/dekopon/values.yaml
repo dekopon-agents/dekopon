@@ -53,7 +53,7 @@ podSecurityContext:
 
 securityContext:
   allowPrivilegeEscalation: false
-  # Neither daemon writes outside its mounted volumes. A tmpfs /tmp is mounted anyway so an
+  # Neither daemon writes outside its mounted volumes. A private /tmp is mounted for each daemon so an
   # incidental temporary file cannot turn into a crash.
   readOnlyRootFilesystem: true
   capabilities:
@@ -439,12 +439,15 @@ providerStorage:
   existingClaim: ""
   rootPath: /var/lib/dekopon-provider-storage
 
-# tmpfs sizes. Both are memory-backed so the credentials file and the socket never touch the
-# node's disk; both count against the pod's memory limit, which is why they are small.
+# Config, runtime and broker tmp remain memory-backed. Gateway scratch is disk-backed;
+# its 256 MiB live attachment allowance is independent of kubelet enforcement of this sizeLimit.
 volumeSizes:
   config: 8Mi
   runtime: 1Mi
   tmp: 16Mi
+  # Size for the default gateway sessions.assetRetentionBytes (256 MiB) plus temporary overhead.
+  # If increasing the typed gateway config budget, increase this disk volume independently.
+  gatewayTmp: 320Mi
 
 # ---------------------------------------------------------------------------------------------
 # Termination

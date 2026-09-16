@@ -65,6 +65,7 @@ transports:
     liveness: { mode: native, progress: message, cancelButton: true }
   - name: whatsapp
     kind: whatsappCloudApi
+    debounceMs: 3000                      # fixed media-first window; 0 bypasses collection
     appSecretEnv: DEKOPOND_WHATSAPP_APP_SECRET
     verifyTokenEnv: DEKOPOND_WHATSAPP_VERIFY_TOKEN
     accessTokenEnv: DEKOPOND_WHATSAPP_ACCESS_TOKEN
@@ -139,6 +140,7 @@ sessions:
   maxConcurrent: 4                            # optional, default 4
   replyOnBusy: true                           # optional, default true
   maxConversations: 1024                      # optional, default 1024 tracked
+  assetRetentionBytes: 268435456              # optional, process-wide disk budget; 0 disables assets
 
 shutdownGraceMs: 120000                       # optional, default 120000
 
@@ -249,6 +251,55 @@ standing instructions visible to any sender authorized to use that agent. Those 
 already model input and must never contain credentials; operators should not treat a system prompt
 as a secret from its users.
 
+## Multi-message media inputs
+
+The shared gateway collects **media-first** inputs after routing/address checks and before
+session admission. WhatsApp `debounceMs` is an unsigned 32-bit millisecond duration (`0..=4294967295`, default `3000`);
+`0` disables collection entirely and preserves immediate admission/busy behavior. Invalid types,
+negative/out-of-range integers and durations that cannot form a timer deadline are refused by
+configuration decoding. A nonzero window starts at the first media receipt and never slides:
+later photos, captions and standalone text can join that actor's open compatible burst, but do not
+extend its deadline. Text arriving first remains immediate. These are heuristic bursts, not
+WhatsApp albums; webhook payload boundaries are not album identities.
+
+Telegram uses a separate fixed **3-second** window only for authenticated `media_group_id`
+members, because Telegram supplies no group-end marker. Member captions join; ordinary text and
+ungrouped Telegram media remain immediate and cannot claim membership. Different native groups
+never merge: a competing group for the same pending actor/audience is visibly refused. WhatsApp's
+setting never changes Telegram timing. In groups/topics, unaddressed native members may inherit
+addressing only from an already-open addressed lead with the exact same actor, route, full scope,
+reply audience and native group ID. Members arriving before that addressed lead (or after expiry)
+remain ignored unless individually addressed; there is no pre-address buffer or grant inheritance.
+Slack/Discord native attachment arrays remain indivisible
+and immediate; local text remains immediate. Their existing 10-attachment parser ceiling now
+refuses an oversized native envelope instead of accepting a truncated subset.
+
+Collection is isolated by canonical authenticated subject, exact bound route, configured transport,
+complete conversation/container/thread and reply audience, even on shared-history routes. Each
+batch retains at most **8 envelopes, 32 assets and 16 KiB of rendered text**, including the source
+boundary/caption-presence labels added for multiple inputs. Limits reject only the incoming
+envelope, visibly and with a traced cause; already collected members remain intact. Native arrays
+are never split. There is at most one collecting batch per compatible actor key and globally at
+most `sessions.maxConcurrent` batches, independently of execution permits.
+
+At the fixed deadline, the batch attempts normal admission immediately. An active conversation or
+exhausted execution capacity produces a visible busy reply (also when `replyOnBusy` is false for
+ordinary messages) and disposes the batch. There is **no execution queue**, no waiting for an
+active session, no replay and no cancellation of paid effects. Late media starts a new bounded
+collection; late standalone text has ordinary immediate/busy behavior. Neither heuristic bursts
+nor native groups guarantee completion when members arrive beyond the fixed window. Collection
+latency is the configured window (3 seconds by default), not 30 seconds plus admission waiting;
+normal inference and transport time remain additional.
+
+Fresh broker authorization and generation selection happen only after admission; collection does
+not fetch assets, contact the model/provider or publish progress. One lead message owns progress,
+reply target and native delivery identity; other message IDs are not fabricated into an album ID.
+An authenticated stop removes only that actor's pending work and preserves the existing ownership
+rules for active sessions. Shutdown discards pending batches without starting them. Original
+receipt traces retain their input and terminal disposition; the lead-parented execution exports
+causal links to every constituent (see [observability](observability.md)). Asset leases, history
+scope, generation fences and on-demand fetch budgets are unchanged.
+
 ## Provider attachments and chat-asset inputs
 
 Bytes can cross between a capability and a chat conversation in both directions, and the sandboxed
@@ -265,7 +316,8 @@ Each direction is an owner-authored route opt-in, because each is new reach.
   reserved top-level `attachments: [{mediaType, base64}]`. The session's broker leg removes that key
   before the result reaches the shell, validates each entry (`image/png`, valid base64, PNG
   signature, at most 8 MiB decoded, at most `maxPerReply` across the whole session), puts the
-  accepted bytes in a request-local slot, and writes back `attached: [{mediaType, bytes}]` so the
+  accepted assets in its bounded disk LRU with temporary delivery pins, and writes back `attached`
+  metadata with a gateway `asset: "chat-asset:<N>"` marker and retained/not-yet-delivered status so the
   shell and the model see metadata only. The ordinary result fields beside the key are untouched.
 - **In: `chatAssetInputs: [<capability id>, …]`.** A capability input may name one of this
   conversation's own attachments as the exact string `chat-asset:<N>`, the number from its
@@ -403,7 +455,7 @@ what does this say?
 
 The model then calls `fetch_chat_asset(1)`. Because a tool result cannot carry an image — Chat Completions types a `tool` message's content as a string, and the Responses API types `function_call_output.output` the same way — the answer arrives as two messages: the tool result says the asset follows, and a `user` message carries the bytes. That shape is the only one both wire formats accept.
 
-- **Numbering follows the exact history audience and live generation.** `Chat Asset #5` means at most one file in that generation, which is what lets a follow-up three turns later resolve. Its monotonic sequence survives independent asset TTL/LRU removal while the transcript generation remains live, so a removed number cannot alias a newer file. Grant/empty-grant invalidation, idle replacement, and conversation-capacity eviction close the generation's asset fence; stale sessions cannot enumerate, publish, or fetch through it, and a replacement generation may safely number from one again. Private participants and different agents/transports/conversations cannot enumerate or fetch one another's attachments. Participants on an explicitly shared route share the live attachment inventory as well as the replayed reference notes; that disclosure is part of choosing shared scope. Numbers are assigned by the gateway rather than by a transport.
+- **Numbering follows the exact history audience and live generation.** `Chat Asset #5` means at most one file in that generation, which is what lets a follow-up three turns later resolve. Its monotonic sequence survives independent asset TTL/LRU removal while the transcript generation remains live, so a removed number cannot alias a newer file. Grant/empty-grant invalidation, idle replacement, and conversation-capacity eviction close the generation's asset fence; stale sessions cannot enumerate, publish, or fetch through it, and a replacement generation may safely number from one again. Private participants and different agents/transports/conversations cannot enumerate or fetch one another's attachments. Participants on an explicitly shared route share the live attachment inventory as well as the replayed reference notes; that disclosure is part of choosing shared scope. Numbers are assigned by the gateway rather than by a transport; one-shot IDs are process-monotonic so expiry cannot alias an old reference.
 - **Every prompt names the whole inventory**, not only what the newest message brought, with the new ones marked. A reference line is the only way a model learns a number exists, and one confined to the turn that introduced it goes unreachable as soon as ordinary chatter pushes that turn out of the replayed history window — while the store holds the file for another hour.
 - **The reference line is what history remembers, not the bytes.** It is a few dozen bytes, so it replays inside the conversation byte budget instead of evicting real conversation the way a base64 screenshot would.
 - **A file that cannot be shown is named anyway.** A media type outside the allowlist, a model with no image modality, or a file Slack withholds entirely all produce a line saying so, which the model can answer around instead of denying a screenshot that plainly exists.
@@ -412,6 +464,60 @@ The model then calls `fetch_chat_asset(1)`. Because a tool result cannot carry a
 - **Bounds.** 8 MiB per attachment, enforced while the response streams rather than after it, because a reported size is sender-influenced and a chunked response need not declare a length. Four fetches per session. Thirty-two attachments addressable per conversation, evicted oldest-first. A textual file is clamped again on the way into the prompt, at the same 256 KiB a script's output is capped at, with a trailer saying where it was cut: the 8 MiB ceiling is sized for images on the wire, and that much `text/plain` is roughly two million tokens — enough to come back from the provider as a context-length rejection. Every one of these refuses in a sentence the model reads and can answer around, never by failing the session.
 - **Redirects.** The HTTP client refuses redirects globally so a bearer token is never forwarded by policy. Slack's `url_private_download` genuinely redirects to its own file host, so that transport follows exactly one hop, only to a host it recognises by comparing the host itself rather than a URL prefix, and re-attaches the token by hand.
 - **Ambient proxies.** Every transport's client is built from one `credential_client` shape that sets `no_proxy()`, so an exported `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` carries no Slack, Discord, Telegram or WhatsApp token — nor the messages and files it authenticates — through a host nobody named to Dekopon. There is no flag to opt back in; a chat service reachable only through a proxy is unreachable.
+- **Gateway-owned disk LRU, weak references.** Inbound inputs fetch once, then reuse the same
+  private file. Validated generated PNGs receive fresh scoped gateway IDs, with capability/invocation
+  provenance, and join the conversation inventory immediately. The model receives
+  `attached: [{mediaType, bytes, asset: "chat-asset:<N>", retained: true, delivered: false}]`:
+  produced and retained is not transport-delivered. Same-session and later-turn edits can use that
+  marker, including editing a previous edit instead of the original. Provider-supplied reserved
+  `attached`/`attachmentNote` values are removed, never trusted as gateway metadata.
+- **One configurable residency budget.** `sessions.assetRetentionBytes` defaults to **268435456**
+  (256 MiB) across all conversations and generated/inbound assets in this gateway process. **Zero
+  disables retention**: newly fetched/generated assets cannot be retained or delivered; text remains
+  usable. It is never an unlimited setting. The shared 8 MiB per-file and transport/proposal limits
+  remain independent safety limits, not competing retention caches. Empty files charge one byte.
+  Configure disk-backed temporary storage with sufficient capacity separately from this logical budget.
+- **Use means consumption.** Successful scoped resolution for model inclusion or provider submission
+  refreshes recency; inventory listing and history reference replay do not. Least-recently-used
+  unpinned files are reclaimed before admission. Individually oversized assets are refused without
+  evicting useful entries; insufficient unpinned space refuses clearly. Active provider requests and
+  outbound delivery hold temporary pins charged to the same budget. Model messages hold weak
+  references, never residency ownership. Retired/expired inventories are pruned lazily; their files
+  are reclaimed on the next blocking admission, once active pins finish. Unlink failures retain
+  accounting rather than pretending disk space was freed.
+- **Released is not unfetched.** A reclaimed asset is never silently downloaded again or substituted
+  with an original input. Requested provider inputs are all resolved and pinned before submission;
+  one missing input refuses the entire call. Historical model attachment parts become an explicit
+  gateway-authored release notice at request encoding, letting the model choose its next action.
+  Actual descriptor IO/corruption errors remain errors, not fabricated release notices. Scoped
+  inventory state and at most 1024 release tombstones distinguish released, unknown and unauthorized
+  IDs. Persistent IDs remain monotonic within the generation; one-shot IDs are process-monotonic
+  to avoid reuse after independent inventory expiry.
+- **Private scratch, not persistence.** The gateway creates 0700 directories and 0600 files beneath
+  the process temporary directory. No model/provider path is accepted or serialized; reads use the
+  original descriptor. No startup recovery, external cache or restart persistence is provided.
+  Cleanup failures emit bounded diagnostics; abrupt process death can leave scratch until the
+  temporary volume is removed.
+- **Storage failures are not successful empty images.** Capacity exhaustion, OS IO categories
+  (including disk-full), and changed/truncated length are sanitized failures, never paths or bytes.
+  An unlinked file still reads through its original descriptor while a lease owns it. No storage
+  failure triggers an automatic network fallback or paid-call retry. A provider-result spool refusal
+  explicitly says the capability already executed and its attachment was not delivered; existing
+  complete/partial transport acceptance rules remain in force. Outbound transports transfer all
+  reply leases to a trace-contextual blocking task before delivery; reads and normal disposal do
+  not occupy async workers. Cancelling the wait does not stop that task: it releases ownership
+  when IO returns. Blocking model consumers retain the synchronous API. Local image answers use
+  a separate reply instead of in-place progress/stream finalization; text-only answers still finalize
+  in place. An unpolled transport future or runtime shutdown before queued work starts can still
+  drop leases on the calling thread; this is not a general asynchronous cleanup service.
+- **Disk backing is an operator requirement.** The chart uses disk-backed gateway `/tmp`, separately
+  sized by `volumeSizes.gatewayTmp`; broker scratch stays tmpfs. Other installations must provide
+  a disk-backed temporary directory, not a memory-backed `emptyDir` or `TMPDIR`. Existing deployed
+  manifests and overrides need separate rollout verification. This removes retained bulk bytes,
+  not all peak allocations: bounded downloads/decodes, textual conversion, base64/JSON request
+  bodies, broker frames and multipart upload buffers still allocate temporarily; filesystem page
+  cache is also outside this claim. No RSS measurement is implied.
+
 - **Resolving a reference differs by transport.** Slack carries a private download URL on the event itself. Discord carries a signed CDN URL plus the source channel/message/attachment IDs; the CDN request carries no token, and an expired 401/403/404 URL is refreshed by re-reading that exact message through pinned Discord REST before retrying the same attachment ID. Telegram carries only a `file_id`, so a fetch is two calls: `getFile` turns the handle into a path valid for about an hour, and the bytes live under `/file/bot<token>/<path>` rather than the method prefix. The round trip happens at fetch time, which is also when that path is freshest.
 - **Discord specifics.** Photos and arbitrary files share the attachment object, retaining their sender-controlled filename, optional media type, and reported size. Production downloads accept only HTTPS `cdn.discordapp.com` or `media.discordapp.net` URLs, reject credentials and redirects, and enforce the byte ceiling while streaming.
 - **Telegram specifics.** A photo arrives as the same image at several sizes and the largest is the one used — a model asked to read text in a screenshot cannot read a 90-pixel-wide copy. Telegram reports no media type for a photo, so `image/jpeg` is inferred, which is what the Bot API re-encodes every photo to; a file sent as a *document* keeps its own bytes, name, and declared type. Words on an upload arrive in `caption` rather than `text`.
@@ -811,7 +917,7 @@ What the key is worth is measured, not assumed — [`inference.md`](inference.md
 
 ### What this means for retention
 
-On a `persistent` route, chat text sits in `dekopond`'s memory for at least the idle timeout after somebody stops talking — on the default, fifteen minutes of a person's question and the agent's answer. With shared scope, that retained content and its attachment inventory belong to the exact conversation audience rather than one sender. **At least**, because eviction is lazy: an abandoned conversation is dropped by the next lookup on its key or by the ceiling displacing it, so with neither happening the bytes stay in the process until it exits. What a timed-out entry can never do is reach a prompt. The daemon writes none of it to disk; the operating system's own paging and core-dump behavior are outside what the daemon controls. Another process under the gateway UID is inside its trust domain; see the [current process boundary](#current-process-boundary).
+On a `persistent` route, chat text sits in `dekopond`'s memory for at least the idle timeout after somebody stops talking — on the default, fifteen minutes of a person's question and the agent's answer. With shared scope, that retained content and its attachment inventory belong to the exact conversation audience rather than one sender. **At least**, because eviction is lazy: an abandoned conversation is dropped by the next lookup on its key or by the ceiling displacing it, so with neither happening the bytes stay in the process until it exits. What a timed-out entry can never do is reach a prompt. The daemon writes none of that conversation text to disk (active attachment payload leases use private temporary files); the operating system's own paging and core-dump behavior are outside what the daemon controls. Another process under the gateway UID is inside its trust domain; see the [current process boundary](#current-process-boundary).
 
 ## Durable memory after transport acceptance
 

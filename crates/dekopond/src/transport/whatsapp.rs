@@ -589,12 +589,6 @@ async fn process_webhook(
     if accepted.is_empty() {
         return content_free(StatusCode::OK);
     }
-    // Meta sends one message per delivery in practice and the parser tolerates a batch, so the
-    // identifier is recorded only when the delivery is the one message this span describes. A
-    // batched delivery leaves it unset and parents every message's `gateway.message` here.
-    if let [only] = accepted.as_slice() {
-        received.record("message.id", only.message_id.as_str());
-    }
     let permit_count = u32::try_from(accepted.len()).expect("delivery bound fits u32");
     // Only the claimed IDs are needed to undo the claim, so the messages themselves move into the
     // delivery rather than being held a second time for a path that usually does not run.
@@ -744,7 +738,11 @@ fn parse_delivery(
                     id: sender.to_owned(),
                     thread: None,
                 };
-                record_conversation(received, &conversation);
+                // A delivery may carry several messages with different terminal dispositions.
+                // Keep their receipt identities distinct while retaining the signed delivery parent.
+                let receipt = received.in_scope(|| receive_span(ChatTransportKind::Whatsapp));
+                receipt.record("message.id", id);
+                record_conversation(&receipt, &conversation);
                 accepted.push(InboundMessage {
                     transport: state.name.clone(),
                     transport_kind: ChatTransportKind::Whatsapp,
@@ -765,7 +763,11 @@ fn parse_delivery(
                         recipient: sender.to_owned(),
                         inbound_message_id: id.to_owned(),
                     }),
-                    receive_span: received.clone(),
+                    receive_span: receipt,
+                    received_at: tokio::time::Instant::now(),
+                    native_group: None,
+                    constituents: Vec::new(),
+                    asset_overflow: false,
                 });
             }
         }
@@ -1038,14 +1040,15 @@ impl ChatDriver for WhatsappDriver {
         target: &ReplyTarget,
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
+        let OutboundReply { text, images } = reply;
+        let images = super::hydration::hydrate_images(images).await?;
         let ReplyTarget::WhatsApp { recipient } = target else {
             return Err(TransportError::Response);
         };
-        let OutboundReply { text, images } = reply;
         // Refuse every locally knowable failure before uploading or sending any part.
         if images
             .iter()
-            .any(|image| image.bytes().len() > media::MAX_IMAGE_BYTES)
+            .any(|image| image.bytes.len() > media::MAX_IMAGE_BYTES)
         {
             return Err(media::failure("image-too-large"));
         }
@@ -1053,7 +1056,7 @@ impl ChatDriver for WhatsappDriver {
         let mut accepted = 0_usize;
         for (index, image) in images.into_iter().enumerate() {
             let caption = (caption_fits && index == 0 && !text.is_empty()).then_some(text.as_str());
-            if let Err(error) = self.send_image(recipient, caption, image, index).await {
+            if let Err(error) = self.send_image(recipient, caption, image).await {
                 return Err(self.reply_failure(error, accepted));
             }
             accepted += 1;

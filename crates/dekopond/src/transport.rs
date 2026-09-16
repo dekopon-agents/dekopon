@@ -26,6 +26,7 @@ use futures_util::future::BoxFuture;
 use thiserror::Error;
 
 pub(crate) mod discord;
+mod hydration;
 pub(crate) mod local;
 pub(crate) mod slack;
 pub(crate) mod telegram;
@@ -91,6 +92,8 @@ pub(crate) struct InboundMessage {
     pub text: String,
     /// What the sender attached, described but not yet numbered or fetched.
     pub assets: Vec<PendingAsset>,
+    /// Native array exceeded its transport ceiling; refuse the whole envelope.
+    pub asset_overflow: bool,
     /// Whether authenticated structured transport metadata says the bot was addressed.
     ///
     /// Discord supplies `Some` from its `mentions` array, including `Some(false)` so presentation
@@ -113,13 +116,21 @@ pub(crate) struct InboundMessage {
     /// Absent for transports or messages with no configured liveness surface. These values come
     /// only from the transport envelope and are never model-controlled.
     pub liveness: Option<LivenessTarget>,
-    /// The span the transport opened when this message arrived, and the root of its trace.
+    /// The span the transport opened for this message's receipt.
     ///
-    /// Built by [`receive_span`] before the payload was parsed, so the acknowledgment, the
-    /// signature check, and the routing decision are already inside it. [`crate::session::run_session`]
+    /// Built by [`receive_span`]; WhatsApp messages get distinct children of the signed delivery
+    /// span, so the acknowledgment and signature check remain in their ancestry.
+    /// [`crate::session::run_session`]
     /// takes it, parents `gateway.message` under it, and drops it — which is what keeps
-    /// `transport.receive` measuring receipt and dispatch rather than the whole session it started.
+    /// `transport.receive` measuring receipt and dispatch for ordinary messages. Collection retains
+    /// constituent receipt handles until their shared terminal disposition.
     pub receive_span: tracing::Span,
+    /// Receipt time, before the shared collector can buffer this envelope.
+    pub received_at: tokio::time::Instant,
+    /// Authenticated Telegram media_group_id, never inferred from text.
+    pub native_group: Option<String>,
+    /// Original receipt traces retained only for a collected input (at most eight).
+    pub constituents: Vec<tracing::Span>,
 }
 
 /// Opens the trace one inbound message rides, at the moment its transport received it.
@@ -681,6 +692,10 @@ pub(crate) trait AssetFetcher: Send + Sync {
 /// of them carries a credential, and the daemon logs the category rather than the message.
 #[derive(Debug, Error)]
 pub enum TransportError {
+    #[error("{0}")]
+    Attachment(#[from] dekopon_model::asset::BlobError),
+    #[error("attachment hydration task failed ({reason}); provider already executed")]
+    AttachmentTask { reason: &'static str },
     #[error("credential environment variable {name} is not set")]
     MissingCredential { name: String },
     #[error("credential environment variable {name} is set to an empty value")]
@@ -717,6 +732,8 @@ impl TransportError {
     /// Stable low-cardinality category for telemetry, never the underlying message.
     pub const fn category(&self) -> &'static str {
         match self {
+            Self::Attachment(_) => "attachment-storage",
+            Self::AttachmentTask { .. } => "attachment-task",
             Self::MissingCredential { .. } => "missing-credential",
             Self::EmptyCredential { .. } => "empty-credential",
             Self::NonUtf8Credential { .. } => "non-utf8-credential",

@@ -89,6 +89,9 @@ for m in gateway_state:
     assert m.get("subPath")=="chatgpt" and m["mountPath"]=="/var/lib/dekopon/chatgpt", m
 assert "config" not in gm and "gateway-config" not in bm
 assert "tmp" not in gm and "gateway-tmp" not in bm
+volumes={v["name"]:v for v in pod["volumes"]}
+assert volumes["gateway-tmp"]["emptyDir"]=={"sizeLimit":"320Mi"}
+assert volumes["tmp"]["emptyDir"]=={"medium":"Memory", "sizeLimit":"16Mi"}
 assert "config-source" not in gm and "config-source" not in bm
 expected={"config-source":"/dekopon-source", "config":"/etc/dekopon",
           "gateway-config":"/etc/dekopon-gateway", "runtime":"/run/dekopon",

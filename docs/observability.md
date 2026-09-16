@@ -142,8 +142,9 @@ these carries a fixed category rather than the untrusted text that triggered it:
 | Event | Emitted by | Carries |
 |---|---|---|
 | `agent.tool.rejected` | `dekopon-agent` | model turn, the tool-call index or count, and a fixed `error.type` such as `too-many-tool-calls` or `unknown-tool` — never the model's own tool name or arguments |
-| `agent.provider_attachment.refused` | `dekopon-agent` | a stable `reason` — `route-disabled`, `invalid-encoding`, `unsupported-media`, `too-large`, or `per-reply-limit`; never the attachment bytes, its declared media type, or any provider text |
-| `agent.chat_asset_input.refused` | `dekopon-agent` | a stable `reason` — `unknown-asset`, `unsupported-media`, `per-invocation-limit`, `session-limit`, `byte-budget`, or `unavailable`; never the attachment number, its bytes, or the sender's file name |
+| `agent.provider_attachment.refused` | `dekopon-agent` | a stable `reason` — `route-disabled`, `invalid-encoding`, `unsupported-media`, `too-large`, `per-reply-limit`, or `storage`; never the attachment bytes, its declared media type, or any provider text |
+| `agent.chat_asset_input.refused` | `dekopon-agent` | a stable `reason` — `unknown-asset`, `unsupported-media`, `per-invocation-limit`, `session-limit`, `byte-budget`, `reclaimed`, `unauthorized`, or `unavailable`; never the attachment number, its bytes, or the sender's file name |
+| `gateway.asset.retention_miss` | `dekopond` | gateway asset ID, known byte size, configured byte budget, and reason (`disabled`, `oversized`, `all-pinned`, `reclaimed`, `unknown`, `unauthorized`, `storage`); no path, payload or secret; emitted inside the resolving message/model/provider trace |
 | `agent.asset.refused` | `dekopon-agent` | the gateway-assigned asset id and the gateway-authored refusal text the model reads back |
 | `agent.asset.fetched` | `dekopon-agent` | the asset id, its media type, its byte count, and `asset.truncated` — whether a textual asset larger than the prompt's textual bound was clamped with a trailer the model reads rather than dropped or failed; never the bytes and never the sender's file name, which is untrusted text |
 | `agent.skill.read` | `dekopon-agent` | model turn, tool-call index, the operator-authored `skill.name` the request matched, `skill.resource` (the resource path; empty for the skill's own instructions), `skill.bytes` of the tool result, and `skill.repeated` — `true` when that text was already in the conversation and a one-line pointer was returned instead; never the skill text and never the name the model typed |
@@ -372,9 +373,12 @@ the receive span measures receipt and dispatch rather than the session it starte
 Telegram `message_id`, a WhatsApp `wamid`, the development transport's boot-scoped counter — and is
 recorded once the payload has been parsed far enough to carry one. A receipt that routes nothing
 closes without it, which is the trace that answers "why did the bot not reply"; so does a refused
-WhatsApp delivery. A WhatsApp delivery carrying more than one message leaves it unset and parents
-every message's `gateway.message` under the one delivery. Neither the sender nor the message text
-goes on this span: those stay on the `gateway.message.received` log event below.
+WhatsApp delivery. Each accepted WhatsApp message has a distinct `transport.receive` child under
+the signed delivery span, carrying its native `message.id` and conversation coordinates. Execution
+nests under that message receipt; for a collected burst, it nests under the lead receipt and links
+to every constituent receipt. This preserves distinguishable input and disposition evidence even
+when one webhook delivers several messages. Neither the sender nor the message text goes on these
+spans: those stay on the `gateway.message.received` log event below.
 
 The four `conversation.*` attributes say *where* an accepted message was posted: its kind
 (`directMessage`, `groupDirectMessage`, `channel`, `thread`), the container above it (a Slack team,
@@ -409,6 +413,17 @@ instead emits `gateway_message_ignored` with `reason = group-unsupported` and it
 A `chat.postMessage` HTTP 429 delays the identical post once: integer `Retry-After` seconds are
 capped at 60, defaulting to 5 when missing or unparsable. A second 429 uses the ordinary
 reply-failure path; no other HTTP failure is retried.
+
+Scratch IO emits `asset.spool` child spans for `operation=write|read|reclaim|cleanup`, recording `bytes`,
+`duration_ms`, `outcome=ok|refused` and a sanitized `reason` on refusal (capacity, per-file bound,
+changed length, or OS IO category). It emits one bounded warning on a failed operation, with no
+path, payload, URL or base64. Reads inherit their active consumption span; final cleanup and reads
+outside an active scope retain the originating message span so they do not create disconnected
+roots. Synchronous IO never holds a span guard across an await. WhatsApp's final media boundaries
+emit `whatsapp.image_upload` and `whatsapp.image_send`, with `bytes`, `duration_ms`,
+`outcome=accepted|failed` and the stable transport error category in `reason`. Upload acceptance
+alone is not delivery; only validated message acceptance completes the send. Cancelled futures can
+close these spans without a terminal outcome. Broker/provider W3C propagation is unchanged.
 
 The prompt loop's spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `shell.script`, `shell.command`) nest under `gateway.session`, and the broker's `broker.invocation` joins the same trace through the proposal's `traceParent` — so one trace reads from "a person asked something in Slack" to "a provider made an HTTP call". `prompt.asset_fetch` joins them whenever a model opens an attachment: one span per fetch, carrying the asset number the conversation referred to and the turn and tool-call index that asked for it, never the file's name or bytes. It is gateway-only, because only a gateway session offers the asset tool.
 
@@ -1040,3 +1055,15 @@ occupied **200 KiB** of signal payload — **148 KiB of traces** and **52 KiB of
 OpenObserve `stream/` tree **1.22 MiB**, indexes, metadata, and directory overhead included. These
 are allocated filesystem blocks and a point-in-time development sample, not a per-prompt storage
 guarantee.
+
+### Collected media inputs
+
+`gateway.message.received` records every routed constituent in its original receipt trace, before
+collection. A collected `gateway.message` is parented by the lead receipt and carries exported
+OpenTelemetry links to all original receipts (including the lead), with `batch.members` bounded
+at eight. Each receipt gets `gateway_input_disposition` with the shared terminal outcome, or a
+local refusal, stop, shutdown or abandonment. No service album ID or synthetic delivery identity
+is invented. Following a constituent's causal link reaches the one model/provider/progress and
+reply execution; it is not duplicated across traces. Non-payload counts/outcomes describe
+membership while original text stays on its own input audit event. Delivery failures remain
+in that shared execution's trace. A single-message, uncollected input keeps its ordinary trace.

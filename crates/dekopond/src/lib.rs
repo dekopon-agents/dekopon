@@ -25,6 +25,7 @@
 
 mod asset;
 mod cache_key;
+mod collection;
 mod config;
 mod conversation;
 mod progress;
@@ -46,6 +47,7 @@ use dekopon_broker_protocol::{BrokerClient, ConversationKind};
 use dekopon_config::LocalCatalog;
 use thiserror::Error;
 use tokio::{sync::mpsc, task::JoinSet, time::timeout};
+use tracing::Instrument as _;
 
 pub use config::{
     CONFIG_API_VERSION, ConfigApiVersion, ConfigError, ConfigProblem, ConversationMatchConfig,
@@ -196,9 +198,10 @@ where
         conversations: ConversationStore::new(config.sessions.max_conversations),
         // Independently bounded for one-shot state; persistent access additionally carries the
         // conversation generation fence, so transcript invalidation retires its assets immediately.
-        assets: Arc::new(AssetStore::new(
+        assets: Arc::new(AssetStore::with_retention(
             config.sessions.max_conversations,
             ASSET_IDLE_TIMEOUT,
+            config.sessions.asset_retention_bytes,
         )),
         asset_fetchers,
         liveness: config.liveness.clone(),
@@ -234,6 +237,7 @@ where
         receiver,
         shutdown,
         config.shutdown_grace,
+        collection::Collector::new(&config.transports, config.sessions.max_concurrent),
     )
     .await;
     readers.abort_all();
@@ -282,6 +286,7 @@ async fn serve<F>(
     mut receiver: mpsc::Receiver<TransportEvent>,
     shutdown: F,
     grace: Duration,
+    mut collector: collection::Collector,
 ) -> ServeOutcome
 where
     F: Future<Output = ()> + Send,
@@ -296,8 +301,20 @@ where
         while let Some(result) = sessions.try_join_next() {
             observe_session(result);
         }
+        let deadline = collector.deadline();
         tokio::select! {
+            biased;
             () = &mut shutdown => break,
+            () = async {
+                match deadline {
+                    Some(deadline) => tokio::time::sleep_until(deadline).await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                for message in collector.take_due(tokio::time::Instant::now()) {
+                    start_session(&runner, &routes, &drivers, &mut sessions, message);
+                }
+            },
             event = receiver.recv() => {
                 let Some(event) = event else {
                     outcome = ServeOutcome::TransportsLost;
@@ -317,15 +334,23 @@ where
                                 &drivers,
                                 &stop_words,
                                 &mut sessions,
+                                &mut collector,
                                 *message,
                             );
                         });
                     }
-                    TransportEvent::CancelRequested(request) => cancel_session(&runner, &request),
+                    TransportEvent::CancelRequested(request) => {
+                        if collector.cancel(&request) {
+                            tracing::info!(event = "gateway_input_stop_requested", transport = %request.transport, via = via_label(request.via));
+                        }
+                        cancel_session(&runner, &request);
+                    },
                 }
             }
         }
     }
+
+    collector.shutdown();
 
     // In-flight sessions are given the configured grace to finish: a model call is already paid
     // for, and abandoning it means a person watching a chat window never hears back.
@@ -357,6 +382,7 @@ fn observe_session(result: Result<(), tokio::task::JoinError>) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
     runner: &Arc<SessionRunner>,
     routes: &Arc<RoutingTable>,
@@ -364,9 +390,10 @@ fn dispatch(
     drivers: &BTreeMap<String, Arc<dyn ChatDriver>>,
     stop_words: &[String],
     sessions: &mut JoinSet<()>,
+    collector: &mut collection::Collector,
     message: InboundMessage,
 ) {
-    let Some(route) = routes.route(&message) else {
+    let Some((route_id, _route)) = routes.route_index(&message) else {
         // Bots see ambient traffic. Silence is the correct answer, and debug level keeps a busy
         // channel from becoming the daemon's log volume. The conversation rides along because
         // "why did the bot not answer in here" is answered by which kind and which container the
@@ -395,7 +422,27 @@ fn dispatch(
             subject: message.subject.canonical(),
             via: dekopon_agent::CancelVia::StopReply,
         };
-        match runner.active_sessions.cancel(&request) {
+        let pending_cancelled = collector.cancel(&request);
+        let active_outcome = runner.active_sessions.cancel(&request);
+        if pending_cancelled {
+            // A cancelled active run already has a progress/delivery owner for its stopped ending.
+            // Normal completion owns an answer, not a stopped ending for the removed batch.
+            if matches!(
+                active_outcome,
+                CancelOutcome::NoSession | CancelOutcome::OtherSubject | CancelOutcome::Completing
+            ) && let Some(driver) = drivers.get(&message.transport).cloned()
+            {
+                let receipt = message.receive_span.clone();
+                sessions.spawn(
+                    async move {
+                        session::answer(&driver, &message, session::STOPPED_REPLY).await;
+                    }
+                    .instrument(receipt),
+                );
+            }
+            return;
+        }
+        match active_outcome {
             CancelOutcome::Cancelled => {
                 tracing::info!(
                     event = "gateway_session_stop_requested",
@@ -406,7 +453,7 @@ fn dispatch(
             }
             // The session existed and this sender owned it; it simply finished first. Routing the
             // word as a question would answer a message that was never one.
-            outcome @ CancelOutcome::AlreadyEnded => {
+            outcome @ (CancelOutcome::AlreadyCancelled | CancelOutcome::Completing) => {
                 tracing::debug!(
                     event = "gateway_session_stop_ignored",
                     transport = %request.transport,
@@ -435,6 +482,7 @@ fn dispatch(
     if message.conversation.kind != ConversationKind::DirectMessage
         && !addressed
         && !inherited_thread
+        && !collector.is_native_continuation(route_id, &message)
     {
         tracing::debug!(
             event = "gateway_message_ignored",
@@ -443,12 +491,46 @@ fn dispatch(
         );
         return;
     }
+    match collector.offer(route_id, message) {
+        collection::Offered::Pending => {}
+        collection::Offered::Immediate(message) => {
+            start_session(runner, routes, drivers, sessions, message)
+        }
+        collection::Offered::Refused(message, reason) => {
+            collection::disposition(&message.receive_span, reason);
+            if let Some(driver) = drivers.get(&message.transport).cloned() {
+                let receipt = message.receive_span.clone();
+                sessions.spawn(async move {
+                    let reply = match reason {
+                        "collection-full" => "Busy collecting other requests. Please try again shortly.",
+                        "incompatible-group" => "Another media group is still being collected. Please retry this group separately.",
+                        "deadline-overflow" => "Input refused: the configured media collection deadline cannot be represented.",
+                        _ => "Input refused: too many attachments or messages, or too much text. Please send a smaller request.",
+                    };
+                    session::answer(&driver, &message, reply).await;
+                }.instrument(receipt));
+            }
+        }
+    }
+}
+
+fn start_session(
+    runner: &Arc<SessionRunner>,
+    routes: &RoutingTable,
+    drivers: &BTreeMap<String, Arc<dyn ChatDriver>>,
+    sessions: &mut JoinSet<()>,
+    message: InboundMessage,
+) {
+    // Routing is startup-fixed; a collected lead selects the exact same bound route at flush.
+    let Some(route) = routes.route(&message) else {
+        collection::disposition(&message.receive_span, "route-lost");
+        return;
+    };
     let Some(driver) = drivers.get(&message.transport).cloned() else {
-        tracing::error!(
-            event = "gateway_message_ignored",
-            transport = %message.transport,
-            reason = "no-driver"
-        );
+        message
+            .receive_span
+            .in_scope(|| tracing::error!(event = "gateway_message_ignored", reason = "no-driver"));
+        collection::disposition(&message.receive_span, "no-driver");
         return;
     };
     sessions.spawn(session::run_session(
@@ -666,6 +748,7 @@ fn build_transport(spec: &TransportConfig) -> Result<Box<dyn ChatTransport>, Tra
             graph_api_version,
             liveness,
             graph_endpoint,
+            ..
         } => Box::new(WhatsappTransport::new(
             name.clone(),
             *bind,

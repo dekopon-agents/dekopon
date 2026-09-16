@@ -288,6 +288,10 @@ impl LocalTransport {
                     reply: ReplyTarget::Local { connection },
                     liveness: native.then_some(LivenessTarget::Local { connection }),
                     receive_span: received,
+                    received_at: tokio::time::Instant::now(),
+                    native_group: None,
+                    constituents: Vec::new(),
+                    asset_overflow: false,
                 };
                 if inbound
                     .send(TransportEvent::Message(Box::new(message)))
@@ -440,22 +444,24 @@ impl LocalDriver {
     }
 
     /// The answer line, naming the message it landed in when it replaced one in place.
-    fn answer(reply: &OutboundReply, message: Option<&str>) -> Value {
-        let mut response = json!({ "reply": reply.text });
+    fn answer(
+        text: &str,
+        images: &[super::hydration::HydratedImage],
+        message: Option<&str>,
+    ) -> Value {
+        let mut response = json!({ "reply": text });
         if let Some(id) = message {
             response["id"] = Value::String(id.to_owned());
         }
-        if !reply.images.is_empty() {
+        if !images.is_empty() {
             response["images"] = Value::Array(
-                reply
-                    .images
+                images
                     .iter()
-                    .enumerate()
-                    .map(|(index, image)| {
+                    .map(|image| {
                         json!({
-                            "filename": image.filename(index),
-                            "mediaType": image.media_type(),
-                            "data": STANDARD.encode(image.bytes()),
+                            "filename": image.filename,
+                            "mediaType": image.media_type,
+                            "data": STANDARD.encode(&image.bytes),
                         })
                     })
                     .collect(),
@@ -468,16 +474,26 @@ impl LocalDriver {
     ///
     /// One implementation for both objects: on this transport a line is a line, so the difference
     /// between finalizing a progress message and finalizing a stream is only which one minted the
-    /// identifier. Attachments ride it too, because a JSON line carries them as well as a reply
-    /// line does — the delete-and-reply fallback exists for services that cannot.
+    /// identifier. Attachments use the owned reply fallback so their disk leases can be transferred
+    /// to the blocking hydration task rather than borrowed across finalization.
     async fn finalize_in_place(
         &self,
         message: &MessageRef,
         reply: &OutboundReply,
     ) -> Result<(), TransportError> {
+        // The borrowed finalize cannot transfer lease ownership. Refuse before any write so the
+        // policy uses its existing delete-and-owned-reply fallback, just like the remote drivers.
+        if !reply.images.is_empty() {
+            return Err(TransportError::Service {
+                code: "answer-has-attachments".to_owned(),
+            });
+        }
         let connection = Self::connection(&message.target)?;
-        self.emit(connection, &Self::answer(reply, Some(message.id.as_str())))
-            .await
+        self.emit(
+            connection,
+            &Self::answer(&reply.text, &[], Some(message.id.as_str())),
+        )
+        .await
     }
 }
 
@@ -488,10 +504,13 @@ impl ChatDriver for LocalDriver {
         target: &ReplyTarget,
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
+        let OutboundReply { text, images } = reply;
+        let images = super::hydration::hydrate_images(images).await?;
         let &ReplyTarget::Local { connection } = target else {
             return Err(TransportError::Response);
         };
-        self.emit(connection, &Self::answer(&reply, None)).await
+        self.emit(connection, &Self::answer(&text, &images, None))
+            .await
     }
 
     fn typing(&self) -> Option<&dyn TypingLease> {

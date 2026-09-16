@@ -8,7 +8,7 @@
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use dekopon_agent::{CancelVia, attachment::GeneratedImage};
+use dekopon_agent::CancelVia;
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, ConversationKind};
 use dekopon_core::{ExternalSubject, Redacted};
 use futures_util::future::BoxFuture;
@@ -337,6 +337,13 @@ impl TelegramTransport {
                 message_id,
             }),
             receive_span: received.clone(),
+            received_at: tokio::time::Instant::now(),
+            native_group: message
+                .get("media_group_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            constituents: Vec::new(),
+            asset_overflow: false,
         }))
     }
 
@@ -978,6 +985,8 @@ impl ChatDriver for TelegramDriver {
         target: &ReplyTarget,
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
+        let OutboundReply { text, images } = reply;
+        let images = super::hydration::hydrate_images(images).await?;
         let ReplyTarget::Telegram {
             chat_id,
             reply_to,
@@ -987,7 +996,6 @@ impl ChatDriver for TelegramDriver {
             return Err(TransportError::Response);
         };
         let (chat_id, reply_to, message_thread_id) = (*chat_id, *reply_to, *message_thread_id);
-        let OutboundReply { text, images } = reply;
         if !images.is_empty() {
             // One `sendPhoto` per attachment; Telegram has no multi-attachment message that also
             // carries a caption the way a person expects to read it.
@@ -996,7 +1004,7 @@ impl ChatDriver for TelegramDriver {
             for (index, image) in images.into_iter().enumerate() {
                 let caption = (index == 0 && caption_fits).then_some(text.as_str());
                 match self
-                    .send_photo(chat_id, reply_to, message_thread_id, caption, image, index)
+                    .send_photo(chat_id, reply_to, message_thread_id, caption, image)
                     .await
                 {
                     Ok(()) => accepted = true,
@@ -1128,16 +1136,15 @@ impl TelegramDriver {
         reply_to: Option<i64>,
         message_thread_id: Option<i64>,
         caption: Option<&str>,
-        image: GeneratedImage,
-        index: usize,
+        image: super::hydration::HydratedImage,
     ) -> Result<(), TransportError> {
-        let filename = image.filename(index);
+        let filename = image.filename;
         #[allow(
             clippy::map_err_ignore,
             reason = "mime_str only rejects strings that are not a media type, and this one is the \
                       literal above it"
         )]
-        let part = reqwest::multipart::Part::bytes(image.into_bytes())
+        let part = reqwest::multipart::Part::bytes(image.bytes)
             .file_name(filename)
             .mime_str("image/png")
             .map_err(|_| TransportError::Response)?;
@@ -2006,7 +2013,10 @@ mod tests {
         png.extend_from_slice(b"kitty pixels");
         let with_image = OutboundReply::with_images(
             "here it is",
-            vec![GeneratedImage::from_png(png).expect("generated PNG fixture")],
+            vec![
+                dekopon_agent::attachment::GeneratedImage::from_png(png)
+                    .expect("generated PNG fixture"),
+            ],
         );
         let refused = ProgressMessage::finalize(&driver, &surface(), &with_image)
             .await

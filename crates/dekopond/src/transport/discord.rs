@@ -14,7 +14,6 @@ use std::{
 
 use async_trait::async_trait;
 use dekopon_agent::CancelVia;
-use dekopon_agent::attachment::GeneratedImage;
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, ConversationKind};
 use dekopon_core::{ExternalSubject, Redacted};
 use futures_util::{SinkExt as _, StreamExt as _, future::BoxFuture};
@@ -682,6 +681,12 @@ impl DiscordTransport {
                 conversation_id,
             }),
             receive_span: received.clone(),
+            received_at: tokio::time::Instant::now(),
+            native_group: None,
+            constituents: Vec::new(),
+            asset_overflow: message["attachments"]
+                .as_array()
+                .is_some_and(|files| files.len() > MAX_ATTACHMENTS),
         }))
     }
 
@@ -1056,6 +1061,8 @@ impl ChatDriver for DiscordDriver {
         target: &ReplyTarget,
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
+        let OutboundReply { text, images } = reply;
+        let mut images = super::hydration::hydrate_images(images).await?;
         let ReplyTarget::Discord {
             channel_id,
             reply_to,
@@ -1066,7 +1073,6 @@ impl ChatDriver for DiscordDriver {
         if !is_snowflake(channel_id) || reply_to.as_deref().is_some_and(|id| !is_snowflake(id)) {
             return Err(TransportError::Response);
         }
-        let OutboundReply { text, mut images } = reply;
         let mut accepted = false;
         // The REST lock is taken per request rather than per reply. One answer's chunks still
         // arrive in order because this loop awaits each one, and no second answer can be posting
@@ -1513,25 +1519,15 @@ impl DiscordDriver {
         &self,
         channel_id: &str,
         body: &Value,
-        images: Vec<GeneratedImage>,
+        images: Vec<super::hydration::HydratedImage>,
     ) -> Result<(), TransportError> {
         let url = format!(
             "{}/api/v{API_VERSION}/channels/{channel_id}/messages",
             self.endpoint
         );
-        let media_type = images
-            .first()
-            .ok_or(TransportError::Response)?
-            .media_type()
-            .to_owned();
         let attachments = images
             .iter()
-            .enumerate()
-            .map(|(index, image)| image.filename(index))
-            .collect::<Vec<_>>();
-        let bytes = images
-            .into_iter()
-            .map(GeneratedImage::into_bytes)
+            .map(|image| &image.filename)
             .collect::<Vec<_>>();
         let mut payload = body.clone();
         payload["attachments"] = Value::Array(
@@ -1556,15 +1552,15 @@ impl DiscordDriver {
         let mut retried = false;
         loop {
             let mut form = reqwest::multipart::Form::new().text("payload_json", payload.clone());
-            for (index, (filename, bytes)) in attachments.iter().zip(&bytes).enumerate() {
+            for (index, image) in images.iter().enumerate() {
                 #[allow(
                     clippy::map_err_ignore,
                     reason = "mime_str only rejects strings that are not a media type, and \
                               GeneratedImage::media_type returns a fixed IANA type"
                 )]
-                let part = reqwest::multipart::Part::bytes(bytes.clone())
-                    .file_name(filename.clone())
-                    .mime_str(&media_type)
+                let part = reqwest::multipart::Part::bytes(image.bytes.clone())
+                    .file_name(image.filename.clone())
+                    .mime_str(image.media_type)
                     .map_err(|_| TransportError::Response)?;
                 form = form.part(format!("files[{index}]"), part);
             }
