@@ -7,6 +7,18 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- Chat images, PDFs and provider reply PNGs now retain private temporary-file leases instead of
+  bulk session vectors. Model requests, chat-asset edits and outbound transports hydrate only at
+  consumption boundaries; a 256 MiB process-wide live-payload allowance refuses new writes without
+  evicting live leases. Storage refusal preserves already-executed provider outcomes, and scratch
+  IO plus WhatsApp upload/send boundaries remain trace-correlated. Generated-output registration
+  remains unsupported; later edits still reuse the original inbound asset.
+- Gateway Helm scratch is disk-backed `emptyDir` with separate `volumeSizes.gatewayTmp` (320Mi
+  default). Existing `volumeSizes.tmp` overrides now affect only broker scratch, still tmpfs.
+  Operators must verify deployed scratch mounts separately; no rollout is implied.
+
 ## [0.16.0] - 2026-09-15
 
 ### Added

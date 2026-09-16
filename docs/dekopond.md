@@ -412,6 +412,39 @@ The model then calls `fetch_chat_asset(1)`. Because a tool result cannot carry a
 - **Bounds.** 8 MiB per attachment, enforced while the response streams rather than after it, because a reported size is sender-influenced and a chunked response need not declare a length. Four fetches per session. Thirty-two attachments addressable per conversation, evicted oldest-first. A textual file is clamped again on the way into the prompt, at the same 256 KiB a script's output is capped at, with a trailer saying where it was cut: the 8 MiB ceiling is sized for images on the wire, and that much `text/plain` is roughly two million tokens — enough to come back from the provider as a context-length rejection. Every one of these refuses in a sentence the model reads and can answer around, never by failing the session.
 - **Redirects.** The HTTP client refuses redirects globally so a bearer token is never forwarded by policy. Slack's `url_private_download` genuinely redirects to its own file host, so that transport follows exactly one hop, only to a host it recognises by comparing the host itself rather than a URL prefix, and re-attaches the token by hand.
 - **Ambient proxies.** Every transport's client is built from one `credential_client` shape that sets `no_proxy()`, so an exported `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` carries no Slack, Discord, Telegram or WhatsApp token — nor the messages and files it authenticates — through a host nobody named to Dekopon. There is no flag to opt back in; a chat service reachable only through a proxy is unreachable.
+- **Owned disk leases, not retained payload vectors.** Fetched assets (including images and PDFs)
+  and validated provider PNG results are spooled before entering session messages or the reply slot.
+  Cloning a message copies a shared lease, not its payload. Both model backends read the same file
+  anew at request encoding; capability expansion reads it into the unchanged data-URL proposal, and
+  transports hydrate it only for delivery. The inbound inventory still holds transport references
+  and refetches on demand; persistent conversation history still records only question/final-answer
+  text. Generated images are not automatically registered as chat assets: later edits can reuse
+  the original inbound marker, not earlier generated pixels. This is an existing limitation.
+- **Scratch lifetime and capacity.** The gateway exclusively creates private 0700 directories and
+  0600 files beneath the process temporary directory. No model/provider path is accepted, no path
+  is serialized, and reads use the retained descriptor rather than reopening a filename. Final
+  lease drop removes the file; inventory/history eviction, cancellation and generation retirement
+  cannot remove another owner's live lease. A process-wide 256 MiB live-payload allowance refuses
+  new writes rather than evicting referenced files (empty files charge one byte). The shared 8 MiB
+  per-file limit and WhatsApp's 5,000,000-byte limit remain unchanged. The allowance is released on
+  failed construction and final drop, not on each clone's drop. Cleanup failures emit bounded
+  diagnostics; abrupt process death can leave scratch until the temporary volume is removed.
+  There is no crash durability or startup recovery service.
+- **Storage failures are not successful empty images.** Capacity exhaustion, OS IO categories
+  (including disk-full), and changed/truncated length are sanitized failures, never paths or bytes.
+  An unlinked file still reads through its original descriptor while a lease owns it. No storage
+  failure triggers an automatic network fallback or paid-call retry. A provider-result spool refusal
+  explicitly says the capability already executed and its attachment was not delivered; existing
+  complete/partial transport acceptance rules remain in force. Local file IO is synchronous and
+  bounded by the file ceiling; cancellation releases ownership when the active syscall returns.
+- **Disk backing is an operator requirement.** The chart uses disk-backed gateway `/tmp`, separately
+  sized by `volumeSizes.gatewayTmp`; broker scratch stays tmpfs. Other installations must provide
+  a disk-backed temporary directory, not a memory-backed `emptyDir` or `TMPDIR`. Existing deployed
+  manifests and overrides need separate rollout verification. This removes retained bulk bytes,
+  not all peak allocations: bounded downloads/decodes, textual conversion, base64/JSON request
+  bodies, broker frames and multipart upload buffers still allocate temporarily; filesystem page
+  cache is also outside this claim. No RSS measurement is implied.
+
 - **Resolving a reference differs by transport.** Slack carries a private download URL on the event itself. Discord carries a signed CDN URL plus the source channel/message/attachment IDs; the CDN request carries no token, and an expired 401/403/404 URL is refreshed by re-reading that exact message through pinned Discord REST before retrying the same attachment ID. Telegram carries only a `file_id`, so a fetch is two calls: `getFile` turns the handle into a path valid for about an hour, and the bytes live under `/file/bot<token>/<path>` rather than the method prefix. The round trip happens at fetch time, which is also when that path is freshest.
 - **Discord specifics.** Photos and arbitrary files share the attachment object, retaining their sender-controlled filename, optional media type, and reported size. Production downloads accept only HTTPS `cdn.discordapp.com` or `media.discordapp.net` URLs, reject credentials and redirects, and enforce the byte ceiling while streaming.
 - **Telegram specifics.** A photo arrives as the same image at several sizes and the largest is the one used — a model asked to read text in a screenshot cannot read a 90-pixel-wide copy. Telegram reports no media type for a photo, so `image/jpeg` is inferred, which is what the Bot API re-encodes every photo to; a file sent as a *document* keeps its own bytes, name, and declared type. Words on an upload arrive in `caption` rather than `text`.
@@ -811,7 +844,7 @@ What the key is worth is measured, not assumed — [`inference.md`](inference.md
 
 ### What this means for retention
 
-On a `persistent` route, chat text sits in `dekopond`'s memory for at least the idle timeout after somebody stops talking — on the default, fifteen minutes of a person's question and the agent's answer. With shared scope, that retained content and its attachment inventory belong to the exact conversation audience rather than one sender. **At least**, because eviction is lazy: an abandoned conversation is dropped by the next lookup on its key or by the ceiling displacing it, so with neither happening the bytes stay in the process until it exits. What a timed-out entry can never do is reach a prompt. The daemon writes none of it to disk; the operating system's own paging and core-dump behavior are outside what the daemon controls. Another process under the gateway UID is inside its trust domain; see the [current process boundary](#current-process-boundary).
+On a `persistent` route, chat text sits in `dekopond`'s memory for at least the idle timeout after somebody stops talking — on the default, fifteen minutes of a person's question and the agent's answer. With shared scope, that retained content and its attachment inventory belong to the exact conversation audience rather than one sender. **At least**, because eviction is lazy: an abandoned conversation is dropped by the next lookup on its key or by the ceiling displacing it, so with neither happening the bytes stay in the process until it exits. What a timed-out entry can never do is reach a prompt. The daemon writes none of that conversation text to disk (active attachment payload leases use private temporary files); the operating system's own paging and core-dump behavior are outside what the daemon controls. Another process under the gateway UID is inside its trust domain; see the [current process boundary](#current-process-boundary).
 
 ## Durable memory after transport acceptance
 

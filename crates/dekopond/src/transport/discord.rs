@@ -1532,7 +1532,7 @@ impl DiscordDriver {
         let bytes = images
             .into_iter()
             .map(GeneratedImage::into_bytes)
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
         let mut payload = body.clone();
         payload["attachments"] = Value::Array(
             attachments

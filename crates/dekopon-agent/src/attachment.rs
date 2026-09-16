@@ -9,7 +9,7 @@
 //!
 //! - **Out.** A successful capability result may carry a top-level `attachments` key holding
 //!   `{mediaType, base64}` objects. The session's broker leg removes it, validates each entry, puts
-//!   the accepted bytes in [`ReplyAttachments`] — a request-local slot that is never a model
+//!   the accepted disk leases in [`ReplyAttachments`] — a request-local slot that is never a model
 //!   message — and leaves the model metadata only.
 //! - **In.** A capability input may carry the marker `chat-asset:<N>`, naming an attachment the
 //!   sender put on their message. For the capabilities a route lists, the leg expands each marker to
@@ -22,8 +22,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
 
-/// Maximum decoded attachment retained in memory or handed to a chat transport.
-pub const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum decoded attachment spooled or handed to a chat transport.
+pub use dekopon_model::asset::MAX_ATTACHMENT_BYTES;
+use dekopon_model::asset::{BlobError, DiskBlob};
 
 /// The one media type a delivered attachment may declare.
 ///
@@ -88,7 +89,7 @@ struct ResultAttachment {
 /// several megabytes; formatting it into a model transcript or telemetry record would be both a data
 /// leak and an unbounded operational cost.
 pub struct GeneratedImage {
-    data: Vec<u8>,
+    data: DiskBlob,
 }
 
 impl GeneratedImage {
@@ -106,7 +107,9 @@ impl GeneratedImage {
         if !data.starts_with(PNG_SIGNATURE) {
             return Err(AttachmentRefusal::UnsupportedMedia);
         }
-        Ok(Self { data })
+        Ok(Self {
+            data: DiskBlob::from_bytes(&data).map_err(AttachmentRefusal::Storage)?,
+        })
     }
 
     /// IANA media type fixed by validation rather than by what the provider claimed.
@@ -130,16 +133,32 @@ impl GeneratedImage {
         }
     }
 
-    /// Raw PNG bytes for the final transport upload.
-    #[must_use]
-    pub fn bytes(&self) -> &[u8] {
-        &self.data
+    /// Materializes raw PNG bytes for the final transport upload.
+    ///
+    /// # Errors
+    /// Returns a sanitized scratch IO failure; the provider effect has already executed.
+    pub fn bytes(&self) -> Result<Vec<u8>, BlobError> {
+        self.data.read()
     }
 
-    /// Consumes the image into its raw PNG bytes.
+    /// Byte count without materializing the payload.
     #[must_use]
-    pub fn into_bytes(self) -> Vec<u8> {
-        self.data
+    pub fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Whether the validated payload is empty (a PNG never is).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.data.is_empty()
+    }
+
+    /// Consumes the image into a transient upload buffer.
+    ///
+    /// # Errors
+    /// Returns a sanitized scratch IO failure; the provider effect has already executed.
+    pub fn into_bytes(self) -> Result<Vec<u8>, BlobError> {
+        self.data.read()
     }
 }
 
@@ -160,6 +179,9 @@ impl fmt::Debug for GeneratedImage {
 /// answer around it. [`Self::reason`] is the stable audit value and [`Self::note`] the sentence.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum AttachmentRefusal {
+    /// The provider executed, but the gateway could not retain its attachment.
+    #[error("{0}")]
+    Storage(BlobError),
     /// The route does not carry provider attachments at all.
     #[error("this route does not deliver provider attachments")]
     RouteDisabled,
@@ -183,6 +205,7 @@ impl AttachmentRefusal {
     #[must_use]
     pub const fn reason(&self) -> &'static str {
         match self {
+            Self::Storage(_) => "storage",
             Self::RouteDisabled => "route-disabled",
             Self::InvalidEncoding => "invalid-encoding",
             Self::UnsupportedMedia => "unsupported-media",
@@ -198,6 +221,9 @@ impl AttachmentRefusal {
     #[must_use]
     pub const fn note(&self) -> &'static str {
         match self {
+            Self::Storage(_) => {
+                "The capability executed, but the gateway could not store its file. It was not delivered. Answer in text; do not repeat the paid call to recover the file."
+            }
             Self::RouteDisabled => {
                 "This conversation cannot carry attachments, so the file this capability produced \
                  was discarded. Answer in text."
@@ -441,7 +467,7 @@ pub trait ChatAssetSource: Send + Sync {
     /// # Errors
     ///
     /// Returns the stable reason the attachment cannot be handed to a capability.
-    fn fetch_for_capability(&self, id: u64) -> Result<(String, Vec<u8>), ChatAssetRefusal>;
+    fn fetch_for_capability(&self, id: u64) -> Result<(String, DiskBlob), ChatAssetRefusal>;
 }
 
 /// One route's chat-asset input expansion: which capabilities opted in, and where bytes come from.
@@ -559,7 +585,13 @@ impl ChatAssetInputs {
         }
         budget.bytes = spent;
         budget.expanded += 1;
-        Ok(format!("data:{mime};base64,{}", STANDARD.encode(&data)))
+        Ok(format!(
+            "data:{mime};base64,{}",
+            STANDARD.encode(
+                data.read()
+                    .map_err(|_error| ChatAssetRefusal::Unavailable)?
+            )
+        ))
     }
 }
 
@@ -594,9 +626,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AttachmentRefusal, ChatAssetInputs, ChatAssetRefusal, GeneratedImage, MAX_ATTACHMENT_BYTES,
-        MAX_CHAT_ASSET_EXPANSIONS_PER_SESSION, MAX_CHAT_ASSET_INPUT_BYTES, ReplyAttachments,
-        chat_asset_marker, strip_attachments,
+        AttachmentRefusal, ChatAssetInputs, ChatAssetRefusal, DiskBlob, GeneratedImage,
+        MAX_ATTACHMENT_BYTES, MAX_CHAT_ASSET_EXPANSIONS_PER_SESSION, MAX_CHAT_ASSET_INPUT_BYTES,
+        ReplyAttachments, chat_asset_marker, strip_attachments,
     };
 
     fn png() -> Vec<u8> {
@@ -660,11 +692,14 @@ mod tests {
     }
 
     impl super::ChatAssetSource for FixedAssets {
-        fn fetch_for_capability(&self, id: u64) -> Result<(String, Vec<u8>), ChatAssetRefusal> {
+        fn fetch_for_capability(&self, id: u64) -> Result<(String, DiskBlob), ChatAssetRefusal> {
             if id > 8 {
                 return Err(ChatAssetRefusal::UnknownAsset);
             }
-            Ok((self.mime.to_owned(), vec![b'x'; self.bytes]))
+            Ok((
+                self.mime.to_owned(),
+                DiskBlob::from_bytes(&vec![b'x'; self.bytes]).expect("spool"),
+            ))
         }
     }
 
@@ -823,7 +858,52 @@ mod tests {
         assert!(output.get("attachments").is_none());
         assert!(output.get("attachmentNote").is_none());
         assert_eq!(output["image"]["generationId"], "gen-1");
-        assert_eq!(slot.take().len(), 1);
+        let delivered = slot.take();
+        assert_eq!(delivered.len(), 1);
+        drop(slot);
+        assert_eq!(
+            delivered.into_iter().next().unwrap().into_bytes().unwrap(),
+            png()
+        );
+    }
+
+    #[test]
+    fn provider_success_followed_by_spool_failure_is_attachment_refusal_not_invocation_failure() {
+        const CHILD: &str = "DEKOPON_TEST_SPOOL_FAILURE";
+        if std::env::var_os(CHILD).is_none() {
+            // A separate process supplies an unusable TMPDIR without mutating concurrent tests'
+            // environment. No real disk exhaustion or permissions bypass is required.
+            let directory = tempfile::tempdir().expect("fixture");
+            let not_directory = directory.path().join("not-a-directory");
+            std::fs::write(&not_directory, b"not a directory").expect("fixture");
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", "attachment::tests::provider_success_followed_by_spool_failure_is_attachment_refusal_not_invocation_failure", "--nocapture"])
+                .env(CHILD, "1").env("TMPDIR", &not_directory).env("TMP", &not_directory).env("TEMP", &not_directory)
+                .output().expect("child test");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let slot = ReplyAttachments::new(1);
+        let mut output = json!({"executed": true, "attachments": [{"mediaType": "image/png", "base64": STANDARD.encode(png())}]});
+        let (accepted, refused) = strip_attachments(&mut output, Some(&slot));
+        assert!(accepted.is_empty());
+        assert!(matches!(
+            refused.as_slice(),
+            [AttachmentRefusal::Storage(_)]
+        ));
+        assert_eq!(output["executed"], true);
+        assert!(output.get("attachments").is_none());
+        assert!(
+            output["attachmentNote"]
+                .as_str()
+                .unwrap()
+                .contains("capability executed")
+        );
+        assert!(slot.take().is_empty());
     }
 
     #[test]

@@ -352,7 +352,7 @@ impl ChatGptCodexModel {
         options: &CompletionOptions,
         on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
     ) -> Result<AssistantTurn, ChatGptRequestError> {
-        let body = build_request_body(&self.model, messages, tools, options);
+        let body = build_request_body(&self.model, messages, tools, options)?;
         let response = self
             .credential
             .agent
@@ -440,6 +440,7 @@ impl ChatModel for ChatGptCodexModel {
 fn turn_failure(error: ChatGptRequestError) -> ModelError {
     match error {
         ChatGptRequestError::Interrupted => ModelError::Interrupted,
+        ChatGptRequestError::Attachment(error) => ModelError::Attachment(error),
         other => ModelError::Request(other.to_string()),
     }
 }
@@ -886,23 +887,27 @@ fn extract_account_id(access: &str) -> Result<String, ChatGptError> {
 ///
 /// The Responses API has taken an array here since before attachments existed, which is why this
 /// transport needs one function rather than the wire-message type the chat-completions path grew.
-fn responses_content(message: &ModelMessage) -> Vec<Value> {
+fn responses_content(message: &ModelMessage) -> Result<Vec<Value>, crate::asset::BlobError> {
     let Some(parts) = message.parts() else {
-        return vec![json!({"type": "input_text", "text": message.content().unwrap_or_default()})];
+        return Ok(vec![
+            json!({"type": "input_text", "text": message.content().unwrap_or_default()}),
+        ]);
     };
     parts
         .iter()
-        .map(|part| match part {
-            ContentPart::Text(text) => json!({"type": "input_text", "text": text}),
-            ContentPart::Image { mime, data } => json!({
-                "type": "input_image",
-                "image_url": data_url(mime, data),
-            }),
-            ContentPart::File { name, mime, data } => json!({
-                "type": "input_file",
-                "filename": name,
-                "file_data": data_url(mime, data),
-            }),
+        .map(|part| {
+            Ok(match part {
+                ContentPart::Text(text) => json!({"type": "input_text", "text": text}),
+                ContentPart::Image { mime, data } => json!({
+                    "type": "input_image",
+                    "image_url": data_url(mime, &data.read()?),
+                }),
+                ContentPart::File { name, mime, data } => json!({
+                    "type": "input_file",
+                    "filename": name,
+                    "file_data": data_url(mime, &data.read()?),
+                }),
+            })
         })
         .collect()
 }
@@ -912,7 +917,7 @@ fn build_request_body(
     messages: &[ModelMessage],
     tools: &[ModelTool],
     options: &CompletionOptions,
-) -> Value {
+) -> Result<Value, crate::asset::BlobError> {
     let instructions = messages
         .iter()
         .filter(|message| message.role() == "system")
@@ -932,7 +937,7 @@ fn build_request_body(
             "user" => input.push(json!({
                 "type": "message",
                 "role": "user",
-                "content": responses_content(message),
+                "content": responses_content(message)?,
             })),
             "assistant" if !message.replay_items().is_empty() => {
                 input.extend(message.replay_items().iter().cloned());
@@ -994,7 +999,7 @@ fn build_request_body(
     {
         object.insert("prompt_cache_key".to_owned(), Value::String(key.to_owned()));
     }
-    body
+    Ok(body)
 }
 
 #[derive(Default)]
@@ -1765,6 +1770,8 @@ fn unix_time() -> Result<u64, ChatGptError> {
 
 #[derive(Debug, Error)]
 enum ChatGptRequestError {
+    #[error("{0}")]
+    Attachment(#[from] crate::asset::BlobError),
     #[error("ChatGPT authorization expired")]
     Unauthorized,
     #[error("ChatGPT request failed: {0}")]
@@ -2143,7 +2150,8 @@ mod tests {
                 parameters: json!({"type":"object"}),
             }],
             &CompletionOptions::default(),
-        );
+        )
+        .expect("request body");
 
         assert_eq!(body["instructions"], "Be concise");
         assert_eq!(body["tools"][0]["name"], "echo_echo");
@@ -2215,32 +2223,33 @@ mod tests {
     fn attachments_become_responses_input_parts() {
         // The Responses path has emitted a `content` array since before attachments existed, so
         // this is the one site that had to learn the new part types.
-        let body = build_request_body(
-            "gpt-5-codex",
-            &[ModelMessage::user_with_parts(vec![
-                ContentPart::Text("what does this say?".to_owned()),
-                ContentPart::Image {
-                    mime: "image/png".to_owned(),
-                    data: b"PNG".to_vec(),
-                },
-                ContentPart::File {
-                    name: "spec.pdf".to_owned(),
-                    mime: "application/pdf".to_owned(),
-                    data: b"PDF".to_vec(),
-                },
-            ])],
-            &[],
-            &CompletionOptions::default(),
-        );
+        let messages = [ModelMessage::user_with_parts(vec![
+            ContentPart::Text("what does this say?".to_owned()),
+            ContentPart::Image {
+                mime: "image/png".to_owned(),
+                data: crate::asset::DiskBlob::from_bytes(b"PNG").expect("spool"),
+            },
+            ContentPart::File {
+                name: "spec.pdf".to_owned(),
+                mime: "application/pdf".to_owned(),
+                data: crate::asset::DiskBlob::from_bytes(b"PDF").expect("spool"),
+            },
+        ])];
+        let cloned = messages.clone();
+        for _ in 0..3 {
+            let body =
+                build_request_body("gpt-5-codex", &cloned, &[], &CompletionOptions::default())
+                    .expect("request body");
 
-        assert_eq!(
-            body["input"][0]["content"],
-            json!([
-                {"type": "input_text", "text": "what does this say?"},
-                {"type": "input_image", "image_url": "data:image/png;base64,UE5H"},
-                {"type": "input_file", "filename": "spec.pdf", "file_data": "data:application/pdf;base64,UERG"},
-            ])
-        );
+            assert_eq!(
+                body["input"][0]["content"],
+                json!([
+                    {"type": "input_text", "text": "what does this say?"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,UE5H"},
+                    {"type": "input_file", "filename": "spec.pdf", "file_data": "data:application/pdf;base64,UERG"},
+                ])
+            );
+        }
     }
 
     #[test]
@@ -2251,7 +2260,8 @@ mod tests {
             &[ModelMessage::user("how many files?")],
             &[],
             &CompletionOptions::default(),
-        );
+        )
+        .expect("request body");
 
         assert_eq!(
             body["input"][0]["content"],
@@ -2271,23 +2281,19 @@ mod tests {
             ModelMessage::system("Be concise."),
             ModelMessage::user("how many files are in the repository?"),
         ];
-        let mut bodies = vec![build_request_body(
-            "gpt-test",
-            &messages,
-            &tools,
-            &CompletionOptions::default(),
-        )];
+        let mut bodies = vec![
+            build_request_body("gpt-test", &messages, &tools, &CompletionOptions::default())
+                .expect("request body"),
+        ];
         for (turn, script) in [(1, "ls | wc -l"), (2, "ls -a | wc -l")] {
             let call_id = format!("call_{turn}");
             let assistant = scripted_turn(turn, &call_id, script);
             messages.push(crate::model::assistant_message(&assistant));
             messages.push(ModelMessage::tool(call_id.as_str(), "12\n"));
-            bodies.push(build_request_body(
-                "gpt-test",
-                &messages,
-                &tools,
-                &CompletionOptions::default(),
-            ));
+            bodies.push(
+                build_request_body("gpt-test", &messages, &tools, &CompletionOptions::default())
+                    .expect("request body"),
+            );
         }
 
         for pair in bodies.windows(2) {
@@ -2338,9 +2344,11 @@ mod tests {
         let mut injected = history.clone();
         injected.insert(2, ModelMessage::system("Prefer relative paths."));
 
-        let plain = build_request_body("gpt-test", &history, &tools, &CompletionOptions::default());
+        let plain = build_request_body("gpt-test", &history, &tools, &CompletionOptions::default())
+            .expect("request body");
         let hoisted =
-            build_request_body("gpt-test", &injected, &tools, &CompletionOptions::default());
+            build_request_body("gpt-test", &injected, &tools, &CompletionOptions::default())
+                .expect("request body");
 
         assert_eq!(
             request_text(&plain["input"]),
@@ -2367,7 +2375,8 @@ mod tests {
             ModelMessage::system(system),
         ];
 
-        let body = build_request_body("gpt-test", &messages, &[], &CompletionOptions::default());
+        let body = build_request_body("gpt-test", &messages, &[], &CompletionOptions::default())
+            .expect("request body");
 
         assert_eq!(body["instructions"], format!("{system}\n\n{system}"));
         assert_eq!(
@@ -2391,7 +2400,8 @@ mod tests {
             &[ModelMessage::user("hello")],
             &[],
             &CompletionOptions::default(),
-        );
+        )
+        .expect("request body");
         let resumed = build_request_body(
             "gpt-test",
             &[
@@ -2401,7 +2411,8 @@ mod tests {
             ],
             &[bash_tool()],
             &CompletionOptions::default(),
-        );
+        )
+        .expect("request body");
 
         for body in [&opening, &resumed] {
             assert_eq!(body["store"], false);
@@ -2429,7 +2440,8 @@ mod tests {
         let messages = cached_conversation();
         let tools = vec![bash_tool()];
         let plain =
-            build_request_body("gpt-test", &messages, &tools, &CompletionOptions::default());
+            build_request_body("gpt-test", &messages, &tools, &CompletionOptions::default())
+                .expect("request body");
 
         assert!(
             plain.get("prompt_cache_key").is_none(),
@@ -2447,7 +2459,8 @@ mod tests {
             &messages,
             &tools,
             &CompletionOptions::default().with_prompt_cache_key("   "),
-        );
+        )
+        .expect("request body");
         assert_eq!(request_text(&blank), request_text(&plain));
     }
 
@@ -2458,13 +2471,15 @@ mod tests {
         let messages = cached_conversation();
         let tools = vec![bash_tool()];
         let plain =
-            build_request_body("gpt-test", &messages, &tools, &CompletionOptions::default());
+            build_request_body("gpt-test", &messages, &tools, &CompletionOptions::default())
+                .expect("request body");
         let keyed = build_request_body(
             "gpt-test",
             &messages,
             &tools,
             &CompletionOptions::default().with_prompt_cache_key("session-7"),
-        );
+        )
+        .expect("request body");
 
         assert_eq!(keyed["prompt_cache_key"], "session-7");
         let plain_fields = plain.as_object().expect("request object");

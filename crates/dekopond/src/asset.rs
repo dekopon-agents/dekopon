@@ -607,7 +607,7 @@ impl Registered {
 /// Well under the 50 MB the model APIs accept, because the binding constraint is the prompt rather
 /// than the wire: a screenshot near this size already costs more tokens than the conversation
 /// around it. A larger file is refused in words the model can pass on, not by failing the session.
-const MAX_ASSET_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_ASSET_BYTES: u64 = dekopon_model::asset::MAX_ATTACHMENT_BYTES as u64;
 
 /// Attachments one session may pull, however many turns it takes.
 ///
@@ -688,7 +688,10 @@ impl AssetSource for SessionAssets {
 /// image says nothing about whether a capability can be handed one, and the caller enforces the
 /// image-only rule itself.
 impl ChatAssetSource for SessionAssets {
-    fn fetch_for_capability(&self, id: u64) -> Result<(String, Vec<u8>), ChatAssetRefusal> {
+    fn fetch_for_capability(
+        &self,
+        id: u64,
+    ) -> Result<(String, dekopon_model::asset::DiskBlob), ChatAssetRefusal> {
         let asset = self.load(id, true).map_err(AssetFailure::for_capability)?;
         Ok((asset.mime, asset.data))
     }
@@ -735,6 +738,11 @@ impl SessionAssets {
         if !self.access.is_active() {
             return Err(AssetFailure::Unknown);
         }
+        let data =
+            dekopon_model::asset::DiskBlob::from_bytes(&data).map_err(AssetFailure::Storage)?;
+        if !self.access.is_active() {
+            return Err(AssetFailure::Unknown);
+        }
         Ok(FetchedAsset {
             name: asset.name,
             mime: asset.mime,
@@ -745,6 +753,7 @@ impl SessionAssets {
 
 /// Which check refused one attachment read, before it is rendered for its audience.
 enum AssetFailure {
+    Storage(dekopon_model::asset::BlobError),
     /// No such number in this conversation, or its generation was retired underneath the read.
     Unknown,
     /// The gateway will not show this one: why, in words, and which refusal a capability reads.
@@ -753,17 +762,22 @@ enum AssetFailure {
         refusal: ChatAssetRefusal,
     },
     /// Larger than the gateway reads.
-    TooLarge { size: u64 },
+    TooLarge {
+        size: u64,
+    },
     /// Nothing can resolve it back to bytes.
     Unavailable,
     /// The transport refused or failed the read.
-    Transport { category: &'static str },
+    Transport {
+        category: &'static str,
+    },
 }
 
 impl AssetFailure {
     /// Words a model can repeat to the sender.
     fn for_model(self, id: u64) -> String {
         match self {
+            Self::Storage(error) => format!("Chat Asset #{id} could not be retained: {error}."),
             Self::Unknown => format!(
                 "There is no Chat Asset #{id} in this conversation. The reference lines in the messages above name the ones there are."
             ),
@@ -787,9 +801,10 @@ impl AssetFailure {
         match self {
             Self::Unknown => ChatAssetRefusal::UnknownAsset,
             Self::Unreadable { refusal, .. } => refusal,
-            Self::TooLarge { .. } | Self::Transport { .. } | Self::Unavailable => {
-                ChatAssetRefusal::Unavailable
-            }
+            Self::Storage(_)
+            | Self::TooLarge { .. }
+            | Self::Transport { .. }
+            | Self::Unavailable => ChatAssetRefusal::Unavailable,
         }
     }
 }

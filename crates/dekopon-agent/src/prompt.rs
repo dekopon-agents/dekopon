@@ -118,8 +118,8 @@ pub struct FetchedAsset {
     pub name: String,
     /// IANA media type.
     pub mime: String,
-    /// The bytes themselves.
-    pub data: Vec<u8>,
+    /// A shared scratch-file lease; clones never copy bytes.
+    pub data: dekopon_model::asset::DiskBlob,
 }
 
 impl fmt::Debug for FetchedAsset {
@@ -1460,7 +1460,17 @@ fn fetch_asset_into(
             return Ok(());
         }
     };
-    let text = is_textual(&asset.mime).then(|| String::from_utf8_lossy(&asset.data).into_owned());
+    let text = if is_textual(&asset.mime) {
+        match asset.data.read() {
+            Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+            Err(error) => {
+                messages.push(ModelMessage::tool(call.id.clone(), error.to_string()));
+                return Ok(());
+            }
+        }
+    } else {
+        None
+    };
     let truncated = text
         .as_ref()
         .is_some_and(|text| text.len() > MAX_TEXTUAL_ASSET_BYTES);
@@ -3625,7 +3635,7 @@ mod tests {
         FetchedAsset {
             name: "attachment.txt".to_owned(),
             mime: "text/plain".to_owned(),
-            data: text.as_bytes().to_vec(),
+            data: dekopon_model::asset::DiskBlob::from_bytes(text.as_bytes()).expect("spool"),
         }
     }
 

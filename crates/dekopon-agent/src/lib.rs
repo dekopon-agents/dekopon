@@ -2029,11 +2029,17 @@ mod tests {
         struct OneAsset;
 
         impl ChatAssetSource for OneAsset {
-            fn fetch_for_capability(&self, id: u64) -> Result<(String, Vec<u8>), ChatAssetRefusal> {
+            fn fetch_for_capability(
+                &self,
+                id: u64,
+            ) -> Result<(String, dekopon_model::asset::DiskBlob), ChatAssetRefusal> {
                 if id != 1 {
                     return Err(ChatAssetRefusal::UnknownAsset);
                 }
-                Ok(("image/png".to_owned(), b"PNG".to_vec()))
+                Ok((
+                    "image/png".to_owned(),
+                    dekopon_model::asset::DiskBlob::from_bytes(b"PNG").expect("spool"),
+                ))
             }
         }
 

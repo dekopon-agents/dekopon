@@ -440,7 +440,7 @@ impl LocalDriver {
     }
 
     /// The answer line, naming the message it landed in when it replaced one in place.
-    fn answer(reply: &OutboundReply, message: Option<&str>) -> Value {
+    fn answer(reply: &OutboundReply, message: Option<&str>) -> Result<Value, TransportError> {
         let mut response = json!({ "reply": reply.text });
         if let Some(id) = message {
             response["id"] = Value::String(id.to_owned());
@@ -452,16 +452,16 @@ impl LocalDriver {
                     .iter()
                     .enumerate()
                     .map(|(index, image)| {
-                        json!({
+                        Ok(json!({
                             "filename": image.filename(index),
                             "mediaType": image.media_type(),
-                            "data": STANDARD.encode(image.bytes()),
-                        })
+                            "data": STANDARD.encode(image.bytes()?),
+                        }))
                     })
-                    .collect(),
+                    .collect::<Result<_, TransportError>>()?,
             );
         }
-        response
+        Ok(response)
     }
 
     /// Turns a progress or stream message into the answer, under the same identifier.
@@ -476,7 +476,7 @@ impl LocalDriver {
         reply: &OutboundReply,
     ) -> Result<(), TransportError> {
         let connection = Self::connection(&message.target)?;
-        self.emit(connection, &Self::answer(reply, Some(message.id.as_str())))
+        self.emit(connection, &Self::answer(reply, Some(message.id.as_str()))?)
             .await
     }
 }
@@ -491,7 +491,7 @@ impl ChatDriver for LocalDriver {
         let &ReplyTarget::Local { connection } = target else {
             return Err(TransportError::Response);
         };
-        self.emit(connection, &Self::answer(&reply, None)).await
+        self.emit(connection, &Self::answer(&reply, None)?).await
     }
 
     fn typing(&self) -> Option<&dyn TypingLease> {

@@ -1045,7 +1045,7 @@ impl ChatDriver for WhatsappDriver {
         // Refuse every locally knowable failure before uploading or sending any part.
         if images
             .iter()
-            .any(|image| image.bytes().len() > media::MAX_IMAGE_BYTES)
+            .any(|image| image.len() > media::MAX_IMAGE_BYTES)
         {
             return Err(media::failure("image-too-large"));
         }

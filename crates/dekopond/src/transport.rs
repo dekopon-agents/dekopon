@@ -681,6 +681,8 @@ pub(crate) trait AssetFetcher: Send + Sync {
 /// of them carries a credential, and the daemon logs the category rather than the message.
 #[derive(Debug, Error)]
 pub enum TransportError {
+    #[error("{0}")]
+    Attachment(#[from] dekopon_model::asset::BlobError),
     #[error("credential environment variable {name} is not set")]
     MissingCredential { name: String },
     #[error("credential environment variable {name} is set to an empty value")]
@@ -717,6 +719,7 @@ impl TransportError {
     /// Stable low-cardinality category for telemetry, never the underlying message.
     pub const fn category(&self) -> &'static str {
         match self {
+            Self::Attachment(_) => "attachment-storage",
             Self::MissingCredential { .. } => "missing-credential",
             Self::EmptyCredential { .. } => "empty-credential",
             Self::NonUtf8Credential { .. } => "non-utf8-credential",

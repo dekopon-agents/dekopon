@@ -66,7 +66,7 @@ these carries a fixed category rather than the untrusted text that triggered it:
 | Event | Emitted by | Carries |
 |---|---|---|
 | `agent.tool.rejected` | `dekopon-agent` | model turn, the tool-call index or count, and a fixed `error.type` such as `too-many-tool-calls` or `unknown-tool` — never the model's own tool name or arguments |
-| `agent.provider_attachment.refused` | `dekopon-agent` | a stable `reason` — `route-disabled`, `invalid-encoding`, `unsupported-media`, `too-large`, or `per-reply-limit`; never the attachment bytes, its declared media type, or any provider text |
+| `agent.provider_attachment.refused` | `dekopon-agent` | a stable `reason` — `route-disabled`, `invalid-encoding`, `unsupported-media`, `too-large`, `per-reply-limit`, or `storage`; never the attachment bytes, its declared media type, or any provider text |
 | `agent.chat_asset_input.refused` | `dekopon-agent` | a stable `reason` — `unknown-asset`, `unsupported-media`, `per-invocation-limit`, `session-limit`, `byte-budget`, or `unavailable`; never the attachment number, its bytes, or the sender's file name |
 | `agent.asset.refused` | `dekopon-agent` | the gateway-assigned asset id and the gateway-authored refusal text the model reads back |
 | `agent.asset.fetched` | `dekopon-agent` | the asset id, its media type, its byte count, and `asset.truncated` — whether a textual asset larger than the prompt's textual bound was clamped with a trailer the model reads rather than dropped or failed; never the bytes and never the sender's file name, which is untrusted text |
@@ -333,6 +333,17 @@ instead emits `gateway_message_ignored` with `reason = group-unsupported` and it
 A `chat.postMessage` HTTP 429 delays the identical post once: integer `Retry-After` seconds are
 capped at 60, defaulting to 5 when missing or unparsable. A second 429 uses the ordinary
 reply-failure path; no other HTTP failure is retried.
+
+Scratch IO emits `asset.spool` child spans for `operation=write|read|cleanup`, recording `bytes`,
+`duration_ms`, `outcome=ok|refused` and a sanitized `reason` on refusal (capacity, per-file bound,
+changed length, or OS IO category). It emits one bounded warning on a failed operation, with no
+path, payload, URL or base64. Reads inherit their active consumption span; final cleanup and reads
+outside an active scope retain the originating message span so they do not create disconnected
+roots. Synchronous IO never holds a span guard across an await. WhatsApp's final media boundaries
+emit `whatsapp.image_upload` and `whatsapp.image_send`, with `bytes`, `duration_ms`,
+`outcome=accepted|failed` and the stable transport error category in `reason`. Upload acceptance
+alone is not delivery; only validated message acceptance completes the send. Cancelled futures can
+close these spans without a terminal outcome. Broker/provider W3C propagation is unchanged.
 
 The prompt loop's spans (`prompt.session`, `prompt.model_turn`, `prompt.script`, `shell.script`, `shell.command`) nest under `gateway.session`, and the broker's `broker.invocation` joins the same trace through the proposal's `traceParent` — so one trace reads from "a person asked something in Slack" to "a provider made an HTTP call". `prompt.asset_fetch` joins them whenever a model opens an attachment: one span per fetch, carrying the asset number the conversation referred to and the turn and tool-call index that asked for it, never the file's name or bytes. It is gateway-only, because only a gateway session offers the asset tool.
 

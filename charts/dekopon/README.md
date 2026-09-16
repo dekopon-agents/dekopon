@@ -149,6 +149,16 @@ configured ChatGPT subdirectory. Neither daemon can rename the other's directory
 Private subdirectories are `0700`; files are `0600` with one link. Each daemon gets a separate
 `/tmp` volume. The broker alone mounts provider storage.
 
+Gateway `/tmp` is **disk-backed** `emptyDir`, sized by `volumeSizes.gatewayTmp` (default 320Mi).
+Existing `volumeSizes.tmp` overrides now affect only broker scratch (still tmpfs, default 16Mi);
+set `gatewayTmp` explicitly when migrating a custom scratch limit. Chat assets hold at most 256 MiB
+of live payload bytes per gateway process, independently enforced before writing. The extra space
+is headroom for filesystem overhead and other gateway scratch consumers, not an eviction guarantee.
+Kubernetes `emptyDir.sizeLimit` is kubelet-enforced, not a reservation or synchronous write quota;
+node ephemeral-storage pressure can still evict the pod. Outside this chart, configure the process
+temporary directory on real disk: a tmpfs-backed `TMPDIR` does not reduce retained RAM. Existing
+rollouts and operator overrides require separate verification; changing this source deploys nothing.
+
 **Upgrade with both daemons stopped:** an `audit.jsonl` on the claim, at its root or under
 `broker/`, is inert; the broker keeps no audit file, so delete it once any records you want are
 copied off. Change an existing ChatGPT directory and its live credential to `65533:65533`, keeping
@@ -475,9 +485,9 @@ equivalent default profile. Do not narrow this to a hand-written profile without
 loads; the failure mode is a trap inside the JIT, not a clean error.
 
 `readOnlyRootFilesystem` is `true` for every container. Neither daemon writes outside its mounted
-volumes, and a memory-backed `/tmp` is mounted anyway so an incidental temporary file cannot turn
-into a crash. The one thing a daemon does write — the ChatGPT credential, when that model kind is
-in use — gets its own writable directory on the claim; see
+volumes. Broker `/tmp` remains memory-backed; gateway `/tmp` stores private, short-lived chat payloads
+on disk. The ChatGPT credential, when that model kind is in use, gets its own writable directory
+on the claim; see
 [The ChatGPT credential is seeded once](#the-chatgpt-credential-is-seeded-once).
 
 ## Two version numbers

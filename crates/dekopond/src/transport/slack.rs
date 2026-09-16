@@ -1428,7 +1428,7 @@ impl SlackReplier {
         index: usize,
     ) -> Result<(), TransportError> {
         let filename = image.filename(index);
-        let length = image.bytes().len().to_string();
+        let length = image.len().to_string();
         let described = check_ok(
             self.http
                 .post(format!("{}/api/files.getUploadURLExternal", self.endpoint))
@@ -1457,7 +1457,7 @@ impl SlackReplier {
             .http
             .post(upload_url)
             .header("content-type", image.media_type())
-            .body(image.into_bytes())
+            .body(image.into_bytes()?)
             .send()
             .await
             .map_err(|source| TransportError::Request(Box::new(source)))?;

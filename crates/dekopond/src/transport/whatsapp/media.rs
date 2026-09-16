@@ -1,6 +1,8 @@
 //! Bounded WhatsApp media courier. No webhook or model content chooses a credential sink.
 
-use std::net::IpAddr;
+use std::{net::IpAddr, time::Instant};
+
+use tracing::Instrument as _;
 
 use dekopon_agent::attachment::GeneratedImage;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
@@ -143,55 +145,102 @@ impl WhatsappDriver {
         image: GeneratedImage,
         index: usize,
     ) -> Result<(), TransportError> {
-        let filename = image.filename(index);
-        let part = reqwest::multipart::Part::bytes(image.into_bytes())
-            .file_name(filename)
-            .mime_str("image/png")
-            .map_err(request_failed)?;
-        let form = reqwest::multipart::Form::new()
-            .text("messaging_product", "whatsapp")
-            .part("file", part);
-        let response = self
-            .http
-            .post(format!(
-                "{}/{}/{}/media",
-                self.endpoint, self.version, self.phone_number_id
-            ))
-            .bearer_auth(self.access_token.expose())
-            .multipart(form)
-            .send()
-            .await
-            .map_err(request_failed)?;
-        let uploaded = json_response(response).await?;
-        let id = uploaded
-            .get("id")
-            .and_then(Value::as_str)
-            .filter(|id| media_id(id))
-            .ok_or_else(|| failure("upload-id"))?;
-        let mut payload = json!({"messaging_product":"whatsapp", "recipient_type":"individual", "to":recipient,
-            "type":"image", "image":{"id":id}});
-        if let Some(caption) = caption {
-            payload["image"]["caption"] = json!(caption);
-        }
-        let response = self
-            .http
-            .post(self.messages_url())
-            .bearer_auth(self.access_token.expose())
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(payload.to_string())
-            .send()
-            .await
-            .map_err(request_failed)?;
-        let sent = json_response(response).await?;
-        if sent.get("messaging_product").and_then(Value::as_str) != Some("whatsapp")
-            || !sent
-                .pointer("/messages/0/id")
+        let bytes = image.len();
+        let upload = tracing::info_span!(
+            "whatsapp.image_upload",
+            bytes,
+            duration_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+            reason = tracing::field::Empty
+        );
+        let started = Instant::now();
+        let result = async {
+            let filename = image.filename(index);
+            let part = reqwest::multipart::Part::bytes(image.bytes()?)
+                .file_name(filename)
+                .mime_str("image/png")
+                .map_err(request_failed)?;
+            let form = reqwest::multipart::Form::new()
+                .text("messaging_product", "whatsapp")
+                .part("file", part);
+            let response = self
+                .http
+                .post(format!(
+                    "{}/{}/{}/media",
+                    self.endpoint, self.version, self.phone_number_id
+                ))
+                .bearer_auth(self.access_token.expose())
+                .multipart(form)
+                .send()
+                .await
+                .map_err(request_failed)?;
+            let uploaded = json_response(response).await?;
+            uploaded
+                .get("id")
                 .and_then(Value::as_str)
-                .is_some_and(canonical_whatsapp_message_id)
-        {
-            return Err(failure("message-acceptance"));
+                .filter(|id| media_id(id))
+                .map(str::to_owned)
+                .ok_or_else(|| failure("upload-id"))
         }
-        Ok(())
+        .instrument(upload.clone())
+        .await;
+        record_media_result(&upload, started, &result);
+        let id = result?;
+        let send = tracing::info_span!(
+            "whatsapp.image_send",
+            bytes,
+            duration_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+            reason = tracing::field::Empty
+        );
+        let started = Instant::now();
+        let result = async {
+            let mut payload = json!({
+                "messaging_product": "whatsapp", "recipient_type": "individual", "to": recipient,
+                "type": "image", "image": {"id": id}
+            });
+            if let Some(caption) = caption {
+                payload["image"]["caption"] = json!(caption);
+            }
+            let response = self
+                .http
+                .post(self.messages_url())
+                .bearer_auth(self.access_token.expose())
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(payload.to_string())
+                .send()
+                .await
+                .map_err(request_failed)?;
+            let sent = json_response(response).await?;
+            if sent.get("messaging_product").and_then(Value::as_str) != Some("whatsapp")
+                || !sent
+                    .pointer("/messages/0/id")
+                    .and_then(Value::as_str)
+                    .is_some_and(canonical_whatsapp_message_id)
+            {
+                return Err(failure("message-acceptance"));
+            }
+            Ok(())
+        }
+        .instrument(send.clone())
+        .await;
+        record_media_result(&send, started, &result);
+        result
+    }
+}
+
+fn record_media_result<T>(
+    span: &tracing::Span,
+    started: Instant,
+    result: &Result<T, TransportError>,
+) {
+    span.record("duration_ms", started.elapsed().as_millis() as u64);
+    span.record(
+        "outcome",
+        if result.is_ok() { "accepted" } else { "failed" },
+    );
+    if let Err(error) = result {
+        span.record("reason", error.category());
     }
 }
 

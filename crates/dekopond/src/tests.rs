@@ -2456,11 +2456,7 @@ impl ChatDriver for RecordingDriver {
         }
         self.record_reply(
             reply.text,
-            reply
-                .images
-                .iter()
-                .map(|image| image.bytes().len())
-                .collect(),
+            reply.images.iter().map(|image| image.len()).collect(),
         );
         Ok(())
     }
@@ -11145,7 +11141,7 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
                     .expect("base64 image")
             )
             .expect("image data decodes"),
-        generated_image().bytes()
+        generated_image().bytes().expect("read image")
     );
     image_reply
         .await
@@ -11175,6 +11171,82 @@ fn capture_spans() -> (
         .with(capture.clone())
         .set_default();
     (capture, guard)
+}
+
+#[test]
+fn spool_spans_keep_message_parent_and_never_record_payload_or_paths() {
+    use dekopon_model::asset::DiskBlob;
+    let (capture, _guard) = capture_spans();
+    let session = tracing::info_span!("gateway.session");
+    let blob = session.in_scope(|| DiskBlob::from_bytes(b"secret pixel sentinel").expect("spool"));
+    // Reading and cleanup after leaving the scope still belong to the originating message.
+    assert_eq!(blob.read().expect("read"), b"secret pixel sentinel");
+    drop(blob);
+    let text = capture.text();
+    for operation in ["write", "read", "cleanup"] {
+        assert!(
+            text.contains(&format!("operation=\"{operation}\"")),
+            "{text}"
+        );
+    }
+    assert!(
+        text.contains("bytes=21")
+            && text.contains("duration_ms=")
+            && text.contains("outcome=\"ok\""),
+        "{text}"
+    );
+    assert!(
+        !text.contains("secret pixel sentinel") && !text.contains("dekopon-assets-"),
+        "{text}"
+    );
+    assert!(
+        capture
+            .span_parents()
+            .iter()
+            .filter(|(name, _)| *name == "asset.spool")
+            .all(|(_, parent)| parent.as_deref() == Some("gateway.session")),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn whatsapp_upload_and_send_spans_remain_children_of_the_message() {
+    use crate::transport::whatsapp::tests_media::{
+        MediaPeer, PNG, accepted, admitted_photo, json_reply,
+    };
+    use tracing::Instrument as _;
+    let (capture, _guard) = capture_spans();
+    let peer = MediaPeer::new(|_, index| match index {
+        0 => json_reply(json!({"id": "987"})),
+        1 => accepted(),
+        _ => panic!("no retry"),
+    })
+    .await;
+    let (transport, inbound) = admitted_photo(&peer.origin, "image/png", None).await;
+    let parent = tracing::info_span!("gateway.message");
+    let image = parent.in_scope(|| GeneratedImage::from_png(PNG.to_vec()).expect("spool"));
+    transport
+        .driver()
+        .reply(
+            &inbound.reply,
+            OutboundReply::with_images("edited", vec![image]),
+        )
+        .instrument(parent)
+        .await
+        .expect("complete delivery");
+    let text = capture.text();
+    for name in ["whatsapp.image_upload", "whatsapp.image_send"] {
+        assert!(capture.span_parents().iter().any(|(span, parent)| *span == name && parent.as_deref() == Some("gateway.message")), "{text}");
+    }
+    assert!(
+        text.contains("outcome=\"accepted\"") && text.contains("duration_ms="),
+        "{text}"
+    );
+    assert!(
+        !text.contains(&STANDARD.encode(PNG)) && !text.contains("dekopon-assets-"),
+        "{text}"
+    );
+    peer.finish().await;
 }
 
 /// Answers one received message with a scripted model, so the span tree is the whole assertion.
@@ -12366,7 +12438,7 @@ async fn a_route_that_withholds_self_inspection_offers_no_such_tool() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_signed_whatsapp_photo_expands_for_edit_and_returns_png_without_transcript_bytes() {
+async fn three_persistent_edits_reuse_the_original_whatsapp_asset_and_deliver_spooled_results() {
     use crate::transport::whatsapp::tests_media::{
         JPEG, MediaPeer, PNG, accepted, admitted_photo, bytes_reply, json_reply, metadata,
     };
@@ -12374,11 +12446,11 @@ async fn a_signed_whatsapp_photo_expands_for_edit_and_returns_png_without_transc
         ("image/jpeg", JPEG, Some("Make the sky purple")),
         ("image/png", PNG, None),
     ] {
-        let peer = MediaPeer::new(move |origin, index| match index {
-            0 => metadata(origin, mime, bytes),
-            1 => bytes_reply(bytes),
-            2 => json_reply(json!({"id":"987"})),
-            3 => accepted(),
+        let peer = MediaPeer::new(move |origin, index| match index % 6 {
+            0 | 2 => metadata(origin, mime, bytes),
+            1 | 3 => bytes_reply(bytes),
+            4 => json_reply(json!({"id":"987"})),
+            5 => accepted(),
             _ => panic!("no retry or extra media calls"),
         })
         .await;
@@ -12388,15 +12460,28 @@ async fn a_signed_whatsapp_photo_expands_for_edit_and_returns_png_without_transc
             "admission must be lazy"
         );
         let directory = temporary();
-        let (broker,mut observed)=stub_broker(directory.path(),vec![
+        let (broker,mut observed)=stub_broker(directory.path(), (0..3).flat_map(|_| vec![
             ResponseEnvelope::capabilities(vec![capability("gpt-image.edit")],vec!["gpt-image".to_owned()]),
             ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed","capability":"gpt-image.edit","input":{"prompt":"purple sky","images":["chat-asset:1"]}})).expect("edit proposal")),
             ResponseEnvelope::invocation(record_output(json!({"attachments":[{"mediaType":"image/png","base64":STANDARD.encode(PNG)}]}))),
-        ]).await;
-        let models = ModelScript::new([
-            script_call("gpt-image edit --prompt 'purple sky' --image chat-asset:1"),
-            answer("Edited image."),
-        ]);
+        ]).collect()).await;
+        let models = ModelScript::new((0..3).flat_map(|_| {
+            [
+                AssistantTurn {
+                    tool_calls: vec![ModelToolCall {
+                        id: "asset-call".to_owned(),
+                        kind: "function".to_owned(),
+                        function: ModelFunctionCall {
+                            name: "fetch_chat_asset".to_owned(),
+                            arguments: "{\"id\":1}".to_owned(),
+                        },
+                    }],
+                    ..answer("")
+                },
+                script_call("gpt-image edit --prompt 'purple sky' --image chat-asset:1"),
+                answer("Edited image."),
+            ]
+        }));
         let mut runner = runner(broker, Arc::clone(&models), 4);
         Arc::get_mut(&mut runner)
             .expect("unique runner")
@@ -12406,20 +12491,34 @@ async fn a_signed_whatsapp_photo_expands_for_edit_and_returns_png_without_transc
         if let ModelConfig::OpenaiCompatible { modalities, .. } = &mut model {
             *modalities = vec![crate::config::Modality::Image];
         }
-        let mut route = route(model);
+        let mut route = persistent_route(model, window());
         route.transport = "wa".to_owned();
         route.provider_attachments = 1;
         route.chat_asset_inputs = Arc::from(vec!["gpt-image.edit".to_owned()]);
-        run_session(runner, route, inbound, transport.driver()).await;
-        assert_eq!(models.requests(), 2);
+        for edit in 0..3 {
+            let mut message = inbound.clone();
+            if edit > 0 {
+                message.assets.clear();
+                message.text = "Edit the original again".to_owned();
+                message.message_id = format!("follow-up-{edit}");
+            }
+            run_session(
+                Arc::clone(&runner),
+                route.clone(),
+                message,
+                transport.driver(),
+            )
+            .await;
+        }
+        assert_eq!(models.requests(), 9);
         let first = models.prompt(0);
         assert!(
             first.iter().any(|(_, text)| text.contains("Chat Asset #1")),
             "{first:?}"
         );
-        let tool = tool_message(&models, 1);
+        let tool = tool_message(&models, 2);
         assert!(tool.contains("attached"), "{tool}");
-        for index in 0..2 {
+        for index in 0..9 {
             for (_, text) in models.prompt(index) {
                 assert!(
                     !text.contains(&STANDARD.encode(bytes))
@@ -12428,33 +12527,74 @@ async fn a_signed_whatsapp_photo_expands_for_edit_and_returns_png_without_transc
                 );
             }
         }
-        let _listing = observed.recv().await.expect("capabilities");
-        let _command = observed.recv().await.expect("command");
-        let BrokerRequest::Invoke {
-            invocation,
-            attestation: Some(claim),
-        } = observed.recv().await.expect("proposal").request
-        else {
-            panic!("attested proposal")
-        };
-        assert_eq!(invocation.capability.as_str(), "gpt-image.edit");
-        assert_eq!(
-            invocation.input["images"][0],
-            format!("data:{mime};base64,{}", STANDARD.encode(bytes))
-        );
-        assert_eq!(claim.subject.canonical(), "whatsapp.15550000001");
-        assert_eq!(claim.scope.expect("scope").transport.as_str(), "wa");
+        for edit in 0..3 {
+            assert!(
+                models
+                    .prompt(edit * 3)
+                    .iter()
+                    .all(|(_, text)| !text.contains("Chat Asset #2")),
+                "generated output must not silently enter the inventory"
+            );
+            if edit > 0 {
+                assert!(
+                    models
+                        .prompt(edit * 3)
+                        .iter()
+                        .any(|(role, text)| role == "assistant" && text == "Edited image.")
+                );
+            }
+            let listing = observed.recv().await.expect("fresh capabilities");
+            assert!(matches!(
+                listing.request,
+                BrokerRequest::Capabilities { .. }
+            ));
+            let _command = observed.recv().await.expect("command");
+            let BrokerRequest::Invoke {
+                invocation,
+                attestation: Some(claim),
+            } = observed.recv().await.expect("proposal").request
+            else {
+                panic!("attested proposal")
+            };
+            assert_eq!(invocation.capability.as_str(), "gpt-image.edit");
+            assert_eq!(
+                invocation.input["images"][0],
+                format!("data:{mime};base64,{}", STANDARD.encode(bytes))
+            );
+            assert_eq!(claim.subject.canonical(), "whatsapp.15550000001");
+            assert_eq!(claim.scope.expect("scope").transport.as_str(), "wa");
+        }
+        // ModelScript clones messages after the session ends: only leases survive, but hydration
+        // is still exact. Each edit fetched the original before invoking the provider.
+        {
+            let prompts = models.prompts.lock().expect("prompts");
+            for edit in 0..3 {
+                let data = prompts[edit * 3 + 1]
+                    .iter()
+                    .filter_map(ModelMessage::parts)
+                    .flatten()
+                    .find_map(|part| match part {
+                        dekopon_model::model::ContentPart::Image { data, .. } => Some(data),
+                        _ => None,
+                    })
+                    .expect("model received original image lease");
+                assert_eq!(data.read().expect("read retained lease"), bytes);
+            }
+        }
         {
             let requests = peer.requests.lock().expect("requests");
-            assert_eq!(requests.len(), 4);
-            assert!(
-                requests[2]
-                    .body
-                    .windows(PNG.len())
-                    .any(|window| window == PNG)
-            );
-            let sent: Value = serde_json::from_slice(&requests[3].body).expect("image send");
-            assert_eq!(sent["image"], json!({"id":"987","caption":"Edited image."}));
+            assert_eq!(requests.len(), 18);
+            for edit in 0..3 {
+                assert!(
+                    requests[edit * 6 + 4]
+                        .body
+                        .windows(PNG.len())
+                        .any(|window| window == PNG)
+                );
+                let sent: Value =
+                    serde_json::from_slice(&requests[edit * 6 + 5].body).expect("image send");
+                assert_eq!(sent["image"], json!({"id":"987","caption":"Edited image."}));
+            }
         }
         peer.finish().await;
     }

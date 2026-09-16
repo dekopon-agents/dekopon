@@ -9,6 +9,9 @@ use std::time::Duration;
 
 use ureq::{Agent, config::ConfigBuilder, typestate::AgentScope};
 
+/// Bounded owned scratch leases for chat payloads.
+pub mod asset;
+
 /// Native ChatGPT/Codex subscription authentication and Responses transport.
 pub mod chatgpt;
 #[cfg(test)]

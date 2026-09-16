@@ -1137,7 +1137,7 @@ impl TelegramDriver {
             reason = "mime_str only rejects strings that are not a media type, and this one is the \
                       literal above it"
         )]
-        let part = reqwest::multipart::Part::bytes(image.into_bytes())
+        let part = reqwest::multipart::Part::bytes(image.into_bytes()?)
             .file_name(filename)
             .mime_str("image/png")
             .map_err(|_| TransportError::Response)?;
