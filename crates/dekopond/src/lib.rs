@@ -198,9 +198,10 @@ where
         conversations: ConversationStore::new(config.sessions.max_conversations),
         // Independently bounded for one-shot state; persistent access additionally carries the
         // conversation generation fence, so transcript invalidation retires its assets immediately.
-        assets: Arc::new(AssetStore::new(
+        assets: Arc::new(AssetStore::with_retention(
             config.sessions.max_conversations,
             ASSET_IDLE_TIMEOUT,
+            config.sessions.asset_retention_bytes,
         )),
         asset_fetchers,
         liveness: config.liveness.clone(),

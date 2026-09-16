@@ -896,16 +896,28 @@ fn responses_content(message: &ModelMessage) -> Result<Vec<Value>, crate::asset:
     parts
         .iter()
         .map(|part| {
+            let bytes = match part {
+                ContentPart::Image { data, .. } | ContentPart::File { data, .. } => match data
+                    .read()
+                {
+                    Ok(bytes) => Some(bytes),
+                    Err(
+                        crate::asset::BlobError::Reclaimed | crate::asset::BlobError::Unauthorized,
+                    ) => return Ok(json!({"type": "input_text", "text": data.release_notice()})),
+                    Err(error) => return Err(error),
+                },
+                ContentPart::Text(_) => None,
+            };
             Ok(match part {
                 ContentPart::Text(text) => json!({"type": "input_text", "text": text}),
-                ContentPart::Image { mime, data } => json!({
+                ContentPart::Image { mime, .. } => json!({
                     "type": "input_image",
-                    "image_url": data_url(mime, &data.read()?),
+                    "image_url": data_url(mime, bytes.as_deref().unwrap_or_default()),
                 }),
-                ContentPart::File { name, mime, data } => json!({
+                ContentPart::File { name, mime, .. } => json!({
                     "type": "input_file",
                     "filename": name,
-                    "file_data": data_url(mime, &data.read()?),
+                    "file_data": data_url(mime, bytes.as_deref().unwrap_or_default()),
                 }),
             })
         })
@@ -2227,12 +2239,16 @@ mod tests {
             ContentPart::Text("what does this say?".to_owned()),
             ContentPart::Image {
                 mime: "image/png".to_owned(),
-                data: crate::asset::DiskBlob::from_bytes(b"PNG").expect("spool"),
+                data: crate::asset::DiskBlob::from_bytes(b"PNG")
+                    .expect("spool")
+                    .into(),
             },
             ContentPart::File {
                 name: "spec.pdf".to_owned(),
                 mime: "application/pdf".to_owned(),
-                data: crate::asset::DiskBlob::from_bytes(b"PDF").expect("spool"),
+                data: crate::asset::DiskBlob::from_bytes(b"PDF")
+                    .expect("spool")
+                    .into(),
             },
         ])];
         let cloned = messages.clone();
@@ -3487,5 +3503,31 @@ mod tests {
                 .expect_err("an absent credential cannot be opened");
 
         assert!(matches!(refused, ChatGptError::NotLoggedIn { .. }));
+    }
+    #[test]
+    fn responses_released_history_is_explicit_but_io_failure_is_not_hidden() {
+        struct Missing(crate::asset::BlobError);
+        impl crate::asset::BlobSource for Missing {
+            fn pin(&self) -> Result<crate::asset::DiskBlob, crate::asset::BlobError> {
+                Err(self.0)
+            }
+        }
+        let message_for = |error| {
+            ModelMessage::user_with_parts(vec![ContentPart::Image {
+                mime: "image/png".into(),
+                data: crate::asset::BlobReference::new(std::sync::Arc::new(Missing(error)), 12, 7),
+            }])
+        };
+        let message = message_for(crate::asset::BlobError::Reclaimed);
+        let wire = serde_json::to_value(super::responses_content(&message).unwrap())
+            .unwrap()
+            .to_string();
+        assert!(
+            wire.contains("gateway: Chat Asset #7 was released"),
+            "{wire}"
+        );
+        assert!(!wire.contains("image_url"));
+        let message = message_for(crate::asset::BlobError::LengthChanged);
+        assert!(super::responses_content(&message).is_err());
     }
 }

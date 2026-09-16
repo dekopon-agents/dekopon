@@ -254,10 +254,31 @@ impl AttachmentRefusal {
 /// history. An embedder takes the slot only after a successful session and drops it on failure or
 /// cancellation, which keeps provider-produced content out of transcripts, persistent history, and
 /// accidental `Debug` output.
-#[derive(Debug)]
 pub struct ReplyAttachments {
     max_per_reply: usize,
     images: Mutex<Vec<GeneratedImage>>,
+    registrar: Option<Arc<dyn GeneratedAssetStore>>,
+}
+
+/// Gateway registration of an already validated PNG; the store owns capacity and filenames.
+pub trait GeneratedAssetStore: Send + Sync {
+    /// Reserves storage before writing, and returns a fresh scoped ID with a temporary delivery pin.
+    ///
+    /// # Errors
+    /// Returns retention failure after a provider effect; never authorizes a retry.
+    fn register(
+        &self,
+        bytes: &[u8],
+        capability: &str,
+        invocation: &str,
+    ) -> Result<(u64, DiskBlob), BlobError>;
+}
+impl fmt::Debug for ReplyAttachments {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ReplyAttachments")
+            .field("max_per_reply", &self.max_per_reply)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ReplyAttachments {
@@ -267,7 +288,15 @@ impl ReplyAttachments {
         Self {
             max_per_reply: max_per_reply as usize,
             images: Mutex::new(Vec::new()),
+            registrar: None,
         }
+    }
+
+    /// Registers validated outputs with the embedding gateway before queueing their delivery pin.
+    #[must_use]
+    pub fn with_store(mut self, store: Arc<dyn GeneratedAssetStore>) -> Self {
+        self.registrar = Some(store);
+        self
     }
 
     /// Removes everything this session accepted, oldest first.
@@ -313,9 +342,23 @@ pub fn strip_attachments(
     output: &mut Value,
     slot: Option<&ReplyAttachments>,
 ) -> (Vec<u64>, Vec<AttachmentRefusal>) {
+    strip_attachments_for_invocation(output, slot, "", "")
+}
+
+/// Strips successful provider outputs while associating gateway assets with their invocation.
+pub fn strip_attachments_for_invocation(
+    output: &mut Value,
+    slot: Option<&ReplyAttachments>,
+    capability: &str,
+    invocation: &str,
+) -> (Vec<u64>, Vec<AttachmentRefusal>) {
     let Some(object) = output.as_object_mut() else {
         return (Vec::new(), Vec::new());
     };
+    // These keys are reserved even without an attachments offer; a provider cannot publish a
+    // forged gateway identity or delivery claim by supplying its own metadata.
+    object.remove(ATTACHED_KEY);
+    object.remove(ATTACHMENT_NOTE_KEY);
     let Some(offered) = object.remove(ATTACHMENTS_KEY) else {
         return (Vec::new(), Vec::new());
     };
@@ -331,13 +374,16 @@ pub fn strip_attachments(
                 Err(_shape) => refusals.push(AttachmentRefusal::InvalidEncoding),
                 Ok(attachments) => {
                     for attachment in attachments {
-                        match accept(slot, &attachment) {
-                            Ok(bytes) => {
+                        match accept(slot, &attachment, capability, invocation) {
+                            Ok((bytes, id)) => {
                                 delivered.push(bytes as u64);
-                                accepted.push(serde_json::json!({
-                                    "mediaType": ATTACHMENT_MEDIA_TYPE,
-                                    "bytes": bytes,
-                                }));
+                                let mut metadata = serde_json::json!({"mediaType": ATTACHMENT_MEDIA_TYPE, "bytes": bytes});
+                                if let Some(id) = id {
+                                    metadata["asset"] = Value::String(format!("chat-asset:{id}"));
+                                    metadata["retained"] = Value::Bool(true);
+                                    metadata["delivered"] = Value::Bool(false);
+                                }
+                                accepted.push(metadata);
                             }
                             Err(refusal) => refusals.push(refusal),
                         }
@@ -360,7 +406,9 @@ pub fn strip_attachments(
 fn accept(
     slot: &ReplyAttachments,
     attachment: &ResultAttachment,
-) -> Result<usize, AttachmentRefusal> {
+    capability: &str,
+    invocation: &str,
+) -> Result<(usize, Option<u64>), AttachmentRefusal> {
     if attachment.media_type != ATTACHMENT_MEDIA_TYPE {
         return Err(AttachmentRefusal::UnsupportedMedia);
     }
@@ -379,13 +427,40 @@ fn accept(
         .decode(&attachment.base64)
         .map_err(|_| AttachmentRefusal::InvalidEncoding)?;
     let bytes = data.len();
-    slot.store(GeneratedImage::from_png(data)?)?;
-    Ok(bytes)
+    if bytes > MAX_ATTACHMENT_BYTES {
+        return Err(AttachmentRefusal::TooLarge);
+    }
+    if !data.starts_with(PNG_SIGNATURE) {
+        return Err(AttachmentRefusal::UnsupportedMedia);
+    }
+    let mut images = slot
+        .images
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if images.len() >= slot.max_per_reply {
+        return Err(AttachmentRefusal::PerReplyLimit);
+    }
+    let (image, id) = if let Some(store) = &slot.registrar {
+        let (id, data) = store
+            .register(&data, capability, invocation)
+            .map_err(AttachmentRefusal::Storage)?;
+        (GeneratedImage { data }, Some(id))
+    } else {
+        (GeneratedImage::from_png(data)?, None)
+    };
+    images.push(image);
+    Ok((bytes, id))
 }
 
 /// Why one `chat-asset:<N>` marker could not be expanded into a capability input.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ChatAssetRefusal {
+    /// Previously retained bytes were reclaimed; no transport refetch is allowed.
+    #[error("the asset was released; ask the user to resend it or select another asset")]
+    Reclaimed,
+    /// The original audience or generation no longer authorizes this reference.
+    #[error("the asset is unavailable in this conversation generation")]
+    Unauthorized,
     /// No attachment in this conversation carries that number.
     #[error("the conversation has no attachment with that number")]
     UnknownAsset,
@@ -413,6 +488,8 @@ impl ChatAssetRefusal {
     #[must_use]
     pub const fn reason(&self) -> &'static str {
         match self {
+            Self::Reclaimed => "reclaimed",
+            Self::Unauthorized => "unauthorized",
             Self::UnknownAsset => "unknown-asset",
             Self::UnsupportedMedia => "unsupported-media",
             Self::PerInvocationLimit => "per-invocation-limit",
@@ -430,6 +507,10 @@ impl ChatAssetRefusal {
     #[must_use]
     pub const fn note(&self) -> &'static str {
         match self {
+            Self::Reclaimed => {
+                "the requested asset was released from disk retention; ask the user to resend it or choose another asset. No call was submitted and no original image was substituted"
+            }
+            Self::Unauthorized => "that reference is not available in this conversation generation",
             Self::UnknownAsset => {
                 "no chat attachment in this conversation carries that number, and the reference \
                  lines above name the ones there are"
@@ -532,9 +613,22 @@ impl ChatAssetInputs {
     /// Returns the first refusal. The input is then abandoned rather than half-expanded: a proposal
     /// carrying one of three requested images is not the call the model asked for.
     pub fn expand(&self, input: &mut Value) -> Result<usize, ChatAssetRefusal> {
+        self.expand_pinned(input).map(|(count, _pins)| count)
+    }
+
+    /// Expands all requested inputs atomically and returns request-local pins for submission.
+    ///
+    /// # Errors
+    /// Any unavailable member refuses the whole proposal; the original input is unchanged.
+    pub fn expand_pinned(
+        &self,
+        input: &mut Value,
+    ) -> Result<(usize, Vec<DiskBlob>), ChatAssetRefusal> {
         let mut budget = ExpansionBudget::default();
-        self.walk(input, &mut budget)?;
-        Ok(budget.expanded)
+        let mut expanded = input.clone();
+        self.walk(&mut expanded, &mut budget)?;
+        *input = expanded;
+        Ok((budget.expanded, budget.pins))
     }
 
     fn walk(
@@ -585,19 +679,19 @@ impl ChatAssetInputs {
         }
         budget.bytes = spent;
         budget.expanded += 1;
-        Ok(format!(
-            "data:{mime};base64,{}",
-            STANDARD.encode(
-                data.read()
-                    .map_err(|_error| ChatAssetRefusal::Unavailable)?
-            )
-        ))
+        let encoded = STANDARD.encode(
+            data.read()
+                .map_err(|_error| ChatAssetRefusal::Unavailable)?,
+        );
+        budget.pins.push(data);
+        Ok(format!("data:{mime};base64,{encoded}"))
     }
 }
 
 /// What one invocation has already spent expanding markers.
 #[derive(Default)]
 struct ExpansionBudget {
+    pins: Vec<DiskBlob>,
     expanded: usize,
     bytes: usize,
 }

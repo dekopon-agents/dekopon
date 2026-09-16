@@ -140,6 +140,7 @@ sessions:
   maxConcurrent: 4                            # optional, default 4
   replyOnBusy: true                           # optional, default true
   maxConversations: 1024                      # optional, default 1024 tracked
+  assetRetentionBytes: 268435456              # optional, process-wide disk budget; 0 disables assets
 
 shutdownGraceMs: 120000                       # optional, default 120000
 
@@ -315,7 +316,8 @@ Each direction is an owner-authored route opt-in, because each is new reach.
   reserved top-level `attachments: [{mediaType, base64}]`. The session's broker leg removes that key
   before the result reaches the shell, validates each entry (`image/png`, valid base64, PNG
   signature, at most 8 MiB decoded, at most `maxPerReply` across the whole session), puts the
-  accepted bytes in a request-local slot, and writes back `attached: [{mediaType, bytes}]` so the
+  accepted assets in its bounded disk LRU with temporary delivery pins, and writes back `attached`
+  metadata with a gateway `asset: "chat-asset:<N>"` marker and retained/not-yet-delivered status so the
   shell and the model see metadata only. The ordinary result fields beside the key are untouched.
 - **In: `chatAssetInputs: [<capability id>, …]`.** A capability input may name one of this
   conversation's own attachments as the exact string `chat-asset:<N>`, the number from its
@@ -453,7 +455,7 @@ what does this say?
 
 The model then calls `fetch_chat_asset(1)`. Because a tool result cannot carry an image — Chat Completions types a `tool` message's content as a string, and the Responses API types `function_call_output.output` the same way — the answer arrives as two messages: the tool result says the asset follows, and a `user` message carries the bytes. That shape is the only one both wire formats accept.
 
-- **Numbering follows the exact history audience and live generation.** `Chat Asset #5` means at most one file in that generation, which is what lets a follow-up three turns later resolve. Its monotonic sequence survives independent asset TTL/LRU removal while the transcript generation remains live, so a removed number cannot alias a newer file. Grant/empty-grant invalidation, idle replacement, and conversation-capacity eviction close the generation's asset fence; stale sessions cannot enumerate, publish, or fetch through it, and a replacement generation may safely number from one again. Private participants and different agents/transports/conversations cannot enumerate or fetch one another's attachments. Participants on an explicitly shared route share the live attachment inventory as well as the replayed reference notes; that disclosure is part of choosing shared scope. Numbers are assigned by the gateway rather than by a transport.
+- **Numbering follows the exact history audience and live generation.** `Chat Asset #5` means at most one file in that generation, which is what lets a follow-up three turns later resolve. Its monotonic sequence survives independent asset TTL/LRU removal while the transcript generation remains live, so a removed number cannot alias a newer file. Grant/empty-grant invalidation, idle replacement, and conversation-capacity eviction close the generation's asset fence; stale sessions cannot enumerate, publish, or fetch through it, and a replacement generation may safely number from one again. Private participants and different agents/transports/conversations cannot enumerate or fetch one another's attachments. Participants on an explicitly shared route share the live attachment inventory as well as the replayed reference notes; that disclosure is part of choosing shared scope. Numbers are assigned by the gateway rather than by a transport; one-shot IDs are process-monotonic so expiry cannot alias an old reference.
 - **Every prompt names the whole inventory**, not only what the newest message brought, with the new ones marked. A reference line is the only way a model learns a number exists, and one confined to the turn that introduced it goes unreachable as soon as ordinary chatter pushes that turn out of the replayed history window — while the store holds the file for another hour.
 - **The reference line is what history remembers, not the bytes.** It is a few dozen bytes, so it replays inside the conversation byte budget instead of evicting real conversation the way a base64 screenshot would.
 - **A file that cannot be shown is named anyway.** A media type outside the allowlist, a model with no image modality, or a file Slack withholds entirely all produce a line saying so, which the model can answer around instead of denying a screenshot that plainly exists.
@@ -462,24 +464,40 @@ The model then calls `fetch_chat_asset(1)`. Because a tool result cannot carry a
 - **Bounds.** 8 MiB per attachment, enforced while the response streams rather than after it, because a reported size is sender-influenced and a chunked response need not declare a length. Four fetches per session. Thirty-two attachments addressable per conversation, evicted oldest-first. A textual file is clamped again on the way into the prompt, at the same 256 KiB a script's output is capped at, with a trailer saying where it was cut: the 8 MiB ceiling is sized for images on the wire, and that much `text/plain` is roughly two million tokens — enough to come back from the provider as a context-length rejection. Every one of these refuses in a sentence the model reads and can answer around, never by failing the session.
 - **Redirects.** The HTTP client refuses redirects globally so a bearer token is never forwarded by policy. Slack's `url_private_download` genuinely redirects to its own file host, so that transport follows exactly one hop, only to a host it recognises by comparing the host itself rather than a URL prefix, and re-attaches the token by hand.
 - **Ambient proxies.** Every transport's client is built from one `credential_client` shape that sets `no_proxy()`, so an exported `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` carries no Slack, Discord, Telegram or WhatsApp token — nor the messages and files it authenticates — through a host nobody named to Dekopon. There is no flag to opt back in; a chat service reachable only through a proxy is unreachable.
-- **Owned disk leases, not retained payload vectors.** Fetched assets (including images and PDFs)
-  and validated provider PNG results are spooled before entering session messages or the reply slot.
-  Cloning a message copies a shared lease, not its payload. Both model backends read the same file
-  anew at request encoding; capability expansion reads it into the unchanged data-URL proposal, and
-  transports hydrate it only for delivery. The inbound inventory still holds transport references
-  and refetches on demand; persistent conversation history still records only question/final-answer
-  text. Generated images are not automatically registered as chat assets: later edits can reuse
-  the original inbound marker, not earlier generated pixels. This is an existing limitation.
-- **Scratch lifetime and capacity.** The gateway exclusively creates private 0700 directories and
-  0600 files beneath the process temporary directory. No model/provider path is accepted, no path
-  is serialized, and reads use the retained descriptor rather than reopening a filename. Final
-  lease drop removes the file; inventory/history eviction, cancellation and generation retirement
-  cannot remove another owner's live lease. A process-wide 256 MiB live-payload allowance refuses
-  new writes rather than evicting referenced files (empty files charge one byte). The shared 8 MiB
-  per-file limit and WhatsApp's 5,000,000-byte limit remain unchanged. The allowance is released on
-  failed construction and final drop, not on each clone's drop. Cleanup failures emit bounded
-  diagnostics; abrupt process death can leave scratch until the temporary volume is removed.
-  There is no crash durability or startup recovery service.
+- **Gateway-owned disk LRU, weak references.** Inbound inputs fetch once, then reuse the same
+  private file. Validated generated PNGs receive fresh scoped gateway IDs, with capability/invocation
+  provenance, and join the conversation inventory immediately. The model receives
+  `attached: [{mediaType, bytes, asset: "chat-asset:<N>", retained: true, delivered: false}]`:
+  produced and retained is not transport-delivered. Same-session and later-turn edits can use that
+  marker, including editing a previous edit instead of the original. Provider-supplied reserved
+  `attached`/`attachmentNote` values are removed, never trusted as gateway metadata.
+- **One configurable residency budget.** `sessions.assetRetentionBytes` defaults to **268435456**
+  (256 MiB) across all conversations and generated/inbound assets in this gateway process. **Zero
+  disables retention**: newly fetched/generated assets cannot be retained or delivered; text remains
+  usable. It is never an unlimited setting. The shared 8 MiB per-file and transport/proposal limits
+  remain independent safety limits, not competing retention caches. Empty files charge one byte.
+  Configure disk-backed temporary storage with sufficient capacity separately from this logical budget.
+- **Use means consumption.** Successful scoped resolution for model inclusion or provider submission
+  refreshes recency; inventory listing and history reference replay do not. Least-recently-used
+  unpinned files are reclaimed before admission. Individually oversized assets are refused without
+  evicting useful entries; insufficient unpinned space refuses clearly. Active provider requests and
+  outbound delivery hold temporary pins charged to the same budget. Model messages hold weak
+  references, never residency ownership. Retired/expired inventories are pruned lazily; their files
+  are reclaimed on the next blocking admission, once active pins finish. Unlink failures retain
+  accounting rather than pretending disk space was freed.
+- **Released is not unfetched.** A reclaimed asset is never silently downloaded again or substituted
+  with an original input. Requested provider inputs are all resolved and pinned before submission;
+  one missing input refuses the entire call. Historical model attachment parts become an explicit
+  gateway-authored release notice at request encoding, letting the model choose its next action.
+  Actual descriptor IO/corruption errors remain errors, not fabricated release notices. Scoped
+  inventory state and at most 1024 release tombstones distinguish released, unknown and unauthorized
+  IDs. Persistent IDs remain monotonic within the generation; one-shot IDs are process-monotonic
+  to avoid reuse after independent inventory expiry.
+- **Private scratch, not persistence.** The gateway creates 0700 directories and 0600 files beneath
+  the process temporary directory. No model/provider path is accepted or serialized; reads use the
+  original descriptor. No startup recovery, external cache or restart persistence is provided.
+  Cleanup failures emit bounded diagnostics; abrupt process death can leave scratch until the
+  temporary volume is removed.
 - **Storage failures are not successful empty images.** Capacity exhaustion, OS IO categories
   (including disk-full), and changed/truncated length are sanitized failures, never paths or bytes.
   An unlinked file still reads through its original descriptor while a lease owns it. No storage

@@ -445,6 +445,8 @@ volumeSizes:
   config: 8Mi
   runtime: 1Mi
   tmp: 16Mi
+  # Size for the default gateway sessions.assetRetentionBytes (256 MiB) plus temporary overhead.
+  # If increasing the typed gateway config budget, increase this disk volume independently.
   gatewayTmp: 320Mi
 
 # ---------------------------------------------------------------------------------------------

@@ -118,8 +118,8 @@ pub struct FetchedAsset {
     pub name: String,
     /// IANA media type.
     pub mime: String,
-    /// A shared scratch-file lease; clones never copy bytes.
-    pub data: dekopon_model::asset::DiskBlob,
+    /// A byte-free reference; gateway references do not pin disk residency.
+    pub data: dekopon_model::asset::BlobReference,
 }
 
 impl fmt::Debug for FetchedAsset {
@@ -646,16 +646,12 @@ where
     } = extensions;
     // Offered only when this conversation actually carries something. A tool that can only fail is
     // a tool a model will still call, and every unusable tool costs prompt tokens on every turn.
-    let assets = assets.filter(|source| !source.is_empty());
     let mut model_tools = vec![script_tool(&runtime.command_words())];
     if agent_config.is_some() {
         model_tools.push(agent_config_tool());
     }
     if !skills.is_empty() {
         model_tools.push(skills::skill_tool());
-    }
-    if assets.is_some() {
-        model_tools.push(asset_tool());
     }
     if improvement_suggestions {
         model_tools.push(improvement::improvement_tool());
@@ -690,6 +686,11 @@ where
 
     for model_turns in 1..=limits.max_steps {
         check_cancelled(cancellation)?;
+        // A provider result can register the first asset during this very session.
+        model_tools.retain(|tool| tool.name != ASSET_TOOL_NAME);
+        if assets.is_some_and(|source| !source.is_empty()) {
+            model_tools.push(asset_tool());
+        }
         // Usage fields are declared empty and recorded once the provider answers: token counts
         // are response data, and they belong on the turn span so a trace query can price a
         // session without leaving the trace.
@@ -1398,7 +1399,7 @@ fn is_textual(mime: &str) -> bool {
 fn asset_tool() -> ModelTool {
     ModelTool {
         name: ASSET_TOOL_NAME.to_owned(),
-        description: "Look at a file someone attached to their chat message. The conversation \
+        description: "Look at an inbound or generated file in this conversation. The conversation \
                       names each one as `Chat Asset #N`; pass that number. Call this when \
                       answering depends on what the file actually contains."
             .to_owned(),
@@ -3635,7 +3636,9 @@ mod tests {
         FetchedAsset {
             name: "attachment.txt".to_owned(),
             mime: "text/plain".to_owned(),
-            data: dekopon_model::asset::DiskBlob::from_bytes(text.as_bytes()).expect("spool"),
+            data: dekopon_model::asset::DiskBlob::from_bytes(text.as_bytes())
+                .expect("spool")
+                .into(),
         }
     }
 

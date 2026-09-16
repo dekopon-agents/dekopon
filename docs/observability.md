@@ -67,7 +67,8 @@ these carries a fixed category rather than the untrusted text that triggered it:
 |---|---|---|
 | `agent.tool.rejected` | `dekopon-agent` | model turn, the tool-call index or count, and a fixed `error.type` such as `too-many-tool-calls` or `unknown-tool` — never the model's own tool name or arguments |
 | `agent.provider_attachment.refused` | `dekopon-agent` | a stable `reason` — `route-disabled`, `invalid-encoding`, `unsupported-media`, `too-large`, `per-reply-limit`, or `storage`; never the attachment bytes, its declared media type, or any provider text |
-| `agent.chat_asset_input.refused` | `dekopon-agent` | a stable `reason` — `unknown-asset`, `unsupported-media`, `per-invocation-limit`, `session-limit`, `byte-budget`, or `unavailable`; never the attachment number, its bytes, or the sender's file name |
+| `agent.chat_asset_input.refused` | `dekopon-agent` | a stable `reason` — `unknown-asset`, `unsupported-media`, `per-invocation-limit`, `session-limit`, `byte-budget`, `reclaimed`, `unauthorized`, or `unavailable`; never the attachment number, its bytes, or the sender's file name |
+| `gateway.asset.retention_miss` | `dekopond` | gateway asset ID, known byte size, configured byte budget, and reason (`disabled`, `oversized`, `all-pinned`, `reclaimed`, `unknown`, `unauthorized`, `storage`); no path, payload or secret; emitted inside the resolving message/model/provider trace |
 | `agent.asset.refused` | `dekopon-agent` | the gateway-assigned asset id and the gateway-authored refusal text the model reads back |
 | `agent.asset.fetched` | `dekopon-agent` | the asset id, its media type, its byte count, and `asset.truncated` — whether a textual asset larger than the prompt's textual bound was clamped with a trailer the model reads rather than dropped or failed; never the bytes and never the sender's file name, which is untrusted text |
 | `agent.skill.read` | `dekopon-agent` | model turn, tool-call index, the operator-authored `skill.name` the request matched, `skill.resource` (the resource path; empty for the skill's own instructions), `skill.bytes` of the tool result, and `skill.repeated` — `true` when that text was already in the conversation and a one-line pointer was returned instead; never the skill text and never the name the model typed |
@@ -337,7 +338,7 @@ A `chat.postMessage` HTTP 429 delays the identical post once: integer `Retry-Aft
 capped at 60, defaulting to 5 when missing or unparsable. A second 429 uses the ordinary
 reply-failure path; no other HTTP failure is retried.
 
-Scratch IO emits `asset.spool` child spans for `operation=write|read|cleanup`, recording `bytes`,
+Scratch IO emits `asset.spool` child spans for `operation=write|read|reclaim|cleanup`, recording `bytes`,
 `duration_ms`, `outcome=ok|refused` and a sanitized `reason` on refusal (capacity, per-file bound,
 changed length, or OS IO category). It emits one bounded warning on a failed operation, with no
 path, payload, URL or base64. Reads inherit their active consumption span; final cleanup and reads

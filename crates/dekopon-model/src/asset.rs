@@ -3,10 +3,7 @@
 use std::{
     fmt,
     io::{self, Read, Seek, SeekFrom, Write},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Instant,
 };
 
@@ -15,8 +12,6 @@ use thiserror::Error;
 
 /// Per-attachment ceiling shared by inbound assets and provider results.
 pub const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
-const MAX_SPOOL_BYTES: usize = 256 * 1024 * 1024;
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
 
 /// A sanitized scratch-storage failure, never a filename or payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
@@ -24,9 +19,21 @@ pub enum BlobError {
     /// The attachment exceeds the supported per-file size.
     #[error("attachment exceeds the byte limit")]
     TooLarge,
-    /// Live leases already occupy the process-wide scratch allowance.
+    /// The owner explicitly disabled gateway attachment retention.
+    #[error("asset retention is disabled (assetRetentionBytes is zero); answer in text")]
+    Disabled,
+    /// Active request pins prevent admission within the gateway retention budget.
     #[error("attachment scratch capacity exhausted")]
     Capacity,
+    /// No retained or released entry recognizes this scoped ID.
+    #[error("unknown asset in this conversation; choose an ID from the current inventory")]
+    Unknown,
+    /// The gateway has reclaimed this asset; callers must not redownload it.
+    #[error("asset was released; ask the user to resend it or choose another asset")]
+    Reclaimed,
+    /// The reference is no longer authorized in its original generation.
+    #[error("asset is unavailable in this conversation generation")]
+    Unauthorized,
     /// An operating-system failure. Only its category is retained.
     #[error("attachment scratch IO failed ({0:?})")]
     Io(io::ErrorKind),
@@ -41,33 +48,10 @@ impl From<io::Error> for BlobError {
     }
 }
 
-struct Reservation {
-    bytes: usize,
-    used: &'static AtomicUsize,
-}
-impl Reservation {
-    fn new(bytes: usize, used: &'static AtomicUsize) -> Result<Self, BlobError> {
-        // Charge empty files too; no number of zero-byte leases bypasses accounting.
-        let bytes = bytes.max(1);
-        used.fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-            used.checked_add(bytes)
-                .filter(|total| *total <= MAX_SPOOL_BYTES)
-        })
-        .map_err(|_used| BlobError::Capacity)?;
-        Ok(Self { bytes, used })
-    }
-}
-impl Drop for Reservation {
-    fn drop(&mut self) {
-        self.used.fetch_sub(self.bytes, Ordering::AcqRel);
-    }
-}
-
 struct Owner {
     file: Mutex<Option<NamedTempFile>>,
     directory: Option<TempDir>,
     len: usize,
-    _reservation: Reservation,
     origin: tracing::Span,
 }
 
@@ -97,10 +81,10 @@ impl DiskBlob {
     /// Spools already downloaded/decoded bytes before publishing a lease.
     ///
     /// # Errors
-    /// Refuses oversized payloads, exhausted aggregate capacity, or scratch IO failure. Failed
+    /// Refuses oversized payloads or scratch IO failure. The gateway reserves capacity before calling. Failed
     /// writes release their reservation and temporary files; no partially written lease escapes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, BlobError> {
-        Self::write_with(bytes, &LIVE_BYTES, |file, bytes| {
+        Self::write_with(bytes, |file, bytes| {
             file.write_all(bytes)?;
             file.flush()
         })
@@ -109,7 +93,6 @@ impl DiskBlob {
     // The same ownership/unwind path serves real writes and deterministic IO-failure tests.
     fn write_with(
         bytes: &[u8],
-        used: &'static AtomicUsize,
         write: impl FnOnce(&mut NamedTempFile, &[u8]) -> io::Result<()>,
     ) -> Result<Self, BlobError> {
         let origin = tracing::Span::current();
@@ -117,7 +100,6 @@ impl DiskBlob {
             if bytes.len() > MAX_ATTACHMENT_BYTES {
                 return Err(BlobError::TooLarge);
             }
-            let reservation = Reservation::new(bytes.len(), used)?;
             // tempfile creates the directory exclusively with 0700 and the file with 0600 on
             // Unix. A random name in this private directory cannot follow a supplied symlink.
             let mut builder = tempfile::Builder::new();
@@ -133,7 +115,6 @@ impl DiskBlob {
                 file: Mutex::new(Some(file)),
                 directory: Some(directory),
                 len: bytes.len(),
-                _reservation: reservation,
                 origin,
             };
             {
@@ -148,6 +129,40 @@ impl DiskBlob {
                 }
             }
             Ok(Self(Arc::new(owner)))
+        })
+    }
+
+    /// Whether an active consumer holds a pin in addition to the cache owner.
+    #[must_use]
+    pub fn is_pinned(&self) -> bool {
+        Arc::strong_count(&self.0) > 1
+    }
+
+    /// Unlinks an unpinned cache entry before the gateway releases its byte accounting.
+    ///
+    /// # Errors
+    /// A live consumer pin refuses reclamation. Unlink failure preserves the descriptor and
+    /// accounting owner so another admission cannot pretend unreclaimed disk is free.
+    pub fn reclaim(&self) -> Result<(), BlobError> {
+        if self.is_pinned() {
+            return Err(BlobError::Capacity);
+        }
+        operation("reclaim", self.len(), || {
+            let mut file = self
+                .0
+                .file
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(owned) = file.as_ref() {
+                match std::fs::remove_file(owned.path()) {
+                    Ok(()) => (),
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            // The descriptor closes before accounting is released; unlink alone is not disk reclamation.
+            drop(file.take());
+            Ok(())
         })
     }
 
@@ -181,7 +196,7 @@ impl DiskBlob {
                     .file
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let file = guard.as_mut().expect("a live owner retains its descriptor");
+                let file = guard.as_mut().ok_or(BlobError::Reclaimed)?;
                 if file.as_file().metadata()?.len() != self.len() as u64 {
                     return Err(BlobError::LengthChanged);
                 }
@@ -194,6 +209,78 @@ impl DiskBlob {
                 Ok(bytes)
             })
         })
+    }
+}
+
+/// A gateway-owned resolver. Resolution must authorize before pinning or touching retention.
+pub trait BlobSource: Send + Sync {
+    /// Pins an existing asset for actual consumption, never by redownloading a reclaimed asset.
+    ///
+    /// # Errors
+    /// Returns a sanitized retention or IO failure.
+    fn pin(&self) -> Result<DiskBlob, BlobError>;
+}
+
+/// Byte-free model reference. Clones do not acquire a disk pin.
+#[derive(Clone)]
+pub struct BlobReference {
+    source: Arc<dyn BlobSource>,
+    bytes: usize,
+    id: u64,
+}
+impl BlobReference {
+    /// Binds a scoped resolver and gateway metadata, never a path.
+    pub fn new(source: Arc<dyn BlobSource>, bytes: usize, id: u64) -> Self {
+        Self { source, bytes, id }
+    }
+    /// Metadata only; never updates recency.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.bytes
+    }
+    /// Whether the payload is empty.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bytes == 0
+    }
+    /// Resolves and reads a transient pin for model inclusion.
+    ///
+    /// # Errors
+    /// Returns the resolver's retention failure or the descriptor's IO failure.
+    pub fn read(&self) -> Result<Vec<u8>, BlobError> {
+        self.source.pin()?.read()
+    }
+    /// Explicit gateway notice substituted for a released historical attachment.
+    #[must_use]
+    pub fn release_notice(&self) -> String {
+        format!(
+            "[gateway: Chat Asset #{} was released from disk retention and is no longer available. Ask the user to resend it or choose another asset; do not silently reuse an original image.]",
+            self.id
+        )
+    }
+}
+impl fmt::Debug for BlobReference {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BlobReference")
+            .field("id", &self.id)
+            .field("bytes", &self.bytes)
+            .finish()
+    }
+}
+impl PartialEq for BlobReference {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.source, &other.source)
+    }
+}
+impl Eq for BlobReference {}
+impl BlobSource for DiskBlob {
+    fn pin(&self) -> Result<DiskBlob, BlobError> {
+        Ok(self.clone())
+    }
+}
+impl From<DiskBlob> for BlobReference {
+    fn from(blob: DiskBlob) -> Self {
+        Self::new(Arc::new(blob.clone()), blob.len(), 0)
     }
 }
 
@@ -320,60 +407,44 @@ mod tests {
     }
 
     #[test]
-    fn bounds_refuse_without_eviction_or_accounting_leaks() {
-        assert_eq!(
-            Reservation::new(MAX_SPOOL_BYTES + 1, &LIVE_BYTES).err(),
-            Some(BlobError::Capacity)
-        );
+    fn oversize_and_partial_write_failure_leave_no_files() {
         assert_eq!(
             DiskBlob::from_bytes(&vec![0; MAX_ATTACHMENT_BYTES + 1]),
             Err(BlobError::TooLarge)
         );
-        let blob = DiskBlob::from_bytes(b"still live").unwrap();
-        assert_eq!(blob.read().unwrap(), b"still live");
-        assert_eq!(
-            BlobError::from(io::Error::from(io::ErrorKind::StorageFull)),
-            BlobError::Io(io::ErrorKind::StorageFull)
-        );
-    }
-
-    #[test]
-    fn partial_write_failure_and_unwind_release_capacity_and_files() {
-        static USED: AtomicUsize = AtomicUsize::new(0);
         let mut path = None;
-        let error = DiskBlob::write_with(b"pixels", &USED, |file, _| {
+        let error = DiskBlob::write_with(b"pixels", |file, _| {
             path = Some(file.path().parent().unwrap().to_owned());
             file.write_all(b"pi")?;
             Err(io::Error::from(io::ErrorKind::StorageFull))
         })
         .unwrap_err();
         assert_eq!(error, BlobError::Io(io::ErrorKind::StorageFull));
-        assert_eq!(USED.load(Ordering::Acquire), 0);
         assert!(!path.unwrap().exists());
-        let result = std::panic::catch_unwind(|| {
-            DiskBlob::write_with(b"pixels", &USED, |_file, _| {
-                panic!("cancel synchronous writer")
-            })
-        });
-        assert!(result.is_err());
-        assert_eq!(USED.load(Ordering::Acquire), 0);
     }
 
     #[test]
-    fn aggregate_capacity_is_shared_and_returns_only_after_last_owner() {
-        static USED: AtomicUsize = AtomicUsize::new(0);
-        let reservation = Reservation::new(MAX_SPOOL_BYTES - 6, &USED).unwrap();
-        let blob =
-            DiskBlob::write_with(b"pixels", &USED, |file, bytes| file.write_all(bytes)).unwrap();
-        let clone = blob.clone();
-        assert_eq!(Reservation::new(1, &USED).err(), Some(BlobError::Capacity));
+    fn reclaim_unlinks_disk_and_failed_unlink_preserves_the_owner() {
+        let blob = DiskBlob::from_bytes(b"pixels").unwrap();
+        let directory = blob.0.directory.as_ref().unwrap().path().to_owned();
+        let path = blob
+            .0
+            .file
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .path()
+            .to_owned();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(matches!(blob.reclaim(), Err(BlobError::Io(_))));
+        assert_eq!(blob.read().unwrap(), b"pixels");
+        std::fs::remove_dir(&path).unwrap();
+        blob.reclaim().unwrap();
+        assert_eq!(blob.read(), Err(BlobError::Reclaimed));
         drop(blob);
-        assert_eq!(USED.load(Ordering::Acquire), MAX_SPOOL_BYTES);
-        assert_eq!(clone.read().unwrap(), b"pixels");
-        drop(clone);
-        assert_eq!(USED.load(Ordering::Acquire), MAX_SPOOL_BYTES - 6);
-        drop(reservation);
-        assert_eq!(USED.load(Ordering::Acquire), 0);
+        assert!(!directory.exists());
     }
 
     #[cfg(unix)]

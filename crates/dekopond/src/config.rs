@@ -947,6 +947,9 @@ pub struct ResolvedRoute {
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SessionsConfig {
+    /// Process-wide retained attachment bytes. Zero disables asset retention, not the bound.
+    #[serde(default = "default_asset_retention_bytes")]
+    pub asset_retention_bytes: usize,
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
     /// Whether a rejected message gets a short "try again" reply instead of silence.
@@ -966,11 +969,17 @@ pub struct SessionsConfig {
 impl Default for SessionsConfig {
     fn default() -> Self {
         Self {
+            asset_retention_bytes: DEFAULT_ASSET_RETENTION_BYTES,
             max_concurrent: DEFAULT_MAX_CONCURRENT_SESSIONS,
             reply_on_busy: true,
             max_conversations: DEFAULT_MAX_CONVERSATIONS,
         }
     }
+}
+
+pub(crate) const DEFAULT_ASSET_RETENTION_BYTES: usize = 256 * 1024 * 1024;
+const fn default_asset_retention_bytes() -> usize {
+    DEFAULT_ASSET_RETENTION_BYTES
 }
 
 const fn default_max_concurrent() -> usize {

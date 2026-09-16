@@ -8612,7 +8612,7 @@ fn asset_store() -> AssetStore {
 }
 
 #[test]
-fn an_asset_is_numbered_per_conversation_and_still_resolves_later() {
+fn one_shot_asset_ids_are_monotonic_and_still_resolve_only_in_their_scope() {
     // The number is the whole interface a model has to an attachment, so it has to mean one file
     // for as long as the reference line naming it is still being replayed.
     let store = asset_store();
@@ -8632,14 +8632,14 @@ fn an_asset_is_numbered_per_conversation_and_still_resolves_later() {
     assert_eq!(first.inventory[0].id, 1);
     assert_eq!(second.arrived, vec![2]);
 
-    // A different conversation numbers from one again, and cannot see the first one's files.
+    // A different one-shot conversation gets a fresh ID and cannot see the first one's files.
     let other = store.assets_for(
         &private_conversation_key("dev", "c2", SUBJECT),
         vec![pending("c.png", "image/png", 30)],
         true,
         now,
     );
-    assert_eq!(other.inventory[0].id, 1);
+    assert_eq!(other.inventory[0].id, 3);
     assert_eq!(
         store
             .get(&private_conversation_key("dev", "c2", SUBJECT), 2, now)
@@ -9027,7 +9027,10 @@ async fn empty_grant_removal_blocks_stale_metadata_and_byte_fetches() {
     })
     .await
     .expect("the stale fetch completes");
-    assert!(refusal.contains("no Chat Asset #1"), "{refusal}");
+    assert!(
+        refusal.contains("unavailable in this conversation generation"),
+        "{refusal}"
+    );
     assert_eq!(
         fetch_calls.load(Ordering::SeqCst),
         0,
@@ -12651,7 +12654,7 @@ async fn a_route_that_withholds_self_inspection_offers_no_such_tool() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn three_persistent_edits_reuse_the_original_whatsapp_asset_and_deliver_spooled_results() {
+async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same_stored_bytes() {
     use crate::transport::whatsapp::tests_media::{
         JPEG, MediaPeer, PNG, accepted, admitted_photo, bytes_reply, json_reply, metadata,
     };
@@ -12659,11 +12662,11 @@ async fn three_persistent_edits_reuse_the_original_whatsapp_asset_and_deliver_sp
         ("image/jpeg", JPEG, Some("Make the sky purple")),
         ("image/png", PNG, None),
     ] {
-        let peer = MediaPeer::new(move |origin, index| match index % 6 {
-            0 | 2 => metadata(origin, mime, bytes),
-            1 | 3 => bytes_reply(bytes),
-            4 => json_reply(json!({"id":"987"})),
-            5 => accepted(),
+        let peer = MediaPeer::new(move |origin, index| match index {
+            0 => metadata(origin, mime, bytes),
+            1 => bytes_reply(bytes),
+            2 | 4 | 6 => json_reply(json!({"id":"987"})),
+            3 | 5 | 7 => accepted(),
             _ => panic!("no retry or extra media calls"),
         })
         .await;
@@ -12673,12 +12676,12 @@ async fn three_persistent_edits_reuse_the_original_whatsapp_asset_and_deliver_sp
             "admission must be lazy"
         );
         let directory = temporary();
-        let (broker,mut observed)=stub_broker(directory.path(), (0..3).flat_map(|_| vec![
+        let (broker,mut observed)=stub_broker(directory.path(), (0..3).flat_map(|edit| vec![
             ResponseEnvelope::capabilities(vec![capability("gpt-image.edit")],vec!["gpt-image".to_owned()]),
-            ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed","capability":"gpt-image.edit","input":{"prompt":"purple sky","images":["chat-asset:1"]}})).expect("edit proposal")),
-            ResponseEnvelope::invocation(record_output(json!({"attachments":[{"mediaType":"image/png","base64":STANDARD.encode(PNG)}]}))),
+            ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed","capability":"gpt-image.edit","input":{"prompt":"purple sky","images":[format!("chat-asset:{}", edit + 1)]}})).expect("edit proposal")),
+            ResponseEnvelope::invocation(record_output(json!({"attachments":[{"mediaType":"image/png","base64":STANDARD.encode([PNG, &[edit as u8]].concat())}]}))),
         ]).collect()).await;
-        let models = ModelScript::new((0..3).flat_map(|_| {
+        let models = ModelScript::new((0..3).flat_map(|edit| {
             [
                 AssistantTurn {
                     tool_calls: vec![ModelToolCall {
@@ -12686,12 +12689,15 @@ async fn three_persistent_edits_reuse_the_original_whatsapp_asset_and_deliver_sp
                         kind: "function".to_owned(),
                         function: ModelFunctionCall {
                             name: "fetch_chat_asset".to_owned(),
-                            arguments: "{\"id\":1}".to_owned(),
+                            arguments: json!({"id":edit + 1}).to_string(),
                         },
                     }],
                     ..answer("")
                 },
-                script_call("gpt-image edit --prompt 'purple sky' --image chat-asset:1"),
+                script_call(&format!(
+                    "gpt-image edit --prompt 'purple sky' --image chat-asset:{}",
+                    edit + 1
+                )),
                 answer("Edited image."),
             ]
         }));
@@ -12712,7 +12718,7 @@ async fn three_persistent_edits_reuse_the_original_whatsapp_asset_and_deliver_sp
             let mut message = inbound.clone();
             if edit > 0 {
                 message.assets.clear();
-                message.text = "Edit the original again".to_owned();
+                message.text = "Edit the most recent generated result".to_owned();
                 message.message_id = format!("follow-up-{edit}");
             }
             run_session(
@@ -12730,7 +12736,12 @@ async fn three_persistent_edits_reuse_the_original_whatsapp_asset_and_deliver_sp
             "{first:?}"
         );
         let tool = tool_message(&models, 2);
-        assert!(tool.contains("attached"), "{tool}");
+        assert!(
+            tool.contains("chat-asset:2")
+                && tool.contains("retained")
+                && tool.contains("delivered"),
+            "{tool}"
+        );
         for index in 0..9 {
             for (_, text) in models.prompt(index) {
                 assert!(
@@ -12745,8 +12756,8 @@ async fn three_persistent_edits_reuse_the_original_whatsapp_asset_and_deliver_sp
                 models
                     .prompt(edit * 3)
                     .iter()
-                    .all(|(_, text)| !text.contains("Chat Asset #2")),
-                "generated output must not silently enter the inventory"
+                    .any(|(_, text)| text.contains(&format!("Chat Asset #{}", edit + 1))),
+                "generated IDs must be visible in later-turn inventory"
             );
             if edit > 0 {
                 assert!(
@@ -12772,7 +12783,14 @@ async fn three_persistent_edits_reuse_the_original_whatsapp_asset_and_deliver_sp
             assert_eq!(invocation.capability.as_str(), "gpt-image.edit");
             assert_eq!(
                 invocation.input["images"][0],
-                format!("data:{mime};base64,{}", STANDARD.encode(bytes))
+                if edit == 0 {
+                    format!("data:{mime};base64,{}", STANDARD.encode(bytes))
+                } else {
+                    format!(
+                        "data:image/png;base64,{}",
+                        STANDARD.encode([PNG, &[(edit - 1) as u8]].concat())
+                    )
+                }
             );
             assert_eq!(claim.subject.canonical(), "whatsapp.15550000001");
             assert_eq!(claim.scope.expect("scope").transport.as_str(), "wa");
@@ -12791,21 +12809,32 @@ async fn three_persistent_edits_reuse_the_original_whatsapp_asset_and_deliver_sp
                         _ => None,
                     })
                     .expect("model received original image lease");
-                assert_eq!(data.read().expect("read retained lease"), bytes);
+                assert_eq!(
+                    data.read().expect("read weak reference"),
+                    if edit == 0 {
+                        bytes.to_vec()
+                    } else {
+                        [PNG, &[(edit - 1) as u8]].concat()
+                    }
+                );
             }
         }
         {
             let requests = peer.requests.lock().expect("requests");
-            assert_eq!(requests.len(), 18);
+            assert_eq!(
+                requests.len(),
+                8,
+                "one inbound fetch reused by model and provider, then three uploads/sends"
+            );
             for edit in 0..3 {
                 assert!(
-                    requests[edit * 6 + 4]
+                    requests[edit * 2 + 2]
                         .body
                         .windows(PNG.len())
                         .any(|window| window == PNG)
                 );
                 let sent: Value =
-                    serde_json::from_slice(&requests[edit * 6 + 5].body).expect("image send");
+                    serde_json::from_slice(&requests[edit * 2 + 3].body).expect("image send");
                 assert_eq!(sent["image"], json!({"id":"987","caption":"Edited image."}));
             }
         }
@@ -13512,4 +13541,97 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
         !collector.is_native_continuation(0, &member),
         "sealed group cannot lend addressing"
     );
+}
+
+#[test]
+fn asset_retention_config_default_custom_zero_and_invalid_values() {
+    let defaults: config::SessionsConfig = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(defaults.asset_retention_bytes, 268_435_456);
+    assert_eq!(
+        config::SessionsConfig::default().asset_retention_bytes,
+        268_435_456
+    );
+    for bytes in [0, 1024, 536_870_912] {
+        let custom: config::SessionsConfig =
+            serde_json::from_value(json!({"assetRetentionBytes": bytes})).unwrap();
+        assert_eq!(custom.asset_retention_bytes, bytes);
+    }
+    for invalid in [json!(-1), json!("256MiB"), json!(null), json!(1.5)] {
+        assert!(
+            serde_json::from_value::<config::SessionsConfig>(
+                json!({"assetRetentionBytes":invalid})
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        serde_json::from_value::<config::SessionsConfig>(json!({"assetRetentionByte":12})).is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn generated_only_session_publishes_fetch_tool_and_reuses_result_before_next_turn() {
+    let directory = temporary();
+    let png = b"\x89PNG\r\n\x1a\nfirst generated image";
+    let (broker, mut observed) = stub_broker(directory.path(), vec![
+        ResponseEnvelope::capabilities(vec![capability("gpt-image.edit")], vec!["gpt-image".to_owned()]),
+        ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed", "capability":"gpt-image.edit", "input":{"prompt":"first"}})).unwrap()),
+        ResponseEnvelope::invocation(record_output(json!({"attachments":[{"mediaType":"image/png", "base64":STANDARD.encode(png)}]}))),
+        ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed", "capability":"gpt-image.edit", "input":{"prompt":"edit result", "images":["chat-asset:1"]}})).unwrap()),
+        ResponseEnvelope::invocation(record_output(json!({"attachments":[{"mediaType":"image/png", "base64":STANDARD.encode(b"\x89PNG\r\n\x1a\nsecond generated image") }]}))),
+    ]).await;
+    let models = ModelScript::new([
+        script_call("gpt-image edit --prompt first"),
+        AssistantTurn {
+            tool_calls: vec![ModelToolCall {
+                id: "generated-fetch".into(),
+                kind: "function".into(),
+                function: ModelFunctionCall {
+                    name: "fetch_chat_asset".into(),
+                    arguments: "{\"id\":1}".into(),
+                },
+            }],
+            ..answer("")
+        },
+        script_call("gpt-image edit --prompt 'edit result' --image chat-asset:1"),
+        answer("Two produced images."),
+    ]);
+    let mut model = model_config();
+    if let ModelConfig::OpenaiCompatible { modalities, .. } = &mut model {
+        *modalities = vec![crate::config::Modality::Image];
+    }
+    let mut route = persistent_route(model, window());
+    route.provider_attachments = 2;
+    route.chat_asset_inputs = Arc::from(vec!["gpt-image.edit".to_owned()]);
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        runner(broker, models.clone(), 4),
+        route,
+        message("produce then edit"),
+        driver.clone(),
+    )
+    .await;
+    assert_eq!(models.requests(), 4);
+    assert!(
+        !models
+            .tool_names(0)
+            .contains(&"fetch_chat_asset".to_owned())
+    );
+    assert!(
+        models
+            .tool_names(1)
+            .contains(&"fetch_chat_asset".to_owned())
+    );
+    assert!(tool_message(&models, 1).contains("chat-asset:1"));
+    for _ in 0..4 {
+        observed.recv().await.unwrap();
+    }
+    let BrokerRequest::Invoke { invocation, .. } = observed.recv().await.unwrap().request else {
+        panic!("second invocation")
+    };
+    assert_eq!(
+        invocation.input["images"][0],
+        format!("data:image/png;base64,{}", STANDARD.encode(png))
+    );
+    assert_eq!(driver.replies(), vec!["Two produced images.".to_owned()]);
 }

@@ -8,7 +8,7 @@ caller as it arrives and can stop a turn mid-answer, keeps a bounded conversatio
 gateway memory, delivers bounded provider-produced attachments on opted-in routes, and optionally
 stores and retrieves namespace-isolated durable chat turns through a JSONL provider. It does not
 cache completed answers, request extended provider retention, use provider-managed conversation
-objects, generate images itself, retain attachment bytes, or automatically replay durable memory.
+objects, generate images itself, retain attachment bytes in model messages, or automatically replay durable memory.
 
 The ChatGPT subscription transport uses a fixed, undocumented ChatGPT/Codex backend rather than the
 public OpenAI Platform API. Public OpenAI documentation is context, not a contract for that endpoint.
@@ -256,9 +256,9 @@ bytes, and the gateway carries them to chat without letting them through the mod
 
 A route opts in with `providerAttachments: { maxPerReply: N }`. The session's broker leg strips the
 reserved `attachments` key from a successful result, decodes at most 8 MiB per entry, validates the
-PNG signature, spools the bytes into a private temporary file, and counts its shared lease against
-the route's per-reply ceiling in a request-local slot. A spool refusal preserves the successful
-provider outcome and reports attachment refusal, never an automatic paid-call retry. The model reads only `attached: [{mediaType, bytes}]` and, on a refusal, one fixed
+PNG signature, reserves the gateway disk budget, and registers a scoped conversation asset with a
+temporary delivery pin counted against the route's per-reply ceiling. A spool refusal preserves the successful
+provider outcome and reports attachment refusal, never an automatic paid-call retry. The model reads only `attached` metadata with the gateway `chat-asset:<N>` marker and retained/not-yet-delivered status and, on a refusal, one fixed
 gateway sentence; attachment bytes never become a `ModelMessage`, a tool result, a prompt transcript,
 or part of `PromptOutcome`. No opt-in means the key is still stripped, the bytes are discarded, and
 replies stay byte-identical to text-only ones.
@@ -273,11 +273,12 @@ the authenticated inbound envelope. Slack uses one external file-upload sequence
 Discord multipart attachments on the first post, Telegram one `sendPhoto` per attachment, and the
 local socket a base64 `images` field omitted entirely when there are none. A receipt means the
 complete text/attachment reply was accepted; a non-atomic later failure is partial delivery and
-suppresses durable recording. Persistent and durable memory keep only final text, so a follow-up can
-discuss the caption but cannot address prior generated pixels as chat assets; generated-output
-registration does not exist. Later edits can still name the original inbound marker. Fetched model
-images and PDFs likewise retain disk leases across model turns, with transient encoding for each
-request; the compact persistent history is unchanged. See [scratch lifetime and bounds](dekopond.md#chat-assets).
+suppresses durable recording. Persistent and durable memory keep only final text; generated asset
+metadata remains in the bounded conversation inventory, so later edits can address the prior result.
+Fetched model images and PDFs carry weak references across model turns. Request encoding resolves
+and temporarily pins available bytes; reclaimed parts become explicit gateway release notices,
+without network fallback. See [disk retention and bounds](dekopond.md#chat-assets).
+
 
 ## Optional durable chat-turn retrieval
 
