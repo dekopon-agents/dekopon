@@ -72,14 +72,13 @@ pub struct BrokerdConfig {
     /// configuration is loaded; an offline `dekopon-brokerd provider` command materializes it.
     #[serde(default)]
     pub provider_set: Option<ManagedProviderSetConfig>,
-    /// Optional broker-owned directory for Wasmtime's persistent compilation cache.
+    /// Bypass persistent cwasm and compile source Wasm at every startup.
     ///
-    /// Absent means Cranelift recompiles every provider at every start, inside whatever startup
-    /// budget the deployment allows. Present means compiled code is read back from this directory,
-    /// so it must be broker-owned and writable by nobody else — a deployment points it at durable
-    /// state such as `/var/lib/dekopon/compile-cache`.
+    /// Defaults to false: managed providers use immutable, boot-verified mapped artifacts under
+    /// `providerSet.storePath/cwasm`. Legacy `providers` paths always compile without a cache.
+    /// Cache errors are fatal; this switch is the operator's explicit escape hatch.
     #[serde(default)]
-    pub compile_cache_path: Option<PathBuf>,
+    pub compile_on_load: bool,
     /// Whether configuration naming something no loaded provider offers refuses startup.
     ///
     /// Defaults to `false`, which warns and continues so a deployment can ship policy and
@@ -577,12 +576,6 @@ async fn resolve(
         .map(|path| resolve_future_path(resolve_path(path)))
         .transpose()?;
     let policies_path = canonical(config.policies_path)?;
-    // Wasmtime creates the cache directory itself and requires an absolute path, so this resolves
-    // the parent rather than requiring the directory to already exist.
-    let compile_cache_path = config
-        .compile_cache_path
-        .map(|path| resolve_future_path(resolve_path(path)))
-        .transpose()?;
     let storage = config
         .storage
         .map(|mut storage| {
@@ -854,7 +847,10 @@ async fn resolve(
         constraint_sets: config.constraint_sets,
         host_limits,
         host_options: BrokerHostOptions {
-            compile_cache_dir: compile_cache_path,
+            cwasm_dir: managed_provider_paths
+                .as_ref()
+                .filter(|_| !config.compile_on_load)
+                .map(|(_, store)| store.join("cwasm")),
             max_total_memory_bytes: config.host_limits.max_total_memory_bytes,
             plaintext_hosts: plaintext_hosts.clone(),
         },

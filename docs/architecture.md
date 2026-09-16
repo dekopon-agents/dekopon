@@ -66,7 +66,7 @@ A model-facing tool call is only a proposal. The daemon-to-broker request carrie
 
 ## Shared host helpers and privileged provider authority
 
-The SDK's optional host feature carries manifest validation, complete conflict reports, engine construction, and store limits. The broker host's optional compilation cache stores code, never authority. Provider JSON Schemas must be object-shaped, and the host is not a general JSON Schema validator: a provider validates its own operation-specific input.
+The SDK's optional host feature carries manifest validation, complete conflict reports, engine construction, and store limits. The broker host owns immutable mapped cwasm, its trusted source/engine index, boot-only hash verification, and the one narrowly allowed unsafe file-deserialization call. Managed broker configurations enable it by default; `compileOnLoad` bypasses it. The cache stores code, never authority. Provider JSON Schemas must be object-shaped, and the host is not a general JSON Schema validator: a provider validates its own operation-specific input.
 
 Model authentication terminates in the model client, separately from provider authority. ChatGPT subscription mode owns a distinct device-flow credential file, refreshes tokens only against OpenAI's fixed authentication host, and sends inference only to the fixed Codex Responses host. It imports no other application's token store and exposes no model credential to a component. Every `dekopon-model` transport — subscription inference, the device-flow exchange, and the OpenAI-compatible client — is built by one agent constructor that disables redirects and ambient proxies, so an exported `HTTPS_PROXY` cannot put a credential-bearing model request on a host nobody named to Dekopon.
 

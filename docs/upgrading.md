@@ -8,6 +8,25 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Mapped compiled providers (unreleased)
+
+Remove broker `compileCachePath`; it is now an unknown field. Managed `providerSet` startup uses
+`storePath/cwasm/v1` by default. Its first boot compiles and writes the cache; subsequent compatible
+boots verify selected compiled hashes once and map the files. The provider store must be writable
+on a miss. Legacy `providers:` paths continue source compilation without writing a cache.
+
+Set `compileOnLoad: true` to disable all cwasm reads/writes, including when a cache error blocks
+startup. Errors do not trigger repair or fallback. For manual cache removal, first stop every
+process using it; never modify mapped artifacts in place. The old compressed cache is unused and
+can be removed offline. Engine upgrades select new compatibility indexes rather than reusing
+incompatible compiled objects. No automatic pruning occurs; see the [cache limits and tracing
+contract](../crates/dekopon-brokerd/README.md#compilation-cache-and-the-concurrent-memory-budget).
+
+Embeddings: rename `BrokerHostOptions::compile_cache_dir` to `cwasm_dir` and honor its immutable
+trusted-file contract, or use `None`. SDK `host::engine` now takes only `Config`; Wasmtime's
+compressed-cache feature is no longer enabled. Provider startup is sequential to bound compiler
+memory; `provider.compile` now reports whole-load wall time, with separate compilation stages.
+
 ## Native-first progress (0.16.0)
 
 An absent liveness block and `mode: off` remain disabled. Inside enabled liveness, omitted

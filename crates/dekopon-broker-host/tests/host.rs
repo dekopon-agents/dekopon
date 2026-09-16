@@ -1082,7 +1082,7 @@ async fn refuses_a_store_beyond_the_aggregate_memory_ceiling() {
 async fn a_persistent_compilation_cache_serves_a_second_load() {
     let directory = tempfile::tempdir().expect("cache directory");
     let options = BrokerHostOptions {
-        compile_cache_dir: Some(directory.path().canonicalize().expect("canonical cache")),
+        cwasm_dir: Some(directory.path().canonicalize().expect("canonical cache")),
         ..BrokerHostOptions::default()
     };
     let cold = BrokerProviderRegistry::load_with_options(
