@@ -60,7 +60,7 @@ wrong:
 |---|---|---|
 | A | `broker-credentials.yaml`, `secret-map.yaml` | rejected if `mode & 0o077 != 0` |
 | B | `broker.yaml`, `policies.cedar`, `dekopond.yaml`, provider `.wasm` files and their parents | rejected if `mode & 0o022 != 0` |
-| C | the parent of `compileCachePath` and of a `chatgptSubscription` `authFile` | must be `0700` and owned by the runtime UID |
+| C | `providerSet.storePath` (the parent of generated `cwasm`) and the parent of a `chatgptSubscription` `authFile` | must be `0700` and owned by the runtime UID |
 | D | every ancestor up to `/` | must be a directory that is not group- or world-writable unless sticky |
 | E | `catalogPath` | no checks at all |
 
@@ -182,11 +182,11 @@ over the real socket, passes `SO_PEERCRED` in both directions, and gets back the
 policy exposes to this peer. It is evaluated from the constraint catalog and the policy set and
 emits **no audit record**.
 
-- **`startupProbe`**, 5 s period, 60 failures — five minutes. The broker compiles every `.wasm`
-  component through Cranelift before it binds the socket, so "the socket answers" is exactly "fully
-  started". Components compile concurrently rather than one at a time, and `compileCachePath` makes
-  a restart read compiled code back from disk instead of recompiling, but the cold path runs
-  Cranelift and the probe budget has to cover it. The
+- **`startupProbe`**, 5 s period, 60 failures — five minutes. The broker loads and validates every
+  component before binding the socket, so "the socket answers" is exactly "fully started".
+  Managed providers default to verified mmap-backed cwasm on the provider store's persistent disk;
+  `compileOnLoad: true` bypasses it. Components load one at a time; a cold cache still runs Cranelift
+  and the probe budget has to cover it. Do not put the cache on the chart's memory-backed `/tmp`. The
   margin is large because a startup probe that gives up restarts the container, and every restart
   starts the compile over.
 - **Broker `readinessProbe`**, 30 s period. It keeps pod readiness truthful and, when the optional

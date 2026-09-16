@@ -15,6 +15,18 @@ All notable changes to Dekopon are documented here. The format is based on
   include instantiation and survive normal errors and timeouts; cancellation reports omit fuel
   consumption when no final reading exists. Memory is not live heap/RSS or aggregate RAM.
   Enforcement, fuel budgets and reservations are unchanged.
+- Startup tracing distinguishes cwasm miss/hit/reuse/bypass, source/compiled sizes and hashes,
+  source verification, per-stage compile/hash/publish/verify/deserialize microseconds, and total
+  registry load time with outcomes and propagated blocking-task ancestry. Compiled-cache growth
+  has fixed object/byte limits and no automatic eviction.
+
+### Changed
+
+- Managed broker providers now use SHA-256-addressed, mmap-backed compiled artifacts by default,
+  verifying selected compiled hashes once per startup. `compileOnLoad: true` bypasses the cache;
+  `compileCachePath` and Wasmtime's compressed cache are removed. Missing indexes compile once;
+  other errors fail startup without retry, repair, or fallback. Startup loads one component at a
+  time to bound compiler memory. See [migration](docs/upgrading.md#mapped-compiled-providers-unreleased).
 
 ## [0.16.0] - 2026-09-15
 

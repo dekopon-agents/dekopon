@@ -101,7 +101,7 @@ where
     }
     // A compilation cache holds compiled code the broker will execute. Anyone who can write into
     // it can choose what the privileged process runs, so it must sit under a private parent.
-    if let Some(cache) = &config.host_options.compile_cache_dir {
+    if let Some(cache) = &config.host_options.cwasm_dir {
         socket::validate_private_parent(cache, uid)?;
     }
     // Loaded before the policy is built so an unknown or unbindable credential is a startup
@@ -136,9 +136,9 @@ where
         max_memory_bytes = config.host_limits.max_memory_bytes,
         worst_case_guest_memory_bytes = config.worst_case_guest_memory_bytes,
         aggregate_ceiling_bytes = config.host_options.max_total_memory_bytes,
-        compile_cache = config
+        cwasm_cache = config
             .host_options
-            .compile_cache_dir
+            .cwasm_dir
             .as_ref()
             .map(|path| path.display().to_string()),
         "broker provider guest-memory budget"

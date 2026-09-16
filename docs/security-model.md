@@ -312,6 +312,22 @@ Memory text is not encrypted by Dekopon at rest, has no deletion/export UX, and 
 automatically replayed. JSONL dedup records are permanent but finite; at the explicit record/byte
 cap, new recording returns `dedup-capacity` while reads remain available.
 
+## Mapped compiled-provider trust
+
+Managed providers default to broker-owned immutable cwasm. Startup still verifies source Wasm
+against the activation lock; a trusted local index binds source digest and engine fingerprint to
+a compiled digest and length. Selected compiled objects are SHA-256-verified once per registry
+startup before Wasmtime maps them. The hash detects corruption; it does not establish provenance
+or defend against an adversary replacing both index and compiled bytes. The operator keeps mapped
+inodes unchanged for their entire lifetime. Same-UID/root filesystem attacks are out of scope.
+
+The only unsafe-code exception is the private `dekopon-broker-host::cwasm::deserialize` call to
+`Component::deserialize_file`. It is reached only for compiler-produced, locally indexed artifacts
+that were just published or verified. Wasmtime checks compatibility. Publication never overwrites
+an existing inode. Failures stop startup; `compileOnLoad: true` explicitly bypasses the feature.
+No hash, file read, or cache authority decision runs on invocations. Provider authority and source
+identity are unchanged. See [configuration and limits](../crates/dekopon-brokerd/README.md#compilation-cache-and-the-concurrent-memory-budget).
+
 ## Current privileged broker foundation
 
 `dekopon-broker-host` is the privileged component library; in deployment only the separately deployed `dekopon-brokerd` process runs it (directly and through `dekopon-broker`), while `dekopon-provider-sdk-testkit` embeds it in-process as a fake broker for provider tests. It links only versioned Dekopon HTTP, storage, and wall clock interfaces, consumes one non-cloneable `AuthorizedInvocation` plus an exact single-use storage grant when applicable, and runs each description or invocation in a fresh memory-, fuel-, input-, output-, and wall-clock-bounded asynchronous Wasmtime store. Provider description and command resolution receive disabled HTTP/storage contexts and a refused clock, and any attempted host call rejects the component. The clock needs no grant inside an authorized invocation: it is read-only host state with no effect, and each read is recorded as `provider_clock_read`. Policy/storage denials remain terminal even if guest code catches the typed WIT error.

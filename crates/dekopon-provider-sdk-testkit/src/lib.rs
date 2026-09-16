@@ -250,13 +250,12 @@ impl FakeBrokerBuilder {
         self
     }
 
-    /// Points Wasmtime at a persistent compilation cache.
+    /// Uses immutable, boot-verified, mmap-backed compiled components in a trusted directory.
     ///
-    /// Cranelift is the whole of a cold start. On a large component this is the difference
-    /// between a test suite that runs and one nobody waits for.
+    /// Do not modify mapped artifacts while a harness lives. Errors fail loading without fallback.
     #[must_use]
     pub fn compile_cache(mut self, directory: impl Into<PathBuf>) -> Self {
-        self.host_options.compile_cache_dir = Some(directory.into());
+        self.host_options.cwasm_dir = Some(directory.into());
         self
     }
 

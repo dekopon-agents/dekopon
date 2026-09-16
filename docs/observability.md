@@ -563,7 +563,9 @@ migration is implemented here.
 
 | Span | Crate | Fields |
 |---|---|---|
-| `provider.compile` | `dekopon-broker-host` | `path`, `artifact_bytes`, `elapsed_ms`; emitted once per provider at startup |
+| `provider.registry_load` | `dekopon-broker-host` | `providers`, `mmap`, `elapsed_us`, `outcome` (`ok`/`error`); one root for complete registry startup, including engine creation and descriptions |
+| `provider.compile` | `dekopon-broker-host` | `path`, source `artifact_bytes`/`artifact_sha256`, `cache` (`lookup`/`miss`/`hit`/`reuse`/`bypass`), `engine_key`, `cwasm_bytes`/`cwasm_sha256`, `source_verify_us`, `cache_wait_us`, `elapsed_us`/`elapsed_ms`, `outcome`; one component load beneath the registry root |
+| `provider.load_stage` | `dekopon-broker-host` | `stage` (`compile`/`artifact_hash`/`publish`/`verify`/`deserialize`), `bytes`, `elapsed_us`, `outcome`; beneath the component load |
 | `provider.describe` | `dekopon-broker-host` | `path`, `stores`, `instantiations`, `fuel.consumed`; emitted once per provider at startup, for the manifest call |
 | `broker.command_run` | `dekopon-brokerd` | `word` and `outcome` (`proposed`, `rendered`, `failed`, `error`); opened once per `runCommand` beneath the client's `traceParent` |
 | `provider.run_command` | `dekopon-broker-host` | provider, `word`, `command.export` (`run-command`), `command.arguments` and `command.arguments.bytes`, `command.stdin` and `command.stdin.bytes` when a value was piped, `command.output` and `command.output.bytes`, `stores`, `instantiations`, `fuel.consumed`; nests under `broker.command_run` |
@@ -588,14 +590,34 @@ one. The span is attached with `Instrument` rather than an entered guard, so a r
 a connection, or a response body never re-parents whatever else the runtime polls on that worker
 thread.
 
-`provider.compile` covers component-set validation rather than per-invocation work, so it answers
-"why was the broker slow to become ready" rather than "why was that call slow". Components compile
-concurrently, so their spans overlap and the compile times sum to more than the wall-clock
-validation. Each loaded provider also emits one info event carrying its identity, artifact digest
-prefix, artifact bytes, compile milliseconds, its capability and command-word counts, and
-`command_export` — `run-command` or `none` — naming which export the host calls
-for its words. The offline `dekopon-brokerd provider sync` and `verify` commands reuse the same host
-validation and can emit the span to their stderr subscriber, but they install no OTLP exporter.
+`provider.compile` retains its existing name but now measures the whole component load: source
+read/hash/check, cache work, and linking. `elapsed_ms` and the loaded-provider event's `compile_ms`
+are whole-load durations, **not compiler CPU time**. Source `artifact_sha256` remains the provider's
+identity; `cwasm_sha256` identifies compiled bytes. Descriptions are sibling spans under
+`provider.registry_load`. The registry span is propagated into blocking jobs, so all startup work
+shares one trace. Components load sequentially; internal Cranelift parallelism is not instrumented
+per native function. Every load/stage also emits a completion event with timing/outcome for JSON
+stdout users without an exporter. A failed stage retains elapsed time and outcome; the enclosing
+component failure event carries its bounded cause chain. Absent later stages are not zero-cost successes.
+
+For a cold miss, expect `compile`, `artifact_hash`, `publish`, then `deserialize`. On a warm hit,
+expect `verify` then `deserialize`, with **no compiler stage**. `reuse` means the same compiled hash
+was already verified/mapped in this registry boot; `bypass` means source compilation without cache
+I/O. `lookup` on failure means the lookup itself did not reach a usable hit/miss. Stage `bytes`
+means input size, not RSS, bytes physically read from disk, or a sum to add across stages.
+`source_verify_us` includes source reading and digest checking; `cache_wait_us` measures loader
+lock wait. Durations use microseconds so warm loads do not disappear into zero-millisecond samples.
+
+To study the feature, group by source hash and engine key; compare cold `compile` against warm
+`verify` + `deserialize`, and compare whole `provider.registry_load` time across matched provider
+sets. Use cgroup `memory.peak`, `memory.stat` anonymous/file memory, and process PSS/private-dirty
+alongside these spans to measure memory savings. Neither cwasm size nor latency proves reclaimed
+RAM. Boot hashing touches every selected byte; clean mapped pages remain reclaimable afterward.
+
+Each loaded-provider event also carries provider ID, source digest prefix/size, capability and
+command-word counts, and `command_export`. The offline `dekopon-brokerd provider sync` and `verify`
+commands reuse uncached host validation and emit these spans to their stderr subscriber, but install
+no OTLP exporter. No startup verification/compilation spans recur during command runs or invocations.
 
 `stores` and `instantiations` are on all three guest-executing spans because the host resolves each
 provider's imports into one `InstancePre` at load: every description, command run, and invocation

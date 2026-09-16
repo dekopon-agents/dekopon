@@ -453,18 +453,44 @@ structured JSON on stdout, filtered by `RUST_LOG`.
 ### Compilation cache and the concurrent memory budget
 
 ```yaml
-compileCachePath: /var/lib/dekopon/compile-cache
+providerSet:
+  lockPath: /var/lib/dekopon/providers/providers.lock.yaml
+  storePath: /var/lib/dekopon/providers/store
+compileOnLoad: false # default; true bypasses cwasm entirely
 hostLimits:
-  # …every other field…
   maxTotalMemoryBytes: 268435456
 ```
 
-`compileCachePath` is optional. Absent, Cranelift compiles every component at every start and the
-socket binds only after that work finishes — the cost a startup probe has to cover. Present, the
-broker keeps Wasmtime's content-addressed cache there and a restart reads compiled code back. The
-directory holds code this privileged process executes, so its parent must be owner-only; the broker
-creates the directory itself. Components compile
-concurrently either way.
+Managed providers default to immutable, file-backed compiled components under
+`providerSet.storePath/cwasm/v1`. A missing source/engine index compiles the verified Wasm once,
+atomically publishes a raw `.cwasm` named by its own SHA-256, then maps it with Wasmtime. Warm
+startup stream-verifies each selected compiled artifact's length and SHA-256 once, checks engine
+compatibility, and maps it without decompression or a whole-file buffer. Calls reuse the retained
+component; they neither hash nor reopen it. Source Wasm is still checked against the provider lock
+at every startup. The index binds source-Wasm SHA-256 plus Wasmtime's engine compatibility
+fingerprint to compiled SHA-256 and length; changing engine configuration selects a new index.
+
+`compileOnLoad: true` disables cache reads and writes and compiles from source at every startup.
+Legacy `providers:` paths and offline provider-manager commands also compile without a cache.
+`compileCachePath` is removed, not aliased; remove it from old configurations. The old compressed
+Wasmtime cache is neither read nor migrated. Component startup runs one at a time off Tokio to bound
+compiler memory and stop scheduling on the first failure; Cranelift may parallelize within a
+component. The socket binds only after the entire registry validates.
+
+Errors are fatal: a corrupt index/artifact, missing indexed object, incompatible mapped artifact,
+publication conflict, or I/O failure is reported with its cause. There is no retry, eviction,
+automatic repair, or fallback. Disable the feature explicitly to get running again, or stop all
+brokers using the cache and remove its generated `cwasm` directory before restarting. Never rewrite
+or truncate mapped files. The filesystem and local index are trusted; adversarial same-UID file
+replacement is outside this feature's model. Use one cache publisher at a time. Compiled artifacts
+are capped at 512 MiB each; before publishing, the cache refuses growth beyond 1,024 objects or
+2 GiB of compiled-object bytes (separate from the source-Wasm store limit). Historical objects are
+not automatically pruned. Keep the cache on persistent disk, not memory-backed `/tmp`, for
+reclaimable pages. Artifact hashes detect corruption, not publisher provenance.
+
+See [startup tracing](../../docs/observability.md#broker-execution-spans) for cache status, sizes,
+source verification, compile/hash/publish/map stage timings, and total registry load time. These
+measure cost, not RAM saved: compare process PSS and cgroup anonymous/file memory separately.
 
 `hostLimits.maxMemoryBytes` bounds one invocation; `hostLimits.maxTotalMemoryBytes` bounds all of
 them at once. It defaults to **256 MiB**, four concurrent stores at the default 64 MiB per store: a

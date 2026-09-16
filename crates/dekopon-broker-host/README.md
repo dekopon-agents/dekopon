@@ -17,9 +17,8 @@ broker-side diagnostics name the bound.
 ## Execution boundary
 
 `BrokerProviderRegistry` compiles configured components once, validates their manifests, and builds
-deterministic capability routes. Components compile concurrently on the blocking pool — Cranelift is
-a cold start's whole cost — while manifests are consumed in configured order, so the conflict report
-and the first reported failure do not depend on which compile finished first. Each artifact is read
+deterministic capability routes. Components load sequentially on the blocking pool to bound compiler
+memory and stop scheduling on the first failure. Each source artifact is read
 once under a 64 MiB source ceiling and the recorded SHA-256 is of that same buffer, so the published
 digest describes exactly what was compiled. A managed `dekopon-brokerd` provider lock additionally
 supplies expected byte length, SHA-256, and provider ID; the host compares all three at that same
@@ -42,9 +41,13 @@ halves share its code path with the describe-mode states and no fixture drives t
 `BrokerHostOptions` carries operational settings that are not host ceilings and are not committed
 into the broker's authority surface:
 
-- `compile_cache_dir` enables Wasmtime's content-addressed on-disk cache, so a restart reads
-  compiled code back instead of running Cranelift again. The directory holds code the privileged
-  broker executes, so it must be writable by the broker and nobody else.
+- `cwasm_dir` enables immutable, content-addressed, mmap-backed compiled artifacts in a trusted
+  operator-owned directory. `None` compiles directly with no cache. A missing source/engine index
+  compiles once; a hit stream-verifies compiled bytes once per registry boot before mapping.
+  Errors fail loading, never trigger fallback or repair. No invocation rehashes or reopens files.
+  The operator must keep mapped inodes unchanged until every registry using them exits. One private
+  `cwasm::deserialize` function is the sole scoped unsafe exception, calling Wasmtime's file API;
+  the rest of the crate denies unsafe code. See the [broker configuration contract](../dekopon-brokerd/README.md#compilation-cache-and-the-concurrent-memory-budget).
 - `max_total_memory_bytes` bounds the guest linear memory reservable across concurrently live
   stores, and defaults to 256 MiB — four stores at the default per-store ceiling. Per-store limits
   bound one invocation; with this set to `None` the worst case is the daemon's connection ceiling

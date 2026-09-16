@@ -30,6 +30,9 @@ policiesPath: policies.cedar
 # invocation either way.
 strict: true
 
+# Direct paths below compile on every startup. For a managed providerSet instead, cwasm is
+# enabled by default under storePath/cwasm; set compileOnLoad: true to bypass that cache.
+# Cache errors are fatal, never an implicit fallback. Do not use the retired compileCachePath.
 providers:
   # The checked-in probe component: one read and one conditional write.
   # Must be a regular single-link file owned by this UID under owner-owned directories.

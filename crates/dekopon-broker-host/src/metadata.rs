@@ -28,13 +28,16 @@ pub(crate) struct ArtifactIdentity {
 /// Taking bytes rather than a path is the point: a digest computed from a second read cannot prove
 /// it describes what Cranelift compiled, and the recorded `artifact_sha256` is published metadata.
 pub(crate) fn identify_bytes(bytes: &[u8]) -> ArtifactIdentity {
-    let digest = Sha256::digest(bytes);
-    let mut sha256 = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        write!(&mut sha256, "{byte:02x}").expect("writing to a String cannot fail");
-    }
     ArtifactIdentity {
         bytes: bytes.len() as u64,
-        sha256,
+        sha256: hex_digest(&Sha256::digest(bytes)),
     }
+}
+
+pub(crate) fn hex_digest(digest: &[u8]) -> String {
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    hex
 }
