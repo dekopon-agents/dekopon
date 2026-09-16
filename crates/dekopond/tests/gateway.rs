@@ -237,7 +237,8 @@ fn gateway_config_with(
                     "mode": "native",
                     "progress": "message",
                     "stream": stream,
-                    "cancelButton": true,
+                    // Detail Off without streaming deliberately has no message to carry a button.
+                    "cancelButton": progress_detail != "off" || stream,
                     "keepAlive": {"atSeconds": [15, 45], "everySeconds": 60, "max": 10}
                 }
             }

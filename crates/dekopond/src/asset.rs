@@ -96,6 +96,8 @@ pub(crate) enum AssetSourceRef {
         /// The signed CDN URL, which is not logged and is fetched only from an allowed host.
         url: String,
     },
+    /// A WhatsApp image, resolved lazily under the owning phone number.
+    WhatsApp { media_id: String, mime: String },
     /// A Telegram file, which is a handle rather than a URL.
     ///
     /// The Bot API hands out a `file_id` and nothing else; resolving it to a path takes a `getFile`
@@ -117,6 +119,10 @@ impl fmt::Debug for AssetSourceRef {
             Self::Discord { attachment_id, .. } => formatter
                 .debug_struct("Discord")
                 .field("attachment_id", attachment_id)
+                .finish_non_exhaustive(),
+            Self::WhatsApp { media_id, .. } => formatter
+                .debug_struct("WhatsApp")
+                .field("media_id", media_id)
                 .finish_non_exhaustive(),
             Self::Telegram { file_id } => formatter
                 .debug_struct("Telegram")
