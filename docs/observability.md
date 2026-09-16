@@ -932,9 +932,6 @@ and log filters. Each command span carries:
 | `shell.command.output` | What the command wrote to stdout, bounded |
 | `shell.command.output.bytes` | The uncut length of that output |
 | `shell.command.exit_code` | The status the command reported |
-| `fuel.initial` | Actual fuel balance read from the fresh store before instantiation, in Wasmtime fuel units. Omitted if unavailable. |
-| `fuel.remaining` | Actual remaining balance at invocation/storage finalization, before the store is dropped. Omitted if unavailable. |
-| `fuel.consumed` | `fuel.initial - fuel.remaining`, when both observations are available and consistent. Independent of memory completeness. |
 | `outcome` | `succeeded`, `failed`, `denied`, `not-found`, `usage-error`, `timed-out`, `limit-exceeded`, or `rejected` |
 
 Every command word gets its span, at `INFO`, however many a run executes. A model-authored `while`
