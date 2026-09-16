@@ -505,3 +505,259 @@ async fn clock_probe_reads_the_host_clock_inside_the_invoke_window() {
     assert_one_store_each(&capture, "provider.describe", 1);
     assert_one_store_each(&capture, "provider.invoke", 1);
 }
+
+/// A payload-free memory probe with no external imports or generated guest artifacts.
+fn memory_component(body: &str, failed: bool) -> tempfile::NamedTempFile {
+    use std::io::Write as _;
+    let manifest = serde_json::to_string(&json!({
+        "apiVersion": dekopon_provider_sdk::ProviderApiVersion::V1Alpha1,
+        "id": "memory-probe",
+        "description": "Synthetic memory observations",
+        "commandWords": ["memprobe"],
+        "capabilities": [{
+            "id": "memory-probe.run", "description": "Synthetic execution",
+            "effect": dekopon_capability::EffectKind::ReadOnly,
+            "risk": dekopon_core::RiskLevel::Low, "inputSchema": {"type": "object"}
+        }]
+    }))
+    .unwrap();
+    let response = if failed {
+        r#"{"outcome":"failed","error":{"code":"synthetic","message":"private-output-sentinel"}}"#
+    } else {
+        r#"{"outcome":"succeeded","output":{"text":"private-output-sentinel"}}"#
+    };
+    let bytes = |data: &[u8]| {
+        data.iter()
+            .map(|byte| format!("\\{byte:02x}"))
+            .collect::<String>()
+    };
+    let descriptor = |offset: u32, length: usize| {
+        bytes(
+            &[
+                offset.to_le_bytes(),
+                u32::try_from(length).unwrap().to_le_bytes(),
+            ]
+            .concat(),
+        )
+    };
+    let wat = format!(
+        r#"(component
+        (core module $m
+            (memory (export "memory") 1)
+            (data (i32.const 0) "{manifest_descriptor}")
+            (data (i32.const 8) "{response_descriptor}")
+            (data (i32.const 64) "{manifest}")
+            (data (i32.const 2048) "{response}")
+            (func (export "realloc") (param i32 i32 i32 i32) (result i32) i32.const 4096)
+            (func (export "describe") (result i32) i32.const 0)
+            (func (export "invoke") (param i32 i32 i32 i32) (result i32) {body} i32.const 8)
+            (func (export "command") (param i32 i32 i32 i32 i32) (result i32) i32.const 8))
+        (core instance $i (instantiate $m))
+        (func (export "describe") (result string)
+            (canon lift (core func $i "describe") (memory (core memory $i "memory"))))
+        (func (export "invoke") (param "capability" string) (param "input" string) (result string)
+            (canon lift (core func $i "invoke") (memory (core memory $i "memory"))
+                (realloc (core func $i "realloc"))))
+        (func (export "run-command") (param "argv" (list string)) (param "stdin" (option string)) (result string)
+            (canon lift (core func $i "command") (memory (core memory $i "memory"))
+                (realloc (core func $i "realloc")))))"#,
+        manifest_descriptor = descriptor(64, manifest.len()),
+        response_descriptor = descriptor(2048, response.len()),
+        manifest = bytes(manifest.as_bytes()),
+        response = bytes(response.as_bytes()),
+    );
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(wat.as_bytes()).unwrap();
+    file
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_and_fuel_summary_is_once_per_invocation_including_failures_without_payloads() {
+    let _sequential = SEQUENTIAL.lock().await;
+    let capture = capture();
+    for (body, failed, outcome, peak, denied) in [
+        ("", false, "succeeded", 65_536, 0),
+        (
+            "i32.const 1 memory.grow drop",
+            false,
+            "succeeded",
+            131_072,
+            0,
+        ),
+        (
+            "i32.const 4 memory.grow drop",
+            false,
+            "succeeded",
+            65_536,
+            1,
+        ),
+        (
+            "i32.const 1 memory.grow drop",
+            true,
+            "provider-error",
+            131_072,
+            0,
+        ),
+        (
+            "i32.const 1 memory.grow drop unreachable",
+            false,
+            "trap",
+            131_072,
+            0,
+        ),
+        (
+            "i32.const 1 memory.grow drop (loop $spin br $spin)",
+            false,
+            "fuel-exhausted",
+            131_072,
+            0,
+        ),
+    ] {
+        capture.clear();
+        let component = memory_component(body, failed);
+        let registry = BrokerProviderRegistry::load(
+            [component.path()],
+            BrokerHostLimits {
+                max_memory_bytes: 3 * 65_536,
+                fuel: 100_000,
+                ..BrokerHostLimits::default()
+            },
+        )
+        .await
+        .expect("synthetic provider loads");
+        assert!(
+            !capture.text().contains("provider.memory"),
+            "describe is separate"
+        );
+        let result = registry
+            .invoke(
+                authorized(
+                    "memory-probe",
+                    "memory-probe.run".parse().unwrap(),
+                    json!({"text": "private-input-sentinel"}),
+                ),
+                None,
+            )
+            .await;
+        assert_eq!(result.is_ok(), outcome == "succeeded", "{result:?}");
+        let events = capture
+            .events()
+            .into_iter()
+            .filter(|(fields, _)| fields.contains("event=\"provider.memory\""))
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1, "{}", capture.text());
+        let (fields, parent) = &events[0];
+        assert_eq!(parent.as_deref(), Some("provider.invoke"));
+        for expected in [
+            "operation=\"invoke\"".to_owned(),
+            "provider=memory-probe".to_owned(),
+            "capability=memory-probe.run".to_owned(),
+            format!("outcome=\"{outcome}\""),
+            format!("memory.max_individual_observed_bytes={peak}"),
+            "memory.observation_complete=true".to_owned(),
+            "memory.per_memory_limit_bytes=196608".to_owned(),
+            format!("memory.growth_denied={denied}"),
+            "memory.growth_failed=0".to_owned(),
+        ] {
+            assert!(fields.contains(&expected), "missing {expected}: {fields}");
+        }
+        assert!(
+            !fields.contains("private-"),
+            "memory event must not copy any payload"
+        );
+        let consumed = recorded(&capture, "provider.invoke", "fuel.consumed");
+        assert_eq!(consumed.len(), 1);
+        assert!(consumed[0] > 0, "the synthetic invocation burns fuel");
+        assert!(fields.contains("fuel.initial=100000"), "{fields}");
+        assert!(
+            fields.contains(&format!("fuel.consumed={}", consumed[0])),
+            "{fields}"
+        );
+        assert!(
+            fields.contains(&format!("fuel.remaining={}", 100_000 - consumed[0])),
+            "{fields}"
+        );
+        if outcome == "fuel-exhausted" {
+            assert_eq!(
+                consumed[0], 100_000,
+                "exhaustion consumes the entire balance"
+            );
+            assert!(fields.contains("fuel.remaining=0"), "{fields}");
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn memory_and_fuel_summary_survives_timeout_and_caller_cancellation() {
+    let _sequential = SEQUENTIAL.lock().await;
+    let capture = capture();
+    let component = memory_component("i32.const 1 memory.grow drop (loop $spin br $spin)", false);
+    let registry = BrokerProviderRegistry::load(
+        [component.path()],
+        BrokerHostLimits {
+            fuel: u64::MAX,
+            ..BrokerHostLimits::default()
+        },
+    )
+    .await
+    .unwrap();
+    for cancel in [false, true] {
+        capture.clear();
+        let invocation = registry.invoke(
+            authorized(
+                "memory-probe",
+                "memory-probe.run".parse().unwrap(),
+                json!({}),
+            ),
+            None,
+        );
+        if cancel {
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(20), invocation)
+                    .await
+                    .is_err()
+            );
+        } else {
+            let error = invocation.await.expect_err("guest spins past the deadline");
+            assert!(matches!(*error.error, BrokerHostError::Timeout { .. }));
+        }
+        let events = capture
+            .events()
+            .into_iter()
+            .filter(|(fields, _)| fields.contains("event=\"provider.memory\""))
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1, "{}", capture.text());
+        let (fields, parent) = &events[0];
+        assert_eq!(parent.as_deref(), Some("provider.invoke"));
+        let outcome = if cancel { "cancelled" } else { "timeout" };
+        assert!(
+            fields.contains(&format!("outcome=\"{outcome}\"")),
+            "{fields}"
+        );
+        assert!(
+            fields.contains("memory.max_individual_observed_bytes=131072"),
+            "{fields}"
+        );
+        assert!(
+            fields.contains(&format!("fuel.initial={}", u64::MAX)),
+            "{fields}"
+        );
+        if cancel {
+            // Drop can report the initial balance but cannot query its owning Store.
+            assert!(!fields.contains("fuel.remaining="), "{fields}");
+            assert!(!fields.contains("fuel.consumed="), "{fields}");
+        } else {
+            let consumed = recorded(&capture, "provider.invoke", "fuel.consumed");
+            assert_eq!(consumed.len(), 1);
+            assert!(consumed[0] > 0);
+            assert!(
+                fields.contains(&format!("fuel.consumed={}", consumed[0])),
+                "{fields}"
+            );
+            assert!(
+                fields.contains(&format!("fuel.remaining={}", u64::MAX - consumed[0])),
+                "{fields}"
+            );
+        }
+    }
+}
