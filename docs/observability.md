@@ -58,6 +58,82 @@ The byte counts are `dekopon.http.request.accounted_bytes` and
 accounts a conservative envelope covering encoding overhead, method, URL, and headers as well as
 the body, so the payload-size name would misreport transfer volume by the size of the headers.
 
+## Provider linear-memory sizing
+
+`dekopon-broker-host` emits one INFO `event="provider.memory"` summary for each invocation
+that obtained a store, parented by `provider.invoke`. Existing broker stdout/OTLP trace and log
+filters include this target. It contains only `operation="invoke"`, provider/capability identifiers,
+fixed outcome categories, actual fuel consumption, and the numeric observations below; it adds no input, output, credentials,
+or user identifiers. Existing enclosing spans retain their own documented fields. This is operational
+telemetry, not authorization evidence or a new metrics exporter.
+
+The operation starts **before component instantiation** and ends after invocation and storage
+finalization. Initial memories, core start functions, input lowering, the export and post-return
+are included. Startup `describe` and pre-authorization `run-command` use separate stores and are
+**not** included in this summary. Pre-store refusals emit no memory summary, not a zero-sized run.
+Normal completion, provider errors, traps, fuel exhaustion, and timeouts all report; a dropped
+invocation future reports `cancelled` via store-owned finalization. Process abort/OOM/SIGKILL cannot
+run that finalizer, and exporter loss can still lose telemetry.
+
+| Field | Meaning |
+|---|---|
+| `memory.max_individual_observed_bytes` | Largest observed **individual** guest linear memory in bytes, including its initial size; never a sum across memories or instances. Absent when no size can be confirmed. |
+| `memory.observation_complete` | `true`: instantiation completed and no ambiguous allocation-failure callback occurred, so the observed value is the largest individual memory high-water size. `false`: the value, if present, is only a confirmed lower bound, not an exact peak. |
+| `memory.per_memory_limit_bytes` | Configured Wasmtime `StoreLimits` cap for **each** linear memory; a module's own maximum can be smaller. |
+| `memory.growth_denied` | Requests refused by the unchanged limiter, including initial allocations and module-maximum refusals. A denial is not consumed memory and need not fail the operation if the guest handles it. |
+| `memory.growth_failed` | Wasmtime allocation-failure callbacks, including type-limit failures; not a count of all failed `memory.grow` instructions. Some failures bypass hooks. |
+| `fuel.initial` | Actual fuel balance read from the fresh store before instantiation, in Wasmtime fuel units. Omitted if unavailable. |
+| `fuel.remaining` | Actual remaining balance at invocation/storage finalization, before the store is dropped. Omitted if unavailable. |
+| `fuel.consumed` | `fuel.initial - fuel.remaining`, when both observations are available and consistent. Independent of memory completeness. |
+| `outcome` | `succeeded`, `provider-error`, `trap`, `fuel-exhausted`, `timeout`, `instantiation-error`, `host-error`, or `cancelled`; host/storage validation can fail after guest execution. |
+
+Wasmtime's synchronous resource limiter reports requested growth, not a success notification.
+Permitted sizes become usable observations only after instantiation succeeds and provided no
+failure callback occurred. Initial allocation failure has no callback, and a type-limit failure can
+have a callback without a preceding growth request. Consequently any failure callback makes the
+observation incomplete: only previously confirmed sizes and subsequent positive `current` sizes
+from hooks are retained. A failed instantiation likewise cannot confirm initial requested sizes.
+This deliberately undercounts some failed runs rather than reporting attempted allocation as use.
+Multiple core instances/memories use a maximum, not a sum; shared memories are not supported by the
+current engine feature set. Tests pin these assumptions to the current Wasmtime integration.
+
+Fuel uses the same pre-instantiation through invocation-finalization boundary as memory. It is
+read with `Store::get_fuel`, never estimated from duration or requested work. Successful calls,
+provider errors, traps, fuel exhaustion and host timeouts report actual consumed fuel when the
+store is still queryable. Exhaustion reports zero remaining and the full initial balance consumed.
+A caller-cancelled future can drop the store without reaching that final reading: its summary
+retains `fuel.initial` but omits remaining/consumed rather than fabricating zero. Fuel units reflect
+Wasmtime's metering, not elapsed CPU time, wall time, host HTTP/storage work or a stable instruction
+count across engine/compiler versions. Fuel budgets and yield policy are unchanged. The existing
+`fuel.consumed` span field remains available for describe/run-command separately; those stores are
+never folded into an invoke summary.
+
+**Operator workflow:** select `event = 'provider.memory'` in broker logs for a bounded time window;
+project provider, capability, outcome, the five `memory.*` fields and three `fuel.*` fields above. Group by provider and
+capability, keeping failures separate. Compute max/percentiles of
+`memory.max_individual_observed_bytes` only where `memory.observation_complete = true`, and compare
+with `memory.per_memory_limit_bytes` (divide bytes by 1,048,576 for MiB). Track incomplete records and
+denials separately, and pivot by the record's trace/span IDs into `provider.invoke` and
+`broker.execution` for the outcome. Backends may normalize dotted attribute names; inspect the
+received schema before writing SQL. Compare consumed fuel with its initial balance separately from
+memory usage, excluding absent observations rather than coalescing them to zero. Local tests do not
+establish receiver ingestion or live deployment coverage.
+
+Linear-memory size is addressable capacity, **not** the guest allocator's live heap, touched pages,
+RSS, virtual reservation, native HTTP buffers, compiled code, or tenant/agent total RAM. Wasm memory
+does not shrink when the guest frees heap objects. Do not sum sequential invocation peaks as RAM.
+For sizing, collect representative complete peaks plus failure counts, allow workload headroom,
+and separately observe container/process memory under realistic concurrency. No limit is changed
+by this instrumentation.
+
+`maxTotalMemoryBytes` is admission reservation, not measured consumption: each live store currently
+books one `maxMemoryBytes` reservation regardless of observed use. **Existing limitation:** that cap
+is enforced per memory while `maxMemories` permits multiple memories, so the reservation is not a
+strict upper bound on the sum of all guest memories. For multi-memory providers, budget conservatively
+for memory count as well as overlapping stores and native overhead; a low observed individual peak
+is not evidence that aggregate reservations or container limits can safely be reduced. This change
+neither fixes nor widens that policy.
+
 ## Refusals, errors, and outcomes
 
 The other half of what survives trace expiry is what a process refused or could not do. Each of

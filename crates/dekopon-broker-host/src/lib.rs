@@ -41,6 +41,7 @@ use wasmtime::{Engine, Store};
 
 mod clock;
 mod http;
+mod memory;
 mod metadata;
 mod storage;
 use clock::ClockState;
@@ -106,7 +107,7 @@ pub const DEFAULT_MAX_TOTAL_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 /// Broker-owned ceilings that authorization may narrow but never widen.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrokerHostLimits {
-    /// Maximum linear memory in one fresh store.
+    /// Maximum size of each linear memory in one fresh store.
     pub max_memory_bytes: usize,
     /// Maximum elements in each Wasm table.
     pub max_table_elements: usize,
@@ -489,7 +490,7 @@ impl Runtime {
         let mut store = Store::new(
             &self.engine,
             StoreState {
-                limits: self.limits.store_bounds().store_limits(),
+                limits: memory::MemoryLimiter::new(self.limits.store_bounds()),
                 http,
                 storage,
                 clock,
@@ -525,7 +526,7 @@ impl Runtime {
 }
 
 struct StoreState {
-    limits: wasmtime::StoreLimits,
+    limits: memory::MemoryLimiter,
     http: HttpState,
     storage: storage::StorageState,
     /// Granted only in an invocation's store; descriptions and command runs are pure.
@@ -899,7 +900,7 @@ impl BrokerWasmProvider {
                     operation: format!("{RUN_COMMAND_EXPORT} {}", self.manifest.id),
                     timeout_ms: operation_timeout.as_millis() as u64,
                 });
-        record_store_outcome(&store, self.runtime.limits.fuel);
+        record_store_outcome(&mut store, self.runtime.limits.fuel);
         // A refused clock read traps, so it is checked before the trap surfaces: the tripwire names
         // the cause, where the trap would only report that the guest stopped.
         if store.data().clock.attempted() {
@@ -979,6 +980,14 @@ impl BrokerWasmProvider {
         let mut store = self
             .runtime
             .store(http, storage_state, ClockState::invoke())?;
+        // Read the actual initial balance before instantiation, rather than assuming a
+        // configured budget was supplied. An unavailable observation is not zero usage.
+        let initial_fuel = store.get_fuel().ok();
+        store.data_mut().limits.observe_invocation(
+            self.manifest.id.as_str(),
+            capability.as_str(),
+            initial_fuel,
+        );
         // The store outlives the guest on every path, including the one where the timeout drops
         // the operation future, so evidence for dispatched calls is harvested exactly once and
         // reaches the caller whether the invocation succeeded or failed.
@@ -1004,7 +1013,20 @@ impl BrokerWasmProvider {
         {
             executed = Err(BrokerHostError::Storage { source });
         }
-        record_store_outcome(&store, self.runtime.limits.fuel);
+        record_store_outcome(&mut store, self.runtime.limits.fuel);
+        store.data_mut().limits.finish(match &executed {
+            Ok(_) => "succeeded",
+            Err(BrokerHostError::ProviderFailure { .. }) => "provider-error",
+            Err(BrokerHostError::Timeout { .. }) => "timeout",
+            Err(BrokerHostError::Invoke { source, .. })
+                if source.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::OutOfFuel) =>
+            {
+                "fuel-exhausted"
+            }
+            Err(BrokerHostError::Invoke { .. }) => "trap",
+            Err(BrokerHostError::Instantiate { .. }) => "instantiation-error",
+            Err(_) => "host-error",
+        });
         let mut data = store.into_data();
         let storage = data.storage.take_evidence();
         let http_calls = data.http.into_evidence();
@@ -1043,6 +1065,7 @@ impl BrokerWasmProvider {
                     source,
                 })?;
             store.data_mut().instantiations += 1;
+            store.data_mut().limits.instantiated();
             bindings
                 .call_invoke(&mut *store, capability.as_str(), input_json)
                 .await
@@ -1549,12 +1572,14 @@ impl BrokerProviderRegistry {
 /// alongside it, because the remaining count in the store is the authority on what the guest
 /// actually burned; a store that reports none records nothing rather than a zero that would read
 /// as an invocation that ran for free.
-fn record_store_outcome(store: &Store<StoreState>, supplied: u64) {
+fn record_store_outcome(store: &mut Store<StoreState>, supplied: u64) {
     let span = tracing::Span::current();
     span.record("instantiations", store.data().instantiations);
-    if let Ok(remaining) = store.get_fuel() {
+    let remaining = store.get_fuel().ok();
+    if let Some(remaining) = remaining {
         span.record("fuel.consumed", supplied.saturating_sub(remaining));
     }
+    store.data_mut().limits.record_remaining_fuel(remaining);
 }
 
 /// The export name a load line and a run span report for one component.
@@ -1609,7 +1634,7 @@ async fn describe_component(
                 operation: format!("describe {}", source.display()),
                 timeout_ms: operation_timeout.as_millis() as u64,
             });
-    record_store_outcome(&store, runtime.limits.fuel);
+    record_store_outcome(&mut store, runtime.limits.fuel);
     // As in a command run: a refused clock read traps, and the tripwire names it before the trap.
     if store.data().clock.attempted() {
         return Err(BrokerHostError::DescribeUsedHostImport {
