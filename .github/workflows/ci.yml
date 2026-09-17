@@ -194,23 +194,22 @@ jobs:
         uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
         with:
           version: v0.17.0
-      - name: Restore Cargo registry
-        id: cargo-cache
-        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Match the main-branch test-dependencies warmer; PRs never save target archives.
+      - name: Restore Rust test dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: cargo-registry-v1-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            cargo-registry-v1-${{ runner.os }}-
+          shared-key: workspace-tests-v1
+          cache-bin: "false"
+          save-if: "false"
       - name: Fetch exact standalone-provider test fixtures
         run: ci/fetch-external-provider-components.sh examples/providers
-      # This runner's CPU-heavy integration tests regressed under process-per-test nextest
-      # scheduling. Splitting this Cargo lane from lint/docs supplies the useful parallelism.
-      - name: Test workspace
-        run: cargo test --workspace --all-features --locked
+      # Keep build and execution on this runner so the test step reuses linked binaries.
+      # Retain Cargo's harness: process-per-test nextest scheduling regressed these tests.
+      - name: Compile workspace tests
+        run: cargo test --workspace --all-features --locked --no-run
+      - name: Run workspace tests
+        run: cargo test --workspace --all-features --locked --lib --bins --tests
+      # Stable Cargo cannot precompile doctests with --no-run. Run them exactly once here.
       - name: Test documentation
         run: cargo test --workspace --all-features --locked --doc
 

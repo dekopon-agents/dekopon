@@ -1,7 +1,7 @@
 name: Cargo cache warm
 
-# Pull-request jobs consume both caches read-only. Warming on main gives every PR a compatible base
-# without uploading multi-gigabyte, PR-scoped target archives that another PR cannot restore.
+# Pull-request jobs consume caches read-only. Warming on main gives every PR a compatible base
+# without uploading PR-scoped target archives that another PR cannot restore.
 on:
   push:
     branches: [main]
@@ -137,5 +137,34 @@ jobs:
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Warm release CLI objects
         run: cargo check --release --locked -p dekopon-brokerd -p dekopond
+
+  test-dependencies:
+    name: warm Rust test dependencies
+    runs-on: ubuntu-24.04
+    env:
+      SCCACHE_BASEDIRS: ${{ github.workspace }}
+      SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_GHA_RW_MODE: READ_WRITE
+      SCCACHE_GHA_VERSION: dekopon-v1
+      RUSTC_WRAPPER: sccache
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: rustup toolchain install
+      - name: Configure compiler cache
+        uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        with:
+          version: v0.17.0
+      # Keep this key, runner, toolchain and build flags aligned with CI's test job.
+      # Default pruning saves dependency artifacts, not workspace crates or test executables.
+      - name: Cache Rust test dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: workspace-tests-v1
+          cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Fetch exact standalone-provider test fixtures
+        run: ci/fetch-external-provider-components.sh examples/providers
       - name: Warm stable test objects
         run: cargo test --workspace --all-features --locked --no-run

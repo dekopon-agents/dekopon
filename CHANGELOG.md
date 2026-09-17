@@ -7,6 +7,11 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- Separate workspace test compilation and execution into CI steps, run doctests once,
+  and restore Swatinem Rust dependency artifacts from a dedicated main-branch cache warmer.
+
 ## [0.17.0] - 2026-09-17
 
 ### Fixed
