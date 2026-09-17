@@ -3311,6 +3311,7 @@ where
             outcome = tracing::field::Empty,
             policy.errors_present = tracing::field::Empty,
             input = tracing::field::Empty,
+            input.bytes = tracing::field::Empty,
         );
         if let Some(subject) = context.attested_subject() {
             authorize.record("subject", tracing::field::display(subject));
@@ -3318,10 +3319,15 @@ where
         if let Some(via) = context.via() {
             authorize.record("via", tracing::field::display(via));
         }
-        // Provider input is recorded unconditionally: a trace that omits what was proposed cannot
-        // reconstruct the run. A `Redacted` value inside it still renders its marker, because that
-        // is a property of the value rather than of this span.
-        authorize.record("input", tracing::field::display(&request.input));
+        // Provider input is recorded unconditionally, bounded like every other attribute and never
+        // dropped: a trace that omits what was proposed cannot reconstruct the run. It is rendered
+        // through the bound rather than cut afterwards, because a proposal carrying image bytes
+        // would otherwise cost a full copy of them here and another in every installed layer. A
+        // `Redacted` value inside it still renders its marker, because that is a property of the
+        // value rather than of this span.
+        let input = dekopon_core::bounded_display(&request.input);
+        authorize.record("input", input.text());
+        authorize.record("input.bytes", input.bytes());
         // Instrumented rather than entered with a guard: on every denial this section awaits an
         // audit append that can suspend. A guard held across that await stays entered on the
         // worker thread while this task is suspended, so another connection's spans parent under

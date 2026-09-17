@@ -9,7 +9,8 @@
 //!
 //! `provider.run_command` also records what the word was asked and what it answered: the arguments
 //! as one JSON array, the piped value when there was one, and the guest's answer, each bounded at
-//! `dekopon_core::MAX_ATTRIBUTE_BYTES` beside the byte length of the whole.
+//! `dekopon_core::MAX_ATTRIBUTE_BYTES` beside the byte length of the whole. `provider.invoke`
+//! records the proposal's `input` under the same cap, beside `input.bytes`.
 //!
 //! It lives in its own test binary because `tracing` resolves per-callsite interest against the
 //! global dispatcher: a sibling test reaching these callsites with no subscriber installed can
@@ -601,6 +602,61 @@ async fn command_run_attributes_past_the_cap_are_truncated_beside_their_full_len
     assert!(
         !rendered.contains(&"x".repeat(cap + 1)),
         "no attribute carries more than the cap"
+    );
+}
+
+/// A proposal's `input` rides the same cap as the command fields, with `input.bytes` beside it.
+///
+/// The value is rendered through the bound rather than built and then cut, so an input carrying a
+/// base64 image never exists twice; what a reader sees is the same prefix and marker either way.
+#[tokio::test(flavor = "multi_thread")]
+async fn invocation_input_past_the_cap_is_truncated_beside_its_full_length() {
+    let _sequential = SEQUENTIAL.lock().await;
+    let capture = capture();
+    capture.clear();
+
+    let registry = BrokerProviderRegistry::load(
+        [provider_fixture("cli-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .expect("command-line provider loads");
+    // Well past the attribute cap and inside the fixture's own 16 KiB text bound.
+    let input = json!({ "text": "x".repeat(16_000) });
+    let input_bytes = input.to_string().len();
+    let output = registry
+        .invoke(
+            authorized(
+                "cli-probe",
+                "cli-probe.count".parse().expect("capability"),
+                input,
+            ),
+            None,
+        )
+        .await
+        .expect("an input inside the fixture's bound runs");
+    assert_eq!(output.output, json!({"characters": 16_000}));
+
+    // `{"text":"` is the nine bytes of the cut prefix that are not the model's own text.
+    let cap = dekopon_core::MAX_ATTRIBUTE_BYTES;
+    let rendered = capture.spans_text();
+    assert!(
+        recorded_value(
+            &capture,
+            "provider.invoke",
+            "input",
+            &format!("{{\"text\":\"{}…[truncated]", "x".repeat(cap - 9))
+        ),
+        "the proposal is its first {cap} bytes plus the marker:\n{rendered}"
+    );
+    assert_eq!(
+        recorded(&capture, "provider.invoke", "input.bytes"),
+        vec![input_bytes as u64],
+        "{rendered}"
+    );
+    assert!(
+        !rendered.contains(&"x".repeat(cap)),
+        "no attribute carries more than the cap:\n{rendered}"
     );
 }
 

@@ -591,10 +591,10 @@ migration is implemented here.
 | `provider.describe` | `dekopon-broker-host` | `path`, `stores`, `instantiations`, `fuel.consumed`; emitted once per provider at startup, for the manifest call |
 | `broker.command_run` | `dekopon-brokerd` | `word` and `outcome` (`proposed`, `rendered`, `failed`, `error`); opened once per `runCommand` beneath the client's `traceParent` |
 | `provider.run_command` | `dekopon-broker-host` | provider, `word`, `command.export` (`run-command`), `command.arguments` and `command.arguments.bytes`, `command.stdin` and `command.stdin.bytes` when a value was piped, `command.output` and `command.output.bytes`, `stores`, `instantiations`, `fuel.consumed`; nests under `broker.command_run` |
-| `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `policy-error`, `secret-denied`, `unconstrained-capability`, `agent-denied`, `attestation-denied`, `unmapped-subject`, `chat-attestation-denied`, `chat-scope-required`, `record-operation-required`, `memory-unavailable`, `invalid-memory-input`, `invalid-turn`), `policy.errors_present`; `subject` and `via` on attested proposals |
+| `broker.authorize` | `dekopon-broker` | invocation, capability, `outcome` (`allowed`, `policy-denied`, `policy-error`, `secret-denied`, `unconstrained-capability`, `agent-denied`, `attestation-denied`, `unmapped-subject`, `chat-attestation-denied`, `chat-scope-required`, `record-operation-required`, `memory-unavailable`, `invalid-memory-input`, `invalid-turn`), `policy.errors_present`, `input` and `input.bytes`; `subject` and `via` on attested proposals |
 | `broker.execute` | `dekopon-broker` | provider; `credential` — the symbolic name the invocation selected, when it selected one; `outcome` (`succeeded`, `failed`, `decision-unaudited`, `outcome-unaudited`) and `error` — the same classified reason the terminal audit record carries — with `error.code` and `error.message` beside it on a typed provider failure; on a storage-backed invocation also `storage = true`, `storage.namespace`, and `storage.reset` |
 | `broker.credential.refresh` | `dekopon-brokerd` | the symbolic `credential` name, and `outcome` (`current`, `adopted`, `rotated`, `rotated-unsaved`, `failed`); emitted once per invocation that selects a credential the broker renews per use, and never any token, account identifier, or file content. `chatgpt.refresh` from `dekopon-model` nests inside it |
-| `provider.invoke` | `dekopon-broker-host` | capability, provider, `input`, `stores`, `instantiations`, `fuel.consumed`; `storage = true` on a storage-backed invocation |
+| `provider.invoke` | `dekopon-broker-host` | capability, provider, `input` and `input.bytes`, `stores`, `instantiations`, `fuel.consumed`; `storage = true` on a storage-backed invocation |
 | `http.request` | `dekopon-http-host` | `http.request.method`, `server.address`, `http.response.status_code`, `dekopon.http.request.accounted_bytes`, `dekopon.http.response.accounted_bytes`, `outcome`; `error.code` and `error.message` on failure |
 
 `http.request` fields mirror `HttpCallEvidence` exactly: the span reports the same call the audit
@@ -838,18 +838,23 @@ withholds half of it serves nobody the constitution recognizes ([goal
 
 | Span | Payload field |
 |---|---|
-| `broker.authorize` | `input` — the untrusted proposal payload |
-| `provider.invoke` | `input` — the payload passed to the component |
+| `broker.authorize` | `input` and `input.bytes` — the untrusted proposal payload |
+| `provider.invoke` | `input` and `input.bytes` — the payload passed to the component |
 | `shell.command` | `shell.command.arguments`, `shell.command.stdin`, `shell.command.output` — the argv after the word, the piped value, and the command's stdout |
 | `provider.run_command` | `command.arguments`, `command.stdin`, `command.output` — the argv, the piped value, and the guest's answer |
 | `http.request` | `url.full` — the destination with its path and query |
 | model/tool log events | the verbatim transcript; see below |
 
-The six command fields cut through `dekopon_core::bounded_attribute`. A value of up to 4096 bytes
+The six command fields and both `input` fields cut at the same place. A value of up to 4096 bytes
 passes unchanged; a longer one is cut at the last character boundary within 4096 bytes and suffixed
 `…[truncated]`. Each field's `.bytes` sibling — `shell.command.output.bytes`,
-`command.arguments.bytes`, and so on — records the uncut length, so a cut value is distinguishable
-from one that happened to end there. The attribute is bounded, never the span.
+`command.arguments.bytes`, `input.bytes`, and so on — records the uncut length, so a cut value is
+distinguishable from one that happened to end there. The attribute is bounded, never the span.
+
+The command fields arrive as text and go through `dekopon_core::bounded_attribute`. A proposal does
+not: `input` is whatever JSON the model sent, and on an image capability that is base64 bytes, so
+`dekopon_core::bounded_display` renders it straight into a buffer that stops at 4096 bytes and keeps
+counting — the same cut and the same marker, without a copy of the whole proposal existing to be cut.
 
 This is **data**, not credentials. A credential is injected into a header at the native HTTP
 boundary, so that header and the wire request carrying it stay out; a header or body a command

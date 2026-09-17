@@ -1603,18 +1603,23 @@ impl BrokerProviderRegistry {
         // `proposal.input` is a field on this span whether or not the capability is storage-backed.
         // It is untrusted payload, and containing it is the authority boundary's job rather than
         // telemetry's: the operator's trace is where the run is reconstructed from, so what a
-        // provider was actually asked to do belongs in it.
+        // provider was actually asked to do belongs in it. It rides the attribute bound like the
+        // command fields, rendered through it so an input carrying image bytes is never copied
+        // whole to be cut afterwards.
         let span = tracing::info_span!(
             "provider.invoke",
             capability = %proposal.capability,
             provider = %provider.manifest.id,
             input = tracing::field::Empty,
+            input.bytes = tracing::field::Empty,
             storage = tracing::field::Empty,
             stores = tracing::field::Empty,
             instantiations = tracing::field::Empty,
             fuel.consumed = tracing::field::Empty,
         );
-        span.record("input", tracing::field::display(&proposal.input));
+        let input = dekopon_core::bounded_display(&proposal.input);
+        span.record("input", input.text());
+        span.record("input.bytes", input.bytes());
         if storage_backed {
             span.record("storage", true);
         }
