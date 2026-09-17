@@ -60,7 +60,7 @@ wrong:
 |---|---|---|
 | A | `broker-credentials.yaml`, `secret-map.yaml` | rejected if `mode & 0o077 != 0` |
 | B | `broker.yaml`, `policies.cedar`, `dekopond.yaml`, provider `.wasm` files and their parents | rejected if `mode & 0o022 != 0` |
-| C | the parent of `compileCachePath` and of a `chatgptSubscription` `authFile` | must be `0700` and owned by the runtime UID |
+| C | `providerSet.storePath` (the parent of generated `cwasm`) and the parent of a `chatgptSubscription` `authFile` | must be `0700` and owned by the runtime UID |
 | D | every ancestor up to `/` | must be a directory that is not group- or world-writable unless sticky |
 | E | `catalogPath` | no checks at all |
 
@@ -149,6 +149,16 @@ configured ChatGPT subdirectory. Neither daemon can rename the other's directory
 Private subdirectories are `0700`; files are `0600` with one link. Each daemon gets a separate
 `/tmp` volume. The broker alone mounts provider storage.
 
+Gateway `/tmp` is **disk-backed** `emptyDir`, sized by `volumeSizes.gatewayTmp` (default 320Mi).
+Existing `volumeSizes.tmp` overrides now affect only broker scratch (still tmpfs, default 16Mi);
+set `gatewayTmp` explicitly when migrating a custom scratch limit. Chat assets hold at most 256 MiB
+of live payload bytes per gateway process, independently enforced before writing. The extra space
+is headroom for filesystem overhead and other gateway scratch consumers, not an eviction guarantee.
+Kubernetes `emptyDir.sizeLimit` is kubelet-enforced, not a reservation or synchronous write quota;
+node ephemeral-storage pressure can still evict the pod. Outside this chart, configure the process
+temporary directory on real disk: a tmpfs-backed `TMPDIR` does not reduce retained RAM. Existing
+rollouts and operator overrides require separate verification; changing this source deploys nothing.
+
 **Upgrade with both daemons stopped:** an `audit.jsonl` on the claim, at its root or under
 `broker/`, is inert; the broker keeps no audit file, so delete it once any records you want are
 copied off. Change an existing ChatGPT directory and its live credential to `65533:65533`, keeping
@@ -182,11 +192,11 @@ over the real socket, passes `SO_PEERCRED` in both directions, and gets back the
 policy exposes to this peer. It is evaluated from the constraint catalog and the policy set and
 emits **no audit record**.
 
-- **`startupProbe`**, 5 s period, 60 failures — five minutes. The broker compiles every `.wasm`
-  component through Cranelift before it binds the socket, so "the socket answers" is exactly "fully
-  started". Components compile concurrently rather than one at a time, and `compileCachePath` makes
-  a restart read compiled code back from disk instead of recompiling, but the cold path runs
-  Cranelift and the probe budget has to cover it. The
+- **`startupProbe`**, 5 s period, 60 failures — five minutes. The broker loads and validates every
+  component before binding the socket, so "the socket answers" is exactly "fully started".
+  Managed providers default to verified mmap-backed cwasm on the provider store's persistent disk;
+  `compileOnLoad: true` bypasses it. Components load one at a time; a cold cache still runs Cranelift
+  and the probe budget has to cover it. Do not put the cache on the chart's memory-backed `/tmp`. The
   margin is large because a startup probe that gives up restarts the container, and every restart
   starts the compile over.
 - **Broker `readinessProbe`**, 30 s period. It keeps pod readiness truthful and, when the optional
@@ -475,9 +485,9 @@ equivalent default profile. Do not narrow this to a hand-written profile without
 loads; the failure mode is a trap inside the JIT, not a clean error.
 
 `readOnlyRootFilesystem` is `true` for every container. Neither daemon writes outside its mounted
-volumes, and a memory-backed `/tmp` is mounted anyway so an incidental temporary file cannot turn
-into a crash. The one thing a daemon does write — the ChatGPT credential, when that model kind is
-in use — gets its own writable directory on the claim; see
+volumes. Broker `/tmp` remains memory-backed; gateway `/tmp` stores private, short-lived chat payloads
+on disk. The ChatGPT credential, when that model kind is in use, gets its own writable directory
+on the claim; see
 [The ChatGPT credential is seeded once](#the-chatgpt-credential-is-seeded-once).
 
 ## Two version numbers

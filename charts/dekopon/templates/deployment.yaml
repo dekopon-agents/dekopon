@@ -366,10 +366,10 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: {{ .Values.volumeSizes.config }}
+        # Chat payload leases use private scratch files, not pod memory.
         - name: gateway-tmp
           emptyDir:
-            medium: Memory
-            sizeLimit: {{ .Values.volumeSizes.tmp }}
+            sizeLimit: {{ .Values.volumeSizes.gatewayTmp }}
         - name: runtime
           emptyDir:
             medium: Memory

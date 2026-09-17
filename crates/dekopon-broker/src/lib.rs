@@ -4949,7 +4949,7 @@ fn public_host_error(error: &BrokerHostError, route: CapabilityRoute) -> &'stati
         | BrokerHostError::Store { .. }
         | BrokerHostError::Linker { .. }
         | BrokerHostError::ArtifactMetadata { .. }
-        | BrokerHostError::CompileCache { .. }
+        | BrokerHostError::CompiledArtifact { .. }
         | BrokerHostError::Compile { .. }
         | BrokerHostError::Instantiate { .. }
         | BrokerHostError::DescribeUsedHostImport { .. }

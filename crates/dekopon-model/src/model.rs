@@ -39,8 +39,8 @@ pub enum ContentPart {
     Image {
         /// IANA media type, such as `image/png`.
         mime: String,
-        /// Raw bytes, encoded only when a request is built.
-        data: Vec<u8>,
+        /// Byte-free reference, resolved only when a request is built.
+        data: crate::asset::BlobReference,
     },
     /// A document the model can read.
     File {
@@ -48,8 +48,8 @@ pub enum ContentPart {
         name: String,
         /// IANA media type, such as `application/pdf`.
         mime: String,
-        /// Raw bytes, encoded only when a request is built.
-        data: Vec<u8>,
+        /// Byte-free reference, resolved only when a request is built.
+        data: crate::asset::BlobReference,
     },
 }
 
@@ -453,7 +453,10 @@ impl ChatModel for OpenAiChatModel {
                 function: tool,
             })
             .collect::<Vec<_>>();
-        let wire = messages.iter().map(WireMessage::from).collect::<Vec<_>>();
+        let wire = messages
+            .iter()
+            .map(WireMessage::try_from)
+            .collect::<Result<Vec<_>, _>>()?;
         let request_body = ChatRequest {
             model: &self.model,
             messages: &wire,
@@ -607,7 +610,7 @@ enum WireContent<'a> {
 #[serde(tag = "type")]
 enum WirePart<'a> {
     #[serde(rename = "text")]
-    Text { text: &'a str },
+    Text { text: std::borrow::Cow<'a, str> },
     #[serde(rename = "image_url")]
     ImageUrl { image_url: WireUrl },
     #[serde(rename = "file")]
@@ -625,36 +628,67 @@ struct WireFile<'a> {
     file_data: String,
 }
 
-impl<'a> From<&'a ModelMessage> for WireMessage<'a> {
-    fn from(message: &'a ModelMessage) -> Self {
-        let content = message.content.as_ref().map(|content| match content {
-            MessageContent::Text(text) => WireContent::Text(text),
-            MessageContent::Parts(parts) => WireContent::Parts(
-                parts
-                    .iter()
-                    .map(|part| match part {
-                        ContentPart::Text(text) => WirePart::Text { text },
-                        ContentPart::Image { mime, data } => WirePart::ImageUrl {
-                            image_url: WireUrl {
-                                url: data_url(mime, data),
-                            },
-                        },
-                        ContentPart::File { name, mime, data } => WirePart::File {
-                            file: WireFile {
-                                filename: name,
-                                file_data: data_url(mime, data),
-                            },
-                        },
-                    })
-                    .collect(),
-            ),
-        });
-        Self {
+impl<'a> TryFrom<&'a ModelMessage> for WireMessage<'a> {
+    type Error = crate::asset::BlobError;
+    fn try_from(message: &'a ModelMessage) -> Result<Self, Self::Error> {
+        let content = message
+            .content
+            .as_ref()
+            .map(|content| -> Result<_, Self::Error> {
+                Ok(match content {
+                    MessageContent::Text(text) => WireContent::Text(text),
+                    MessageContent::Parts(parts) => WireContent::Parts(
+                        parts
+                            .iter()
+                            .map(|part| {
+                                let bytes = match part {
+                                    ContentPart::Image { data, .. }
+                                    | ContentPart::File { data, .. } => match data.read() {
+                                        Ok(bytes) => Some(bytes),
+                                        Err(
+                                            crate::asset::BlobError::Reclaimed
+                                            | crate::asset::BlobError::Unauthorized,
+                                        ) => {
+                                            return Ok(WirePart::Text {
+                                                text: data.release_notice().into(),
+                                            });
+                                        }
+                                        Err(error) => return Err(error),
+                                    },
+                                    ContentPart::Text(_) => None,
+                                };
+                                Ok(match part {
+                                    ContentPart::Text(text) => WirePart::Text { text: text.into() },
+                                    ContentPart::Image { mime, .. } => WirePart::ImageUrl {
+                                        image_url: WireUrl {
+                                            url: data_url(
+                                                mime,
+                                                bytes.as_deref().unwrap_or_default(),
+                                            ),
+                                        },
+                                    },
+                                    ContentPart::File { name, mime, .. } => WirePart::File {
+                                        file: WireFile {
+                                            filename: name,
+                                            file_data: data_url(
+                                                mime,
+                                                bytes.as_deref().unwrap_or_default(),
+                                            ),
+                                        },
+                                    },
+                                })
+                            })
+                            .collect::<Result<_, Self::Error>>()?,
+                    ),
+                })
+            })
+            .transpose()?;
+        Ok(Self {
             role: message.role,
             content,
             tool_calls: &message.tool_calls,
             tool_call_id: message.tool_call_id.as_deref(),
-        }
+        })
     }
 }
 
@@ -1050,6 +1084,9 @@ fn completion_url(endpoint: &str) -> String {
 /// Failure while requesting or decoding a model turn.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum ModelError {
+    /// A retained attachment could not be read; no model request was sent.
+    #[error("{0}")]
+    Attachment(#[from] crate::asset::BlobError),
     /// Client configuration was invalid.
     #[error("invalid model configuration: {0}")]
     Configuration(String),
@@ -1385,7 +1422,10 @@ mod tests {
             bodies.push(
                 serde_json::to_value(ChatRequest {
                     model: "test-model",
-                    messages: &messages.iter().map(WireMessage::from).collect::<Vec<_>>(),
+                    messages: &messages
+                        .iter()
+                        .map(|message| WireMessage::try_from(message).expect("wire"))
+                        .collect::<Vec<_>>(),
                     tools: &tools,
                     tool_choice: "auto",
                     prompt_cache_key: None,
@@ -1460,7 +1500,10 @@ mod tests {
         let request = |prompt_cache_key| {
             serde_json::to_value(ChatRequest {
                 model: "test-model",
-                messages: &messages.iter().map(WireMessage::from).collect::<Vec<_>>(),
+                messages: &messages
+                    .iter()
+                    .map(|message| WireMessage::try_from(message).expect("wire"))
+                    .collect::<Vec<_>>(),
                 tools: &tools,
                 tool_choice: "auto",
                 prompt_cache_key,
@@ -1581,7 +1624,8 @@ mod tests {
 
     /// One message through the chat-completions wire mapping.
     fn wire(message: &ModelMessage) -> Value {
-        serde_json::to_value(WireMessage::from(message)).expect("serialize wire message")
+        serde_json::to_value(WireMessage::try_from(message).expect("wire"))
+            .expect("serialize wire message")
     }
 
     #[test]
@@ -1605,29 +1649,37 @@ mod tests {
             ContentPart::Text("what does this say?".to_owned()),
             ContentPart::Image {
                 mime: "image/png".to_owned(),
-                data: b"PNG".to_vec(),
+                data: crate::asset::DiskBlob::from_bytes(b"PNG")
+                    .expect("spool")
+                    .into(),
             },
             ContentPart::File {
                 name: "spec.pdf".to_owned(),
                 mime: "application/pdf".to_owned(),
-                data: b"PDF".to_vec(),
+                data: crate::asset::DiskBlob::from_bytes(b"PDF")
+                    .expect("spool")
+                    .into(),
             },
         ]);
 
-        assert_eq!(
-            wire(&message),
-            json!({
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "what does this say?"},
-                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,UE5H"}},
-                    {"type": "file", "file": {
-                        "filename": "spec.pdf",
-                        "file_data": "data:application/pdf;base64,UERG"
-                    }},
-                ],
-            })
-        );
+        let clone = message.clone();
+        for _ in 0..3 {
+            assert_eq!(wire(&clone), wire(&message));
+            assert_eq!(
+                wire(&message),
+                json!({
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "what does this say?"},
+                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,UE5H"}},
+                        {"type": "file", "file": {
+                            "filename": "spec.pdf",
+                            "file_data": "data:application/pdf;base64,UERG"
+                        }},
+                    ],
+                })
+            );
+        }
     }
 
     #[test]
@@ -1640,7 +1692,9 @@ mod tests {
             ContentPart::Text("look".to_owned()),
             ContentPart::Image {
                 mime: "image/png".to_owned(),
-                data: b"PNG".to_vec(),
+                data: crate::asset::DiskBlob::from_bytes(b"PNG")
+                    .expect("spool")
+                    .into(),
             },
         ]);
 
@@ -1994,5 +2048,31 @@ mod tests {
         let text = ModelMessage::user("look");
         assert_eq!(text.content(), Some("look"));
         assert_eq!(text.parts(), None);
+    }
+    #[test]
+    fn chat_completions_released_history_is_explicit_but_io_failure_is_not_hidden() {
+        struct Missing(crate::asset::BlobError);
+        impl crate::asset::BlobSource for Missing {
+            fn pin(&self) -> Result<crate::asset::DiskBlob, crate::asset::BlobError> {
+                Err(self.0)
+            }
+        }
+        let message_for = |error| {
+            ModelMessage::user_with_parts(vec![ContentPart::Image {
+                mime: "image/png".into(),
+                data: crate::asset::BlobReference::new(std::sync::Arc::new(Missing(error)), 12, 7),
+            }])
+        };
+        let message = message_for(crate::asset::BlobError::Reclaimed);
+        let wire = serde_json::to_value(WireMessage::try_from(&message).unwrap())
+            .unwrap()
+            .to_string();
+        assert!(
+            wire.contains("gateway: Chat Asset #7 was released"),
+            "{wire}"
+        );
+        assert!(!wire.contains("image_url"));
+        let message = message_for(crate::asset::BlobError::LengthChanged);
+        assert!(WireMessage::try_from(&message).is_err());
     }
 }

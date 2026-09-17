@@ -220,7 +220,12 @@ impl RoutingTable {
     /// A catch-all is not a wakeup on its own. `dispatch` still requires channel traffic to address
     /// the bot before any of this becomes a session.
     pub fn route(&self, message: &InboundMessage) -> Option<&BoundRoute> {
-        self.routes.iter().find(|route| {
+        self.route_index(message).map(|(_, route)| route)
+    }
+
+    /// Declaration index is the exact startup-fixed route identity for collection isolation.
+    pub(crate) fn route_index(&self, message: &InboundMessage) -> Option<(usize, &BoundRoute)> {
+        self.routes.iter().enumerate().find(|(_, route)| {
             route.transport == message.transport
                 && route.conversation.matches(&message.conversation)
                 && route

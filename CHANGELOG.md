@@ -13,6 +13,39 @@ All notable changes to Dekopon are documented here. The format is based on
   extension across Slack, Discord, Telegram, WhatsApp and local. Healthy transports serve during
   recovery; flapping spends a finite budget, and any terminal failure drains the gateway and exits
   nonzero for a supervisor restart without replaying outbound effects.
+
+- Pin `tracing-core` to the exact revision of upstream tracing PR #3614, fixing lost cold-callsite
+  events/spans when the sole registered dispatcher is scoped to another thread. Direct and
+  transitive tracing consumers share the patched core; test assertions and parallelism are unchanged.
+
+- Validate inbound WhatsApp PNG signatures without unaccounted scratch writes. Completed asset
+  downloads that exceed retention limits now remain unavailable without silently redownloading;
+  known-oversized inputs still refuse before transport IO.
+
+- Collect media-first WhatsApp bursts before admission (`debounceMs: 3000` by default, `0` for
+  immediate behavior) and Telegram native media groups in a separate fixed 3-second window.
+  Bounded, actor-isolated inputs share one lead reply and causally linked execution; fixed-window
+  expiry attempts admission immediately, never queues behind active sessions. Oversized native
+  Slack/Discord arrays are explicitly refused instead of silently truncated. Multi-message
+  WhatsApp webhooks retain distinct receipt identities; pending stops acknowledge even while an
+  earlier answer completes. Immediate inputs retain their existing text truncation behavior.
+
+- Outbound image hydration and owned scratch disposal now run off async workers with the delivery
+  trace context. Local image answers use the existing separate-reply fallback rather than
+  finalizing a progress/stream line in place; text-only finalization is unchanged.
+
+### Changed
+
+- Chat assets now use one gateway-owned disk LRU, configured by `sessions.assetRetentionBytes`
+  (256 MiB default; zero disables asset retention/delivery). Model history holds weak references;
+  reclaimed images become explicit release notices, and unavailable provider inputs refuse the
+  entire edit without refetch or original-image fallback. Validated generated PNGs receive reusable
+  scoped `chat-asset` IDs for successive edits and share their stored bytes with outbound delivery.
+  Temporary request pins count toward the same budget; storage failure preserves already-executed
+  provider outcomes and never retries the paid call.
+- Gateway Helm scratch is disk-backed `emptyDir` with separate `volumeSizes.gatewayTmp` (320Mi
+  default). Existing `volumeSizes.tmp` overrides now affect only broker scratch, still tmpfs.
+  Operators must verify deployed scratch mounts separately; no rollout is implied.
 ### Added
 
 - Broker provider invocations emit a payload-free linear-memory sizing summary with the largest
@@ -21,6 +54,18 @@ All notable changes to Dekopon are documented here. The format is based on
   include instantiation and survive normal errors and timeouts; cancellation reports omit fuel
   consumption when no final reading exists. Memory is not live heap/RSS or aggregate RAM.
   Enforcement, fuel budgets and reservations are unchanged.
+- Startup tracing distinguishes cwasm miss/hit/reuse/bypass, source/compiled sizes and hashes,
+  source verification, per-stage compile/hash/publish/verify/deserialize microseconds, and total
+  registry load time with outcomes and propagated blocking-task ancestry. Compiled-cache growth
+  has fixed object/byte limits and no automatic eviction.
+
+### Changed
+
+- Managed broker providers now use SHA-256-addressed, mmap-backed compiled artifacts by default,
+  verifying selected compiled hashes once per startup. `compileOnLoad: true` bypasses the cache;
+  `compileCachePath` and Wasmtime's compressed cache are removed. Missing indexes compile once;
+  other errors fail startup without retry, repair, or fallback. Startup loads one component at a
+  time to bound compiler memory. See [migration](docs/upgrading.md#mapped-compiled-providers-unreleased).
 
 ## [0.16.0] - 2026-09-15
 

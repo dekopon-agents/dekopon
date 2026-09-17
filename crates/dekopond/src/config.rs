@@ -422,6 +422,12 @@ pub enum TransportConfig {
         waba_id: String,
         phone_number_id: String,
         graph_api_version: String,
+        /// Fixed media-first collection window; zero bypasses collection.
+        #[serde(
+            default = "default_whatsapp_debounce_ms",
+            deserialize_with = "deserialize_debounce_ms"
+        )]
+        debounce_ms: u32,
         /// What a running session shows; WhatsApp has typing and nothing else.
         #[serde(default)]
         liveness: LivenessConfig,
@@ -450,6 +456,25 @@ pub enum TransportConfig {
         #[serde(default)]
         liveness: LivenessConfig,
     },
+}
+
+const fn default_whatsapp_debounce_ms() -> u32 {
+    3000
+}
+
+fn deserialize_debounce_ms<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u32, D::Error> {
+    let millis = u32::deserialize(deserializer)?;
+    if std::time::Instant::now()
+        .checked_add(Duration::from_millis(u64::from(millis)))
+        .is_none()
+    {
+        return Err(serde::de::Error::custom(
+            "debounceMs cannot be represented as a timer deadline",
+        ));
+    }
+    Ok(millis)
 }
 
 impl TransportConfig {
@@ -922,6 +947,9 @@ pub struct ResolvedRoute {
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SessionsConfig {
+    /// Process-wide retained attachment bytes. Zero disables asset retention, not the bound.
+    #[serde(default = "default_asset_retention_bytes")]
+    pub asset_retention_bytes: usize,
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
     /// Whether a rejected message gets a short "try again" reply instead of silence.
@@ -941,11 +969,17 @@ pub struct SessionsConfig {
 impl Default for SessionsConfig {
     fn default() -> Self {
         Self {
+            asset_retention_bytes: DEFAULT_ASSET_RETENTION_BYTES,
             max_concurrent: DEFAULT_MAX_CONCURRENT_SESSIONS,
             reply_on_busy: true,
             max_conversations: DEFAULT_MAX_CONVERSATIONS,
         }
     }
+}
+
+pub(crate) const DEFAULT_ASSET_RETENTION_BYTES: usize = 256 * 1024 * 1024;
+const fn default_asset_retention_bytes() -> usize {
+    DEFAULT_ASSET_RETENTION_BYTES
 }
 
 const fn default_max_concurrent() -> usize {
@@ -1189,6 +1223,7 @@ pub(crate) fn resolve(
                 waba_id,
                 phone_number_id,
                 graph_api_version,
+                debounce_ms,
                 liveness,
                 graph_endpoint,
             } => {
@@ -1222,6 +1257,7 @@ pub(crate) fn resolve(
                     waba_id,
                     phone_number_id,
                     graph_api_version,
+                    debounce_ms,
                     liveness,
                     graph_endpoint: Some(graph_endpoint),
                 }

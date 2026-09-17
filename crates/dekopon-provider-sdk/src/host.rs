@@ -12,7 +12,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    path::{Path, PathBuf},
 };
 
 use dekopon_core::{CapabilityId, CommandWordConflict, ProviderId};
@@ -20,7 +19,7 @@ use serde_json::Value;
 use thiserror::Error;
 use wasmtime::component::types::{ComponentFunc, ComponentItem};
 use wasmtime::component::{Component, Type};
-use wasmtime::{Cache, CacheConfig, Config, Engine, StoreLimitsBuilder};
+use wasmtime::{Config, Engine, StoreLimitsBuilder};
 
 use crate::ProviderManifest;
 
@@ -517,15 +516,6 @@ pub fn command_input_bytes(argv: &[String], stdin: Option<&str>) -> usize {
 /// Failure to build the shared Wasmtime engine.
 #[derive(Debug, Error)]
 pub enum EngineError {
-    /// The persistent compilation cache directory could not be prepared.
-    #[error("could not open the provider compilation cache at {}", path.display())]
-    CompileCache {
-        /// Configured cache directory.
-        path: PathBuf,
-        /// Wasmtime error.
-        #[source]
-        source: wasmtime::Error,
-    },
     /// Wasmtime engine initialization failed.
     #[error("could not initialize the Wasmtime engine")]
     Engine {
@@ -551,26 +541,12 @@ pub fn config() -> Config {
 
 /// Builds the one engine a host compiles and runs every component on.
 ///
-/// A cache directory holds compiled machine code this process will execute, keyed by the artifact
-/// bytes and the engine configuration, so a rebuilt component compiles again rather than being
-/// served stale: point it only at a directory the host's own user controls. `None` runs Cranelift
-/// again in every process.
+/// Persistent compiled artifacts are owned by the broker host, not Wasmtime's compressed cache.
 ///
 /// # Errors
 ///
-/// Returns [`EngineError::CompileCache`] when the cache directory cannot be prepared, and
-/// [`EngineError::Engine`] when Wasmtime refuses the configuration.
-pub fn engine(mut config: Config, compile_cache_dir: Option<&Path>) -> Result<Engine, EngineError> {
-    if let Some(directory) = compile_cache_dir {
-        let mut cache = CacheConfig::new();
-        cache.with_directory(directory);
-        config.cache(Some(Cache::new(cache).map_err(|source| {
-            EngineError::CompileCache {
-                path: directory.to_path_buf(),
-                source,
-            }
-        })?));
-    }
+/// Returns [`EngineError::Engine`] when Wasmtime refuses the configuration.
+pub fn engine(config: Config) -> Result<Engine, EngineError> {
     Engine::new(&config).map_err(|source| EngineError::Engine { source })
 }
 

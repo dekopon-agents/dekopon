@@ -5,6 +5,7 @@ broker:
 transports:
   - name: support-whatsapp
     kind: whatsappCloudApi
+    debounceMs: 3000 # fixed media-first collection window; 0 preserves immediate admission
     appSecretEnv: DEKOPOND_WHATSAPP_APP_SECRET
     verifyTokenEnv: DEKOPOND_WHATSAPP_VERIFY_TOKEN
     accessTokenEnv: DEKOPOND_WHATSAPP_ACCESS_TOKEN

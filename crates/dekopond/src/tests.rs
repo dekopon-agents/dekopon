@@ -2457,11 +2457,7 @@ impl ChatDriver for RecordingDriver {
         }
         self.record_reply(
             reply.text,
-            reply
-                .images
-                .iter()
-                .map(|image| image.bytes().len())
-                .collect(),
+            reply.images.iter().map(|image| image.len()).collect(),
         );
         Ok(())
     }
@@ -2976,6 +2972,10 @@ fn message(text: &str) -> InboundMessage {
         // No transport ran, so there is no receipt to hang this message's trace from. A test that
         // asserts on the trace root drives a real transport instead.
         receive_span: tracing::Span::none(),
+        received_at: tokio::time::Instant::now(),
+        native_group: None,
+        constituents: Vec::new(),
+        asset_overflow: false,
     }
 }
 
@@ -3053,6 +3053,10 @@ fn owned_slack_message(text: &str, inherited: bool) -> InboundMessage {
         },
         liveness: None,
         receive_span: tracing::Span::none(),
+        received_at: tokio::time::Instant::now(),
+        native_group: None,
+        constituents: Vec::new(),
+        asset_overflow: false,
     }
 }
 
@@ -4207,7 +4211,7 @@ async fn a_native_stop_wins_the_race_and_suppresses_answer_history_and_durable_r
         runner
             .active_sessions
             .cancel(&cancel(SUBJECT, CancelVia::StopReply)),
-        CancelOutcome::AlreadyEnded
+        CancelOutcome::AlreadyCancelled
     );
     model.release();
     session.await.expect("the cancelled session exits");
@@ -6404,6 +6408,7 @@ async fn losing_every_transport_ends_the_daemon_as_a_failure() {
         receiver,
         std::future::pending(),
         Duration::from_secs(1),
+        crate::collection::Collector::new(&[], 4),
     )
     .await;
 
@@ -6425,6 +6430,7 @@ async fn a_requested_shutdown_ends_the_daemon_successfully() {
         receiver,
         std::future::ready(()),
         Duration::from_secs(1),
+        crate::collection::Collector::new(&[], 4),
     )
     .await;
 
@@ -6471,6 +6477,7 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
         &repliers,
         NO_STOP_WORDS,
         &mut sessions,
+        &mut crate::collection::Collector::new(&[], 4),
         ambient,
     );
     assert_eq!(
@@ -6496,6 +6503,7 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
         &repliers,
         NO_STOP_WORDS,
         &mut sessions,
+        &mut crate::collection::Collector::new(&[], 4),
         structurally_unaddressed,
     );
     assert_eq!(sessions.len(), 0, "structured addressing must win");
@@ -6515,6 +6523,7 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
         &repliers,
         NO_STOP_WORDS,
         &mut sessions,
+        &mut crate::collection::Collector::new(&[], 4),
         elsewhere,
     );
     assert_eq!(
@@ -6537,6 +6546,7 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
         &repliers,
         NO_STOP_WORDS,
         &mut sessions,
+        &mut crate::collection::Collector::new(&[], 4),
         addressed,
     );
     assert_eq!(sessions.len(), 1, "an addressed message starts one session");
@@ -6584,6 +6594,7 @@ async fn a_transport_owned_thread_continuation_bypasses_only_the_repeat_mention(
         &repliers,
         NO_STOP_WORDS,
         &mut sessions,
+        &mut crate::collection::Collector::new(&[], 4),
         continuation,
     );
     assert_eq!(
@@ -6641,6 +6652,7 @@ async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
         &repliers,
         NO_STOP_WORDS,
         &mut sessions,
+        &mut crate::collection::Collector::new(&[], 4),
         ambient,
     );
     assert_eq!(
@@ -6665,6 +6677,7 @@ async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
         &repliers,
         NO_STOP_WORDS,
         &mut sessions,
+        &mut crate::collection::Collector::new(&[], 4),
         addressed,
     );
     assert_eq!(sessions.len(), 1, "and being summoned in one is");
@@ -6739,6 +6752,7 @@ async fn a_local_channel_line_reaches_its_route_without_a_mention() {
         &repliers,
         NO_STOP_WORDS,
         &mut sessions,
+        &mut crate::collection::Collector::new(&[], 4),
         message,
     );
 
@@ -8594,7 +8608,7 @@ fn asset_store() -> AssetStore {
 }
 
 #[test]
-fn an_asset_is_numbered_per_conversation_and_still_resolves_later() {
+fn one_shot_asset_ids_are_monotonic_and_still_resolve_only_in_their_scope() {
     // The number is the whole interface a model has to an attachment, so it has to mean one file
     // for as long as the reference line naming it is still being replayed.
     let store = asset_store();
@@ -8614,14 +8628,14 @@ fn an_asset_is_numbered_per_conversation_and_still_resolves_later() {
     assert_eq!(first.inventory[0].id, 1);
     assert_eq!(second.arrived, vec![2]);
 
-    // A different conversation numbers from one again, and cannot see the first one's files.
+    // A different one-shot conversation gets a fresh ID and cannot see the first one's files.
     let other = store.assets_for(
         &private_conversation_key("dev", "c2", SUBJECT),
         vec![pending("c.png", "image/png", 30)],
         true,
         now,
     );
-    assert_eq!(other.inventory[0].id, 1);
+    assert_eq!(other.inventory[0].id, 3);
     assert_eq!(
         store
             .get(&private_conversation_key("dev", "c2", SUBJECT), 2, now)
@@ -9009,7 +9023,10 @@ async fn empty_grant_removal_blocks_stale_metadata_and_byte_fetches() {
     })
     .await
     .expect("the stale fetch completes");
-    assert!(refusal.contains("no Chat Asset #1"), "{refusal}");
+    assert!(
+        refusal.contains("unavailable in this conversation generation"),
+        "{refusal}"
+    );
     assert_eq!(
         fetch_calls.load(Ordering::SeqCst),
         0,
@@ -10472,6 +10489,7 @@ async fn a_telegram_photo_is_routed_with_its_largest_size() {
             "from": {"id": 16034700182_i64, "is_bot": false},
             "chat": {"id": 4242, "type": "private"},
             "caption": "what does this say?",
+            "media_group_id": "native-album-1",
             "photo": [
                 {"file_id": "thumb", "file_size": 900},
                 {"file_id": "full", "file_size": 214_000}
@@ -10484,6 +10502,7 @@ async fn a_telegram_photo_is_routed_with_its_largest_size() {
 
     let message = next_message(&mut transport).await;
     assert_eq!(message.text, "what does this say?");
+    assert_eq!(message.native_group.as_deref(), Some("native-album-1"));
     assert_eq!(
         message.assets,
         vec![PendingAsset {
@@ -11143,7 +11162,7 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
                     .expect("base64 image")
             )
             .expect("image data decodes"),
-        generated_image().bytes()
+        generated_image().bytes().expect("read image")
     );
     image_reply
         .await
@@ -11173,6 +11192,82 @@ fn capture_spans() -> (
         .with(capture.clone())
         .set_default();
     (capture, guard)
+}
+
+#[test]
+fn spool_spans_keep_message_parent_and_never_record_payload_or_paths() {
+    use dekopon_model::asset::DiskBlob;
+    let (capture, _guard) = capture_spans();
+    let session = tracing::info_span!("gateway.session");
+    let blob = session.in_scope(|| DiskBlob::from_bytes(b"secret pixel sentinel").expect("spool"));
+    // Reading and cleanup after leaving the scope still belong to the originating message.
+    assert_eq!(blob.read().expect("read"), b"secret pixel sentinel");
+    drop(blob);
+    let text = capture.text();
+    for operation in ["write", "read", "cleanup"] {
+        assert!(
+            text.contains(&format!("operation=\"{operation}\"")),
+            "{text}"
+        );
+    }
+    assert!(
+        text.contains("bytes=21")
+            && text.contains("duration_ms=")
+            && text.contains("outcome=\"ok\""),
+        "{text}"
+    );
+    assert!(
+        !text.contains("secret pixel sentinel") && !text.contains("dekopon-assets-"),
+        "{text}"
+    );
+    assert!(
+        capture
+            .span_parents()
+            .iter()
+            .filter(|(name, _)| *name == "asset.spool")
+            .all(|(_, parent)| parent.as_deref() == Some("gateway.session")),
+        "{text}"
+    );
+}
+
+#[tokio::test]
+async fn whatsapp_upload_and_send_spans_remain_children_of_the_message() {
+    use crate::transport::whatsapp::tests_media::{
+        MediaPeer, PNG, accepted, admitted_photo, json_reply,
+    };
+    use tracing::Instrument as _;
+    let (capture, _guard) = capture_spans();
+    let peer = MediaPeer::new(|_, index| match index {
+        0 => json_reply(json!({"id": "987"})),
+        1 => accepted(),
+        _ => panic!("no retry"),
+    })
+    .await;
+    let (transport, inbound) = admitted_photo(&peer.origin, "image/png", None).await;
+    let parent = tracing::info_span!("gateway.message");
+    let image = parent.in_scope(|| GeneratedImage::from_png(PNG.to_vec()).expect("spool"));
+    transport
+        .driver()
+        .reply(
+            &inbound.reply,
+            OutboundReply::with_images("edited", vec![image]),
+        )
+        .instrument(parent)
+        .await
+        .expect("complete delivery");
+    let text = capture.text();
+    for name in ["whatsapp.image_upload", "whatsapp.image_send"] {
+        assert!(capture.span_parents().iter().any(|(span, parent)| *span == name && parent.as_deref() == Some("gateway.message")), "{text}");
+    }
+    assert!(
+        text.contains("outcome=\"accepted\"") && text.contains("duration_ms="),
+        "{text}"
+    );
+    assert!(
+        !text.contains(&STANDARD.encode(PNG)) && !text.contains("dekopon-assets-"),
+        "{text}"
+    );
+    peer.finish().await;
 }
 
 /// Answers one received message with a scripted model, so the span tree is the whole assertion.
@@ -11369,6 +11464,199 @@ async fn a_whatsapp_delivery_opens_its_trace_around_the_signature_check() {
     answer_once(message).await;
 
     assert_trace_opens_at_receipt(&capture, "whatsapp", "wamid.traced");
+}
+
+#[tokio::test]
+async fn whatsapp_multi_message_webhook_exports_distinct_receipts_links_and_mixed_dispositions() {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::{
+        error::OTelSdkResult,
+        trace::{SdkTracerProvider, SpanData, SpanExporter},
+    };
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone, Debug, Default)]
+    struct Exported(Arc<Mutex<Vec<SpanData>>>);
+    impl SpanExporter for Exported {
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            self.0.lock().unwrap().extend(batch);
+            Ok(())
+        }
+    }
+    let exported = Exported::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exported.clone())
+        .build();
+    let _subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("whatsapp-ingress-test")))
+        .set_default();
+    let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = probe.local_addr().unwrap();
+    drop(probe);
+    let mut transport = crate::transport::whatsapp::WhatsappTransport::new(
+        "dev".into(),
+        address,
+        "/wa".into(),
+        "123".into(),
+        "456".into(),
+        "v23.0".into(),
+        "http://127.0.0.1:9".into(),
+        "secret".into(),
+        "verify".into(),
+        "access".into(),
+        liveness_settings(LivenessMode::Off),
+    )
+    .unwrap();
+    transport.connect().await.unwrap();
+    let body = serde_json::to_vec(&json!({
+        "object": "whatsapp_business_account",
+        "entry": [{"id": "123", "changes": [{"field": "messages", "value": {
+            "messaging_product": "whatsapp", "metadata": {"phone_number_id": "456"},
+            "contacts": [{"wa_id": "16034700182"}],
+            "messages": (0..9).map(|index| json!({
+                "id": format!("wamid.burst-{index}"), "from": "16034700182", "type": "image",
+                "image": {"id": format!("{}", index + 1), "mime_type": "image/png", "caption": format!("reference {index}")}
+            })).collect::<Vec<_>>()
+        }}]}]
+    })).unwrap();
+    let digest = crate::transport::whatsapp::hmac_sha256(b"secret", &body);
+    let signature: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    let response = reqwest::Client::new()
+        .post(format!("http://{address}/wa"))
+        .header("x-hub-signature-256", format!("sha256={signature}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    drop(response);
+
+    let directory = temporary();
+    let config = resolved(directory.path(), &document(directory.path())).await;
+    let routes = Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+        )],
+    )
+    .await;
+    let models = ModelScript::new([answer("Collected answer.")]);
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let driver = Arc::new(RecordingDriver::default());
+    let drivers = BTreeMap::from([("dev".into(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
+    let mut collector = burst_collector(None);
+    let mut sessions = tokio::task::JoinSet::new();
+    for _ in 0..9 {
+        let input = next_message(&mut transport).await;
+        crate::dispatch(
+            &runner,
+            &routes,
+            &BTreeMap::new(),
+            &drivers,
+            &[],
+            &mut sessions,
+            &mut collector,
+            input,
+        );
+    }
+    while let Some(result) = sessions.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(models.requests(), 0);
+    assert_eq!(driver.replies().len(), 1, "only the ninth input is refused");
+    let batch = collector.take_due(collector.deadline().unwrap()).remove(0);
+    assert_eq!(batch.assets.len(), 8);
+    run_session(runner, route(model_config()), batch, driver).await;
+    assert_eq!(models.requests(), 1);
+    drop(transport);
+    provider.force_flush().unwrap();
+    {
+        let spans = exported.0.lock().unwrap();
+        let attribute = |span: &SpanData, key: &str| {
+            span.attributes
+                .iter()
+                .find(|item| item.key.as_str() == key)
+                .map(|item| item.value.to_string())
+        };
+        let execution = spans
+            .iter()
+            .find(|span| span.name == "gateway.message")
+            .expect("exported execution");
+        assert_eq!(execution.links.links.len(), 8);
+        let mut receipt_ids = std::collections::HashSet::new();
+        let mut delivery_id = None;
+        for index in 0..9 {
+            let id = format!("wamid.burst-{index}");
+            let receipt = spans
+                .iter()
+                .find(|span| {
+                    span.name == "transport.receive"
+                        && attribute(span, "message.id").as_deref() == Some(&id)
+                })
+                .expect("message receipt");
+            assert!(
+                receipt_ids.insert(receipt.span_context.span_id()),
+                "every message has its own receipt"
+            );
+            assert_eq!(
+                *delivery_id.get_or_insert(receipt.parent_span_id),
+                receipt.parent_span_id
+            );
+            assert_eq!(
+                receipt.span_context.trace_id(),
+                execution.span_context.trace_id()
+            );
+            assert_eq!(
+                execution
+                    .links
+                    .links
+                    .iter()
+                    .any(|link| link.span_context == receipt.span_context),
+                index < 8
+            );
+            if index == 0 {
+                assert_eq!(execution.parent_span_id, receipt.span_context.span_id());
+            }
+            let outcomes: Vec<_> = receipt
+                .events
+                .events
+                .iter()
+                .flat_map(|event| &event.attributes)
+                .filter(|item| item.key.as_str() == "outcome")
+                .map(|item| item.value.to_string())
+                .collect();
+            assert_eq!(
+                outcomes,
+                [if index < 8 { "answered" } else { "batch-limit" }],
+                "{id}"
+            );
+            assert!(
+                receipt
+                    .events
+                    .events
+                    .iter()
+                    .any(|event| event
+                        .attributes
+                        .iter()
+                        .any(|item| item.key.as_str() == "audit.event"
+                            && item.value.to_string() == "gateway.message.received")),
+                "original input event for {id}"
+            );
+        }
+        let delivery = spans
+            .iter()
+            .find(|span| Some(span.span_context.span_id()) == delivery_id)
+            .expect("signed delivery parent exported");
+        assert_eq!(delivery.name, "transport.receive");
+        assert_eq!(
+            delivery.parent_span_id,
+            opentelemetry::trace::SpanId::INVALID
+        );
+        assert!(attribute(delivery, "message.id").is_none());
+    }
+    provider.shutdown().unwrap();
 }
 
 #[tokio::test]
@@ -12045,7 +12333,7 @@ async fn no_origin_takes_back_an_answer_that_is_already_being_delivered() {
         if let Some(outcome) = origin.deliver(&runner, &session) {
             assert_eq!(
                 outcome,
-                CancelOutcome::AlreadyEnded,
+                CancelOutcome::Completing,
                 "completion already claimed the one decision a session gets: {origin:?}"
             );
         }
@@ -12364,7 +12652,7 @@ async fn a_route_that_withholds_self_inspection_offers_no_such_tool() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_signed_whatsapp_photo_expands_for_edit_and_returns_png_without_transcript_bytes() {
+async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same_stored_bytes() {
     use crate::transport::whatsapp::tests_media::{
         JPEG, MediaPeer, PNG, accepted, admitted_photo, bytes_reply, json_reply, metadata,
     };
@@ -12375,8 +12663,8 @@ async fn a_signed_whatsapp_photo_expands_for_edit_and_returns_png_without_transc
         let peer = MediaPeer::new(move |origin, index| match index {
             0 => metadata(origin, mime, bytes),
             1 => bytes_reply(bytes),
-            2 => json_reply(json!({"id":"987"})),
-            3 => accepted(),
+            2 | 4 | 6 => json_reply(json!({"id":"987"})),
+            3 | 5 | 7 => accepted(),
             _ => panic!("no retry or extra media calls"),
         })
         .await;
@@ -12386,15 +12674,31 @@ async fn a_signed_whatsapp_photo_expands_for_edit_and_returns_png_without_transc
             "admission must be lazy"
         );
         let directory = temporary();
-        let (broker,mut observed)=stub_broker(directory.path(),vec![
+        let (broker,mut observed)=stub_broker(directory.path(), (0..3).flat_map(|edit| vec![
             ResponseEnvelope::capabilities(vec![capability("gpt-image.edit")],vec!["gpt-image".to_owned()]),
-            ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed","capability":"gpt-image.edit","input":{"prompt":"purple sky","images":["chat-asset:1"]}})).expect("edit proposal")),
-            ResponseEnvelope::invocation(record_output(json!({"attachments":[{"mediaType":"image/png","base64":STANDARD.encode(PNG)}]}))),
-        ]).await;
-        let models = ModelScript::new([
-            script_call("gpt-image edit --prompt 'purple sky' --image chat-asset:1"),
-            answer("Edited image."),
-        ]);
+            ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed","capability":"gpt-image.edit","input":{"prompt":"purple sky","images":[format!("chat-asset:{}", edit + 1)]}})).expect("edit proposal")),
+            ResponseEnvelope::invocation(record_output(json!({"attachments":[{"mediaType":"image/png","base64":STANDARD.encode([PNG, &[edit as u8]].concat())}]}))),
+        ]).collect()).await;
+        let models = ModelScript::new((0..3).flat_map(|edit| {
+            [
+                AssistantTurn {
+                    tool_calls: vec![ModelToolCall {
+                        id: "asset-call".to_owned(),
+                        kind: "function".to_owned(),
+                        function: ModelFunctionCall {
+                            name: "fetch_chat_asset".to_owned(),
+                            arguments: json!({"id":edit + 1}).to_string(),
+                        },
+                    }],
+                    ..answer("")
+                },
+                script_call(&format!(
+                    "gpt-image edit --prompt 'purple sky' --image chat-asset:{}",
+                    edit + 1
+                )),
+                answer("Edited image."),
+            ]
+        }));
         let mut runner = runner(broker, Arc::clone(&models), 4);
         Arc::get_mut(&mut runner)
             .expect("unique runner")
@@ -12404,20 +12708,39 @@ async fn a_signed_whatsapp_photo_expands_for_edit_and_returns_png_without_transc
         if let ModelConfig::OpenaiCompatible { modalities, .. } = &mut model {
             *modalities = vec![crate::config::Modality::Image];
         }
-        let mut route = route(model);
+        let mut route = persistent_route(model, window());
         route.transport = "wa".to_owned();
         route.provider_attachments = 1;
         route.chat_asset_inputs = Arc::from(vec!["gpt-image.edit".to_owned()]);
-        run_session(runner, route, inbound, transport.driver()).await;
-        assert_eq!(models.requests(), 2);
+        for edit in 0..3 {
+            let mut message = inbound.clone();
+            if edit > 0 {
+                message.assets.clear();
+                message.text = "Edit the most recent generated result".to_owned();
+                message.message_id = format!("follow-up-{edit}");
+            }
+            run_session(
+                Arc::clone(&runner),
+                route.clone(),
+                message,
+                transport.driver(),
+            )
+            .await;
+        }
+        assert_eq!(models.requests(), 9);
         let first = models.prompt(0);
         assert!(
             first.iter().any(|(_, text)| text.contains("Chat Asset #1")),
             "{first:?}"
         );
-        let tool = tool_message(&models, 1);
-        assert!(tool.contains("attached"), "{tool}");
-        for index in 0..2 {
+        let tool = tool_message(&models, 2);
+        assert!(
+            tool.contains("chat-asset:2")
+                && tool.contains("retained")
+                && tool.contains("delivered"),
+            "{tool}"
+        );
+        for index in 0..9 {
             for (_, text) in models.prompt(index) {
                 assert!(
                     !text.contains(&STANDARD.encode(bytes))
@@ -12426,33 +12749,92 @@ async fn a_signed_whatsapp_photo_expands_for_edit_and_returns_png_without_transc
                 );
             }
         }
-        let _listing = observed.recv().await.expect("capabilities");
-        let _command = observed.recv().await.expect("command");
-        let BrokerRequest::Invoke {
-            invocation,
-            attestation: Some(claim),
-        } = observed.recv().await.expect("proposal").request
-        else {
-            panic!("attested proposal")
-        };
-        assert_eq!(invocation.capability.as_str(), "gpt-image.edit");
-        assert_eq!(
-            invocation.input["images"][0],
-            format!("data:{mime};base64,{}", STANDARD.encode(bytes))
-        );
-        assert_eq!(claim.subject.canonical(), "whatsapp.15550000001");
-        assert_eq!(claim.scope.expect("scope").transport.as_str(), "wa");
+        for edit in 0..3 {
+            assert!(
+                models
+                    .prompt(edit * 3)
+                    .iter()
+                    .any(|(_, text)| text.contains(&format!("Chat Asset #{}", edit + 1))),
+                "generated IDs must be visible in later-turn inventory"
+            );
+            if edit > 0 {
+                assert!(
+                    models
+                        .prompt(edit * 3)
+                        .iter()
+                        .any(|(role, text)| role == "assistant" && text == "Edited image.")
+                );
+            }
+            let listing = observed.recv().await.expect("fresh capabilities");
+            assert!(matches!(
+                listing.request,
+                BrokerRequest::Capabilities { .. }
+            ));
+            let _command = observed.recv().await.expect("command");
+            let BrokerRequest::Invoke {
+                invocation,
+                attestation: Some(claim),
+            } = observed.recv().await.expect("proposal").request
+            else {
+                panic!("attested proposal")
+            };
+            assert_eq!(invocation.capability.as_str(), "gpt-image.edit");
+            assert_eq!(
+                invocation.input["images"][0],
+                if edit == 0 {
+                    format!("data:{mime};base64,{}", STANDARD.encode(bytes))
+                } else {
+                    format!(
+                        "data:image/png;base64,{}",
+                        STANDARD.encode([PNG, &[(edit - 1) as u8]].concat())
+                    )
+                }
+            );
+            assert_eq!(claim.subject.canonical(), "whatsapp.15550000001");
+            assert_eq!(claim.scope.expect("scope").transport.as_str(), "wa");
+        }
+        // ModelScript clones messages after the session ends: only leases survive, but hydration
+        // is still exact. Each edit fetched the original before invoking the provider.
+        {
+            let prompts = models.prompts.lock().expect("prompts");
+            for edit in 0..3 {
+                let data = prompts[edit * 3 + 1]
+                    .iter()
+                    .filter_map(ModelMessage::parts)
+                    .flatten()
+                    .find_map(|part| match part {
+                        dekopon_model::model::ContentPart::Image { data, .. } => Some(data),
+                        _ => None,
+                    })
+                    .expect("model received original image lease");
+                assert_eq!(
+                    data.read().expect("read weak reference"),
+                    if edit == 0 {
+                        bytes.to_vec()
+                    } else {
+                        [PNG, &[(edit - 1) as u8]].concat()
+                    }
+                );
+            }
+        }
         {
             let requests = peer.requests.lock().expect("requests");
-            assert_eq!(requests.len(), 4);
-            assert!(
-                requests[2]
-                    .body
-                    .windows(PNG.len())
-                    .any(|window| window == PNG)
+            assert_eq!(
+                requests.len(),
+                8,
+                "one inbound fetch reused by model and provider, then three uploads/sends"
             );
-            let sent: Value = serde_json::from_slice(&requests[3].body).expect("image send");
-            assert_eq!(sent["image"], json!({"id":"987","caption":"Edited image."}));
+            for edit in 0..3 {
+                assert!(
+                    requests[edit * 2 + 2]
+                        .body
+                        .windows(PNG.len())
+                        .any(|window| window == PNG)
+                );
+                let sent: Value =
+                    serde_json::from_slice(&requests[edit * 2 + 3].body).expect("image send");
+                assert_eq!(sent["image"], json!({"id":"987","caption":"Edited image."}));
+            }
         }
         peer.finish().await;
     }
@@ -12500,6 +12882,7 @@ async fn unauthorized_and_unrouted_whatsapp_photos_fetch_nothing() {
                 &BTreeMap::new(),
                 &[],
                 &mut sessions,
+                &mut crate::collection::Collector::new(&[], 4),
                 inbound,
             );
             assert!(sessions.is_empty());
@@ -12557,6 +12940,700 @@ async fn whatsapp_asset_numbers_cannot_cross_conversations_or_retired_generation
     peer.finish().await;
 }
 
+fn burst_collector(millis: Option<u64>) -> crate::collection::Collector {
+    let mut value = json!({
+        "kind": "whatsappCloudApi", "name": "dev", "appSecretEnv": "APP_SECRET",
+        "verifyTokenEnv": "VERIFY_TOKEN", "accessTokenEnv": "ACCESS_TOKEN",
+        "bind": "127.0.0.1:9080", "callbackPath": "/webhooks/whatsapp", "wabaId": "123",
+        "phoneNumberId": "456", "graphApiVersion": "v25.0"
+    });
+    if let Some(millis) = millis {
+        value["debounceMs"] = json!(millis);
+    }
+    let transport: crate::TransportConfig = serde_json::from_value(value).expect("typed transport");
+    crate::collection::Collector::new(&[transport], 4)
+}
+
+fn burst_photo(text: &str) -> InboundMessage {
+    let mut message = message(text);
+    message.transport_kind = dekopon_broker_protocol::ChatTransportKind::Whatsapp;
+    message.assets = vec![pending("reference.png", "image/png", 12)];
+    message
+}
+
+#[test]
+fn whatsapp_debounce_is_unsigned_strict_and_defaults_to_three_seconds() {
+    use crate::collection::Offered;
+    for (configured, expected) in [(None, 3000), (Some(900), 900), (Some(0), 0)] {
+        let mut collector = burst_collector(configured);
+        let photo = burst_photo("");
+        let start = photo.received_at;
+        let result = collector.offer(0, photo);
+        if expected == 0 {
+            assert!(matches!(result, Offered::Immediate(_)));
+            assert!(collector.deadline().is_none());
+        } else {
+            assert!(matches!(result, Offered::Pending));
+            assert_eq!(
+                collector.deadline(),
+                Some(start + Duration::from_millis(expected))
+            );
+        }
+    }
+    for malformed in [
+        json!(-1),
+        json!(1.5),
+        json!("3000"),
+        json!(null),
+        json!(u64::from(u32::MAX) + 1),
+        json!(u64::MAX),
+    ] {
+        let value = json!({"kind":"whatsappCloudApi", "name":"wa", "appSecretEnv":"APP", "verifyTokenEnv":"VERIFY", "accessTokenEnv":"ACCESS", "bind":"127.0.0.1:9080", "callbackPath":"/wa", "wabaId":"123", "phoneNumberId":"456", "graphApiVersion":"v25.0", "debounceMs":malformed});
+        assert!(serde_json::from_value::<crate::TransportConfig>(value).is_err());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn photo_burst_three_references_and_edit_prompt_make_one_authorized_model_turn() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+        )],
+    )
+    .await;
+    let models = ModelScript::new([answer("Edited together.")]);
+    let driver = Arc::new(RecordingDriver::default());
+    let mut collector = burst_collector(None);
+    for (index, caption) in ["first reference", "", "third reference"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut photo = burst_photo(caption);
+        photo.assets = vec![pending(&format!("reference-{index}.png"), "image/png", 12)];
+        assert!(matches!(
+            collector.offer(0, photo),
+            crate::collection::Offered::Pending
+        ));
+    }
+    let mut prompt = burst_photo("edit these three together");
+    prompt.assets.clear();
+    assert!(matches!(
+        collector.offer(0, prompt),
+        crate::collection::Offered::Pending
+    ));
+    assert_eq!(models.requests(), 0);
+    assert!(
+        observed.try_recv().is_err(),
+        "collection performs no broker work"
+    );
+    let ready = collector.take_due(collector.deadline().unwrap());
+    assert_eq!(ready.len(), 1);
+    let mut model = model_config();
+    if let ModelConfig::OpenaiCompatible { modalities, .. } = &mut model {
+        *modalities = vec![crate::config::Modality::Image];
+    }
+    run_session(
+        runner(broker, Arc::clone(&models), 4),
+        route(model),
+        ready.into_iter().next().unwrap(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(models.requests(), 1);
+    assert_eq!(driver.replies(), ["Edited together."]);
+    let prompt = models
+        .prompt(0)
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    for needle in [
+        "Chat Asset #1",
+        "Chat Asset #2",
+        "Chat Asset #3",
+        "edit these three together",
+        "first reference",
+        "third reference",
+    ] {
+        assert!(prompt.contains(needle), "missing {needle}: {prompt}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn photo_burst_busy_at_fixed_deadline_is_disposed_even_when_busy_replies_disabled() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(directory.path(), Vec::new()).await;
+    let models = ModelScript::forbidden();
+    let mut runner = runner(broker, Arc::clone(&models), 1);
+    Arc::get_mut(&mut runner).unwrap().reply_on_busy = false;
+    let photo = burst_photo("");
+    let active = runner
+        .gate
+        .admit((photo.transport.clone(), photo.conversation.key()))
+        .expect("active run");
+    let mut collector = burst_collector(None);
+    assert!(matches!(
+        collector.offer(0, photo),
+        crate::collection::Offered::Pending
+    ));
+    let ready = collector.take_due(collector.deadline().unwrap()).remove(0);
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        Arc::clone(&runner),
+        route(model_config()),
+        ready,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), [BUSY_REPLY]);
+    drop(active);
+    assert!(
+        collector
+            .take_due(tokio::time::Instant::now() + Duration::from_secs(60))
+            .is_empty()
+    );
+    assert_eq!(models.requests(), 0);
+    assert!(observed.try_recv().is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn photo_burst_refreshes_authorization_at_admission_and_registers_no_refused_assets() {
+    let directory = temporary();
+    let (broker, mut observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(Vec::new(), Vec::new())],
+    )
+    .await;
+    let models = ModelScript::forbidden();
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let mut collector = burst_collector(None);
+    assert!(matches!(
+        collector.offer(0, burst_photo("edit")),
+        crate::collection::Offered::Pending
+    ));
+    assert!(observed.try_recv().is_err());
+    let ready = collector.take_due(collector.deadline().unwrap()).remove(0);
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        runner,
+        route(model_config()),
+        ready,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(driver.replies(), [UNAUTHORIZED_REPLY]);
+    assert_eq!(models.requests(), 0);
+    assert!(matches!(
+        observed.recv().await.unwrap().request,
+        BrokerRequest::Capabilities { .. }
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn photo_burst_serve_flushes_at_fixed_deadline_with_one_lead_reply() {
+    let directory = temporary();
+    let mut doc = document(directory.path());
+    doc["models"][0]["modalities"] = json!(["image"]);
+    let config = resolved(directory.path(), &doc).await;
+    let routes = Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
+    let (broker, _observed) = stub_broker(
+        directory.path(),
+        vec![ResponseEnvelope::capabilities(
+            vec![capability("cli-probe.upper")],
+            Vec::new(),
+        )],
+    )
+    .await;
+    let models = ModelScript::new([answer("One answer.")]);
+    let driver = Arc::new(RecordingDriver::default());
+    let drivers = Arc::new(BTreeMap::from([(
+        "dev".to_owned(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )]));
+    let (sender, receiver) = mpsc::channel(8);
+    let (shutdown, stopped) = tokio::sync::oneshot::channel();
+    let service = tokio::spawn(crate::serve(
+        runner(broker, Arc::clone(&models), 4),
+        routes,
+        Arc::new(BTreeMap::new()),
+        drivers,
+        Arc::new(vec!["stop".into()]),
+        receiver,
+        async move {
+            stopped.await.unwrap();
+        },
+        Duration::from_secs(5),
+        burst_collector(None),
+    ));
+    for index in 0..3 {
+        let mut photo = burst_photo("");
+        photo.assets = vec![pending(&format!("reference-{index}.png"), "image/png", 12)];
+        sender
+            .send(TransportEvent::Message(Box::new(photo)))
+            .await
+            .unwrap();
+    }
+    while sender.capacity() != 8 {
+        tokio::task::yield_now().await;
+    }
+    tokio::time::advance(Duration::from_millis(2999)).await;
+    let mut prompt = burst_photo("please edit all three");
+    prompt.assets.clear();
+    sender
+        .send(TransportEvent::Message(Box::new(prompt)))
+        .await
+        .unwrap();
+    while sender.capacity() != 8 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(models.requests(), 0);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    // Model execution uses a real blocking worker; keep the deterministic Tokio clock fixed while
+    // yielding until that worker returns, with an independent wall-clock test failure bound.
+    let bound = std::time::Instant::now() + Duration::from_secs(10);
+    while driver.replies().is_empty() {
+        assert!(
+            std::time::Instant::now() < bound,
+            "shared session did not answer"
+        );
+        tokio::task::yield_now().await;
+    }
+    shutdown.send(()).unwrap();
+    assert_eq!(service.await.unwrap(), crate::ServeOutcome::Shutdown);
+    assert_eq!(models.requests(), 1);
+    assert_eq!(driver.replies(), ["One answer."]);
+    let prompt = models
+        .prompt(0)
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(prompt.contains("Chat Asset #3"));
+    assert!(prompt.contains("please edit all three"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn photo_burst_dispatch_stop_disposes_owned_pending_input_without_starting_a_session() {
+    let directory = temporary();
+    let (runner, routes) = idle_routing_loop(directory.path()).await;
+    let driver = Arc::new(RecordingDriver::default());
+    let drivers = BTreeMap::from([("dev".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
+    let mut collector = burst_collector(None);
+    let mut sessions = tokio::task::JoinSet::new();
+    let identities = BTreeMap::new();
+    let stop_words = vec!["stop".to_owned()];
+    crate::dispatch(
+        &runner,
+        &routes,
+        &identities,
+        &drivers,
+        &stop_words,
+        &mut sessions,
+        &mut collector,
+        burst_photo(""),
+    );
+    assert!(collector.deadline().is_some());
+    assert!(sessions.is_empty());
+    let mut stop = burst_photo("stop");
+    stop.assets.clear();
+    crate::dispatch(
+        &runner,
+        &routes,
+        &identities,
+        &drivers,
+        &stop_words,
+        &mut sessions,
+        &mut collector,
+        stop,
+    );
+    assert!(collector.deadline().is_none());
+    while let Some(result) = sessions.join_next().await {
+        result.unwrap();
+    }
+    assert_eq!(driver.replies(), [crate::session::STOPPED_REPLY]);
+    assert!(
+        collector
+            .take_due(tokio::time::Instant::now() + Duration::from_secs(60))
+            .is_empty()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pending_batch_stop_acknowledges_normal_completion_but_not_an_owned_stopped_ending() {
+    for already_cancelled in [false, true] {
+        let directory = temporary();
+        let config = resolved(directory.path(), &document(directory.path())).await;
+        let routes =
+            Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
+        let (broker, _observed) = stub_broker(
+            directory.path(),
+            vec![ResponseEnvelope::capabilities(
+                vec![capability("cli-probe.upper")],
+                Vec::new(),
+            )],
+        )
+        .await;
+        let model = BlockedModel::new("the earlier answer");
+        let runner = runner_with(broker, Arc::new(Arc::clone(&model)), 4);
+        let earlier = Arc::new(ParkedReplyDriver::default());
+        let session = tokio::spawn(run_session(
+            Arc::clone(&runner),
+            route(model_config()),
+            message("answer me"),
+            Arc::clone(&earlier) as Arc<dyn ChatDriver>,
+        ));
+        model.wait_until_entered().await;
+        if already_cancelled {
+            assert_eq!(
+                runner
+                    .active_sessions
+                    .cancel(&cancel(SUBJECT, CancelVia::StopReply)),
+                CancelOutcome::Cancelled
+            );
+        } else {
+            model.release();
+        }
+        tokio::time::timeout(Duration::from_secs(10), earlier.delivering.notified())
+            .await
+            .expect("earlier terminal delivery is blocked");
+
+        let acknowledgments = Arc::new(RecordingDriver::default());
+        let drivers = BTreeMap::from([(
+            "dev".to_owned(),
+            Arc::clone(&acknowledgments) as Arc<dyn ChatDriver>,
+        )]);
+        let mut collector = burst_collector(None);
+        let mut sessions = tokio::task::JoinSet::new();
+        for text in ["", "stop", "stop"] {
+            let mut input = burst_photo(text);
+            if !text.is_empty() {
+                input.assets.clear();
+            }
+            crate::dispatch(
+                &runner,
+                &routes,
+                &BTreeMap::new(),
+                &drivers,
+                &["stop".into()],
+                &mut sessions,
+                &mut collector,
+                input,
+            );
+        }
+        assert!(collector.deadline().is_none());
+        while let Some(result) = sessions.join_next().await {
+            result.unwrap();
+        }
+        assert_eq!(
+            acknowledgments.replies(),
+            if already_cancelled {
+                vec![]
+            } else {
+                vec![crate::session::STOPPED_REPLY]
+            }
+        );
+        if already_cancelled {
+            model.release();
+        }
+        earlier.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(10), session)
+            .await
+            .expect("earlier session drains")
+            .unwrap();
+        assert_eq!(
+            wait_for_delivery(&earlier).await,
+            [if already_cancelled {
+                crate::session::STOPPED_REPLY
+            } else {
+                "the earlier answer"
+            }]
+        );
+        assert!(
+            collector
+                .take_due(tokio::time::Instant::now() + Duration::from_secs(60))
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn photo_burst_native_slack_and_discord_arrays_are_atomic_or_wholly_refused() {
+    use crate::collection::Offered;
+    for count in [3, 11] {
+        let files: Vec<_> = (0..count).map(|index| json!({
+            "id": format!("F{index}"), "name": format!("reference-{index}.png"), "mimetype":"image/png", "size":12,
+            "url_private_download": format!("https://files.slack.com/f/F{index}/image.png")
+        })).collect();
+        let socket = spawn_socket_mock(vec![events_envelope(
+            "array",
+            json!({
+                "type":"message", "subtype":"file_share", "channel":"d0123abc", "channel_type":"im",
+                "user":"u9xyz", "ts":"1700000000.000001", "text":"edit references", "files":files
+            }),
+        )]);
+        let http = spawn_http_mock(slack_handler(vec![socket.url.clone()]));
+        let mut slack = slack(&http.base);
+        slack.connect().await.unwrap();
+        let message = next_message(&mut slack).await;
+        let mut collector = burst_collector(None);
+        match collector.offer(0, message) {
+            Offered::Immediate(message) if count == 3 => assert_eq!(message.assets.len(), 3),
+            Offered::Refused(_, "input-limit") if count == 11 => {}
+            _ => panic!("Slack native array was split or queued"),
+        }
+
+        let mut event = discord_message(
+            "300000000000000099",
+            "200000000000000099",
+            None,
+            DISCORD_USER,
+            false,
+            "edit references",
+        );
+        event["attachments"] = json!((0..count).map(|index| json!({
+            "id": format!("4000000000000000{index:02}"), "filename":format!("reference-{index}.png"),
+            "content_type":"image/png", "size":12, "url":format!("https://cdn.discordapp.com/attachments/200000000000000099/4000000000000000{index:02}/image.png")
+        })).collect::<Vec<_>>());
+        let socket =
+            spawn_discord_socket_mock(vec![discord_dispatch(2, "MESSAGE_CREATE", event)], None);
+        let http = spawn_http_mock(discord_handler(socket.url.clone()));
+        let mut discord = crate::transport::discord::DiscordTransport::new(
+            "discord".into(),
+            http.base.clone(),
+            "test-token".into(),
+            liveness_settings(LivenessMode::Off),
+        )
+        .unwrap();
+        discord.connect().await.unwrap();
+        let message = next_message(&mut discord).await;
+        match collector.offer(0, message) {
+            Offered::Immediate(message) if count == 3 => assert_eq!(message.assets.len(), 3),
+            Offered::Refused(_, "input-limit") if count == 11 => {}
+            _ => panic!("Discord native array was split or queued"),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native_lead() {
+    let directory = temporary();
+    let mut doc = document(directory.path());
+    doc["transports"][0] =
+        json!({"kind":"telegramLongPoll", "name":"dev", "botTokenEnv":"TELEGRAM_TEST_TOKEN"});
+    doc["routes"][0]["conversation"]["kind"] = json!(["thread"]);
+    let config = resolved(directory.path(), &doc).await;
+    let routes = Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
+    let (broker, _observed) = stub_broker(directory.path(), Vec::new()).await;
+    let runner = runner(broker, ModelScript::forbidden(), 4);
+    let drivers = BTreeMap::from([(
+        "dev".to_owned(),
+        Arc::new(RecordingDriver::default()) as Arc<dyn ChatDriver>,
+    )]);
+    let identities = BTreeMap::from([(
+        "dev".to_owned(),
+        TransportIdentity {
+            user_id: Some("123".into()),
+            handle: Some("test_bot".into()),
+        },
+    )]);
+    let mut collector = crate::collection::Collector::new(&[], 4);
+    let mut sessions = tokio::task::JoinSet::new();
+    let mut member = burst_photo("");
+    member.transport_kind = dekopon_broker_protocol::ChatTransportKind::Telegram;
+    member.subject = ExternalSubject::telegram("123456").unwrap();
+    member.conversation = Conversation {
+        kind: ConversationKind::Thread,
+        container: None,
+        id: "-100123".into(),
+        thread: Some("42".into()),
+    };
+    member.native_group = Some("native-group".into());
+    member.reply = ReplyTarget::Telegram {
+        chat_id: -100123,
+        reply_to: Some(1),
+        message_thread_id: Some(42),
+    };
+    // Before an addressed lead, even a valid native member cannot wake the bot.
+    crate::dispatch(
+        &runner,
+        &routes,
+        &identities,
+        &drivers,
+        &[],
+        &mut sessions,
+        &mut collector,
+        member.clone(),
+    );
+    assert!(collector.deadline().is_none());
+    let mut lead = member.clone();
+    lead.text = "@test_bot edit these references".into();
+    crate::dispatch(
+        &runner,
+        &routes,
+        &identities,
+        &drivers,
+        &[],
+        &mut sessions,
+        &mut collector,
+        lead,
+    );
+    assert!(collector.deadline().is_some());
+    assert!(
+        !collector.is_native_continuation(1, &member),
+        "different bound route"
+    );
+    for axis in 0..3 {
+        let mut outsider = member.clone();
+        match axis {
+            0 => outsider.subject = ExternalSubject::telegram("654321").unwrap(),
+            1 => outsider.native_group = Some("other-group".into()),
+            _ => outsider.conversation.thread = Some("43".into()),
+        }
+        assert!(!collector.is_native_continuation(0, &outsider));
+        crate::dispatch(
+            &runner,
+            &routes,
+            &identities,
+            &drivers,
+            &[],
+            &mut sessions,
+            &mut collector,
+            outsider,
+        );
+    }
+    for id in [2, 3] {
+        member.message_id = id.to_string();
+        member.reply = ReplyTarget::Telegram {
+            chat_id: -100123,
+            reply_to: Some(id),
+            message_thread_id: Some(42),
+        };
+        crate::dispatch(
+            &runner,
+            &routes,
+            &identities,
+            &drivers,
+            &[],
+            &mut sessions,
+            &mut collector,
+            member.clone(),
+        );
+    }
+    assert!(sessions.is_empty(), "collection starts no effects");
+    let ready = collector.take_due(collector.deadline().unwrap());
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].assets.len(), 3);
+    assert_eq!(ready[0].constituents.len(), 3);
+    assert_eq!(
+        ready[0].reply,
+        ReplyTarget::Telegram {
+            chat_id: -100123,
+            reply_to: Some(1),
+            message_thread_id: Some(42)
+        }
+    );
+    assert!(
+        !collector.is_native_continuation(0, &member),
+        "sealed group cannot lend addressing"
+    );
+}
+
+#[test]
+fn asset_retention_config_default_custom_zero_and_invalid_values() {
+    let defaults: config::SessionsConfig = serde_json::from_value(json!({})).unwrap();
+    assert_eq!(defaults.asset_retention_bytes, 268_435_456);
+    assert_eq!(
+        config::SessionsConfig::default().asset_retention_bytes,
+        268_435_456
+    );
+    for bytes in [0, 1024, 536_870_912] {
+        let custom: config::SessionsConfig =
+            serde_json::from_value(json!({"assetRetentionBytes": bytes})).unwrap();
+        assert_eq!(custom.asset_retention_bytes, bytes);
+    }
+    for invalid in [json!(-1), json!("256MiB"), json!(null), json!(1.5)] {
+        assert!(
+            serde_json::from_value::<config::SessionsConfig>(
+                json!({"assetRetentionBytes":invalid})
+            )
+            .is_err()
+        );
+    }
+    assert!(
+        serde_json::from_value::<config::SessionsConfig>(json!({"assetRetentionByte":12})).is_err()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn generated_only_session_publishes_fetch_tool_and_reuses_result_before_next_turn() {
+    let directory = temporary();
+    let png = b"\x89PNG\r\n\x1a\nfirst generated image";
+    let (broker, mut observed) = stub_broker(directory.path(), vec![
+        ResponseEnvelope::capabilities(vec![capability("gpt-image.edit")], vec!["gpt-image".to_owned()]),
+        ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed", "capability":"gpt-image.edit", "input":{"prompt":"first"}})).unwrap()),
+        ResponseEnvelope::invocation(record_output(json!({"attachments":[{"mediaType":"image/png", "base64":STANDARD.encode(png)}]}))),
+        ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed", "capability":"gpt-image.edit", "input":{"prompt":"edit result", "images":["chat-asset:1"]}})).unwrap()),
+        ResponseEnvelope::invocation(record_output(json!({"attachments":[{"mediaType":"image/png", "base64":STANDARD.encode(b"\x89PNG\r\n\x1a\nsecond generated image") }]}))),
+    ]).await;
+    let models = ModelScript::new([
+        script_call("gpt-image edit --prompt first"),
+        AssistantTurn {
+            tool_calls: vec![ModelToolCall {
+                id: "generated-fetch".into(),
+                kind: "function".into(),
+                function: ModelFunctionCall {
+                    name: "fetch_chat_asset".into(),
+                    arguments: "{\"id\":1}".into(),
+                },
+            }],
+            ..answer("")
+        },
+        script_call("gpt-image edit --prompt 'edit result' --image chat-asset:1"),
+        answer("Two produced images."),
+    ]);
+    let mut model = model_config();
+    if let ModelConfig::OpenaiCompatible { modalities, .. } = &mut model {
+        *modalities = vec![crate::config::Modality::Image];
+    }
+    let mut route = persistent_route(model, window());
+    route.provider_attachments = 2;
+    route.chat_asset_inputs = Arc::from(vec!["gpt-image.edit".to_owned()]);
+    let driver = Arc::new(RecordingDriver::default());
+    run_session(
+        runner(broker, models.clone(), 4),
+        route,
+        message("produce then edit"),
+        driver.clone(),
+    )
+    .await;
+    assert_eq!(models.requests(), 4);
+    assert!(
+        !models
+            .tool_names(0)
+            .contains(&"fetch_chat_asset".to_owned())
+    );
+    assert!(
+        models
+            .tool_names(1)
+            .contains(&"fetch_chat_asset".to_owned())
+    );
+    assert!(tool_message(&models, 1).contains("chat-asset:1"));
+    for _ in 0..4 {
+        observed.recv().await.unwrap();
+    }
+    let BrokerRequest::Invoke { invocation, .. } = observed.recv().await.unwrap().request else {
+        panic!("second invocation")
+    };
+    assert_eq!(
+        invocation.input["images"][0],
+        format!("data:image/png;base64,{}", STANDARD.encode(png))
+    );
+    assert_eq!(driver.replies(), vec!["Two produced images.".to_owned()]);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn fatal_transport_supervision_bounds_the_drain_of_a_parked_session() {
     let directory = temporary();
@@ -12600,6 +13677,7 @@ async fn fatal_transport_supervision_bounds_the_drain_of_a_parked_session() {
                 terminal = crate::supervise_transports(&mut readers, std::future::pending()).await;
             },
             Duration::from_millis(50),
+            crate::collection::Collector::new(&[], 4),
         ),
     )
     .await

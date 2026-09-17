@@ -84,6 +84,8 @@ sessions:
   # Conversations tracked at once, across every persistent route. Reaching it evicts the least
   # recently used conversation rather than refusing a message.
   maxConversations: 1024
+  # Gateway-wide disk LRU budget. Zero refuses asset retention/delivery; text remains usable.
+  assetRetentionBytes: 268435456
 
 shutdownGraceMs: 120000
 

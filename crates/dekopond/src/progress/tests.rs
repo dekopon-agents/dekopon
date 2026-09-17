@@ -1520,3 +1520,152 @@ fn every_unrenderable_template_placeholder_is_reported_together() {
         "three mistakes are three refusals in one pass"
     );
 }
+
+/// Exercise the real local driver through the terminal policy, not a fake finalize refusal.
+#[tokio::test]
+async fn local_image_answers_fall_back_once_while_text_finalizes_in_place() {
+    use crate::transport::{ChatTransport, TransportEvent, local::LocalTransport};
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use serde_json::{Value, json};
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+    for stream in [false, true] {
+        for with_image in [false, true] {
+            use std::os::unix::fs::PermissionsExt as _;
+            let directory = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let path = directory.path().join("dev.sock");
+            let config = liveness(stream);
+            let mut transport =
+                LocalTransport::new("dev".to_owned(), path.clone(), config.settings);
+            transport.connect().await.unwrap();
+            let mut client = tokio::net::UnixStream::connect(path).await.unwrap();
+            client
+                .write_all(
+                    format!(
+                        "{}\n",
+                        json!({"subject": "tel.16034700182", "text": "hello"})
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let TransportEvent::Message(inbound) =
+                tokio::time::timeout(Duration::from_secs(2), transport.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            else {
+                panic!("message")
+            };
+            let (mut policy, sink) = ProgressPolicy::start(ProgressInputs {
+                driver: transport.driver(),
+                target: inbound.liveness.clone(),
+                reply: inbound.reply.clone(),
+                transport: "dev".to_owned(),
+                detail: ProgressDetail::Plain,
+                settings: config.settings,
+                keep_alive: config.keep_alive.clone(),
+                liveness: config,
+                cancellation: SessionCancellation::new(),
+                max_duration: None,
+            });
+            sink.emit(started());
+            if stream {
+                let text = recorded_delta();
+                sink.emit(ProgressEvent::TextDelta {
+                    turn: 1,
+                    cumulative_chars: text.as_str().chars().count(),
+                    text,
+                });
+            } else {
+                sink.emit(answered_with_tool(1));
+            }
+            let mut reader = BufReader::new(client);
+            let surface = if stream { "delta" } else { "progress" };
+            let mut lines = Vec::new();
+            let id = loop {
+                let mut line = String::new();
+                tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let line: Value = serde_json::from_str(&line).unwrap();
+                let id = line[surface]["id"].as_str().map(str::to_owned);
+                lines.push(line);
+                if let Some(id) = id {
+                    break id;
+                }
+            };
+            let png = b"\x89PNG\r\n\x1a\nlocal fidelity sentinel";
+            let reply = if with_image {
+                OutboundReply::with_images(
+                    "done",
+                    vec![
+                        dekopon_agent::attachment::GeneratedImage::from_png(png.to_vec()).unwrap(),
+                    ],
+                )
+            } else {
+                OutboundReply::text("done")
+            };
+            assert!(policy.terminal(Terminal::Answered(reply)).await);
+            // A marker queued after terminal completion bounds the collected output and catches
+            // duplicate final writes without relying on an arbitrary no-more-lines sleep.
+            transport
+                .driver()
+                .reply(&inbound.reply, OutboundReply::text("end marker"))
+                .await
+                .unwrap();
+            loop {
+                let mut line = String::new();
+                tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let line: Value = serde_json::from_str(&line).unwrap();
+                if line["reply"] == "end marker" {
+                    break;
+                }
+                lines.push(line);
+            }
+            let answers = lines
+                .iter()
+                .filter(|line| line["reply"] == "done")
+                .collect::<Vec<_>>();
+            assert_eq!(answers.len(), 1, "{lines:?}");
+            let answer = answers[0];
+            let deleted = lines
+                .iter()
+                .position(|line| line["progress"]["deleted"] == true);
+            if with_image {
+                assert!(answer.get("id").is_none(), "owned fallback, not finalize");
+                assert_eq!(answer["images"][0]["filename"], "generated-image.png");
+                assert_eq!(answer["images"][0]["mediaType"], "image/png");
+                assert_eq!(
+                    STANDARD
+                        .decode(answer["images"][0]["data"].as_str().unwrap())
+                        .unwrap(),
+                    png
+                );
+                if stream {
+                    assert!(deleted.is_none(), "append-only stream is preserved");
+                } else {
+                    let deleted = deleted.expect("progress removed before fallback");
+                    assert_eq!(lines[deleted]["progress"]["id"], id);
+                    assert!(
+                        deleted
+                            < lines
+                                .iter()
+                                .position(|line| line["reply"] == "done")
+                                .unwrap()
+                    );
+                }
+            } else {
+                assert_eq!(answer["id"], id);
+                assert!(answer.get("images").is_none());
+                assert!(deleted.is_none());
+            }
+        }
+    }
+}

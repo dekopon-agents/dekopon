@@ -24,7 +24,7 @@ use std::{
 };
 
 use dekopon_broker_host::{
-    BrokerHostError, BrokerHostLimits, BrokerProviderRegistry, CommandRunOutcome,
+    BrokerHostError, BrokerHostLimits, BrokerHostOptions, BrokerProviderRegistry, CommandRunOutcome,
 };
 use dekopon_capability::{
     AuthorizedInvocation, ExecutionConstraints, ProposedInvocation, broker::AuthorizationGate,
@@ -143,6 +143,168 @@ fn authorized(provider: &str, capability: CapabilityId, input: Value) -> Authori
 
 fn probe() -> PathBuf {
     provider_fixture("memory-reservation-probe-provider.wasm")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compiled_artifact_spans_distinguish_cold_warm_bypass_and_failure() {
+    let _sequential = SEQUENTIAL.lock().await;
+    let capture = capture();
+    capture.clear();
+    let directory = tempfile::tempdir().expect("cache");
+    let options = BrokerHostOptions {
+        cwasm_dir: Some(directory.path().to_owned()),
+        ..BrokerHostOptions::default()
+    };
+    let cold = BrokerProviderRegistry::load_with_options(
+        [probe()],
+        BrokerHostLimits::default(),
+        None,
+        &options,
+    )
+    .await
+    .expect("cold load");
+    assert!(recorded_value(
+        &capture,
+        "provider.compile",
+        "cache",
+        "miss"
+    ));
+    for stage in ["compile", "artifact_hash", "publish", "deserialize"] {
+        assert!(
+            recorded_value(&capture, "provider.load_stage", "stage", stage),
+            "missing {stage}: {}",
+            capture.spans_text()
+        );
+    }
+    assert!(
+        !recorded_value(&capture, "provider.load_stage", "stage", "verify"),
+        "a new artifact is hashed once, before publication"
+    );
+    assert_eq!(
+        recorded(&capture, "provider.load_stage", "elapsed_us").len(),
+        4
+    );
+    assert_eq!(
+        recorded(&capture, "provider.compile", "source_verify_us").len(),
+        1
+    );
+    assert!(recorded(&capture, "provider.compile", "cwasm_bytes")[0] > 0);
+    assert!(recorded_value(
+        &capture,
+        "provider.registry_load",
+        "outcome",
+        "ok"
+    ));
+    drop(cold);
+
+    capture.clear();
+    let warm = BrokerProviderRegistry::load_with_options(
+        [probe()],
+        BrokerHostLimits::default(),
+        None,
+        &options,
+    )
+    .await
+    .expect("warm load");
+    assert!(recorded_value(&capture, "provider.compile", "cache", "hit"));
+    for stage in ["verify", "deserialize"] {
+        assert!(recorded_value(
+            &capture,
+            "provider.load_stage",
+            "stage",
+            stage
+        ));
+    }
+    assert!(!recorded_value(
+        &capture,
+        "provider.load_stage",
+        "stage",
+        "compile"
+    ));
+    assert_eq!(
+        recorded(&capture, "provider.load_stage", "elapsed_us").len(),
+        2
+    );
+    capture.clear();
+    warm.run_command("recall", &["recall".to_owned()], None)
+        .await
+        .expect("mapped command");
+    assert!(recordings(&capture, "provider.compile").is_empty());
+    assert!(
+        recordings(&capture, "provider.load_stage").is_empty(),
+        "no verification on calls"
+    );
+    drop(warm);
+
+    let object = std::fs::read_dir(directory.path().join("v1/sha256"))
+        .expect("objects")
+        .next()
+        .expect("object")
+        .expect("entry")
+        .path();
+    let mut bytes = std::fs::read(&object).expect("bytes");
+    bytes[0] ^= 1;
+    std::fs::write(&object, bytes).expect("damage after unmapping");
+    capture.clear();
+    let error = BrokerProviderRegistry::load_with_options(
+        [probe()],
+        BrokerHostLimits::default(),
+        None,
+        &options,
+    )
+    .await
+    .expect_err("refuse corrupt cache");
+    assert!(
+        dekopon_core::error_chain(&error).contains("SHA-256 mismatch"),
+        "{error:?}"
+    );
+    assert!(recorded_value(
+        &capture,
+        "provider.load_stage",
+        "outcome",
+        "error"
+    ));
+    assert!(recorded_value(
+        &capture,
+        "provider.registry_load",
+        "outcome",
+        "error"
+    ));
+    assert!(!recorded_value(
+        &capture,
+        "provider.load_stage",
+        "stage",
+        "compile"
+    ));
+    assert!(!recorded_value(
+        &capture,
+        "provider.load_stage",
+        "stage",
+        "deserialize"
+    ));
+
+    capture.clear();
+    BrokerProviderRegistry::load([probe()], BrokerHostLimits::default())
+        .await
+        .expect("explicit no-cache path");
+    assert!(recorded_value(
+        &capture,
+        "provider.compile",
+        "cache",
+        "bypass"
+    ));
+    assert!(recorded_value(
+        &capture,
+        "provider.load_stage",
+        "stage",
+        "compile"
+    ));
+    assert!(!recorded_value(
+        &capture,
+        "provider.load_stage",
+        "stage",
+        "verify"
+    ));
 }
 
 /// Loading a command-word provider proves the export statically instead of instantiating twice.

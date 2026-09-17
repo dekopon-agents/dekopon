@@ -233,6 +233,10 @@ async fn managed_provider_configuration_is_strict_and_network_free() {
         vec![fs::canonicalize(&blob).expect("canonical blob")]
     );
     assert_eq!(resolved.locked_providers.as_ref().map(Vec::len), Some(1));
+    assert_eq!(
+        resolved.host_options.cwasm_dir,
+        Some(store.canonicalize().expect("canonical store").join("cwasm"))
+    );
 
     // This fixture directory is private, so the server's own UID is the only peer a socket bound
     // under it could admit; `run` refuses the other two.
@@ -241,7 +245,47 @@ async fn managed_provider_configuration_is_strict_and_network_free() {
     write_config(&path, &runnable);
     super::run(&path, async {})
         .await
-        .expect("daemon compiles and describes the exact locked buffer before binding");
+        .expect("daemon populates the default mapped cache before binding");
+    super::run(&path, async {})
+        .await
+        .expect("warm daemon loads mapped artifacts");
+
+    let object = fs::read_dir(store.join("cwasm/v1/sha256"))
+        .expect("compiled objects")
+        .next()
+        .expect("one object")
+        .expect("entry")
+        .path();
+    let mut damaged = fs::read(&object).expect("compiled bytes");
+    damaged[0] ^= 1;
+    fs::write(&object, damaged).expect("corrupt only after both brokers have exited");
+    let error = super::run(&path, async {})
+        .await
+        .expect_err("cache corruption is fatal");
+    assert!(
+        format!("{error:?}").contains("compiled SHA-256 mismatch"),
+        "{error:?}"
+    );
+    runnable["compileOnLoad"] = json!(true);
+    write_config(&path, &runnable);
+    let bypass = config::load(&path, uid)
+        .await
+        .expect("explicit bypass config");
+    assert_eq!(bypass.host_options.cwasm_dir, None);
+    super::run(&path, async {})
+        .await
+        .expect("operator bypass ignores corrupt cwasm");
+
+    let mut retired = document.clone();
+    retired["compileCachePath"] = json!("old-cache");
+    write_config(&path, &retired);
+    let error = config::load(&path, uid)
+        .await
+        .expect_err("retired cache setting is not ignored");
+    assert!(
+        format!("{error:?}").contains("compileCachePath"),
+        "{error:?}"
+    );
 
     let mut mixed = document.clone();
     mixed["providers"] = json!(["cli-probe.wasm"]);
@@ -960,23 +1004,13 @@ async fn concurrent_guest_memory_budget_is_resolved_and_validated() {
     write_owner_only(&policies, POLICIES.as_bytes());
 
     let mut document = attested_document(uid);
-    document["compileCachePath"] = json!("compile-cache");
+    document["compileOnLoad"] = json!(true);
     document["hostLimits"] = host_limits_document(Some(256 * 1024 * 1024));
     write_config(&path, &document);
     let resolved = config::load(&path, uid)
         .await
         .expect("an aggregate ceiling above one store loads");
-    assert_eq!(
-        resolved.host_options.compile_cache_dir.as_deref(),
-        Some(
-            directory
-                .path()
-                .canonicalize()
-                .expect("canonical fixture directory")
-                .join("compile-cache")
-                .as_path()
-        )
-    );
+    assert_eq!(resolved.host_options.cwasm_dir, None);
     assert_eq!(
         resolved.host_options.max_total_memory_bytes,
         Some(256 * 1024 * 1024)

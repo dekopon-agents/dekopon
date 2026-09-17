@@ -422,9 +422,9 @@ struct ActiveSession {
 
 /// What a cancel request found.
 ///
-/// Four answers rather than a bool because the caller acts differently on each: a stop word with no
-/// session behind it is an ordinary message to answer, another person's press is acknowledged and
-/// ignored, and a session that already finished needs nothing done about it.
+/// A stop word with no session behind it is an ordinary message to answer. An already-cancelled
+/// session owns its stopped ending; a normally completing session cannot acknowledge a pending
+/// batch cancelled alongside it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CancelOutcome {
     /// This request won the race; the session's own policy task writes the ending.
@@ -433,8 +433,10 @@ pub(crate) enum CancelOutcome {
     NoSession,
     /// A session is running, but somebody else started it.
     OtherSubject,
-    /// The session had already finished or already been stopped.
-    AlreadyEnded,
+    /// The session had already been stopped and owns its stopped ending.
+    AlreadyCancelled,
+    /// The session claimed normal completion and will not deliver a stopped ending.
+    Completing,
 }
 
 impl CancelOutcome {
@@ -447,7 +449,7 @@ impl CancelOutcome {
             Self::Cancelled => None,
             Self::NoSession => Some("no-session"),
             Self::OtherSubject => Some("other-subject"),
-            Self::AlreadyEnded => Some("already-ended"),
+            Self::AlreadyCancelled | Self::Completing => Some("already-ended"),
         }
     }
 }
@@ -520,8 +522,10 @@ impl ActiveSessions {
             .cancel(CancelSource::User { via: request.via })
         {
             CancelOutcome::Cancelled
+        } else if session.cancellation.is_cancelled() {
+            CancelOutcome::AlreadyCancelled
         } else {
-            CancelOutcome::AlreadyEnded
+            CancelOutcome::Completing
         }
     }
 }
@@ -603,31 +607,41 @@ fn attributed_prompt(subject: &dekopon_core::ExternalSubject, text: &str) -> Str
 }
 
 /// Runs one routed message end to end, answering unless an optional continuation declines.
-pub(crate) async fn run_session(
+pub(crate) fn run_session(
     runner: Arc<SessionRunner>,
     route: BoundRoute,
     mut message: InboundMessage,
     driver: Arc<dyn ChatDriver>,
-) {
-    // The trace already exists: the transport opened `transport.receive` when the envelope arrived,
-    // which is what puts the acknowledgment and the routing decision in front of this span rather
-    // than outside the trace entirely. Taking the handle out of the message parents this span under
-    // it and closes it here, so `transport.receive` measures receipt and dispatch instead of the
-    // whole session it started.
-    let span = {
-        let received = std::mem::replace(&mut message.receive_span, tracing::Span::none());
-        tracing::info_span!(
-            parent: &received,
-            "gateway.message",
-            transport = %message.transport,
-            agent = %route.agent,
-            outcome = tracing::field::Empty
-        )
-    };
-    let outcome = execute(runner, route, message, driver)
-        .instrument(span.clone())
-        .await;
-    span.record("outcome", outcome);
+) -> impl std::future::Future<Output = ()> + Send {
+    // Construct before spawn so even a task aborted before its first poll disposes its receipts.
+    let receipts = crate::collection::Dispositions(message.constituents.clone());
+    async move {
+        // The trace already exists: the transport opened `transport.receive` when the envelope arrived,
+        // which is what puts the acknowledgment and the routing decision in front of this span rather
+        // than outside the trace entirely. Taking the handle out of the message parents this span under
+        // it and closes it here, so `transport.receive` measures receipt and dispatch instead of the
+        // whole session it started.
+        let span = {
+            let received = std::mem::replace(&mut message.receive_span, tracing::Span::none());
+            tracing::info_span!(
+                parent: &received,
+                "gateway.message",
+                transport = %message.transport,
+                agent = %route.agent,
+                outcome = tracing::field::Empty,
+                batch.members = tracing::field::Empty
+            )
+        };
+        span.record("batch.members", receipts.0.len());
+        for receipt in &receipts.0 {
+            dekopon_telemetry::link_span(&span, receipt);
+        }
+        let outcome = execute(runner, route, message, driver)
+            .instrument(span.clone())
+            .await;
+        span.record("outcome", outcome);
+        receipts.finish(outcome);
+    }
 }
 
 async fn execute(
@@ -636,19 +650,9 @@ async fn execute(
     message: InboundMessage,
     driver: Arc<dyn ChatDriver>,
 ) -> &'static str {
-    // Who said it and what they said, on the log record rather than the span: chat text is
-    // unbounded and span attributes are the wrong container for it. A person talking to a Dekopon
-    // agent is talking to its operator, and the operator's trace records the inbound message.
-    tracing::info!(
-        target: "dekopond::audit",
-        {
-            audit.event = "gateway.message.received",
-            subject = %message.subject,
-            channel = message.conversation.id.as_str(),
-            text = message.text.as_str(),
-        },
-        "gateway message received"
-    );
+    if message.constituents.is_empty() {
+        crate::collection::record_received(&message);
+    }
 
     // One admission slot per conversation, keyed on the same value everything else keys on: the
     // registry, the cancel request, and the memory key are all `Conversation::key()`, so a stop
@@ -656,7 +660,7 @@ async fn execute(
     let key = (message.transport.clone(), message.conversation.key());
     let Some(admission) = runner.gate.admit(key) else {
         tracing::info!(event = "gateway_session_rejected", reason = "busy");
-        if runner.reply_on_busy {
+        if runner.reply_on_busy || !message.constituents.is_empty() {
             answer(&driver, &message, BUSY_REPLY).await;
         }
         return "busy";
@@ -883,7 +887,8 @@ async fn session(
     let leg = leg.with_cancel_signal(cancellation.signal());
     // Request-local and dropped with the session: an attachment the route cannot deliver never
     // becomes bytes this process holds, and a cancelled or failed session drops the slot unread.
-    let attachments = Arc::new(ReplyAttachments::new(route.provider_attachments));
+    let attachments =
+        Arc::new(ReplyAttachments::new(route.provider_attachments).with_store(assets.clone()));
     let leg = if route.provider_attachments > 0 {
         leg.with_provider_attachments(Arc::clone(&attachments))
     } else {
@@ -1416,7 +1421,11 @@ fn memory_record_category(error: &MemoryRecordFailure) -> &'static str {
 /// The outbound bound is applied here, once, rather than in each transport: a model writes this
 /// text, every chat service rejects or mangles an oversized post, and one bound at the session
 /// boundary is one place to read rather than three places to keep in agreement.
-async fn answer(driver: &Arc<dyn ChatDriver>, message: &InboundMessage, text: &str) -> bool {
+pub(crate) async fn answer(
+    driver: &Arc<dyn ChatDriver>,
+    message: &InboundMessage,
+    text: &str,
+) -> bool {
     match driver
         .reply(&message.reply, OutboundReply::text(bound_outbound(text)))
         .await

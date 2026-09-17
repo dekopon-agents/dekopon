@@ -4,7 +4,8 @@
 //! [`AuthorizedInvocation`], links only the project-owned buffered HTTP and namespace-bound
 //! storage interfaces, and applies the invocation's exact host-call constraints in a fresh store.
 
-#![forbid(unsafe_code)]
+// The sole exception is cwasm::deserialize, after trusted-artifact verification.
+#![deny(unsafe_code)]
 
 use std::{
     collections::BTreeMap,
@@ -40,6 +41,7 @@ use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Engine, Store};
 
 mod clock;
+mod cwasm;
 mod http;
 mod memory;
 mod metadata;
@@ -169,12 +171,12 @@ impl Default for BrokerHostLimits {
 /// rotate every stored chat-memory namespace.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrokerHostOptions {
-    /// Absolute directory for Wasmtime's content-addressed compilation cache.
+    /// Broker-owned persistent directory for immutable, mmap-backed compiled artifacts.
     ///
-    /// `None` recompiles every provider with Cranelift at every start. A deployment whose pods roll
-    /// inside a startup-probe budget wants this pointed at durable broker-owned state; the
-    /// directory must be writable only by the broker, because its contents are compiled code.
-    pub compile_cache_dir: Option<PathBuf>,
+    /// `None` compiles from Wasm without a cache. Managed broker configurations derive this
+    /// from the provider store unless `compileOnLoad` is true. The operator must not modify
+    /// mapped files while the registry lives; hashes are verified once at registry startup.
+    pub cwasm_dir: Option<PathBuf>,
     /// Aggregate guest linear memory reservable across concurrently live stores.
     ///
     /// [`BrokerHostLimits::max_memory_bytes`] bounds one invocation; this bounds all of them at
@@ -192,7 +194,7 @@ pub struct BrokerHostOptions {
 impl Default for BrokerHostOptions {
     fn default() -> Self {
         Self {
-            compile_cache_dir: None,
+            cwasm_dir: None,
             max_total_memory_bytes: Some(DEFAULT_MAX_TOTAL_MEMORY_BYTES),
             plaintext_hosts: PlaintextHosts::default(),
         }
@@ -426,6 +428,8 @@ impl Drop for MemoryReservation {
 
 struct Runtime {
     engine: Engine,
+    engine_key: String,
+    cwasm: Option<cwasm::Cache>,
     // One linker for the whole process. Its contents are fixed by the generated bindings, so
     // rebuilding it per call only re-registered the same host functions and forced every
     // instantiation to resolve imports from scratch.
@@ -447,19 +451,20 @@ impl Runtime {
             });
         }
         let config = host::config();
-        let engine = host::engine(config, options.compile_cache_dir.as_deref()).map_err(
-            |error| match error {
-                EngineError::CompileCache { path, source } => {
-                    BrokerHostError::CompileCache { path, source }
-                }
-                EngineError::Engine { source } => BrokerHostError::Engine { source },
-            },
-        )?;
+        let engine = host::engine(config).map_err(|error| match error {
+            EngineError::Engine { source } => BrokerHostError::Engine { source },
+        })?;
+        let cwasm = options
+            .cwasm_dir
+            .clone()
+            .map(|root| cwasm::Cache::new(root, &engine));
         let mut linker = Linker::new(&engine);
         bindings::Provider::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
             .map_err(|source| BrokerHostError::Linker { source })?;
         Ok(Self {
+            engine_key: cwasm::compatibility_key(&engine),
             engine,
+            cwasm,
             linker,
             limits,
             memory_budget: options.max_total_memory_bytes.map(|maximum| {
@@ -593,13 +598,51 @@ impl fmt::Debug for BrokerWasmProvider {
 
 /// Compiles one provider component, off the asynchronous runtime.
 ///
-/// Everything here is CPU-bound Cranelift work with no `await` in it, which is why the registry
-/// hands it to the blocking pool: three providers on a four-core host should not compile one at a
-/// time while the socket stays unbound.
+/// Source verification, compilation, and mmap loading stay off Tokio's async workers.
 fn compile_component(
     runtime: &Runtime,
     source: ProviderSource,
 ) -> Result<CompiledComponent, BrokerHostError> {
+    let span = tracing::info_span!(
+        "provider.compile",
+        path = %source.path.display(),
+        artifact_bytes = tracing::field::Empty,
+        artifact_sha256 = tracing::field::Empty,
+        cache = if runtime.cwasm.is_some() { "lookup" } else { "bypass" },
+        engine_key = %runtime.engine_key,
+        cwasm_bytes = tracing::field::Empty,
+        cwasm_sha256 = tracing::field::Empty,
+        source_verify_us = tracing::field::Empty,
+        cache_wait_us = tracing::field::Empty,
+        elapsed_us = tracing::field::Empty,
+        elapsed_ms = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+    );
+    span.in_scope(|| {
+        let started = Instant::now();
+        let mut result = prepare_component(runtime, source);
+        let elapsed_us = cwasm::micros(started);
+        let elapsed_ms = elapsed_us / 1000;
+        if let Ok(compiled) = &mut result {
+            compiled.compile_ms = elapsed_ms;
+        }
+        let outcome = if result.is_ok() { "ok" } else { "error" };
+        span.record("elapsed_us", elapsed_us);
+        span.record("elapsed_ms", elapsed_ms);
+        span.record("outcome", outcome);
+        match &result {
+            Ok(_) => tracing::info!(elapsed_us, outcome, "provider component load finished"),
+            Err(error) => tracing::error!(elapsed_us, outcome, error = %dekopon_core::bounded_attribute(&dekopon_core::error_chain(error)), "provider component load failed"),
+        }
+        result
+    })
+}
+
+fn prepare_component(
+    runtime: &Runtime,
+    source: ProviderSource,
+) -> Result<CompiledComponent, BrokerHostError> {
+    let started = Instant::now();
     // Open and read once. A digest taken from a second read cannot prove it describes the bytes
     // Cranelift consumed. Locked metadata is checked on this descriptor before allocation, then the
     // read itself is capped at one byte beyond the applicable limit so concurrent growth cannot
@@ -676,26 +719,34 @@ fn compile_component(
             });
         }
     }
+    let span = tracing::Span::current();
+    span.record("artifact_bytes", artifact.bytes);
+    span.record("artifact_sha256", &artifact.sha256);
+    let source_verify_us = cwasm::micros(started);
+    span.record("source_verify_us", source_verify_us);
+    tracing::info!(
+        source_verify_us,
+        artifact_bytes = artifact.bytes,
+        "provider source verified"
+    );
     let expected_provider_id = source.expected.map(|expected| expected.provider_id);
     let source = source.path;
-    // Compilation happens once per provider at startup rather than per invocation, so this span
-    // answers "why was the broker slow to become ready", not "why was that call slow".
-    let compile = tracing::info_span!(
-        "provider.compile",
-        path = %source.display(),
-        artifact_bytes = artifact.bytes,
-        elapsed_ms = tracing::field::Empty,
-    );
-    let started = Instant::now();
-    let component = compile
-        .in_scope(|| Component::new(&runtime.engine, &bytes))
+    let component = match &runtime.cwasm {
+        Some(cache) => cache
+            .load(&runtime.engine, &bytes, &artifact.sha256)
+            .map_err(|error| BrokerHostError::CompiledArtifact {
+                path: source.clone(),
+                source: error,
+            })?,
+        None => cwasm::stage("compile", artifact.bytes, || {
+            Component::new(&runtime.engine, &bytes)
+        })
         .map_err(|error| BrokerHostError::Compile {
             path: source.clone(),
             source: error,
-        })?;
-    let elapsed = started.elapsed();
-    let compile_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-    compile.record("elapsed_ms", compile_ms);
+        })?,
+    };
+    drop(bytes);
     let command_export = command_export(&runtime.engine, &component);
     let pre = runtime
         .linker
@@ -710,7 +761,7 @@ fn compile_component(
         expected_provider_id,
         artifact_bytes: artifact.bytes,
         artifact_sha256: artifact.sha256,
-        compile_ms,
+        compile_ms: 0, // Filled by the outer load span, including source verification and linking.
         pre,
         command_export,
     })
@@ -1218,50 +1269,66 @@ impl BrokerProviderRegistry {
         I: IntoIterator<Item = ProviderSource>,
     {
         let sources = sources.into_iter().collect::<Vec<_>>();
-        if sources.is_empty() {
-            return Err(BrokerHostError::NoProviders);
-        }
-        let runtime = Arc::new(Runtime::new(limits, options)?);
-        // Cranelift is the whole of a cold start and it is pure CPU, so every provider is
-        // dispatched at once instead of one core compiling three components while the socket stays
-        // unbound. The results are consumed in source order below, so the conflict report and the
-        // first reported failure are exactly what the serial load produced.
-        let compiling = sources
-            .iter()
-            .map(|source| {
-                let runtime = Arc::clone(&runtime);
-                let source = source.clone();
-                tokio::task::spawn_blocking(move || compile_component(&runtime, source))
-            })
-            .collect::<Vec<_>>();
-        let mut providers = Vec::with_capacity(sources.len());
-        // Every conflict, then one failure. Returning on the first would make fixing a provider
-        // directory take one restart per mistake; an operator should see the whole picture once.
-        let mut scan = ConflictScan::new();
-        for (source, compiling) in sources.into_iter().zip(compiling) {
-            // A compilation task that panicked used to report itself as a fabricated "did not
-            // complete", sending an operator to look for a truncated artifact. The join failure
-            // says which it was — a panic and its message, or a cancellation — so it is kept as
-            // the cause rather than replaced.
-            let compiled = compiling.await.map_err(|join| BrokerHostError::Compile {
-                path: source.path,
-                source: wasmtime::Error::new(join),
-            })??;
-            let provider = BrokerWasmProvider::load(Arc::clone(&runtime), compiled).await?;
-            scan.record(&provider.manifest, providers.len());
-            providers.push(provider);
-        }
+        let span = tracing::info_span!(
+            "provider.registry_load",
+            providers = sources.len(),
+            mmap = options.cwasm_dir.is_some(),
+            elapsed_us = tracing::field::Empty,
+            outcome = tracing::field::Empty
+        );
+        let started = Instant::now();
+        let result = async {
+            if sources.is_empty() {
+                return Err(BrokerHostError::NoProviders);
+            }
+            let runtime = Arc::new(Runtime::new(limits, options)?);
+            // Load one component at a time, off Tokio. This bounds compiler/source working
+            // memory and stops scheduling work on the first failure; no detached startup jobs
+            // continue writing the cache after refusal. Cranelift may still parallelize within
+            // a component. Carry the registry span into the blocking task.
+            let mut providers = Vec::with_capacity(sources.len());
+            // Every conflict, then one failure. Returning on the first would make fixing a provider
+            // directory take one restart per mistake; an operator should see the whole picture once.
+            let mut scan = ConflictScan::new();
+            for source in sources {
+                let task_runtime = Arc::clone(&runtime);
+                let task_source = source.clone();
+                let span = tracing::Span::current();
+                let compiling = tokio::task::spawn_blocking(move || {
+                    span.in_scope(|| compile_component(&task_runtime, task_source))
+                });
+                // A compilation task that panicked used to report itself as a fabricated "did not
+                // complete", sending an operator to look for a truncated artifact. The join failure
+                // says which it was — a panic and its message, or a cancellation — so it is kept as
+                // the cause rather than replaced.
+                let compiled = compiling.await.map_err(|join| BrokerHostError::Compile {
+                    path: source.path,
+                    source: wasmtime::Error::new(join),
+                })??;
+                let provider = BrokerWasmProvider::load(Arc::clone(&runtime), compiled).await?;
+                scan.record(&provider.manifest, providers.len());
+                providers.push(provider);
+            }
 
-        let routes = scan
-            .finish()
-            .map_err(|report| BrokerHostError::ConflictingProviders {
-                report: Box::new(report),
-            })?;
-        Ok(Self {
-            providers,
-            routes,
-            storage_host,
-        })
+            let routes = scan
+                .finish()
+                .map_err(|report| BrokerHostError::ConflictingProviders {
+                    report: Box::new(report),
+                })?;
+            Ok(Self {
+                providers,
+                routes,
+                storage_host,
+            })
+        }
+        .instrument(span.clone())
+        .await;
+        let elapsed_us = cwasm::micros(started);
+        let outcome = if result.is_ok() { "ok" } else { "error" };
+        span.record("elapsed_us", elapsed_us);
+        span.record("outcome", outcome);
+        span.in_scope(|| tracing::info!(elapsed_us, outcome, "provider registry load finished"));
+        result
     }
 
     /// Returns each provider's command words, in load order.
@@ -1905,10 +1972,10 @@ pub enum BrokerHostError {
         #[source]
         source: std::io::Error,
     },
-    /// The persistent compilation cache directory could not be prepared.
-    #[error("could not open the broker provider compilation cache at {}", path.display())]
-    CompileCache {
-        /// Configured cache directory.
+    /// A compiled artifact could not be built, verified, published, or mapped. No fallback.
+    #[error("compiled artifact load failed for {}; set compileOnLoad: true to bypass the cwasm cache", path.display())]
+    CompiledArtifact {
+        /// Provider source path.
         path: PathBuf,
         /// Wasmtime error.
         #[source]
