@@ -27,7 +27,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::{display::Base64Display, engine::general_purpose::STANDARD};
 use dekopon_agent::CancelVia;
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, ConversationKind};
 use dekopon_core::ExternalSubject;
@@ -153,9 +153,8 @@ impl LocalTransport {
             let mut reader = BufReader::new(reader).take(MAX_LINE_BYTES);
             let writes = tokio::spawn(async move {
                 while let Some(reply) = outbound_receive.recv().await {
-                    let line = format!("{}\n", reply.line);
-                    let accepted = writer.write_all(line.as_bytes()).await.is_ok()
-                        && writer.flush().await.is_ok();
+                    let accepted =
+                        writer.write_all(&reply.line).await.is_ok() && writer.flush().await.is_ok();
                     #[allow(
                         clippy::let_underscore_must_use,
                         reason = "a oneshot send fails only when the writer's caller stopped \
@@ -377,8 +376,47 @@ pub(crate) struct LocalDriver {
 }
 
 struct LocalWrite {
-    line: String,
+    /// The rendered line including its terminator, so nothing copies it again to add one.
+    line: Vec<u8>,
     ack: oneshot::Sender<bool>,
+}
+
+/// The answer line: the text, the message it replaced when it replaced one, and the attachments.
+#[derive(serde::Serialize)]
+struct AnswerLine<'a> {
+    reply: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    images: Vec<AnswerImage<'a>>,
+}
+
+/// One attachment on that line, in the shape this transport has always written.
+#[derive(serde::Serialize)]
+struct AnswerImage<'a> {
+    filename: &'a str,
+    #[serde(rename = "mediaType")]
+    media_type: &'static str,
+    data: Base64Data<'a>,
+}
+
+/// Base64 written as it is encoded rather than built first.
+///
+/// One 8 MiB image used to exist as its raw bytes, an encoded `String`, a copy of that string
+/// inside a `Value`, and the rendered line, all at the same time. Serializing through `collect_str`
+/// puts the encoding straight into the line's buffer, and the line is the only copy of it.
+struct Base64Data<'a>(&'a [u8]);
+
+impl std::fmt::Display for Base64Data<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", Base64Display::new(self.0, &STANDARD))
+    }
+}
+
+impl serde::Serialize for Base64Data<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
 }
 
 impl LocalDriver {
@@ -407,7 +445,10 @@ impl LocalDriver {
                   LocalWrite this call just built, and oneshot::error::RecvError is a unit struct \
                   meaning the writer task dropped the acknowledgement"
     )]
-    async fn emit(&self, connection: u64, line: &Value) -> Result<(), TransportError> {
+    async fn emit<T>(&self, connection: u64, line: &T) -> Result<(), TransportError>
+    where
+        T: serde::Serialize + ?Sized,
+    {
         let sender = self
             .connections
             .lock()
@@ -417,12 +458,16 @@ impl LocalDriver {
         let Some(sender) = sender else {
             return Err(TransportError::Closed);
         };
+        #[allow(
+            clippy::map_err_ignore,
+            reason = "every line this transport writes is a serde_json::Value or one of the \
+                      structs above, none of which holds a non-string map key or a non-finite \
+                      float, so serialization has no failure to report"
+        )]
+        let line = super::compact_json(line, b"\n").map_err(|_| TransportError::Response)?;
         let (ack, received) = oneshot::channel();
         sender
-            .send(LocalWrite {
-                line: line.to_string(),
-                ack,
-            })
+            .send(LocalWrite { line, ack })
             .map_err(|_| TransportError::Closed)?;
         if received.await.map_err(|_| TransportError::Closed)? {
             Ok(())
@@ -457,30 +502,23 @@ impl LocalDriver {
     }
 
     /// The answer line, naming the message it landed in when it replaced one in place.
-    fn answer(
-        text: &str,
-        images: &[super::hydration::HydratedImage],
-        message: Option<&str>,
-    ) -> Value {
-        let mut response = json!({ "reply": text });
-        if let Some(id) = message {
-            response["id"] = Value::String(id.to_owned());
+    fn answer<'a>(
+        text: &'a str,
+        images: &'a [super::hydration::HydratedImage],
+        message: Option<&'a str>,
+    ) -> AnswerLine<'a> {
+        AnswerLine {
+            reply: text,
+            id: message,
+            images: images
+                .iter()
+                .map(|image| AnswerImage {
+                    filename: &image.filename,
+                    media_type: image.media_type,
+                    data: Base64Data(&image.bytes),
+                })
+                .collect(),
         }
-        if !images.is_empty() {
-            response["images"] = Value::Array(
-                images
-                    .iter()
-                    .map(|image| {
-                        json!({
-                            "filename": image.filename,
-                            "mediaType": image.media_type,
-                            "data": STANDARD.encode(&image.bytes),
-                        })
-                    })
-                    .collect(),
-            );
-        }
-        response
     }
 
     /// Turns a progress or stream message into the answer, under the same identifier.
@@ -899,7 +937,7 @@ mod unit_tests {
                 recorded
                     .lock()
                     .expect("recorded lines")
-                    .push(serde_json::from_str::<Value>(&write.line).expect("a JSON line"));
+                    .push(serde_json::from_slice::<Value>(&write.line).expect("a JSON line"));
                 #[allow(
                     clippy::let_underscore_must_use,
                     reason = "the acknowledgement fails only when the call under test stopped \

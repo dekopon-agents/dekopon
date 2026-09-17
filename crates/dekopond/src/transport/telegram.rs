@@ -978,7 +978,7 @@ impl ChatDriver for TelegramDriver {
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
         let OutboundReply { text, images } = reply;
-        let images = super::hydration::hydrate_images(images).await?;
+        let mut images = super::hydration::ImageQueue::new(images);
         let ReplyTarget::Telegram {
             chat_id,
             reply_to,
@@ -990,10 +990,16 @@ impl ChatDriver for TelegramDriver {
         let (chat_id, reply_to, message_thread_id) = (*chat_id, *reply_to, *message_thread_id);
         if !images.is_empty() {
             // One `sendPhoto` per attachment; Telegram has no multi-attachment message that also
-            // carries a caption the way a person expects to read it.
+            // carries a caption the way a person expects to read it. Each is read immediately
+            // before its own send and dropped after it.
             let caption_fits = text.encode_utf16().count() <= MAX_PHOTO_CAPTION_CHARS;
             let mut accepted = false;
-            for (index, image) in images.into_iter().enumerate() {
+            while let Some(read) = images.next().await {
+                let (index, image) = match read {
+                    Ok(read) => read,
+                    Err(_) if accepted => return Err(TransportError::PartialDelivery),
+                    Err(error) => return Err(error),
+                };
                 let caption = (index == 0 && caption_fits).then_some(text.as_str());
                 match self
                     .send_photo(chat_id, reply_to, message_thread_id, caption, image)

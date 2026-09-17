@@ -887,7 +887,7 @@ impl ChatDriver for SlackReplier {
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
         let OutboundReply { text, images } = reply;
-        let images = super::hydration::hydrate_images(images).await?;
+        let images = super::hydration::ImageQueue::new(images);
         let ReplyTarget::Slack { channel, thread_ts } = target else {
             return Err(TransportError::Response);
         };
@@ -1387,15 +1387,23 @@ impl SlackReplier {
     /// The service-selected upload URL receives only image bytes; the bot token returns to the fixed
     /// Web API origin for completion. The answer text rides the first upload's `initial_comment`, so
     /// a reply with several attachments still posts one comment rather than repeating itself.
+    ///
+    /// Each attachment is read immediately before its own upload and dropped after it, so a reply
+    /// carrying several never holds more than the one on the wire.
     async fn upload_attachments(
         &self,
         channel: String,
         thread_ts: Option<String>,
         text: String,
-        images: Vec<super::hydration::HydratedImage>,
+        mut images: super::hydration::ImageQueue,
     ) -> Result<(), TransportError> {
         let mut accepted = false;
-        for (index, image) in images.into_iter().enumerate() {
+        while let Some(read) = images.next().await {
+            let (index, image) = match read {
+                Ok(read) => read,
+                Err(_) if accepted => return Err(TransportError::PartialDelivery),
+                Err(error) => return Err(error),
+            };
             let comment = (index == 0)
                 .then_some(text.as_str())
                 .filter(|text| !text.is_empty());

@@ -715,6 +715,43 @@ pub(crate) fn asset_buffer(declared: Option<u64>, limit: usize) -> Vec<u8> {
     Vec::with_capacity(hint)
 }
 
+/// Renders one value as compact JSON into a buffer sized by a counting pass, with `suffix` after
+/// it.
+///
+/// `serde_json::to_string` grows its buffer by doubling, so a line carrying one base64 image held
+/// twice what it carried. Counting first costs a second serialization pass and no allocation at
+/// all, and the caller's line terminator is appended into the same exact buffer rather than into a
+/// second one.
+///
+/// # Errors
+///
+/// Returns whatever the value's own `Serialize` reported.
+pub(crate) fn compact_json<T>(value: &T, suffix: &[u8]) -> Result<Vec<u8>, serde_json::Error>
+where
+    T: serde::Serialize + ?Sized,
+{
+    let mut counter = ByteCounter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    let mut buffer = Vec::with_capacity(counter.0.saturating_add(suffix.len()));
+    serde_json::to_writer(&mut buffer, value)?;
+    buffer.extend_from_slice(suffix);
+    Ok(buffer)
+}
+
+/// Counts the bytes a serialization writes without keeping any of them.
+struct ByteCounter(usize);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buffer.len());
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Makes room for one more chunk without letting the buffer grow past `limit`.
 ///
 /// `Vec` grows by doubling, so an 8 MiB image accumulated chunk by chunk ended up held in 16 MiB.

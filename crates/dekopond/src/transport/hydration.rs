@@ -18,10 +18,124 @@ pub(super) struct HydratedImage {
 pub(super) fn hydrate_images(
     images: Vec<GeneratedImage>,
 ) -> impl Future<Output = Result<Vec<HydratedImage>, TransportError>> + Send {
-    hydrate_images_with(images, GeneratedImage::into_bytes)
+    hydrate_images_with(0, images, GeneratedImage::into_bytes)
+}
+
+/// Reads every image without consuming its lease, handing the leases back with the bytes.
+///
+/// Discord posts all of a reply's attachments in one multipart body, so it needs them together.
+/// What it must not do is keep a second copy against a retry that usually never happens: the leases
+/// come back, and a retried attempt reads them again off the worker instead.
+pub(super) fn read_images(
+    images: Vec<GeneratedImage>,
+) -> impl Future<Output = Result<(Vec<GeneratedImage>, Vec<HydratedImage>), TransportError>> + Send
+{
+    let span = tracing::Span::current();
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
+    let task = tokio::task::spawn_blocking(move || {
+        tracing::dispatcher::with_default(&dispatch, || {
+            span.in_scope(move || {
+                let read = images
+                    .iter()
+                    .enumerate()
+                    .map(|(index, image)| {
+                        Ok(HydratedImage {
+                            filename: image.filename(index),
+                            media_type: image.media_type(),
+                            bytes: image.bytes()?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, BlobError>>();
+                read.map(|read| (images, read))
+            })
+        })
+    });
+    async move { join(task.await)?.map_err(TransportError::from) }
+}
+
+/// The images of one reply, read one at a time rather than all before the first upload.
+///
+/// Reading them all up front held every attachment resident until the last upload finished: a reply
+/// carrying four 8 MiB images held 32 MiB while the first one was still going over the wire. A
+/// transport that posts one attachment per message takes them from here instead, so only the
+/// attachment on the wire is in memory.
+///
+/// Every lease still leaves the async worker: each read is its own blocking task, and whatever is
+/// left when this is dropped — a refused upload, an early return — is disposed on one too.
+pub(super) struct ImageQueue {
+    images: std::vec::IntoIter<GeneratedImage>,
+    next: usize,
+}
+
+impl ImageQueue {
+    pub(super) fn new(images: Vec<GeneratedImage>) -> Self {
+        Self {
+            images: images.into_iter(),
+            next: 0,
+        }
+    }
+
+    /// Byte counts of the images still to be posted, without materializing any of them.
+    pub(super) fn lengths(&self) -> impl Iterator<Item = usize> + '_ {
+        self.images.as_slice().iter().map(GeneratedImage::len)
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.images.as_slice().is_empty()
+    }
+
+    /// Reads the next image off the async worker, with its position in the reply.
+    pub(super) async fn next(&mut self) -> Option<Result<(usize, HydratedImage), TransportError>> {
+        let image = self.images.next()?;
+        let index = self.next;
+        self.next += 1;
+        Some(
+            hydrate_images_with(index, vec![image], GeneratedImage::into_bytes)
+                .await
+                .map(|mut read| (index, read.remove(0))),
+        )
+    }
+}
+
+impl Drop for ImageQueue {
+    /// Disposing a lease unlinks a file, which is the blocking work reading one is.
+    fn drop(&mut self) {
+        let remaining = self.images.by_ref().collect::<Vec<_>>();
+        if remaining.is_empty() {
+            return;
+        }
+        // Outside a runtime there is no blocking pool to move them to, and disposing them here is
+        // better than leaking the scratch files: the collection above drops either way.
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let span = tracing::Span::current();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        drop(handle.spawn_blocking(move || {
+            tracing::dispatcher::with_default(&dispatch, || span.in_scope(move || drop(remaining)));
+        }));
+    }
+}
+
+/// Reports a blocking read that never produced a result, without rendering a panic payload.
+fn join<T>(joined: Result<T, tokio::task::JoinError>) -> Result<T, TransportError> {
+    joined.map_err(|error| {
+        // Panic payloads may contain arbitrary text; retain the actionable join cause only.
+        let reason = if error.is_panic() {
+            "panic"
+        } else {
+            "cancelled"
+        };
+        tracing::error!(
+            reason,
+            "attachment hydration task failed; provider already executed"
+        );
+        TransportError::AttachmentTask { reason }
+    })
 }
 
 fn hydrate_images_with(
+    first_index: usize,
     images: Vec<GeneratedImage>,
     mut read: impl FnMut(GeneratedImage) -> Result<Vec<u8>, BlobError> + Send + 'static,
 ) -> impl Future<Output = Result<Vec<HydratedImage>, TransportError>> + Send {
@@ -35,7 +149,7 @@ fn hydrate_images_with(
                         .into_iter()
                         .enumerate()
                         .map(|(index, image)| {
-                            let filename = image.filename(index);
+                            let filename = image.filename(first_index + index);
                             let media_type = image.media_type();
                             let bytes = read(image)?;
                             Ok(HydratedImage {
@@ -53,21 +167,7 @@ fn hydrate_images_with(
         let Some(task) = task else {
             return Ok(Vec::new());
         };
-        task.await
-            .map_err(|error| {
-                // Panic payloads may contain arbitrary text; retain the actionable join cause only.
-                let reason = if error.is_panic() {
-                    "panic"
-                } else {
-                    "cancelled"
-                };
-                tracing::error!(
-                    reason,
-                    "attachment hydration task failed; provider already executed"
-                );
-                TransportError::AttachmentTask { reason }
-            })?
-            .map_err(TransportError::from)
+        join(task.await)?.map_err(TransportError::from)
     }
 }
 
@@ -155,13 +255,111 @@ mod tests {
         assert!(!capture.text().contains("dekopon-assets-"));
     }
 
+    /// How many leases have been read so far, as the spool's own spans report it.
+    fn reads(capture: &CaptureLayer) -> usize {
+        capture
+            .records()
+            .into_iter()
+            .filter(|record| {
+                matches!(record, Record::Span { name: "asset.spool", fields, .. }
+                    if fields.contains(&"operation=\"read\"".to_owned()))
+            })
+            .count()
+    }
+
+    /// A transport that posts one attachment per message takes them one at a time, so the second
+    /// image is still only a lease while the first one is going over the wire.
+    #[tokio::test]
+    async fn a_queue_reads_one_image_at_a_time() {
+        let capture = CaptureLayer::workspace();
+        let _guard = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
+        let mut queue = ImageQueue::new(images());
+        assert_eq!(queue.lengths().collect::<Vec<_>>(), vec![PNG.len(); 2]);
+        assert!(!queue.is_empty());
+
+        let (index, first) = queue.next().await.unwrap().unwrap();
+
+        assert_eq!(index, 0);
+        assert_eq!(first.filename, "generated-image.png");
+        assert_eq!(first.bytes, PNG);
+        assert_eq!(
+            reads(&capture),
+            1,
+            "an image was read before its own upload asked for it"
+        );
+
+        let (index, second) = queue.next().await.unwrap().unwrap();
+
+        assert_eq!(index, 1);
+        assert_eq!(second.filename, "generated-image-2.png");
+        assert_eq!(reads(&capture), 2);
+        assert!(queue.next().await.is_none());
+        assert!(queue.is_empty());
+    }
+
+    /// A refused upload abandons the rest of the reply, and those leases still leave the worker.
+    #[tokio::test]
+    async fn a_queue_dropped_part_way_disposes_what_is_left_off_the_async_worker() {
+        let threads = SpoolThreads::default();
+        let _guard = tracing_subscriber::registry()
+            .with(threads.clone())
+            .set_default();
+        let mut queue = ImageQueue::new(images());
+        threads.0.lock().unwrap().clear();
+
+        drop(queue.next().await.unwrap().unwrap());
+        drop(queue);
+
+        // Disposal is a blocking task; a bounded wait makes a broken boundary fail rather than
+        // hang the suite.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while threads.0.lock().unwrap().len() < 3 && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let spool_threads = threads.0.lock().unwrap();
+        assert_eq!(
+            spool_threads.len(),
+            3,
+            "one read and both final-owner cleanups"
+        );
+        assert!(
+            spool_threads
+                .iter()
+                .all(|id| *id != std::thread::current().id())
+        );
+    }
+
+    /// Discord needs every attachment at once and gets the leases back, so its one retry reads
+    /// them again instead of a second copy being held through an upload that usually succeeds.
+    #[tokio::test]
+    async fn reading_images_hands_the_leases_back_for_a_second_read() {
+        let capture = CaptureLayer::workspace();
+        let _guard = tracing_subscriber::registry()
+            .with(capture.clone())
+            .set_default();
+
+        let (images, first) = read_images(images()).await.unwrap();
+        let (images, second) = read_images(images).await.unwrap();
+
+        assert_eq!(reads(&capture), 4, "two images read twice");
+        assert_eq!(images.len(), 2);
+        for read in [first, second] {
+            assert_eq!(read.len(), 2);
+            assert_eq!(read[0].filename, "generated-image.png");
+            assert_eq!(read[1].filename, "generated-image-2.png");
+            assert!(read.iter().all(|image| image.bytes == PNG));
+        }
+    }
+
     #[tokio::test]
     async fn slow_hydration_does_not_block_async_timers() {
         let (release, wait) = mpsc::channel();
         let (started, ready) = tokio::sync::oneshot::channel();
         let mut started = Some(started);
         let async_thread = std::thread::current().id();
-        let hydration = hydrate_images_with(images(), move |image| {
+        let hydration = hydrate_images_with(0, images(), move |image: GeneratedImage| {
             assert_ne!(std::thread::current().id(), async_thread);
             if let Some(started) = started.take() {
                 started.send(()).unwrap();
@@ -187,7 +385,7 @@ mod tests {
             .set_default();
         let images = images();
         threads.0.lock().unwrap().clear();
-        let error = hydrate_images_with(images, |_image| {
+        let error = hydrate_images_with(0, images, |_image| {
             Err(BlobError::Io(std::io::ErrorKind::PermissionDenied))
         })
         .await
@@ -213,7 +411,7 @@ mod tests {
 
     #[tokio::test]
     async fn hydration_join_failure_is_distinct_without_rendering_panic_payload() {
-        let error = hydrate_images_with(images(), |_image| panic!("private panic sentinel"))
+        let error = hydrate_images_with(0, images(), |_image| panic!("private panic sentinel"))
             .await
             .err()
             .unwrap();
@@ -235,7 +433,7 @@ mod tests {
         let mut finished = Some(finished);
         let async_thread = std::thread::current().id();
         let image = GeneratedImage::from_png(PNG.to_vec()).unwrap();
-        let hydration = hydrate_images_with(vec![image], move |image| {
+        let hydration = hydrate_images_with(0, vec![image], move |image| {
             assert_ne!(std::thread::current().id(), async_thread);
             started.take().unwrap().send(()).unwrap();
             wait.recv_timeout(Duration::from_secs(2)).unwrap();
