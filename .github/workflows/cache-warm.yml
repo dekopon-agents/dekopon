@@ -1,7 +1,7 @@
 name: Cargo cache warm
 
-# Pull-request jobs consume caches read-only. Warming on main gives every PR a compatible base
-# without uploading PR-scoped target archives that another PR cannot restore.
+# PR tests and Linux releases consume caches read-only. Warming on main gives them a compatible
+# base without uploading PR/tag-scoped target archives that later PRs/releases cannot restore.
 on:
   push:
     branches: [main]
@@ -9,6 +9,7 @@ on:
       - ".cargo/**"
       - ".github/workflows/cache-warm.yml"
       - ".github/workflows/ci.yml"
+      - ".github/workflows/release.yml"
       - ".clippy.toml"
       - "clippy.toml"
       - "Cargo.lock"
@@ -168,3 +169,37 @@ jobs:
         run: ci/fetch-external-provider-components.sh examples/providers
       - name: Warm stable test objects
         run: cargo test --workspace --all-features --locked --no-run
+
+  release-dependencies:
+    name: warm release dependencies (${{ matrix.target }})
+    if: github.ref == 'refs/heads/main'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install target toolchain
+        run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.target }}
+      # Match release.yml's native runner, action, shared key, toolchain and build flags.
+      # No sccache wrapper here: release artifact builds do not use one either.
+      - name: Cache Linux release dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: linux-release-v1-${{ matrix.target }}
+          cache-workspace-crates: "false"
+          cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # Build only: no tests, provider downloads, packaging, signing or publication.
+      - name: Warm release CLI dependencies
+        run: cargo build --release --locked -p dekopon-brokerd -p dekopond --target ${{ matrix.target }}
