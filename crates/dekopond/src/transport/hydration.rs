@@ -1,5 +1,7 @@
 //! The owned disk-to-upload boundary shared by outbound transports.
 
+use std::collections::VecDeque;
+
 use dekopon_agent::attachment::GeneratedImage;
 use dekopon_model::asset::BlobError;
 
@@ -21,72 +23,53 @@ pub(super) fn hydrate_images(
     hydrate_images_with(0, images, GeneratedImage::into_bytes)
 }
 
-/// Reads every image without consuming its lease, handing the leases back with the bytes.
+/// One reply's attachments, still on disk, taken one at a time or read all at once.
 ///
-/// Discord posts all of a reply's attachments in one multipart body, so it needs them together.
-/// What it must not do is keep a second copy against a retry that usually never happens: the leases
-/// come back, and a retried attempt reads them again off the worker instead.
-pub(super) fn read_images(
-    images: Vec<GeneratedImage>,
-) -> impl Future<Output = Result<(Vec<GeneratedImage>, Vec<HydratedImage>), TransportError>> + Send
-{
-    let span = tracing::Span::current();
-    let dispatch = tracing::dispatcher::get_default(Clone::clone);
-    let task = tokio::task::spawn_blocking(move || {
-        tracing::dispatcher::with_default(&dispatch, || {
-            span.in_scope(move || {
-                let read = images
-                    .iter()
-                    .enumerate()
-                    .map(|(index, image)| {
-                        Ok(HydratedImage {
-                            filename: image.filename(index),
-                            media_type: image.media_type(),
-                            bytes: image.bytes()?,
-                        })
-                    })
-                    .collect::<Result<Vec<_>, BlobError>>();
-                read.map(|read| (images, read))
-            })
-        })
-    });
-    async move { join(task.await)?.map_err(TransportError::from) }
-}
-
-/// The images of one reply, read one at a time rather than all before the first upload.
+/// Reading them all before the first upload held every attachment resident until the last one
+/// finished: a reply carrying four 8 MiB images held 32 MiB while the first was still going over
+/// the wire. A transport that posts one attachment per message takes them from [`Self::next`]
+/// instead, so only the attachment on the wire is in memory; Discord, which posts them together in
+/// one multipart body, uses [`Self::read_all`] and gets the leases back rather than keeping a
+/// second copy against a retry that usually never happens.
 ///
-/// Reading them all up front held every attachment resident until the last upload finished: a reply
-/// carrying four 8 MiB images held 32 MiB while the first one was still going over the wire. A
-/// transport that posts one attachment per message takes them from here instead, so only the
-/// attachment on the wire is in memory.
-///
-/// Every lease still leaves the async worker: each read is its own blocking task, and whatever is
-/// left when this is dropped — a refused upload, an early return — is disposed on one too.
+/// Every lease leaves the async worker either way: each read is its own blocking task, and whatever
+/// is left when this is dropped — a refused upload, an early return, a retry that never came — is
+/// disposed on one too.
+#[derive(Default)]
 pub(super) struct ImageQueue {
-    images: std::vec::IntoIter<GeneratedImage>,
+    images: VecDeque<GeneratedImage>,
     next: usize,
 }
 
 impl ImageQueue {
     pub(super) fn new(images: Vec<GeneratedImage>) -> Self {
         Self {
-            images: images.into_iter(),
+            images: images.into(),
             next: 0,
         }
     }
 
     /// Byte counts of the images still to be posted, without materializing any of them.
     pub(super) fn lengths(&self) -> impl Iterator<Item = usize> + '_ {
-        self.images.as_slice().iter().map(GeneratedImage::len)
+        self.images.iter().map(GeneratedImage::len)
+    }
+
+    /// The gateway-owned name each remaining attachment will be posted under, in order.
+    pub(super) fn filenames(&self) -> Vec<String> {
+        self.images
+            .iter()
+            .enumerate()
+            .map(|(index, image)| image.filename(self.next + index))
+            .collect()
     }
 
     pub(super) fn is_empty(&self) -> bool {
-        self.images.as_slice().is_empty()
+        self.images.is_empty()
     }
 
     /// Reads the next image off the async worker, with its position in the reply.
     pub(super) async fn next(&mut self) -> Option<Result<(usize, HydratedImage), TransportError>> {
-        let image = self.images.next()?;
+        let image = self.images.pop_front()?;
         let index = self.next;
         self.next += 1;
         Some(
@@ -95,17 +78,49 @@ impl ImageQueue {
                 .map(|mut read| (index, read.remove(0))),
         )
     }
+
+    /// Reads every remaining image off the async worker without consuming its lease.
+    ///
+    /// The leases go to the blocking thread and come back, so a second call reads them again
+    /// instead of a caller holding a copy between attempts.
+    pub(super) async fn read_all(&mut self) -> Result<Vec<HydratedImage>, TransportError> {
+        let taken = std::mem::take(&mut self.images);
+        let first = self.next;
+        let span = tracing::Span::current();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let task = tokio::task::spawn_blocking(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                span.in_scope(move || {
+                    let read = taken
+                        .iter()
+                        .enumerate()
+                        .map(|(index, image)| {
+                            Ok(HydratedImage {
+                                filename: image.filename(first + index),
+                                media_type: image.media_type(),
+                                bytes: image.bytes()?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>, BlobError>>();
+                    (taken, read)
+                })
+            })
+        });
+        let (taken, read) = join(task.await)?;
+        self.images = taken;
+        read.map_err(TransportError::from)
+    }
 }
 
 impl Drop for ImageQueue {
     /// Disposing a lease unlinks a file, which is the blocking work reading one is.
     fn drop(&mut self) {
-        let remaining = self.images.by_ref().collect::<Vec<_>>();
+        let remaining = std::mem::take(&mut self.images);
         if remaining.is_empty() {
             return;
         }
         // Outside a runtime there is no blocking pool to move them to, and disposing them here is
-        // better than leaking the scratch files: the collection above drops either way.
+        // better than leaking the scratch files: `remaining` drops either way.
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             return;
         };
@@ -340,11 +355,12 @@ mod tests {
             .with(capture.clone())
             .set_default();
 
-        let (images, first) = read_images(images()).await.unwrap();
-        let (images, second) = read_images(images).await.unwrap();
+        let mut queue = ImageQueue::new(images());
+        let first = queue.read_all().await.unwrap();
+        let second = queue.read_all().await.unwrap();
 
         assert_eq!(reads(&capture), 4, "two images read twice");
-        assert_eq!(images.len(), 2);
+        assert!(!queue.is_empty(), "the leases did not come back");
         for read in [first, second] {
             assert_eq!(read.len(), 2);
             assert_eq!(read[0].filename, "generated-image.png");

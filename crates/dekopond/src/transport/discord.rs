@@ -1047,7 +1047,8 @@ impl ChatDriver for DiscordDriver {
         target: &ReplyTarget,
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
-        let OutboundReply { text, mut images } = reply;
+        let OutboundReply { text, images } = reply;
+        let mut images = super::hydration::ImageQueue::new(images);
         let ReplyTarget::Discord {
             channel_id,
             reply_to,
@@ -1507,17 +1508,13 @@ impl DiscordDriver {
         &self,
         channel_id: &str,
         body: &Value,
-        mut images: Vec<dekopon_agent::attachment::GeneratedImage>,
+        mut images: super::hydration::ImageQueue,
     ) -> Result<(), TransportError> {
         let url = format!(
             "{}/api/v{API_VERSION}/channels/{channel_id}/messages",
             self.endpoint
         );
-        let attachments = images
-            .iter()
-            .enumerate()
-            .map(|(index, image)| image.filename(index))
-            .collect::<Vec<_>>();
+        let attachments = images.filenames();
         let mut payload = body.clone();
         payload["attachments"] = Value::Array(
             attachments
@@ -1540,8 +1537,7 @@ impl DiscordDriver {
         let payload = serde_json::to_string(&payload).map_err(|_| TransportError::Response)?;
         let mut retried = false;
         loop {
-            let (returned, read) = super::hydration::read_images(images).await?;
-            images = returned;
+            let read = images.read_all().await?;
             let mut form = reqwest::multipart::Form::new().text("payload_json", payload.clone());
             for (index, image) in read.into_iter().enumerate() {
                 #[allow(
