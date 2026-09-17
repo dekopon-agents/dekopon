@@ -2387,6 +2387,66 @@ mod tests {
         }
     }
 
+    /// Every item the `input` array can carry, in the wire shape the Responses API is sent.
+    ///
+    /// The body is a typed borrowed struct rather than `json!` now, and an assistant message with
+    /// text — the one item every other test here reaches through a replayed item instead — is
+    /// where a silent shape change would hide.
+    #[test]
+    fn every_input_item_keeps_the_shape_the_responses_api_is_sent() {
+        let assistant = crate::model::AssistantTurn {
+            content: Some("here you go".to_owned()),
+            tool_calls: vec![crate::model::ModelToolCall {
+                id: "call-9".to_owned(),
+                kind: "function".to_owned(),
+                function: crate::model::ModelFunctionCall {
+                    name: "bash".to_owned(),
+                    arguments: r#"{"script":"ls"}"#.to_owned(),
+                },
+            }],
+            usage: None,
+            replay_items: Vec::new(),
+        };
+        let messages = vec![
+            ModelMessage::user("what is here?"),
+            crate::model::assistant_message(&assistant),
+            ModelMessage::tool("call-9", "one file"),
+        ];
+
+        let body = request_body_json(
+            "gpt-test",
+            &messages,
+            &[bash_tool()],
+            &CompletionOptions::default(),
+        )
+        .expect("request body");
+
+        assert_eq!(
+            body["input"],
+            json!([
+                {"type": "message", "role": "user",
+                 "content": [{"type": "input_text", "text": "what is here?"}]},
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "here you go", "annotations": []}]},
+                {"type": "function_call", "call_id": "call-9", "name": "bash",
+                 "arguments": "{\"script\":\"ls\"}"},
+                {"type": "function_call_output", "call_id": "call-9", "output": "one file"},
+            ])
+        );
+        assert_eq!(
+            body["tools"],
+            json!([{
+                "type": "function",
+                "name": "bash",
+                "description": "Run a sandboxed script",
+                "parameters": bash_tool().parameters,
+            }])
+        );
+        assert_eq!(body["text"], json!({"verbosity": "low"}));
+        assert_eq!(body["tool_choice"], "auto");
+        assert_eq!(body["parallel_tool_calls"], true);
+    }
+
     #[test]
     fn a_text_only_user_message_keeps_its_single_input_text_part() {
         // Unchanged shape for every request that carries no attachment.
