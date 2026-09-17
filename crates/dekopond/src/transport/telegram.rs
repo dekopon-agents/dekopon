@@ -23,9 +23,9 @@ use crate::{
         AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver,
         ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageRef, OutboundReply,
         ProgressLimits, ProgressMessage, ReplyTarget, StreamLimits, StreamedText, TextStream,
-        TextUnit, TransportError, TransportEvent, TransportIdentity, TypingLease, bound_inbound,
-        credential_client, floor_boundary, receive_span, record_conversation,
-        retry_after_from_body, split_message,
+        TextUnit, TransportError, TransportEvent, TransportIdentity, TypingLease, asset_buffer,
+        bound_inbound, credential_client, floor_boundary, receive_span, record_conversation,
+        reserve_for_chunk, retry_after_from_body, split_message,
     },
 };
 
@@ -565,14 +565,17 @@ impl AssetFetcher for TelegramDriver {
                 });
             }
             // Streamed against the ceiling rather than buffered and measured afterwards, for the
-            // same reason the Slack path is: a declared length is not a bound.
-            let mut body = Vec::new();
+            // same reason the Slack path is: a declared length is not a bound, only a clamped
+            // starting size for the buffer.
+            let limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+            let mut body = asset_buffer(response.content_length(), limit);
             while let Some(chunk) = response.chunk().await.map_err(request_failed)? {
                 if body.len().saturating_add(chunk.len()) as u64 > max_bytes {
                     return Err(TransportError::Service {
                         code: "asset-too-large".to_owned(),
                     });
                 }
+                reserve_for_chunk(&mut body, chunk.len(), limit);
                 body.extend_from_slice(&chunk);
             }
             Ok(body)

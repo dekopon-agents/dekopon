@@ -37,8 +37,8 @@ use crate::{
         ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageRef, NativeStatus,
         OutboundReply, ProgressLimits, ProgressMessage, ReplyTarget, SeenIds, Status, StreamLimits,
         StreamedText, TextStream, ThreadClaim, ThreadContinuation, ThreadOwnership, TransportError,
-        TransportEvent, TransportIdentity, bound_inbound, credential_client, floor_boundary,
-        receive_span, record_conversation,
+        TransportEvent, TransportIdentity, asset_buffer, bound_inbound, credential_client,
+        floor_boundary, receive_span, record_conversation, reserve_for_chunk,
     },
 };
 
@@ -1915,8 +1915,10 @@ impl AssetFetcher for SlackReplier {
             }
             // Streamed against the ceiling rather than buffered and measured afterwards. The
             // reported size is sender-influenced metadata and a chunked response need not declare
-            // a length at all, so the only bound that holds is the one applied while reading.
-            let mut body = Vec::new();
+            // a length at all, so the only bound that holds is the one applied while reading; the
+            // declared length is a clamped starting size for the buffer and nothing else.
+            let limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+            let mut body = asset_buffer(response.content_length(), limit);
             while let Some(chunk) = response
                 .chunk()
                 .await
@@ -1927,6 +1929,7 @@ impl AssetFetcher for SlackReplier {
                         code: "asset-too-large".to_owned(),
                     });
                 }
+                reserve_for_chunk(&mut body, chunk.len(), limit);
                 body.extend_from_slice(&chunk);
             }
             Ok(body)

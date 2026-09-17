@@ -378,6 +378,87 @@ async fn serialization_stops_at_the_frame_bound() {
     assert!(matches!(error, ProtocolError::FrameTooLarge { .. }));
 }
 
+/// A chat attachment rides one frame, and a frame is a buffer: a multi-megabyte one must not be
+/// held twice because its closing quote did not fit.
+///
+/// 11,185,049 payload bytes cost 22,370,098 while the buffer grew by doubling. Counting the payload
+/// first makes the allocation exact, so acceptance is the whole frame plus its four-byte prefix.
+#[test]
+fn a_multi_megabyte_frame_is_held_once_at_its_own_size() {
+    let maximum = 16 * 1024 * 1024;
+    let value = json!({"image": "x".repeat(11 * 1024 * 1024)});
+
+    let mut counter = super::BoundedJsonCounter::new(maximum);
+    serde_json::to_writer(&mut counter, &value).expect("the frame fits its maximum");
+    let mut buffer = super::BoundedJsonBuffer::new(maximum, counter.length);
+    serde_json::to_writer(&mut buffer, &value).expect("the frame fits its maximum");
+
+    assert_eq!(
+        buffer.payload_len(),
+        counter.length,
+        "the counted pass and the written pass disagree about the payload"
+    );
+    assert!(
+        buffer.frame.capacity() <= buffer.frame.len() + 64 * 1024,
+        "an {}-byte frame is held in {} bytes",
+        buffer.frame.len(),
+        buffer.frame.capacity()
+    );
+}
+
+/// A frame past the maximum is refused without any of it being held.
+#[test]
+fn a_frame_past_the_maximum_is_counted_rather_than_buffered() {
+    let mut counter = super::BoundedJsonCounter::new(32);
+
+    serde_json::to_writer(&mut counter, &json!({"value": "x".repeat(256)}))
+        .expect_err("the counter stops at the bound");
+
+    assert!(counter.exceeded);
+    assert!(counter.length <= 32);
+}
+
+/// The payload buffer follows the bytes that arrive and stops exactly at the declared length.
+#[tokio::test]
+async fn a_multi_megabyte_payload_is_read_into_exactly_its_declared_length() {
+    let payload = vec![b'x'; 11 * 1024 * 1024];
+    let (mut writer, mut reader) = duplex(64 * 1024);
+    let length = payload.len();
+    let sending = tokio::spawn(async move {
+        writer.write_all(&payload).await.expect("payload sends");
+    });
+
+    let bytes = super::read_payload(&mut reader, length)
+        .await
+        .expect("the declared payload arrives");
+
+    sending.await.expect("the sending task completes");
+    assert_eq!(bytes.len(), length);
+    assert_eq!(
+        bytes.capacity(),
+        length,
+        "the payload buffer grew past the frame it holds"
+    );
+}
+
+/// A peer that announces more than it sends fails rather than decoding a short frame.
+#[tokio::test]
+async fn a_payload_that_ends_early_is_not_decoded() {
+    let (mut writer, mut reader) = duplex(64);
+    writer.write_all(b"abc").await.expect("partial payload");
+    drop(writer);
+
+    let error = super::read_payload(&mut reader, 8)
+        .await
+        .expect_err("a short payload must fail");
+
+    assert!(
+        matches!(&error, super::ReadFrameError::Io(source)
+            if source.kind() == std::io::ErrorKind::UnexpectedEof),
+        "{error:?}"
+    );
+}
+
 #[test]
 fn wire_invocation_contains_no_identity_or_authority_fields() {
     let value = serde_json::to_value(RequestEnvelope::invoke(None, invocation()))

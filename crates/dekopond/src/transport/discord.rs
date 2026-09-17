@@ -35,8 +35,8 @@ use crate::{
         ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageRef, OutboundReply,
         ProgressLimits, ProgressMessage, ReplyTarget, SeenIds, StreamLimits, StreamedText,
         TextStream, TextUnit, TransportError, TransportEvent, TransportIdentity, TypingLease,
-        bound_inbound, credential_client, floor_boundary, jitter_below, receive_span,
-        record_conversation, retry_after_from_body, split_message,
+        asset_buffer, bound_inbound, credential_client, floor_boundary, jitter_below, receive_span,
+        record_conversation, reserve_for_chunk, retry_after_from_body, split_message,
     },
 };
 
@@ -1718,7 +1718,10 @@ impl DiscordDriver {
                 code: format!("http-{}", response.status().as_u16()),
             });
         }
-        let mut body = Vec::new();
+        // The declared length only sizes the buffer, clamped to the ceiling; what refuses an
+        // oversized asset is the cutoff applied while reading.
+        let limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+        let mut body = asset_buffer(response.content_length(), limit);
         while let Some(chunk) = response
             .chunk()
             .await
@@ -1729,6 +1732,7 @@ impl DiscordDriver {
                     code: "asset-too-large".to_owned(),
                 });
             }
+            reserve_for_chunk(&mut body, chunk.len(), limit);
             body.extend_from_slice(&chunk);
         }
         Ok(body)

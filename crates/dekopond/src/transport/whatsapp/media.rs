@@ -4,7 +4,7 @@ use std::{net::IpAddr, time::Instant};
 
 use tracing::Instrument as _;
 
-use crate::transport::hydration::HydratedImage;
+use crate::transport::{asset_buffer, hydration::HydratedImage, reserve_for_chunk};
 use dekopon_agent::attachment::validate_png;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
@@ -77,11 +77,14 @@ async fn read_body(
     {
         return Err(failure("response-too-large"));
     }
-    let mut bytes = Vec::new();
+    // The declared length was checked above and only sizes the buffer here; the cutoff in the loop
+    // is what refuses a response that grows past the ceiling.
+    let mut bytes = asset_buffer(response.content_length(), limit);
     while let Some(chunk) = response.chunk().await.map_err(request_failed)? {
         if bytes.len().saturating_add(chunk.len()) > limit {
             return Err(failure("response-too-large"));
         }
+        reserve_for_chunk(&mut bytes, chunk.len(), limit);
         bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
