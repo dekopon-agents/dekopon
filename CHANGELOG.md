@@ -9,6 +9,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Changed
 
+- Warm Linux amd64/ARM64 release dependency caches on main and restore them across
+  subsequent releases without creating new tag-scoped Linux build caches.
 - Separate workspace test compilation and execution into CI steps, run doctests once,
   and restore Swatinem Rust dependency artifacts from a dedicated main-branch cache warmer.
 

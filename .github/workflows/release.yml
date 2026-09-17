@@ -104,9 +104,18 @@ jobs:
         run: |
           rustup toolchain install
           rustup target add ${{ matrix.target }}
-      # GitHub scopes caches created on a tag to that tag, so this cannot warm a later release.
-      # Keep workspace outputs to make a retry of this immutable release fast instead.
-      - name: Cache Cargo artifacts
+      # Tags can restore main's caches. Match cache-warm.yml; never save a Linux tag copy.
+      - name: Restore Linux release dependencies
+        if: runner.os == 'Linux'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: linux-release-v1-${{ matrix.target }}
+          cache-workspace-crates: "false"
+          cache-bin: "false"
+          save-if: "false"
+      # macOS has no main-branch warmer yet; preserve its tag-local retry cache.
+      - name: Cache macOS Cargo artifacts
+        if: runner.os == 'macOS'
         uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
         with:
           key: release-${{ matrix.target }}
