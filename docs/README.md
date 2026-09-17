@@ -12,6 +12,7 @@ Read in this order:
 2. [`development.md`](development.md) — source and test map, generated artifacts, separate workspaces, validation, CI, and PR workflow.
 3. [`security-model.md`](security-model.md) — trusted and untrusted inputs, threat model, and present limitations.
 4. [`architecture.md`](architecture.md) — how the design maps to crate boundaries and the two-process deployment.
+   [`guest-memory-mapping.md`](guest-memory-mapping.md) is an **Exploration** that was prototyped and rejected: mapping a file into a provider's linear memory, with the Wasmtime 48 facts, fault behavior, and measurements behind the verdict. Read it before trying to cut memory on the provider path.
 5. [`cli.md`](cli.md) and [`dekopond.md`](dekopond.md) — the operator command surfaces and the long-running gateway.
    [`catalog.md`](catalog.md) is the field-by-field contract for the resources they all read, including which fields are load-bearing and which are reserved.
    [`chat-progress.md`](chat-progress.md) is the design of record for what a waiting person is shown while a session runs and for every way one is stopped.
