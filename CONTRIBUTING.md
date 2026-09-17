@@ -28,7 +28,7 @@ cargo install cargo-deny --locked
 cargo deny --all-features check
 ```
 
-The pinned compiler is the MSRV, so the required `test (Rust)` check is the ordinary `cargo test` pair in [Root workspace](docs/development.md#root-workspace) and there is no second MSRV run. Run `cargo package --workspace --locked` from a clean tree when changing package metadata, crate dependencies, or include lists. Validate workflow and shell-script edits with `actionlint .github/workflows/*.yml` and `shellcheck <SCRIPT>`; the exact file list CI shellchecks is the `shellcheck` line in [Root workspace](docs/development.md#root-workspace).
+The pinned compiler is the MSRV, so the required `test (Rust)` check is the compile/run/doctest sequence in [Root workspace](docs/development.md#root-workspace) and there is no second MSRV run. Run `cargo package --workspace --locked` from a clean tree when changing package metadata, crate dependencies, or include lists. Validate workflow and shell-script edits with `actionlint .github/workflows/*.yml` and `shellcheck <SCRIPT>`; the exact file list CI shellchecks is the `shellcheck` line in [Root workspace](docs/development.md#root-workspace).
 
 Documentation edits are gated too: run the duplicate-entry check below, and add every new `audit.event` name, backticked, to [`docs/observability.md`](docs/observability.md) in the same change ([details](docs/development.md#documentation-gates)).
 
