@@ -4,6 +4,7 @@
 //! isolated in Dekopon's own auth file; credentials owned by other clients are never imported.
 
 use std::{
+    borrow::Cow,
     collections::BTreeMap,
     env,
     ffi::OsString,
@@ -26,9 +27,9 @@ use ureq::Agent;
 
 use crate::{
     model::{
-        AssistantTurn, ChatModel, CompletionOptions, ContentPart, ModelError, ModelFunctionCall,
-        ModelMessage, ModelTool, ModelToolCall, ModelUsage, data_url, read_error_body,
-        sanitize_diagnostic,
+        AssistantTurn, ChatModel, CompletionOptions, ContentPart, DataUrl, JSON_CONTENT_TYPE,
+        ModelError, ModelFunctionCall, ModelMessage, ModelTool, ModelToolCall, ModelUsage,
+        compact_json_body, read_error_body, sanitize_diagnostic,
     },
     sse::{MAX_STREAM_BYTES, SseError, SseEvent, SseReader},
     stream::{ModelText, TurnEvent},
@@ -352,7 +353,10 @@ impl ChatGptCodexModel {
         options: &CompletionOptions,
         on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
     ) -> Result<AssistantTurn, ChatGptRequestError> {
-        let body = build_request_body(&self.model, messages, tools, options)?;
+        let body = compact_json_body(&build_request_body(&self.model, messages, tools, options)?)
+            .map_err(|error| {
+            ChatGptRequestError::Transport(format!("request body: {error}"))
+        })?;
         let response = self
             .credential
             .agent
@@ -369,7 +373,8 @@ impl ChatGptCodexModel {
             )
             .header("openai-beta", "responses=experimental")
             .header("accept", "text/event-stream")
-            .send_json(&body)
+            .content_type(JSON_CONTENT_TYPE)
+            .send(&body)
             .map_err(|error| ChatGptRequestError::Transport(error.to_string()))?;
 
         let status = response.status().as_u16();
@@ -883,53 +888,156 @@ fn extract_account_id(access: &str) -> Result<String, ChatGptError> {
         .ok_or_else(|| ChatGptError::Protocol("access token omitted ChatGPT account ID".to_owned()))
 }
 
+/// One Responses-API request, borrowed from the turn it describes.
+///
+/// A typed body rather than `json!`: building the request as a `Value` copies every message into it
+/// through `to_value`, and on a turn carrying a screenshot that copy is the image again. Field
+/// order here is the wire order, which a `Value` body left to whether `serde_json`'s
+/// `preserve_order` feature was unified into the build.
+#[derive(Debug, Serialize)]
+struct ResponsesRequest<'a> {
+    model: &'a str,
+    store: bool,
+    stream: bool,
+    instructions: String,
+    input: Vec<ResponsesItem<'a>>,
+    tools: Vec<ResponsesTool<'a>>,
+    tool_choice: &'static str,
+    parallel_tool_calls: bool,
+    include: [&'static str; 1],
+    text: ResponsesText,
+    /// Serialized only when a key exists, so a keyless request carries no such field at all.
+    /// `prompt_cache_key` routes toward a warm prefix and authorizes nothing; the conversation
+    /// itself is already in `input` either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<&'a str>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesText {
+    verbosity: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesTool<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    name: &'a str,
+    description: &'a str,
+    parameters: &'a Value,
+}
+
+/// One entry of the `input` array.
+///
+/// Untagged because a replayed item is whatever the API sent last turn and already carries its own
+/// `type`; the rest name theirs.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ResponsesItem<'a> {
+    Replay(&'a Value),
+    Message(ResponsesMessage<'a>),
+    FunctionCall(ResponsesFunctionCall<'a>),
+    FunctionCallOutput(ResponsesFunctionCallOutput<'a>),
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesMessage<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    role: &'static str,
+    content: Vec<ResponsesContent<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesFunctionCall<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    call_id: &'a str,
+    name: &'a str,
+    arguments: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+struct ResponsesFunctionCallOutput<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    call_id: &'a str,
+    output: &'a str,
+}
+
+/// One part of a message's `content` array.
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+enum ResponsesContent<'a> {
+    #[serde(rename = "input_text")]
+    InputText { text: Cow<'a, str> },
+    #[serde(rename = "input_image")]
+    InputImage { image_url: DataUrl<'a> },
+    #[serde(rename = "input_file")]
+    InputFile {
+        filename: &'a str,
+        file_data: DataUrl<'a>,
+    },
+    #[serde(rename = "output_text")]
+    OutputText {
+        text: &'a str,
+        /// Always empty, and always present: the API requires the key on an assistant message.
+        annotations: [Value; 0],
+    },
+}
+
 /// The `content` array for one user message, text-only or multimodal.
 ///
 /// The Responses API has taken an array here since before attachments existed, which is why this
 /// transport needs one function rather than the wire-message type the chat-completions path grew.
-fn responses_content(message: &ModelMessage) -> Result<Vec<Value>, crate::asset::BlobError> {
+fn responses_content(
+    message: &ModelMessage,
+) -> Result<Vec<ResponsesContent<'_>>, crate::asset::BlobError> {
     let Some(parts) = message.parts() else {
-        return Ok(vec![
-            json!({"type": "input_text", "text": message.content().unwrap_or_default()}),
-        ]);
+        return Ok(vec![ResponsesContent::InputText {
+            text: message.content().unwrap_or_default().into(),
+        }]);
     };
     parts
         .iter()
         .map(|part| {
             let bytes = match part {
-                ContentPart::Image { data, .. } | ContentPart::File { data, .. } => match data
-                    .read()
-                {
-                    Ok(bytes) => Some(bytes),
-                    Err(
-                        crate::asset::BlobError::Reclaimed | crate::asset::BlobError::Unauthorized,
-                    ) => return Ok(json!({"type": "input_text", "text": data.release_notice()})),
-                    Err(error) => return Err(error),
-                },
+                ContentPart::Image { data, .. } | ContentPart::File { data, .. } => {
+                    match data.read() {
+                        Ok(bytes) => Some(bytes),
+                        Err(
+                            crate::asset::BlobError::Reclaimed
+                            | crate::asset::BlobError::Unauthorized,
+                        ) => {
+                            return Ok(ResponsesContent::InputText {
+                                text: data.release_notice().into(),
+                            });
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
                 ContentPart::Text(_) => None,
             };
             Ok(match part {
-                ContentPart::Text(text) => json!({"type": "input_text", "text": text}),
-                ContentPart::Image { mime, .. } => json!({
-                    "type": "input_image",
-                    "image_url": data_url(mime, bytes.as_deref().unwrap_or_default()),
-                }),
-                ContentPart::File { name, mime, .. } => json!({
-                    "type": "input_file",
-                    "filename": name,
-                    "file_data": data_url(mime, bytes.as_deref().unwrap_or_default()),
-                }),
+                ContentPart::Text(text) => ResponsesContent::InputText { text: text.into() },
+                ContentPart::Image { mime, .. } => ResponsesContent::InputImage {
+                    image_url: DataUrl::new(mime, bytes.unwrap_or_default()),
+                },
+                ContentPart::File { name, mime, .. } => ResponsesContent::InputFile {
+                    filename: name,
+                    file_data: DataUrl::new(mime, bytes.unwrap_or_default()),
+                },
             })
         })
         .collect()
 }
 
-fn build_request_body(
-    model: &str,
-    messages: &[ModelMessage],
-    tools: &[ModelTool],
-    options: &CompletionOptions,
-) -> Result<Value, crate::asset::BlobError> {
+fn build_request_body<'a>(
+    model: &'a str,
+    messages: &'a [ModelMessage],
+    tools: &'a [ModelTool],
+    options: &'a CompletionOptions,
+) -> Result<ResponsesRequest<'a>, crate::asset::BlobError> {
     let instructions = messages
         .iter()
         .filter(|message| message.role() == "system")
@@ -946,72 +1054,67 @@ fn build_request_body(
     for message in messages {
         match message.role() {
             "system" => {}
-            "user" => input.push(json!({
-                "type": "message",
-                "role": "user",
-                "content": responses_content(message)?,
+            "user" => input.push(ResponsesItem::Message(ResponsesMessage {
+                kind: "message",
+                role: "user",
+                content: responses_content(message)?,
             })),
             "assistant" if !message.replay_items().is_empty() => {
-                input.extend(message.replay_items().iter().cloned());
+                input.extend(message.replay_items().iter().map(ResponsesItem::Replay));
             }
             "assistant" => {
                 if let Some(content) = message.content().filter(|content| !content.is_empty()) {
-                    input.push(json!({
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{"type": "output_text", "text": content, "annotations": []}],
+                    input.push(ResponsesItem::Message(ResponsesMessage {
+                        kind: "message",
+                        role: "assistant",
+                        content: vec![ResponsesContent::OutputText {
+                            text: content,
+                            annotations: [],
+                        }],
                     }));
                 }
                 for call in message.tool_calls() {
-                    input.push(json!({
-                        "type": "function_call",
-                        "call_id": call.id,
-                        "name": call.function.name,
-                        "arguments": call.function.arguments,
+                    input.push(ResponsesItem::FunctionCall(ResponsesFunctionCall {
+                        kind: "function_call",
+                        call_id: &call.id,
+                        name: &call.function.name,
+                        arguments: &call.function.arguments,
                     }));
                 }
             }
-            "tool" => input.push(json!({
-                "type": "function_call_output",
-                "call_id": message.tool_call_id().unwrap_or_default(),
-                "output": message.content().unwrap_or_default(),
-            })),
+            "tool" => input.push(ResponsesItem::FunctionCallOutput(
+                ResponsesFunctionCallOutput {
+                    kind: "function_call_output",
+                    call_id: message.tool_call_id().unwrap_or_default(),
+                    output: message.content().unwrap_or_default(),
+                },
+            )),
             _ => {}
         }
     }
     let tools = tools
         .iter()
-        .map(|tool| {
-            json!({
-                "type": "function",
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": tool.parameters,
-            })
+        .map(|tool| ResponsesTool {
+            kind: "function",
+            name: &tool.name,
+            description: &tool.description,
+            parameters: &tool.parameters,
         })
         .collect::<Vec<_>>();
 
-    let mut body = json!({
-        "model": model,
-        "store": false,
-        "stream": true,
-        "instructions": instructions,
-        "input": input,
-        "tools": tools,
-        "tool_choice": "auto",
-        "parallel_tool_calls": true,
-        "include": ["reasoning.encrypted_content"],
-        "text": {"verbosity": "low"},
-    });
-    // Added only when a key exists, so a keyless request is byte-for-byte the request this
-    // transport sent before the field existed. `prompt_cache_key` routes toward a warm prefix and
-    // authorizes nothing; the conversation itself is already in `input` either way.
-    if let Some(key) = options.prompt_cache_key()
-        && let Some(object) = body.as_object_mut()
-    {
-        object.insert("prompt_cache_key".to_owned(), Value::String(key.to_owned()));
-    }
-    Ok(body)
+    Ok(ResponsesRequest {
+        model,
+        store: false,
+        stream: true,
+        instructions,
+        input,
+        tools,
+        tool_choice: "auto",
+        parallel_tool_calls: true,
+        include: ["reasoning.encrypted_content"],
+        text: ResponsesText { verbosity: "low" },
+        prompt_cache_key: options.prompt_cache_key(),
+    })
 }
 
 #[derive(Default)]
@@ -2153,7 +2256,7 @@ mod tests {
             crate::model::assistant_message(&assistant),
             ModelMessage::tool("call-1", "{}"),
         ];
-        let body = build_request_body(
+        let body = request_body_json(
             "gpt-test",
             &messages,
             &[ModelTool {
@@ -2169,6 +2272,22 @@ mod tests {
         assert_eq!(body["tools"][0]["name"], "echo_echo");
         assert_eq!(body["input"][1]["type"], "reasoning");
         assert_eq!(body["input"][2]["type"], "function_call_output");
+    }
+
+    /// One built request read back as the JSON it is sent as.
+    ///
+    /// The body is a typed borrowed struct now, so the assertions below go through the same
+    /// `compact_json_body` the transport sends — which makes each of them a check on the bytes on
+    /// the wire rather than on an intermediate value nothing transmits.
+    fn request_body_json(
+        model: &str,
+        messages: &[ModelMessage],
+        tools: &[ModelTool],
+        options: &CompletionOptions,
+    ) -> Result<Value, crate::asset::BlobError> {
+        let body = build_request_body(model, messages, tools, options)?;
+        let encoded = super::compact_json_body(&body).expect("the request body serializes");
+        Ok(serde_json::from_slice(&encoded).expect("a compact request body is JSON"))
     }
 
     /// Serializes one request fragment so a comparison is over the bytes a provider's prefix cache
@@ -2254,7 +2373,7 @@ mod tests {
         let cloned = messages.clone();
         for _ in 0..3 {
             let body =
-                build_request_body("gpt-5-codex", &cloned, &[], &CompletionOptions::default())
+                request_body_json("gpt-5-codex", &cloned, &[], &CompletionOptions::default())
                     .expect("request body");
 
             assert_eq!(
@@ -2271,7 +2390,7 @@ mod tests {
     #[test]
     fn a_text_only_user_message_keeps_its_single_input_text_part() {
         // Unchanged shape for every request that carries no attachment.
-        let body = build_request_body(
+        let body = request_body_json(
             "gpt-5-codex",
             &[ModelMessage::user("how many files?")],
             &[],
@@ -2298,7 +2417,7 @@ mod tests {
             ModelMessage::user("how many files are in the repository?"),
         ];
         let mut bodies = vec![
-            build_request_body("gpt-test", &messages, &tools, &CompletionOptions::default())
+            request_body_json("gpt-test", &messages, &tools, &CompletionOptions::default())
                 .expect("request body"),
         ];
         for (turn, script) in [(1, "ls | wc -l"), (2, "ls -a | wc -l")] {
@@ -2307,7 +2426,7 @@ mod tests {
             messages.push(crate::model::assistant_message(&assistant));
             messages.push(ModelMessage::tool(call_id.as_str(), "12\n"));
             bodies.push(
-                build_request_body("gpt-test", &messages, &tools, &CompletionOptions::default())
+                request_body_json("gpt-test", &messages, &tools, &CompletionOptions::default())
                     .expect("request body"),
             );
         }
@@ -2360,10 +2479,10 @@ mod tests {
         let mut injected = history.clone();
         injected.insert(2, ModelMessage::system("Prefer relative paths."));
 
-        let plain = build_request_body("gpt-test", &history, &tools, &CompletionOptions::default())
+        let plain = request_body_json("gpt-test", &history, &tools, &CompletionOptions::default())
             .expect("request body");
         let hoisted =
-            build_request_body("gpt-test", &injected, &tools, &CompletionOptions::default())
+            request_body_json("gpt-test", &injected, &tools, &CompletionOptions::default())
                 .expect("request body");
 
         assert_eq!(
@@ -2391,7 +2510,7 @@ mod tests {
             ModelMessage::system(system),
         ];
 
-        let body = build_request_body("gpt-test", &messages, &[], &CompletionOptions::default())
+        let body = request_body_json("gpt-test", &messages, &[], &CompletionOptions::default())
             .expect("request body");
 
         assert_eq!(body["instructions"], format!("{system}\n\n{system}"));
@@ -2411,14 +2530,14 @@ mod tests {
         // here kept passing, so the assertion is written to be deleted deliberately rather than
         // edged past.
         let assistant = scripted_turn(1, "call_1", "ls | wc -l");
-        let opening = build_request_body(
+        let opening = request_body_json(
             "gpt-test",
             &[ModelMessage::user("hello")],
             &[],
             &CompletionOptions::default(),
         )
         .expect("request body");
-        let resumed = build_request_body(
+        let resumed = request_body_json(
             "gpt-test",
             &[
                 ModelMessage::user("how many files are in the repository?"),
@@ -2455,9 +2574,8 @@ mod tests {
         // Anything else would be a wire change shipped by a feature nobody has switched on.
         let messages = cached_conversation();
         let tools = vec![bash_tool()];
-        let plain =
-            build_request_body("gpt-test", &messages, &tools, &CompletionOptions::default())
-                .expect("request body");
+        let plain = request_body_json("gpt-test", &messages, &tools, &CompletionOptions::default())
+            .expect("request body");
 
         assert!(
             plain.get("prompt_cache_key").is_none(),
@@ -2470,7 +2588,7 @@ mod tests {
 
         // A caller deriving a key from an empty conversation ID must land on the same bytes rather
         // than routing every such session into one shared empty lane.
-        let blank = build_request_body(
+        let blank = request_body_json(
             "gpt-test",
             &messages,
             &tools,
@@ -2486,10 +2604,9 @@ mod tests {
         // field the previous request had must survive unchanged; the key may only be added.
         let messages = cached_conversation();
         let tools = vec![bash_tool()];
-        let plain =
-            build_request_body("gpt-test", &messages, &tools, &CompletionOptions::default())
-                .expect("request body");
-        let keyed = build_request_body(
+        let plain = request_body_json("gpt-test", &messages, &tools, &CompletionOptions::default())
+            .expect("request body");
+        let keyed = request_body_json(
             "gpt-test",
             &messages,
             &tools,
@@ -3231,6 +3348,22 @@ mod tests {
         assert!(request.contains("chatgpt-account-id: acct-test"));
         assert!(request.contains("originator: dekopon"));
         assert!(request.contains(concat!("user-agent: dekopon/", env!("CARGO_PKG_VERSION"))));
+        // One compact document with its length declared: the endpoint's acceptance of a chunked
+        // request is unverified, and the mock reads the body by `content-length` the same way.
+        assert!(request.contains("content-type: application/json; charset=utf-8"));
+        let body = request
+            .split_once("\r\n\r\n")
+            .expect("a request body follows its headers")
+            .1;
+        assert!(
+            request.contains(&format!("content-length: {}", body.len())),
+            "{request}"
+        );
+        assert!(
+            body.starts_with(r#"{"model":"gpt-test","store":false,"stream":true,"#),
+            "{body}"
+        );
+        assert!(!body.contains('\n'), "the body carries pretty-printing");
     }
 
     fn export_fixture(path: &Path) {
