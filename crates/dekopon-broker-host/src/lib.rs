@@ -1618,7 +1618,7 @@ impl BrokerProviderRegistry {
             fuel.consumed = tracing::field::Empty,
         );
         let input = dekopon_core::bounded_display(&proposal.input);
-        span.record("input", input.text());
+        span.record("input", tracing::field::display(input.text()));
         span.record("input.bytes", input.bytes());
         if storage_backed {
             span.record("storage", true);

@@ -133,11 +133,14 @@ async fn a_proposal_past_the_cap_is_recorded_truncated_beside_its_full_length() 
         .map(|(_, fields)| fields)
         .collect::<Vec<_>>()
         .join("\n");
-    // `{"text":"` is the nine bytes of the cut prefix that are not the model's own text, and the
-    // capture renders a recorded string the way `Debug` does.
-    let expected = format!("{{\"text\":\"{}…[truncated]", "x".repeat(cap - 9));
+    // `{"text":"` is the nine bytes of the cut prefix that are not the model's own text. The value
+    // is still recorded through `Display`, so a reader sees the proposal rather than an escaped
+    // rendering of it; what changed is only where it ends.
     assert!(
-        authorize.contains(&format!("input={expected:?}")),
+        authorize.contains(&format!(
+            "input={{\"text\":\"{}…[truncated]",
+            "x".repeat(cap - 9)
+        )),
         "{authorize}"
     );
     assert!(

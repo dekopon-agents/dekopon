@@ -3326,7 +3326,7 @@ where
         // `Redacted` value inside it still renders its marker, because that is a property of the
         // value rather than of this span.
         let input = dekopon_core::bounded_display(&request.input);
-        authorize.record("input", input.text());
+        authorize.record("input", tracing::field::display(input.text()));
         authorize.record("input.bytes", input.bytes());
         // Instrumented rather than entered with a guard: on every denial this section awaits an
         // audit append that can suspend. A guard held across that await stays entered on the
