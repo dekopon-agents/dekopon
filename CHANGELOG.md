@@ -7,6 +7,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-09-17
+
 ### Fixed
 
 - Recover startup and established chat-transport failures through one bounded exponential-backoff
@@ -16,7 +18,9 @@ All notable changes to Dekopon are documented here. The format is based on
 
 - Pin `tracing-core` to the exact revision of upstream tracing PR #3614, fixing lost cold-callsite
   events/spans when the sole registered dispatcher is scoped to another thread. Direct and
-  transitive tracing consumers share the patched core; test assertions and parallelism are unchanged.
+  transitive tracing consumers in workspace-built archives/images share the patched core;
+  test assertions and parallelism are unchanged. Downstream crates.io builds do not inherit
+  this workspace-root patch.
 
 - Validate inbound WhatsApp PNG signatures without unaccounted scratch writes. Completed asset
   downloads that exceed retention limits now remain unavailable without silently redownloading;
@@ -43,9 +47,12 @@ All notable changes to Dekopon are documented here. The format is based on
   scoped `chat-asset` IDs for successive edits and share their stored bytes with outbound delivery.
   Temporary request pins count toward the same budget; storage failure preserves already-executed
   provider outcomes and never retries the paid call.
-- Gateway Helm scratch is disk-backed `emptyDir` with separate `volumeSizes.gatewayTmp` (320Mi
-  default). Existing `volumeSizes.tmp` overrides now affect only broker scratch, still tmpfs.
-  Operators must verify deployed scratch mounts separately; no rollout is implied.
+- Managed broker providers now use SHA-256-addressed, mmap-backed compiled artifacts by default,
+  verifying selected compiled hashes once per startup. `compileOnLoad: true` bypasses the cache;
+  `compileCachePath` and Wasmtime's compressed cache are removed. Missing indexes compile once;
+  other errors fail startup without retry, repair, or fallback. Startup loads one component at a
+  time to bound compiler memory. See [migration](docs/upgrading.md#mapped-compiled-providers-0170).
+
 ### Added
 
 - Broker provider invocations emit a payload-free linear-memory sizing summary with the largest
@@ -59,13 +66,15 @@ All notable changes to Dekopon are documented here. The format is based on
   registry load time with outcomes and propagated blocking-task ancestry. Compiled-cache growth
   has fixed object/byte limits and no automatic eviction.
 
+## [dekopon-chart-0.9.0] - 2026-09-17
+
 ### Changed
 
-- Managed broker providers now use SHA-256-addressed, mmap-backed compiled artifacts by default,
-  verifying selected compiled hashes once per startup. `compileOnLoad: true` bypasses the cache;
-  `compileCachePath` and Wasmtime's compressed cache are removed. Missing indexes compile once;
-  other errors fail startup without retry, repair, or fallback. Startup loads one component at a
-  time to bound compiler memory. See [migration](docs/upgrading.md#mapped-compiled-providers-unreleased).
+- Default application version is now 0.17.0.
+- Gateway scratch is disk-backed `emptyDir` with separate `volumeSizes.gatewayTmp` (320Mi
+  default). Existing `volumeSizes.tmp` overrides now affect only broker scratch, still tmpfs.
+  Operators must verify deployed scratch mounts separately; no rollout is implied. See
+  [migration](docs/upgrading.md#disk-backed-chat-assets-0170).
 
 ## [0.16.0] - 2026-09-15
 
