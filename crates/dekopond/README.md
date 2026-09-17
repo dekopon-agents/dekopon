@@ -8,6 +8,12 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
   polling, a raw-body-HMAC-authenticated text/image WhatsApp Cloud API webhook with pinned Graph
   replies, and an owner-only Unix development socket. WhatsApp is the only public wakeup surface;
   it expects operator-owned TLS termination and exact-path routing.
+- **Connection recovery** — all five adapters share a composable receive/connection extension:
+  30-second attempts, 500 ms exponential backoff capped at 60 seconds plus up to 249 ms jitter,
+  ten failures per episode, reset only after five continuously connected minutes. Healthy peers
+  serve during recovery. Any terminal reader failure drains sessions and exits nonzero so the
+  supervisor can restart the gateway container. No outbound effects are replayed. See
+  [policy and lifecycle](../../docs/dekopond.md#connection-recovery).
 - **Routing** — first match wins on (transport, direct message or channel), and a channel
   route names one channel or, with the name left out, any channel the bot is invited to.
   Declaration order is the precedence rule: a named channel written above a catch-all keeps

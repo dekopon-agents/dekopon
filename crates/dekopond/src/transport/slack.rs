@@ -38,7 +38,7 @@ use crate::{
         OutboundReply, ProgressLimits, ProgressMessage, ReplyTarget, SeenIds, Status, StreamLimits,
         StreamedText, TextStream, ThreadClaim, ThreadContinuation, ThreadOwnership, TransportError,
         TransportEvent, TransportIdentity, bound_inbound, credential_client, floor_boundary,
-        receive_span, reconnect_delay, record_conversation,
+        receive_span, record_conversation,
     },
 };
 
@@ -124,7 +124,6 @@ pub(crate) struct SlackTransport {
     /// What each conversation turned out to be, for the events that do not say.
     channel_kinds: Tracked<SlackChannelKind>,
     pending: VecDeque<TransportEvent>,
-    failures: u32,
     experience: SlackExperience,
     deadline: Duration,
     thread_ownership: Arc<SlackThreadOwnership>,
@@ -168,7 +167,6 @@ impl SlackTransport {
             seen: SeenIds::new(DEDUP_CAPACITY),
             channel_kinds: Tracked::new(MAX_TRACKED_CHANNEL_KINDS),
             pending: VecDeque::new(),
-            failures: 0,
             experience,
             deadline: LIVENESS_DEADLINE,
             thread_ownership,
@@ -219,7 +217,6 @@ impl SlackTransport {
             }
         };
         self.socket = Some(socket);
-        self.failures = 0;
         Ok(())
     }
 
@@ -390,10 +387,10 @@ impl SlackTransport {
     /// awaits, and a span guard held across an await is the wrong trace for whatever ran next.
     async fn accept(&mut self, frame: &Value, received: &Span) -> Result<(), TransportError> {
         match frame["type"].as_str() {
-            // Slack rotates sockets on its own schedule; a disconnect is routine, not a failure.
+            // Slack rotates sockets on its own schedule; the recovery layer reopens it.
             Some("disconnect") => {
                 self.socket = None;
-                return Ok(());
+                return Err(TransportError::Closed);
             }
             Some("events_api") => {}
             _ => return Ok(()),
@@ -821,32 +818,23 @@ impl ChatTransport for SlackTransport {
         })
     }
 
+    fn reconnect(&mut self) -> BoxFuture<'_, Result<TransportIdentity, TransportError>> {
+        Box::pin(async move {
+            self.socket = None;
+            self.open().await?;
+            Ok(self.identity.clone())
+        })
+    }
+
     fn next(&mut self) -> BoxFuture<'_, Result<TransportEvent, TransportError>> {
         Box::pin(async move {
             loop {
                 if let Some(event) = self.pending.pop_front() {
                     return Ok(event);
                 }
-                if self.socket.is_none() {
-                    tokio::time::sleep(reconnect_delay(self.failures)).await;
-                    if let Err(error) = self.open().await {
-                        self.failures = self.failures.saturating_add(1);
-                        tracing::warn!(
-                            event = "gateway_transport_reconnect_failed",
-                            transport = %self.name,
-                            category = error.category()
-                        );
-                    }
-                    continue;
-                }
                 if let Err(error) = self.pump().await {
                     self.socket = None;
-                    self.failures = self.failures.saturating_add(1);
-                    tracing::warn!(
-                        event = "gateway_transport_disconnected",
-                        transport = %self.name,
-                        category = error.category()
-                    );
+                    return Err(error);
                 }
             }
         })

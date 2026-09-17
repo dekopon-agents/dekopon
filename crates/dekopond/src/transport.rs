@@ -28,6 +28,7 @@ use thiserror::Error;
 pub(crate) mod discord;
 mod hydration;
 pub(crate) mod local;
+pub(crate) mod recovery;
 pub(crate) mod slack;
 pub(crate) mod telegram;
 pub(crate) mod whatsapp;
@@ -182,6 +183,11 @@ pub(crate) fn record_conversation(span: &tracing::Span, conversation: &Conversat
 /// One event produced by a chat transport.
 #[derive(Clone, Debug)]
 pub(crate) enum TransportEvent {
+    /// Reader-authenticated identity, queued before its first message.
+    Connected {
+        name: String,
+        identity: TransportIdentity,
+    },
     /// A user message eligible for ordinary routing.
     Message(Box<InboundMessage>),
     /// An authenticated request to stop one active run, from any of the ways a service offers.
@@ -473,8 +479,18 @@ pub(crate) trait ChatTransport: Send {
     /// Authenticates, resolves the bot's own identity, and opens the wakeup path.
     fn connect(&mut self) -> BoxFuture<'_, Result<TransportIdentity, TransportError>>;
 
-    /// Waits for the next routable message or native session-control event, reconnecting internally
-    /// as needed.
+    /// Reopens the wakeup path without discarding adapter protocol state or deduplication.
+    fn reconnect(&mut self) -> BoxFuture<'_, Result<TransportIdentity, TransportError>> {
+        self.connect()
+    }
+
+    /// Whether another connection attempt can recover this failure.
+    fn retryable(&self, error: &TransportError) -> bool {
+        !matches!(error, TransportError::InsecureSocket { .. })
+    }
+
+    /// Waits for the next routable message or native session-control event. Connection failures
+    /// escape to the shared recovery extension; adapters retain protocol resume state.
     fn next(&mut self) -> BoxFuture<'_, Result<TransportEvent, TransportError>>;
 
     /// A cheaply cloned handle sessions answer and show progress through.
@@ -718,6 +734,16 @@ pub enum TransportError {
     MalformedResponse(#[source] serde_json::Error),
     #[error("chat service accepted only part of a split answer")]
     PartialDelivery,
+    #[error("chat transport connection attempt exceeded its deadline")]
+    ConnectTimeout,
+    #[error("chat transport recovery exhausted after {failures} failures")]
+    RecoveryExhausted {
+        failures: u32,
+        #[source]
+        source: Box<TransportError>,
+    },
+    #[error("chat transport identity changed during recovery")]
+    IdentityChanged,
     #[error("chat socket closed")]
     Closed,
     #[error("transport input/output failed")]
@@ -743,6 +769,9 @@ impl TransportError {
             Self::MalformedResponse(_) => "malformed-response",
             Self::PartialDelivery => "partial-delivery",
             Self::Closed => "closed",
+            Self::ConnectTimeout => "connect-timeout",
+            Self::RecoveryExhausted { .. } => "recovery-exhausted",
+            Self::IdentityChanged => "identity-changed",
             Self::Io(_) => "io",
             Self::InsecureSocket { .. } => "insecure-socket",
             Self::Subject(_) => "subject",

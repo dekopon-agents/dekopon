@@ -36,7 +36,7 @@ use crate::{
         ProgressLimits, ProgressMessage, ReplyTarget, SeenIds, StreamLimits, StreamedText,
         TextStream, TextUnit, TransportError, TransportEvent, TransportIdentity, TypingLease,
         bound_inbound, credential_client, floor_boundary, jitter_below, receive_span,
-        reconnect_delay, record_conversation, retry_after_from_body, split_message,
+        record_conversation, retry_after_from_body, split_message,
     },
 };
 
@@ -120,7 +120,6 @@ pub(crate) struct DiscordTransport {
     /// What each guild channel this bot has been spoken to in actually is.
     channels: ChannelShapes,
     pending: VecDeque<TransportEvent>,
-    failures: u32,
     /// `liveness.mode: native` — an inbound message carries coordinates for transient signals.
     ///
     /// One decision rather than the whole block: what Discord can render is fixed, and progress,
@@ -180,7 +179,6 @@ impl DiscordTransport {
             seen: SeenIds::new(DEDUP_CAPACITY),
             channels: ChannelShapes::new(CHANNEL_SHAPE_CAPACITY),
             pending: VecDeque::new(),
-            failures: 0,
             native: liveness.mode == LivenessMode::Native,
         })
     }
@@ -288,7 +286,6 @@ impl DiscordTransport {
         loop {
             match self.pump().await? {
                 PumpResult::Ready => {
-                    self.failures = 0;
                     return Ok(());
                 }
                 PumpResult::Event(event) => self.pending.push_back(event),
@@ -899,11 +896,26 @@ impl ChatTransport for DiscordTransport {
 
     fn connect(&mut self) -> BoxFuture<'_, Result<TransportIdentity, TransportError>> {
         Box::pin(async move {
-            self.discover().await?;
+            self.socket = None;
+            if self.gateway_url.is_none() {
+                self.discover().await?;
+            }
             if let Err(error) = self.open().await {
                 self.socket = None;
                 return Err(error);
             }
+            Ok(self.identity.clone())
+        })
+    }
+
+    fn retryable(&self, error: &TransportError) -> bool {
+        !is_fatal(error)
+    }
+
+    fn reconnect(&mut self) -> BoxFuture<'_, Result<TransportIdentity, TransportError>> {
+        Box::pin(async move {
+            self.socket = None;
+            self.open().await?;
             Ok(self.identity.clone())
         })
     }
@@ -914,38 +926,12 @@ impl ChatTransport for DiscordTransport {
                 if let Some(event) = self.pending.pop_front() {
                     return Ok(event);
                 }
-                if self.socket.is_none() {
-                    tokio::time::sleep(reconnect_delay(self.failures)).await;
-                    if let Err(error) = self.open().await {
-                        self.socket = None;
-                        if is_fatal(&error) {
-                            return Err(error);
-                        }
-                        self.failures = self.failures.saturating_add(1);
-                        tracing::warn!(
-                            event = "gateway_transport_reconnect_failed",
-                            transport = %self.name,
-                            category = error.category()
-                        );
-                        continue;
-                    }
-                }
                 match self.pump().await {
-                    Ok(PumpResult::Event(event)) => {
-                        return Ok(event);
-                    }
+                    Ok(PumpResult::Event(event)) => return Ok(event),
                     Ok(PumpResult::Ready | PumpResult::Idle) => {}
                     Err(error) => {
                         self.socket = None;
-                        if is_fatal(&error) {
-                            return Err(error);
-                        }
-                        self.failures = self.failures.saturating_add(1);
-                        tracing::warn!(
-                            event = "gateway_transport_disconnected",
-                            transport = %self.name,
-                            category = error.category()
-                        );
+                        return Err(error);
                     }
                 }
             }
@@ -1995,7 +1981,8 @@ fn is_fatal(error: &TransportError) -> bool {
     matches!(
         error,
         TransportError::Service { code }
-            if code == "http-401"
+            if code == "session-start-limit-exhausted"
+                || code == "http-401"
                 || code == "http-403"
                 || code
                     .strip_prefix("gateway-close-")
@@ -2317,7 +2304,14 @@ mod unit_tests {
             .consume_identify()
             .expect("the send boundary consumes it");
         assert_eq!(transport.session_starts.expect("limit").remaining, 0);
-        assert!(transport.prepare_identify().await.is_err());
+        let exhausted = transport
+            .prepare_identify()
+            .await
+            .expect_err("Identify budget spent");
+        assert!(
+            is_fatal(&exhausted),
+            "recovery must not retry a spent Identify budget"
+        );
     }
 
     #[test]

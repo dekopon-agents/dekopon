@@ -36,7 +36,7 @@ mod transport;
 pub mod cli;
 
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, HashMap},
     future::Future,
     path::Path,
     sync::Arc,
@@ -83,13 +83,6 @@ use crate::{
 /// growing a queue the daemon can never work through. Admission control refuses the overflow with
 /// a sentence, which is a better answer than an unbounded backlog.
 const INBOUND_BUFFER: usize = 64;
-/// How often a transport that ended for good is announced again while the daemon keeps serving.
-///
-/// A transport whose reader stops is gone until the process restarts, and the deployment has no
-/// gateway probe: one error line at the moment it happened is a signal nobody is looking at an hour
-/// later. Re-stating it on an interval is what lets an alert fire on the condition rather than on
-/// catching the edge.
-const TRANSPORT_HEALTH_INTERVAL: Duration = Duration::from_secs(60);
 /// Independent fallback timeout for attachment inventories after their last message.
 ///
 /// Persistent access dies earlier whenever its conversation generation does. This remains longer
@@ -149,46 +142,25 @@ where
         event = "gateway_broker_ready",
         capability.count = capabilities.len()
     );
-    let mut transports = Vec::with_capacity(config.transports.len());
-    let mut identities = BTreeMap::new();
     let mut drivers: BTreeMap<String, Arc<dyn ChatDriver>> = BTreeMap::new();
     let mut asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>> = HashMap::new();
     let mut thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>> = HashMap::new();
-    let mut connect_problems = Vec::new();
-    for (spec, mut transport) in config.transports.iter().zip(built_transports) {
-        let identity = match transport.connect().await {
-            Ok(identity) => identity,
-            Err(source) => {
-                connect_problems.push(TransportConnectProblem {
-                    transport: spec.name().to_owned(),
-                    source,
-                });
-                continue;
-            }
-        };
-        tracing::info!(
-            event = "gateway_transport_connected",
-            transport = spec.name(),
-            kind = spec.kind()
-        );
-        identities.insert(spec.name().to_owned(), identity);
-        drivers.insert(spec.name().to_owned(), transport.driver());
-        // Absent for a transport that carries no attachments, which is what makes the tool
-        // unavailable on a route bound to one.
+    let (sender, receiver) = mpsc::channel::<TransportEvent>(INBOUND_BUFFER);
+    let mut readers = JoinSet::new();
+    for transport in built_transports {
+        let transport = transport::recovery::RecoveringTransport::new(transport);
+        let name = transport.name().to_owned();
+        drivers.insert(name.clone(), transport.driver());
         if let Some(fetcher) = transport.asset_fetcher() {
-            asset_fetchers.insert(spec.name().to_owned(), fetcher);
+            asset_fetchers.insert(name.clone(), fetcher);
         }
         if let Some(ownership) = transport.thread_ownership() {
-            thread_ownership.insert(spec.name().to_owned(), ownership);
+            thread_ownership.insert(name, ownership);
         }
-        transports.push(transport);
+        readers.spawn(read_transport(Box::new(transport), sender.clone()));
     }
-
-    if !connect_problems.is_empty() {
-        return Err(DekopondError::TransportConnect {
-            problems: connect_problems,
-        });
-    }
+    // Retain this sender until supervision completes: a reader failure must reach the supervisor,
+    // rather than racing a closed inbound queue and losing its underlying cause.
 
     let runner = Arc::new(SessionRunner {
         broker: config.broker.clone(),
@@ -209,48 +181,50 @@ where
         active_sessions: session::ActiveSessions::default(),
     });
 
-    let (sender, receiver) = mpsc::channel::<TransportEvent>(INBOUND_BUFFER);
-    let health = Arc::new(TransportHealth::new(transports.len()));
-    let mut readers = JoinSet::new();
-    for transport in transports {
-        readers.spawn(read_transport(
-            transport,
-            sender.clone(),
-            Arc::clone(&health),
-        ));
-    }
-    drop(sender);
-    let health_reporter = tokio::spawn(report_transport_health(Arc::clone(&health)));
-
     tracing::info!(
         event = "gateway_started",
         transport.count = config.transports.len(),
         route.count = routes.len()
     );
 
+    let mut terminal = Ok(());
+    let stopped = async {
+        terminal = supervise_transports(&mut readers, shutdown).await;
+        // Stop admission at every adapter before session draining, including sleepers/connectors.
+        readers.abort_all();
+    };
     let outcome = serve(
         runner,
         routes,
-        Arc::new(identities),
+        Arc::new(BTreeMap::new()),
         Arc::new(drivers),
         Arc::new(config.stop_words.clone()),
         receiver,
-        shutdown,
+        stopped,
         config.shutdown_grace,
         collection::Collector::new(&config.transports, config.sessions.max_concurrent),
     )
     .await;
     readers.abort_all();
-    while readers.join_next().await.is_some() {}
-    health_reporter.abort();
-    // Awaiting an aborted handle is how the task is joined, not how it is checked: the only
-    // answer it can give is the cancellation just asked for.
-    #[allow(
-        clippy::let_underscore_must_use,
-        reason = "the JoinHandle was aborted on the line above, so its Result is the cancellation \
-                  this shutdown requested rather than an outcome anything can act on"
-    )]
-    let _ = health_reporter.await;
+    while let Some(result) = readers.join_next().await {
+        match result {
+            // A peer can fail before the supervisor abort reaches it. Preserve that reason too.
+            Ok(Err(problem)) => tracing::warn!(
+                event = "gateway_transport_stopped",
+                transport = %problem.transport,
+                category = problem.source.category(),
+            ),
+            Err(error) if !error.is_cancelled() => tracing::error!(
+                event = "gateway_transport_task_failed", error = %error,
+            ),
+            Ok(Ok(())) | Err(_) => {}
+        }
+    }
+    drop(sender);
+    if let Err(error) = terminal {
+        tracing::error!(event = "gateway_stopped", reason = "transport-failed");
+        return Err(error);
+    }
     match outcome {
         ServeOutcome::Shutdown => {
             tracing::info!(event = "gateway_stopped", reason = "shutdown");
@@ -280,7 +254,7 @@ enum ServeOutcome {
 async fn serve<F>(
     runner: Arc<SessionRunner>,
     routes: Arc<RoutingTable>,
-    identities: Arc<BTreeMap<String, TransportIdentity>>,
+    mut identities: Arc<BTreeMap<String, TransportIdentity>>,
     drivers: Arc<BTreeMap<String, Arc<dyn ChatDriver>>>,
     stop_words: Arc<Vec<String>>,
     mut receiver: mpsc::Receiver<TransportEvent>,
@@ -321,6 +295,9 @@ where
                     break;
                 };
                 match event {
+                    TransportEvent::Connected { name, identity } => {
+                        Arc::make_mut(&mut identities).insert(name, identity);
+                    }
                     TransportEvent::Message(message) => {
                         // Routing runs inside the transport's receive span, so a message dropped as
                         // unrouted or unaddressed says why inside its own trace instead of leaving
@@ -571,89 +548,53 @@ const fn via_label(via: dekopon_agent::CancelVia) -> &'static str {
     }
 }
 
-/// One reader task per transport, feeding the routing loop.
+/// One reader per adapter, with identity delivered before any of its messages.
 async fn read_transport(
     mut transport: Box<dyn ChatTransport>,
     sender: mpsc::Sender<TransportEvent>,
-    health: Arc<TransportHealth>,
-) {
-    loop {
-        match transport.next().await {
-            Ok(event) => {
-                if sender.send(event).await.is_err() {
-                    return;
-                }
-            }
-            Err(error) => {
-                // A transport that cannot recover on its own ends its own reader. The alternative
-                // is a hot loop against a service that is telling us to stop.
-                tracing::error!(
-                    event = "gateway_transport_stopped",
-                    transport = transport.name(),
-                    category = error.category()
-                );
-                // Recorded rather than only logged: this daemon keeps serving whatever is left,
-                // so the condition outlives the line that reported it.
-                health.mark_dead(transport.name());
-                return;
+) -> Result<(), TransportConnectProblem> {
+    let result = async {
+        let identity = transport.connect().await?;
+        if sender
+            .send(TransportEvent::Connected {
+                name: transport.name().to_owned(),
+                identity,
+            })
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
+        loop {
+            let event = transport.next().await?;
+            if sender.send(event).await.is_err() {
+                return Ok(());
             }
         }
     }
+    .await;
+    result.map_err(|source| TransportConnectProblem {
+        transport: transport.name().to_owned(),
+        source,
+    })
 }
 
-/// Which transports have ended for good, shared by the readers and the health reporter.
-#[derive(Debug)]
-struct TransportHealth {
-    configured: usize,
-    dead: std::sync::Mutex<BTreeSet<String>>,
-}
-
-impl TransportHealth {
-    fn new(configured: usize) -> Self {
-        Self {
-            configured,
-            dead: std::sync::Mutex::new(BTreeSet::new()),
+/// Any terminal reader failure stops the whole gateway, even while other readers are healthy.
+async fn supervise_transports<F>(
+    readers: &mut JoinSet<Result<(), TransportConnectProblem>>,
+    shutdown: F,
+) -> Result<(), DekopondError>
+where
+    F: Future<Output = ()> + Send,
+{
+    tokio::select! {
+        biased;
+        () = shutdown => Ok(()),
+        result = readers.join_next() => match result {
+            Some(Ok(Err(problem))) => Err(DekopondError::TransportConnect { problems: vec![problem] }),
+            Some(Err(source)) => Err(DekopondError::TransportTask(source)),
+            Some(Ok(Ok(()))) | None => Err(DekopondError::TransportsLost),
         }
-    }
-
-    fn mark_dead(&self, transport: &str) {
-        self.dead
-            .lock()
-            .expect("gateway transport health")
-            .insert(transport.to_owned());
-    }
-
-    /// The dead transports by name, sorted so one line means the same thing every time.
-    fn dead(&self) -> Vec<String> {
-        self.dead
-            .lock()
-            .expect("gateway transport health")
-            .iter()
-            .cloned()
-            .collect()
-    }
-}
-
-/// Re-states a degraded transport set on an interval for as long as it stays degraded.
-async fn report_transport_health(health: Arc<TransportHealth>) {
-    let mut interval = tokio::time::interval(TRANSPORT_HEALTH_INTERVAL);
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // `interval` fires immediately once, and nothing can be dead before the readers start.
-    interval.tick().await;
-    loop {
-        interval.tick().await;
-        let dead = health.dead();
-        if dead.is_empty() {
-            continue;
-        }
-        // Configured transport names, which an operator wrote and telemetry already carries per
-        // event. Nothing here comes from a chat service.
-        tracing::warn!(
-            event = "gateway_transports_degraded",
-            transport.dead = dead.len(),
-            transport.configured = health.configured,
-            transports = %dead.join(",")
-        );
     }
 }
 
@@ -811,12 +752,15 @@ pub enum DekopondError {
     /// The configured broker did not answer a capability probe at startup.
     #[error("broker is not reachable; start dekopon-brokerd before the gateway")]
     BrokerProbe(#[source] dekopon_broker_protocol::ClientError),
-    /// Every transport that could not authenticate or open its wakeup path.
+    /// A transport could not establish or recover its wakeup path.
     #[error("{}", render_problems(.problems))]
     TransportConnect {
-        /// Transport names and connection failures, in configured order.
+        /// Terminal transport failures, including the configured name and underlying cause.
         problems: Vec<TransportConnectProblem>,
     },
+    /// A transport reader panicked or was unexpectedly cancelled.
+    #[error("chat transport task failed")]
+    TransportTask(#[source] tokio::task::JoinError),
     /// Every transport ended on its own, with no shutdown asked for.
     ///
     /// The daemon has no way left to hear a message, so it stops. Reporting it as a failure is the
@@ -827,7 +771,7 @@ pub enum DekopondError {
 
 /// A configured transport and its connection failure.
 #[derive(Debug, Error)]
-#[error("chat transport {transport} could not connect")]
+#[error("chat transport {transport} failed")]
 pub struct TransportConnectProblem {
     /// Configured transport name included in the diagnostic.
     pub transport: String,

@@ -24,7 +24,7 @@ use crate::{
         ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageRef, OutboundReply,
         ProgressLimits, ProgressMessage, ReplyTarget, StreamLimits, StreamedText, TextStream,
         TextUnit, TransportError, TransportEvent, TransportIdentity, TypingLease, bound_inbound,
-        credential_client, floor_boundary, receive_span, reconnect_delay, record_conversation,
+        credential_client, floor_boundary, receive_span, record_conversation,
         retry_after_from_body, split_message,
     },
 };
@@ -95,7 +95,6 @@ pub(crate) struct TelegramTransport {
     driver: Arc<TelegramDriver>,
     offset: i64,
     pending: VecDeque<TransportEvent>,
-    failures: u32,
     /// `liveness.mode: native` — an inbound message carries coordinates for transient signals.
     ///
     /// One decision rather than the whole block: what the Bot API can render is fixed, and
@@ -166,7 +165,6 @@ impl TelegramTransport {
             }),
             offset: 0,
             pending: VecDeque::new(),
-            failures: 0,
             native: liveness.mode == LivenessMode::Native,
         })
     }
@@ -234,7 +232,6 @@ impl TelegramTransport {
                 None => {}
             }
         }
-        self.failures = 0;
         Ok(())
     }
 
@@ -503,15 +500,7 @@ impl ChatTransport for TelegramTransport {
                 if let Some(event) = self.pending.pop_front() {
                     return Ok(event);
                 }
-                if let Err(error) = self.poll().await {
-                    self.failures = self.failures.saturating_add(1);
-                    tracing::warn!(
-                        event = "gateway_transport_poll_failed",
-                        transport = %self.name,
-                        category = error.category()
-                    );
-                    tokio::time::sleep(reconnect_delay(self.failures)).await;
-                }
+                self.poll().await?;
             }
         })
     }

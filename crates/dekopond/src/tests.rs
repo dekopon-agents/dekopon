@@ -1244,7 +1244,7 @@ async fn every_missing_transport_credential_is_named_before_anything_connects() 
 }
 
 #[tokio::test]
-async fn every_failing_transport_connection_is_named_in_one_refusal() {
+async fn a_permanent_transport_failure_stops_the_gateway_and_preserves_its_cause() {
     let directory = temporary();
     fs::write(
         directory.path().join("dekopon.yaml"),
@@ -1276,17 +1276,18 @@ async fn every_failing_transport_connection_is_named_in_one_refusal() {
     .expect("startup is bounded")
     .expect_err("both non-socket paths refuse transport startup");
     let crate::DekopondError::TransportConnect { problems } = &error else {
-        panic!("expected aggregate connect refusal: {error:?}");
+        panic!("expected a terminal transport refusal: {error:?}");
     };
-    assert_eq!(problems.len(), 2);
+    assert_eq!(problems.len(), 1);
     let rendered = error.to_string();
-    for ((problem, name), path) in problems.iter().zip(["first", "second"]).zip(&paths) {
-        assert_eq!(problem.transport, name);
+    for problem in problems {
+        let name = problem.transport.as_str();
+        let path = &paths[usize::from(name == "second")];
         assert!(
             matches!(&problem.source, TransportError::InsecureSocket { path: refused }
             if refused == &path.display().to_string())
         );
-        assert!(rendered.contains(&format!("chat transport {name} could not connect")));
+        assert!(rendered.contains(&format!("chat transport {name} failed")));
         assert!(
             rendered.contains(&problem.source.to_string()),
             "cause is rendered: {rendered}"
@@ -6323,16 +6324,15 @@ async fn a_transport_reader_forwards_messages_and_stops_when_the_transport_does(
         driver: Arc::new(RecordingDriver::default()),
     };
     let (routed, mut received) = mpsc::channel(4);
-    let health = Arc::new(crate::TransportHealth::new(1));
-    let reader = tokio::spawn(crate::read_transport(
-        Box::new(transport),
-        routed,
-        Arc::clone(&health),
-    ));
+    let reader = tokio::spawn(crate::read_transport(Box::new(transport), routed));
 
     sender
         .send(message("first"))
         .expect("fixture accepts a message");
+    assert!(matches!(
+        received.recv().await,
+        Some(TransportEvent::Connected { .. })
+    ));
     let TransportEvent::Message(received) = received.recv().await.expect("the reader forwards it")
     else {
         panic!("the fixture sent a message event");
@@ -6340,12 +6340,12 @@ async fn a_transport_reader_forwards_messages_and_stops_when_the_transport_does(
     assert_eq!(received.text, "first");
 
     drop(sender);
-    reader.await.expect("the reader ends with its transport");
-    assert_eq!(
-        health.dead(),
-        vec!["dev".to_owned()],
-        "a transport that ended for good is recorded, not only logged once"
-    );
+    let error = reader
+        .await
+        .expect("reader joined")
+        .expect_err("closed input is fatal");
+    assert_eq!(error.transport, "dev");
+    assert!(matches!(error.source, TransportError::Closed));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -6360,21 +6360,15 @@ async fn a_reader_that_stops_because_the_daemon_stopped_is_not_a_dead_transport(
     };
     let (routed, received) = mpsc::channel(1);
     drop(received);
-    let health = Arc::new(crate::TransportHealth::new(1));
-    let reader = tokio::spawn(crate::read_transport(
-        Box::new(transport),
-        routed,
-        Arc::clone(&health),
-    ));
+    let reader = tokio::spawn(crate::read_transport(Box::new(transport), routed));
 
     sender
         .send(message("nobody is listening"))
         .expect("fixture accepts a message");
-    reader.await.expect("the reader ends with the daemon");
-    assert!(
-        health.dead().is_empty(),
-        "a reader ending with the daemon is not a transport failure"
-    );
+    reader
+        .await
+        .expect("reader joined")
+        .expect("routing shutdown is not failure");
 }
 
 /// The stop-word list for tests about routing rather than cancellation.
@@ -7283,7 +7277,8 @@ async fn a_slack_disconnect_reconnects_on_a_fresh_socket() {
         json!({"type": "disconnect", "reason": "refresh_requested"}),
     ]);
     let http = spawn_http_mock(slack_handler(vec![first.url.clone(), second.url.clone()]));
-    let mut transport = slack(&http.base);
+    let transport = slack(&http.base);
+    let mut transport = crate::transport::recovery::RecoveringTransport::new(Box::new(transport));
     transport.connect().await.expect("slack transport connects");
 
     let message = expect_message(
@@ -7336,7 +7331,8 @@ async fn a_silent_slack_socket_is_abandoned_rather_than_waited_on_forever() {
     )]);
     let wedged = spawn_socket_mock(Vec::new());
     let http = spawn_http_mock(slack_handler(vec![wedged.url.clone(), second.url.clone()]));
-    let mut transport = slack(&http.base).with_deadline(Duration::from_millis(100));
+    let transport = slack(&http.base).with_deadline(Duration::from_millis(100));
+    let mut transport = crate::transport::recovery::RecoveringTransport::new(Box::new(transport));
     transport.connect().await.expect("slack transport connects");
 
     let message = expect_message(
@@ -10320,7 +10316,8 @@ async fn discord_reconnects_when_a_heartbeat_is_not_acknowledged() {
     let mut first =
         spawn_discord_socket_mock_with_heartbeat(Vec::new(), Some(second.url.clone()), 20, false);
     let http = spawn_http_mock(discord_handler(first.url.clone()));
-    let mut transport = discord(&http.base);
+    let transport = discord(&http.base);
+    let mut transport = crate::transport::recovery::RecoveringTransport::new(Box::new(transport));
     transport.connect().await.expect("Discord connects");
 
     let message = expect_message(
@@ -10393,7 +10390,8 @@ async fn discord_reconnects_with_resume_before_delivering_more_messages() {
     let first =
         spawn_discord_socket_mock(vec![json!({"op": 7, "d": null})], Some(second.url.clone()));
     let http = spawn_http_mock(discord_handler(first.url.clone()));
-    let mut transport = discord(&http.base);
+    let transport = discord(&http.base);
+    let mut transport = crate::transport::recovery::RecoveringTransport::new(Box::new(transport));
     transport.connect().await.expect("Discord connects");
 
     let message = expect_message(
@@ -13634,4 +13632,86 @@ async fn generated_only_session_publishes_fetch_tool_and_reuses_result_before_ne
         format!("data:image/png;base64,{}", STANDARD.encode(png))
     );
     assert_eq!(driver.replies(), vec!["Two produced images.".to_owned()]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn fatal_transport_supervision_bounds_the_drain_of_a_parked_session() {
+    let directory = temporary();
+    let config = resolved(directory.path(), &document(directory.path())).await;
+    let routes =
+        Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("routes"));
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
+    let runner = runner(broker, ModelScript::new([answer("answer")]), 4);
+    let driver = Arc::new(ParkedReplyDriver::default());
+    let drivers = Arc::new(BTreeMap::from([(
+        "dev".to_owned(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )]));
+    let (sender, receiver) = mpsc::channel(4);
+    sender
+        .send(TransportEvent::Message(Box::new(message("hello"))))
+        .await
+        .expect("queued");
+    let mut readers = tokio::task::JoinSet::new();
+    let delivering = Arc::clone(&driver);
+    readers.spawn(async move {
+        delivering.delivering.notified().await;
+        Err(crate::TransportConnectProblem {
+            transport: "failed-peer".to_owned(),
+            source: TransportError::Closed,
+        })
+    });
+    let mut terminal = Ok(());
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::serve(
+            runner,
+            routes,
+            Arc::new(BTreeMap::new()),
+            drivers,
+            Arc::new(NO_STOP_WORDS.to_vec()),
+            receiver,
+            async {
+                terminal = crate::supervise_transports(&mut readers, std::future::pending()).await;
+            },
+            Duration::from_millis(50),
+            crate::collection::Collector::new(&[], 4),
+        ),
+    )
+    .await
+    .expect("fatal exit cannot await a parked reply forever");
+    assert_eq!(outcome, crate::ServeOutcome::Shutdown);
+    assert!(matches!(
+        terminal,
+        Err(crate::DekopondError::TransportConnect { .. })
+    ));
+    assert!(started.elapsed() >= Duration::from_millis(50));
+    assert!(
+        driver.delivered().is_empty(),
+        "aborting a drain must not replay delivery"
+    );
+}
+
+#[test]
+fn recovery_forwards_slack_agent_capabilities_without_rebuilding_them() {
+    let inner = slack_with(
+        "http://127.0.0.1:9",
+        SlackExperience::Agent,
+        LivenessConfig::default(),
+    );
+    let driver = inner.driver();
+    let fetcher = inner.asset_fetcher().expect("Slack assets");
+    let ownership = inner.thread_ownership().expect("Agent ownership");
+    let transport = crate::transport::recovery::RecoveringTransport::new(Box::new(inner));
+    assert!(Arc::ptr_eq(&driver, &transport.driver()));
+    assert!(Arc::ptr_eq(
+        &fetcher,
+        &transport.asset_fetcher().expect("forwarded assets")
+    ));
+    assert!(Arc::ptr_eq(
+        &ownership,
+        &transport.thread_ownership().expect("forwarded ownership")
+    ));
 }

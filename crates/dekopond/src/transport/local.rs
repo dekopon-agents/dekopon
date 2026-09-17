@@ -324,6 +324,19 @@ impl ChatTransport for LocalTransport {
         })
     }
 
+    fn reconnect(&mut self) -> BoxFuture<'_, Result<TransportIdentity, TransportError>> {
+        Box::pin(async move {
+            // Drop the old listener and its path guard before rebinding. Keep the process nonce,
+            // connection IDs and existing reply handles unchanged.
+            self.listener.take();
+            self.guard.take();
+            let (listener, guard) = bind(&self.socket_path)?;
+            self.listener = Some(listener);
+            self.guard = Some(guard);
+            Ok(TransportIdentity::default())
+        })
+    }
+
     fn next(&mut self) -> BoxFuture<'_, Result<TransportEvent, TransportError>> {
         Box::pin(async move {
             loop {
@@ -1020,6 +1033,30 @@ mod unit_tests {
                     "cancel": false
                 }
             })]
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_rebinds_without_changing_the_boot_identity_or_reply_driver() {
+        let directory = private_directory();
+        let path = directory.path().join("recover.sock");
+        let mut transport = transport(path.clone());
+        transport.connect().await.expect("first listener");
+        let nonce = transport.boot_nonce.clone();
+        let driver = transport.driver();
+        for _ in 0..2 {
+            transport
+                .reconnect()
+                .await
+                .expect("old listener released before rebinding");
+            assert_eq!(transport.boot_nonce, nonce);
+            assert!(Arc::ptr_eq(&driver, &transport.driver()));
+            assert!(path.exists());
+        }
+        drop(transport);
+        assert!(
+            !path.exists(),
+            "final guard removes only its current socket"
         );
     }
 

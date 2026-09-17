@@ -8,6 +8,17 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Bounded chat-transport recovery (Unreleased)
+
+No configuration changes are required. All adapters now use the
+[shared recovery defaults](dekopond.md#connection-recovery). Connections start concurrently;
+`gateway_started` no longer means every adapter is connected. Replace alerts on
+`gateway_transports_degraded` with recovery/exit monitoring: exhausting even one adapter now
+terminates the gateway nonzero after bounded draining rather than serving a permanently degraded
+set forever. Ensure the process supervisor restarts failed gateways. Kubernetes restarts the
+container; it need not replace the pod. Broker authority and outbound-effect retry behavior do not
+change.
+
 ## Mapped compiled providers (unreleased)
 
 Remove broker `compileCachePath`; it is now an unknown field. Managed `providerSet` startup uses
