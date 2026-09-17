@@ -9,10 +9,45 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Changed
 
+- Cut the `input` attribute on `broker.authorize` and `provider.invoke` at 4096 bytes with the
+  `…[truncated]` marker and an `input.bytes` sibling carrying the uncut length, the same bound the
+  six command fields already take. Operators reading a proposal out of a trace now see its first
+  4096 bytes rather than all of it. Recording it unbounded cost one copy of the input JSON per
+  installed layer: 96.0 MiB of allocator peak for one 8 MiB image with the console and OTLP layers
+  a `dekopon-brokerd` installs, nine times the JSON itself. Input is still recorded
+  unconditionally; the attribute is bounded, never the span.
+
 - Warm Linux amd64/ARM64 release dependency caches on main and restore them across
   subsequent releases without creating new tag-scoped Linux build caches.
 - Separate workspace test compilation and execution into CI steps, run doctests once,
   and restore Swatinem Rust dependency artifacts from a dedicated main-branch cache warmer.
+
+### Fixed
+
+- Build model request bodies as borrowed typed values and serialize them compactly into one
+  exactly sized buffer, with each attachment's `data:` URL encoded straight into it. A turn
+  carrying one 8 MiB image allocated 33,835,888 bytes for its Responses body and 134,502,934 at
+  four images, rebuilt on every step of the turn; the 89.5 MB buffer `ureq`'s pretty JSON body grew
+  for a 44.7 MB request was the largest single allocation on the image path. The request now
+  declares its `Content-Length` and is compact rather than pretty; every field, option and fallback
+  is unchanged.
+
+- Allocate broker protocol frames at the size they carry. An 11,185,049-byte frame — one chat
+  attachment — was held in 22,370,098 bytes, because a buffer that grows by doubling pays for the
+  next power of two when the closing quote does not fit. A frame past the configured maximum is now
+  refused before any of it is buffered, and an arriving frame still grows only with the bytes that
+  actually arrive.
+
+- Size inbound asset buffers from a `Content-Length` clamped to the transport ceiling and cap their
+  growth at it, across Slack, Discord, Telegram and WhatsApp. An 8,388,608-byte file ended in a
+  16,777,216-byte buffer. The streaming over-limit cutoff is unchanged: a declared length bounds
+  nothing.
+
+- Read reply attachments one upload at a time on Slack, Telegram and WhatsApp instead of reading
+  all of them before the first upload, move Discord's bytes into its multipart body rather than
+  copying them for a retry, and build the local transport's answer line without intermediate
+  copies of the base64 — one 8 MiB image left 42,008,399 bytes resident there. Disk leases still
+  leave the async worker, and caption, ordering, size-refusal and retry behavior are unchanged.
 
 ## [0.17.0] - 2026-09-17
 
