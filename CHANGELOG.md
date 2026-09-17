@@ -7,6 +7,11 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- Add an opt-in CI timing CLI with frozen run samples, attempt-aware API timings,
+  historical workflow source references and allowlisted log metrics without retained logs.
+
 ### Fixed
 
 - Recover startup and established chat-transport failures through one bounded exponential-backoff
