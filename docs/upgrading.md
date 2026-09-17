@@ -8,7 +8,28 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
-## Bounded chat-transport recovery (Unreleased)
+## Disk-backed chat assets (0.17.0)
+
+Upgrade the gateway's scratch storage alongside the binary. Chart 0.9.0 uses disk-backed
+`emptyDir` for gateway `/tmp`, sized independently by `volumeSizes.gatewayTmp` (320Mi default).
+`volumeSizes.tmp` now sizes only broker scratch, which remains tmpfs. Older charts and custom
+installations must provide a writable disk-backed process temporary directory themselves;
+retaining a memory-backed `/tmp` does not move retained image bytes off RAM. Verify the actual
+mount and capacity after rollout, including any existing overrides.
+
+`sessions.assetRetentionBytes` bounds the gateway-owned asset LRU (256 MiB default); zero disables
+asset retention and delivery. Size scratch for that budget plus temporary IO headroom. Retention
+is ephemeral, not restart persistence: model history keeps weak references and reclaimed images
+become release notices. An unavailable provider image input refuses the edit rather than fetching
+again or substituting the original image. Scratch errors do not retry already-executed provider
+calls. Transient decode/request/upload allocations and filesystem page cache still use memory;
+this release does not claim measured production RAM savings.
+
+WhatsApp now collects media-first bursts for `debounceMs: 3000` by default; set `0` to preserve
+immediate admission. Telegram native media groups use a fixed three-second collection window.
+See [asset handling](dekopond.md#chat-assets) for the retention and delivery contract.
+
+## Bounded chat-transport recovery (0.17.0)
 
 No configuration changes are required. All adapters now use the
 [shared recovery defaults](dekopond.md#connection-recovery). Connections start concurrently;
@@ -19,7 +40,7 @@ set forever. Ensure the process supervisor restarts failed gateways. Kubernetes 
 container; it need not replace the pod. Broker authority and outbound-effect retry behavior do not
 change.
 
-## Mapped compiled providers (unreleased)
+## Mapped compiled providers (0.17.0)
 
 Remove broker `compileCachePath`; it is now an unknown field. Managed `providerSet` startup uses
 `storePath/cwasm/v1` by default. Its first boot compiles and writes the cache; subsequent compatible
