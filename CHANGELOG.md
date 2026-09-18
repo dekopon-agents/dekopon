@@ -7,6 +7,15 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- Check the first Slack file download URL on the same rule as the redirect hop after it, at the one
+  place the bot token is attached. A download URL arrives on the authenticated Socket Mode
+  connection, so only Slack itself could name a foreign host; it is now parsed rather than
+  prefix-matched and must be an allowlisted Slack host over HTTPS on the default port with no
+  credentials in the authority, and a refused URL fails the fetch before any request leaves the
+  process.
+
 ### Changed
 
 - Cut the `input` attribute on `broker.authorize` and `provider.invoke` at 4096 bytes with the

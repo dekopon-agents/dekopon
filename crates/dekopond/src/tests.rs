@@ -6938,6 +6938,72 @@ where
     }
 }
 
+/// The same loopback mock with response headers the handler chooses.
+///
+/// A redirect is a status and a `location` together, which is the one shape [`spawn_raw_http_mock`]
+/// cannot answer.
+#[allow(
+    clippy::let_underscore_must_use,
+    reason = "a mock that cannot finish writing its canned response leaves the transport under \
+              test without one, which is what the calling test already asserts on"
+)]
+fn spawn_redirecting_http_mock<H>(handler: H) -> RawHttpMock
+where
+    H: Fn(&str) -> (u16, Vec<(String, String)>, Vec<u8>) + Send + Sync + 'static,
+{
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("redirecting mock binds");
+    let address = listener.local_addr().expect("redirecting mock address");
+    listener
+        .set_nonblocking(true)
+        .expect("redirecting mock is pollable");
+    let listener = tokio::net::TcpListener::from_std(listener).expect("redirecting mock adopts");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let recorded = Arc::clone(&calls);
+    tokio::spawn(async move {
+        let handler = Arc::new(handler);
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let handler = Arc::clone(&handler);
+            let recorded = Arc::clone(&recorded);
+            tokio::spawn(async move {
+                let mut stream = stream;
+                let Some((path, headers, _body)) = read_http_request_parts(&mut stream).await
+                else {
+                    return;
+                };
+                recorded
+                    .lock()
+                    .expect("redirecting mock call log")
+                    .push((path.clone(), headers));
+                let (status, extra, response) = handler(&path);
+                let reason = match status {
+                    200 => "OK",
+                    302 => "Found",
+                    _ => "Not Found",
+                };
+                let mut head = format!("HTTP/1.1 {status} {reason}\r\n");
+                for (name, value) in extra {
+                    head.push_str(&format!("{name}: {value}\r\n"));
+                }
+                head.push_str(&format!(
+                    "Content-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.len()
+                ));
+                use tokio::io::AsyncWriteExt as _;
+                let _ = stream.write_all(head.as_bytes()).await;
+                let _ = stream.write_all(&response).await;
+                let _ = stream.flush().await;
+            });
+        }
+    });
+    RawHttpMock {
+        base: format!("http://{address}"),
+        calls,
+    }
+}
+
 /// The same request with raw headers retained for credential-boundary assertions.
 async fn read_http_request_parts(
     stream: &mut tokio::net::TcpStream,
@@ -9486,28 +9552,155 @@ async fn a_chat_asset_marker_expands_only_for_a_listed_capability() {
 }
 
 #[test]
-fn a_redirect_away_from_slack_is_not_followed() {
+fn a_download_url_away_from_slack_is_not_followed() {
+    use crate::transport::slack::is_slack_file_url;
+
     // `credential_client` refuses redirects globally so a bearer token is never forwarded by
-    // policy. The
-    // one hop this transport follows by hand has to check the host itself, and a prefix comparison
-    // would accept the lookalike below.
-    assert!(crate::transport::slack::is_slack_file_url(
-        "https://files.slack.com/f/F0123/shot.png"
+    // policy. Every hop this transport takes by hand — the URL the event supplied as much as the
+    // `location` after it — has to check the host itself, and a prefix comparison would accept the
+    // lookalike below.
+    assert!(is_slack_file_url(
+        "https://files.slack.com/f/F0123/shot.png",
+        config::SLACK_ENDPOINT
     ));
-    assert!(!crate::transport::slack::is_slack_file_url(
-        "https://files.slack.com.evil.test/f/F0123/shot.png"
+    assert!(is_slack_file_url(
+        "https://scientist.slack.com/files-pri/T0123-F0123/shot.png",
+        config::SLACK_ENDPOINT
     ));
-    assert!(!crate::transport::slack::is_slack_file_url(
-        "https://evil.test/?x=files.slack.com"
+    assert!(!is_slack_file_url(
+        "https://files.slack.com.evil.test/f/F0123/shot.png",
+        config::SLACK_ENDPOINT
+    ));
+    assert!(!is_slack_file_url(
+        "https://evil.test/?x=files.slack.com",
+        config::SLACK_ENDPOINT
     ));
     // Credentials in the authority must not smuggle a host past the check either.
-    assert!(!crate::transport::slack::is_slack_file_url(
-        "https://files.slack.com@evil.test/f/F0123"
+    assert!(!is_slack_file_url(
+        "https://files.slack.com@evil.test/f/F0123",
+        config::SLACK_ENDPOINT
     ));
     // Plaintext would put the token on the wire in clear.
-    assert!(!crate::transport::slack::is_slack_file_url(
-        "http://files.slack.com/f/F0123"
+    assert!(!is_slack_file_url(
+        "http://files.slack.com/f/F0123",
+        config::SLACK_ENDPOINT
     ));
+    // Slack's own name in front of a port nobody at Slack is listening on.
+    assert!(!is_slack_file_url(
+        "https://files.slack.com:8443/f/F0123",
+        config::SLACK_ENDPOINT
+    ));
+    // A stand-in endpoint reaches its own loopback origin, and nothing else — the same rule
+    // `is_slack_upload_url` applies, so production accepts none of it.
+    assert!(is_slack_file_url(
+        "http://127.0.0.1:9000/files/shot.png",
+        "http://127.0.0.1:9000"
+    ));
+    assert!(!is_slack_file_url(
+        "http://127.0.0.1:9001/files/shot.png",
+        "http://127.0.0.1:9000"
+    ));
+    assert!(!is_slack_file_url(
+        "https://files.slack.com/f/F0123/shot.png",
+        "http://127.0.0.1:9000"
+    ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slack_download_sends_the_bot_token_to_no_other_host() {
+    // The URL arrives on the Socket Mode connection, so supplying a foreign one takes Slack itself
+    // or a man in the middle of it. The token still goes to a checked host either way, on the first
+    // request as much as on the redirect.
+    let elsewhere = spawn_raw_http_mock(|_| (200, "image/png", b"foreign bytes".to_vec()));
+    let foreign = format!("{}/f/F0123/shot.png", elsewhere.base);
+    let offsite = foreign.clone();
+    let base = Arc::new(Mutex::new(String::new()));
+    let response_base = Arc::clone(&base);
+    let files = spawn_redirecting_http_mock(move |path| match path {
+        "/f/F0123/shot.png" => (200, Vec::new(), b"slack bytes".to_vec()),
+        "/f/F0123/redirect.png" => (
+            302,
+            vec![(
+                "location".to_owned(),
+                format!(
+                    "{}/f/F0123/shot.png",
+                    response_base.lock().expect("base lock")
+                ),
+            )],
+            Vec::new(),
+        ),
+        "/f/F0123/offsite.png" => (
+            302,
+            vec![("location".to_owned(), offsite.clone())],
+            Vec::new(),
+        ),
+        other => panic!("unexpected Slack file call: {other}"),
+    });
+    *base.lock().expect("base lock") = files.base.clone();
+    let transport = slack(&files.base);
+    let fetcher = transport
+        .asset_fetcher()
+        .expect("Slack fetches its own attachments");
+    let source = |url: String| AssetSourceRef::Slack {
+        file_id: "F0123".to_owned(),
+        url,
+    };
+
+    let direct = fetcher
+        .fetch(&source(format!("{}/f/F0123/shot.png", files.base)), 1024)
+        .await
+        .expect("the file host answers the first request");
+    assert_eq!(direct, b"slack bytes");
+    let redirected = fetcher
+        .fetch(
+            &source(format!("{}/f/F0123/redirect.png", files.base)),
+            1024,
+        )
+        .await
+        .expect("the one hop to another path on the file host is followed");
+    assert_eq!(redirected, b"slack bytes");
+    let served = files.calls().len();
+
+    fetcher
+        .fetch(&source(foreign), 1024)
+        .await
+        .expect_err("a first URL on a foreign host is refused");
+    fetcher
+        .fetch(&source(format!("{}/f/F0123/offsite.png", files.base)), 1024)
+        .await
+        .expect_err("a redirect to a foreign host is refused");
+    // Same origin as the endpoint, with credentials in the authority that a browser would send.
+    fetcher
+        .fetch(
+            &source(format!(
+                "http://user:pass@{}/f/F0123/shot.png",
+                files
+                    .base
+                    .strip_prefix("http://")
+                    .expect("a loopback mock base")
+            )),
+            1024,
+        )
+        .await
+        .expect_err("userinfo in the authority is refused");
+
+    assert!(
+        elsewhere.calls().is_empty(),
+        "no request reached the foreign host, so no bearer token left the process"
+    );
+    assert_eq!(
+        files.calls().len(),
+        served + 1,
+        "only the refused redirect's own request was made"
+    );
+    assert!(
+        files.calls()[0]
+            .1
+            .to_ascii_lowercase()
+            .contains("authorization: bearer xoxb-test-bot-token"),
+        "the file host does receive the token: {:?}",
+        files.calls()[0].1
+    );
 }
 
 // ---------------------------------------------------------------------------
