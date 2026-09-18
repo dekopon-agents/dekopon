@@ -35,8 +35,8 @@ use crate::{
         ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageRef, OutboundReply,
         ProgressLimits, ProgressMessage, ReplyTarget, SeenIds, StreamLimits, StreamedText,
         TextStream, TextUnit, TransportError, TransportEvent, TransportIdentity, TypingLease,
-        bound_inbound, credential_client, floor_boundary, jitter_below, receive_span,
-        record_conversation, retry_after_from_body, split_message,
+        asset_buffer, bound_inbound, credential_client, floor_boundary, jitter_below, receive_span,
+        record_conversation, reserve_for_chunk, retry_after_from_body, split_message,
     },
 };
 
@@ -1048,7 +1048,7 @@ impl ChatDriver for DiscordDriver {
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
         let OutboundReply { text, images } = reply;
-        let mut images = super::hydration::hydrate_images(images).await?;
+        let mut images = super::hydration::ImageQueue::new(images);
         let ReplyTarget::Discord {
             channel_id,
             reply_to,
@@ -1501,20 +1501,20 @@ impl DiscordDriver {
         }
     }
 
+    /// The bytes are moved into the multipart body rather than copied into it, and the one retry a
+    /// 429 allows reads them again from their disk leases instead of a second copy being held
+    /// through an upload that usually succeeds.
     async fn create_message_with_images(
         &self,
         channel_id: &str,
         body: &Value,
-        images: Vec<super::hydration::HydratedImage>,
+        mut images: super::hydration::ImageQueue,
     ) -> Result<(), TransportError> {
         let url = format!(
             "{}/api/v{API_VERSION}/channels/{channel_id}/messages",
             self.endpoint
         );
-        let attachments = images
-            .iter()
-            .map(|image| &image.filename)
-            .collect::<Vec<_>>();
+        let attachments = images.filenames();
         let mut payload = body.clone();
         payload["attachments"] = Value::Array(
             attachments
@@ -1537,15 +1537,16 @@ impl DiscordDriver {
         let payload = serde_json::to_string(&payload).map_err(|_| TransportError::Response)?;
         let mut retried = false;
         loop {
+            let read = images.read_all().await?;
             let mut form = reqwest::multipart::Form::new().text("payload_json", payload.clone());
-            for (index, image) in images.iter().enumerate() {
+            for (index, image) in read.into_iter().enumerate() {
                 #[allow(
                     clippy::map_err_ignore,
                     reason = "mime_str only rejects strings that are not a media type, and \
                               GeneratedImage::media_type returns a fixed IANA type"
                 )]
-                let part = reqwest::multipart::Part::bytes(image.bytes.clone())
-                    .file_name(image.filename.clone())
+                let part = reqwest::multipart::Part::bytes(image.bytes)
+                    .file_name(image.filename)
                     .mime_str(image.media_type)
                     .map_err(|_| TransportError::Response)?;
                 form = form.part(format!("files[{index}]"), part);
@@ -1718,7 +1719,10 @@ impl DiscordDriver {
                 code: format!("http-{}", response.status().as_u16()),
             });
         }
-        let mut body = Vec::new();
+        // The declared length only sizes the buffer, clamped to the ceiling; what refuses an
+        // oversized asset is the cutoff applied while reading.
+        let limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+        let mut body = asset_buffer(response.content_length(), limit);
         while let Some(chunk) = response
             .chunk()
             .await
@@ -1729,6 +1733,7 @@ impl DiscordDriver {
                     code: "asset-too-large".to_owned(),
                 });
             }
+            reserve_for_chunk(&mut body, chunk.len(), limit);
             body.extend_from_slice(&chunk);
         }
         Ok(body)

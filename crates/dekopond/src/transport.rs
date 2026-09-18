@@ -702,6 +702,70 @@ pub(crate) trait AssetFetcher: Send + Sync {
     ) -> BoxFuture<'_, Result<Vec<u8>, TransportError>>;
 }
 
+/// Starts an asset body from what the peer declared, clamped to the limit that actually governs.
+///
+/// A declared length is metadata a sender influences, so it bounds nothing and the streaming cutoff
+/// stays the only refusal; clamped to `limit` it is still the right first guess, and a response
+/// that declares its length then arrives in one exact allocation.
+pub(crate) fn asset_buffer(declared: Option<u64>, limit: usize) -> Vec<u8> {
+    let hint = declared
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or(0)
+        .min(limit);
+    Vec::with_capacity(hint)
+}
+
+/// Renders one value as compact JSON into a buffer sized by a counting pass, with `suffix` after
+/// it.
+///
+/// `serde_json::to_string` grows its buffer by doubling, so a line carrying one base64 image held
+/// twice what it carried. Counting first costs a second serialization pass and no allocation at
+/// all, and the caller's line terminator is appended into the same exact buffer rather than into a
+/// second one.
+///
+/// # Errors
+///
+/// Returns whatever the value's own `Serialize` reported.
+pub(crate) fn compact_json<T>(value: &T, suffix: &[u8]) -> Result<Vec<u8>, serde_json::Error>
+where
+    T: serde::Serialize + ?Sized,
+{
+    let mut counter = ByteCounter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    let mut buffer = Vec::with_capacity(counter.0.saturating_add(suffix.len()));
+    serde_json::to_writer(&mut buffer, value)?;
+    buffer.extend_from_slice(suffix);
+    Ok(buffer)
+}
+
+/// Counts the bytes a serialization writes without keeping any of them.
+struct ByteCounter(usize);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buffer.len());
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Makes room for one more chunk without letting the buffer grow past `limit`.
+///
+/// `Vec` grows by doubling, so an 8 MiB image accumulated chunk by chunk ended up held in 16 MiB.
+/// The caller refuses anything past `limit` before it is appended, so growing toward `limit` and
+/// never beyond it cannot reserve more than the asset the caller already agreed to hold.
+pub(crate) fn reserve_for_chunk(buffer: &mut Vec<u8>, chunk: usize, limit: usize) {
+    let needed = buffer.len().saturating_add(chunk);
+    if needed <= buffer.capacity() {
+        return;
+    }
+    let target = buffer.capacity().saturating_mul(2).min(limit).max(needed);
+    buffer.reserve_exact(target - buffer.len());
+}
+
 /// Transport-level failure.
 ///
 /// Variants carry service-supplied text only where that text is a documented API error code; none
@@ -1082,9 +1146,51 @@ mod tests {
 
     use super::{
         BASE_RECONNECT_DELAY, MAX_RECONNECT_DELAY, MAX_RECONNECT_DOUBLINGS, RECONNECT_JITTER_MS,
-        SeenIds, TextUnit, TransportIdentity, credential_client_from, is_stop_word, jitter_below,
-        reconnect_delay, retry_after_from_body, split_message,
+        SeenIds, TextUnit, TransportIdentity, asset_buffer, credential_client_from, is_stop_word,
+        jitter_below, reconnect_delay, reserve_for_chunk, retry_after_from_body, split_message,
     };
+
+    /// An 8 MiB image accumulated in 64 KiB chunks used to end in a 16 MiB buffer, because a `Vec`
+    /// doubles when it grows. The ceiling the read is already refused against is the cap.
+    #[test]
+    fn an_asset_buffer_never_grows_past_the_ceiling_it_is_read_under() {
+        let limit = 8 * 1024 * 1024;
+        let chunk = 64 * 1024;
+
+        let mut body = asset_buffer(None, limit);
+        while body.len() < limit {
+            reserve_for_chunk(&mut body, chunk, limit);
+            body.extend_from_slice(&vec![0_u8; chunk]);
+        }
+
+        assert_eq!(body.len(), limit);
+        assert_eq!(
+            body.capacity(),
+            limit,
+            "an undeclared {limit}-byte asset is held in {} bytes",
+            body.capacity()
+        );
+    }
+
+    /// A declared length is not a bound, but clamped to the ceiling it is the right starting size:
+    /// a response that declares its length arrives in one allocation.
+    #[test]
+    fn a_declared_length_sizes_the_buffer_and_is_clamped_to_the_ceiling() {
+        let limit = 8 * 1024 * 1024;
+
+        assert_eq!(asset_buffer(Some(1_000), limit).capacity(), 1_000);
+        assert_eq!(asset_buffer(None, limit).capacity(), 0);
+        assert_eq!(
+            asset_buffer(Some(u64::MAX), limit).capacity(),
+            limit,
+            "a declared length past the ceiling reserved more than the read may ever hold"
+        );
+
+        let mut body = asset_buffer(Some(1_000), limit);
+        reserve_for_chunk(&mut body, 1_000, limit);
+        body.extend_from_slice(&[0_u8; 1_000]);
+        assert_eq!(body.capacity(), 1_000, "the declared length was not enough");
+    }
 
     /// The discard port: a proxy that is well formed, never dialled, and obvious in a diff.
     const AMBIENT_PROXY: &str = "http://127.0.0.1:9";

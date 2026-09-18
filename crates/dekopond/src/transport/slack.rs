@@ -37,8 +37,8 @@ use crate::{
         ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageRef, NativeStatus,
         OutboundReply, ProgressLimits, ProgressMessage, ReplyTarget, SeenIds, Status, StreamLimits,
         StreamedText, TextStream, ThreadClaim, ThreadContinuation, ThreadOwnership, TransportError,
-        TransportEvent, TransportIdentity, bound_inbound, credential_client, floor_boundary,
-        receive_span, record_conversation,
+        TransportEvent, TransportIdentity, asset_buffer, bound_inbound, credential_client,
+        floor_boundary, receive_span, record_conversation, reserve_for_chunk,
     },
 };
 
@@ -887,7 +887,7 @@ impl ChatDriver for SlackReplier {
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
         let OutboundReply { text, images } = reply;
-        let images = super::hydration::hydrate_images(images).await?;
+        let images = super::hydration::ImageQueue::new(images);
         let ReplyTarget::Slack { channel, thread_ts } = target else {
             return Err(TransportError::Response);
         };
@@ -1387,15 +1387,23 @@ impl SlackReplier {
     /// The service-selected upload URL receives only image bytes; the bot token returns to the fixed
     /// Web API origin for completion. The answer text rides the first upload's `initial_comment`, so
     /// a reply with several attachments still posts one comment rather than repeating itself.
+    ///
+    /// Each attachment is read immediately before its own upload and dropped after it, so a reply
+    /// carrying several never holds more than the one on the wire.
     async fn upload_attachments(
         &self,
         channel: String,
         thread_ts: Option<String>,
         text: String,
-        images: Vec<super::hydration::HydratedImage>,
+        mut images: super::hydration::ImageQueue,
     ) -> Result<(), TransportError> {
         let mut accepted = false;
-        for (index, image) in images.into_iter().enumerate() {
+        while let Some(read) = images.next().await {
+            let (index, image) = match read {
+                Ok(read) => read,
+                Err(_) if accepted => return Err(TransportError::PartialDelivery),
+                Err(error) => return Err(error),
+            };
             let comment = (index == 0)
                 .then_some(text.as_str())
                 .filter(|text| !text.is_empty());
@@ -1915,8 +1923,10 @@ impl AssetFetcher for SlackReplier {
             }
             // Streamed against the ceiling rather than buffered and measured afterwards. The
             // reported size is sender-influenced metadata and a chunked response need not declare
-            // a length at all, so the only bound that holds is the one applied while reading.
-            let mut body = Vec::new();
+            // a length at all, so the only bound that holds is the one applied while reading; the
+            // declared length is a clamped starting size for the buffer and nothing else.
+            let limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+            let mut body = asset_buffer(response.content_length(), limit);
             while let Some(chunk) = response
                 .chunk()
                 .await
@@ -1927,6 +1937,7 @@ impl AssetFetcher for SlackReplier {
                         code: "asset-too-large".to_owned(),
                     });
                 }
+                reserve_for_chunk(&mut body, chunk.len(), limit);
                 body.extend_from_slice(&chunk);
             }
             Ok(body)

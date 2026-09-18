@@ -1034,20 +1034,26 @@ impl ChatDriver for WhatsappDriver {
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
         let OutboundReply { text, images } = reply;
-        let images = super::hydration::hydrate_images(images).await?;
+        let mut images = super::hydration::ImageQueue::new(images);
         let ReplyTarget::WhatsApp { recipient } = target else {
             return Err(TransportError::Response);
         };
-        // Refuse every locally knowable failure before uploading or sending any part.
+        // Refuse every locally knowable failure before uploading or sending any part. A lease
+        // reports its byte count without being read, so this still sees every image up front while
+        // each one is read only immediately before its own upload.
         if images
-            .iter()
-            .any(|image| image.bytes.len() > media::MAX_IMAGE_BYTES)
+            .lengths()
+            .any(|length| length > media::MAX_IMAGE_BYTES)
         {
             return Err(media::failure("image-too-large"));
         }
         let caption_fits = !images.is_empty() && text.chars().count() <= media::MAX_CAPTION_CHARS;
         let mut accepted = 0_usize;
-        for (index, image) in images.into_iter().enumerate() {
+        while let Some(read) = images.next().await {
+            let (index, image) = match read {
+                Ok(read) => read,
+                Err(error) => return Err(self.reply_failure(error, accepted)),
+            };
             let caption = (caption_fits && index == 0 && !text.is_empty()).then_some(text.as_str());
             if let Err(error) = self.send_image(recipient, caption, image).await {
                 return Err(self.reply_failure(error, accepted));

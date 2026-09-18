@@ -1,6 +1,6 @@
 use std::{fmt, io::Read as _, ops::ControlFlow, time::Duration};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::{display::Base64Display, engine::general_purpose::STANDARD};
 use dekopon_core::Redacted;
 
 use serde::{Deserialize, Serialize, Serializer};
@@ -115,13 +115,85 @@ impl MessageContent {
     }
 }
 
-/// Encodes one attachment as the `data:` URL both wire formats accept.
+/// One attachment as the `data:` URL both wire formats accept.
 ///
 /// Built at request time and dropped with the request. Nothing retains the encoded copy, which is
-/// what keeps a screenshot from being held twice for the life of a conversation.
-pub(crate) fn data_url(mime: &str, data: &[u8]) -> String {
-    format!("data:{mime};base64,{}", STANDARD.encode(data))
+/// what keeps a screenshot from being held twice for the life of a conversation — and serializing
+/// goes through `collect_str`, so the base64 form is written into the request buffer as it is
+/// produced rather than existing first as a `String` a third again the size of the image.
+pub(crate) struct DataUrl<'a> {
+    mime: &'a str,
+    data: Vec<u8>,
 }
+
+impl<'a> DataUrl<'a> {
+    pub(crate) fn new(mime: &'a str, data: Vec<u8>) -> Self {
+        Self { mime, data }
+    }
+}
+
+impl fmt::Display for DataUrl<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "data:{};base64,{}",
+            self.mime,
+            Base64Display::new(&self.data, &STANDARD)
+        )
+    }
+}
+
+/// Renders bytes as a summary, for the same reason [`ContentPart`] does.
+impl fmt::Debug for DataUrl<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DataUrl")
+            .field("mime", &self.mime)
+            .field("bytes", &self.data.len())
+            .finish()
+    }
+}
+
+impl Serialize for DataUrl<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+/// Counts the bytes a serialization writes without keeping any of them.
+struct ByteCounter(usize);
+
+impl std::io::Write for ByteCounter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buffer.len());
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Serializes `body` as compact JSON into one buffer sized by a counting pass.
+///
+/// `ureq`'s `send_json` renders with `serde_json::to_vec_pretty`, and that `Vec` grows by doubling:
+/// a 44.7 MB request body — one conversation carrying a few screenshots — allocated 89.5 MB, the
+/// largest single allocation in the whole image path. Counting first costs a second serialization
+/// pass and no allocation at all; the buffer that follows is exact, so the body exists once and its
+/// `Content-Length` is known before the request opens.
+pub(crate) fn compact_json_body<T>(body: &T) -> Result<Vec<u8>, serde_json::Error>
+where
+    T: Serialize + ?Sized,
+{
+    let mut counter = ByteCounter(0);
+    serde_json::to_writer(&mut counter, body)?;
+    let mut buffer = Vec::with_capacity(counter.0);
+    serde_json::to_writer(&mut buffer, body)?;
+    Ok(buffer)
+}
+
+/// The content type `ureq`'s own JSON body sets, kept because these bodies now set their own.
+pub(crate) const JSON_CONTENT_TYPE: &str = "application/json; charset=utf-8";
 
 /// One model-request conversation message.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -484,8 +556,11 @@ impl ChatModel for OpenAiChatModel {
             // wire rather than into a variable that could later be formatted somewhere else.
             request = request.header("authorization", &format!("Bearer {}", token.expose()));
         }
+        let encoded = compact_json_body(&request_body)
+            .map_err(|error| ModelError::Request(format!("request body: {error}")))?;
         let mut response = request
-            .send_json(&request_body)
+            .content_type(JSON_CONTENT_TYPE)
+            .send(&encoded)
             .map_err(|error| ModelError::Request(error.to_string()))?;
         let status = response.status().as_u16();
         if !(200..300).contains(&status) {
@@ -612,20 +687,20 @@ enum WirePart<'a> {
     #[serde(rename = "text")]
     Text { text: std::borrow::Cow<'a, str> },
     #[serde(rename = "image_url")]
-    ImageUrl { image_url: WireUrl },
+    ImageUrl { image_url: WireUrl<'a> },
     #[serde(rename = "file")]
     File { file: WireFile<'a> },
 }
 
 #[derive(Debug, Serialize)]
-struct WireUrl {
-    url: String,
+struct WireUrl<'a> {
+    url: DataUrl<'a>,
 }
 
 #[derive(Debug, Serialize)]
 struct WireFile<'a> {
     filename: &'a str,
-    file_data: String,
+    file_data: DataUrl<'a>,
 }
 
 impl<'a> TryFrom<&'a ModelMessage> for WireMessage<'a> {
@@ -661,18 +736,15 @@ impl<'a> TryFrom<&'a ModelMessage> for WireMessage<'a> {
                                     ContentPart::Text(text) => WirePart::Text { text: text.into() },
                                     ContentPart::Image { mime, .. } => WirePart::ImageUrl {
                                         image_url: WireUrl {
-                                            url: data_url(
-                                                mime,
-                                                bytes.as_deref().unwrap_or_default(),
-                                            ),
+                                            url: DataUrl::new(mime, bytes.unwrap_or_default()),
                                         },
                                     },
                                     ContentPart::File { name, mime, .. } => WirePart::File {
                                         file: WireFile {
                                             filename: name,
-                                            file_data: data_url(
+                                            file_data: DataUrl::new(
                                                 mime,
-                                                bytes.as_deref().unwrap_or_default(),
+                                                bytes.unwrap_or_default(),
                                             ),
                                         },
                                     },
@@ -1682,6 +1754,47 @@ mod tests {
         }
     }
 
+    /// `ureq`'s own JSON body renders with `to_vec_pretty` into a `Vec` that doubles past the
+    /// payload; the request buffer this crate sends is exactly the document it carries.
+    #[test]
+    fn a_request_body_buffer_is_exactly_the_bytes_it_carries() {
+        let body = json!({"data": "x".repeat(1_000_000)});
+
+        let encoded = super::compact_json_body(&body).expect("the request body serializes");
+
+        assert_eq!(
+            encoded.capacity(),
+            encoded.len(),
+            "the buffer grew past the body it holds"
+        );
+        assert_eq!(
+            encoded,
+            serde_json::to_vec(&body).expect("the same document, compact")
+        );
+    }
+
+    /// The `data:` URL is written as it is encoded rather than built first, and the two renderings
+    /// must stay the same string: it is the only thing the model ever sees of an attachment.
+    #[test]
+    fn an_attachment_serializes_as_the_data_url_it_has_always_been() {
+        use base64::Engine as _;
+        let bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+
+        let url = super::DataUrl::new("image/png", bytes.clone());
+
+        assert_eq!(
+            serde_json::to_value(&url).expect("the data URL serializes"),
+            json!(format!(
+                "data:image/png;base64,{}",
+                base64::engine::general_purpose::STANDARD.encode(&bytes)
+            ))
+        );
+        assert!(
+            !format!("{url:?}").contains("PNG"),
+            "the debug rendering carries bytes"
+        );
+    }
+
     #[test]
     fn an_attachment_never_reaches_the_audit_transcript_as_bytes() {
         // `dekopon-agent` logs every prompt by serializing the message slice, so `ModelMessage`'s
@@ -1940,9 +2053,9 @@ mod tests {
 
     /// The JSON body of a recorded request.
     ///
-    /// Parsed rather than string-matched: `ureq` serializes a body with
-    /// `serde_json::to_vec_pretty`, so `"stream": true` reaches the wire carrying whitespace a
-    /// substring assertion would miss. The claim is about the field, not about its spelling.
+    /// Parsed rather than string-matched: the claim is about the field, not about its spelling,
+    /// and a body that once carried `to_vec_pretty` whitespace around `"stream": true` would have
+    /// slipped past a substring assertion.
     fn request_body(request: &str) -> Value {
         let (_, body) = request
             .split_once("\r\n\r\n")

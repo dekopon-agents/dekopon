@@ -398,7 +398,8 @@ The gateway-only types around them are `ConversationKey`, `ConversationSeed`, `C
 
 ### Request 1: Slack question
 
-Immediately before `send_json`, the subscription request is equivalent to:
+The subscription request is built as a borrowed typed struct rather than a `Value`, so nothing
+copies a conversation's attachments into it; the document it serializes to is equivalent to:
 
 ```rust
 let request_1 = json!({
@@ -470,10 +471,15 @@ let response = agent
     .header("user-agent", &format!("dekopon/{}", env!("CARGO_PKG_VERSION")))
     .header("openai-beta", "responses=experimental")
     .header("accept", "text/event-stream")
-    .send_json(&request_1)?;
+    .content_type("application/json; charset=utf-8")
+    .send(&compact_json_body(&request_1)?)?;
 ```
 
-`send_json` supplies the JSON content type. The production code exposes the access token only while constructing the authorization header; it never formats the credential into telemetry or a provider invocation.
+The body is serialized compactly into one buffer sized by a counting pass rather than through
+`ureq`'s `send_json`, whose `to_vec_pretty` buffer more than doubles past a request carrying
+attachments; the request declares its `Content-Length` and is never chunked. The production code
+exposes the access token only while constructing the authorization header; it never formats the
+credential into telemetry or a provider invocation.
 
 Suppose the SSE stream asks for the `bash` tool. After parsing, the important normalized value looks like:
 

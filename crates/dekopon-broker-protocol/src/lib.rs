@@ -1117,20 +1117,7 @@ where
         if length > limits.max_frame_bytes {
             return Err(ReadFrameError::TooLarge { length });
         }
-        let mut bytes = Vec::with_capacity(length.min(READ_CHUNK_BYTES));
-        (&mut *reader)
-            .take(length as u64)
-            .read_to_end(&mut bytes)
-            .await?;
-        // `read_to_end` stops at end of stream as well as at the limit, so a peer that announces
-        // more than it sends must still fail rather than decoding a short frame.
-        if bytes.len() != length {
-            return Err(ReadFrameError::Io(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "broker frame ended before its declared length",
-            )));
-        }
-        Ok(bytes)
+        read_payload(reader, length).await
     })
     .await
     .map_err(|_| ProtocolError::Timeout)?
@@ -1143,6 +1130,40 @@ where
         },
     })?;
     serde_json::from_slice(&bytes).map_err(|source| ProtocolError::Deserialize { source })
+}
+
+/// Reads exactly `length` payload bytes into a buffer that never holds more than them.
+///
+/// Each step reserves one more chunk and stops at `length`, which the caller has already validated
+/// against the frame maximum: allocation still follows the bytes that actually arrive, so a peer
+/// that sends a prefix and then stalls holds one chunk rather than a whole frame, and the buffer no
+/// longer overshoots on the way there. Doubling did: an 11 MiB frame — one chat attachment —
+/// arrived into a buffer holding 16 MiB.
+async fn read_payload<R>(reader: &mut R, length: usize) -> Result<Vec<u8>, ReadFrameError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::new();
+    let mut filled = 0;
+    while filled < length {
+        if bytes.len() == filled {
+            let target = bytes.len().saturating_add(READ_CHUNK_BYTES).min(length);
+            bytes.reserve_exact(target - bytes.len());
+            bytes.resize(target, 0);
+        }
+        let read = reader.read(&mut bytes[filled..]).await?;
+        // End of stream: a peer that announces more than it sends must fail rather than decoding
+        // a short frame.
+        if read == 0 {
+            return Err(ReadFrameError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "broker frame ended before its declared length",
+            )));
+        }
+        filled += read;
+    }
+    bytes.truncate(filled);
+    Ok(bytes)
 }
 
 #[derive(Debug)]
@@ -1172,15 +1193,25 @@ where
     T: Serialize,
 {
     let limits = limits.validate()?;
-    let mut buffer = BoundedJsonBuffer::new(limits.max_frame_bytes);
+    // The payload is counted before it is written, so the frame is allocated once at exactly its
+    // final size. A buffer grown as the serialization arrived doubled instead: an 11,185,049-byte
+    // frame — one chat attachment — held 22,370,098 bytes, because its closing quote did not fit.
+    // Counting holds nothing, so a value past the maximum is now refused before any of it is held.
+    let mut counter = BoundedJsonCounter::new(limits.max_frame_bytes);
+    if let Err(source) = serde_json::to_writer(&mut counter, value) {
+        return Err(frame_write_failure(
+            source,
+            counter.exceeded,
+            limits.max_frame_bytes,
+        ));
+    }
+    let mut buffer = BoundedJsonBuffer::new(limits.max_frame_bytes, counter.length);
     if let Err(source) = serde_json::to_writer(&mut buffer, value) {
-        if buffer.exceeded {
-            return Err(ProtocolError::FrameTooLarge {
-                length: limits.max_frame_bytes.saturating_add(1),
-                maximum: limits.max_frame_bytes,
-            });
-        }
-        return Err(ProtocolError::Serialize { source });
+        return Err(frame_write_failure(
+            source,
+            buffer.exceeded,
+            limits.max_frame_bytes,
+        ));
     }
     let payload = buffer.payload_len();
     #[allow(
@@ -1205,6 +1236,53 @@ where
     .map_err(|source| ProtocolError::Io { source })
 }
 
+/// Classifies what one serialization pass over a bounded sink reported.
+fn frame_write_failure(source: serde_json::Error, exceeded: bool, maximum: usize) -> ProtocolError {
+    if exceeded {
+        return ProtocolError::FrameTooLarge {
+            length: maximum.saturating_add(1),
+            maximum,
+        };
+    }
+    ProtocolError::Serialize { source }
+}
+
+/// Measures a frame's payload against the maximum without keeping a byte of it.
+struct BoundedJsonCounter {
+    length: usize,
+    maximum: usize,
+    exceeded: bool,
+}
+
+impl BoundedJsonCounter {
+    fn new(maximum: usize) -> Self {
+        Self {
+            length: 0,
+            maximum,
+            exceeded: false,
+        }
+    }
+}
+
+impl io::Write for BoundedJsonCounter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        let Some(length) = self.length.checked_add(bytes.len()) else {
+            self.exceeded = true;
+            return Err(io::Error::other("bounded JSON frame overflowed"));
+        };
+        if length > self.maximum {
+            self.exceeded = true;
+            return Err(io::Error::other("bounded JSON frame exceeded its limit"));
+        }
+        self.length = length;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Serialization target holding the complete frame: a reserved length prefix, then the payload.
 struct BoundedJsonBuffer {
     frame: Vec<u8>,
@@ -1213,8 +1291,12 @@ struct BoundedJsonBuffer {
 }
 
 impl BoundedJsonBuffer {
-    fn new(maximum: usize) -> Self {
-        let mut frame = Vec::with_capacity(FRAME_PREFIX_BYTES + maximum.min(8 * 1024));
+    /// Allocates the whole frame for a payload [`BoundedJsonCounter`] has already measured.
+    ///
+    /// The bound is still enforced on every write: the count and the write are two passes over the
+    /// same value, and this sink is what keeps the second one honest about the first.
+    fn new(maximum: usize, payload: usize) -> Self {
+        let mut frame = Vec::with_capacity(FRAME_PREFIX_BYTES + payload);
         frame.extend_from_slice(&[0_u8; FRAME_PREFIX_BYTES]);
         Self {
             frame,
