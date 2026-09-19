@@ -18,6 +18,9 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Changed
 
+- Reuse test-owned compiled Wasm providers across the broker memory authority-rotation
+  test's sequential setups, preserving independent authority state and cold-path tests.
+
 - Cut the `input` attribute on `broker.authorize` and `provider.invoke` at 4096 bytes with the
   `…[truncated]` marker and an `input.bytes` sibling carrying the uncut length, the same bound the
   six command fields already take. Operators reading a proposal out of a trace now see its first

@@ -292,6 +292,15 @@ cargo deny --all-features check
 
 The same quality lane also runs the [Provider example workspaces](#provider-example-workspaces) commands for every `examples/providers/*/Cargo.toml`, and the context also requires the toolchain-free [Documentation gates](#documentation-gates).
 
+The broker memory authority-rotation test reuses a private, test-owned cwasm directory across
+its sequential broker constructions. It still creates independent registries, stores, policies and
+authority limits; only immutable compiled provider artifacts are reused. The directory starts
+empty on every test invocation, lives outside the asserted storage tree, and is removed after all
+registries drop. Other fixtures retain their default cold loaders, including dedicated compilation
+and integrity tests. No cache is shared between parallel tests or fetched from GitHub. To exercise
+this case alone, run `cargo test -p dekopon-broker --test memory --all-features --locked
+authority_surface_ignores_order_and_denied_provider_but_rotates_every_semantic_ceiling -- --exact`.
+
 `rust-toolchain.toml` is also the MSRV, so the test commands above are the MSRV check. Moving it, or anything else in the component toolchain, is the lockstep its leading comment lists.
 
 For package metadata, include lists, or dependency-boundary changes, run from a clean tree:
