@@ -56,74 +56,102 @@ The model proposes; a separate broker authorizes and executes provider effects.
 
 ## Rust guidelines
 
-How dekopon's Rust is written, and what an implementing agent decides on its own versus asks
-about. Where this section and the surrounding code disagree, match the code and say so in the
-PR.
+The tone of dekopon's Rust, for any agent that writes it. Where a rule and the surrounding code
+disagree, match the code and say so in the PR. Each rule: one sentence of why, then the pair to
+mirror.
 
-### Authority: what you decide and what you ask
+### Authority
 
-- **Contract surfaces — stop and ask:** WIT, wire frames and their fields, config keys and
-  values, chart values and mounts, what is deleted, and the proof-gate invariants (G1–G4).
-- **Everything inside a crate is yours:** type and variant names, error enums, module layout,
-  facade shapes, helper names, buffer sizes under a stated cap, test placement. Decide, mirror the
-  nearest sibling, list the choice in your report. The verifier checks it; the owner does not
-  pre-approve it. (Public crate APIs will be treated as contracts later; today they are yours.)
+Contract surfaces stop and ask: WIT, wire frames and their fields, config keys and values, chart
+values and mounts, what is deleted, the proof-gate invariants. Everything inside a crate is yours;
+decide, mirror the nearest sibling, list it in your report under "Choices I made". Public crate
+APIs are internals for now.
+
+- Yes: pick `AssetInputs { rows, descriptors, sends_remaining }` as the host's parameter type and report it.
+- No: `contact_supervisor("should the parameter be named AssetInputs or InvokeAssets?")`
 
 ### Errors
 
-- One `thiserror` enum per module or crate; variants carry `#[source]`; the sentence says what
-  failed, not the value that failed. Never `String` errors, never `anyhow` in library code.
-- Across a trust boundary carry `io::ErrorKind`, not `io::Error` (as `BlobError` does).
-- Refusals are matched by variant in tests and callers, never by message text.
+Typed variants are what callers match on to refuse; a string can only be printed.
 
-### Types and dispatch
+- Yes:
+  ```rust
+  #[derive(Debug, Error)]
+  pub enum AssetError {
+      #[error("asset exceeds the per-asset ceiling")]
+      TooLarge,
+      #[error("could not read the asset")]
+      Io { kind: io::ErrorKind },
+  }
+  ```
+- No: `Err(format!("asset too large: {bytes}"))`, `anyhow!("read failed")`, `Io(io::Error)` across the broker boundary, `assert!(msg.contains("too large"))` in a test.
 
-- Variation by kind is a **closed enum matched exhaustively** (`Source::File`, later
-  `Source::Channel`). No `Box<dyn Trait>` until a second implementer lives outside the crate.
-- **Newtypes** for ids, byte counts, indexes and paths that mean different things
-  (`AssetId(u64)`, not `u64`): the descriptor-index-versus-asset-id swap must not compile.
-- Invariants are types or `Result`s. No `unwrap`, `expect` or slice indexing in non-test code
-  (`clippy::unwrap_used`, `expect_used` denied); a truly impossible state is `unreachable!()`
-  with a sentence.
+### Dispatch
 
-### Bytes and memory
+A closed enum makes the compiler find every match arm when the next kind arrives.
 
-- Bytes **stream**: `std::io::Read`/`Write`, tokio `AsyncRead`/`AsyncWrite`, `base64`'s
-  `EncoderWriter`/`DecoderReader`, `http_body::Body` with an exact `size_hint`. `Vec<u8>` only
-  where the guest boundary forces it, and then ≤ one bounded chunk.
-- Every growable buffer has a **named ceiling constant**; `Vec::with_capacity(cap)` once and
-  reuse, not grow. A `.clone()` needs a comment saying why.
-- Borrow first: `&str`, `&[u8]`, `&Path` parameters; own only what you store.
-- `Arc` for shared ownership, never `Rc`; `Mutex` over `RwLock` unless measured; a lock scope
-  holds no `await`.
+- Yes: `enum Source { File { fd: OwnedFd, cursor: u64, len: u64 } }` … `match source { Source::File { .. } => … }`
+- No: `Box<dyn AssetSource>` with one implementer, or `trait Source { fn read(&mut self, …) }` plus generics threaded through every caller.
+
+### Newtypes
+
+Two `u64`s that mean different things must not be swappable.
+
+- Yes: `struct AssetId(u64); struct DescriptorIndex(u32);`
+- No: `fn admit(id: u64, descriptor: u64, bytes: u64)`
+
+### Panics
+
+The broker holds the credentials; one bad frame must not take it down.
+
+- Yes: `let file = guard.as_mut().ok_or(BlobError::Reclaimed)?;`
+- No: `guard.as_mut().expect("owner holds a file")`, `frame[0..4]` on peer bytes, `.unwrap()` on a socket.
+
+### Bytes
+
+Bytes stream through bounded readers and writers; a whole payload in a `Vec` is the peak this
+change exists to remove.
+
+- Yes: `io::copy(&mut DecoderReader::new(&mut spool, &STANDARD).take(CHUNK), &mut sink)`; `reqwest::Body::wrap(body)` with an exact `size_hint`; `Vec::with_capacity(MAX_CHUNK_BYTES)` reused.
+- No: `let all = std::fs::read(path)?; let b64 = STANDARD.encode(&all);`, `wrap_stream`, a `Vec` that grows until the payload ends.
+
+### Ownership
+
+Own only what you store; a clone that satisfies the borrow checker is a design smell.
+
+- Yes: `fn register(&mut self, content_type: &str, blob: DiskBlob)`; `Arc<Mutex<Table>>`; lock, copy the field out, unlock, then `.await`.
+- No: `fn register(&mut self, content_type: String, blob: &DiskBlob) { … blob.clone() … }`; `Rc`; `let g = m.lock(); client.send(&*g).await`.
 
 ### Async
 
-- tokio only. Blocking file I/O goes through `spawn_blocking`, as `hydration.rs` does.
-- `async fn` in traits is fine (the `bindgen!` host traits already are); spell
-  `-> impl Future<Output = T> + Send` only where the future crosses a `spawn`. Never
-  `async_trait`; no `Pin<Box<dyn Future>>` unless the future is stored in a struct.
+tokio is the runtime; the `bindgen!` host traits are already `async fn` in traits, so ours are too.
+
+- Yes: `trait Sink { fn write(&mut self, chunk: &[u8]) -> impl Future<Output = io::Result<()>> + Send; }` where a spawn needs it; `tokio::task::spawn_blocking(move || blob.read())`.
+- No: `#[async_trait]`, `Pin<Box<dyn Future<Output = …>>>` in a signature, `std::fs::read` inside an `async fn`.
 
 ### Dependencies
 
-- Prefer what the workspace has: tokio, rustix, reqwest/http_body, base64, serde, thiserror,
-  tracing. Wrap them; never re-implement (no hand-rolled base64, no custom framing when
-  `http_body` exists). A new crate needs one sentence in the PR body and a tier-1 maintainer.
+The workspace already carries the mature crate; wrapping it is one function, re-implementing it is a second security boundary.
+
+- Yes: `base64::write::EncoderWriter`, `http_body::Body`, `rustix::net::recvmsg`, `tokio::net::UnixStream::pair()`.
+- No: a hand-rolled base64 table, a length-prefix framer beside `http_body`, a new crate without a sentence in the PR body.
 
 ### Tests
 
-- Names are sentences stating the invariant, like `a_queue_reads_one_image_at_a_time`.
-- Real primitives: `UnixStream::pair()`, real files in a `tempdir`, loopback HTTP. Mock only the
-  network. No trait-mocking frameworks.
-- Every limit has a test at the boundary and one past it, asserting the variant.
+The name states the invariant, the primitives are real, and every limit is tested at the edge and one past it.
+
+- Yes: `fn a_rejected_frame_leaves_no_open_descriptors()` over `UnixStream::pair()`; `fn an_asset_of_exactly_the_ceiling_is_accepted()` beside `fn one_byte_over_the_ceiling_is_refused()` asserting `matches!(err, AssetError::TooLarge)`.
+- No: `fn test_frame_2()`, `mockall::mock! { Broker }`, `assert!(err.to_string().contains("too large"))`.
 
 ### Comments
 
-- Doc comments say **why** and the invariant, not what; match the density of `DiskBlob`'s.
-- No narrating comments (`// step 1`, `// handle error`), no `TODO`/`FIXME` in a PR.
+A comment says why or states the invariant; the code already says what.
+
+- Yes: `// The descriptor closes before accounting is released; unlink alone is not disk reclamation.`
+- No: `// step 1: open the file`, `// handle error`, `// TODO: clean this up`.
 
 ### The tells you are writing Python in Rust
 
-`Option<String>` where an enum belongs; `Vec<u8>` handed whole between layers; `.clone()` to
-appease the borrow checker; `HashMap<String, serde_json::Value>` as a struct; `unwrap()` on a
-socket; a `bool` parameter; strings compared to select behaviour; a `Result<(), String>`.
+`Option<String>` where an enum belongs; `HashMap<String, serde_json::Value>` as a struct; a `bool`
+parameter; behaviour selected by comparing strings; `Result<(), String>`; `.clone()` to end a
+borrow; `Vec<u8>` handed whole between layers.
