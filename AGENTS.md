@@ -155,3 +155,31 @@ A comment says why or states the invariant; the code already says what.
 `Option<String>` where an enum belongs; `HashMap<String, serde_json::Value>` as a struct; a `bool`
 parameter; behaviour selected by comparing strings; `Result<(), String>`; `.clone()` to end a
 borrow; `Vec<u8>` handed whole between layers.
+
+### Review checklist
+
+How a verifier reads a change against the Rust guidelines, and how an editor reports one. The
+verifier is the check that replaces pre-approval of crate internals, so it is never skipped and
+never relaxed; the final PR reviewer has a different job and does not repeat it.
+
+**Findings are tagged.** Every finding is one of `contract` (WIT, wire frames, config keys and
+values, chart values and mounts, a deletion, a proof-gate invariant), `guideline` (a rule in this section,
+quoted by heading) or `taste`. `contract` and `guideline` findings carry `file:line`, the concrete
+failure and the exact fix, and make the verdict `FIX REQUIRED`. `taste` is advisory, listed last,
+and never blocks.
+
+**Evidence standard.** A finding names what it saw, not what it suspects; "this could leak" is not
+a finding until the line that leaks is named. A claim in the editor's report ("mirrors
+`DiskBlob::reclaim`") is checked, not trusted.
+
+**Two fix passes.** An editor gets two resumed passes on `FIX REQUIRED`. A third `FIX REQUIRED`
+reports the lane as blocked with both verdicts side by side; the disagreement is the owner's.
+
+**The lane report** ends with two fixed headings. `Choices I made`: every place the editor read
+the brief's intent over its text and did something the text did not say, one line each with the
+sentence it overrode. `Limits`: one table of every ceiling constant the lane added or moved: name,
+value, the test that hits it and the test one past it.
+
+**The PR reviewer** reads the assembled change for what only the whole shows: one definition per
+fact across lanes, seams matching on both sides, deletions complete, docs describing only the new
+behaviour, CHANGELOG bullets present. It does not re-run the per-lane rubric.
