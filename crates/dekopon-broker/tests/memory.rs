@@ -24,7 +24,7 @@ use dekopon_broker::{
 const MEMORY_RECORD: &str = "memory.chat.record";
 const MEMORY_RECENT: &str = "memory.chat.recent";
 use dekopon_broker_host::{
-    BoundCredential, BrokerHostError, BrokerHostLimits, BrokerProviderRegistry,
+    BoundCredential, BrokerHostError, BrokerHostLimits, BrokerHostOptions, BrokerProviderRegistry,
 };
 use dekopon_broker_protocol::{ChatScopeClaim, InvocationRequest};
 use dekopon_capability::{
@@ -214,6 +214,37 @@ async fn build_broker_with_principal(
     authority_credential: Option<(&str, &str)>,
     permit_generic_storage: bool,
 ) -> Broker<InMemoryAuditLog> {
+    build_broker_with_options(
+        root,
+        audit,
+        memory,
+        storage_limits,
+        host_limits,
+        reverse_provider_order,
+        mapped_principal,
+        authority_credential,
+        permit_generic_storage,
+        &BrokerHostOptions::default(),
+    )
+    .await
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the integration fixture keeps authority inputs separate from operational cache options"
+)]
+async fn build_broker_with_options(
+    root: &Path,
+    audit: Arc<InMemoryAuditLog>,
+    memory: ChatMemoryConfig,
+    storage_limits: StorageLimits,
+    host_limits: BrokerHostLimits,
+    reverse_provider_order: bool,
+    mapped_principal: &str,
+    authority_credential: Option<(&str, &str)>,
+    permit_generic_storage: bool,
+    options: &BrokerHostOptions,
+) -> Broker<InMemoryAuditLog> {
     let storage = StorageHost::open(root, storage_limits).expect("storage host");
     let mut providers = vec![
         provider_fixture("memory-chat-provider.wasm"),
@@ -226,9 +257,10 @@ async fn build_broker_with_principal(
     if reverse_provider_order {
         providers.reverse();
     }
-    let registry = BrokerProviderRegistry::load_with_storage(providers, host_limits, Some(storage))
-        .await
-        .expect("memory provider loads");
+    let registry =
+        BrokerProviderRegistry::load_with_options(providers, host_limits, Some(storage), options)
+            .await
+            .expect("memory provider loads");
     let world = PolicyWorld::new(
         [
             "gateway".parse::<PrincipalId>().expect("gateway"),
@@ -2572,6 +2604,13 @@ async fn invoke_generic_storage_denial(broker: &Broker<InMemoryAuditLog>, invoca
 
 #[tokio::test(flavor = "multi_thread")]
 async fn authority_surface_ignores_order_and_denied_provider_but_rotates_every_semantic_ceiling() {
+    // One owner and sequential loaders: no parallel publishers or shared mutable broker state.
+    // Keep compiled artifacts outside the storage tree whose generations this test checks.
+    let compiled = tempfile::tempdir().expect("compiled providers");
+    let options = BrokerHostOptions {
+        cwasm_dir: Some(compiled.path().to_owned()),
+        ..BrokerHostOptions::default()
+    };
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
     let root = directory.join("provider-storage");
@@ -2580,13 +2619,17 @@ async fn authority_surface_ignores_order_and_denied_provider_but_rotates_every_s
     baseline_memory
         .enabled_agents
         .push("other-agent".parse().expect("agent"));
-    let broker = build_broker_with(
+    let broker = build_broker_with_options(
         &root,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         baseline_memory.clone(),
         StorageLimits::default(),
         BrokerHostLimits::default(),
         false,
+        "maintainer",
+        None,
+        false,
+        &options,
     )
     .await;
     assert_eq!(
@@ -2604,10 +2647,20 @@ async fn authority_surface_ignores_order_and_denied_provider_but_rotates_every_s
     drop(broker);
     assert_eq!(generation_count(&root), 1);
 
+    let cold_artifacts = snapshot_tree_bytes(compiled.path());
+    assert_eq!(
+        cold_artifacts
+            .iter()
+            .filter(|(path, _, _)| path.extension().is_some_and(|ext| ext == "cwasm"))
+            .count(),
+        3,
+        "the first registry compiles the three distinct provider fixtures"
+    );
+
     // Principal is an owner-controlled mapping for the canonical subject in the base namespace,
     // not part of the resulting effective authority surface. Equivalent grants under a remap keep
     // continuity exactly as provider order, policy formatting, and unrelated denied providers do.
-    let broker = build_broker_with_principal(
+    let broker = build_broker_with_options(
         &root,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         baseline_memory.clone(),
@@ -2617,6 +2670,7 @@ async fn authority_surface_ignores_order_and_denied_provider_but_rotates_every_s
         "maintainer-v2",
         None,
         false,
+        &options,
     )
     .await;
     let remapped = query_memory(
@@ -2632,13 +2686,17 @@ async fn authority_surface_ignores_order_and_denied_provider_but_rotates_every_s
 
     let mut reordered = baseline_memory.clone();
     reordered.enabled_agents.reverse();
-    let broker = build_broker_with(
+    let broker = build_broker_with_options(
         &root,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         reordered,
         StorageLimits::default(),
         BrokerHostLimits::default(),
         true,
+        "maintainer",
+        None,
+        false,
+        &options,
     )
     .await;
     let order_only = query_memory(
@@ -2658,13 +2716,17 @@ async fn authority_surface_ignores_order_and_denied_provider_but_rotates_every_s
 
     let mut host_limits = BrokerHostLimits::default();
     host_limits.max_tables += 1;
-    let broker = build_broker_with(
+    let broker = build_broker_with_options(
         &root,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         baseline_memory.clone(),
         StorageLimits::default(),
         host_limits,
         false,
+        "maintainer",
+        None,
+        false,
+        &options,
     )
     .await;
     assert_recent_empty(&broker, "surface-host").await;
@@ -2673,13 +2735,17 @@ async fn authority_surface_ignores_order_and_denied_provider_but_rotates_every_s
 
     // Returning B -> A still mints a third generation; an old authority generation is never
     // reopened merely because its canonical bytes recur.
-    let broker = build_broker_with(
+    let broker = build_broker_with_options(
         &root,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         baseline_memory.clone(),
         StorageLimits::default(),
         BrokerHostLimits::default(),
         false,
+        "maintainer",
+        None,
+        false,
+        &options,
     )
     .await;
     assert_recent_empty(&broker, "surface-a-again").await;
@@ -2688,13 +2754,17 @@ async fn authority_surface_ignores_order_and_denied_provider_but_rotates_every_s
 
     let mut memory_limit = baseline_memory.clone();
     memory_limit.max_recent_turns -= 1;
-    let broker = build_broker_with(
+    let broker = build_broker_with_options(
         &root,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         memory_limit,
         StorageLimits::default(),
         BrokerHostLimits::default(),
         false,
+        "maintainer",
+        None,
+        false,
+        &options,
     )
     .await;
     assert_recent_empty(&broker, "surface-memory-limit").await;
@@ -2705,18 +2775,29 @@ async fn authority_surface_ignores_order_and_denied_provider_but_rotates_every_s
         max_open_handles: StorageLimits::default().max_open_handles - 1,
         ..StorageLimits::default()
     };
-    let broker = build_broker_with(
+    let broker = build_broker_with_options(
         &root,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
         baseline_memory,
         storage_limit,
         BrokerHostLimits::default(),
         false,
+        "maintainer",
+        None,
+        false,
+        &options,
     )
     .await;
     assert_recent_empty(&broker, "surface-storage-limit").await;
     drop(broker);
     assert_eq!(generation_count(&root), 5);
+    assert_eq!(
+        snapshot_tree_bytes(compiled.path()),
+        cold_artifacts,
+        "authority changes and provider ordering must reuse immutable compiled artifacts"
+    );
+    // All registries are dropped before the private mapped-artifact directory is removed.
+    compiled.close().expect("compiled fixtures can be removed");
 }
 
 async fn assert_recent_empty(broker: &Broker<InMemoryAuditLog>, invocation: &str) {
