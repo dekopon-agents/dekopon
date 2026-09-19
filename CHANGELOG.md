@@ -26,6 +26,11 @@ All notable changes to Dekopon are documented here. The format is based on
   a `dekopon-brokerd` installs, nine times the JSON itself. Input is still recorded
   unconditionally; the attribute is bounded, never the span.
 
+- Deny `clippy::unwrap_used` and `clippy::clone_on_ref_ptr` workspace-wide. Non-test code already
+  satisfied both, at one line's cost. Test code is exempt from `unwrap_used` through a crate-root
+  `cfg_attr(test, …)` and a per-file allow under `crates/*/tests/`; `clone_on_ref_ptr` is not
+  exempt, so a refcount bump reads as `Arc::clone(&x)` in tests too. `expect_used` and
+  `indexing_slicing` are not denied yet.
 - Warm Linux amd64/ARM64 release dependency caches on main and restore them across
   subsequent releases without creating new tag-scoped Linux build caches.
 - Separate workspace test compilation and execution into CI steps, run doctests once,

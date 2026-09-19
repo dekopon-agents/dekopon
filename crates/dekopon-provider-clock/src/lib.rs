@@ -4,6 +4,7 @@
 //! implements, and only while it runs an authorized `invoke`.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 mod bindings {
     wit_bindgen::generate!({

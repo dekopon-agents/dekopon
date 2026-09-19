@@ -4,6 +4,7 @@
 //! transaction, authority, or storage backend.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 /// The imported storage WIT contract used by the generated guest bindings.
 pub const STORAGE_WIT: &str = include_str!("../wit/deps/storage.wit");

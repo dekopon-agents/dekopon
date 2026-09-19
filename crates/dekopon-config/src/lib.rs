@@ -5,6 +5,7 @@
 //! [`LocalCatalog`], after which consumers operate only on typed protocol resources.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 use std::{
     collections::BTreeMap,

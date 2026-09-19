@@ -7,6 +7,8 @@
 //! carries only `src/**`, `wit/**`, `README.md`, and `Cargo.toml` — the repository-relative path
 //! below does not exist for a crates.io consumer.
 
+#![allow(clippy::unwrap_used)]
+
 use dekopon_provider_http::HTTP_WIT;
 
 #[test]

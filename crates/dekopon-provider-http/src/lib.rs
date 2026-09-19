@@ -4,6 +4,7 @@
 //! authorized broker is expected to implement.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 use std::{error::Error, fmt};
 

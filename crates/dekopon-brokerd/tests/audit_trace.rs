@@ -16,6 +16,8 @@
 //! Its own test binary, because `tracing` caches per-callsite interest against the global
 //! dispatcher for the whole process. Both tests share the one subscriber a process can install.
 
+#![allow(clippy::unwrap_used)]
+
 use std::{
     collections::BTreeMap,
     path::Path,

@@ -13796,10 +13796,10 @@ async fn generated_only_session_publishes_fetch_tool_and_reuses_result_before_ne
     route.chat_asset_inputs = Arc::from(vec!["gpt-image.edit".to_owned()]);
     let driver = Arc::new(RecordingDriver::default());
     run_session(
-        runner(broker, models.clone(), 4),
+        runner(broker, Arc::clone(&models), 4),
         route,
         message("produce then edit"),
-        driver.clone(),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
     )
     .await;
     assert_eq!(models.requests(), 4);

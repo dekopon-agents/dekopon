@@ -10,6 +10,7 @@
 //! `dekopon_broker::audit` events the in-process broker emits.
 
 #![cfg(unix)]
+#![allow(clippy::unwrap_used)]
 
 use std::{
     fs,

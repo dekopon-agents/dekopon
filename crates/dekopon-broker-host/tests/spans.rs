@@ -18,6 +18,8 @@
 //! `cargo test` runs them as threads in one process against one global capture, and two loads
 //! interleaved in it would be indistinguishable from one load that instantiated twice.
 
+#![allow(clippy::unwrap_used)]
+
 use std::{
     path::PathBuf,
     sync::OnceLock,

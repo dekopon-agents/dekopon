@@ -16,6 +16,7 @@
 //! grammar, and that needs no filesystem at all.
 
 #![cfg(unix)]
+#![allow(clippy::unwrap_used)]
 
 use std::{collections::BTreeMap, path::PathBuf};
 

@@ -121,6 +121,7 @@
 //! assert_eq!(outcome.output, "HI");
 //! ```
 
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;

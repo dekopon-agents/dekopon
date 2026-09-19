@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
 #[cfg(unix)]
 use std::{io, path::PathBuf, process::ExitCode};
 

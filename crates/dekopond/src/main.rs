@@ -1,3 +1,5 @@
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
 #[cfg(unix)]
 use dekopond::cli;
 #[cfg(unix)]

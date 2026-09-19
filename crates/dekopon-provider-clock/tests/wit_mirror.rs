@@ -6,6 +6,8 @@
 //! the published package carries only `src/**`, `wit/**`, `README.md`, and `Cargo.toml` — the
 //! repository-relative path below does not exist for a crates.io consumer.
 
+#![allow(clippy::unwrap_used)]
+
 #[test]
 fn vendored_clock_contract_matches_the_published_package() {
     assert_eq!(

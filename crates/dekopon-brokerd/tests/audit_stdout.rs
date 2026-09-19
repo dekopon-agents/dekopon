@@ -9,6 +9,8 @@
 //! caller's trace, because `broker.invocation` carries it as the ordinary `trace` span field and the
 //! JSON formatter renders every enclosing span.
 
+#![allow(clippy::unwrap_used)]
+
 use std::{
     fs,
     io::{BufRead as _, BufReader},

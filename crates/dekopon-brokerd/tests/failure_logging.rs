@@ -9,6 +9,8 @@
 //! global dispatcher, so a sibling test reaching these callsites with no subscriber installed can
 //! disable them for the whole process.
 
+#![allow(clippy::unwrap_used)]
+
 use std::{
     collections::BTreeMap, fs, os::unix::fs::PermissionsExt as _, path::Path, sync::Arc,
     time::Duration,

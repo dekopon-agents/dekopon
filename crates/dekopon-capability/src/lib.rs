@@ -49,6 +49,7 @@
 //! authenticated broker messages, authorization policy, or credential separation.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 use std::fmt;
 

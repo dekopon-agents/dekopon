@@ -11,6 +11,7 @@
 //! file-permission mask already had.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 mod accept;
 mod attribute;

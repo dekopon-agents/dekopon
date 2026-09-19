@@ -43,6 +43,8 @@
 //! deadlocks waiting for a namespace lease. Annotate tests with
 //! `#[tokio::test(flavor = "multi_thread")]`.
 
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
 use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},

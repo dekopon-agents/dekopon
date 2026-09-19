@@ -22,6 +22,7 @@
 
 #![forbid(unsafe_code)]
 #![cfg(unix)]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 mod asset;
 mod cache_key;

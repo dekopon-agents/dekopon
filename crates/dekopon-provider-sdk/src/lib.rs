@@ -18,6 +18,7 @@
 //! off by default and no guest build enables it.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 use std::fmt;
 

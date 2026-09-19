@@ -6,6 +6,7 @@
 
 // The sole exception is cwasm::deserialize, after trusted-artifact verification.
 #![deny(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 use std::{
     collections::BTreeMap,

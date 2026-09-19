@@ -5,6 +5,7 @@
 //! mapping before dispatching these untrusted requests.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 use std::{fmt, io, time::Duration};
 

@@ -11,6 +11,7 @@
 //! and graph scheduling remain deferred until a production frontend consumes them.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 use std::{
     error::Error,

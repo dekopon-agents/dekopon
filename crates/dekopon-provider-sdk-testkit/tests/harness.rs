@@ -3,6 +3,8 @@
 //! Every test here is `multi_thread`: the storage path dispatches to `spawn_blocking`, and a
 //! current-thread runtime deadlocks waiting for a namespace lease.
 
+#![allow(clippy::unwrap_used)]
+
 use dekopon_provider_sdk_testkit::{
     BrokerHostError, BrokerHostLimits, CommandRunOutcome, ContinuityPolicy, FakeBroker,
     FakeBrokerError, StorageAccess, StorageInterface, StorageLimits,

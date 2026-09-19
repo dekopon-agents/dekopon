@@ -12,6 +12,8 @@
 //! so a token is never accepted as a command-line argument, never written to a configuration file
 //! this crate parses, and never attached to a span attribute or log field.
 
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
 mod install;
 
 use std::{fmt, str::FromStr, sync::OnceLock, time::Duration};
