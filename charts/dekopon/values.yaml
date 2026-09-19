@@ -439,6 +439,11 @@ providerStorage:
   existingClaim: ""
   rootPath: /var/lib/dekopon-provider-storage
 
+# Match these values in the operator-authored broker.config.inline assets section.
+brokerAssets:
+  rootPath: /var/lib/dekopon-assets
+  maxInFlightBytes: 67108864
+
 # Config, runtime and broker tmp remain memory-backed. Gateway scratch is disk-backed;
 # its 256 MiB live attachment allowance is independent of kubelet enforcement of this sizeLimit.
 volumeSizes:
@@ -448,6 +453,10 @@ volumeSizes:
   # Size for the default gateway sessions.assetRetentionBytes (256 MiB) plus temporary overhead.
   # If increasing the typed gateway config budget, increase this disk volume independently.
   gatewayTmp: 320Mi
+  # Size for gateway sessions.assetRetentionBytes (256 MiB) plus brokerAssets.maxInFlightBytes
+  # (64 MiB): unlinked outputs remain on this disk volume until the gateway closes them.
+  # If increasing either budget, increase this disk volume independently.
+  brokerAssets: 320Mi
 
 # ---------------------------------------------------------------------------------------------
 # Termination

@@ -10,6 +10,7 @@
 {{- $run := .Values.paths.runtimeDir -}}
 {{- $state := .Values.paths.stateDir -}}
 {{- $storageRoot := .Values.providerStorage.rootPath -}}
+{{- $assetsRoot := .Values.brokerAssets.rootPath -}}
 {{- $providerSetDir := include "dekopon.providerSetDir" . -}}
 apiVersion: apps/v1
 kind: Deployment
@@ -108,7 +109,7 @@ spec:
               # in-place pod restart, and after a previous run these are 0700 and owned by $uid,
               # which root without CAP_DAC_OVERRIDE can neither enter nor write. Reclaiming them
               # keeps the capability set at CHOWN plus FOWNER instead of adding DAC_OVERRIDE.
-              for d in {{ $cfg }} {{ $gcfg }} {{ $run }} {{ $state }}{{ if .Values.providerStorage.enabled }} {{ $storageRoot }}{{ end }}; do
+              for d in {{ $cfg }} {{ $gcfg }} {{ $run }} {{ $state }} {{ $assetsRoot }}{{ if .Values.providerStorage.enabled }} {{ $storageRoot }}{{ end }}; do
                 chown 0:0 "$d"
                 chmod 0700 "$d"
               done
@@ -220,11 +221,11 @@ spec:
               fi
 {{- end }}
 
-              # Private config and provider-storage parents must be 0700 and owned by
+              # Private config, broker-assets and provider-storage parents must be 0700 and owned by
               # the runtime UID, and every ancestor up to / must be a directory that is not
               # group- or world-writable unless it is sticky. An emptyDir arrives root-owned and
               # 0777 and a local-path volume arrives root-owned and 0777, so both need this.
-              for d in {{ $cfg }}{{ if .Values.providerStorage.enabled }} {{ $storageRoot }}{{ end }}; do
+              for d in {{ $cfg }} {{ $assetsRoot }}{{ if .Values.providerStorage.enabled }} {{ $storageRoot }}{{ end }}; do
                 chmod 0700 "$d"
                 chown "$uid:$gid" "$d"
                 got=$(stat -c '%u:%a:%F' "$d")
@@ -260,6 +261,8 @@ spec:
               mountPath: {{ $run }}
             - name: state
               mountPath: {{ $state }}
+            - name: broker-assets
+              mountPath: {{ $assetsRoot }}
 {{- if .Values.providerStorage.enabled }}
             - name: provider-storage
               mountPath: {{ $storageRoot }}
@@ -383,6 +386,9 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: {{ .Values.volumeSizes.tmp }}
+        - name: broker-assets
+          emptyDir:
+            sizeLimit: {{ .Values.volumeSizes.brokerAssets }}
         # Retained model-credential state on one real filesystem. The backing
         # store has to honour no-follow opens, advisory exclusive locks, same-directory atomic
         # rename, and file and directory fsync. tmpfs does not qualify and neither does anything

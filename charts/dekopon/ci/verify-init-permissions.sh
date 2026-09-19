@@ -92,10 +92,14 @@ assert "tmp" not in gm and "gateway-tmp" not in bm
 volumes={v["name"]:v for v in pod["volumes"]}
 assert volumes["gateway-tmp"]["emptyDir"]=={"sizeLimit":"320Mi"}
 assert volumes["tmp"]["emptyDir"]=={"medium":"Memory", "sizeLimit":"16Mi"}
+assert volumes["broker-assets"]["emptyDir"]=={"sizeLimit":"320Mi"}
+assert "broker-assets" not in gm
+assert bm["broker-assets"]["mountPath"]=="/var/lib/dekopon-assets"
 assert "config-source" not in gm and "config-source" not in bm
 expected={"config-source":"/dekopon-source", "config":"/etc/dekopon",
           "gateway-config":"/etc/dekopon-gateway", "runtime":"/run/dekopon",
           "state":"/var/lib/dekopon"}
+expected.update({"broker-assets": "/var/lib/dekopon-assets"})
 if "provider-storage" in bm:
     expected.update({"provider-storage":"/var/lib/dekopon-provider-storage"})
 assert {m["name"]:m["mountPath"] for m in ic["volumeMounts"]}==expected
@@ -135,6 +139,7 @@ run_init() {
     -v "${resource}-etc":/etc/dekopon -v "${resource}-gateway-etc":/etc/dekopon-gateway \
     -v "${resource}-run":/run/dekopon -v "${resource}-state":/var/lib/dekopon \
     -v "${resource}-storage":/var/lib/dekopon-provider-storage \
+    -v "${resource}-assets":/var/lib/dekopon-assets \
     "$busybox" /bin/sh -c "$(cat "$1")"
 }
 
@@ -146,8 +151,8 @@ on_state() {
 
 reset_mounts() {
   docker run --rm --platform "$platform" -v "${resource}-etc":/a -v "${resource}-run":/b -v "${resource}-state":/c \
-    -v "${resource}-storage":/d -v "${resource}-gateway-etc":/f "$busybox" \
-    sh -c 'chmod 0777 /a /b /c /d /f; chown 0:0 /a /b /c /d /f'
+    -v "${resource}-storage":/d -v "${resource}-gateway-etc":/f -v "${resource}-assets":/g "$busybox" \
+    sh -c 'chmod 0777 /a /b /c /d /f /g; chown 0:0 /a /b /c /d /f /g'
 }
 
 credential_digest() {
@@ -199,7 +204,7 @@ assert_eq() {
   fi
 }
 
-for suffix in src etc gateway-etc run state storage; do
+for suffix in src etc gateway-etc run state storage assets; do
   v="$resource-$suffix"
   if docker volume inspect "$v" >/dev/null 2>&1; then
     echo "refusing preexisting test volume $v" >&2
@@ -242,6 +247,23 @@ run_init "$work/init.sh"
 
 echo "==> (b) in-place restart: the emptyDirs still hold the previous run's 0700 directories"
 run_init "$work/init.sh"
+root_perms=$(docker run --rm --platform "$platform" -v "${resource}-assets":/s "$busybox" \
+  sh -c "stat -c '%u:%g:%a:%F' /s")
+assert_eq "broker assets root permissions" "$root_perms" "65532:65532:700:directory"
+
+for path in /tmp/assets /etc/dekopon /dekopon-source/assets /opt/dekopon/providers/assets /var/lib/dekopon-assets/../assets; do
+  if helm template dekopon "$chart_dir" -f "$values" \
+    --set brokerAssets.rootPath="$path" >/dev/null 2>&1; then
+    echo "FAIL broker assets accepted overlapping or noncanonical path $path" >&2
+    exit 1
+  fi
+done
+if helm template dekopon "$chart_dir" -f "$values" \
+  --set providerStorage.enabled=true \
+  --set providerStorage.rootPath=/var/lib/dekopon-assets >/dev/null 2>&1; then
+  echo "FAIL provider storage accepted the broker assets path" >&2
+  exit 1
+fi
 
 echo "==> stat of the result"
 docker run --rm --platform "$platform" \
@@ -494,6 +516,7 @@ docker run --rm -i --platform "$platform" --user 0:0 \
   -v "${resource}-run":/run/dekopon \
   --mount "type=volume,src=${resource}-state,dst=/gateway-state,volume-subpath=chatgpt" \
   -v "${resource}-storage":/var/lib/dekopon-provider-storage \
+  -v "${resource}-assets":/var/lib/dekopon-assets \
   "$python_image" python3 - < "$chart_dir/ci/check-ipc-layout.py"
 
 # Missing/mismatched inline server pins cannot fall back to the gateway euid.
