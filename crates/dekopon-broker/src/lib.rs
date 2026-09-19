@@ -438,6 +438,15 @@ pub enum ContextError {
     PrincipalMismatch,
 }
 
+/// Audited invocation result with successful native asset effects.
+#[derive(Debug)]
+pub struct AssetInvocationResult {
+    /// Existing bounded invocation metadata.
+    pub result: InvocationResult,
+    /// Read-only output files and table changes, absent on failure.
+    pub assets: dekopon_broker_host::asset::AssetOutputs,
+}
+
 /// Which trusted route the broker executes a capability through.
 ///
 /// This is the operator's declaration, not a spelling convention. The reserved durable chat-memory
@@ -1624,6 +1633,12 @@ fn validate_set_constraints(set: &ConstraintSet) -> Result<(), BrokerBuildError>
             return Err(BrokerBuildError::InvalidPolicyConstraints);
         }
     }
+    if let Some(asset) = &constraints.asset
+        && ((asset.send && set.effect != EffectKind::ExternalWrite)
+            || ((asset.attach || asset.remove) && set.effect == EffectKind::ReadOnly))
+    {
+        return Err(BrokerBuildError::InvalidPolicyConstraints);
+    }
     let Some(http) = &constraints.http else {
         return Ok(());
     };
@@ -2797,7 +2812,8 @@ where
         grant: Option<&AttestorGrant>,
         attestation: Option<&Attestation>,
         mut request: InvocationRequest,
-    ) -> Result<InvocationResult, BrokerError> {
+        assets: dekopon_broker_host::asset::AssetInputs,
+    ) -> Result<AssetInvocationResult, BrokerError> {
         // Resolved once. The claim decides the context and the refusal together, so a second call
         // would re-evaluate the `agent.prompt` policy for the same message and throw the class
         // away in favour of a single flattened reason.
@@ -2845,7 +2861,14 @@ where
                 refusal = Some(unevaluated_refusal("chat-scope-required"));
             }
         }
-        self.invoke_inner(&context, request, refusal).await
+        let mut outputs = dekopon_broker_host::asset::AssetOutputs::default();
+        let result = self
+            .invoke_inner(&context, request, refusal, assets, &mut outputs)
+            .await?;
+        Ok(AssetInvocationResult {
+            result,
+            assets: outputs,
+        })
     }
 
     /// Constructs the hidden record proposal from typed post-acceptance fields only.
@@ -2904,7 +2927,14 @@ where
                 "assistant": turn.assistant,
             }),
         };
-        self.invoke_inner(&context, request, refusal).await
+        self.invoke_inner(
+            &context,
+            request,
+            refusal,
+            Default::default(),
+            &mut Default::default(),
+        )
+        .await
     }
 
     /// Derives the context one attested operation is evaluated — or refused — under.
@@ -3300,6 +3330,8 @@ where
         context: &AuthenticatedContext,
         request: InvocationRequest,
         refusal: Option<Refusal>,
+        assets: dekopon_broker_host::asset::AssetInputs,
+        outputs: &mut dekopon_broker_host::asset::AssetOutputs,
     ) -> Result<InvocationResult, BrokerError> {
         // Every capability, storage-backed or not, records who proposed what: a decision a trace
         // cannot attribute to a proposal is not a run anyone can reconstruct.
@@ -3496,7 +3528,7 @@ where
         } else if let Some(credential) = set.credential_for(context.actor()) {
             execute.record("credential", credential);
         }
-        self.execute(context, request, set, policy_ids)
+        self.execute(context, request, set, policy_ids, assets, outputs)
             .instrument(execute)
             .await
     }
@@ -3663,6 +3695,8 @@ where
         mut request: InvocationRequest,
         set: ConstraintSet,
         policy_ids: Vec<String>,
+        assets: dekopon_broker_host::asset::AssetInputs,
+        outputs: &mut dekopon_broker_host::asset::AssetOutputs,
     ) -> Result<InvocationResult, BrokerError> {
         // Scope/evidence preparation is deliberately non-mutating. The authorization decision is
         // recorded before `materialize` may create a namespace, rotate a generation
@@ -3978,11 +4012,12 @@ where
         let started = Instant::now();
         let execution = self
             .registry
-            .invoke_with_storage(authorized, credential, storage_grant)
+            .invoke_with_storage(authorized, credential, storage_grant, assets)
             .await;
         let duration_ms = duration_millis(started.elapsed());
         let (result, audit_event) = match execution {
             Ok(output) => {
+                *outputs = output.assets;
                 let output_digest = output.storage.as_ref().map_or_else(
                     || outcome_evidence_digest(&invocation_id, "provider-response", &output.output),
                     |storage| {
@@ -4321,6 +4356,14 @@ fn encode_execution_constraints(
         );
     } else {
         encoded.byte("execution.storage.present", 0);
+    }
+    if let Some(asset) = &constraints.asset {
+        encoded.byte("execution.asset.present", 1);
+        encoded.boolean("execution.asset.attach", asset.attach);
+        encoded.boolean("execution.asset.remove", asset.remove);
+        encoded.boolean("execution.asset.send", asset.send);
+    } else {
+        encoded.byte("execution.asset.present", 0);
     }
 }
 
@@ -4899,8 +4942,10 @@ fn public_host_error(error: &BrokerHostError, route: CapabilityRoute) -> &'stati
         | BrokerHostError::ArtifactDigestMismatch { .. }
         | BrokerHostError::ProviderIdentityMismatch { .. } => "provider-configuration",
         BrokerHostError::MemoryBudgetExhausted { .. } => "host-memory-budget",
+        BrokerHostError::AssetOverBudget => "over-budget",
         BrokerHostError::AuthorizedProviderMismatch { .. } => "authorized-provider-mismatch",
-        BrokerHostError::InputNotObject { .. }
+        BrokerHostError::AssetInput { .. }
+        | BrokerHostError::InputNotObject { .. }
         | BrokerHostError::SerializeInput { .. }
         | BrokerHostError::InputTooLarge { .. }
         | BrokerHostError::CommandInputTooLarge { .. } => "invalid-input",

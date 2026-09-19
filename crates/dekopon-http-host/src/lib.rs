@@ -11,6 +11,12 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+pub mod asset;
+mod stream;
+pub use stream::{
+    CHUNK_BYTES, FilePart, Part, Representation, StreamedRequest, StreamedResponse, read_decoded,
+};
+
 use std::{
     borrow::Cow,
     collections::{BTreeSet, HashMap},
@@ -631,15 +637,31 @@ impl BoundCredential {
         }
     }
 
+    fn echoes_stream_chunk(&self, window: &mut Vec<u8>, bytes: &[u8], overlap: usize) -> bool {
+        window.extend_from_slice(bytes);
+        if self
+            .echo_values
+            .iter()
+            .any(|secret| !secret.expose().is_empty() && contains_bytes(window, secret.expose()))
+        {
+            return true;
+        }
+        let keep = window.len().min(overlap);
+        let start = window.len() - keep;
+        window.copy_within(start.., 0);
+        window.truncate(keep);
+        false
+    }
+
     fn echoes_credential(&self, response: &Response) -> bool {
         self.echo_values.iter().any(|secret| {
             let secret = secret.expose();
             !secret.is_empty()
                 && (contains_bytes(&response.body, secret)
-                    || response
-                        .headers
-                        .iter()
-                        .any(|header| contains_bytes(&header.value, secret)))
+                    || response.headers.iter().any(|header| {
+                        contains_bytes(header.name.as_bytes(), secret)
+                            || contains_bytes(&header.value, secret)
+                    }))
         })
     }
 
@@ -783,6 +805,7 @@ pub struct BufferedHttpClient {
     secret_injections: u32,
     attempted: bool,
     policy_violation: Option<&'static str>,
+    asset_over_budget: bool,
     evidence: Vec<HttpCallEvidence>,
     resolved: HashMap<String, Vec<SocketAddr>>,
     pinned_client: Option<PinnedClient>,
@@ -888,10 +911,16 @@ impl BufferedHttpClient {
             secret_injections: 0,
             attempted: false,
             policy_violation: None,
+            asset_over_budget: false,
             evidence: Vec::new(),
             resolved: HashMap::new(),
             pinned_client: None,
         })
+    }
+
+    /// Sticky native disk exhaustion; independent of the fixed HTTP WIT error vocabulary.
+    pub fn asset_over_budget(&self) -> bool {
+        self.asset_over_budget
     }
 
     /// Whether provider code attempted any HTTP call.
@@ -944,7 +973,17 @@ impl BufferedHttpClient {
         // request and exiting the span on whichever thread happened to drop the guard.
         let result = self.send_checked(request).instrument(span.clone()).await;
 
-        let outcome = outcome_label(&result);
+        self.record_request(&span, evidence_index, &result);
+        result
+    }
+
+    fn record_request<T>(
+        &mut self,
+        span: &tracing::Span,
+        evidence_index: usize,
+        result: &Result<T, HttpError>,
+    ) {
+        let outcome = outcome_label(result);
         let failure = result.as_ref().err();
         span.in_scope(|| {
             // `prepare` is what learns the method and authority, so the evidence entry it pushed
@@ -1007,10 +1046,13 @@ impl BufferedHttpClient {
         if let Some(error) = failure {
             self.policy_violation = violation_label(error.code).or(self.policy_violation);
         }
-        result
     }
 
-    async fn send_checked(&mut self, request: Request) -> Result<Response, HttpError> {
+    async fn authorize_request(
+        &mut self,
+        request: Request,
+        streamed: Option<stream::RequestLengths>,
+    ) -> Result<(PreparedRequest, HttpConstraints, usize), HttpError> {
         let Some(grant) = self.grant.clone() else {
             return Err(http_error(
                 ErrorCode::Denied,
@@ -1031,7 +1073,7 @@ impl BufferedHttpClient {
                 "secret-bearing request path uses prohibited encoding or separators",
             ));
         }
-        let mut prepared = self.prepare(request, &grant).await?;
+        let mut prepared = self.prepare(request, &grant, streamed).await?;
         // Injection happens strictly after `prepare`, so every guest-facing rule has already run:
         // a guest-supplied `authorization` header was rejected (never overwritten), and the
         // destination passed the grant. The credential's own binding is narrower than the grant's
@@ -1120,6 +1162,11 @@ impl BufferedHttpClient {
             }
         }
 
+        Ok((prepared, grant, evidence_index))
+    }
+
+    async fn send_checked(&mut self, request: Request) -> Result<Response, HttpError> {
+        let (prepared, grant, evidence_index) = self.authorize_request(request, None).await?;
         let executed = self.execute(prepared, &grant).await;
         if let Ok((response, response_bytes)) = &executed {
             let evidence = &mut self.evidence[evidence_index];
@@ -1147,6 +1194,7 @@ impl BufferedHttpClient {
         &mut self,
         request: Request,
         grant: &HttpConstraints,
+        streamed: Option<stream::RequestLengths>,
     ) -> Result<PreparedRequest, HttpError> {
         #[allow(
             clippy::map_err_ignore,
@@ -1169,7 +1217,9 @@ impl BufferedHttpClient {
         let minimum_request_bytes =
             encoded_request_bytes(method.as_str(), &request.uri, 0, request.body.len() as u64)
                 .ok_or_else(|| http_error(ErrorCode::RequestTooLarge, "request size overflowed"))?;
-        if minimum_request_bytes > grant.max_request_bytes {
+        if streamed.map_or(minimum_request_bytes, |lengths| lengths.literal)
+            > grant.max_request_bytes
+        {
             return Err(http_error(
                 ErrorCode::RequestTooLarge,
                 "request exceeds the authorized byte limit",
@@ -1297,7 +1347,7 @@ impl BufferedHttpClient {
             request.body.len() as u64,
         )
         .ok_or_else(|| http_error(ErrorCode::RequestTooLarge, "request size overflowed"))?;
-        if request_bytes > grant.max_request_bytes {
+        if streamed.map_or(request_bytes, |lengths| lengths.literal) > grant.max_request_bytes {
             return Err(http_error(
                 ErrorCode::RequestTooLarge,
                 "request exceeds the authorized byte limit",
@@ -1360,7 +1410,7 @@ impl BufferedHttpClient {
             host,
             authority,
             addresses,
-            request_bytes,
+            request_bytes: streamed.map_or(request_bytes, |lengths| lengths.total),
         })
     }
 
@@ -1822,7 +1872,7 @@ fn violation_label(code: ErrorCode) -> Option<&'static str> {
 }
 
 /// One outcome vocabulary for the span and the accounting record, so they cannot disagree.
-fn outcome_label(result: &Result<Response, HttpError>) -> &'static str {
+fn outcome_label<T>(result: &Result<T, HttpError>) -> &'static str {
     match result {
         Ok(_) => "succeeded",
         Err(error) => violation_label(error.code).unwrap_or("failed"),

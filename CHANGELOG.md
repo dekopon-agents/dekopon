@@ -7,6 +7,13 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- Broker-host asset resources and exact-length streamed HTTP bodies move file bytes through
+  read-only descriptors instead of provider JSON. Optional broker `assets.rootPath` and
+  `assets.maxInFlightBytes` configure private ephemeral spools with fail-fast disk accounting;
+  asset mutation grants remain broker-authorized and failed invocations return no asset effects.
+
 ### Fixed
 
 - Check the first Slack file download URL on the same rule as the redirect hop after it, at the one

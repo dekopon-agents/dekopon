@@ -701,21 +701,7 @@ struct ExpansionBudget {
     bytes: usize,
 }
 
-/// Reads `chat-asset:<N>` as the attachment number it names.
-///
-/// An exact match and nothing else. A leading zero, a surrounding sentence, a trailing space, or an
-/// empty number is an ordinary string: widening this would let a gateway rewrite text a person
-/// actually typed.
-fn chat_asset_marker(text: &str) -> Option<u64> {
-    let digits = text.strip_prefix("chat-asset:")?;
-    if digits.is_empty()
-        || digits.starts_with('0')
-        || !digits.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-    digits.parse().ok()
-}
+use dekopon_core::chat_asset_marker;
 
 #[cfg(test)]
 mod tests {

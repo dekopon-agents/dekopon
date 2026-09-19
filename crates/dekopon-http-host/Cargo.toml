@@ -16,7 +16,11 @@ include = ["src/**", "README.md", "Cargo.toml"]
 [dependencies]
 base64.workspace = true
 dekopon-capability.workspace = true
-dekopon-core.workspace = true
+dekopon-core = { workspace = true, features = ["native"] }
+bytes.workspace = true
+http-body.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true
 serde.workspace = true

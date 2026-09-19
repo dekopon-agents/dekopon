@@ -99,6 +99,7 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
                 credential: None,
                 credential_by_agent: Default::default(),
                 constraints: dekopon_capability::ExecutionConstraints {
+                    asset: None,
                     timeout_ms: 10_000,
                     max_output_bytes: 131_072,
                     http: None,
@@ -123,6 +124,7 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
             credential: None,
             credential_by_agent: Default::default(),
             constraints: dekopon_capability::ExecutionConstraints {
+                asset: None,
                 timeout_ms: 10_000,
                 max_output_bytes: 131_072,
                 http: None,
@@ -146,6 +148,7 @@ fn constraints_with_http_credential(credential: Option<&str>) -> ConstraintCatal
                 credential: Some(credential.to_owned()),
                 credential_by_agent: Default::default(),
                 constraints: dekopon_capability::ExecutionConstraints {
+                    asset: None,
                     timeout_ms: 10_000,
                     max_output_bytes: 131_072,
                     http: Some(HttpConstraints {
@@ -682,11 +685,12 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
                     input: json!({}),
                     secret_use: None,
                 },
+                Default::default(),
             )
             .await
             .expect("ordinary invocation is audited");
         assert_eq!(
-            result.outcome,
+            result.result.outcome,
             dekopon_capability::InvocationOutcome::Succeeded,
             "{result:?}"
         );
@@ -732,11 +736,12 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
                 input: json!({}),
                 secret_use: None,
             },
+            Default::default(),
         )
         .await
         .expect("chat invocation is audited");
     assert_eq!(
-        chat_result.outcome,
+        chat_result.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded,
         "{chat_result:?}"
     );
@@ -756,11 +761,12 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
                 input: json!({}),
                 secret_use: None,
             },
+            Default::default(),
         )
         .await
         .expect("attested invocation is audited");
     assert_eq!(
-        result.outcome,
+        result.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded,
         "{result:?}"
     );
@@ -891,6 +897,7 @@ async fn a_rendered_page_never_reaches_a_reserved_memory_route() {
             credential: None,
             credential_by_agent: Default::default(),
             constraints: dekopon_capability::ExecutionConstraints {
+                asset: None,
                 timeout_ms: 10_000,
                 max_output_bytes: 131_072,
                 http: None,
@@ -999,6 +1006,7 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
             credential: None,
             credential_by_agent: Default::default(),
             constraints: dekopon_capability::ExecutionConstraints {
+                asset: None,
                 timeout_ms: 10_000,
                 max_output_bytes: 131_072,
                 http: None,
@@ -1060,14 +1068,15 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
                 input: json!({}),
                 secret_use: None,
             },
+            Default::default(),
         )
         .await
         .expect("reserved denial is audited");
     assert_eq!(
-        result.outcome,
+        result.result.outcome,
         dekopon_capability::InvocationOutcome::Denied
     );
-    assert_eq!(result.error.as_deref(), Some("chat-scope-required"));
+    assert_eq!(result.result.error.as_deref(), Some("chat-scope-required"));
 
     let gateway = gateway();
     let grant = grant();
@@ -1114,15 +1123,16 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
                 input: json!({}),
                 secret_use: None,
             },
+            Default::default(),
         )
         .await
         .expect("chat reserved denial is audited");
     assert_eq!(
-        chat_result.outcome,
+        chat_result.result.outcome,
         dekopon_capability::InvocationOutcome::Denied
     );
     assert_eq!(
-        chat_result.error.as_deref(),
+        chat_result.result.error.as_deref(),
         Some("record-operation-required"),
         "the record route is unreachable from the generic chat invoke path"
     );
@@ -1142,14 +1152,15 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
                 input: json!({}),
                 secret_use: None,
             },
+            Default::default(),
         )
         .await
         .expect("attested reserved denial is audited");
     assert_eq!(
-        result.outcome,
+        result.result.outcome,
         dekopon_capability::InvocationOutcome::Denied
     );
-    assert_eq!(result.error.as_deref(), Some("chat-scope-required"));
+    assert_eq!(result.result.error.as_deref(), Some("chat-scope-required"));
 }
 
 fn memory_constraint(
@@ -1166,6 +1177,7 @@ fn memory_constraint(
         credential: None,
         credential_by_agent: Default::default(),
         constraints: dekopon_capability::ExecutionConstraints {
+            asset: None,
             timeout_ms: 10_000,
             max_output_bytes: 131_072,
             http: None,
@@ -1256,14 +1268,17 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
                             .bound_to(id),
                     ),
                     request,
+                    Default::default(),
                 )
                 .await
         } else {
-            broker.invoke(&gateway(), None, None, request).await
+            broker
+                .invoke(&gateway(), None, None, request, Default::default())
+                .await
         }
         .expect("reserved route denial is audited");
         assert_eq!(
-            result.outcome,
+            result.result.outcome,
             dekopon_capability::InvocationOutcome::Denied
         );
     }
@@ -1341,14 +1356,18 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
                 input: json!({}),
                 secret_use: None,
             },
+            Default::default(),
         )
         .await
         .expect("generic record denial is accounted");
     assert_eq!(
-        generic.outcome,
+        generic.result.outcome,
         dekopon_capability::InvocationOutcome::Denied
     );
-    assert_eq!(generic.error.as_deref(), Some("record-operation-required"));
+    assert_eq!(
+        generic.result.error.as_deref(),
+        Some("record-operation-required")
+    );
 
     let record_id = "record-1".parse::<InvocationId>().expect("invocation");
     let record = broker
@@ -1402,15 +1421,17 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
                 input: json!({"last": 1}),
                 secret_use: None,
             },
+            Default::default(),
         )
         .await
         .expect("recent accounted");
     assert_eq!(
-        recent.outcome,
+        recent.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
     );
     assert_eq!(
         recent
+            .result
             .output
             .as_ref()
             .and_then(|value| value["turns"][0]["user"].as_str()),
@@ -2029,6 +2050,7 @@ async fn a_corrupt_memory_namespace_is_reset_by_the_invocation_that_finds_it() {
                 input: json!({"last": 1}),
                 secret_use: None,
             },
+            Default::default(),
         )
         .await
         .expect_err("the invocation that finds the corruption fails");
@@ -2216,9 +2238,11 @@ async fn query_memory_result_in(
                 input,
                 secret_use: None,
             },
+            Default::default(),
         )
         .await
         .expect("query accounted")
+        .result
 }
 
 async fn query_memory_in(
@@ -2592,14 +2616,15 @@ async fn invoke_generic_storage_denial(broker: &Broker<InMemoryAuditLog>, invoca
                 input: json!({"mode": "quota-denial"}),
                 secret_use: None,
             },
+            Default::default(),
         )
         .await
         .expect("storage denial is accounted");
     assert_eq!(
-        result.outcome,
+        result.result.outcome,
         dekopon_capability::InvocationOutcome::Failed
     );
-    assert_eq!(result.error.as_deref(), Some("storage-quota"));
+    assert_eq!(result.result.error.as_deref(), Some("storage-quota"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -3066,6 +3091,7 @@ async fn every_declared_route_conflict_is_reported_at_startup() {
         credential: None,
         credential_by_agent: Default::default(),
         constraints: dekopon_capability::ExecutionConstraints {
+            asset: None,
             timeout_ms: 10_000,
             max_output_bytes: 131_072,
             http: None,

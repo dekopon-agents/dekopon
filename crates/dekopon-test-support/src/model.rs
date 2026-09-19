@@ -32,7 +32,7 @@ const PARK_CEILING: Duration = Duration::from_secs(30);
 /// loop had". None of those is assertable against a model that answers all at once, so this one
 /// hands out exactly one event per release and announces each hand-off.
 ///
-/// The two directions use different primitives for the same reason [`crate::BlockedRuntime`] does:
+/// The two directions use different primitives for the same reason `BlockedRuntime` does:
 /// the waiting side of `release` is the blocking prompt thread, which has no executor, while the
 /// waiting side of the announcement is an async test that may have time paused.
 ///

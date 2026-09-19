@@ -472,7 +472,7 @@ impl FakeBroker {
         )?;
 
         self.registry
-            .invoke_with_storage(authorized, None, grant)
+            .invoke_with_storage(authorized, None, grant, Default::default())
             .await
             .map_err(|failure| FakeBrokerError::Invocation(Box::new(failure)))
     }
@@ -518,6 +518,7 @@ impl FakeBroker {
 
     fn constraints(&self) -> ExecutionConstraints {
         ExecutionConstraints {
+            asset: None,
             timeout_ms: self.timeout_ms,
             max_output_bytes: self.max_output_bytes,
             http: None,

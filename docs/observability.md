@@ -414,6 +414,20 @@ A `chat.postMessage` HTTP 429 delays the identical post once: integer `Retry-Aft
 capped at 60, defaulting to 5 when missing or unparsable. A second 429 uses the ordinary
 reply-failure path; no other HTTP failure is retried.
 
+Broker assets are recorded by reference, content type, byte count and SHA-256, never by bytes.
+Opened and attached resources emit `asset.id`, `asset.content_type`, and `asset.bytes` inside
+`provider.invoke`. Attached outputs and consumed HTTP asset parts record `asset.sha256`
+over decoded bytes; the first WIT read of an opened input records its full decoded digest using
+bounded positional I/O, once per handle. HTTP retains its inline digest of transmitted bytes.
+Direct WIT writer calls record guest-list length and copied-byte count: oversized lists are
+rejected before a payload copy. These are payload-copy bounds, not process RSS measurements.
+Content-type labels remain authoritative; the single intake sniff/disagreement record is a
+committed gateway integration requirement, not implemented by the broker. Native `asset.encode` and `asset.decode` spans carry `bytes` and
+`duration_us`. Streamed HTTP uses the same `http.request` span and `accounting.http.request`
+record as buffered HTTP, including refused attempts; its request byte count is the exact total
+body length, while its request grant bounds literal parts only. An `asset.send` capability uses
+the ordinary `broker.decision` and `broker.execution` records, not a separate authorization path.
+
 Scratch IO emits `asset.spool` child spans for `operation=write|read|reclaim|cleanup`, recording `bytes`,
 `duration_ms`, `outcome=ok|refused` and a sanitized `reason` on refusal (capacity, per-file bound,
 changed length, or OS IO category). It emits one bounded warning on a failed operation, with no

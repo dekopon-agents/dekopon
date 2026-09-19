@@ -134,6 +134,7 @@ fn authorized(provider: &str, capability: CapabilityId, input: Value) -> Authori
                 .expect("valid principal fixture"),
             "policy-test".to_owned(),
             ExecutionConstraints {
+                asset: None,
                 timeout_ms: 5_000,
                 max_output_bytes: 4_096,
                 http: None,
@@ -502,6 +503,7 @@ async fn every_operation_instantiates_the_component_exactly_once() {
         .invoke(
             authorized("cli-probe", capability, json!({"text": "héllo"})),
             None,
+            Default::default(),
         )
         .await
         .expect("the proposed capability runs");
@@ -634,6 +636,7 @@ async fn invocation_input_past_the_cap_is_truncated_beside_its_full_length() {
                 input,
             ),
             None,
+            Default::default(),
         )
         .await
         .expect("an input inside the fixture's bound runs");
@@ -689,7 +692,11 @@ async fn clock_probe_reads_the_host_clock_inside_the_invoke_window() {
 
     let before = unix_millis_now();
     let output = registry
-        .invoke(authorized("clock-probe", capability, json!({})), None)
+        .invoke(
+            authorized("clock-probe", capability, json!({})),
+            None,
+            Default::default(),
+        )
         .await
         .expect("the clock reads inside invoke");
     let after = unix_millis_now();
@@ -857,6 +864,7 @@ async fn memory_and_fuel_summary_is_once_per_invocation_including_failures_witho
                     json!({"text": "private-input-sentinel"}),
                 ),
                 None,
+                Default::default(),
             )
             .await;
         assert_eq!(result.is_ok(), outcome == "succeeded", "{result:?}");
@@ -930,6 +938,7 @@ async fn memory_and_fuel_summary_survives_timeout_and_caller_cancellation() {
                 json!({}),
             ),
             None,
+            Default::default(),
         );
         if cancel {
             assert!(

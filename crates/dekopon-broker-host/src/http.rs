@@ -17,7 +17,7 @@ pub(crate) type HttpCeilings = HttpHostCeilings;
 
 #[derive(Debug)]
 pub(crate) struct HttpState {
-    client: BufferedHttpClient,
+    pub(crate) client: BufferedHttpClient,
 }
 
 impl HttpState {
@@ -98,7 +98,7 @@ impl HttpState {
     }
 }
 
-fn map_error(error: NativeHttpError) -> HttpError {
+pub(crate) fn map_error(error: NativeHttpError) -> HttpError {
     HttpError {
         code: match error.code {
             NativeErrorCode::InvalidMethod => ErrorCode::InvalidMethod,

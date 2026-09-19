@@ -13,7 +13,8 @@
 //! — `dekopon-agent`, `dekopon-model`, `dekopon-shell` — are the boundaries the shared doubles
 //! implement, and all three are already normal dependencies of `dekopond` itself. Because this
 //! crate is a dev-dependency everywhere, none of them appears in any `cargo tree --edges normal`
-//! CI reads.
+//! CI reads. The `agent-runtime` feature opts into `BlockedRuntime` and its agent dependency;
+//! generic socket, file, capture and transport fixtures do not compile the prompt loop.
 
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
@@ -29,6 +30,7 @@ use std::{
 mod capture;
 mod driver;
 mod model;
+#[cfg(feature = "agent-runtime")]
 mod runtime;
 mod transcripts;
 
@@ -39,6 +41,7 @@ pub use driver::{
     StreamCall,
 };
 pub use model::{ScriptedStreamModel, scripted_text};
+#[cfg(feature = "agent-runtime")]
 pub use runtime::BlockedRuntime;
 pub use transcripts::{
     CODEX_RESPONSES_TOOL_CALL, CODEX_RESPONSES_TWO_DELTAS, OPENAI_CHAT_COMPLETIONS_TOOL_CALL,

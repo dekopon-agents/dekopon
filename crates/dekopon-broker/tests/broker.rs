@@ -253,6 +253,7 @@ unless { context has via };"#;
 /// One plaintext loopback GET against a fixture server.
 fn loopback_constraints(authority: &str) -> ExecutionConstraints {
     ExecutionConstraints {
+        asset: None,
         timeout_ms: 5_000,
         max_output_bytes: 1024 * 1024,
         http: Some(HttpConstraints {
@@ -398,17 +399,21 @@ async fn policy_authorizes_and_audits_no_payloads() {
                 "cli-probe.upper",
                 json!({"text": "top-secret-payload"}),
             ),
+            Default::default(),
         )
         .await
         .expect("authorized invocation is accounted");
     assert_eq!(
-        result.outcome,
+        result.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
     );
-    assert_eq!(result.decision.decision_id, "allow-invoke-once");
-    assert_eq!(result.decision.policy_revision, "policy-test");
-    assert_eq!(result.output, Some(json!({"text": "TOP-SECRET-PAYLOAD"})));
-    assert_eq!(result.evidence.len(), 2);
+    assert_eq!(result.result.decision.decision_id, "allow-invoke-once");
+    assert_eq!(result.result.decision.policy_revision, "policy-test");
+    assert_eq!(
+        result.result.output,
+        Some(json!({"text": "TOP-SECRET-PAYLOAD"}))
+    );
+    assert_eq!(result.result.evidence.len(), 2);
 
     let records = audit.records().await;
     assert_eq!(records.len(), 2);
@@ -463,16 +468,17 @@ async fn unmatched_identity_is_denied_before_provider_execution() {
                 "cli-probe.upper",
                 json!({"text": "secret"}),
             ),
+            Default::default(),
         )
         .await
         .expect("policy denial is audited");
     assert_eq!(
-        result.outcome,
+        result.result.outcome,
         dekopon_capability::InvocationOutcome::Denied
     );
-    assert_eq!(result.decision.decision_id, "deny-invoke-denied");
-    assert_eq!(result.error.as_deref(), Some("policy-denied"));
-    assert!(result.output.is_none());
+    assert_eq!(result.result.decision.decision_id, "deny-invoke-denied");
+    assert_eq!(result.result.error.as_deref(), Some("policy-denied"));
+    assert!(result.result.output.is_none());
     let records = audit.records().await;
     assert_eq!(records.len(), 1);
     assert!(matches!(
@@ -588,6 +594,7 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
     );
     let authority = server.authority().to_owned();
     let constraints = ExecutionConstraints {
+        asset: None,
         timeout_ms: 5_000,
         max_output_bytes: 1024 * 1024,
         http: Some(HttpConstraints {
@@ -636,14 +643,15 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
                     "body": "body-secret"
                 }),
             ),
+            Default::default(),
         )
         .await
         .expect("authorized HTTP request succeeds");
     assert_eq!(
-        result.outcome,
+        result.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
     );
-    assert_eq!(result.evidence.len(), 3);
+    assert_eq!(result.result.evidence.len(), 3);
     let wire = server.request();
     assert!(wire.ends_with(b"\r\n\r\nbody-secret"));
     server.join();
@@ -681,6 +689,7 @@ async fn jsonplaceholder_write_requires_external_write_policy_and_redacts_conten
     let server = LoopbackServer::once(response.as_bytes());
     let authority = server.authority().to_owned();
     let constraints = ExecutionConstraints {
+        asset: None,
         timeout_ms: 5_000,
         max_output_bytes: 1024 * 1024,
         http: Some(HttpConstraints {
@@ -757,11 +766,15 @@ async fn jsonplaceholder_write_requires_external_write_policy_and_redacts_conten
                     "endpoint": format!("http://{authority}")
                 }),
             ),
+            Default::default(),
         )
         .await
         .expect("ungranted read is denied and audited");
-    assert_eq!(read.outcome, dekopon_capability::InvocationOutcome::Denied);
-    assert_eq!(read.error.as_deref(), Some("policy-denied"));
+    assert_eq!(
+        read.result.outcome,
+        dekopon_capability::InvocationOutcome::Denied
+    );
+    assert_eq!(read.result.error.as_deref(), Some("policy-denied"));
 
     let result = broker
         .invoke(
@@ -778,15 +791,16 @@ async fn jsonplaceholder_write_requires_external_write_policy_and_redacts_conten
                     "endpoint": format!("http://{authority}")
                 }),
             ),
+            Default::default(),
         )
         .await
         .expect("authorized JSONPlaceholder write succeeds");
     assert_eq!(
-        result.outcome,
+        result.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
     );
     assert_eq!(
-        result.output.as_ref().expect("write returns output")["post"]["id"],
+        result.result.output.as_ref().expect("write returns output")["post"]["id"],
         101
     );
     let wire = server.request();
@@ -828,6 +842,7 @@ async fn failed_execution_audits_the_external_write_that_already_landed() {
     );
     let authority = server.authority().to_owned();
     let constraints = ExecutionConstraints {
+        asset: None,
         timeout_ms: 5_000,
         max_output_bytes: 1024 * 1024,
         http: Some(HttpConstraints {
@@ -885,6 +900,7 @@ async fn failed_execution_audits_the_external_write_that_already_landed() {
                     "endpoint": format!("http://{authority}")
                 }),
             ),
+            Default::default(),
         )
         .await
         .expect("a failing provider is still durably accounted");
@@ -897,14 +913,14 @@ async fn failed_execution_audits_the_external_write_that_already_landed() {
     server.join();
 
     assert_eq!(
-        result.outcome,
+        result.result.outcome,
         dekopon_capability::InvocationOutcome::Failed
     );
-    assert_eq!(result.error.as_deref(), Some("provider-failure"));
+    assert_eq!(result.result.error.as_deref(), Some("provider-failure"));
     // The class stays the class; the provider's own answer rides beside it, which is the only
     // thing in the result that says what the endpoint actually did.
     assert_eq!(
-        result.detail,
+        result.result.detail,
         Some(ProviderFailureDetail::new(
             "invalid-response",
             "endpoint returned an invalid post"
@@ -913,6 +929,7 @@ async fn failed_execution_audits_the_external_write_that_already_landed() {
     );
     assert!(
         result
+            .result
             .evidence
             .iter()
             .any(|evidence| evidence.kind == "http-calls"),
@@ -1017,11 +1034,12 @@ async fn credentialed_constraint_sets_inject_bound_secrets_and_never_audit_them(
                 "http-probe.fetch",
                 json!({ "uri": format!("http://{authority}/pulls/7"), "method": "GET" }),
             ),
+            Default::default(),
         )
         .await
         .expect("authorized credentialed request succeeds");
     assert_eq!(
-        result.outcome,
+        result.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
     );
 
@@ -1042,7 +1060,7 @@ async fn credentialed_constraint_sets_inject_bound_secrets_and_never_audit_them(
     );
     assert!(!serialized.contains(SECRET), "audit leaked the secret");
     assert!(!serialized.contains("Bearer"), "audit leaked the scheme");
-    let public = serde_json::to_string(&result).expect("result serializes");
+    let public = serde_json::to_string(&result.result).expect("result serializes");
     assert!(!public.contains(SECRET), "result leaked the secret");
 }
 
@@ -1172,12 +1190,13 @@ async fn a_refreshing_credential_resolves_once_per_invocation_outside_the_guest_
                 "http-probe.fetch",
                 json!({ "uri": format!("http://{authority}/images/generations"), "method": "GET" }),
             ),
+            Default::default(),
         )
         .await
         .expect("the renewed credential serves the invocation");
 
     assert_eq!(
-        result.outcome,
+        result.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
     );
     assert_eq!(
@@ -1287,6 +1306,7 @@ async fn an_unrenewable_credential_fails_its_invocation_and_classifies_why() {
                 "http-probe.fetch",
                 json!({ "uri": format!("http://{authority}/"), "method": "GET" }),
             ),
+            Default::default(),
         )
     };
 
@@ -1294,12 +1314,16 @@ async fn an_unrenewable_credential_fails_its_invocation_and_classifies_why() {
         .await
         .expect("an unrenewable credential is a failed invocation, not a broker error");
     assert_eq!(
-        permanent.outcome,
+        permanent.result.outcome,
         dekopon_capability::InvocationOutcome::Failed
     );
-    assert_eq!(permanent.error.as_deref(), Some("credential-unavailable"));
+    assert_eq!(
+        permanent.result.error.as_deref(),
+        Some("credential-unavailable")
+    );
     assert!(
         !permanent
+            .result
             .evidence
             .iter()
             .any(|evidence| evidence.kind == "http-calls"),
@@ -1310,11 +1334,11 @@ async fn an_unrenewable_credential_fails_its_invocation_and_classifies_why() {
         .await
         .expect("the broker keeps serving after an unusable credential");
     assert_eq!(
-        transient.outcome,
+        transient.result.outcome,
         dekopon_capability::InvocationOutcome::Failed
     );
     assert_eq!(
-        transient.error.as_deref(),
+        transient.result.error.as_deref(),
         Some("credential-refresh-failed"),
         "a transient renewal failure must not read as one an operator has to fix"
     );
@@ -1406,11 +1430,11 @@ async fn model_selected_drn_requires_dual_policy_and_exact_private_binding() {
         secret: secret_drn(),
     });
     let result = broker
-        .invoke(&context("caller"), None, None, proposal)
+        .invoke(&context("caller"), None, None, proposal, Default::default())
         .await
         .expect("dual-authorized invocation completes");
     assert_eq!(
-        result.outcome,
+        result.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
     );
     let wire = server.request_text();
@@ -1487,14 +1511,14 @@ async fn capability_policy_alone_cannot_authorize_a_drn() {
         secret: secret_drn(),
     });
     let result = broker
-        .invoke(&context("caller"), None, None, proposal)
+        .invoke(&context("caller"), None, None, proposal, Default::default())
         .await
         .expect("denial audited");
     assert_eq!(
-        result.outcome,
+        result.result.outcome,
         dekopon_capability::InvocationOutcome::Denied
     );
-    assert_eq!(result.error.as_deref(), Some("secret-denied"));
+    assert_eq!(result.result.error.as_deref(), Some("secret-denied"));
     let encoded = serde_json::to_string(&audit.records().await).expect("audit serializes");
     assert!(encoded.contains(secret_drn().as_str()), "{encoded}");
     assert!(encoded.contains("secret_sink"), "{encoded}");
@@ -1691,14 +1715,15 @@ async fn a_command_word_s_basic_proposal_needs_a_binding_for_its_exact_username(
             None,
             None,
             submit("invoke-basic-other-user"),
+            Default::default(),
         )
         .await
         .expect("denial audited");
     assert_eq!(
-        refused.outcome,
+        refused.result.outcome,
         dekopon_capability::InvocationOutcome::Denied
     );
-    assert_eq!(refused.error.as_deref(), Some("secret-denied"));
+    assert_eq!(refused.result.error.as_deref(), Some("secret-denied"));
 
     let allowed = bound_user
         .invoke(
@@ -1706,11 +1731,12 @@ async fn a_command_word_s_basic_proposal_needs_a_binding_for_its_exact_username(
             None,
             None,
             submit("invoke-basic-bound-user"),
+            Default::default(),
         )
         .await
         .expect("dual-authorized invocation completes");
     assert_eq!(
-        allowed.outcome,
+        allowed.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
     );
     let wire = server.request_text();
@@ -1796,14 +1822,14 @@ async fn authorized_source_failure_is_a_terminal_audited_failure_not_an_ambiguou
         secret: secret_drn(),
     });
     let result = broker
-        .invoke(&context("caller"), None, None, proposal)
+        .invoke(&context("caller"), None, None, proposal, Default::default())
         .await
         .expect("source failure is a normal audited result");
     assert_eq!(
-        result.outcome,
+        result.result.outcome,
         dekopon_capability::InvocationOutcome::Failed
     );
-    assert_eq!(result.error.as_deref(), Some("secret-resolution"));
+    assert_eq!(result.result.error.as_deref(), Some("secret-resolution"));
     let records = audit.records().await;
     assert_eq!(records.len(), 2, "decision plus terminal failed execution");
     let AuditEvent::Execution {
@@ -1892,11 +1918,12 @@ async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
     )
     .expect("both the default and the override match the store and its destinations");
 
-    let fetch = |id: &'static str, context: AuthenticatedContext| {
-        let authority = authority.clone();
-        let broker = &broker;
-        async move {
-            let result = broker
+    let fetch =
+        |id: &'static str, context: AuthenticatedContext| {
+            let authority = authority.clone();
+            let broker = &broker;
+            async move {
+                let result = broker
                 .invoke(
                     &context,
                     None,
@@ -1905,16 +1932,15 @@ async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
                         id,
                         "http-probe.fetch",
                         json!({ "uri": format!("http://{authority}/pulls/7"), "method": "GET" }),
-                    ),
-                )
+                    ), Default::default())
                 .await
                 .expect("the authorized request is accounted");
-            assert_eq!(
-                result.outcome,
-                dekopon_capability::InvocationOutcome::Succeeded
-            );
-        }
-    };
+                assert_eq!(
+                    result.result.outcome,
+                    dekopon_capability::InvocationOutcome::Succeeded
+                );
+            }
+        };
     fetch(
         "invoke-nestedset",
         agent_context("caller", "nestedset-github"),
@@ -2039,6 +2065,7 @@ async fn an_agent_with_no_override_and_no_default_transacts_unauthenticated() {
                     "http-probe.fetch",
                     json!({ "uri": format!("http://{authority}/pulls/7"), "method": "GET" }),
                 ),
+                Default::default(),
             )
             .await
             .expect("the authorized request is accounted");
@@ -2073,6 +2100,7 @@ async fn an_agent_with_no_override_and_no_default_transacts_unauthenticated() {
 #[tokio::test(flavor = "multi_thread")]
 async fn credentialed_constraint_sets_fail_closed_at_construction() {
     let http = |hosts: Vec<String>| ExecutionConstraints {
+        asset: None,
         timeout_ms: 5_000,
         max_output_bytes: 1024 * 1024,
         http: Some(HttpConstraints {
@@ -2274,14 +2302,18 @@ async fn via_isolation_holds_in_both_directions() {
                 "cli-probe.upper",
                 json!({"text": "on behalf of"}),
             ),
+            Default::default(),
         )
         .await
         .expect("attested invocation is accounted");
     assert_eq!(
-        attested.outcome,
+        attested.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
     );
-    assert_eq!(attested.output, Some(json!({"text": "ON BEHALF OF"})));
+    assert_eq!(
+        attested.result.output,
+        Some(json!({"text": "ON BEHALF OF"}))
+    );
 
     // The mapped principal arriving as itself, with the same agent actor, is a different context
     // than the attested one and matches nothing.
@@ -2295,14 +2327,15 @@ async fn via_isolation_holds_in_both_directions() {
                 "cli-probe.upper",
                 json!({"text": "direct"}),
             ),
+            Default::default(),
         )
         .await
         .expect("direct proposal is accounted");
     assert_eq!(
-        direct.outcome,
+        direct.result.outcome,
         dekopon_capability::InvocationOutcome::Denied
     );
-    assert_eq!(direct.error.as_deref(), Some("policy-denied"));
+    assert_eq!(direct.result.error.as_deref(), Some("policy-denied"));
     assert!(
         broker
             .capabilities(&agent_context("cpetersen", "some-agent"))
@@ -2321,14 +2354,15 @@ async fn via_isolation_holds_in_both_directions() {
                 "cli-probe.reverse",
                 json!({"text": "crossed"}),
             ),
+            Default::default(),
         )
         .await
         .expect("attested proposal outside the attested rule is accounted");
     assert_eq!(
-        crossed.outcome,
+        crossed.result.outcome,
         dekopon_capability::InvocationOutcome::Denied
     );
-    assert_eq!(crossed.error.as_deref(), Some("policy-denied"));
+    assert_eq!(crossed.result.error.as_deref(), Some("policy-denied"));
 
     // Capability listings agree with the invocation decisions on both sides of the boundary.
     let visible = broker
@@ -2387,14 +2421,18 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
                 "cli-probe.upper",
                 json!({"text": "claim"}),
             ),
+            Default::default(),
         )
         .await
         .expect("a refused attestation is accounted");
     assert_eq!(
-        ungranted.outcome,
+        ungranted.result.outcome,
         dekopon_capability::InvocationOutcome::Denied
     );
-    assert_eq!(ungranted.error.as_deref(), Some("attestation-denied"));
+    assert_eq!(
+        ungranted.result.error.as_deref(),
+        Some("attestation-denied")
+    );
 
     // Authority over a different workspace is not authority over this one.
     let out_of_scope = broker
@@ -2407,14 +2445,18 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
                 "cli-probe.upper",
                 json!({"text": "claim"}),
             ),
+            Default::default(),
         )
         .await
         .expect("an out-of-scope attestation is accounted");
     assert_eq!(
-        out_of_scope.outcome,
+        out_of_scope.result.outcome,
         dekopon_capability::InvocationOutcome::Denied
     );
-    assert_eq!(out_of_scope.error.as_deref(), Some("attestation-denied"));
+    assert_eq!(
+        out_of_scope.result.error.as_deref(),
+        Some("attestation-denied")
+    );
 
     let records = audit.records().await;
     assert_eq!(records.len(), 2);
@@ -2464,14 +2506,15 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
                 "cli-probe.upper",
                 json!({"text": "claim"}),
             ),
+            Default::default(),
         )
         .await
         .expect("an unmapped subject is accounted");
     assert_eq!(
-        unmapped.outcome,
+        unmapped.result.outcome,
         dekopon_capability::InvocationOutcome::Denied
     );
-    assert_eq!(unmapped.error.as_deref(), Some("unmapped-subject"));
+    assert_eq!(unmapped.result.error.as_deref(), Some("unmapped-subject"));
     let records = audit.records().await;
     assert_eq!(records.len(), 1);
     let AuditEvent::Decision {
@@ -2516,11 +2559,12 @@ async fn attested_success_audits_via_and_subject() {
                 "cli-probe.upper",
                 json!({"text": "top-secret-payload"}),
             ),
+            Default::default(),
         )
         .await
         .expect("attested invocation is accounted");
     assert_eq!(
-        result.outcome,
+        result.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
     );
 
@@ -2787,14 +2831,18 @@ async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
                 "cli-probe.reverse",
                 json!({"text": "x"}),
             ),
+            Default::default(),
         )
         .await
         .expect("the refusal is accounted");
     assert_eq!(
-        result.outcome,
+        result.result.outcome,
         dekopon_capability::InvocationOutcome::Denied
     );
-    assert_eq!(result.error.as_deref(), Some("unconstrained-capability"));
+    assert_eq!(
+        result.result.error.as_deref(),
+        Some("unconstrained-capability")
+    );
     assert!(
         broker
             .capabilities(&context("caller"))
@@ -2839,6 +2887,7 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
             None,
             None,
             request("invoke-explained", "cli-probe.upper", json!({"text": "hi"})),
+            Default::default(),
         )
         .await
         .expect("the allowed invocation is accounted");
@@ -2852,6 +2901,7 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
                 "cli-probe.upper",
                 json!({"text": "hi"}),
             ),
+            Default::default(),
         )
         .await
         .expect("the denial is accounted");
@@ -2917,14 +2967,18 @@ async fn tolerating_an_unconstrained_capability_warns_but_still_denies_it() {
                 "cli-probe.reverse",
                 json!({"text": "x"}),
             ),
+            Default::default(),
         )
         .await
         .expect("the refusal is accounted");
     assert_eq!(
-        result.outcome,
+        result.result.outcome,
         dekopon_capability::InvocationOutcome::Denied
     );
-    assert_eq!(result.error.as_deref(), Some("unconstrained-capability"));
+    assert_eq!(
+        result.result.error.as_deref(),
+        Some("unconstrained-capability")
+    );
     assert!(
         broker
             .capabilities(&context("caller"))
@@ -3002,11 +3056,12 @@ async fn tolerating_a_constraint_set_that_routes_nowhere_drops_it() {
             None,
             None,
             request("invoke-routed", "cli-probe.upper", json!({"text": "x"})),
+            Default::default(),
         )
         .await
         .expect("the routed capability still executes");
     assert_eq!(
-        result.outcome,
+        result.result.outcome,
         dekopon_capability::InvocationOutcome::Succeeded
     );
 }

@@ -13,6 +13,10 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+/// Shared bounded native base64 plumbing; absent from guest builds.
+#[cfg(feature = "native")]
+pub mod base64;
+
 mod accept;
 mod attribute;
 mod diagnostics;
@@ -916,4 +920,17 @@ mod command_word_tests {
             "keep this list sorted and unique"
         );
     }
+}
+
+/// Parses an exact conversation asset marker; ordinary text is never rewritten.
+#[must_use]
+pub fn chat_asset_marker(text: &str) -> Option<u64> {
+    let digits = text.strip_prefix("chat-asset:")?;
+    if digits.is_empty()
+        || digits.starts_with('0')
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    digits.parse().ok()
 }

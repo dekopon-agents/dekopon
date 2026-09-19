@@ -832,6 +832,27 @@ lease and reservation remain held while a started blocking job drains, and shutd
 host timeout + lock timeout + finalization budget + two frame deadlines; a failed kernel or
 filesystem may exceed it. Hostile same-UID mutation is out of scope.
 
+## Ephemeral broker assets
+
+The optional strict section below enables asset writers and streamed HTTP response spools:
+
+```yaml
+assets:
+  rootPath: /var/lib/dekopon-assets
+  maxInFlightBytes: 67108864
+```
+
+Both keys are required when the section is present. Startup requires a broker-owned 0700 directory,
+refuses overlap with broker state or providers, and empties every entry without following symlinks.
+Without the section, allocation and streamed HTTP refuse with a message naming `assets.rootPath`;
+reading passed descriptors and permitted table operations need no broker disk.
+
+The byte budget covers concurrent output writers and HTTP spools; exhausted capacity or ENOSPC
+fails immediately without queueing or retry. Outputs use separate read-only descriptors and are
+unlinked before delivery; received files are read positionally. Only a successful invocation
+returns typed attached, removed, and sent effects. The backing volume must additionally accommodate
+unlinked outputs retained by the gateway; those no longer count as broker in-flight work.
+
 ## Catalog ownership at policy startup
 
 The agent catalog belongs to the gateway. Cedar declares `Dekopon::Agent` but does not enumerate

@@ -1,4 +1,4 @@
-//! Test fixture for the broker host's `dekopon:http/client@1.0.0` import, reached through its
+//! Test fixture for the broker host's HTTP and asset imports, reached through its
 //! `httpprobe` word.
 //!
 //! It is not a provider to deploy. Each capability is one `httpprobe` subcommand declared through
@@ -44,6 +44,128 @@ mod bindings {
         generate_all,
         pub_export_macro: true,
     });
+}
+
+fn asset_probe(mode: &str, input: &Value) -> Result<Value, ProviderError> {
+    use dekopon_provider_http::{Part, StreamedRequest};
+    use dekopon_provider_sdk::asset::{self, Encoding};
+    let asset_error =
+        |error: asset::AssetError| ProviderError::new(error.code.as_str(), error.message);
+    if mode == "direct-write" {
+        // Deliberately bypass the SDK chunking helper: adversarial direct WIT list lifting.
+        use bindings::dekopon::asset::asset as raw;
+        let bytes = input["bytes"].as_u64().unwrap() as usize;
+        let writer = raw::allocate("application/octet-stream", raw::Encoding::Identity)
+            .map_err(|error| ProviderError::new("allocate", error.message))?;
+        let result = writer.write(&vec![b'x'; bytes]);
+        if result.is_ok() {
+            raw::attach(writer).map_err(|error| ProviderError::new("attach", error.message))?;
+        }
+        if result.is_err() {
+            match input["afterWriteError"].as_str() {
+                Some("spin") => loop {
+                    std::hint::spin_loop();
+                },
+                Some("http-denied") => {
+                    let _refused = dekopon_provider_http::send(
+                        Request::new("GET", "http://127.0.0.1:1").unwrap(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        return Ok(json!({"caught": result.is_err()}));
+    }
+    if mode == "read" {
+        let handle = asset::open(input["reference"].as_str().unwrap()).map_err(asset_error)?;
+        let mut chunk = [0; 65536];
+        let mut bytes = 0;
+        loop {
+            let count = handle.read(&mut chunk).map_err(asset_error)?;
+            if count == 0 {
+                break;
+            }
+            bytes += count;
+        }
+        return Ok(json!({"read": bytes}));
+    }
+    if mode == "send" {
+        let reference = input
+            .get("reference")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProviderError::new("invalid-input", "reference must be a string"))?;
+        let handle = asset::open(reference).map_err(asset_error)?;
+        asset::send(&handle).map_err(asset_error)?;
+        return Ok(json!({"sent": true}));
+    }
+    if mode == "stream" {
+        let references = input
+            .get("references")
+            .and_then(Value::as_array)
+            .ok_or_else(|| ProviderError::new("invalid-input", "references must be an array"))?;
+        let handles = references
+            .iter()
+            .map(|reference| {
+                let reference = reference.as_str().ok_or_else(|| {
+                    ProviderError::new("invalid-input", "reference must be a string")
+                })?;
+                asset::open(reference).map_err(asset_error)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let uri = input
+            .get("uri")
+            .and_then(Value::as_str)
+            .ok_or_else(|| ProviderError::new("invalid-input", "uri must be a string"))?;
+        let mut request = StreamedRequest::new("POST", uri)
+            .map_err(|error| ProviderError::new("invalid-input", error.to_string()))?;
+        request.body = handles
+            .iter()
+            .map(|handle| Part::asset(handle, Encoding::Base64))
+            .collect();
+        let response = dekopon_provider_http::stream(request);
+        if input.get("catch_stream_error").and_then(Value::as_bool) == Some(true) {
+            return Ok(json!({"caught": response.is_err()}));
+        }
+        let response =
+            response.map_err(|error| ProviderError::new(error.code.as_str(), error.message))?;
+        let writer = asset::allocate("text/plain", Encoding::Identity).map_err(asset_error)?;
+        let mut bytes = [0; 65536];
+        loop {
+            let count = response.body.read(&mut bytes).map_err(asset_error)?;
+            if count == 0 {
+                break;
+            }
+            writer.write_all(&bytes[..count]).map_err(asset_error)?;
+        }
+        asset::attach(writer).map_err(asset_error)?;
+        return Ok(json!({"status": response.status}));
+    }
+    let writer = asset::allocate("text/plain", Encoding::Identity).map_err(asset_error)?;
+    writer.write_all(b"asset ").map_err(asset_error)?;
+    writer.write_all(b"probe").map_err(asset_error)?;
+    if mode == "channel" {
+        return Ok(json!({"ok": true}));
+    }
+    let attached = asset::attach(writer);
+    if mode == "catch-denied" {
+        return Ok(json!({"caught": attached.is_err()}));
+    }
+    attached.map_err(asset_error)?;
+    match mode {
+        "trap" => panic!("asset test trap after attach"),
+        "timeout" => loop {
+            std::hint::spin_loop();
+        },
+        "fail" => Err(ProviderError::new(
+            "asset-test-failure",
+            "failure after attach",
+        )),
+        "attach" => Ok(json!({"ok": true})),
+        _ => Err(ProviderError::new(
+            "invalid-input",
+            "unknown asset test mode",
+        )),
+    }
 }
 
 struct HttpProbe;
@@ -121,6 +243,10 @@ impl Provider for HttpProbe {
     }
 
     fn invoke(capability: &CapabilityId, input: Value) -> Result<Value, ProviderError> {
+        if let Some(mode) = input.get("assetMode").and_then(Value::as_str) {
+            return asset_probe(mode, &input);
+        }
+
         if capability.as_str() == CONDITIONAL_WRITE {
             return conditional_write(&input);
         }

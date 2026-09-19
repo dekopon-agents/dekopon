@@ -858,6 +858,7 @@ dependencies = [
 name = "dekopon-broker-host"
 version = "0.17.0"
 dependencies = [
+ "dekopon-broker-protocol",
  "dekopon-capability",
  "dekopon-core",
  "dekopon-http-host",
@@ -865,6 +866,7 @@ dependencies = [
  "dekopon-provider-sdk-testkit",
  "dekopon-storage-host",
  "dekopon-test-support",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -959,6 +961,7 @@ dependencies = [
 name = "dekopon-core"
 version = "0.17.0"
 dependencies = [
+ "base64 0.23.1",
  "libc",
  "serde",
  "serde_json",
@@ -971,13 +974,17 @@ name = "dekopon-http-host"
 version = "0.17.0"
 dependencies = [
  "base64 0.23.1",
+ "bytes",
  "dekopon-capability",
  "dekopon-core",
  "dekopon-test-support",
  "futures-util",
+ "http-body",
  "reqwest",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

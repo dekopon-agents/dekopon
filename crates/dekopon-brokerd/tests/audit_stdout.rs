@@ -140,10 +140,11 @@ permit(principal == Dekopon::Principal::"caller",
                 secret_use: None,
                 input: json!({"text": "hello through broker"}),
             },
+            Default::default(),
         )
         .await
         .expect("the authorized invocation completes");
-    assert_eq!(result.outcome, InvocationOutcome::Succeeded);
+    assert_eq!(result.result.outcome, InvocationOutcome::Succeeded);
 
     let until = Instant::now() + Duration::from_secs(30);
     let records = loop {

@@ -447,10 +447,11 @@ async fn every_audit_record_carries_the_client_s_w3c_trace_id() {
                 secret_use: None,
                 input: serde_json::json!({"text": "hello through broker"}),
             },
+            Default::default(),
         )
         .await
         .expect("the authorized invocation completes");
-    assert_eq!(invoked.outcome, InvocationOutcome::Succeeded);
+    assert_eq!(invoked.result.outcome, InvocationOutcome::Succeeded);
 
     // The storage-routed entrance. No chat memory is configured, so this is an audited refusal —
     // which is the point: a refusal is a decision, and it has to land in the caller's trace too.

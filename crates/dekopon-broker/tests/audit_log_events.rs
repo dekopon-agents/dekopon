@@ -71,6 +71,7 @@ fn request(id: &str, capability: &str, input: serde_json::Value) -> InvocationRe
 
 fn loopback_constraints(authority: &str) -> ExecutionConstraints {
     ExecutionConstraints {
+        asset: None,
         timeout_ms: 5_000,
         max_output_bytes: 1024 * 1024,
         http: Some(HttpConstraints {
@@ -193,11 +194,10 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
                 "invoke-audited",
                 "http-probe.fetch",
                 serde_json::json!({ "uri": format!("http://{authority}/pulls/7"), "method": "GET" }),
-            ),
-        )
+            ), Default::default())
         .await
         .expect("authorized credentialed request succeeds");
-    assert_eq!(allowed.outcome, InvocationOutcome::Succeeded);
+    assert_eq!(allowed.result.outcome, InvocationOutcome::Succeeded);
     server.join();
 
     let denied = broker
@@ -206,10 +206,11 @@ async fn each_decision_emits_one_audit_record_inside_its_own_span() {
             None,
             None,
             request("invoke-refused", "http-probe.absent", serde_json::json!({})),
+            Default::default(),
         )
         .await
         .expect("an unconstrained capability is still an accounted decision");
-    assert_eq!(denied.outcome, InvocationOutcome::Denied);
+    assert_eq!(denied.result.outcome, InvocationOutcome::Denied);
 
     let records = audit_records(&captured);
     assert_eq!(

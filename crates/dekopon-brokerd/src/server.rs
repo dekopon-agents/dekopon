@@ -2,10 +2,10 @@ use std::{collections::BTreeMap, future::Future, io, sync::Arc, time::Duration};
 
 use dekopon_broker::{AttestorGrant, AuditLog, AuthenticatedContext, Broker, BrokerError};
 use dekopon_broker_protocol::{
-    Attestation, BrokerRequest, CommandRunOutcome, ERROR_BROKER_UNAVAILABLE,
+    Attestation, BrokerRequest, CommandRunOutcome, DescriptorStream, ERROR_BROKER_UNAVAILABLE,
     ERROR_CAPACITY_EXHAUSTED, ERROR_INVALID_REQUEST, ERROR_OUTCOME_UNAUDITED, ERROR_PROVIDER,
     ERROR_UNAUTHENTICATED, FrameLimits, InvocationRequest, ProtocolError, RequestEnvelope,
-    ResponseEnvelope, TraceParent, read_frame, write_frame,
+    ResponseEnvelope, TraceParent,
 };
 use dekopon_core::{
     ACCEPT_BACKOFF_MS, InvocationId, MAX_ACCEPT_BACKOFF_MS, retryable_accept_error,
@@ -215,6 +215,12 @@ const fn protocol_error_kind(error: &ProtocolError) -> &'static str {
         ProtocolError::FrameTooLarge { .. } => "frame-too-large",
         ProtocolError::Serialize { .. } => "serialize",
         ProtocolError::Deserialize { .. } => "deserialize",
+        ProtocolError::DescriptorsTruncated => "descriptors-truncated",
+        ProtocolError::TooManyDescriptors => "too-many-descriptors",
+        ProtocolError::UnexpectedDescriptors => "unexpected-descriptors",
+        ProtocolError::DescriptorIndex => "descriptor-index",
+        ProtocolError::DescriptorFlags { .. } => "descriptor-flags",
+        ProtocolError::TooManyAssetRows => "too-many-asset-rows",
     }
 }
 
@@ -258,16 +264,17 @@ fn claim_is_valid(attestation: Option<&Attestation>, proposal: Option<&Invocatio
 /// The message stays generic on purpose: which half of the claim was malformed is a property of a
 /// frame the peer built, and a client that cannot bind its own attestation cannot act on detail.
 async fn refuse_invalid_claim(
-    stream: &mut UnixStream,
+    stream: &mut DescriptorStream,
     limits: FrameLimits,
 ) -> Result<(), ConnectionError> {
-    write_frame(
-        stream,
-        &ResponseEnvelope::error(ERROR_INVALID_REQUEST, "attestation is invalid"),
-        limits,
-    )
-    .await
-    .map_err(ConnectionError::Write)?;
+    stream
+        .write_frame(
+            &ResponseEnvelope::error(ERROR_INVALID_REQUEST, "attestation is invalid"),
+            &[],
+            limits,
+        )
+        .await
+        .map_err(ConnectionError::Write)?;
     Err(ConnectionError::InvalidRequest)
 }
 
@@ -325,7 +332,7 @@ fn adopt_trace_parent(span: &tracing::Span, parent: TraceParent) {
 }
 
 async fn handle<A>(
-    mut stream: UnixStream,
+    stream: UnixStream,
     broker: &Broker<A>,
     identities: &BTreeMap<u32, MappedPeer>,
     limits: FrameLimits,
@@ -337,22 +344,40 @@ where
         .peer_cred()
         .map_err(|source| ConnectionError::PeerCredentials { source })?;
     let uid = credentials.uid();
+    let mut stream = DescriptorStream::new(stream);
     let Some(peer) = identities.get(&uid) else {
         // The wire answer is deliberately opaque, so this is the only place the reason exists. It
         // is also the usual reason a deployed broker never becomes ready: its own readiness probe
         // connects as the broker's UID, and a configuration that does not map that UID refuses it
         // exactly like any other stranger.
         tracing::warn!(event = "broker_peer_unmapped", peer.uid = uid);
-        write_frame(
-            &mut stream,
-            &ResponseEnvelope::error(ERROR_UNAUTHENTICATED, "peer is not mapped by broker policy"),
-            limits,
-        )
-        .await
-        .map_err(ConnectionError::Write)?;
+        stream
+            .write_frame(
+                &ResponseEnvelope::error(
+                    ERROR_UNAUTHENTICATED,
+                    "peer is not mapped by broker policy",
+                ),
+                &[],
+                limits,
+            )
+            .await
+            .map_err(ConnectionError::Write)?;
         return Ok(());
     };
-    let request = match read_frame::<_, RequestEnvelope>(&mut stream, limits).await {
+    let received =
+        stream
+            .read_frame::<RequestEnvelope>(limits)
+            .await
+            .and_then(|(request, descriptors)| {
+                request.request.validate()?;
+                if !descriptors.is_empty()
+                    && !matches!(request.request, BrokerRequest::Invoke { .. })
+                {
+                    return Err(ProtocolError::UnexpectedDescriptors);
+                }
+                Ok((request, descriptors))
+            });
+    let (request, descriptors) = match received {
         Ok(request) => request,
         Err(error) => {
             // A timeout, an oversized frame, and unreadable JSON are one wire code and three
@@ -363,17 +388,19 @@ where
                 error.kind = protocol_error_kind(&error),
                 error = %error,
             );
-            write_frame(
-                &mut stream,
-                &ResponseEnvelope::error(ERROR_INVALID_REQUEST, "request frame is invalid"),
-                limits,
-            )
-            .await
-            .map_err(ConnectionError::Write)?;
+            stream
+                .write_frame(
+                    &ResponseEnvelope::error(ERROR_INVALID_REQUEST, "request frame is invalid"),
+                    &[],
+                    limits,
+                )
+                .await
+                .map_err(ConnectionError::Write)?;
             return Err(ConnectionError::InvalidRequest);
         }
     };
     let context = &peer.context;
+    let mut outputs = dekopon_broker_host::asset::AssetOutputs::default();
     let response = match request.request {
         BrokerRequest::Capabilities { attestation } => {
             if !claim_is_valid(attestation.as_ref(), None) {
@@ -440,6 +467,8 @@ where
         BrokerRequest::Invoke {
             attestation,
             invocation,
+            assets,
+            sends_remaining,
         } => {
             // Structural binding is already one frame; this check is defense in depth and makes a
             // mismatched or malformed claim a protocol error rather than a policy decision.
@@ -456,11 +485,24 @@ where
                     peer.attestor.as_ref(),
                     attestation.as_ref(),
                     invocation,
+                    dekopon_broker_host::asset::AssetInputs {
+                        rows: assets,
+                        descriptors,
+                        sends_remaining,
+                    },
                 )
                 .instrument(span)
                 .await
             {
-                Ok(result) => ResponseEnvelope::invocation(result),
+                Ok(outcome) => {
+                    outputs = outcome.assets;
+                    ResponseEnvelope::invocation(
+                        outcome.result,
+                        std::mem::take(&mut outputs.attached),
+                        std::mem::take(&mut outputs.removed),
+                        std::mem::take(&mut outputs.sent),
+                    )
+                }
                 Err(error) => return write_broker_failure(&mut stream, limits, error).await,
             }
         }
@@ -489,12 +531,19 @@ where
                 .instrument(span)
                 .await
             {
-                Ok(result) => ResponseEnvelope::invocation(result),
+                Ok(result) => ResponseEnvelope::invocation(result, vec![], vec![], vec![]),
                 Err(error) => return write_broker_failure(&mut stream, limits, error).await,
             }
         }
     };
-    write_frame(&mut stream, &response, limits)
+    use std::os::fd::AsFd as _;
+    let descriptors = outputs
+        .files
+        .iter()
+        .map(|file| file.file().as_fd())
+        .collect::<Vec<_>>();
+    stream
+        .write_frame(&response, &descriptors, limits)
         .await
         .map_err(ConnectionError::Write)
 }
@@ -505,7 +554,7 @@ where
 /// non-idempotent external effect, so the distinction the broker library draws survives the
 /// wire boundary.
 async fn write_broker_failure(
-    stream: &mut UnixStream,
+    stream: &mut DescriptorStream,
     limits: FrameLimits,
     error: BrokerError,
 ) -> Result<(), ConnectionError> {
@@ -542,7 +591,8 @@ async fn write_broker_failure(
             ConnectionError::Broker { source: error },
         )
     };
-    write_frame(stream, &ResponseEnvelope::error(code, message), limits)
+    stream
+        .write_frame(&ResponseEnvelope::error(code, message), &[], limits)
         .await
         .map_err(ConnectionError::Write)?;
     Err(failure)
