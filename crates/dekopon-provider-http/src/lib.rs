@@ -1,4 +1,4 @@
-//! Rust guest facade for the buffered `dekopon:http@1.0.0` component interface.
+//! Rust guest facade for the buffered and streamed `dekopon:http@1.1.0` component interface.
 //!
 //! This crate contains no HTTP transport. [`send`] calls a host import that only a separately
 //! authorized broker is expected to implement.
@@ -7,6 +7,8 @@
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
 use std::{error::Error, fmt};
+
+use dekopon_provider_sdk::asset::{Encoding, Handle};
 
 /// The imported HTTP WIT contract used by the generated guest bindings.
 pub const HTTP_WIT: &str = include_str!("../wit/deps/http.wit");
@@ -37,6 +39,9 @@ mod bindings {
     wit_bindgen::generate!({
         path: "wit",
         world: "http-client",
+        with: {
+            "dekopon:asset/asset@0.1.0": dekopon_provider_sdk::asset::bindings::dekopon::asset::asset,
+        },
         generate_all,
     });
 }
@@ -126,6 +131,83 @@ pub struct Response {
     pub headers: Vec<Header>,
     /// Complete response body.
     pub body: Vec<u8>,
+}
+
+/// One ordered segment of a host-composed request body.
+#[derive(Debug)]
+pub enum Part<'a> {
+    /// Literal bytes, counted against the HTTP request limit.
+    Literal(Vec<u8>),
+    /// Asset bytes, re-encoded and streamed by the host without entering guest memory.
+    Asset {
+        /// The asset to stream.
+        handle: &'a Handle,
+        /// Encoding on the wire, independent of the stored encoding.
+        encoding: Encoding,
+    },
+}
+
+impl<'a> Part<'a> {
+    /// Creates a literal body segment.
+    pub fn literal(bytes: impl Into<Vec<u8>>) -> Self {
+        Self::Literal(bytes.into())
+    }
+
+    /// Borrows an asset for one host-streamed segment.
+    pub fn asset(handle: &'a Handle, encoding: Encoding) -> Self {
+        Self::Asset { handle, encoding }
+    }
+}
+
+/// A request whose body the host composes at exact length.
+#[derive(Debug)]
+pub struct StreamedRequest<'a> {
+    /// Any valid standard or extension HTTP method token.
+    pub method: String,
+    /// Absolute request URI; authoritative validation remains host-owned.
+    pub uri: String,
+    /// Ordered headers; duplicate names are preserved.
+    pub headers: Vec<Header>,
+    /// Ordered literal and asset body segments.
+    pub body: Vec<Part<'a>>,
+}
+
+impl<'a> StreamedRequest<'a> {
+    /// Creates a request without headers or body segments.
+    pub fn new(method: impl Into<String>, uri: impl Into<String>) -> Result<Self, BuildError> {
+        let request = Request::new(method, uri)?;
+        Ok(Self {
+            method: request.method,
+            uri: request.uri,
+            headers: request.headers,
+            body: Vec::new(),
+        })
+    }
+
+    /// Appends one header without coalescing duplicate names.
+    #[must_use]
+    pub fn with_header(mut self, header: Header) -> Self {
+        self.headers.push(header);
+        self
+    }
+
+    /// Replaces the ordered body segments.
+    #[must_use]
+    pub fn with_body(mut self, body: Vec<Part<'a>>) -> Self {
+        self.body = body;
+        self
+    }
+}
+
+/// An echo-scanned HTTP response whose body is spooled on the broker.
+#[derive(Debug)]
+pub struct StreamedResponse {
+    /// HTTP status code.
+    pub status: u16,
+    /// Ordered response headers; duplicate names are preserved.
+    pub headers: Vec<Header>,
+    /// Response bytes, read through the asset host.
+    pub body: Handle,
 }
 
 /// Stable failure classes returned by the broker HTTP host.
@@ -274,6 +356,54 @@ pub fn send(request: Request) -> Result<Response, HttpError> {
         })
 }
 
+/// Sends a host-composed request and returns an echo-scanned response handle.
+///
+/// This function grants no authority. The broker enforces HTTP and asset bounds, and requires
+/// its asset directory to be configured before spooling a response.
+pub fn stream(request: StreamedRequest<'_>) -> Result<StreamedResponse, HttpError> {
+    use bindings::dekopon::http::client as wit;
+    let request = wit::StreamedRequest {
+        method: request.method,
+        uri: request.uri,
+        headers: request
+            .headers
+            .into_iter()
+            .map(|header| wit::Header {
+                name: header.name,
+                value: header.value,
+            })
+            .collect(),
+        body: request
+            .body
+            .into_iter()
+            .map(|part| match part {
+                Part::Literal(bytes) => wit::Part::Literal(bytes),
+                Part::Asset { handle, encoding } => wit::Part::Asset(wit::AssetPart {
+                    handle: handle.as_inner(),
+                    encoding,
+                }),
+            })
+            .collect(),
+    };
+    wit::stream(&request)
+        .map(|response| StreamedResponse {
+            status: response.status,
+            headers: response
+                .headers
+                .into_iter()
+                .map(|header| Header {
+                    name: header.name,
+                    value: header.value,
+                })
+                .collect(),
+            body: Handle::from_inner(response.body),
+        })
+        .map_err(|error| HttpError {
+            code: map_error_code(error.code),
+            message: error.message,
+        })
+}
+
 fn map_error_code(code: bindings::dekopon::http::client::ErrorCode) -> HttpErrorCode {
     use bindings::dekopon::http::client::ErrorCode as Wit;
     match code {
@@ -325,7 +455,25 @@ fn is_field_value(value: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{HTTP_WIT, Header, HttpError, HttpErrorCode, Request, method};
+    use super::{HTTP_WIT, Header, HttpError, HttpErrorCode, Part, Request, StreamedRequest, method};
+
+    #[test]
+    fn streamed_builder_validates_and_preserves_part_and_header_order() {
+        assert!(StreamedRequest::new("BAD METHOD", "https://example.test/").is_err());
+        assert!(StreamedRequest::new(method::POST, "").is_err());
+        let request = StreamedRequest::new(method::POST, "https://example.test/")
+            .unwrap()
+            .with_header(Header::text("x-example", "first").unwrap())
+            .with_header(Header::text("x-example", "second").unwrap())
+            .with_body(vec![
+                Part::literal(b"head".to_vec()),
+                Part::literal(b"tail".to_vec()),
+            ]);
+        assert_eq!(request.headers[0].value, b"first");
+        assert_eq!(request.headers[1].value, b"second");
+        assert!(matches!(&request.body[0], Part::Literal(bytes) if bytes == b"head"));
+        assert!(matches!(&request.body[1], Part::Literal(bytes) if bytes == b"tail"));
+    }
 
     const ALL_CODES: [HttpErrorCode; 13] = [
         HttpErrorCode::InvalidMethod,

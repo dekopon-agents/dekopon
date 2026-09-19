@@ -29,6 +29,7 @@ dekopon-capability.workspace = true
 dekopon-core.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+wit-bindgen.workspace = true
 # Declared directly rather than inherited: features are additive and the workspace entry enables
 # `env`, which Cargo cannot subtract for one crate. A guest must never read a process environment
 # (`env`) or probe a terminal for colour (`color`), so this is the narrowest clap that renders plain

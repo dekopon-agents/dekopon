@@ -172,6 +172,15 @@ jobs:
           do
             cmp crates/dekopon-provider-sdk/wit/provider.wit "$mirror"
           done
+          for mirror in \
+            wit/http/deps/asset.wit \
+            crates/dekopon-provider-sdk/wit/deps/asset.wit \
+            crates/dekopon-provider-http/wit/deps/asset.wit \
+            crates/dekopon-broker-host/wit/deps/asset.wit \
+            examples/providers/http-probe/wit/deps/asset.wit
+          do
+            cmp wit/asset/asset.wit "$mirror"
+          done
           cmp \
             wit/http/http.wit \
             crates/dekopon-provider-http/wit/deps/http.wit

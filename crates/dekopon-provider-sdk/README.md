@@ -48,45 +48,38 @@ A provider that needs a broker service adds the import to its own composed world
 ```wit
 world provider {
     include dekopon:provider/provider-cli@0.3.0;
-    import dekopon:http/client@1.0.0;
+    import dekopon:asset/asset@0.1.0;
+    import dekopon:http/client@1.1.0;
 }
 ```
 
 Additional imports are embedded in the component type and fail closed unless an authorized broker linker implements them. See the [`http-probe`](../../examples/providers/http-probe/README.md) fixture for the HTTP import, and [`clock-probe`](../../examples/providers/clock-probe/README.md) for `dekopon:clock/wall@1.0.0`. Host imports are for `invoke`: `run-command` stays pure, and a broker refuses a component that reaches for one there.
 
-## Attachments out of band
+## Assets out of band
 
-Every value on this boundary is a JSON string, so bytes travel base64-encoded — and an embedding host
-must not print them into a model transcript. One convention solves that, and it is a **documented
-JSON wire shape rather than a type this crate exports**: a provider ships from its own repository
-against its own pinned SDK version, so what the two sides share is the schema below, and each side
-reads it with its own local type. (Exporting a Rust type here would also compile this crate's source
-into every host that reads it, which is the wrong coupling for two strings.)
+Asset bytes never enter a model transcript, proposal, result JSON, or broker frame. Proposals keep
+`chat-asset:<N>` string references; the gateway passes read-only descriptors separately. During
+`invoke`, `asset::open` resolves only references passed with that invocation. `asset::list` returns
+conversation metadata, not authority to open an unreferenced asset.
 
-A capability result object may carry a top-level `attachments` key:
+The `asset` module wraps `dekopon:asset/asset@0.1.0`. `Handle::read` and `read_at` read at most 64 KiB
+of decoded bytes per call; `read_all` reserves the stored length when known and otherwise grows as
+it reads. `asset::allocate(content_type, encoding)` creates a writer, and `Writer::write_all`
+appends stored bytes in chunks of at most 64 KiB. Identity and canonical base64 are storage
+encodings, not content types. The host performs encoding conversion.
 
-```json
-{
-  "attachments": [{"mediaType": "image/png", "base64": "<standard base64 of the bytes>"}],
-  "image": {"generationId": "…", "bytes": 1234567}
-}
-```
+`asset::attach(writer)` consumes the writer and joins the conversation's temp files; it does **not**
+send them. The gateway numbers successful outputs and adds a bounded reference, content-type and
+size note to the command output. Return only application metadata in the ordinary JSON result.
+`asset::send(&handle)` separately marks delivery on this turn's reply; `remove` deletes an unsent
+asset. Attach, remove and send require their own broker grants. A dropped unattached writer is
+discarded, and failed invocations do not contribute outputs.
 
-Both fields are required on each entry, and a reader rejects unknown fields inside one. A host that
-supports the convention strips the key before the result reaches its model, validates each entry
-against its own byte and media bounds, delivers the accepted bytes out of band, and replaces the key
-with metadata — `dekopond` writes `attached: [{mediaType, bytes}]`, and `attachmentNote` carrying one
-fixed sentence when it refused an entry (one PNG per entry, at most 8 MiB, only on a route whose
-owner opted in). A host that does not support it simply leaves the result alone.
-
-So treat an attachment as a *delivery request* rather than a guaranteed effect, and keep everything
-the model needs to reason about in the ordinary result fields beside it. The key names `attachments`,
-`attached`, and `attachmentNote` are reserved for this shape on every capability.
-
-The inbound mirror is the same kind of agreement: a host may replace the exact input string
-`chat-asset:<N>` with a `data:<mime>;base64,…` URL before it proposes, for the capabilities its
-operator listed. A provider that receives an unexpanded marker should reject it as invalid input
-rather than guess.
+For HTTP bodies, `dekopon-provider-http::StreamedRequest` composes ordered `Part::literal` and
+`Part::asset` segments. The host streams asset parts at exact length without loading them into the
+guest and returns an echo-scanned response `Handle`. Buffered HTTP `send` remains available for
+small requests. Import the asset interface beside HTTP as above; imports are available only in
+`invoke`, never the pure `run-command` phase.
 
 ## Host feature
 
