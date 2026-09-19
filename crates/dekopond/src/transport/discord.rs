@@ -1048,6 +1048,7 @@ impl ChatDriver for DiscordDriver {
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
         let OutboundReply { text, images } = reply;
+        super::hydration::validate_types(&images, super::hydration::AcceptedTypes::Files)?;
         let mut images = super::hydration::ImageQueue::new(images);
         let ReplyTarget::Discord {
             channel_id,
@@ -1547,7 +1548,7 @@ impl DiscordDriver {
                 )]
                 let part = reqwest::multipart::Part::bytes(image.bytes)
                     .file_name(image.filename)
-                    .mime_str(image.media_type)
+                    .mime_str(&image.media_type)
                     .map_err(|_| TransportError::Response)?;
                 form = form.part(format!("files[{index}]"), part);
             }

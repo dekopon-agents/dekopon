@@ -28,6 +28,15 @@ All notable changes to Dekopon are documented here. The format is based on
 - Reuse test-owned compiled Wasm providers across the broker memory authority-rotation
   test's sequential setups, preserving independent authority state and cold-path tests.
 
+- **Breaking (config):** refuse removed route `providerAttachments` and `chatAssetInputs` keys;
+  references resolve automatically, while delivery requires broker-authorized `asset.send`.
+- **Breaking (provider SDK):** asset-producing providers must return typed descriptor outputs through
+  `dekopon:asset`; retired result attachment objects and data-URL proposals are refused, with no shim.
+- **Breaking (behavior):** attach retains but never sends; four new sends per turn, persistent sent
+  flags, positional read-only file handles, and five/40 MiB invocation bounds replace expansion.
+  Output labels are authoritative with metadata-only mismatch logging; Telegram/WhatsApp deliver
+  PNG/JPEG, while file adapters accept concrete valid media types. Failed deliveries are not retried.
+
 - Cut the `input` attribute on `broker.authorize` and `provider.invoke` at 4096 bytes with the
   `…[truncated]` marker and an `input.bytes` sibling carrying the uncut length, the same bound the
   six command fields already take. Operators reading a proposal out of a trace now see its first

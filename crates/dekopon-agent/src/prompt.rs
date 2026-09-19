@@ -207,8 +207,7 @@ pub enum ReplyDisposition {
 /// Result of a completed prompt/tool session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PromptOutcome {
-    /// Final assistant text. Empty only when [`Self::disposition`] is
-    /// [`ReplyDisposition::Suppress`].
+    /// Final assistant text; may be empty for deliberate silence or an authorized asset-only reply.
     pub answer: String,
     /// Whether the embedding surface should deliver `answer`.
     pub disposition: ReplyDisposition,
@@ -343,6 +342,7 @@ pub struct SessionInputs<'a> {
     limits: PromptLimits,
     options: Option<&'a CompletionOptions>,
     assets: Option<&'a dyn AssetSource>,
+    reply_assets: Option<&'a crate::attachment::ReplyAttachments>,
     usage_observer: Option<&'a dyn ModelUsageObserver>,
     agent_config: Option<&'a AgentConfigView>,
     cancellation: Option<&'a dyn CancellationProbe>,
@@ -362,6 +362,7 @@ impl<'a> SessionInputs<'a> {
             limits,
             options: None,
             assets: None,
+            reply_assets: None,
             usage_observer: None,
             agent_config: None,
             cancellation: None,
@@ -370,6 +371,16 @@ impl<'a> SessionInputs<'a> {
             skills: &[],
             improvement_suggestions: false,
         }
+    }
+
+    /// Allows an empty final text only when explicitly authorized files are queued for delivery.
+    #[must_use]
+    pub const fn with_reply_assets(
+        mut self,
+        assets: &'a crate::attachment::ReplyAttachments,
+    ) -> Self {
+        self.reply_assets = Some(assets);
+        self
     }
 
     /// Mounts operator-authored skills, listed in the system prompt and read on demand.
@@ -473,6 +484,7 @@ impl<'a> SessionInputs<'a> {
 struct SessionExtensions<'a> {
     options: &'a CompletionOptions,
     assets: Option<&'a dyn AssetSource>,
+    reply_assets: Option<&'a crate::attachment::ReplyAttachments>,
     usage_observer: Option<&'a dyn ModelUsageObserver>,
     agent_config: Option<&'a AgentConfigView>,
     cancellation: Option<&'a dyn CancellationProbe>,
@@ -502,6 +514,7 @@ where
         limits,
         options,
         assets,
+        reply_assets,
         usage_observer,
         agent_config,
         cancellation,
@@ -547,6 +560,7 @@ where
         SessionExtensions {
             options,
             assets,
+            reply_assets,
             usage_observer,
             agent_config,
             cancellation,
@@ -636,6 +650,7 @@ where
     let SessionExtensions {
         options,
         assets,
+        reply_assets,
         usage_observer,
         agent_config,
         cancellation,
@@ -856,6 +871,11 @@ where
             let answer = turn
                 .content
                 .filter(|content| !content.trim().is_empty())
+                .or_else(|| {
+                    reply_assets
+                        .filter(|assets| assets.has_queued())
+                        .map(|_| String::new())
+                })
                 .ok_or(PromptError::EmptyAnswer)?;
             emit(
                 progress,

@@ -10,7 +10,7 @@
 //! It has none. It holds chat bot credentials and model credentials — the things it needs to hear a
 //! question and to ask a model — and it never holds a provider credential, a policy, or an
 //! authorization. Producing an image is a provider effect like any other: image bytes reach a reply
-//! only through a route's `providerAttachments` opt-in, carried on a result the broker already
+//! only through explicit asset.send authorization, carried on a typed result the broker already
 //! authorized and executed. Every provider effect a session drives is submitted to
 //! `dekopon-brokerd` as an *attested* proposal naming the sender's canonical subject, and the
 //! broker alone maps that subject to a principal, decides what it may do, and executes it. The
@@ -54,9 +54,8 @@ pub use config::{
     CONFIG_API_VERSION, ConfigApiVersion, ConfigError, ConfigProblem, ConversationMatchConfig,
     DEFAULT_STOP_WORDS, DekopondConfig, HARD_MAX_CONFIG_BYTES, KeepAliveConfig, LivenessConfig,
     LivenessMode, LivenessOverride, LivenessSettings, MemoryConfig, MemoryPolicy, MemoryScope,
-    MemoryWindow, ProgressSurface, ProviderAttachmentsConfig, ResolvedConfig, ResolvedRoute,
-    ResolvedTelemetry, SlackExperience, SlackLivenessFallback, TelemetryConfig, TemplateOverrides,
-    TransportConfig,
+    MemoryWindow, ProgressSurface, ResolvedConfig, ResolvedRoute, ResolvedTelemetry,
+    SlackExperience, SlackLivenessFallback, TelemetryConfig, TemplateOverrides, TransportConfig,
 };
 pub use routes::{RouteError, RouteProblem};
 pub use session::SessionError;

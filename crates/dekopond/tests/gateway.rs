@@ -1091,7 +1091,10 @@ async fn a_persistent_route_answers_a_follow_up_with_the_exchange_before_it() {
                     "Answer in one short sentence. You have no authority of your own.\n\n",
                     "Durable chat memory is available on demand. Use `memory recent --last N` or ",
                     "`memory search --query TEXT`. Searches inspect at most 200 prior turns. Do not ",
-                    "claim recall without retrieving it."
+                    "claim recall without retrieving it.\n\n",
+                    "[Gateway assets: this reply adapter accepts any concrete syntactically valid media type (no wildcards). ",
+                    "Plan a converter for other formats; attaching retains a file but only a separately authorized asset.send delivers it. ",
+                    "References use chat-asset:<N>, never data URLs.]"
                 )
             ),
             ("user", "what broke?"),
@@ -1149,7 +1152,10 @@ async fn explicit_shared_scope_replays_attributed_history_across_two_principals(
                     "Answer in one short sentence. You have no authority of your own.\n\n",
                     "Durable chat memory is available on demand. Use `memory recent --last N` or ",
                     "`memory search --query TEXT`. Searches inspect at most 200 prior turns. Do not ",
-                    "claim recall without retrieving it."
+                    "claim recall without retrieving it.\n\n",
+                    "[Gateway assets: this reply adapter accepts any concrete syntactically valid media type (no wildcards). ",
+                    "Plan a converter for other formats; attaching retains a file but only a separately authorized asset.send delivers it. ",
+                    "References use chat-asset:<N>, never data URLs.]"
                 )
                 .to_owned(),
             ),

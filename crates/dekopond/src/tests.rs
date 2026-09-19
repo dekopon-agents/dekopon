@@ -192,8 +192,6 @@ async fn a_complete_configuration_resolves_with_documented_defaults() {
 
     assert_eq!(resolved.transports.len(), 1);
     assert_eq!(resolved.routes.len(), 1);
-    assert_eq!(resolved.routes[0].provider_attachments, 0);
-    assert!(resolved.routes[0].chat_asset_inputs.is_empty());
     assert_eq!(resolved.sessions.max_concurrent, 4);
     assert!(resolved.sessions.reply_on_busy);
     assert_eq!(resolved.routes[0].limits.max_steps, 8);
@@ -247,32 +245,33 @@ async fn an_explicit_shared_scope_survives_resolution_and_route_binding() {
 }
 
 #[tokio::test]
-async fn provider_attachments_and_chat_asset_inputs_are_per_route_opt_ins() {
+async fn retired_asset_route_keys_refuse_even_explicit_empty_configuration() {
     let directory = temporary();
-    let mut document = document(directory.path());
-    document["routes"][0]["providerAttachments"] = json!({"maxPerReply": 2});
-    document["routes"][0]["chatAssetInputs"] = json!(["cli-probe.upper"]);
-
-    let resolved = load(directory.path(), &document)
-        .await
-        .expect("both opt-ins resolve");
-
-    assert_eq!(resolved.routes[0].provider_attachments, 2);
-    assert_eq!(
-        resolved.routes[0]
-            .chat_asset_inputs
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>(),
-        ["cli-probe.upper".to_owned()]
-    );
-    let routes = RoutingTable::bind(&resolved, &catalog(true, Some("reasoning")))
-        .expect("the route binds both opt-ins");
-    let bound = routes
-        .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
-        .expect("route matches");
-    assert_eq!(bound.provider_attachments, 2);
-    assert_eq!(&*bound.chat_asset_inputs, ["cli-probe.upper".to_owned()]);
+    for (key, value, replacement) in [
+        (
+            "providerAttachments",
+            json!({"maxPerReply":2}),
+            "asset.send",
+        ),
+        ("providerAttachments", Value::Null, "asset.send"),
+        ("chatAssetInputs", json!([]), "automatically"),
+        (
+            "chatAssetInputs",
+            json!(["cli-probe.upper"]),
+            "automatically",
+        ),
+    ] {
+        let mut document = document(directory.path());
+        document["routes"][0][key] = value;
+        let error = load(directory.path(), &document)
+            .await
+            .expect_err("retired key");
+        let ConfigError::Decode { source } = error else {
+            panic!("decode refusal")
+        };
+        assert!(source.to_string().contains(key));
+        assert!(source.to_string().contains(replacement));
+    }
 }
 
 /// `apiKeyEnv` has three meanings and they used to have one outcome.
@@ -474,9 +473,7 @@ async fn whatsapp_configuration_is_explicit_strict_and_pinned() {
         );
     }
 
-    let mut with_images = document.clone();
-    with_images["routes"][0]["providerAttachments"] = json!({"maxPerReply": 1});
-    load(directory.path(), &with_images)
+    load(directory.path(), &document)
         .await
         .expect("WhatsApp supports PNG replies");
 }
@@ -615,11 +612,7 @@ async fn invalid_configurations_fail_closed_at_startup() {
             mutate(|document| {
                 document["routes"][0]["providerAttachments"] = json!({"maxPerReply": 0});
             }),
-            |error| {
-                reports(error, |problem| {
-                    matches!(problem, ConfigProblem::InvalidProviderAttachments { .. })
-                })
-            },
+            |error| matches!(error, ConfigError::Decode { .. }),
         ),
         (
             "a chat-asset input that is not a capability identifier",
@@ -2835,22 +2828,46 @@ async fn stub_broker(
     directory: &Path,
     responses: Vec<ResponseEnvelope>,
 ) -> (ResolvedBroker, mpsc::UnboundedReceiver<RequestEnvelope>) {
+    stub_broker_assets(
+        directory,
+        responses
+            .into_iter()
+            .map(|response| (response, Vec::new()))
+            .collect(),
+    )
+    .await
+}
+
+#[allow(
+    clippy::let_underscore_must_use,
+    reason = "fixture observer and socket are test-owned; absent observations fail the calling test"
+)]
+async fn stub_broker_assets(
+    directory: &Path,
+    responses: Vec<(ResponseEnvelope, Vec<std::os::fd::OwnedFd>)>,
+) -> (ResolvedBroker, mpsc::UnboundedReceiver<RequestEnvelope>) {
     let socket = directory.join("broker.sock");
     let listener = UnixListener::bind(&socket).expect("bind stub broker");
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).expect("secure stub socket");
     let (observed, receiver) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        for response in responses {
-            let Ok((mut stream, _)) = listener.accept().await else {
+        for (response, descriptors) in responses {
+            let Ok((stream, _)) = listener.accept().await else {
                 return;
             };
-            let Ok(request) =
-                read_frame::<_, RequestEnvelope>(&mut stream, FrameLimits::default()).await
+            let mut stream = dekopon_broker_protocol::DescriptorStream::new(stream);
+            let Ok((request, _inputs)) = stream
+                .read_frame::<RequestEnvelope>(FrameLimits::default())
+                .await
             else {
                 return;
             };
             let _ = observed.send(request);
-            let _ = write_frame(&mut stream, &response, FrameLimits::default()).await;
+            use std::os::fd::AsFd;
+            let passed: Vec<_> = descriptors.iter().map(AsFd::as_fd).collect();
+            let _ = stream
+                .write_frame(&response, &passed, FrameLimits::default())
+                .await;
         }
     });
     (
@@ -2878,8 +2895,6 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
         instructions: Some("Answer briefly.".to_owned()),
         skills: Arc::from(Vec::new()),
         model: Arc::new(model),
-        provider_attachments: 0,
-        chat_asset_inputs: Arc::from(Vec::new()),
         improvement_suggestions: false,
         inspect_agent_config: true,
         limits: PromptLimits {
@@ -3260,36 +3275,59 @@ async fn an_authorized_message_reaches_its_agent_and_answers_in_chat() {
     assert_eq!(claim.scope.expect("chat scope").transport.as_str(), "dev");
 }
 
-/// One capability result offering one PNG the way a provider does.
-fn attachment_output() -> Value {
-    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
-    png.extend_from_slice(b"kitty pixels");
-    json!({
-        "attachments": [{"mediaType": "image/png", "base64": STANDARD.encode(&png)}],
-        "image": {"generationId": "gen-7"}
-    })
+fn asset_response(bytes: &[u8], label: &str) -> (ResponseEnvelope, Vec<std::os::fd::OwnedFd>) {
+    let blob = dekopon_model::asset::DiskBlob::from_bytes(bytes).unwrap();
+    let metadata = dekopon_broker_protocol::NewAsset {
+        descriptor: 0,
+        content_type: label.to_owned(),
+        encoding: dekopon_broker_protocol::AssetEncoding::Identity,
+        bytes: bytes.len() as u64,
+        sha256: "0".repeat(64),
+    };
+    (
+        ResponseEnvelope::invocation(
+            record_output(json!({"generationId":"gen-7"})),
+            vec![metadata],
+            Vec::new(),
+            Vec::new(),
+        ),
+        vec![blob.descriptor().unwrap()],
+    )
+}
+fn plain_response(response: ResponseEnvelope) -> (ResponseEnvelope, Vec<std::os::fd::OwnedFd>) {
+    (response, Vec::new())
+}
+fn queued_response(id: u64) -> (ResponseEnvelope, Vec<std::os::fd::OwnedFd>) {
+    plain_response(ResponseEnvelope::invocation(
+        record_output(json!({})),
+        Vec::new(),
+        Vec::new(),
+        vec![id],
+    ))
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_provider_attachment_reaches_the_reply_without_entering_the_transcript() {
     let directory = temporary();
-    let (broker, _observed) = stub_broker(
+    let (broker, _observed) = stub_broker_assets(
         directory.path(),
         vec![
-            probe_listing(),
-            upper_proposal("kitty"),
-            ResponseEnvelope::invocation(record_output(attachment_output())),
+            plain_response(probe_listing()),
+            plain_response(upper_proposal("kitty")),
+            asset_response(b"\x89PNG\r\n\x1a\nkitty pixels", "image/png"),
+            plain_response(upper_proposal("send")),
+            queued_response(1),
         ],
     )
     .await;
     let models = ModelScript::new([
         script_call("probe upper --text kitty"),
+        script_call("probe upper --text send"),
         answer("Here is your kitty."),
     ]);
     let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
-    let mut route = route(model_config());
-    route.provider_attachments = 1;
+    let route = route(model_config());
 
     run_session(
         runner,
@@ -3302,8 +3340,8 @@ async fn a_provider_attachment_reaches_the_reply_without_entering_the_transcript
     assert_eq!(driver.replies(), ["Here is your kitty."]);
     assert_eq!(driver.image_bytes(), [vec![20]]);
     let tool = tool_message(&models, 1);
-    assert!(tool.contains("\"attached\""), "{tool}");
-    assert!(tool.contains("\"bytes\""), "{tool}");
+    assert!(tool.contains("chat-asset:1"), "{tool}");
+    assert!(tool.contains("stored bytes"), "{tool}");
     assert!(
         !tool.contains(&STANDARD.encode(b"kitty pixels")),
         "attachment bytes reached the model: {tool}"
@@ -3340,23 +3378,25 @@ async fn no_model_message_in_a_session_carries_an_attachment_blob() {
     // recognisable run of it rather than something a 1 KiB threshold could miss.
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     png.extend(std::iter::repeat_n(b'Z', 64 * 1024));
-    let output = json!({
-        "attachments": [{"mediaType": "image/png", "base64": STANDARD.encode(&png)}]
-    });
-    let (broker, _observed) = stub_broker(
+    let (broker, _observed) = stub_broker_assets(
         directory.path(),
         vec![
-            probe_listing(),
-            upper_proposal("kitty"),
-            ResponseEnvelope::invocation(record_output(output)),
+            plain_response(probe_listing()),
+            plain_response(upper_proposal("kitty")),
+            asset_response(&png, "image/png"),
+            plain_response(upper_proposal("send")),
+            queued_response(1),
         ],
     )
     .await;
-    let models = ModelScript::new([script_call("probe upper --text kitty"), answer("Posted.")]);
+    let models = ModelScript::new([
+        script_call("probe upper --text kitty"),
+        script_call("probe upper --text send"),
+        answer("Posted."),
+    ]);
     let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
-    let mut route = route(model_config());
-    route.provider_attachments = 1;
+    let route = route(model_config());
 
     run_session(
         runner,
@@ -3382,16 +3422,21 @@ async fn no_model_message_in_a_session_carries_an_attachment_blob() {
     }
 }
 
-/// The key is stripped even where nothing can deliver it, and the model is told why in one sentence.
+/// Old provider result envelopes are refused, never decoded.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_route_without_the_opt_in_strips_the_attachment_and_says_so() {
+async fn an_old_provider_is_refused_by_name_without_decoding_its_result() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(
         directory.path(),
         vec![
             probe_listing(),
             upper_proposal("kitty"),
-            ResponseEnvelope::invocation(record_output(attachment_output())),
+            ResponseEnvelope::invocation(
+                record_output(json!({"attachments": []})),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
         ],
     )
     .await;
@@ -3412,8 +3457,8 @@ async fn a_route_without_the_opt_in_strips_the_attachment_and_says_so() {
 
     assert_eq!(driver.image_bytes(), [Vec::<usize>::new()]);
     let tool = tool_message(&models, 1);
-    assert!(tool.contains("\"attached\":[]"), "{tool}");
-    assert!(tool.contains("cannot carry attachments"), "{tool}");
+    assert!(tool.contains("cli-probe.upper"), "{tool}");
+    assert!(tool.contains("dekopon:asset"), "{tool}");
     assert!(
         !tool.contains(&STANDARD.encode(b"kitty pixels")),
         "attachment bytes reached the model: {tool}"
@@ -3536,7 +3581,12 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
         directory.path(),
         vec![
             memory_surface_response(),
-            ResponseEnvelope::invocation(record_result(InvocationOutcome::Succeeded, None)),
+            ResponseEnvelope::invocation(
+                record_result(InvocationOutcome::Succeeded, None),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
         ],
     )
     .await;
@@ -3718,7 +3768,12 @@ async fn a_final_turn_decline_after_capability_work_warns_against_blind_retry() 
         vec![
             probe_listing(),
             upper_proposal("maybe"),
-            ResponseEnvelope::invocation(record_result(InvocationOutcome::Succeeded, None)),
+            ResponseEnvelope::invocation(
+                record_result(InvocationOutcome::Succeeded, None),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
         ],
     )
     .await;
@@ -3916,8 +3971,8 @@ async fn denied_failed_dedup_and_storage_record_results_are_terminal_without_ret
             directory.path(),
             vec![
                 memory_surface_response(),
-                ResponseEnvelope::invocation(result.clone()),
-                ResponseEnvelope::invocation(result),
+                ResponseEnvelope::invocation(result.clone(), Vec::new(), Vec::new(), Vec::new()),
+                ResponseEnvelope::invocation(result, Vec::new(), Vec::new(), Vec::new()),
             ],
         )
         .await;
@@ -3960,7 +4015,12 @@ async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_te
         directory.path(),
         vec![
             memory_surface_response(),
-            ResponseEnvelope::invocation(record_result(InvocationOutcome::Succeeded, None)),
+            ResponseEnvelope::invocation(
+                record_result(InvocationOutcome::Succeeded, None),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
         ],
     )
     .await;
@@ -3990,7 +4050,12 @@ async fn model_failure_and_partial_delivery_never_record_the_gateways_failure_te
         directory.path(),
         vec![
             memory_surface_response(),
-            ResponseEnvelope::invocation(record_result(InvocationOutcome::Succeeded, None)),
+            ResponseEnvelope::invocation(
+                record_result(InvocationOutcome::Succeeded, None),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
         ],
     )
     .await;
@@ -4862,6 +4927,10 @@ fn message_from(subject: &str, text: &str) -> InboundMessage {
     }
 }
 
+fn expected_asset_instructions() -> String {
+    "Answer briefly.\n\n[Gateway assets: this reply adapter accepts any concrete syntactically valid media type (no wildcards). Plan a converter for other formats; attaching retains a file but only a separately authorized asset.send delivers it. References use chat-asset:<N>, never data URLs.]".to_owned()
+}
+
 /// A prompt written the way a test reads it.
 fn transcript(messages: &[(&str, &str)]) -> Vec<(String, String)> {
     messages
@@ -4964,13 +5033,16 @@ async fn a_persistent_route_replays_the_previous_exchange_into_the_next_prompt()
     );
     assert_eq!(
         models.prompt(0),
-        transcript(&[("system", "Answer briefly."), ("user", "what broke?")]),
+        transcript(&[
+            ("system", &expected_asset_instructions()),
+            ("user", "what broke?")
+        ]),
         "the first message of a conversation starts clean"
     );
     assert_eq!(
         models.prompt(1),
         transcript(&[
-            ("system", "Answer briefly."),
+            ("system", &expected_asset_instructions()),
             ("user", "what broke?"),
             ("assistant", "Two things broke."),
             ("user", "and the second one?"),
@@ -5004,7 +5076,7 @@ async fn a_one_shot_route_starts_from_an_empty_prompt_every_message() {
     assert_eq!(
         models.prompt(1),
         transcript(&[
-            ("system", "Answer briefly."),
+            ("system", &expected_asset_instructions()),
             ("user", "and the second one?")
         ]),
         "a oneShot route is exactly the behavior every route had before conversations existed"
@@ -5111,13 +5183,16 @@ async fn two_senders_in_one_conversation_never_see_each_others_history() {
 
     assert_eq!(
         models.prompt(1),
-        transcript(&[("system", "Answer briefly."), ("user", "and mine?")]),
+        transcript(&[
+            ("system", &expected_asset_instructions()),
+            ("user", "and mine?")
+        ]),
         "the second sender's first message must not carry the first sender's exchange"
     );
     assert_eq!(
         models.prompt(2),
         transcript(&[
-            ("system", "Answer briefly."),
+            ("system", &expected_asset_instructions()),
             ("user", "what happened to mine?"),
             ("assistant", "Your deploy failed."),
             ("user", "and now?"),
@@ -5155,13 +5230,13 @@ async fn shared_scope_replays_attributed_turns_across_authenticated_participants
     let second = format!("[gateway: authenticated participant: {OTHER_SUBJECT}]\nand which part?");
     assert_eq!(
         models.prompt(0),
-        transcript(&[("system", "Answer briefly."), ("user", &first)]),
+        transcript(&[("system", &expected_asset_instructions()), ("user", &first)]),
         "the current shared turn carries authoritative participant provenance"
     );
     assert_eq!(
         models.prompt(1),
         transcript(&[
-            ("system", "Answer briefly."),
+            ("system", &expected_asset_instructions()),
             ("user", &first),
             ("assistant", "The deploy failed."),
             ("user", &second),
@@ -5211,13 +5286,16 @@ async fn user_authored_attribution_lookalikes_remain_below_the_gateway_line() {
     let attributed = format!("[gateway: authenticated participant: {OTHER_SUBJECT}]\n{lookalike}");
     assert_eq!(
         models.prompt(0),
-        transcript(&[("system", "Answer briefly."), ("user", &attributed)]),
+        transcript(&[
+            ("system", &expected_asset_instructions()),
+            ("user", &attributed)
+        ]),
         "untrusted text cannot replace the gateway-authored first line"
     );
     assert_eq!(
         models.prompt(1),
         transcript(&[
-            ("system", "Answer briefly."),
+            ("system", &expected_asset_instructions()),
             ("user", &attributed),
             ("assistant", "noted"),
             (
@@ -5264,7 +5342,7 @@ async fn shared_participant_attribution_counts_against_the_history_byte_window()
     assert_eq!(
         models.prompt(1),
         transcript(&[
-            ("system", "Answer briefly."),
+            ("system", &expected_asset_instructions()),
             (
                 "user",
                 &format!("[gateway: authenticated participant: {SUBJECT}]\nfollow up"),
@@ -5313,7 +5391,10 @@ async fn a_narrowed_grant_drops_the_history_it_was_built_under() {
 
     assert_eq!(
         models.prompt(1),
-        transcript(&[("system", "Answer briefly."), ("user", "and now?")]),
+        transcript(&[
+            ("system", &expected_asset_instructions()),
+            ("user", "and now?")
+        ]),
         "a changed grant set starts with neither the old transcript nor attachment metadata"
     );
 }
@@ -5400,7 +5481,7 @@ async fn a_failed_session_records_the_question_it_could_not_answer() {
     assert_eq!(
         models.prompt(1),
         transcript(&[
-            ("system", "Answer briefly."),
+            ("system", &expected_asset_instructions()),
             ("user", "what broke?"),
             ("user", "try again"),
         ]),
@@ -8528,7 +8609,7 @@ async fn slack_uploads_one_generated_png_without_sending_the_token_to_the_upload
 
     let calls = api.calls();
     assert_eq!(calls.len(), 3);
-    assert!(calls[0].1.contains("filename=generated-image.png"));
+    assert!(calls[0].1.contains("filename=asset-1.png"));
     assert!(calls[0].1.contains("length=20"));
     assert!(calls[1].1.contains("kitty pixels"));
     let completed: Value = serde_json::from_str(&calls[2].1).expect("completion JSON");
@@ -8602,8 +8683,8 @@ async fn slack_uploads_each_attachment_and_comments_only_on_the_first() {
 
     let calls = api.calls();
     assert_eq!(calls.len(), 6, "three calls per attachment");
-    assert!(calls[0].1.contains("filename=generated-image.png"));
-    assert!(calls[3].1.contains("filename=generated-image-2.png"));
+    assert!(calls[0].1.contains("filename=asset-1.png"));
+    assert!(calls[3].1.contains("filename=asset-2.png"));
     let first: Value = serde_json::from_str(&calls[2].1).expect("first completion JSON");
     let second: Value = serde_json::from_str(&calls[5].1).expect("second completion JSON");
     assert_eq!(first["initial_comment"], "Two kittens.");
@@ -9502,9 +9583,9 @@ async fn a_capability_input_does_not_spend_the_model_attachment_budget() {
     );
 }
 
-/// A marker only expands for a capability the route listed; everything else keeps the string.
+/// Every proposal marker resolves without changing JSON, independently of capability names.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_chat_asset_marker_expands_only_for_a_listed_capability() {
+async fn a_chat_asset_marker_resolves_without_expansion_or_a_capability_allowlist() {
     struct FixedFetcher(Vec<u8>);
 
     impl AssetFetcher for FixedFetcher {
@@ -9534,27 +9615,20 @@ async fn a_chat_asset_marker_expands_only_for_a_listed_capability() {
         true,
     ));
     let inputs = dekopon_agent::attachment::ChatAssetInputs::new(
-        Arc::clone(&assets) as Arc<dyn dekopon_agent::attachment::ChatAssetSource>,
-        vec!["http-probe.conditional-write".to_owned()],
+        Arc::clone(&assets) as Arc<dyn dekopon_agent::attachment::ChatAssetSource>
     );
 
-    assert!(inputs.covers("http-probe.conditional-write"));
-    assert!(!inputs.covers("http-probe.fetch"));
-    let expanded = tokio::task::spawn_blocking(move || {
-        let mut input = json!({"images": ["chat-asset:1"]});
-        let count = inputs.expand(&mut input).expect("one expansion");
-        (count, input)
+    let prepared = tokio::task::spawn_blocking(move || {
+        let input = json!({"images": ["chat-asset:1"]});
+        let (assets, pins) = inputs.prepare(&input, 4).expect("one reference");
+        assert_eq!(assets.descriptors.len(), 1);
+        assert_eq!(assets.rows[0].origin, "chat");
+        assert_eq!(pins[0].read().unwrap(), b"\x89PNG\r\n\x1a\nshot");
+        input
     })
     .await
-    .expect("the blocking task completes");
-    assert_eq!(expanded.0, 1);
-    assert_eq!(
-        expanded.1["images"][0],
-        format!(
-            "data:image/png;base64,{}",
-            STANDARD.encode(b"\x89PNG\r\n\x1a\nshot")
-        )
-    );
+    .unwrap();
+    assert_eq!(prepared["images"][0], "chat-asset:1");
 }
 
 #[test]
@@ -10018,7 +10092,7 @@ async fn discord_posts_generated_png_as_a_bounded_multipart_attachment() {
                 "channel_id": DISCORD_CHANNEL,
                 "attachments": [{
                     "id": "555555555555555555",
-                    "filename": "generated-image.png"
+                    "filename": "asset-1.png"
                 }]
             })
         } else {
@@ -10047,7 +10121,7 @@ async fn discord_posts_generated_png_as_a_bounded_multipart_attachment() {
     let multipart = &calls[0].1;
     assert!(multipart.contains("name=\"payload_json\""));
     assert!(multipart.contains("name=\"files[0]\""));
-    assert!(multipart.contains("filename=\"generated-image.png\""));
+    assert!(multipart.contains("filename=\"asset-1.png\""));
     assert!(multipart.contains("kitty pixels"));
     assert!(multipart.contains("\"attachments\""));
     assert!(multipart.contains(DISCORD_MESSAGE));
@@ -10062,8 +10136,8 @@ async fn discord_posts_every_attachment_on_the_first_message() {
             "id": "444444444444444444",
             "channel_id": DISCORD_CHANNEL,
             "attachments": [
-                {"id": "555555555555555555", "filename": "generated-image.png"},
-                {"id": "555555555555555556", "filename": "generated-image-2.png"}
+                {"id": "555555555555555555", "filename": "asset-1.png"},
+                {"id": "555555555555555556", "filename": "asset-2.png"}
             ]
         })
     });
@@ -10086,8 +10160,8 @@ async fn discord_posts_every_attachment_on_the_first_message() {
     let multipart = &calls[0].1;
     assert!(multipart.contains("name=\"files[0]\""), "{multipart}");
     assert!(multipart.contains("name=\"files[1]\""), "{multipart}");
-    assert!(multipart.contains("filename=\"generated-image.png\""));
-    assert!(multipart.contains("filename=\"generated-image-2.png\""));
+    assert!(multipart.contains("filename=\"asset-1.png\""));
+    assert!(multipart.contains("filename=\"asset-2.png\""));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -11088,8 +11162,58 @@ async fn telegram_sends_a_generated_png_as_a_photo_in_the_authenticated_topic() 
     assert_eq!(calls.len(), 1);
     let multipart = &calls[0].1;
     assert!(multipart.contains("name=\"photo\""));
-    assert!(multipart.contains("filename=\"generated-image.png\""));
+    assert!(multipart.contains("filename=\"asset-1.png\""));
     assert!(multipart.contains("kitty pixels"));
+    assert!(multipart.contains("Here is your kitty."));
+    assert!(multipart.contains("name=\"reply_parameters\""));
+    assert!(multipart.contains("\"message_id\":3"));
+    assert!(multipart.contains("-1001"));
+    assert!(multipart.contains("77"));
+    assert!(multipart.contains("3"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn telegram_sends_a_declared_jpeg_as_a_photo_in_the_authenticated_topic() {
+    let http = spawn_http_mock(|path, _body| {
+        assert!(path.contains("sendPhoto"));
+        json!({
+            "ok": true,
+            "result": {
+                "message_id": 12,
+                "message_thread_id": 77,
+                "chat": {"id": -1001},
+                "photo": [{"file_id": "photo-small"}, {"file_id": "photo-large"}]
+            }
+        })
+    });
+    let transport = telegram(&http.base);
+
+    transport
+        .driver()
+        .reply(
+            &ReplyTarget::Telegram {
+                chat_id: -1001,
+                reply_to: Some(3),
+                message_thread_id: Some(77),
+            },
+            OutboundReply::with_images(
+                "Here is your kitty.",
+                vec![dekopon_agent::attachment::GeneratedImage::new(
+                    dekopon_model::asset::DiskBlob::from_bytes(b"jpeg pixels").unwrap(),
+                    "image/jpeg".to_owned(),
+                    dekopon_broker_protocol::AssetEncoding::Identity,
+                )],
+            ),
+        )
+        .await
+        .expect("photo and caption are accepted together");
+
+    let calls = http.calls();
+    assert_eq!(calls.len(), 1);
+    let multipart = &calls[0].1;
+    assert!(multipart.contains("name=\"photo\""));
+    assert!(multipart.contains("filename=\"asset-1.jpg\""));
+    assert!(multipart.contains("jpeg pixels") && multipart.contains("Content-Type: image/jpeg"));
     assert!(multipart.contains("Here is your kitty."));
     assert!(multipart.contains("name=\"reply_parameters\""));
     assert!(multipart.contains("\"message_id\":3"));
@@ -11129,9 +11253,9 @@ async fn telegram_sends_one_photo_per_attachment_and_captions_the_first() {
 
     let calls = http.calls();
     assert_eq!(calls.len(), 2);
-    assert!(calls[0].1.contains("filename=\"generated-image.png\""));
+    assert!(calls[0].1.contains("filename=\"asset-1.png\""));
     assert!(calls[0].1.contains("Two kittens."));
-    assert!(calls[1].1.contains("filename=\"generated-image-2.png\""));
+    assert!(calls[1].1.contains("filename=\"asset-2.png\""));
     assert!(
         !calls[1].1.contains("Two kittens."),
         "the caption is written once: {}",
@@ -11350,8 +11474,8 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
         2,
         "every attachment reaches the local caller"
     );
-    assert_eq!(response["images"][0]["filename"], "generated-image.png");
-    assert_eq!(response["images"][1]["filename"], "generated-image-2.png");
+    assert_eq!(response["images"][0]["filename"], "asset-1.png");
+    assert_eq!(response["images"][1]["filename"], "asset-2.png");
     assert_eq!(response["images"][0]["mediaType"], "image/png");
     assert_eq!(
         STANDARD
@@ -12451,7 +12575,12 @@ async fn every_origin_stops_a_session_inside_a_parked_capability_call() {
         let (broker, reached, release) = parked_broker(
             directory.path(),
             vec![probe_listing(), upper_proposal("hi")],
-            ResponseEnvelope::invocation(record_result(InvocationOutcome::Succeeded, None)),
+            ResponseEnvelope::invocation(
+                record_result(InvocationOutcome::Succeeded, None),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
         )
         .await;
         let models = ModelScript::new([script_call("probe upper --text hi")]);
@@ -12873,10 +13002,12 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
             "admission must be lazy"
         );
         let directory = temporary();
-        let (broker,mut observed)=stub_broker(directory.path(), (0..3).flat_map(|edit| vec![
-            ResponseEnvelope::capabilities(vec![capability("gpt-image.edit")],vec!["gpt-image".to_owned()]),
-            ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed","capability":"gpt-image.edit","input":{"prompt":"purple sky","images":[format!("chat-asset:{}", edit + 1)]}})).expect("edit proposal")),
-            ResponseEnvelope::invocation(record_output(json!({"attachments":[{"mediaType":"image/png","base64":STANDARD.encode([PNG, &[edit as u8]].concat())}]}))),
+        let (broker,mut observed)=stub_broker_assets(directory.path(), (0..3).flat_map(|edit| vec![
+            plain_response(ResponseEnvelope::capabilities(vec![capability("gpt-image.edit")],vec!["gpt-image".to_owned()])),
+            plain_response(ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed","capability":"gpt-image.edit","input":{"prompt":"purple sky","images":[format!("chat-asset:{}", edit + 1)]}})).unwrap())),
+            asset_response(&[PNG, &[edit as u8]].concat(), "image/png"),
+            plain_response(ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed", "capability":"gpt-image.edit", "input":{}})).unwrap())),
+            queued_response(edit + 2),
         ]).collect()).await;
         let models = ModelScript::new((0..3).flat_map(|edit| {
             [
@@ -12895,6 +13026,7 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
                     "gpt-image edit --prompt 'purple sky' --image chat-asset:{}",
                     edit + 1
                 )),
+                script_call("gpt-image send"),
                 answer("Edited image."),
             ]
         }));
@@ -12909,8 +13041,6 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
         }
         let mut route = persistent_route(model, window());
         route.transport = "wa".to_owned();
-        route.provider_attachments = 1;
-        route.chat_asset_inputs = Arc::from(vec!["gpt-image.edit".to_owned()]);
         for edit in 0..3 {
             let mut message = inbound.clone();
             if edit > 0 {
@@ -12926,7 +13056,7 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
             )
             .await;
         }
-        assert_eq!(models.requests(), 9);
+        assert_eq!(models.requests(), 12);
         let first = models.prompt(0);
         assert!(
             first.iter().any(|(_, text)| text.contains("Chat Asset #1")),
@@ -12934,12 +13064,10 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
         );
         let tool = tool_message(&models, 2);
         assert!(
-            tool.contains("chat-asset:2")
-                && tool.contains("retained")
-                && tool.contains("delivered"),
+            tool.contains("chat-asset:2") && tool.contains("attached") && tool.contains("not sent"),
             "{tool}"
         );
-        for index in 0..9 {
+        for index in 0..12 {
             for (_, text) in models.prompt(index) {
                 assert!(
                     !text.contains(&STANDARD.encode(bytes))
@@ -12951,7 +13079,7 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
         for edit in 0..3 {
             assert!(
                 models
-                    .prompt(edit * 3)
+                    .prompt(edit * 4)
                     .iter()
                     .any(|(_, text)| text.contains(&format!("Chat Asset #{}", edit + 1))),
                 "generated IDs must be visible in later-turn inventory"
@@ -12959,7 +13087,7 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
             if edit > 0 {
                 assert!(
                     models
-                        .prompt(edit * 3)
+                        .prompt(edit * 4)
                         .iter()
                         .any(|(role, text)| role == "assistant" && text == "Edited image.")
                 );
@@ -12973,6 +13101,7 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
             let BrokerRequest::Invoke {
                 invocation,
                 attestation: Some(claim),
+                ..
             } = observed.recv().await.expect("proposal").request
             else {
                 panic!("attested proposal")
@@ -12980,15 +13109,10 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
             assert_eq!(invocation.capability.as_str(), "gpt-image.edit");
             assert_eq!(
                 invocation.input["images"][0],
-                if edit == 0 {
-                    format!("data:{mime};base64,{}", STANDARD.encode(bytes))
-                } else {
-                    format!(
-                        "data:image/png;base64,{}",
-                        STANDARD.encode([PNG, &[(edit - 1) as u8]].concat())
-                    )
-                }
+                format!("chat-asset:{}", edit + 1)
             );
+            observed.recv().await.expect("send command");
+            observed.recv().await.expect("send invocation");
             assert_eq!(claim.subject.canonical(), "whatsapp.15550000001");
             assert_eq!(claim.scope.expect("scope").transport.as_str(), "wa");
         }
@@ -12997,7 +13121,7 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
         {
             let prompts = models.prompts.lock().expect("prompts");
             for edit in 0..3 {
-                let data = prompts[edit * 3 + 1]
+                let data = prompts[edit * 4 + 1]
                     .iter()
                     .filter_map(ModelMessage::parts)
                     .flatten()
@@ -13770,12 +13894,12 @@ fn asset_retention_config_default_custom_zero_and_invalid_values() {
 async fn generated_only_session_publishes_fetch_tool_and_reuses_result_before_next_turn() {
     let directory = temporary();
     let png = b"\x89PNG\r\n\x1a\nfirst generated image";
-    let (broker, mut observed) = stub_broker(directory.path(), vec![
-        ResponseEnvelope::capabilities(vec![capability("gpt-image.edit")], vec!["gpt-image".to_owned()]),
-        ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed", "capability":"gpt-image.edit", "input":{"prompt":"first"}})).unwrap()),
-        ResponseEnvelope::invocation(record_output(json!({"attachments":[{"mediaType":"image/png", "base64":STANDARD.encode(png)}]}))),
-        ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed", "capability":"gpt-image.edit", "input":{"prompt":"edit result", "images":["chat-asset:1"]}})).unwrap()),
-        ResponseEnvelope::invocation(record_output(json!({"attachments":[{"mediaType":"image/png", "base64":STANDARD.encode(b"\x89PNG\r\n\x1a\nsecond generated image") }]}))),
+    let (broker, mut observed) = stub_broker_assets(directory.path(), vec![
+        plain_response(ResponseEnvelope::capabilities(vec![capability("gpt-image.edit")], vec!["gpt-image".to_owned()])),
+        plain_response(ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed", "capability":"gpt-image.edit", "input":{"prompt":"first"}})).unwrap())),
+        asset_response(png, "image/png"),
+        plain_response(ResponseEnvelope::command_run(serde_json::from_value(json!({"outcome":"proposed", "capability":"gpt-image.edit", "input":{"prompt":"edit result", "images":["chat-asset:1"]}})).unwrap())),
+        asset_response(b"second generated image", "image/png"),
     ]).await;
     let models = ModelScript::new([
         script_call("gpt-image edit --prompt first"),
@@ -13797,9 +13921,7 @@ async fn generated_only_session_publishes_fetch_tool_and_reuses_result_before_ne
     if let ModelConfig::OpenaiCompatible { modalities, .. } = &mut model {
         *modalities = vec![crate::config::Modality::Image];
     }
-    let mut route = persistent_route(model, window());
-    route.provider_attachments = 2;
-    route.chat_asset_inputs = Arc::from(vec!["gpt-image.edit".to_owned()]);
+    let route = persistent_route(model, window());
     let driver = Arc::new(RecordingDriver::default());
     run_session(
         runner(broker, Arc::clone(&models), 4),
@@ -13826,10 +13948,7 @@ async fn generated_only_session_publishes_fetch_tool_and_reuses_result_before_ne
     let BrokerRequest::Invoke { invocation, .. } = observed.recv().await.unwrap().request else {
         panic!("second invocation")
     };
-    assert_eq!(
-        invocation.input["images"][0],
-        format!("data:image/png;base64,{}", STANDARD.encode(png))
-    );
+    assert_eq!(invocation.input["images"][0], "chat-asset:1");
     assert_eq!(driver.replies(), vec!["Two produced images.".to_owned()]);
 }
 
@@ -13913,4 +14032,145 @@ fn recovery_forwards_slack_agent_capabilities_without_rebuilding_them() {
         &ownership,
         &transport.thread_ownership().expect("forwarded ownership")
     ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn queued_assets_deliver_on_empty_text_but_not_when_the_model_fails_before_reply() {
+    for fail in [false, true] {
+        let directory = temporary();
+        let (broker, _observed) = stub_broker_assets(
+            directory.path(),
+            vec![
+                plain_response(probe_listing()),
+                plain_response(upper_proposal("create")),
+                asset_response(b"payload", "text/plain"),
+                plain_response(upper_proposal("send")),
+                queued_response(1),
+            ],
+        )
+        .await;
+        let models = ModelScript::scripted([
+            Some(script_call("probe upper --text create")),
+            Some(script_call("probe upper --text send")),
+            (!fail).then(|| answer("")),
+        ]);
+        let driver = Arc::new(RecordingDriver::default());
+        run_session(
+            runner(broker, models, 4),
+            route(model_config()),
+            message("make a file"),
+            driver.clone(),
+        )
+        .await;
+        assert_eq!(
+            driver.image_bytes(),
+            if fail { vec![vec![]] } else { vec![vec![7]] }
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_once() {
+    const NOTICE: &str = "[gateway: a previous asset send did not complete. Sent flags remain set; no automatic retry was made.]";
+    const OTHER_SUBJECT: &str = "tel.16035550100";
+    for memory in [window(), shared_window()] {
+        let directory = temporary();
+        let (broker, _observed) = stub_broker_assets(
+            directory.path(),
+            vec![
+                plain_response(probe_listing()),
+                plain_response(upper_proposal("create")),
+                asset_response(b"payload", "text/plain"),
+                plain_response(upper_proposal("send")),
+                queued_response(1),
+                plain_response(probe_listing()),
+                plain_response(probe_listing()),
+                plain_response(probe_listing()),
+            ],
+        )
+        .await;
+        let models = ModelScript::new([
+            script_call("probe upper --text create"),
+            script_call("probe upper --text send"),
+            answer("Here it is."),
+            answer("unrelated"),
+            answer("noted"),
+            answer("next"),
+        ]);
+        let runner = runner(broker, models.clone(), 4);
+        let route = persistent_route(model_config(), memory);
+        let failed =
+            Arc::new(RecordingDriver::default().failing_replies_from(0, FailureKind::Response));
+        run_session(
+            runner.clone(),
+            route.clone(),
+            message("make a file"),
+            failed,
+        )
+        .await;
+        let driver = Arc::new(RecordingDriver::default());
+        let mut unrelated = message_from(OTHER_SUBJECT, "different audience");
+        if memory.scope == MemoryScope::SharedConversation {
+            unrelated.conversation.id = "other-conversation".to_owned();
+        }
+        run_session(runner.clone(), route.clone(), unrelated, driver.clone()).await;
+        assert!(
+            models
+                .prompt(3)
+                .iter()
+                .all(|(_, content)| !content.contains(NOTICE)),
+            "notice cannot cross audience"
+        );
+        let subject = match memory.scope {
+            MemoryScope::PrivateConversation => SUBJECT,
+            MemoryScope::SharedConversation => OTHER_SUBJECT,
+        };
+        let inbound = "🟣".repeat(MAX_INBOUND_TEXT_BYTES / "🟣".len());
+        assert_eq!(inbound.len(), MAX_INBOUND_TEXT_BYTES);
+        run_session(
+            runner.clone(),
+            route.clone(),
+            message_from(subject, &inbound),
+            driver.clone(),
+        )
+        .await;
+        let prompt = models.prompt(4);
+        let (_, current) = prompt.last().unwrap();
+        assert_eq!(
+            prompt
+                .iter()
+                .map(|(_, text)| text.matches(NOTICE).count())
+                .sum::<usize>(),
+            1
+        );
+        let expected_head = match memory.scope {
+            MemoryScope::PrivateConversation => format!("{NOTICE}\n"),
+            MemoryScope::SharedConversation => {
+                format!("[gateway: authenticated participant: {subject}]\n{NOTICE}\n")
+            }
+        };
+        assert!(
+            current.starts_with(&expected_head),
+            "authoritative attribution, complete notice, then untrusted text"
+        );
+        let (bounded, marker) = current.rsplit_once('\n').unwrap();
+        assert_eq!(marker, "[message truncated by the gateway]");
+        assert!(bounded.len() <= MAX_INBOUND_TEXT_BYTES);
+        assert!(bounded.len() > MAX_INBOUND_TEXT_BYTES - "🟣".len());
+        assert!(bounded[expected_head.len()..].chars().all(|c| c == '🟣'));
+        run_session(runner, route, message_from(subject, "follow up"), driver).await;
+        let following = models.prompt(5);
+        assert!(
+            !following.last().unwrap().1.contains(NOTICE),
+            "no fresh notice after consumption"
+        );
+        assert_eq!(
+            following
+                .iter()
+                .map(|(_, text)| text.matches(NOTICE).count())
+                .sum::<usize>(),
+            1,
+            "only its historical transcript occurrence remains"
+        );
+    }
 }

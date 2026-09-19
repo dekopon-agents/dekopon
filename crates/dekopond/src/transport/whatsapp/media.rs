@@ -5,7 +5,7 @@ use std::{net::IpAddr, time::Instant};
 use tracing::Instrument as _;
 
 use crate::transport::{asset_buffer, hydration::HydratedImage, reserve_for_chunk};
-use dekopon_agent::attachment::validate_png;
+
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
 use super::*;
@@ -161,7 +161,7 @@ impl WhatsappDriver {
             let filename = image.filename;
             let part = reqwest::multipart::Part::bytes(image.bytes)
                 .file_name(filename)
-                .mime_str("image/png")
+                .mime_str(&image.media_type)
                 .map_err(request_failed)?;
             let form = reqwest::multipart::Form::new()
                 .text("messaging_product", "whatsapp")
@@ -302,7 +302,7 @@ impl AssetFetcher for WhatsappDriver {
             }
             // Match the existing courier's signature-level validation, not full image decoding.
             let valid = match mime.as_str() {
-                "image/png" => validate_png(&bytes).is_ok(),
+                "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
                 "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
                 _ => false,
             };

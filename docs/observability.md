@@ -142,8 +142,9 @@ these carries a fixed category rather than the untrusted text that triggered it:
 | Event | Emitted by | Carries |
 |---|---|---|
 | `agent.tool.rejected` | `dekopon-agent` | model turn, the tool-call index or count, and a fixed `error.type` such as `too-many-tool-calls` or `unknown-tool` — never the model's own tool name or arguments |
-| `agent.provider_attachment.refused` | `dekopon-agent` | a stable `reason` — `route-disabled`, `invalid-encoding`, `unsupported-media`, `too-large`, `per-reply-limit`, or `storage`; never the attachment bytes, its declared media type, or any provider text |
-| `agent.chat_asset_input.refused` | `dekopon-agent` | a stable `reason` — `unknown-asset`, `unsupported-media`, `per-invocation-limit`, `session-limit`, `byte-budget`, `reclaimed`, `unauthorized`, or `unavailable`; never the attachment number, its bytes, or the sender's file name |
+| `agent.chat_asset_input.refused` | `dekopon-agent` | a stable `reason` — `unknown-asset`, `unsupported-media`, `per-invocation-limit`, `data-url`, `storage`, `byte-budget`, `reclaimed`, `unauthorized`, or `unavailable`; never the attachment number, its bytes, or the sender's file name |
+| `agent.asset.send` | `dekopon-agent` | `asset.id`, authenticated transport name, `dispatched` and optional bounded `error`; emitted once per queued asset at terminal delivery or abandonment, never payload bytes; dispatched means attempted, not accepted |
+| `gateway.asset.content_type_mismatch` | `dekopond` | exactly one event per admitted output when a 12-byte decoded-prefix sniff disagrees: `asset.id`, declared `asset.content_type` (128 characters), `asset.detected_type`, stored `asset.bytes`, `asset.sha256`; label stays authoritative; matching or unrecognized prefixes emit none |
 | `gateway.asset.retention_miss` | `dekopond` | gateway asset ID, known byte size, configured byte budget, and reason (`disabled`, `oversized`, `all-pinned`, `reclaimed`, `unknown`, `unauthorized`, `storage`); no path, payload or secret; emitted inside the resolving message/model/provider trace |
 | `agent.asset.refused` | `dekopon-agent` | the gateway-assigned asset id and the gateway-authored refusal text the model reads back |
 | `agent.asset.fetched` | `dekopon-agent` | the asset id, its media type, its byte count, and `asset.truncated` — whether a textual asset larger than the prompt's textual bound was clamped with a trailer the model reads rather than dropped or failed; never the bytes and never the sender's file name, which is untrusted text |
@@ -1093,3 +1094,9 @@ is invented. Following a constituent's causal link reaches the one model/provide
 reply execution; it is not duplicated across traces. Non-payload counts/outcomes describe
 membership while original text stays on its own input audit event. Delivery failures remain
 in that shared execution's trace. A single-message, uncollected input keeps its ordinary trace.
+
+Gateway assets are recorded by reference, declared content type, stored byte count and SHA-256,
+never payload bytes. Gateway conversion uses the same `asset.encode` / `asset.decode` spans as
+native hosts (`bytes`, `duration_us`); `asset.spool` remains the positional scratch-read lifecycle.
+A send failure leaves a bounded next-turn notice; `dispatched` belongs only to `agent.asset.send`,
+not an asset table field. Broker decisions still record the ordinary asset.send authorization.

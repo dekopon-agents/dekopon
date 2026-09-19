@@ -27,10 +27,10 @@ use std::{
 };
 
 use async_trait::async_trait;
-use base64::{display::Base64Display, engine::general_purpose::STANDARD};
 use dekopon_agent::CancelVia;
 use dekopon_broker_protocol::{ChatTransportKind, Conversation, ConversationKind};
 use dekopon_core::ExternalSubject;
+use dekopon_core::base64::{Base64Display, STANDARD};
 use futures_util::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -396,7 +396,7 @@ struct AnswerLine<'a> {
 struct AnswerImage<'a> {
     filename: &'a str,
     #[serde(rename = "mediaType")]
-    media_type: &'static str,
+    media_type: &'a str,
     data: Base64Data<'a>,
 }
 
@@ -415,7 +415,17 @@ impl std::fmt::Display for Base64Data<'_> {
 
 impl serde::Serialize for Base64Data<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(self)
+        let start = std::time::Instant::now();
+        let span = tracing::info_span!(
+            "asset.encode",
+            bytes = self.0.len(),
+            duration_us = tracing::field::Empty
+        );
+        span.in_scope(|| {
+            let result = serializer.collect_str(self);
+            span.record("duration_us", start.elapsed().as_micros() as u64);
+            result
+        })
     }
 }
 
@@ -514,7 +524,7 @@ impl LocalDriver {
                 .iter()
                 .map(|image| AnswerImage {
                     filename: &image.filename,
-                    media_type: image.media_type,
+                    media_type: &image.media_type,
                     data: Base64Data(&image.bytes),
                 })
                 .collect(),
@@ -556,6 +566,7 @@ impl ChatDriver for LocalDriver {
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
         let OutboundReply { text, images } = reply;
+        super::hydration::validate_types(&images, super::hydration::AcceptedTypes::Files)?;
         let images = super::hydration::hydrate_images(images).await?;
         let &ReplyTarget::Local { connection } = target else {
             return Err(TransportError::Response);

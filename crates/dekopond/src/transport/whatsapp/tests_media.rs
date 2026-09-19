@@ -292,7 +292,12 @@ async fn media_errors_are_bounded_and_name_the_failed_check() {
 
 #[tokio::test]
 async fn image_upload_is_multipart_and_only_message_acceptance_is_delivery() {
-    for caption in [String::new(), "🟣".repeat(1024), "🟣".repeat(1025)] {
+    for (caption, label, bytes, filename) in [
+        (String::new(), "image/png", PNG, "asset-1.png"),
+        ("🟣".repeat(1024), "image/png", PNG, "asset-1.png"),
+        ("🟣".repeat(1025), "image/png", PNG, "asset-1.png"),
+        (String::new(), "image/jpeg", JPEG, "asset-1.jpg"),
+    ] {
         let peer = MediaPeer::new(|_, index| {
             if index == 0 {
                 json_reply(json!({"id":"987"}))
@@ -302,7 +307,17 @@ async fn image_upload_is_multipart_and_only_message_acceptance_is_delivery() {
         })
         .await;
         driver(&peer.origin)
-            .reply(&target(), OutboundReply::with_images(&caption, vec![png()]))
+            .reply(
+                &target(),
+                OutboundReply::with_images(
+                    &caption,
+                    vec![GeneratedImage::new(
+                        dekopon_model::asset::DiskBlob::from_bytes(bytes).unwrap(),
+                        label.to_owned(),
+                        dekopon_broker_protocol::AssetEncoding::Identity,
+                    )],
+                ),
+            )
             .await
             .expect("image accepted");
         {
@@ -317,14 +332,14 @@ async fn image_upload_is_multipart_and_only_message_acceptance_is_delivery() {
             let upload = String::from_utf8_lossy(&requests[0].body);
             assert!(upload.contains("name=\"messaging_product\"\r\n\r\nwhatsapp"));
             assert!(
-                upload.contains("filename=\"generated-image.png\"")
-                    && upload.contains("Content-Type: image/png")
+                upload.contains(&format!("filename=\"{filename}\""))
+                    && upload.contains(&format!("Content-Type: {label}"))
             );
             assert!(
                 requests[0]
                     .body
-                    .windows(PNG.len())
-                    .any(|bytes| bytes == PNG)
+                    .windows(bytes.len())
+                    .any(|part| part == bytes)
             );
             let sent: Value = serde_json::from_slice(&requests[1].body).expect("message");
             assert_eq!(sent["to"], "15550000001");
@@ -380,22 +395,85 @@ async fn upload_success_is_not_delivery_and_later_failures_are_partial() {
     }
 }
 
+fn encoded_image(bytes: &[u8], encoding: dekopon_broker_protocol::AssetEncoding) -> GeneratedImage {
+    use dekopon_broker_protocol::AssetEncoding;
+    use dekopon_core::base64::{Engine as _, STANDARD};
+    let stored = match encoding {
+        AssetEncoding::Identity => bytes.to_vec(),
+        AssetEncoding::Base64 => STANDARD.encode(bytes).into_bytes(),
+    };
+    GeneratedImage::new(
+        dekopon_model::asset::DiskBlob::from_bytes(&stored).unwrap(),
+        "image/png".to_owned(),
+        encoding,
+    )
+}
+
 #[tokio::test]
-async fn oversized_output_is_refused_before_any_upload_or_text() {
-    let peer = MediaPeer::new(|_, _| panic!("preflight must send nothing")).await;
+async fn identity_and_base64_outputs_at_the_decoded_ceiling_upload_identical_bytes() {
+    use dekopon_broker_protocol::AssetEncoding;
     let mut bytes = PNG.to_vec();
-    bytes.resize(5_000_001, 0);
-    let large = GeneratedImage::from_png(bytes).expect("generic ceiling exceeds WhatsApp's");
-    let error = driver(&peer.origin)
-        .reply(
-            &target(),
-            OutboundReply::with_images("answer", vec![png(), large]),
-        )
-        .await
-        .expect_err("too large");
-    assert!(error.to_string().contains("image-too-large"));
-    assert!(peer.requests.lock().expect("requests").is_empty());
-    peer.finish().await;
+    bytes.resize(media::MAX_IMAGE_BYTES, 0);
+    for encoding in [AssetEncoding::Identity, AssetEncoding::Base64] {
+        let peer = MediaPeer::new(|_, index| match index {
+            0 => json_reply(json!({"id":"987"})),
+            1 => accepted(),
+            _ => panic!("one upload and one captioned image, never a retry"),
+        })
+        .await;
+        driver(&peer.origin)
+            .reply(
+                &target(),
+                OutboundReply::with_images("answer", vec![encoded_image(&bytes, encoding)]),
+            )
+            .await
+            .unwrap();
+        {
+            let requests = peer.requests.lock().unwrap();
+            assert_eq!(requests.len(), 2);
+            assert_eq!(requests[0].path, "/v25.0/456/media");
+            let body = &requests[0].body;
+            let start = body
+                .windows(PNG.len())
+                .position(|part| part == PNG)
+                .unwrap();
+            assert_eq!(&body[start..start + bytes.len()], bytes);
+            assert!(
+                body[start + bytes.len()..].starts_with(b"\r\n--"),
+                "no extra payload bytes"
+            );
+            let message: Value = serde_json::from_slice(&requests[1].body).unwrap();
+            assert_eq!(message["image"]["caption"], "answer");
+        }
+        peer.finish().await;
+    }
+}
+
+#[tokio::test]
+async fn identity_and_base64_outputs_one_decoded_byte_over_refuse_before_any_upload_or_text() {
+    use dekopon_broker_protocol::AssetEncoding;
+    let mut bytes = PNG.to_vec();
+    bytes.resize(media::MAX_IMAGE_BYTES + 1, 0);
+    for encoding in [AssetEncoding::Identity, AssetEncoding::Base64] {
+        let peer = MediaPeer::new(|_, _| panic!("preflight must send nothing")).await;
+        let error = driver(&peer.origin)
+            .reply(
+                &target(),
+                OutboundReply::with_images(
+                    // A valid first image and standalone text must not escape before the later refusal.
+                    "x".repeat(media::MAX_CAPTION_CHARS + 1),
+                    vec![png(), encoded_image(&bytes, encoding)],
+                ),
+            )
+            .await
+            .expect_err("too large");
+        assert!(
+            matches!(error, TransportError::Service { ref code } if code == "image-too-large"),
+            "{error:?}"
+        );
+        assert!(peer.requests.lock().unwrap().is_empty());
+        peer.finish().await;
+    }
 }
 
 pub(crate) async fn admitted_photo(

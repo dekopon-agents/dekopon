@@ -1034,15 +1034,18 @@ impl ChatDriver for WhatsappDriver {
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
         let OutboundReply { text, images } = reply;
+        super::hydration::validate_types(&images, super::hydration::AcceptedTypes::Photos)?;
         let mut images = super::hydration::ImageQueue::new(images);
         let ReplyTarget::WhatsApp { recipient } = target else {
             return Err(TransportError::Response);
         };
         // Refuse every locally knowable failure before uploading or sending any part. A lease
-        // reports its byte count without being read, so this still sees every image up front while
-        // each one is read only immediately before its own upload.
+        // reports decoded length from at most two stored tail bytes on a blocking worker. Payloads
+        // are still read one at a time immediately before upload; retention counts stored bytes.
         if images
-            .lengths()
+            .decoded_lengths()
+            .await?
+            .into_iter()
             .any(|length| length > media::MAX_IMAGE_BYTES)
         {
             return Err(media::failure("image-too-large"));

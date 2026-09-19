@@ -14,8 +14,8 @@
 //! - [`SessionInvoker`] — capability dispatch that prefers a local read-only leg and falls through
 //!   to a broker leg;
 //! - [`BrokerLeg`] — a synchronous [`CapabilityInvoker`] facade over the asynchronous
-//!   [`BrokerClient`], for sessions that run on a blocking task, carrying the two
-//!   [`attachment`] conventions that move bytes between a capability and a chat conversation
+//!   [`BrokerClient`], for sessions that run on a blocking task, carrying the typed
+//!   [`attachment`] handles that move bytes between a capability and a chat conversation
 //!   without putting them in the transcript.
 //!
 //! Nothing here holds authority. The broker leg submits identity-free proposals and reports back
@@ -61,9 +61,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use thiserror::Error;
 
 #[cfg(unix)]
-use crate::attachment::{
-    ChatAssetInputs, ChatAssetRefusal, ReplyAttachments, strip_attachments_for_invocation,
-};
+use crate::attachment::{ChatAssetInputs, ChatAssetRefusal, ReplyAttachments};
 use crate::{meta::EffectiveCapabilityView, prompt::ScriptRuntime};
 
 pub mod attachment;
@@ -465,14 +463,9 @@ pub struct BrokerLeg {
     /// fires: [`CancelSignal::never`] until an embedder ties it to its own session with
     /// [`BrokerLeg::with_cancel_signal`].
     cancel: CancelSignal,
-    /// Where validated provider attachments go, and how many this reply may carry.
-    ///
-    /// `None` for a session whose route delivers none, which is every embedder that has not asked
-    /// for them. The reserved `attachments` result key is still stripped then: bytes must not reach
-    /// the shell merely because nowhere can accept them.
+    /// Gateway table intake and explicitly authorized sends for this turn.
     attachments: Option<Arc<ReplyAttachments>>,
-    /// Which capabilities may receive expanded `chat-asset:<N>` inputs, and where their bytes come
-    /// from. `None` expands nothing, leaving every marker as the ordinary string it is.
+    /// Scoped descriptor resolution. Absent sources refuse references, never expand them.
     asset_inputs: Option<ChatAssetInputs>,
     /// Where this leg reports the work a person is waiting on, when an embedder wants to show it.
     ///
@@ -490,7 +483,6 @@ pub struct BrokerLeg {
     /// an ordinary invocation — so a word that renders its own help spends nothing.
     calls_used: AtomicU32,
     /// Attachments this session has accepted into the reply, which numbers each one for a surface.
-    attachments_accepted: AtomicU32,
     /// The command word whose proposal is waiting on its capability call, and when its run began.
     ///
     /// Held so the pair [`ProgressEvent::ToolStarted`] opened under the word finishes with the
@@ -558,7 +550,6 @@ impl BrokerLeg {
             progress: None,
             calls_max: 0,
             calls_used: AtomicU32::new(0),
-            attachments_accepted: AtomicU32::new(0),
             pending_report: Mutex::new(None),
         })
     }
@@ -577,29 +568,21 @@ impl BrokerLeg {
         self
     }
 
-    /// Delivers provider-produced attachments through `slot` instead of discarding them.
-    ///
-    /// Only an embedder that can actually put bytes in front of a person calls this, and only for a
-    /// route whose owner opted in: a slot is what separates "this conversation carries files" from
-    /// "a capability offered bytes nothing can deliver".
+    /// Registers typed broker outputs and queues only explicitly authorized sends.
     #[must_use]
     pub fn with_provider_attachments(mut self, slot: Arc<ReplyAttachments>) -> Self {
         self.attachments = Some(slot);
         self
     }
 
-    /// Expands `chat-asset:<N>` markers in the inputs of the capabilities `inputs` lists.
-    ///
-    /// Separate from [`Self::with_provider_attachments`] because the two reaches are separate: one
-    /// sends provider bytes to a person, the other sends a person's bytes to a provider, and an
-    /// owner grants them independently.
+    /// Resolves every exact proposal marker to a scoped read-only descriptor.
     #[must_use]
     pub fn with_chat_asset_inputs(mut self, inputs: ChatAssetInputs) -> Self {
         self.asset_inputs = Some(inputs);
         self
     }
 
-    /// Reports every command word, capability call, and accepted attachment to `sink`.
+    /// Reports every command word and capability call to `sink`.
     ///
     /// `max_capability_calls` is the session's ceiling, and it is required here rather than
     /// optional because [`ProgressEvent::ToolStarted`] says "3 of 16 calls": a count with no
@@ -670,80 +653,38 @@ impl BrokerLeg {
         self.identifiers.trace()
     }
 
-    /// Expands this proposal's `chat-asset:<N>` markers, when the route listed the capability.
-    ///
-    /// A capability the route did not list keeps its input byte for byte, markers included. That is
-    /// deliberate: `chat-asset:3` is a plain string until an owner says a capability may be handed
-    /// attachment bytes, and the provider is the one that decides what to do with a string it did
-    /// not expect.
-    fn expanded(
+    /// Resolves every proposal reference without changing the proposal JSON.
+    fn prepare_assets(
         &self,
-        capability: &str,
-        input: Value,
-    ) -> Result<(Value, Vec<dekopon_model::asset::DiskBlob>), ChatAssetRefusal> {
-        let Some(inputs) = self
-            .asset_inputs
-            .as_ref()
-            .filter(|it| it.covers(capability))
-        else {
-            return Ok((input, Vec::new()));
+        input: &Value,
+    ) -> Result<
+        (
+            dekopon_broker_protocol::InvokeAssets,
+            Vec<dekopon_model::asset::DiskBlob>,
+        ),
+        ChatAssetRefusal,
+    > {
+        let remaining = self.attachments.as_ref().map_or(0, |slot| slot.remaining());
+        let prepared = match &self.asset_inputs {
+            Some(inputs) => inputs.prepare(input, remaining),
+            None => attachment::references(input).and_then(|ids| {
+                if ids.is_empty() {
+                    Ok((
+                        dekopon_broker_protocol::InvokeAssets {
+                            rows: Vec::new(),
+                            descriptors: Vec::new(),
+                            sends_remaining: remaining,
+                        },
+                        Vec::new(),
+                    ))
+                } else {
+                    Err(ChatAssetRefusal::UnknownAsset)
+                }
+            }),
         };
-        let mut input = input;
-        match inputs.expand_pinned(&mut input) {
-            Ok((expanded, pins)) => {
-                tracing::debug!(
-                    command.leg = "broker",
-                    chat_asset.expansions = expanded,
-                    "chat asset inputs expanded"
-                );
-                Ok((input, pins))
-            }
-            Err(refusal) => {
-                tracing::warn!(
-                    target: "dekopon_agent::audit",
-                    {
-                        audit.event = "agent.chat_asset_input.refused",
-                        reason = refusal.reason(),
-                    },
-                    "chat asset input refused"
-                );
-                Err(refusal)
-            }
-        }
-    }
-
-    /// Moves any attachments this result offered into the reply slot, auditing every refusal.
-    ///
-    /// A refusal never fails the call. The invocation already happened and may already have cost the
-    /// account money, so turning undeliverable bytes into a failed capability would make the model
-    /// retry an effect that succeeded.
-    ///
-    /// Acceptance is where a progress surface learns a file is coming: the reply that carries it is
-    /// posted whole minutes later, and until then the only thing to say is that the picture exists.
-    fn deliver_attachments(&self, output: &mut Value, capability: &str, invocation: &str) {
-        let (accepted, refusals) = strip_attachments_for_invocation(
-            output,
-            self.attachments.as_deref(),
-            capability,
-            invocation,
-        );
-        for bytes in accepted {
-            self.emit(ProgressEvent::Attachment {
-                index: self.attachments_accepted.fetch_add(1, Ordering::Relaxed),
-                media_type: crate::attachment::ATTACHMENT_MEDIA_TYPE.to_owned(),
-                bytes,
-            });
-        }
-        for refusal in refusals {
-            tracing::warn!(
-                target: "dekopon_agent::audit",
-                {
-                    audit.event = "agent.provider_attachment.refused",
-                    reason = refusal.reason(),
-                },
-                "provider attachment refused"
-            );
-        }
+        prepared.inspect_err(|refusal| {
+            tracing::warn!(target: "dekopon_agent::audit", { audit.event = "agent.chat_asset_input.refused", reason = refusal.reason() }, "chat asset input refused");
+        })
     }
 }
 
@@ -1050,7 +991,7 @@ impl BrokerLeg {
         }
         // The last point at which the proposal's JSON is still this process's to edit: a command
         // word's `run-command` proposal arrives here after the interpreter checked the grant.
-        let (input, asset_pins) = match self.expanded(capability, input) {
+        let (assets, asset_pins) = match self.prepare_assets(&input) {
             Ok(input) => input,
             // A refusal here is permanent and the call never happened, which is the interpreter's
             // `Denied` — exit 126, its one non-retryable status — rather than a `Failed` the model
@@ -1083,36 +1024,68 @@ impl BrokerLeg {
         // worker: `Handle::block_on` from a worker would deadlock the executor, and from the
         // blocking pool it is the ordinary bridge back into async code.
         let invocation = request.id.to_string();
-        let submitted = self
-            .runtime
-            .block_on(async { self.client.invoke(self.attestation.clone(), request).await });
+        let submitted = self.runtime.block_on(async {
+            self.client
+                .invoke(self.attestation.clone(), request, assets)
+                .await
+        });
         // The provider request is over. Release its transient input pins before admitting outputs.
         drop(asset_pins);
         match submitted {
-            Ok(result) => match result.outcome {
-                InvocationOutcome::Succeeded => {
-                    let mut output = result.output.unwrap_or(Value::Null);
-                    self.deliver_attachments(&mut output, capability, &invocation);
-                    CapabilityCallResult::Succeeded(output)
+            Ok(outcome) => {
+                let result = outcome.result;
+                match result.outcome {
+                    InvocationOutcome::Succeeded => {
+                        let mut output = result.output.unwrap_or(Value::Null);
+                        if output
+                            .as_object()
+                            .is_some_and(|object| object.contains_key("attachments"))
+                        {
+                            return CapabilityCallResult::Denied {
+                                reason: format!(
+                                    "{capability} returned retired result attachments; migrate this provider to dekopon:asset; the capability already executed"
+                                ),
+                            };
+                        }
+                        if let Some(slot) = &self.attachments {
+                            let note = slot.receive(
+                                outcome.attached,
+                                outcome.descriptors,
+                                outcome.removed,
+                                outcome.sent,
+                                capability,
+                                &invocation,
+                            );
+                            if !note.is_empty() {
+                                output = serde_json::json!({"result": output, "assetNote": note});
+                            }
+                        } else if !outcome.attached.is_empty()
+                            || !outcome.removed.is_empty()
+                            || !outcome.sent.is_empty()
+                        {
+                            output = serde_json::json!({"result": output, "assetNote": "[gateway: capability executed but this embedder has no asset store; received asset effects could not be retained or delivered; do not repeat the paid call]"});
+                        }
+                        CapabilityCallResult::Succeeded(output)
+                    }
+                    // A refusal has to stay a refusal all the way to the script's exit code. The
+                    // interpreter maps `Denied` to 126 and `Failed` to 1, and a model that reads
+                    // "policy said no" as "the call errored" will retry something it must not retry.
+                    InvocationOutcome::Denied => CapabilityCallResult::Denied {
+                        reason: result
+                            .error
+                            .unwrap_or_else(|| "authorization refused this invocation".to_owned()),
+                    },
+                    // The classification decides the exit status and what a model may retry; the
+                    // provider's own code and message travel beside it so the script output carries
+                    // the upstream refusal rather than only its class.
+                    InvocationOutcome::Failed => CapabilityCallResult::Failed {
+                        error: result.error.unwrap_or_else(|| {
+                            "the broker reported a failed invocation".to_owned()
+                        }),
+                        detail: result.detail,
+                    },
                 }
-                // A refusal has to stay a refusal all the way to the script's exit code. The
-                // interpreter maps `Denied` to 126 and `Failed` to 1, and a model that reads
-                // "policy said no" as "the call errored" will retry something it must not retry.
-                InvocationOutcome::Denied => CapabilityCallResult::Denied {
-                    reason: result
-                        .error
-                        .unwrap_or_else(|| "authorization refused this invocation".to_owned()),
-                },
-                // The classification decides the exit status and what a model may retry; the
-                // provider's own code and message travel beside it so the script output carries
-                // the upstream refusal rather than only its class.
-                InvocationOutcome::Failed => CapabilityCallResult::Failed {
-                    error: result
-                        .error
-                        .unwrap_or_else(|| "the broker reported a failed invocation".to_owned()),
-                    detail: result.detail,
-                },
-            },
+            }
             // An unmapped peer — or, for an attested leg, a refused attestation — is an
             // authorization refusal that never reached a decision record, so it arrives as a
             // transport-level code rather than a `Denied` outcome. It is still a refusal, and
@@ -1470,7 +1443,6 @@ mod tests {
             sync::{Arc, Mutex, atomic::AtomicU32},
         };
 
-        use base64::{Engine as _, engine::general_purpose::STANDARD};
         use dekopon_broker_protocol::{
             BrokerClient, BrokerRequest, CommandRunOutcome, ERROR_UNAUTHENTICATED, FrameLimits,
             InvocationOutcome, InvocationResult, RequestEnvelope, ResponseEnvelope, read_frame,
@@ -1485,7 +1457,7 @@ mod tests {
             CapabilityCallResult, CapabilityDescription, CapabilityInvoker, CommandRun, ExitCode,
             Limits,
         };
-        use serde_json::{Value, json};
+        use serde_json::json;
         use tokio::{
             net::UnixListener,
             sync::{mpsc, oneshot},
@@ -1493,13 +1465,7 @@ mod tests {
 
         use crate::{
             Attestation, BrokerLeg, IdSequence, ProgressEvent, ProgressSink, ShellRuntime,
-            attachment::{
-                AttachmentRefusal, ChatAssetInputs, ChatAssetRefusal, ChatAssetSource,
-                ReplyAttachments,
-            },
-            current_trace_parent,
-            meta::EffectiveCapabilityView,
-            prompt::ScriptRuntime,
+            current_trace_parent, meta::EffectiveCapabilityView, prompt::ScriptRuntime,
         };
 
         const CAPABILITY: &str = "http-probe.fetch";
@@ -1856,7 +1822,6 @@ mod tests {
                 progress: None,
                 calls_max: 0,
                 calls_used: AtomicU32::new(0),
-                attachments_accepted: AtomicU32::new(0),
                 pending_report: Mutex::new(None),
             }
         }
@@ -1879,10 +1844,12 @@ mod tests {
             let directory = private_broker_directory();
             let leg = stub_leg(
                 directory.path(),
-                vec![ResponseEnvelope::invocation(result(
-                    InvocationOutcome::Denied,
-                    Some("policy-denied"),
-                ))],
+                vec![ResponseEnvelope::invocation(
+                    result(InvocationOutcome::Denied, Some("policy-denied")),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )],
             )
             .await;
 
@@ -1915,14 +1882,70 @@ mod tests {
         }
 
         #[tokio::test(flavor = "multi_thread")]
+        async fn an_embedder_without_a_store_reports_received_descriptors_instead_of_silently_discarding_metadata()
+         {
+            use dekopon_broker_protocol::{AssetEncoding, DescriptorStream, NewAsset};
+            use std::os::fd::AsFd;
+            let directory = private_broker_directory();
+            let socket = directory.path().join("broker.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let blob = dekopon_model::asset::DiskBlob::from_bytes(b"PRIVATE_PAYLOAD").unwrap();
+            let descriptor = blob.descriptor().unwrap();
+            drop(blob);
+            let peer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut stream = DescriptorStream::new(stream);
+                let (_request, descriptors) = stream
+                    .read_frame::<RequestEnvelope>(FrameLimits::default())
+                    .await
+                    .unwrap();
+                assert!(descriptors.is_empty());
+                let mut result = result(InvocationOutcome::Succeeded, None);
+                result.output = Some(json!({"effect":"complete"}));
+                let reply = ResponseEnvelope::invocation(
+                    result,
+                    vec![NewAsset {
+                        descriptor: 0,
+                        content_type: "text/plain".to_owned(),
+                        encoding: AssetEncoding::Identity,
+                        bytes: 15,
+                        sha256: "0".repeat(64),
+                    }],
+                    vec![],
+                    vec![],
+                );
+                stream
+                    .write_frame(&reply, &[descriptor.as_fd()], FrameLimits::default())
+                    .await
+                    .unwrap();
+            });
+            let result = invoke(leg_with(&socket, None), CAPABILITY).await;
+            peer.await.unwrap();
+            let CapabilityCallResult::Succeeded(output) = result else {
+                panic!("effect already completed")
+            };
+            assert_eq!(output["result"]["effect"], "complete");
+            assert!(
+                output["assetNote"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no asset store")
+            );
+            assert!(!output.to_string().contains("PRIVATE_PAYLOAD"));
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
         async fn a_failed_invocation_carries_the_broker_reason_without_becoming_a_denial() {
             let directory = private_broker_directory();
             let leg = stub_leg(
                 directory.path(),
-                vec![ResponseEnvelope::invocation(result(
-                    InvocationOutcome::Failed,
-                    Some("provider trapped"),
-                ))],
+                vec![ResponseEnvelope::invocation(
+                    result(InvocationOutcome::Failed, Some("provider trapped")),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )],
             )
             .await;
 
@@ -1947,10 +1970,15 @@ mod tests {
             );
             let leg = stub_leg(
                 directory.path(),
-                vec![ResponseEnvelope::invocation(InvocationResult {
-                    detail: Some(detail.clone()),
-                    ..result(InvocationOutcome::Failed, Some("provider-failure"))
-                })],
+                vec![ResponseEnvelope::invocation(
+                    InvocationResult {
+                        detail: Some(detail.clone()),
+                        ..result(InvocationOutcome::Failed, Some("provider-failure"))
+                    },
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )],
             )
             .await;
 
@@ -1968,10 +1996,12 @@ mod tests {
             let directory = private_broker_directory();
             let leg = stub_leg(
                 directory.path(),
-                vec![ResponseEnvelope::invocation(result(
-                    InvocationOutcome::Succeeded,
-                    None,
-                ))],
+                vec![ResponseEnvelope::invocation(
+                    result(InvocationOutcome::Succeeded, None),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )],
             )
             .await;
 
@@ -1982,178 +2012,6 @@ mod tests {
         }
 
         /// One PNG offered the way a provider offers one.
-        fn offered_attachment() -> InvocationResult {
-            let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
-            png.extend_from_slice(b"provider pixels");
-            InvocationResult {
-                output: Some(json!({
-                    "attachments": [{
-                        "mediaType": "image/png",
-                        "base64": STANDARD.encode(&png),
-                    }],
-                    "image": {"generationId": "gen-3"},
-                })),
-                ..result(InvocationOutcome::Succeeded, None)
-            }
-        }
-
-        #[tokio::test(flavor = "multi_thread")]
-        async fn a_leg_with_a_slot_routes_attachment_bytes_out_of_the_result() {
-            let directory = private_broker_directory();
-            let leg = stub_leg(
-                directory.path(),
-                vec![ResponseEnvelope::invocation(offered_attachment())],
-            )
-            .await;
-            let slot = Arc::new(ReplyAttachments::new(1));
-            let leg = leg.with_provider_attachments(Arc::clone(&slot));
-
-            assert_eq!(
-                invoke(leg, CAPABILITY).await,
-                CapabilityCallResult::Succeeded(json!({
-                    "attached": [{"mediaType": "image/png", "bytes": 23}],
-                    "image": {"generationId": "gen-3"},
-                }))
-            );
-            assert_eq!(slot.take().len(), 1);
-        }
-
-        /// Without a slot the key is still removed: bytes must not reach the shell merely because
-        /// nowhere can deliver them, and an embedder with no attachment destination, such as
-        /// `dekopon-console`, is exactly that.
-        #[tokio::test(flavor = "multi_thread")]
-        async fn a_leg_without_a_slot_strips_the_attachment_and_names_the_refusal() {
-            let directory = private_broker_directory();
-            let leg = stub_leg(
-                directory.path(),
-                vec![ResponseEnvelope::invocation(offered_attachment())],
-            )
-            .await;
-
-            assert_eq!(
-                invoke(leg, CAPABILITY).await,
-                CapabilityCallResult::Succeeded(json!({
-                    "attached": [],
-                    "attachmentNote": AttachmentRefusal::RouteDisabled.note(),
-                    "image": {"generationId": "gen-3"},
-                }))
-            );
-        }
-
-        struct OneAsset;
-
-        impl ChatAssetSource for OneAsset {
-            fn fetch_for_capability(
-                &self,
-                id: u64,
-            ) -> Result<(String, dekopon_model::asset::DiskBlob), ChatAssetRefusal> {
-                if id != 1 {
-                    return Err(ChatAssetRefusal::UnknownAsset);
-                }
-                Ok((
-                    "image/png".to_owned(),
-                    dekopon_model::asset::DiskBlob::from_bytes(b"PNG").expect("spool"),
-                ))
-            }
-        }
-
-        /// Runs one invocation with a caller-supplied input, the way an embedding binary does.
-        async fn invoke_with(leg: BrokerLeg, input: Value) -> CapabilityCallResult {
-            tokio::task::spawn_blocking(move || leg.invoke(CAPABILITY, input, None))
-                .await
-                .expect("blocking dispatch completes")
-        }
-
-        #[tokio::test(flavor = "multi_thread")]
-        async fn a_listed_capability_receives_the_expanded_marker() {
-            let directory = private_broker_directory();
-            let (leg, mut observed) = stub_leg_observing(
-                directory.path(),
-                vec![ResponseEnvelope::invocation(result(
-                    InvocationOutcome::Succeeded,
-                    None,
-                ))],
-                None,
-            )
-            .await;
-            let leg = leg.with_chat_asset_inputs(ChatAssetInputs::new(
-                Arc::new(OneAsset),
-                vec![CAPABILITY.to_owned()],
-            ));
-
-            assert_eq!(
-                invoke_with(leg, json!({"images": ["chat-asset:1"]})).await,
-                CapabilityCallResult::Succeeded(json!({"status": 200}))
-            );
-            let request = observed.recv().await.expect("stub broker saw the proposal");
-            let BrokerRequest::Invoke { invocation, .. } = request.request else {
-                panic!("a capability call is an invoke frame");
-            };
-            assert_eq!(invocation.input["images"][0], "data:image/png;base64,UE5H");
-        }
-
-        /// A route that did not list the capability must not rewrite its input. The string is the
-        /// provider's to interpret, and a gateway editing it would be deciding on its behalf.
-        #[tokio::test(flavor = "multi_thread")]
-        async fn a_marker_in_an_unlisted_capability_reaches_the_broker_untouched() {
-            let directory = private_broker_directory();
-            let (leg, mut observed) = stub_leg_observing(
-                directory.path(),
-                vec![ResponseEnvelope::invocation(result(
-                    InvocationOutcome::Succeeded,
-                    None,
-                ))],
-                None,
-            )
-            .await;
-            let leg = leg.with_chat_asset_inputs(ChatAssetInputs::new(
-                Arc::new(OneAsset),
-                vec!["gpt-image.edit".to_owned()],
-            ));
-
-            assert_eq!(
-                invoke_with(leg, json!({"images": ["chat-asset:1"]})).await,
-                CapabilityCallResult::Succeeded(json!({"status": 200}))
-            );
-            let request = observed.recv().await.expect("stub broker saw the proposal");
-            let BrokerRequest::Invoke { invocation, .. } = request.request else {
-                panic!("a capability call is an invoke frame");
-            };
-            assert_eq!(invocation.input["images"][0], "chat-asset:1");
-        }
-
-        /// A refusal is permanent and the call never happened, so it comes back as the
-        /// interpreter's one non-retryable status rather than as an error to try again.
-        #[tokio::test(flavor = "multi_thread")]
-        async fn one_unavailable_member_of_multiple_inputs_submits_no_proposal() {
-            let directory = private_broker_directory();
-            let (leg, mut observed) = stub_leg_observing(directory.path(), Vec::new(), None).await;
-            let leg = leg.with_chat_asset_inputs(ChatAssetInputs::new(
-                Arc::new(OneAsset),
-                vec![CAPABILITY.to_owned()],
-            ));
-
-            let CapabilityCallResult::Denied { reason } =
-                invoke_with(leg, json!({"images": ["chat-asset:1", "chat-asset:9"]})).await
-            else {
-                panic!("an unknown attachment number is a refusal, not a failed call");
-            };
-            // The interpreter prints this as `<capability>: denied: <reason>`, which a policy
-            // denial also takes, so the text has to say which side refused.
-            assert!(
-                reason.contains("the gateway refused this call before it reached the broker"),
-                "{reason}"
-            );
-            assert!(
-                reason.contains("no chat attachment in this conversation carries that number"),
-                "{reason}"
-            );
-            assert!(
-                observed.try_recv().is_err(),
-                "nothing reached the broker: {reason}"
-            );
-        }
-
         #[tokio::test(flavor = "multi_thread")]
         async fn an_attested_leg_proposes_on_behalf_of_its_subject() {
             // The whole difference between the two legs is the frame, so assert on the frame. An
@@ -2162,10 +2020,12 @@ mod tests {
             let directory = private_broker_directory();
             let (leg, mut observed) = stub_leg_observing(
                 directory.path(),
-                vec![ResponseEnvelope::invocation(result(
-                    InvocationOutcome::Succeeded,
-                    None,
-                ))],
+                vec![ResponseEnvelope::invocation(
+                    result(InvocationOutcome::Succeeded, None),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )],
                 Some(attestation()),
             )
             .await;
@@ -2179,6 +2039,7 @@ mod tests {
             let BrokerRequest::Invoke {
                 attestation: Some(attestation),
                 invocation,
+                ..
             } = request.request
             else {
                 panic!("an attested leg must send an attested invoke frame: {request:?}");
@@ -2220,10 +2081,12 @@ mod tests {
             let directory = private_broker_directory();
             let (leg, mut observed) = stub_leg_observing(
                 directory.path(),
-                vec![ResponseEnvelope::invocation(result(
-                    InvocationOutcome::Succeeded,
-                    None,
-                ))],
+                vec![ResponseEnvelope::invocation(
+                    result(InvocationOutcome::Succeeded, None),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )],
                 None,
             )
             .await;
@@ -2283,10 +2146,12 @@ mod tests {
             let directory = private_broker_directory();
             let (leg, mut observed) = stub_leg_observing(
                 directory.path(),
-                vec![ResponseEnvelope::invocation(result(
-                    InvocationOutcome::Succeeded,
-                    None,
-                ))],
+                vec![ResponseEnvelope::invocation(
+                    result(InvocationOutcome::Succeeded, None),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )],
                 None,
             )
             .await;
@@ -2507,10 +2372,15 @@ mod tests {
             let directory = private_broker_directory();
             let leg = stub_leg(
                 directory.path(),
-                vec![ResponseEnvelope::invocation(result(
-                    InvocationOutcome::Denied,
-                    Some("authorization refused this invocation"),
-                ))],
+                vec![ResponseEnvelope::invocation(
+                    result(
+                        InvocationOutcome::Denied,
+                        Some("authorization refused this invocation"),
+                    ),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )],
             )
             .await;
             let (sink, progress) = recording_sink();
@@ -2559,35 +2429,6 @@ mod tests {
                 vec![
                     format!("started {CAPABILITY} arguments=1 calls=0/4"),
                     format!("finished {CAPABILITY} Cancelled"),
-                ]
-            );
-        }
-
-        #[tokio::test(flavor = "multi_thread")]
-        async fn an_accepted_attachment_is_reported_where_it_is_accepted() {
-            // The reply carrying the bytes is posted when the whole session ends; the only thing
-            // there is to say in between is that a picture exists and how big it is.
-            let directory = private_broker_directory();
-            let leg = stub_leg(
-                directory.path(),
-                vec![ResponseEnvelope::invocation(offered_attachment())],
-            )
-            .await;
-            let (sink, progress) = recording_sink();
-            let leg = leg
-                .with_provider_attachments(Arc::new(ReplyAttachments::new(1)))
-                .with_progress(progress, 4);
-
-            assert!(matches!(
-                invoke(leg, CAPABILITY).await,
-                CapabilityCallResult::Succeeded(_)
-            ));
-            assert_eq!(
-                sink.labels(),
-                vec![
-                    format!("started {CAPABILITY} arguments=1 calls=1/4"),
-                    "attachment 0 image/png 23".to_owned(),
-                    format!("finished {CAPABILITY} Succeeded"),
                 ]
             );
         }
@@ -2671,10 +2512,12 @@ mod tests {
                 directory.path(),
                 vec![
                     proposal_of(CAPABILITY),
-                    ResponseEnvelope::invocation(result(
-                        InvocationOutcome::Denied,
-                        Some("policy-denied"),
-                    )),
+                    ResponseEnvelope::invocation(
+                        result(InvocationOutcome::Denied, Some("policy-denied")),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    ),
                 ],
             )
             .await;

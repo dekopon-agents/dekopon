@@ -53,7 +53,7 @@ credentials and model credentials only. Provider credentials and policy remain i
    `whatsapp.<wa_id>`, and a `via`-scoped `agent.prompt` policy grant. A signed webhook does not mint
    a principal or bypass broker policy.
 
-PNG/JPEG photos with an optional caption and provider-produced PNG replies are supported. Video,
+PNG/JPEG photos with an optional caption and explicitly queued PNG/JPEG replies are supported. Video,
 documents, stickers, templates, interactive messages,
 reactions, status processing, business-management APIs, embedded signup, webhook multiplexing, and
 TLS termination are out of scope. Meta rejects free-form replies outside its customer-service
@@ -71,11 +71,11 @@ that agent and install the external GPT-image provider in the **broker**, with o
 constraints, credential binding, and policy for `gpt-image.edit` (and `gpt-image.generate` if desired).
 This example does not install a provider or grant authority. Do not put its API key in the gateway.
 
-`chatAssetInputs: [gpt-image.edit]` lets the model propose
-`{"prompt":"Make the sky purple","images":["chat-asset:1"]}` using a numbered photo reference.
-`providerAttachments` returns the authorized provider's PNG without putting image bytes in the
-shell, result transcript, or conversation history. A photo without a caption is still admitted;
-the agent can ask what edit is wanted. Keep the two opt-ins absent for a text-only route.
+The model proposes numbered references such as `{"images":["chat-asset:1"]}`; the gateway passes
+read-only descriptors without expanding JSON. A handle-aware provider attaches its output to the
+conversation; a separate broker-authorized `asset.send` delivers it. The WhatsApp adapter accepts
+`image/png` and `image/jpeg` only. Put those types in route instructions and plan conversion for
+other formats. A captionless photo is still admitted; the agent can ask what edit is wanted.
 
 Images are limited to **5,000,000 bytes** in either direction (smaller than the generic 8 MiB
 attachment slot). Oversized output is refused before any upload/send; no transcoding occurs.

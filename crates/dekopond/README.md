@@ -23,15 +23,11 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
 - **Chat assets** — Slack, Discord, and Telegram photos/files plus WhatsApp PNG/JPEG photos become bounded references
   that a model opens on demand. Discord signed CDN URLs are host-checked, streamed under the same
   8 MiB ceiling, and refreshed from the exact source message after expiry.
-- **Provider attachments** — a route with `providerAttachments` delivers the PNGs an authorized
-  capability returned: the reserved `attachments` result key is stripped before the shell sees it,
-  each entry validated at up to 8 MiB, and the bytes uploaded natively on Slack/Discord/Telegram/WhatsApp or
-  written to the local protocol without entering prompts or memory. A route listing
-  `chatAssetInputs` does the reverse for those capabilities, expanding a `chat-asset:<N>` input
-  marker into a data URL before proposing. WhatsApp accepts inbound PNG/JPEG and outgoing PNG
-  up to 5,000,000 bytes, with lazy pinned-host downloads and Graph media upload/image-ID replies.
-  Editing uses the existing `gpt-image.edit` route opt-in and an image-capable model; the provider
-  and its credential remain broker-owned.
+- **Asset handles** — exact proposal references carry read-only descriptors, never expanded bytes.
+  Successful typed outputs join the scoped disk LRU; attaching does not send. Broker-authorized
+  `asset.send` queues at most four files per turn, with persistent sent flags and bounded failure
+  notices. Slack/Discord/local accept concrete valid media types; Telegram/WhatsApp send PNG/JPEG.
+  WhatsApp retains its 5,000,000-byte ceiling. See the [asset contract](../../docs/dekopond.md#asset-handles-and-delivery).
 - **Liveness** — disabled unless opted in, and only after fresh authorization. Default `progress: auto`
   prefers native status, then typing/reaction, avoiding redundant progress messages; explicit
   `progress: message` retains one delayed editable surface finalized as the answer. Auto also permits
@@ -89,12 +85,11 @@ graph excludes `dekopon-broker`, `dekopon-broker-host`, `dekopon-brokerd`, `deko
 `dekopon-storage-host`, and `dekopon-policy`, and CI's `cargo tree` gate enforces that; only its
 tests link `dekopon-brokerd` and `dekopon-storage-host`, as dev-dependencies.
 
-Producing an attachment is provider authority; delivering one is not. The gateway holds no image
-credential: a capability the broker authorized returns the bytes, and owner configuration plus the
-authenticated envelope fix whether and where they go. The model chooses neither — it reads only
-`attached` metadata. Attachment bytes cross broker IPC in expanded inputs and provider results,
-but the gateway keeps them out of the shell, model transcript, and conversation history. Broker
-input spans include expanded data; the byte-free gateway result is not a broker-telemetry filter.
+Producing and sending assets are separately broker-authorized effects. The gateway holds no image
+credential, accepts no provider path and changes no proposal reference into bytes. Typed metadata
+and read-only descriptors cross broker IPC; outputs are retained without a copy and explicit sends
+use only authenticated reply coordinates. Provider bytes remain outside shell, model transcripts,
+history and asset trace fields.
 
 Message text is untrusted end to end, and so are the agent's own standing orders and mounted
 skills from the catalog: none of them can assert identity, name a principal, or widen a grant. An

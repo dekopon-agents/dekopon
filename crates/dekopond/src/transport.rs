@@ -772,6 +772,9 @@ pub(crate) fn reserve_for_chunk(buffer: &mut Vec<u8>, chunk: usize, limit: usize
 /// of them carries a credential, and the daemon logs the category rather than the message.
 #[derive(Debug, Error)]
 pub enum TransportError {
+    /// The existing adapter cannot deliver this declared format.
+    #[error("unsupported asset content type; this transport accepts {accepted}")]
+    AssetType { accepted: &'static str },
     #[error("{0}")]
     Attachment(#[from] dekopon_model::asset::BlobError),
     #[error("attachment hydration task failed ({reason}); provider already executed")]
@@ -824,6 +827,7 @@ impl TransportError {
         match self {
             Self::Attachment(_) => "attachment-storage",
             Self::AttachmentTask { .. } => "attachment-task",
+            Self::AssetType { .. } => "asset-type",
             Self::MissingCredential { .. } => "missing-credential",
             Self::EmptyCredential { .. } => "empty-credential",
             Self::NonUtf8Credential { .. } => "non-utf8-credential",

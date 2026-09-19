@@ -2,7 +2,9 @@
 
 use std::{
     fmt,
-    io::{self, Read, Seek, SeekFrom, Write},
+    fs::File,
+    io::{self, Write},
+    os::{fd::OwnedFd, unix::fs::FileExt},
     sync::{Arc, Mutex},
     time::Instant,
 };
@@ -48,8 +50,31 @@ impl From<io::Error> for BlobError {
     }
 }
 
+enum BlobFile {
+    Path(NamedTempFile),
+    Fd(File),
+}
+
+impl BlobFile {
+    fn as_file(&self) -> &File {
+        match self {
+            Self::Path(file) => file.as_file(),
+            Self::Fd(file) => file,
+        }
+    }
+    fn close(self) -> io::Result<()> {
+        match self {
+            Self::Path(file) => file.close(),
+            Self::Fd(file) => {
+                drop(file);
+                Ok(())
+            }
+        }
+    }
+}
+
 struct Owner {
-    file: Mutex<Option<NamedTempFile>>,
+    file: Mutex<Option<BlobFile>>,
     directory: Option<TempDir>,
     len: usize,
     origin: tracing::Span,
@@ -112,7 +137,7 @@ impl DiskBlob {
             let directory = builder.tempdir()?;
             let file = NamedTempFile::new_in(directory.path())?;
             let owner = Owner {
-                file: Mutex::new(Some(file)),
+                file: Mutex::new(Some(BlobFile::Path(file))),
                 directory: Some(directory),
                 len: bytes.len(),
                 origin,
@@ -122,7 +147,9 @@ impl DiskBlob {
                     .file
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let file = guard.as_mut().expect("unpublished owner holds a file");
+                let Some(BlobFile::Path(file)) = guard.as_mut() else {
+                    return Err(BlobError::Reclaimed);
+                };
                 write(file, bytes)?;
                 if file.as_file().metadata()?.len() != bytes.len() as u64 {
                     return Err(BlobError::LengthChanged);
@@ -130,6 +157,66 @@ impl DiskBlob {
             }
             Ok(Self(Arc::new(owner)))
         })
+    }
+
+    /// Admits a read-only broker descriptor without copying its contents.
+    ///
+    /// # Errors
+    /// Refuses a changed fstat length or a stored payload over the per-asset ceiling.
+    pub fn from_descriptor(descriptor: OwnedFd, len: usize) -> Result<Self, BlobError> {
+        if len > MAX_ATTACHMENT_BYTES {
+            return Err(BlobError::TooLarge);
+        }
+        let file = File::from(descriptor);
+        if file.metadata()?.len() != len as u64 {
+            return Err(BlobError::LengthChanged);
+        }
+        Ok(Self(Arc::new(Owner {
+            file: Mutex::new(Some(BlobFile::Fd(file))),
+            directory: None,
+            len,
+            origin: tracing::Span::current(),
+        })))
+    }
+
+    /// Obtains a read-only, close-on-exec descriptor for one invocation.
+    ///
+    /// Path-backed scratch has a writable owner, so it is opened afresh; a broker output is
+    /// read-only by construction and can be duplicated because all readers are positional.
+    /// # Errors
+    /// Refuses reclaimed files, changed lengths or descriptor IO failure.
+    pub fn descriptor(&self) -> Result<OwnedFd, BlobError> {
+        let guard = self
+            .0
+            .file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let file = guard.as_ref().ok_or(BlobError::Reclaimed)?;
+        let descriptor = match file {
+            BlobFile::Path(file) => File::open(file.path())?,
+            BlobFile::Fd(file) => file.try_clone()?,
+        };
+        if descriptor.metadata()?.len() != self.len() as u64 {
+            return Err(BlobError::LengthChanged);
+        }
+        Ok(descriptor.into())
+    }
+
+    /// Reads a bounded range without observing or changing a shared file offset.
+    /// # Errors
+    /// Refuses reclaimed, truncated or otherwise unreadable files.
+    pub fn read_exact_at(&self, bytes: &mut [u8], offset: u64) -> Result<(), BlobError> {
+        let guard = self
+            .0
+            .file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let file = guard.as_ref().ok_or(BlobError::Reclaimed)?.as_file();
+        if file.metadata()?.len() != self.len() as u64 {
+            return Err(BlobError::LengthChanged);
+        }
+        file.read_exact_at(bytes, offset)?;
+        Ok(())
     }
 
     /// Whether an active consumer holds a pin in addition to the cache owner.
@@ -153,7 +240,7 @@ impl DiskBlob {
                 .file
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(owned) = file.as_ref() {
+            if let Some(BlobFile::Path(owned)) = file.as_ref() {
                 match std::fs::remove_file(owned.path()) {
                     Ok(()) => (),
                     Err(error) if error.kind() == io::ErrorKind::NotFound => (),
@@ -178,7 +265,7 @@ impl DiskBlob {
         self.len() == 0
     }
 
-    /// Materializes one bounded consumption buffer. Concurrent readers serialize descriptor seeks.
+    /// Materializes one bounded consumption buffer using positional reads only.
     ///
     /// # Errors
     /// Returns a sanitized IO or length failure; never substitutes empty bytes or retries a call.
@@ -191,21 +278,8 @@ impl DiskBlob {
         };
         parent.in_scope(|| {
             operation("read", self.len(), || {
-                let mut guard = self
-                    .0
-                    .file
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let file = guard.as_mut().ok_or(BlobError::Reclaimed)?;
-                if file.as_file().metadata()?.len() != self.len() as u64 {
-                    return Err(BlobError::LengthChanged);
-                }
-                file.seek(SeekFrom::Start(0))?;
-                let mut bytes = Vec::with_capacity(self.len());
-                file.take(self.len() as u64 + 1).read_to_end(&mut bytes)?;
-                if bytes.len() != self.len() {
-                    return Err(BlobError::LengthChanged);
-                }
+                let mut bytes = vec![0; self.len()];
+                self.read_exact_at(&mut bytes, 0)?;
                 Ok(bytes)
             })
         })
@@ -219,6 +293,12 @@ pub trait BlobSource: Send + Sync {
     /// # Errors
     /// Returns a sanitized retention or IO failure.
     fn pin(&self) -> Result<DiskBlob, BlobError>;
+    /// Reads the consumer representation, decoding retained encodings when necessary.
+    /// # Errors
+    /// Returns the same scoped retention and IO failures as pinning.
+    fn read(&self) -> Result<Vec<u8>, BlobError> {
+        self.pin()?.read()
+    }
 }
 
 /// Byte-free model reference. Clones do not acquire a disk pin.
@@ -248,7 +328,7 @@ impl BlobReference {
     /// # Errors
     /// Returns the resolver's retention failure or the descriptor's IO failure.
     pub fn read(&self) -> Result<Vec<u8>, BlobError> {
-        self.source.pin()?.read()
+        self.source.read()
     }
     /// Explicit gateway notice substituted for a released historical attachment.
     #[must_use]
@@ -293,7 +373,7 @@ impl Drop for Owner {
                     .get_mut()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take();
-                let file_result = file.map_or(Ok(()), NamedTempFile::close);
+                let file_result = file.map_or(Ok(()), BlobFile::close);
                 let directory_result = self.directory.take().map_or(Ok(()), TempDir::close);
                 file_result?;
                 directory_result?;
@@ -335,6 +415,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pathless_descriptors_are_reusable_and_positional_across_invocations() {
+        let original = DiskBlob::from_bytes(b"0123456789").unwrap();
+        let blob = DiskBlob::from_descriptor(original.descriptor().unwrap(), 10).unwrap();
+        drop(original);
+        for _ in 0..2 {
+            let first = File::from(blob.descriptor().unwrap());
+            let second = File::from(blob.descriptor().unwrap());
+            let mut prefix = [0; 4];
+            first.read_exact_at(&mut prefix, 0).unwrap();
+            assert_eq!(&prefix, b"0123");
+            assert_eq!(blob.read().unwrap(), b"0123456789");
+            first.read_exact_at(&mut prefix, 4).unwrap();
+            assert_eq!(&prefix, b"4567");
+            second.read_exact_at(&mut prefix, 0).unwrap();
+            assert_eq!(&prefix, b"0123");
+            assert!(first.write_at(b"x", 0).is_err());
+        }
+        blob.reclaim().unwrap();
+        assert_eq!(blob.read(), Err(BlobError::Reclaimed));
+        assert!(blob.0.file.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn descriptor_admission_checks_fstat_and_the_exact_ceiling() {
+        let blob = DiskBlob::from_bytes(&vec![0; MAX_ATTACHMENT_BYTES]).unwrap();
+        assert!(
+            DiskBlob::from_descriptor(blob.descriptor().unwrap(), MAX_ATTACHMENT_BYTES).is_ok()
+        );
+        assert_eq!(
+            DiskBlob::from_descriptor(blob.descriptor().unwrap(), MAX_ATTACHMENT_BYTES + 1),
+            Err(BlobError::TooLarge)
+        );
+        assert_eq!(
+            DiskBlob::from_descriptor(blob.descriptor().unwrap(), MAX_ATTACHMENT_BYTES - 1),
+            Err(BlobError::LengthChanged)
+        );
+    }
+
+    #[test]
     fn clones_and_concurrent_readers_keep_one_file_until_last_drop() {
         let blob = DiskBlob::from_bytes(b"private pixels").unwrap();
         let directory = blob.0.directory.as_ref().unwrap().path().to_owned();
@@ -358,7 +477,9 @@ mod tests {
         let blob = DiskBlob::from_bytes(b"pixels").unwrap();
         {
             let file = blob.0.file.lock().unwrap();
-            let file = file.as_ref().unwrap();
+            let BlobFile::Path(file) = file.as_ref().unwrap() else {
+                panic!("path fixture")
+            };
             std::fs::remove_file(file.path()).unwrap();
         }
         assert_eq!(blob.read().unwrap(), b"pixels");
@@ -379,10 +500,13 @@ mod tests {
         let blob = DiskBlob::from_bytes(b"pixels").unwrap();
         {
             let mut guard = blob.0.file.lock().unwrap();
-            let (file, path) = guard.take().unwrap().into_parts();
+            let BlobFile::Path(owned) = guard.take().unwrap() else {
+                panic!("path fixture")
+            };
+            let (file, path) = owned.into_parts();
             let write_only = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
             drop(file);
-            *guard = Some(NamedTempFile::from_parts(write_only, path));
+            *guard = Some(BlobFile::Path(NamedTempFile::from_parts(write_only, path)));
         }
         let error = blob.read().unwrap_err();
         assert!(matches!(error, BlobError::Io(_)));
@@ -397,7 +521,9 @@ mod tests {
         other.write_all(b"not the image").unwrap();
         {
             let guard = blob.0.file.lock().unwrap();
-            let file = guard.as_ref().unwrap();
+            let BlobFile::Path(file) = guard.as_ref().unwrap() else {
+                panic!("path fixture")
+            };
             std::fs::remove_file(file.path()).unwrap();
             std::os::unix::fs::symlink(other.path(), file.path()).unwrap();
         }
@@ -427,15 +553,13 @@ mod tests {
     fn reclaim_unlinks_disk_and_failed_unlink_preserves_the_owner() {
         let blob = DiskBlob::from_bytes(b"pixels").unwrap();
         let directory = blob.0.directory.as_ref().unwrap().path().to_owned();
-        let path = blob
-            .0
-            .file
-            .lock()
-            .unwrap()
-            .as_ref()
-            .unwrap()
-            .path()
-            .to_owned();
+        let path = {
+            let guard = blob.0.file.lock().unwrap();
+            let BlobFile::Path(file) = guard.as_ref().unwrap() else {
+                panic!("path fixture")
+            };
+            file.path().to_owned()
+        };
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
         assert!(matches!(blob.reclaim(), Err(BlobError::Io(_))));

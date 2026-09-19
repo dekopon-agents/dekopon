@@ -9,7 +9,7 @@ use super::TransportError;
 
 pub(super) struct HydratedImage {
     pub filename: String,
-    pub media_type: &'static str,
+    pub media_type: String,
     pub bytes: Vec<u8>,
 }
 
@@ -49,9 +49,26 @@ impl ImageQueue {
         }
     }
 
-    /// Byte counts of the images still to be posted, without materializing any of them.
-    pub(super) fn lengths(&self) -> impl Iterator<Item = usize> + '_ {
-        self.images.iter().map(GeneratedImage::len)
+    /// Preflights every upload length off the async worker without materializing payloads.
+    /// As with `read_all`, the blocking task owns all leases until IO completes.
+    pub(super) async fn decoded_lengths(&mut self) -> Result<Vec<usize>, TransportError> {
+        let taken = std::mem::take(&mut self.images);
+        let span = tracing::Span::current();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        let task = tokio::task::spawn_blocking(move || {
+            tracing::dispatcher::with_default(&dispatch, || {
+                span.in_scope(move || {
+                    let lengths = taken
+                        .iter()
+                        .map(GeneratedImage::decoded_len)
+                        .collect::<Result<Vec<_>, BlobError>>();
+                    (taken, lengths)
+                })
+            })
+        });
+        let (taken, lengths) = join(task.await)?;
+        self.images = taken;
+        lengths.map_err(TransportError::from)
     }
 
     /// The gateway-owned name each remaining attachment will be posted under, in order.
@@ -97,7 +114,7 @@ impl ImageQueue {
                         .map(|(index, image)| {
                             Ok(HydratedImage {
                                 filename: image.filename(first + index),
-                                media_type: image.media_type(),
+                                media_type: image.media_type().to_owned(),
                                 bytes: image.bytes()?,
                             })
                         })
@@ -165,7 +182,7 @@ fn hydrate_images_with(
                         .enumerate()
                         .map(|(index, image)| {
                             let filename = image.filename(first_index + index);
-                            let media_type = image.media_type();
+                            let media_type = image.media_type().to_owned();
                             let bytes = read(image)?;
                             Ok(HydratedImage {
                                 filename,
@@ -186,8 +203,81 @@ fn hydrate_images_with(
     }
 }
 
+/// Adapter-supported formats; encoding conversion is independent of content format.
+pub(super) enum AcceptedTypes {
+    Files,
+    Photos,
+}
+pub(super) fn validate_types(
+    images: &[GeneratedImage],
+    accepted: AcceptedTypes,
+) -> Result<(), TransportError> {
+    for image in images {
+        let label = image.media_type();
+        let valid =
+            !label.contains('*') && reqwest::multipart::Part::text("").mime_str(label).is_ok();
+        let allowed = match accepted {
+            AcceptedTypes::Files => valid,
+            AcceptedTypes::Photos => valid && matches!(label, "image/png" | "image/jpeg"),
+        };
+        if !allowed {
+            let accepted = match accepted {
+                AcceptedTypes::Files => "any concrete valid media type",
+                AcceptedTypes::Photos => "image/png, image/jpeg",
+            };
+            return Err(TransportError::AssetType { accepted });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn file_and_photo_adapters_refuse_unsupported_labels_before_hydration() {
+        use super::{AcceptedTypes, validate_types};
+        use dekopon_broker_protocol::AssetEncoding;
+        use dekopon_model::asset::DiskBlob;
+        for label in [
+            "image/png",
+            "image/jpeg",
+            "image/webp",
+            "application/pdf",
+            "text/plain",
+            "application/octet-stream",
+            "",
+            "image/*",
+            "not a mime",
+        ] {
+            let images = vec![dekopon_agent::attachment::GeneratedImage::new(
+                DiskBlob::from_bytes(b"bounded").unwrap(),
+                label.to_owned(),
+                AssetEncoding::Identity,
+            )];
+            for (adapter, allowed, expected) in [
+                (
+                    AcceptedTypes::Files,
+                    !matches!(label, "" | "image/*" | "not a mime"),
+                    "any concrete valid media type",
+                ),
+                (
+                    AcceptedTypes::Photos,
+                    matches!(label, "image/png" | "image/jpeg"),
+                    "image/png, image/jpeg",
+                ),
+            ] {
+                match validate_types(&images, adapter) {
+                    Ok(()) => assert!(allowed, "{label} must be refused"),
+                    Err(TransportError::AssetType { accepted }) => {
+                        assert!(!allowed, "{label} must be accepted");
+                        assert_eq!(accepted, expected);
+                    }
+                    Err(error) => panic!("expected AssetType for {label}, got {error:?}"),
+                }
+            }
+        }
+    }
+
     use super::*;
     use dekopon_test_support::{CaptureLayer, Record};
     use std::{
@@ -239,9 +329,9 @@ mod tests {
             assert_eq!(
                 image.filename,
                 if index == 0 {
-                    "generated-image.png"
+                    "asset-1.png"
                 } else {
-                    "generated-image-2.png"
+                    "asset-2.png"
                 }
             );
         }
@@ -291,13 +381,13 @@ mod tests {
             .with(capture.clone())
             .set_default();
         let mut queue = ImageQueue::new(images());
-        assert_eq!(queue.lengths().collect::<Vec<_>>(), vec![PNG.len(); 2]);
+        assert_eq!(queue.decoded_lengths().await.unwrap(), vec![PNG.len(); 2]);
         assert!(!queue.is_empty());
 
         let (index, first) = queue.next().await.unwrap().unwrap();
 
         assert_eq!(index, 0);
-        assert_eq!(first.filename, "generated-image.png");
+        assert_eq!(first.filename, "asset-1.png");
         assert_eq!(first.bytes, PNG);
         assert_eq!(
             reads(&capture),
@@ -308,7 +398,7 @@ mod tests {
         let (index, second) = queue.next().await.unwrap().unwrap();
 
         assert_eq!(index, 1);
-        assert_eq!(second.filename, "generated-image-2.png");
+        assert_eq!(second.filename, "asset-2.png");
         assert_eq!(reads(&capture), 2);
         assert!(queue.next().await.is_none());
         assert!(queue.is_empty());
@@ -363,8 +453,8 @@ mod tests {
         assert!(!queue.is_empty(), "the leases did not come back");
         for read in [first, second] {
             assert_eq!(read.len(), 2);
-            assert_eq!(read[0].filename, "generated-image.png");
-            assert_eq!(read[1].filename, "generated-image-2.png");
+            assert_eq!(read[0].filename, "asset-1.png");
+            assert_eq!(read[1].filename, "asset-2.png");
             assert!(read.iter().all(|image| image.bytes == PNG));
         }
     }
