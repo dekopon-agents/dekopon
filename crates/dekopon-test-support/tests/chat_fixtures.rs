@@ -6,6 +6,8 @@
 //! a parked stream emits nothing at all, and that the driver's per-object switches and failure
 //! injection are independent of each other.
 
+#![allow(clippy::unwrap_used)]
+
 use std::{
     ops::ControlFlow,
     sync::{

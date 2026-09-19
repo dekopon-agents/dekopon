@@ -1,6 +1,9 @@
 //! Real broker/client subprocesses. On Linux root runs the distinct-UID acceptance;
 //! ordinary unprivileged package tests exercise the owner-client subprocess path.
 //! DEKOPON_REQUIRE_CROSS_UID=1 makes missing UID-switch authority a hard failure.
+
+#![allow(clippy::unwrap_used)]
+
 use std::{
     fs,
     os::unix::{

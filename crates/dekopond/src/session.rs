@@ -887,8 +887,11 @@ async fn session(
     let leg = leg.with_cancel_signal(cancellation.signal());
     // Request-local and dropped with the session: an attachment the route cannot deliver never
     // becomes bytes this process holds, and a cancelled or failed session drops the slot unread.
-    let attachments =
-        Arc::new(ReplyAttachments::new(route.provider_attachments).with_store(assets.clone()));
+    let attachments = Arc::new(
+        ReplyAttachments::new(route.provider_attachments).with_store(
+            Arc::clone(&assets) as Arc<dyn dekopon_agent::attachment::GeneratedAssetStore>
+        ),
+    );
     let leg = if route.provider_attachments > 0 {
         leg.with_provider_attachments(Arc::clone(&attachments))
     } else {

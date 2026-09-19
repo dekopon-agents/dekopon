@@ -24,6 +24,7 @@
 //! broker protocol.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 use std::time::Duration;
 
@@ -2459,7 +2460,7 @@ mod tests {
         /// One recorder, twice: the handle the assertions read and the trait object a leg takes.
         fn recording_sink() -> (Arc<RecordingSink>, Arc<dyn ProgressSink>) {
             let recorder = Arc::new(RecordingSink::default());
-            let installed: Arc<dyn ProgressSink> = recorder.clone();
+            let installed = Arc::clone(&recorder) as Arc<dyn ProgressSink>;
             (recorder, installed)
         }
 

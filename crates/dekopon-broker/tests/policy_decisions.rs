@@ -9,6 +9,8 @@
 //! The `agent.prompt` rows have no exact-engine counterpart — the session gate is authority the
 //! Cedar migration adds — so they are asserted against their documented intent alone.
 
+#![allow(clippy::unwrap_used)]
+
 use std::{collections::BTreeMap, sync::Arc};
 
 use dekopon_broker::{

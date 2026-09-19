@@ -1,4 +1,7 @@
 //! Real-binary startup, diagnostics, and JSON tracing for the operator's mmap toggle.
+
+#![allow(clippy::unwrap_used)]
+
 use dekopon_test_support::provider_fixture;
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};

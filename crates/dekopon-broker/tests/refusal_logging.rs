@@ -11,6 +11,8 @@
 //! global dispatcher, so a sibling test hitting these callsites with no subscriber installed can
 //! disable them for the whole process.
 
+#![allow(clippy::unwrap_used)]
+
 use std::{collections::BTreeMap, sync::Arc};
 
 use dekopon_broker::{

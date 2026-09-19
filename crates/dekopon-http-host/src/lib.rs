@@ -9,6 +9,7 @@
 //! [`ErrorCode::Denied`] rather than returned to the component.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 use std::{
     borrow::Cow,

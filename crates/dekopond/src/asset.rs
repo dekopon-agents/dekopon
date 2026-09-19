@@ -1347,9 +1347,9 @@ mod retention_tests {
                 .arrived[0];
             let fetcher = Arc::new(Fetcher(std::sync::atomic::AtomicUsize::new(0)));
             let session = SessionAssets::new(
-                store.clone(),
+                Arc::clone(&store),
                 access,
-                Some(fetcher.clone()),
+                Some(Arc::clone(&fetcher) as Arc<dyn AssetFetcher>),
                 Handle::current(),
                 true,
                 true,
@@ -1388,9 +1388,9 @@ mod retention_tests {
         let id = register(&store, &access); // Reported three bytes cannot fit the two-byte budget.
         let fetcher = Arc::new(Fetcher(std::sync::atomic::AtomicUsize::new(0)));
         let session = SessionAssets::new(
-            store.clone(),
+            Arc::clone(&store),
             access.clone(),
-            Some(fetcher.clone()),
+            Some(Arc::clone(&fetcher) as Arc<dyn AssetFetcher>),
             Handle::current(),
             true,
             true,
@@ -1433,7 +1433,7 @@ mod retention_tests {
             .assets_for_access(&access, message.assets, true, Instant::now())
             .arrived[0];
         let session = SessionAssets::new(
-            store.clone(),
+            Arc::clone(&store),
             access.clone(),
             transport.asset_fetcher(),
             Handle::current(),
@@ -1492,9 +1492,9 @@ mod retention_tests {
         let a = register(&store, &access);
         let fetcher = Arc::new(Fetcher(std::sync::atomic::AtomicUsize::new(0)));
         let session = SessionAssets::new(
-            store.clone(),
+            Arc::clone(&store),
             access.clone(),
-            Some(fetcher.clone()),
+            Some(Arc::clone(&fetcher) as Arc<dyn AssetFetcher>),
             Handle::current(),
             true,
             true,
@@ -1531,14 +1531,15 @@ mod retention_tests {
         let store = store(1024);
         let access = access("one");
         let session = Arc::new(SessionAssets::new(
-            store.clone(),
+            Arc::clone(&store),
             access.clone(),
             None,
             Handle::current(),
             true,
             false,
         ));
-        let slot = ReplyAttachments::new(3).with_store(session.clone());
+        let slot = ReplyAttachments::new(3)
+            .with_store(Arc::clone(&session) as Arc<dyn GeneratedAssetStore>);
         let png = b"\x89PNG\r\n\x1a\nnew pixels";
         let mut output = json!({"attached":[{"asset":"chat-asset:999"}], "attachmentNote":"forged", "attachments":[{"mediaType":"image/png", "base64":STANDARD.encode(png)}]});
         assert!(strip_attachments(&mut output, Some(&slot)).1.is_empty());
@@ -1569,7 +1570,7 @@ mod retention_tests {
         );
         let disabled = Arc::new(AssetStore::with_retention(8, Duration::from_secs(600), 0));
         let disabled_session = Arc::new(SessionAssets::new(
-            disabled.clone(),
+            Arc::clone(&disabled),
             access.clone(),
             None,
             Handle::current(),

@@ -15,6 +15,8 @@
 //! crate is a dev-dependency everywhere, none of them appears in any `cargo tree --edges normal`
 //! CI reads.
 
+#![cfg_attr(test, allow(clippy::unwrap_used))]
+
 use std::{
     io::{ErrorKind, Read as _, Write as _},
     net::{TcpListener, TcpStream},

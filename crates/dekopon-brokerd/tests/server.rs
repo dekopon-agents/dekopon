@@ -1,3 +1,5 @@
+#![allow(clippy::unwrap_used)]
+
 use std::{
     collections::BTreeMap, fs, os::unix::fs::PermissionsExt as _, path::Path, sync::Arc,
     time::Duration,

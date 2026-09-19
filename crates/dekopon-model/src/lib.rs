@@ -4,6 +4,7 @@
 //! a separate concern and are never exposed through these clients.
 
 #![forbid(unsafe_code)]
+#![cfg_attr(test, allow(clippy::unwrap_used))]
 
 use std::time::Duration;
 

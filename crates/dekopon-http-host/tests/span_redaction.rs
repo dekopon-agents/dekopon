@@ -6,6 +6,8 @@
 //! A dedicated binary with one global subscriber is the only arrangement where this assertion is
 //! not order-dependent.
 
+#![allow(clippy::unwrap_used)]
+
 use std::time::Duration;
 
 use dekopon_capability::HttpConstraints;

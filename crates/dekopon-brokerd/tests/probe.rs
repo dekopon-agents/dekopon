@@ -1,4 +1,7 @@
 //! Black-box health checks never start the daemon or load configuration.
+
+#![allow(clippy::unwrap_used)]
+
 use std::{
     fs,
     os::unix::fs::PermissionsExt as _,

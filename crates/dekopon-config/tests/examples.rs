@@ -5,6 +5,8 @@
 //! example promises, breaks instructions a reader follows literally. Both review examples may
 //! propose a comment and neither may approve or merge.
 
+#![allow(clippy::unwrap_used)]
+
 use std::path::{Path, PathBuf};
 
 use dekopon_config::LocalCatalog;

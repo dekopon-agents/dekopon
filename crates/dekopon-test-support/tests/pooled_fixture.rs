@@ -5,6 +5,8 @@
 //! connection the client was actually waiting on. A caller with a deadline of its own then had a
 //! coin flip on its hands, which is what these two elapsed-time bounds are here to keep fixed.
 
+#![allow(clippy::unwrap_used)]
+
 use std::{
     io::{Read as _, Write as _},
     net::TcpStream,

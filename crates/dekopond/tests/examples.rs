@@ -7,6 +7,7 @@
 //! `modelClass` no configured model offers — caught at test time instead of in someone's terminal.
 
 #![cfg(unix)]
+#![allow(clippy::unwrap_used)]
 
 use std::path::PathBuf;
 
