@@ -20,6 +20,12 @@ pub use dekopon_capability::{InvocationOutcome, InvocationResult};
 pub use dekopon_core::ProviderFailureDetail;
 
 mod conversation;
+#[cfg(unix)]
+mod descriptor;
+#[cfg(unix)]
+pub use descriptor::DescriptorStream;
+#[cfg(unix)]
+use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
 
 pub use conversation::{
     Conversation, ConversationKind, ConversationKindMatch, ConversationMatch,
@@ -825,12 +831,19 @@ impl RequestEnvelope {
 
     /// Creates an invocation proposal request, optionally attested on behalf of a subject.
     #[must_use]
-    pub const fn invoke(attestation: Option<Attestation>, invocation: InvocationRequest) -> Self {
+    pub const fn invoke(
+        attestation: Option<Attestation>,
+        invocation: InvocationRequest,
+        assets: Vec<AssetRow>,
+        sends_remaining: u8,
+    ) -> Self {
         Self {
             api_version: ProtocolVersion::V1Alpha2,
             request: BrokerRequest::Invoke {
                 attestation,
                 invocation,
+                assets,
+                sends_remaining,
             },
         }
     }
@@ -921,6 +934,12 @@ pub enum BrokerRequest {
         attestation: Option<Attestation>,
         /// Proposal fields without principal or actor claims.
         invocation: InvocationRequest,
+        /// Conversation asset metadata, never asset bytes.
+        #[serde(default)]
+        assets: Vec<AssetRow>,
+        /// Deliveries still permitted in this turn.
+        #[serde(default, rename = "sendsRemaining")]
+        sends_remaining: u8,
     },
     /// Dedicated model-hidden recording operation after transport acceptance.
     ///
@@ -933,6 +952,93 @@ pub enum BrokerRequest {
         /// Typed post-acceptance fields the broker turns into the proposal itself.
         turn: DeliveredTurnRequest,
     },
+}
+
+impl BrokerRequest {
+    /// Checks the typed invocation's metadata bound after strict decoding.
+    pub fn validate(&self) -> Result<(), ProtocolError> {
+        if matches!(self, Self::Invoke { assets, .. } if assets.len() > MAX_ASSET_ROWS) {
+            return Err(ProtocolError::TooManyAssetRows);
+        }
+        Ok(())
+    }
+}
+
+/// Maximum conversation metadata rows on an invocation.
+pub const MAX_ASSET_ROWS: usize = 32;
+/// Maximum input references or attached outputs on one frame.
+pub const MAX_DESCRIPTORS_PER_FRAME: usize = 5;
+
+/// One row of the conversation's asset table; never asset bytes.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AssetRow {
+    /// Conversation-local number.
+    pub id: u64,
+    /// Declared media type.
+    pub content_type: String,
+    /// Representation of the stored bytes.
+    pub encoding: AssetEncoding,
+    /// Stored byte count.
+    pub bytes: u64,
+    /// Source label, not authority.
+    pub origin: String,
+    /// Whether delivery was already requested.
+    pub sent: bool,
+}
+
+/// Representation of bytes in an asset descriptor.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AssetEncoding {
+    /// Unencoded bytes.
+    Identity,
+    /// Canonical standard base64.
+    Base64,
+}
+
+/// An attached output, indexed into the frame's passed descriptors.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct NewAsset {
+    /// Zero-based descriptor index, equal to this output's position.
+    pub descriptor: u32,
+    /// Declared media type.
+    pub content_type: String,
+    /// Representation of the stored bytes.
+    pub encoding: AssetEncoding,
+    /// Stored byte count.
+    pub bytes: u64,
+    /// Lowercase hex SHA-256 digest.
+    pub sha256: String,
+}
+
+/// Conversation metadata and referenced inputs for one invocation.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+pub struct InvokeAssets {
+    /// The conversation's metadata table.
+    pub rows: Vec<AssetRow>,
+    /// Deliveries still permitted in this turn.
+    pub sends_remaining: u8,
+    /// Read-only inputs in distinct reference order.
+    pub descriptors: Vec<OwnedFd>,
+}
+
+/// A completed invocation together with its asset changes.
+#[cfg(unix)]
+#[derive(Debug)]
+pub struct AssetInvocationOutcome {
+    /// Terminal invocation result.
+    pub result: InvocationResult,
+    /// Attached output metadata in descriptor order.
+    pub attached: Vec<NewAsset>,
+    /// Removed conversation numbers.
+    pub removed: Vec<u64>,
+    /// Numbers marked for delivery.
+    pub sent: Vec<u64>,
+    /// Read-only attached output descriptors.
+    pub descriptors: Vec<OwnedFd>,
 }
 
 /// One strict public broker response.
@@ -990,10 +1096,20 @@ impl ResponseEnvelope {
 
     /// Creates a completed invocation response, including denials and provider failures.
     #[must_use]
-    pub const fn invocation(result: InvocationResult) -> Self {
+    pub const fn invocation(
+        result: InvocationResult,
+        attached: Vec<NewAsset>,
+        removed: Vec<u64>,
+        sent: Vec<u64>,
+    ) -> Self {
         Self {
             api_version: ProtocolVersion::V1Alpha2,
-            response: BrokerResponse::Invocation { result },
+            response: BrokerResponse::Invocation {
+                result,
+                attached,
+                removed,
+                sent,
+            },
         }
     }
 
@@ -1036,6 +1152,15 @@ pub enum BrokerResponse {
     Invocation {
         /// Denied, failed, or succeeded result with public evidence.
         result: InvocationResult,
+        /// Outputs in exactly the passed descriptor order.
+        #[serde(default)]
+        attached: Vec<NewAsset>,
+        /// Conversation assets removed by this invocation.
+        #[serde(default)]
+        removed: Vec<u64>,
+        /// Conversation assets marked for delivery.
+        #[serde(default)]
+        sent: Vec<u64>,
     },
     /// One command word run to completion: the answer to [`BrokerRequest::RunCommand`].
     ///
@@ -1334,6 +1459,28 @@ impl io::Write for BoundedJsonBuffer {
 /// Bounded framing or strict JSON failure.
 #[derive(Debug, Error)]
 pub enum ProtocolError {
+    /// Ancillary data did not fit the receive buffer.
+    #[error("broker frame descriptors were truncated")]
+    DescriptorsTruncated,
+    /// Received descriptor flags could not be secured.
+    #[error("could not set broker descriptor close-on-exec flags")]
+    DescriptorFlags {
+        /// Close-on-exec flag failure.
+        #[source]
+        source: io::Error,
+    },
+    /// A frame carried more descriptors than permitted.
+    #[error("broker frame has too many descriptors")]
+    TooManyDescriptors,
+    /// Only invocation frames may carry descriptors.
+    #[error("broker frame has unexpected descriptors")]
+    UnexpectedDescriptors,
+    /// Attached output indexes must exactly cover the received descriptors in order.
+    #[error("broker frame has invalid descriptor indexes")]
+    DescriptorIndex,
+    /// The conversation metadata exceeds its row bound.
+    #[error("broker frame has too many asset rows")]
+    TooManyAssetRows,
     /// Configured frame maximum was zero or exceeded the hard ceiling.
     #[error("frame maximum must be between 1 and {maximum} bytes")]
     InvalidFrameLimit {
@@ -1497,13 +1644,29 @@ impl BrokerClient {
         &self,
         attestation: Option<Attestation>,
         request: InvocationRequest,
-    ) -> Result<InvocationResult, ClientError> {
+        assets: InvokeAssets,
+    ) -> Result<AssetInvocationOutcome, ClientError> {
         let attestation = attestation.map(|claim| claim.bound_to(request.id.clone()));
-        match self
-            .exchange(RequestEnvelope::invoke(attestation, request))
-            .await?
-        {
-            BrokerResponse::Invocation { result } => Ok(result),
+        let descriptors: Vec<_> = assets.descriptors.iter().map(|fd| fd.as_fd()).collect();
+        let (response, descriptors) = self
+            .exchange_assets(
+                RequestEnvelope::invoke(attestation, request, assets.rows, assets.sends_remaining),
+                &descriptors,
+            )
+            .await?;
+        match response {
+            BrokerResponse::Invocation {
+                result,
+                attached,
+                removed,
+                sent,
+            } => Ok(AssetInvocationOutcome {
+                result,
+                attached,
+                removed,
+                sent,
+                descriptors,
+            }),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             BrokerResponse::Capabilities { .. } | BrokerResponse::CommandRun { .. } => {
                 Err(ClientError::UnexpectedResponse)
@@ -1522,7 +1685,7 @@ impl BrokerClient {
             .exchange(RequestEnvelope::record_delivered_turn(attestation, turn))
             .await?
         {
-            BrokerResponse::Invocation { result } => Ok(result),
+            BrokerResponse::Invocation { result, .. } => Ok(result),
             BrokerResponse::Error { code, message } => Err(ClientError::Remote { code, message }),
             BrokerResponse::Capabilities { .. } | BrokerResponse::CommandRun { .. } => {
                 Err(ClientError::UnexpectedResponse)
@@ -1531,12 +1694,27 @@ impl BrokerClient {
     }
 
     async fn exchange(&self, request: RequestEnvelope) -> Result<BrokerResponse, ClientError> {
+        Ok(self.exchange_assets(request, &[]).await?.0)
+    }
+
+    async fn exchange_assets(
+        &self,
+        request: RequestEnvelope,
+        descriptors: &[BorrowedFd<'_>],
+    ) -> Result<(BrokerResponse, Vec<OwnedFd>), ClientError> {
+        request
+            .request
+            .validate()
+            .map_err(|source| ClientError::Protocol {
+                phase: ExchangePhase::Request,
+                source,
+            })?;
         validate_socket_path(&self.socket, self.expected_server_uid).await?;
         #[allow(
             clippy::map_err_ignore,
             reason = "tokio's Elapsed says only that io_timeout expired, which ClientError::ConnectTimeout already states"
         )]
-        let mut stream = timeout(self.limits.io_timeout, UnixStream::connect(&self.socket))
+        let stream = timeout(self.limits.io_timeout, UnixStream::connect(&self.socket))
             .await
             .map_err(|_| ClientError::ConnectTimeout)?
             .map_err(|source| ClientError::Connect { source })?;
@@ -1552,20 +1730,48 @@ impl BrokerClient {
         // The phase is the whole point: everything up to and including this write leaves the
         // broker with no request to act on, and everything after it leaves this client unable to
         // say whether the request was acted on.
-        write_frame(&mut stream, &request, self.limits)
+        let mut stream = DescriptorStream::new(stream);
+        stream
+            .write_frame(&request, descriptors, self.limits)
             .await
             .map_err(|source| ClientError::Protocol {
                 phase: ExchangePhase::Request,
                 source,
             })?;
-        let response = read_frame::<_, ResponseEnvelope>(&mut stream, self.limits)
+        let (response, descriptors) = stream
+            .read_frame::<ResponseEnvelope>(self.limits)
             .await
             .map_err(|source| ClientError::Protocol {
                 phase: ExchangePhase::Response,
                 source,
             })?;
-        Ok(response.response)
+        validate_response_descriptors(&response.response, descriptors.len()).map_err(|source| {
+            ClientError::Protocol {
+                phase: ExchangePhase::Response,
+                source,
+            }
+        })?;
+        Ok((response.response, descriptors))
     }
+}
+
+#[cfg(unix)]
+fn validate_response_descriptors(response: &BrokerResponse, count: usize) -> Result<(), ProtocolError> {
+    match response {
+        BrokerResponse::Invocation { attached, .. } => {
+            if attached.len() != count
+                || attached
+                    .iter()
+                    .enumerate()
+                    .any(|(index, asset)| usize::try_from(asset.descriptor) != Ok(index))
+            {
+                return Err(ProtocolError::DescriptorIndex);
+            }
+        }
+        _ if count != 0 => return Err(ProtocolError::UnexpectedDescriptors),
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Applies the shared socket rules before every exchange, parent included.

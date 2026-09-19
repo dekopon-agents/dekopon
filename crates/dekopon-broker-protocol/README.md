@@ -46,8 +46,21 @@ Frames use a four-byte big-endian length followed by strict JSON. Reads, writes,
 and complete frames have independent positive limits and deadlines; oversized lengths are rejected
 before allocation, and an in-bound length is a claim the reader never pre-allocates against —
 payload buffers grow with the bytes that actually arrive, and a frame shorter than its prefix fails
-rather than decoding. One frame is one write. Each client operation uses a fresh Unix connection and
-validates the exact protocol version and response variant.
+rather than decoding. Frames without descriptors remain one write; an asset frame sends its first
+byte with `SCM_RIGHTS`, then the remaining bytes. `DescriptorStream` uses `recvmsg` for every read,
+including the four-byte prefix, and refuses truncated control data or more than five descriptors.
+Linux receives descriptors with `MSG_CMSG_CLOEXEC`; macOS immediately sets `FD_CLOEXEC` before
+exposing them. Rejected frames close their received descriptors. Each client operation uses a fresh
+Unix connection and validates the exact protocol version and response variant.
+
+`Invoke` carries at most 32 typed `AssetRow` metadata rows and `sendsRemaining`, with read-only
+input descriptors in reference order; `RunCommand` carries neither. `Invocation` returns typed
+`attached`, `removed`, and `sent` fields. Each attached output's `descriptor` equals its position,
+and the output count must exactly match the received descriptor count. Typed request/response
+callers reject descriptors on other variants; the generic frame codec does not inspect metadata.
+`BrokerClient::invoke` accepts `InvokeAssets` and returns `AssetInvocationOutcome`, preserving
+`ClientError` and its execution-phase distinction. Metadata and descriptor possession grant no
+provider authority.
 
 `ClientError` distinguishes the phase a framing failure belongs to, because the wire's
 `broker-unavailable` / `outcome-unaudited` split is worth nothing if a client-local timeout erases
