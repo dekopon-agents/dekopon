@@ -53,3 +53,133 @@ The model proposes; a separate broker authorizes and executes provider effects.
   Local tests do not prove deployed behavior or remote CI; never claim otherwise.
 - Follow the [PR checklist](docs/development.md#before-opening-a-pull-request); required CI and human review precede merge.
   Automated agents never approve their own changes.
+
+## Rust guidelines
+
+The tone of dekopon's Rust, for any agent that writes it. Where a rule and the surrounding code
+disagree, match the code and say so in the PR. Each rule: one sentence of why, then the pair to
+mirror.
+
+### Authority
+
+Contract surfaces stop and ask: WIT, wire frames and their fields, config keys and values, chart
+values and mounts, what is deleted, the proof-gate invariants. Everything inside a crate is yours;
+decide, mirror the nearest sibling, list it in your report under "Choices I made". Public crate
+APIs are internals for now.
+
+- Yes: pick `AssetInputs { rows, descriptors, sends_remaining }` as the host's parameter type and report it.
+- No: `contact_supervisor("should the parameter be named AssetInputs or InvokeAssets?")`
+
+### Errors
+
+Typed variants are what callers match on to refuse; a string can only be printed.
+
+- Yes:
+  ```rust
+  #[derive(Debug, Error)]
+  pub enum AssetError {
+      #[error("asset exceeds the per-asset ceiling")]
+      TooLarge,
+      #[error("could not read the asset")]
+      Io { kind: io::ErrorKind },
+  }
+  ```
+- No: `Err(format!("asset too large: {bytes}"))`, `anyhow!("read failed")`, `Io(io::Error)` across the broker boundary, `assert!(msg.contains("too large"))` in a test.
+
+### Dispatch
+
+A closed enum makes the compiler find every match arm when the next kind arrives.
+
+- Yes: `enum Source { File { fd: OwnedFd, cursor: u64, len: u64 } }` … `match source { Source::File { .. } => … }`
+- No: `Box<dyn AssetSource>` with one implementer, or `trait Source { fn read(&mut self, …) }` plus generics threaded through every caller.
+
+### Newtypes
+
+Two `u64`s that mean different things must not be swappable.
+
+- Yes: `struct AssetId(u64); struct DescriptorIndex(u32);`
+- No: `fn admit(id: u64, descriptor: u64, bytes: u64)`
+
+### Panics
+
+The broker holds the credentials; one bad frame must not take it down.
+
+- Yes: `let file = guard.as_mut().ok_or(BlobError::Reclaimed)?;`
+- No: `guard.as_mut().expect("owner holds a file")`, `frame[0..4]` on peer bytes, `.unwrap()` on a socket.
+
+### Bytes
+
+Bytes stream through bounded readers and writers; a whole payload in a `Vec` is the peak this
+change exists to remove.
+
+- Yes: `io::copy(&mut DecoderReader::new(&mut spool, &STANDARD).take(CHUNK), &mut sink)`; `reqwest::Body::wrap(body)` with an exact `size_hint`; `Vec::with_capacity(MAX_CHUNK_BYTES)` reused.
+- No: `let all = std::fs::read(path)?; let b64 = STANDARD.encode(&all);`, `wrap_stream`, a `Vec` that grows until the payload ends.
+
+### Ownership
+
+Own only what you store; a clone that satisfies the borrow checker is a design smell.
+
+- Yes: `fn register(&mut self, content_type: &str, blob: DiskBlob)`; `Arc<Mutex<Table>>`; lock, copy the field out, unlock, then `.await`.
+- No: `fn register(&mut self, content_type: String, blob: &DiskBlob) { … blob.clone() … }`; `Rc`; `let g = m.lock(); client.send(&*g).await`.
+
+### Async
+
+tokio is the runtime; the `bindgen!` host traits are already `async fn` in traits, so ours are too.
+
+- Yes: `trait Sink { fn write(&mut self, chunk: &[u8]) -> impl Future<Output = io::Result<()>> + Send; }` where a spawn needs it; `tokio::task::spawn_blocking(move || blob.read())`.
+- No: `#[async_trait]`, `Pin<Box<dyn Future<Output = …>>>` in a signature, `std::fs::read` inside an `async fn`.
+
+### Dependencies
+
+The workspace already carries the mature crate; wrapping it is one function, re-implementing it is a second security boundary.
+
+- Yes: `base64::write::EncoderWriter`, `http_body::Body`, `rustix::net::recvmsg`, `tokio::net::UnixStream::pair()`.
+- No: a hand-rolled base64 table, a length-prefix framer beside `http_body`, a new crate without a sentence in the PR body.
+
+### Tests
+
+The name states the invariant, the primitives are real, and every limit is tested at the edge and one past it.
+
+- Yes: `fn a_rejected_frame_leaves_no_open_descriptors()` over `UnixStream::pair()`; `fn an_asset_of_exactly_the_ceiling_is_accepted()` beside `fn one_byte_over_the_ceiling_is_refused()` asserting `matches!(err, AssetError::TooLarge)`.
+- No: `fn test_frame_2()`, `mockall::mock! { Broker }`, `assert!(err.to_string().contains("too large"))`.
+
+### Comments
+
+A comment says why or states the invariant; the code already says what.
+
+- Yes: `// The descriptor closes before accounting is released; unlink alone is not disk reclamation.`
+- No: `// step 1: open the file`, `// handle error`, `// TODO: clean this up`.
+
+### The tells you are writing Python in Rust
+
+`Option<String>` where an enum belongs; `HashMap<String, serde_json::Value>` as a struct; a `bool`
+parameter; behaviour selected by comparing strings; `Result<(), String>`; `.clone()` to end a
+borrow; `Vec<u8>` handed whole between layers.
+
+### Review checklist
+
+How a verifier reads a change against the Rust guidelines, and how an editor reports one. The
+verifier is the check that replaces pre-approval of crate internals, so it is never skipped and
+never relaxed; the final PR reviewer has a different job and does not repeat it.
+
+**Findings are tagged.** Every finding is one of `contract` (WIT, wire frames, config keys and
+values, chart values and mounts, a deletion, a proof-gate invariant), `guideline` (a rule in this section,
+quoted by heading) or `taste`. `contract` and `guideline` findings carry `file:line`, the concrete
+failure and the exact fix, and make the verdict `FIX REQUIRED`. `taste` is advisory, listed last,
+and never blocks.
+
+**Evidence standard.** A finding names what it saw, not what it suspects; "this could leak" is not
+a finding until the line that leaks is named. A claim in the editor's report ("mirrors
+`DiskBlob::reclaim`") is checked, not trusted.
+
+**Two fix passes.** An editor gets two resumed passes on `FIX REQUIRED`. A third `FIX REQUIRED`
+reports the lane as blocked with both verdicts side by side; the disagreement is the owner's.
+
+**The lane report** ends with two fixed headings. `Choices I made`: every place the editor read
+the brief's intent over its text and did something the text did not say, one line each with the
+sentence it overrode. `Limits`: one table of every ceiling constant the lane added or moved: name,
+value, the test that hits it and the test one past it.
+
+**The PR reviewer** reads the assembled change for what only the whole shows: one definition per
+fact across lanes, seams matching on both sides, deletions complete, docs describing only the new
+behaviour, CHANGELOG bullets present. It does not re-run the per-lane rubric.
