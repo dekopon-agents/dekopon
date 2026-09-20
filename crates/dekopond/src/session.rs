@@ -907,7 +907,7 @@ async fn session(
     let leg = leg
         .with_provider_attachments(Arc::clone(&attachments))
         .with_chat_asset_inputs(ChatAssetInputs::new(
-            Arc::clone(&assets) as Arc<dyn dekopon_agent::attachment::ChatAssetSource>,
+            Arc::clone(&assets) as Arc<dyn dekopon_agent::attachment::ChatAssetSource>
         ));
     // The kind decides the budget: what is worth streaming to one reader in a direct message is
     // not what a channel with a hundred of them wants. The route keeps `progressDetail`, which is

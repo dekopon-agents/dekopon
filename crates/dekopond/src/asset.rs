@@ -1804,13 +1804,21 @@ mod retention_tests {
             Some(AssetSourceRef::Generated { capability, invocation }) if capability == "image.edit" && invocation == "invocation-2")
         );
         assert_eq!(store.retention.lock().unwrap().bytes, png.len());
-        let slot = ReplyAttachments::new(MAX_SENDS_PER_TURN, session.clone(), "local".to_owned());
+        let slot = ReplyAttachments::new(
+            MAX_SENDS_PER_TURN,
+            Arc::<SessionAssets>::clone(&session),
+            "local".to_owned(),
+        );
         assert!(slot.take().is_empty(), "attach never sends");
         slot.receive(vec![], vec![], vec![], vec![id], "asset.send", "send-1");
         assert_eq!(slot.remaining(), 3);
         assert_eq!(slot.take().pop().unwrap().bytes().unwrap(), png);
         slot.finish(dekopon_agent::attachment::AssetDeliveryDisposition::Delivered);
-        let next = ReplyAttachments::new(MAX_SENDS_PER_TURN, session.clone(), "local".to_owned());
+        let next = ReplyAttachments::new(
+            MAX_SENDS_PER_TURN,
+            Arc::<SessionAssets>::clone(&session),
+            "local".to_owned(),
+        );
         next.receive(vec![], vec![], vec![], vec![id], "asset.send", "send-2");
         assert_eq!(next.remaining(), 4, "duplicate in next turn costs nothing");
         assert!(next.take().is_empty());
@@ -1820,7 +1828,7 @@ mod retention_tests {
     async fn pathless_removal_closes_residency_and_disabled_intake_publishes_no_id() {
         let store = store(3);
         let access = access("one");
-        let session = session(store.clone(), access.clone());
+        let session = session(Arc::clone(&store), access.clone());
         let (fd, metadata) = received(b"abc", "text/plain", AssetEncoding::Identity);
         let id = session
             .register(fd, &metadata, "asset.attach", "invocation")
@@ -1847,7 +1855,7 @@ mod retention_tests {
     #[tokio::test]
     async fn encoded_intake_and_reference_budget_use_decoded_limits() {
         let store = store(64 * 1024 * 1024);
-        let session = session(store.clone(), access("encoded-limits"));
+        let session = session(Arc::clone(&store), access("encoded-limits"));
         let raw = vec![0; dekopon_model::asset::MAX_ATTACHMENT_BYTES];
         let encoded = STANDARD.encode(&raw);
         assert_eq!(encoded.len(), 11_184_812);
@@ -1860,7 +1868,7 @@ mod retention_tests {
             references.push(format!("chat-asset:{id}"));
         }
         assert_eq!(store.retention.lock().unwrap().bytes, 5 * encoded.len());
-        let inputs = ChatAssetInputs::new(session.clone());
+        let inputs = ChatAssetInputs::new(Arc::<SessionAssets>::clone(&session));
         let (assets, pins) = inputs.prepare(&json!(references), 4).unwrap();
         assert_eq!(assets.descriptors.len(), 5);
         assert_eq!(
@@ -1943,7 +1951,11 @@ mod retention_tests {
             .with(capture.clone())
             .set_default();
         let session = session(store(1024), access("one"));
-        let slot = ReplyAttachments::new(MAX_SENDS_PER_TURN, session.clone(), "local".to_owned());
+        let slot = ReplyAttachments::new(
+            MAX_SENDS_PER_TURN,
+            Arc::<SessionAssets>::clone(&session),
+            "local".to_owned(),
+        );
         for length in [128, 129] {
             let label = "a".repeat(length);
             let (fd, metadata) = received(b"\x89PNG\r\n\x1a\n", &label, AssetEncoding::Identity);
@@ -1988,7 +2000,11 @@ mod retention_tests {
     #[tokio::test]
     async fn fourth_send_fits_fifth_refuses_and_a_new_turn_has_fresh_allowance() {
         let session = session(store(1024), access("one"));
-        let slot = ReplyAttachments::new(MAX_SENDS_PER_TURN, session.clone(), "local".to_owned());
+        let slot = ReplyAttachments::new(
+            MAX_SENDS_PER_TURN,
+            Arc::<SessionAssets>::clone(&session),
+            "local".to_owned(),
+        );
         for index in 0..5 {
             let (fd, metadata) = received(b"abc", "text/plain", AssetEncoding::Identity);
             let id = session
@@ -2019,7 +2035,7 @@ mod retention_tests {
                 .set_default();
             let store = store(1024);
             let access = access("one");
-            let session = session(store.clone(), access.clone());
+            let session = session(Arc::clone(&store), access.clone());
             let (fd, metadata) = received(b"abc", "text/plain", AssetEncoding::Identity);
             let id = session
                 .register(fd, &metadata, "asset.attach", "invocation")

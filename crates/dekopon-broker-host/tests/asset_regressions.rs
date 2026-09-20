@@ -1,3 +1,6 @@
+// Match the workspace's test-only unwrap policy; production code keeps the deny lint.
+#![allow(clippy::unwrap_used)]
+
 use dekopon_broker_host::asset::AssetInputs;
 use dekopon_broker_host::{BrokerHostError, BrokerHostLimits, BrokerProviderRegistry};
 use dekopon_broker_protocol::{AssetEncoding, AssetRow};

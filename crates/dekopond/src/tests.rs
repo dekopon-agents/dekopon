@@ -14059,7 +14059,7 @@ async fn queued_assets_deliver_on_empty_text_but_not_when_the_model_fails_before
             runner(broker, models, 4),
             route(model_config()),
             message("make a file"),
-            driver.clone(),
+            Arc::<RecordingDriver>::clone(&driver),
         )
         .await;
         assert_eq!(
@@ -14097,12 +14097,12 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
             answer("noted"),
             answer("next"),
         ]);
-        let runner = runner(broker, models.clone(), 4);
+        let runner = runner(broker, Arc::<ModelScript>::clone(&models), 4);
         let route = persistent_route(model_config(), memory);
         let failed =
             Arc::new(RecordingDriver::default().failing_replies_from(0, FailureKind::Response));
         run_session(
-            runner.clone(),
+            Arc::clone(&runner),
             route.clone(),
             message("make a file"),
             failed,
@@ -14113,7 +14113,13 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
         if memory.scope == MemoryScope::SharedConversation {
             unrelated.conversation.id = "other-conversation".to_owned();
         }
-        run_session(runner.clone(), route.clone(), unrelated, driver.clone()).await;
+        run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            unrelated,
+            Arc::<RecordingDriver>::clone(&driver),
+        )
+        .await;
         assert!(
             models
                 .prompt(3)
@@ -14128,10 +14134,10 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
         let inbound = "🟣".repeat(MAX_INBOUND_TEXT_BYTES / "🟣".len());
         assert_eq!(inbound.len(), MAX_INBOUND_TEXT_BYTES);
         run_session(
-            runner.clone(),
+            Arc::clone(&runner),
             route.clone(),
             message_from(subject, &inbound),
-            driver.clone(),
+            Arc::<RecordingDriver>::clone(&driver),
         )
         .await;
         let prompt = models.prompt(4);
