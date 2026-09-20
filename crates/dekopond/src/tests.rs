@@ -6358,10 +6358,16 @@ async fn a_reader_that_stops_because_the_daemon_stopped_is_not_a_dead_transport(
         inbound,
         driver: Arc::new(RecordingDriver::default()),
     };
-    let (routed, received) = mpsc::channel(1);
-    drop(received);
+    let (routed, mut received) = mpsc::channel(1);
     let reader = tokio::spawn(crate::read_transport(Box::new(transport), routed));
 
+    // Let connection notification finish before closing the route. Otherwise the reader can
+    // exit at that first send and drop the fixture's input before we enqueue the message.
+    assert!(matches!(
+        received.recv().await,
+        Some(TransportEvent::Connected { .. })
+    ));
+    drop(received);
     sender
         .send(message("nobody is listening"))
         .expect("fixture accepts a message");
