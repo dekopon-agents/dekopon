@@ -84,6 +84,14 @@ All notable changes to Dekopon are documented here. The format is based on
   copies of the base64 — one 8 MiB image left 42,008,399 bytes resident there. Disk leases still
   leave the async worker, and caption, ordering, size-refusal and retry behavior are unchanged.
 
+## [dekopon-chart-0.10.0] - 2026-09-20
+
+### Added
+
+- Provision broker-only disk-backed ephemeral asset storage and the corresponding ownership-init
+  volume mount. The gateway never mounts the broker asset directory; descriptor passing remains
+  the cross-process boundary.
+
 ## [0.17.0] - 2026-09-17
 
 ### Fixed
