@@ -18,7 +18,7 @@ use std::{
 use thiserror::Error;
 
 pub use dekopon_model::asset::MAX_ATTACHMENT_BYTES;
-/// Stored bytes referenced by one invocation, independently of JSON frame size.
+/// Decoded bytes referenced by one invocation, independently of JSON frame size.
 pub const MAX_INVOCATION_ASSET_BYTES: usize = 40 * 1024 * 1024;
 
 /// One explicitly queued asset, pinned until the transport completes.
@@ -357,7 +357,7 @@ pub enum ChatAssetRefusal {
     UnsupportedMedia,
     #[error("one invocation may reference at most five distinct assets")]
     PerInvocationLimit,
-    #[error("the assets exceed the 40 MiB per-invocation stored-byte budget")]
+    #[error("the assets exceed the 40 MiB per-invocation decoded-byte budget")]
     ByteBudget,
     #[error("the attachment's bytes could not be read")]
     Unavailable,
@@ -413,17 +413,27 @@ impl ChatAssetInputs {
         let references = references(input)?;
         let mut pins = Vec::with_capacity(references.len());
         let mut descriptors = Vec::with_capacity(references.len());
-        let mut total = 0usize;
-        for id in references {
-            let (_, blob) = self.source.fetch_for_capability(id)?;
-            let descriptor = blob.descriptor().map_err(ChatAssetRefusal::Storage)?;
-            total = input_total(total, blob.len())?;
-            descriptors.push(descriptor);
+        for id in &references {
+            let (_, blob) = self.source.fetch_for_capability(*id)?;
+            descriptors.push(blob.descriptor().map_err(ChatAssetRefusal::Storage)?);
             pins.push(blob);
+        }
+        // Fetch may populate the inventory's stored lengths; take the table after pinning.
+        let rows = self.source.rows();
+        let mut total = 0usize;
+        for (id, blob) in references.iter().zip(&pins) {
+            let row = rows
+                .iter()
+                .find(|row| row.id == *id)
+                .ok_or(ChatAssetRefusal::UnknownAsset)?;
+            let decoded = GeneratedImage::new(blob.clone(), row.content_type.clone(), row.encoding)
+                .decoded_len()
+                .map_err(ChatAssetRefusal::Storage)?;
+            total = input_total(total, decoded)?;
         }
         Ok((
             InvokeAssets {
-                rows: self.source.rows(),
+                rows,
                 descriptors,
                 sends_remaining,
             },
@@ -597,7 +607,7 @@ mod tests {
         assert!(ChatAssetRefusal::DataUrl.note().contains("chat-asset:<N>"));
     }
     #[test]
-    fn invocation_stored_byte_budget_accepts_the_edge_and_refuses_one_past() {
+    fn invocation_decoded_byte_budget_accepts_the_edge_and_refuses_one_past() {
         assert_eq!(
             input_total(MAX_INVOCATION_ASSET_BYTES - 1, 1),
             Ok(MAX_INVOCATION_ASSET_BYTES)

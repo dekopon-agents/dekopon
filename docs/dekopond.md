@@ -351,8 +351,10 @@ or cancelled turns deliver none. Delivery disposition is logged as `agent.asset.
 adds one bounded gateway notice to the next turn. An output retention refusal names the failure
 without suggesting a repeat of an already-executed paid capability.
 
-Limits are **8 MiB stored per asset, five distinct references / attached outputs and 40 MiB stored
+Limits are **8 MiB decoded per asset, five distinct references / attached outputs and 40 MiB decoded
 per invocation**, 32 table entries per conversation and the configurable 256 MiB default disk LRU.
+An eight-MiB base64 asset may store up to 11,184,812 bytes; identity stays at 8,388,608.
+Disk retention and broker in-flight spool budgets account for actual stored bytes.
 These limits are separate from model-facing fetch limits. Listing metadata does not update LRU
 recency; resolving bytes does. Reclaimed files never refetch or silently substitute older pixels.
 
@@ -610,7 +612,7 @@ policy, not a claim that Meta guarantees an exhaustive CDN list; unknown CDN URL
 The process-owned client resolves only Graph and that host, with a 5-second DNS deadline and at
 most 32 public addresses bound to the actual connection (no second unchecked lookup). Each Graph
 or download request has a 15-second deadline; session admission, the four model fetches per turn,
-the route's capability-call budget, and each invocation's five input descriptors / 40 MiB stored-byte
+the route's capability-call budget, and each invocation's five input descriptors / 40 MiB decoded-byte
 ceiling bound concurrency and total work. Downloads enforce the smaller of the caller's bound and
 5,000,000 bytes while streaming, then verify the declared length and PNG/JPEG signature. There is
 no image decoding, dimension/color-space guarantee, transcoding, URL caching, or automatic retry.
@@ -619,7 +621,7 @@ Queued PNG/JPEG replies use multipart `POST /{version}/{phone-number-id}/media` 
 `messaging_product=whatsapp` and a gateway-named `file` part carrying the declared PNG/JPEG content type, then an ordinary
 image message with `image.id` (never a model-selected URL). The same 5,000,000-byte ceiling applies
 to decoded upload bytes, independent of identity/base64 storage. All outputs are preflighted before
-uploading or sending any reply part; retention and invocation budgets still count stored bytes. Text of at most 1,024 Unicode scalars captions the first image; longer text is sent in full as
+uploading or sending any reply part; retention counts stored bytes while invocation limits count decoded bytes. Text of at most 1,024 Unicode scalars captions the first image; longer text is sent in full as
 split text after all images, and empty captions are omitted. Upload acceptance alone is not message
 acceptance, and a message ID is not proof of human delivery. There is no media deletion subsystem;
 Meta's uploaded-media retention applies.

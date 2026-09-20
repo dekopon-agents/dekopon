@@ -12,8 +12,10 @@ use std::{
 use tempfile::{NamedTempFile, TempDir};
 use thiserror::Error;
 
-/// Per-attachment ceiling shared by inbound assets and provider results.
+/// Decoded per-attachment ceiling shared by inbound assets and provider results.
 pub const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
+/// Largest stored representation: padded base64 of an eight-MiB decoded asset.
+pub const MAX_STORED_ATTACHMENT_BYTES: usize = MAX_ATTACHMENT_BYTES.div_ceil(3) * 4;
 
 /// A sanitized scratch-storage failure, never a filename or payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
@@ -162,9 +164,10 @@ impl DiskBlob {
     /// Admits a read-only broker descriptor without copying its contents.
     ///
     /// # Errors
-    /// Refuses a changed fstat length or a stored payload over the per-asset ceiling.
+    /// Refuses a changed fstat length or a stored payload over the representation ceiling.
+    /// The encoding-aware caller must also check the decoded per-asset ceiling before admission.
     pub fn from_descriptor(descriptor: OwnedFd, len: usize) -> Result<Self, BlobError> {
-        if len > MAX_ATTACHMENT_BYTES {
+        if len > MAX_STORED_ATTACHMENT_BYTES {
             return Err(BlobError::TooLarge);
         }
         let file = File::from(descriptor);
@@ -439,12 +442,21 @@ mod tests {
 
     #[test]
     fn descriptor_admission_checks_fstat_and_the_exact_ceiling() {
-        let blob = DiskBlob::from_bytes(&vec![0; MAX_ATTACHMENT_BYTES]).unwrap();
+        let file = NamedTempFile::new().unwrap();
+        file.as_file()
+            .set_len(MAX_STORED_ATTACHMENT_BYTES as u64)
+            .unwrap();
+        let blob = DiskBlob::from_descriptor(
+            File::open(file.path()).unwrap().into(),
+            MAX_STORED_ATTACHMENT_BYTES,
+        )
+        .unwrap();
         assert!(
-            DiskBlob::from_descriptor(blob.descriptor().unwrap(), MAX_ATTACHMENT_BYTES).is_ok()
+            DiskBlob::from_descriptor(blob.descriptor().unwrap(), MAX_STORED_ATTACHMENT_BYTES)
+                .is_ok()
         );
         assert_eq!(
-            DiskBlob::from_descriptor(blob.descriptor().unwrap(), MAX_ATTACHMENT_BYTES + 1),
+            DiskBlob::from_descriptor(blob.descriptor().unwrap(), MAX_STORED_ATTACHMENT_BYTES + 1),
             Err(BlobError::TooLarge)
         );
         assert_eq!(

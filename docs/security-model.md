@@ -148,7 +148,7 @@ OTLP trace and log fields carry prompts, model responses, command arguments and 
 - **Authorization is a gate, not a filter.** A session calls `capabilities` under a chat attestation of `(subject, agent, scope)` before any model call or liveness write, and the broker answers it only if policy permits `agent.prompt` for that principal and agent. An empty answer, or a refusal, ends the session with a fixed sentence and costs nothing. Failures also answer one fixed line — a `PromptError` can carry model, provider, or transport text, and none of it reaches chat.
 - **Assets are scoped file handles, not authority.** Every proposal's exact references resolve
   automatically in its authenticated conversation generation; at most five read-only close-on-exec
-  descriptors and 40 MiB of stored bytes cross per invocation. Paths never come from the model.
+  descriptors and assets totaling 40 MiB decoded cross per invocation. Paths never come from the model.
   Path-backed files are freshly opened read-only, pathless broker outputs are duplicated read-only,
   and all readers use positional IO. Broker policy and HTTP grants still decide effects; descriptor
   access covers only references in this invocation, not the whole metadata table. No byte expansion

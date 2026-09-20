@@ -62,6 +62,7 @@ pub struct Validator {
     filled: usize,
     padded: bool,
     invalid: bool,
+    decoded: u64,
 }
 
 impl Validator {
@@ -79,15 +80,27 @@ impl Validator {
             self.filled += 1;
             if self.filled == 4 {
                 let mut decoded = [0; 3];
-                if STANDARD.decode_slice(self.quantum, &mut decoded).is_err() {
-                    self.invalid = true;
-                    return Err(CodecError::InvalidEncoding);
-                }
+                let len = match STANDARD.decode_slice(self.quantum, &mut decoded) {
+                    Ok(len) => len,
+                    Err(_) => {
+                        self.invalid = true;
+                        return Err(CodecError::InvalidEncoding);
+                    }
+                };
+                self.decoded = self
+                    .decoded
+                    .checked_add(len as u64)
+                    .ok_or(CodecError::TooLarge)?;
                 self.padded = self.quantum[3] == b'=';
                 self.filled = 0;
             }
         }
         Ok(())
+    }
+
+    /// Decoded bytes in complete validated quanta. An incomplete quantum is charged when completed.
+    pub fn decoded_len(&self) -> u64 {
+        self.decoded
     }
 
     /// Refuses an incomplete final quantum or any earlier invalid write.
@@ -128,6 +141,10 @@ mod tests {
                 validator.write(&input.as_bytes()[..split]).unwrap();
                 validator.write(&input.as_bytes()[split..]).unwrap();
                 validator.finish().unwrap();
+                assert_eq!(
+                    validator.decoded_len(),
+                    STANDARD.decode(input).unwrap().len() as u64
+                );
             }
         }
     }

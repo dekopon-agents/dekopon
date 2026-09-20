@@ -817,15 +817,17 @@ impl SessionAssets {
                 },
             });
         }
-        if asset.size > MAX_ASSET_BYTES {
-            return Err(AssetFailure::TooLarge { size: asset.size });
-        }
         if let Some(data) = self
             .store
             .pin(&self.access, id, false)
             .map_err(AssetFailure::Storage)?
         {
+            // Retained descriptors were checked at intake by decoded length. Their stored
+            // base64 size may exceed the raw download ceiling.
             return Ok((asset, data));
+        }
+        if asset.size > MAX_ASSET_BYTES {
+            return Err(AssetFailure::TooLarge { size: asset.size });
         }
         // Zero and individually impossible admissions do not spend transport IO.
         self.store
@@ -958,7 +960,7 @@ impl Retention {
             self.miss(id, bytes, "disabled");
             return Err(BlobError::Disabled);
         }
-        if bytes.max(1) > self.budget || bytes > dekopon_model::asset::MAX_ATTACHMENT_BYTES {
+        if bytes.max(1) > self.budget || bytes > dekopon_model::asset::MAX_STORED_ATTACHMENT_BYTES {
             self.miss(id, bytes, "oversized");
             return Err(BlobError::TooLarge);
         }
@@ -979,6 +981,9 @@ impl Retention {
         Ok(())
     }
     fn admit(&mut self, key: RetentionKey, bytes: &[u8]) -> Result<DiskBlob, BlobError> {
+        if bytes.len() > dekopon_model::asset::MAX_ATTACHMENT_BYTES {
+            return Err(BlobError::TooLarge);
+        }
         self.admit_with(key, bytes.len(), || DiskBlob::from_bytes(bytes))
     }
     fn admit_with(
@@ -1173,6 +1178,15 @@ impl dekopon_agent::attachment::GeneratedAssetStore for SessionAssets {
         let len = usize::try_from(metadata.bytes).map_err(|_overflow| BlobError::TooLarge)?;
         self.store.check_size(0, len)?;
         let data = DiskBlob::from_descriptor(descriptor, len)?;
+        let decoded = GeneratedImage::new(
+            data.clone(),
+            metadata.content_type.clone(),
+            metadata.encoding,
+        )
+        .decoded_len()?;
+        if decoded > dekopon_model::asset::MAX_ATTACHMENT_BYTES {
+            return Err(BlobError::TooLarge);
+        }
         // Sniff only a decoded prefix. The declared label remains authoritative even on mismatch.
         let detected = sniff(&data, metadata.encoding)?;
         self.access.with_active(|key| {
@@ -1737,9 +1751,10 @@ mod retention_tests {
     }
 
     fn received(bytes: &[u8], label: &str, encoding: AssetEncoding) -> (OwnedFd, NewAsset) {
-        let blob = DiskBlob::from_bytes(bytes).unwrap();
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, bytes).unwrap();
         (
-            blob.descriptor().unwrap(),
+            std::fs::File::open(file.path()).unwrap().into(),
             NewAsset {
                 descriptor: 0,
                 content_type: label.to_owned(),
@@ -1820,6 +1835,44 @@ mod retention_tests {
         );
         assert!(disabled.get_inventory(&access).is_empty());
     }
+    #[tokio::test]
+    async fn encoded_intake_and_reference_budget_use_decoded_limits() {
+        let store = store(64 * 1024 * 1024);
+        let session = session(store.clone(), access("encoded-limits"));
+        let raw = vec![0; dekopon_model::asset::MAX_ATTACHMENT_BYTES];
+        let encoded = STANDARD.encode(&raw);
+        assert_eq!(encoded.len(), 11_184_812);
+        let mut references = Vec::new();
+        for _ in 0..5 {
+            let (fd, metadata) = received(encoded.as_bytes(), "image/png", AssetEncoding::Base64);
+            let id = session
+                .register(fd, &metadata, "image.edit", "invocation")
+                .unwrap();
+            references.push(format!("chat-asset:{id}"));
+        }
+        assert_eq!(store.retention.lock().unwrap().bytes, 5 * encoded.len());
+        let inputs = ChatAssetInputs::new(session.clone());
+        let (assets, pins) = inputs.prepare(&json!(references), 4).unwrap();
+        assert_eq!(assets.descriptors.len(), 5);
+        assert_eq!(
+            pins.iter().map(DiskBlob::len).sum::<usize>(),
+            5 * encoded.len()
+        );
+        drop((assets, pins));
+        for encoding in [AssetEncoding::Identity, AssetEncoding::Base64] {
+            let bytes = match encoding {
+                AssetEncoding::Identity => vec![0; raw.len() + 1],
+                AssetEncoding::Base64 => STANDARD.encode(vec![0; raw.len() + 1]).into_bytes(),
+            };
+            let (fd, metadata) = received(&bytes, "image/png", encoding);
+            assert_eq!(
+                session.register(fd, &metadata, "image.edit", "overflow"),
+                Err(BlobError::TooLarge)
+            );
+            assert_eq!(session.rows().len(), 5);
+        }
+    }
+
     #[tokio::test]
     async fn decoded_prefix_sniff_logs_once_only_on_label_disagreement() {
         use tracing_subscriber::prelude::*;

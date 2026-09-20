@@ -16,6 +16,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Fixed
 
+- Asset limits count decoded bytes: eight MiB per asset and forty MiB per invocation, including
+  base64-backed files. Disk budgets still charge stored bytes, without changing wire metadata.
 - Check the first Slack file download URL on the same rule as the redirect hop after it, at the one
   place the bot token is attached. A download URL arrives on the authenticated Socket Mode
   connection, so only Slack itself could name a foreign host; it is now parsed rather than

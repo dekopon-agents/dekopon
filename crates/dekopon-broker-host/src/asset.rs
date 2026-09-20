@@ -241,8 +241,9 @@ impl AssetState {
                 {
                     return Err(AssetAdmissionError::InvalidDescriptor);
                 }
+                let decoded = file_decoded_length(&file, encoding(row.encoding), metadata.len())?;
                 total = total
-                    .checked_add(metadata.len())
+                    .checked_add(decoded)
                     .ok_or(AssetAdmissionError::TooLarge)?;
                 if total > MAX_INVOCATION_BYTES {
                     return Err(AssetAdmissionError::TooLarge);
@@ -381,20 +382,26 @@ async fn decoded_length(
     if matches!(value, wit::Encoding::Identity) {
         return Ok(stored);
     }
-    file.read(move |file| {
-        if stored == 0 {
-            return Ok(0);
-        }
-        let invalid = || AssetIoError::Io {
-            kind: std::io::ErrorKind::InvalidData,
-        };
-        let mut tail = [0; 2];
-        let offset = stored.checked_sub(2).ok_or_else(invalid)?;
-        file.read_exact_at(&mut tail, offset)?;
-        base64::decoded_len(stored, &tail).map_err(|_invalid| invalid())
-    })
-    .await
-    .map_err(io_error)
+    file.read(move |file| file_decoded_length(file, value, stored))
+        .await
+        .map_err(io_error)
+}
+
+fn file_decoded_length(
+    file: &File,
+    value: wit::Encoding,
+    stored: u64,
+) -> Result<u64, AssetIoError> {
+    if matches!(value, wit::Encoding::Identity) || stored == 0 {
+        return Ok(stored);
+    }
+    let invalid = || AssetIoError::Io {
+        kind: std::io::ErrorKind::InvalidData,
+    };
+    let mut tail = [0; 2];
+    let offset = stored.checked_sub(2).ok_or_else(invalid)?;
+    file.read_exact_at(&mut tail, offset)?;
+    base64::decoded_len(stored, &tail).map_err(|_invalid| invalid())
 }
 
 impl HandleResource {
@@ -599,16 +606,19 @@ impl wit::HostWriter for StoreState {
                 .refuse(error(wit::ErrorCode::Io, "asset writer is closed")));
         };
         let next = spool.len().checked_add(bytes.len() as u64);
-        let total = self.assets.written.checked_add(bytes.len() as u64);
-        if bytes.len() > CHUNK_BYTES
-            || next.is_none_or(|len| len > MAX_ASSET_BYTES)
-            || total.is_none_or(|len| len > MAX_INVOCATION_BYTES)
-        {
+        let stored_limit = match writer.encoding {
+            wit::Encoding::Identity => MAX_ASSET_BYTES,
+            wit::Encoding::Base64 => {
+                base64::encoded_len(MAX_ASSET_BYTES).expect("bounded asset length")
+            }
+        };
+        if bytes.len() > CHUNK_BYTES || next.is_none_or(|len| len > stored_limit) {
             return Ok(self.assets.refuse(error(
                 wit::ErrorCode::TooLarge,
                 "asset write exceeds its byte ceiling",
             )));
         }
+        let previous_decoded = writer.validator.decoded_len();
         if matches!(writer.encoding, wit::Encoding::Base64) && {
             let started = std::time::Instant::now();
             let span = tracing::info_span!(
@@ -625,7 +635,21 @@ impl wit::HostWriter for StoreState {
                 "asset writer is not canonical base64",
             )));
         }
-        self.assets.written += bytes.len() as u64;
+        let (decoded, added) = match writer.encoding {
+            wit::Encoding::Identity => (next.expect("stored length checked"), bytes.len() as u64),
+            wit::Encoding::Base64 => (
+                writer.validator.decoded_len(),
+                writer.validator.decoded_len() - previous_decoded,
+            ),
+        };
+        let total = self.assets.written.checked_add(added);
+        if decoded > MAX_ASSET_BYTES || total.is_none_or(|len| len > MAX_INVOCATION_BYTES) {
+            return Ok(self.assets.refuse(error(
+                wit::ErrorCode::TooLarge,
+                "asset write exceeds its decoded byte ceiling",
+            )));
+        }
+        self.assets.written = total.expect("invocation length checked");
         match spool.write(bytes).await {
             Ok(spool) => {
                 writer.spool = Some(spool);
@@ -1081,6 +1105,150 @@ mod tests {
                 .code,
             wit::ErrorCode::TooLarge
         );
+    }
+
+    #[tokio::test]
+    async fn base64_writer_limits_count_decoded_bytes_including_padding() {
+        let stored_limit = base64::encoded_len(MAX_ASSET_BYTES).unwrap();
+        assert_eq!(stored_limit, 11_184_812);
+        for extra in [0, 1] {
+            let root = tempfile::tempdir().unwrap();
+            let directory = AssetDirectory::new(root.path().to_owned(), stored_limit + 1);
+            let mut state = state(
+                Some(directory),
+                AssetConstraints {
+                    attach: true,
+                    ..Default::default()
+                },
+                AssetInputs::default(),
+                vec![],
+            )
+            .await;
+            let writer = state
+                .allocate("image/png".to_owned(), wit::Encoding::Base64)
+                .await
+                .unwrap()
+                .unwrap();
+            let encoded = base64::Engine::encode(
+                &base64::STANDARD,
+                vec![0; MAX_ASSET_BYTES as usize + extra],
+            );
+            // The one-decoded-byte overflow has the SAME stored length, but different padding.
+            assert_eq!(encoded.len() as u64, stored_limit);
+            let mut result = Ok(());
+            for chunk in encoded.as_bytes().chunks(CHUNK_BYTES - 1) {
+                result = state
+                    .write(Resource::new_borrow(writer.rep()), chunk.to_vec())
+                    .await
+                    .unwrap();
+                if result.is_err() {
+                    break;
+                }
+            }
+            if extra == 0 {
+                result.unwrap();
+                assert_eq!(state.assets.written, MAX_ASSET_BYTES);
+                assert_eq!(
+                    state
+                        .write(Resource::new_borrow(writer.rep()), vec![b'A'])
+                        .await
+                        .unwrap()
+                        .unwrap_err()
+                        .code,
+                    wit::ErrorCode::TooLarge
+                );
+            } else {
+                assert_eq!(result.unwrap_err().code, wit::ErrorCode::TooLarge);
+            }
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn base64_invocation_decoded_sum_accepts_forty_mib_then_refuses_one_byte() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = AssetDirectory::new(root.path().to_owned(), 64 * 1024 * 1024);
+        let mut state = state(
+            Some(directory),
+            AssetConstraints::default(),
+            AssetInputs::default(),
+            vec![],
+        )
+        .await;
+        let encoded = base64::Engine::encode(&base64::STANDARD, vec![0; MAX_ASSET_BYTES as usize]);
+        for _ in 0..5 {
+            let writer = state
+                .allocate("image/png".to_owned(), wit::Encoding::Base64)
+                .await
+                .unwrap()
+                .unwrap();
+            for chunk in encoded.as_bytes().chunks(CHUNK_BYTES - 1) {
+                state
+                    .write(Resource::new_borrow(writer.rep()), chunk.to_vec())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            wit::HostWriter::drop(&mut state, writer).await.unwrap();
+        }
+        assert_eq!(state.assets.written, MAX_INVOCATION_BYTES);
+        let writer = state
+            .allocate("text/plain".to_owned(), wit::Encoding::Base64)
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .write(Resource::new_borrow(writer.rep()), b"AA=".to_vec())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            state
+                .write(Resource::new_borrow(writer.rep()), b"=".to_vec())
+                .await
+                .unwrap()
+                .unwrap_err()
+                .code,
+            wit::ErrorCode::TooLarge
+        );
+    }
+
+    #[tokio::test]
+    async fn base64_input_sum_accepts_forty_decoded_mib_and_refuses_one_more() {
+        use std::io::Write as _;
+        for extra in [0, 1] {
+            let mut inputs = AssetInputs::default();
+            for id in 1..=5 {
+                let decoded = MAX_ASSET_BYTES as usize + if id == 5 { extra } else { 0 };
+                let encoded = base64::Engine::encode(&base64::STANDARD, vec![0; decoded]);
+                let mut file = tempfile::NamedTempFile::new().unwrap();
+                file.write_all(encoded.as_bytes()).unwrap();
+                inputs.rows.push(AssetRow {
+                    id,
+                    content_type: "image/png".to_owned(),
+                    encoding: AssetEncoding::Base64,
+                    bytes: encoded.len() as u64,
+                    origin: "test".to_owned(),
+                    sent: false,
+                });
+                inputs
+                    .descriptors
+                    .push(File::open(file.path()).unwrap().into());
+            }
+            let result = AssetState::invoke(
+                inputs,
+                vec![1, 2, 3, 4, 5],
+                AssetConstraints::default(),
+                None,
+                "test".to_owned(),
+            )
+            .await;
+            if extra == 0 {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(result, Err(AssetAdmissionError::TooLarge)));
+            }
+        }
     }
 
     #[tokio::test]
