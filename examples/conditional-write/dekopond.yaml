@@ -51,16 +51,8 @@ routes:
   - transport: workspace-slack
     conversation: { kind: [directMessage] }
     agent: xaviers-conditional-writer
-    # Let this route deliver the files an authorized capability produced. A capability result may
-    # carry a top-level `attachments: [{mediaType, base64}]`; the gateway strips it, validates each
-    # PNG, and uploads it beside the answer. Delete this block and such a result is refused with a
-    # sentence the model reads — nothing else about the route changes.
-    providerAttachments:
-      maxPerReply: 1
-    # Capabilities whose input may name one of this conversation's attachments as `chat-asset:2`.
-    # The gateway expands the marker to a data URL before proposing; a capability left out of this
-    # list receives the string verbatim and decides for itself.
-    chatAssetInputs: [http-probe.conditional-write]
+    # Asset references resolve automatically; attaching retains a file, while sending requires
+    # a separately broker-authorized asset.send invocation.
     limits:
       # One review is a handful of steps: view the pull request, read the files, approve, answer.
       # A budget that cannot finish the job is a bug; a budget that can loop is a bill.

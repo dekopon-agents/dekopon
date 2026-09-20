@@ -66,20 +66,6 @@ fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
     ));
     let route = config.routes.first().expect("one route");
     assert_eq!(route.transport, transport.name());
-    // The walkthrough's route opts into both byte conventions, which is what makes the two reserved
-    // keys in a capability's input and result reachable from this example.
-    assert_eq!(
-        route.provider_attachments,
-        Some(dekopond::ProviderAttachmentsConfig { max_per_reply: 1 })
-    );
-    assert_eq!(
-        route
-            .chat_asset_inputs
-            .iter()
-            .map(ToString::to_string)
-            .collect::<Vec<_>>(),
-        ["http-probe.conditional-write".to_owned()]
-    );
     assert_eq!(route.limits.max_steps, 8);
     assert_eq!(route.limits.max_capability_calls, 16);
     // The walkthrough demonstrates a remembered conversation, which is the mode a reader has to

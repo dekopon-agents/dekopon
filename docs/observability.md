@@ -142,8 +142,9 @@ these carries a fixed category rather than the untrusted text that triggered it:
 | Event | Emitted by | Carries |
 |---|---|---|
 | `agent.tool.rejected` | `dekopon-agent` | model turn, the tool-call index or count, and a fixed `error.type` such as `too-many-tool-calls` or `unknown-tool` — never the model's own tool name or arguments |
-| `agent.provider_attachment.refused` | `dekopon-agent` | a stable `reason` — `route-disabled`, `invalid-encoding`, `unsupported-media`, `too-large`, `per-reply-limit`, or `storage`; never the attachment bytes, its declared media type, or any provider text |
-| `agent.chat_asset_input.refused` | `dekopon-agent` | a stable `reason` — `unknown-asset`, `unsupported-media`, `per-invocation-limit`, `session-limit`, `byte-budget`, `reclaimed`, `unauthorized`, or `unavailable`; never the attachment number, its bytes, or the sender's file name |
+| `agent.chat_asset_input.refused` | `dekopon-agent` | a stable `reason` — `unknown-asset`, `unsupported-media`, `per-invocation-limit`, `data-url`, `storage`, `byte-budget`, `reclaimed`, `unauthorized`, or `unavailable`; never the attachment number, its bytes, or the sender's file name |
+| `agent.asset.send` | `dekopon-agent` | `asset.id`, authenticated transport name, `dispatched` and optional bounded `error`; emitted once per queued asset at terminal delivery or abandonment, never payload bytes; dispatched means attempted, not accepted |
+| `gateway.asset.content_type_mismatch` | `dekopond` | exactly one event per admitted output when a 12-byte decoded-prefix sniff disagrees: `asset.id`, declared `asset.content_type` (128 characters), `asset.detected_type`, stored `asset.bytes`, `asset.sha256`; label stays authoritative; matching or unrecognized prefixes emit none |
 | `gateway.asset.retention_miss` | `dekopond` | gateway asset ID, known byte size, configured byte budget, and reason (`disabled`, `oversized`, `all-pinned`, `reclaimed`, `unknown`, `unauthorized`, `storage`); no path, payload or secret; emitted inside the resolving message/model/provider trace |
 | `agent.asset.refused` | `dekopon-agent` | the gateway-assigned asset id and the gateway-authored refusal text the model reads back |
 | `agent.asset.fetched` | `dekopon-agent` | the asset id, its media type, its byte count, and `asset.truncated` — whether a textual asset larger than the prompt's textual bound was clamped with a trailer the model reads rather than dropped or failed; never the bytes and never the sender's file name, which is untrusted text |
@@ -413,6 +414,21 @@ instead emits `gateway_message_ignored` with `reason = group-unsupported` and it
 A `chat.postMessage` HTTP 429 delays the identical post once: integer `Retry-After` seconds are
 capped at 60, defaulting to 5 when missing or unparsable. A second 429 uses the ordinary
 reply-failure path; no other HTTP failure is retried.
+
+Broker assets are recorded by reference, content type, byte count and SHA-256, never by bytes.
+Opened and attached resources emit `asset.id`, `asset.content_type`, and `asset.bytes` inside
+`provider.invoke`. Attached outputs and consumed HTTP asset parts record `asset.sha256`
+over decoded bytes; the first WIT read of an opened input records its full decoded digest using
+bounded positional I/O, once per handle. HTTP retains its inline digest of transmitted bytes.
+Direct WIT writer calls record guest-list length and copied-byte count: oversized lists are
+rejected before a payload copy. These are payload-copy bounds, not process RSS measurements.
+**Current:** content-type labels remain authoritative; gateway intake compares a bounded decoded
+prefix and emits the existing `gateway.asset.content_type_mismatch` event once on disagreement, with metadata
+only (see [asset handles](dekopond.md#asset-handles-and-delivery)). The broker does not sniff labels. Native `asset.encode` and `asset.decode` spans carry `bytes` and
+`duration_us`. Streamed HTTP uses the same `http.request` span and `accounting.http.request`
+record as buffered HTTP, including refused attempts; its request byte count is the exact total
+body length, while its request grant bounds literal parts only. An `asset.send` capability uses
+the ordinary `broker.decision` and `broker.execution` records, not a separate authorization path.
 
 Scratch IO emits `asset.spool` child spans for `operation=write|read|reclaim|cleanup`, recording `bytes`,
 `duration_ms`, `outcome=ok|refused` and a sanitized `reason` on refusal (capacity, per-file bound,
@@ -1079,3 +1095,9 @@ is invented. Following a constituent's causal link reaches the one model/provide
 reply execution; it is not duplicated across traces. Non-payload counts/outcomes describe
 membership while original text stays on its own input audit event. Delivery failures remain
 in that shared execution's trace. A single-message, uncollected input keeps its ordinary trace.
+
+Gateway assets are recorded by reference, declared content type, stored byte count and SHA-256,
+never payload bytes. Gateway conversion uses the same `asset.encode` / `asset.decode` spans as
+native hosts (`bytes`, `duration_us`); `asset.spool` remains the positional scratch-read lifecycle.
+A send failure leaves a bounded next-turn notice; `dispatched` belongs only to `agent.asset.send`,
+not an asset table field. Broker decisions still record the ordinary asset.send authorization.

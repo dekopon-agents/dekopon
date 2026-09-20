@@ -118,9 +118,6 @@ routes:                                       # first match wins; order matters
     subjects: [slack.t0123abc.u9xyz]          # optional, and only beside kind: [directMessage]
     agent: xaviers-conditional-writer
     model: local-qwen                         # optional; else the first model offering the agent's modelClass
-    providerAttachments:                      # optional; absent means this route delivers none
-      maxPerReply: 1                          # required, 1-255 attachments per reply
-    chatAssetInputs: [gpt-image.edit]         # optional; capabilities whose input may name a chat asset
     improvementSuggestions: true              # optional; offers suggest_improvement, recorded to telemetry
     inspectAgentConfig: false                 # optional, default true; withholds inspect_agent_config
     progressDetail: plain                     # optional: off | plain (default) | detailed
@@ -179,7 +176,6 @@ A gateway that starts and then refuses everything is worse than one that does no
 - `subjects:` beside anything but `kind: [directMessage]`, an empty `subjects:` list, or `memory.scope: sharedConversation` on a `[directMessage]`-only route, where the direct message already is the subject;
 - a `liveness.conversations.<kind>` key for a kind the transport never produces;
 - a missing or blank chat or bound-route model credential environment variable. A model's `apiKeyEnv` is optional and absent means "this endpoint needs no key", which a loopback llama.cpp genuinely does not; naming a variable that is unset or exported blank is the opposite claim, and this process cannot see one exported after it started;
-- a route whose `providerAttachments.maxPerReply` is `0` (omit the block instead);
 - an unknown Slack experience, liveness mode/fallback, or field inside those strict blocks; an off
   Slack liveness with a reaction fallback, or a classic app with native liveness and no reaction
   fallback, is also refused because the configured fallback could never take effect;
@@ -329,59 +325,55 @@ receipt traces retain their input and terminal disposition; the lead-parented ex
 causal links to every constituent (see [observability](observability.md)). Asset leases, history
 scope, generation fences and on-demand fetch budgets are unchanged.
 
-## Provider attachments and chat-asset inputs
+## Asset handles and delivery
 
-Bytes can cross between a capability and a chat conversation in both directions, and the sandboxed
-shell is on neither path. It has no byte type, so printing a base64 blob would clamp it into the
-model transcript as a screenful of garbage and charge the session for the rest. Both directions are
-therefore courier behaviour in this daemon — it already fetches inbound attachment bytes and already
-uploads files to a chat service — and neither changes who authorizes an invocation. The gateway holds
-no image credential of its own: **producing** an image is a provider effect, authorized by the broker
-and audited there like any other external write.
+The gateway's conversation-generation table is the only asset inventory: uploads and provider
+outputs have scoped `chat-asset:<N>` references, never model-supplied paths. Every exact matching
+proposal string leaf is resolved automatically, in first-occurrence order; repeated references
+share one pin and descriptor. Data URLs in proposals are refused before broker submission.
+The proposal JSON remains unchanged. Only referenced files cross the broker boundary as read-only,
+close-on-exec descriptors; the complete bounded metadata table and remaining-send allowance ride
+beside the invocation. Broker subject, Cedar and HTTP authorization are unchanged.
 
-Each direction is an owner-authored route opt-in, because each is new reach.
+A successful provider `attach` returns a descriptor and typed metadata, not a JSON byte envelope.
+The gateway numbers it at intake, charges its fstat size to the disk LRU, and appends a bounded
+`assetNote` naming the reference, declared content type and stored-byte count. The declared label
+is authoritative; a bounded decoded-prefix disagreement produces one metadata-only event.
+Pathless outputs are retained without copying and reclaimed by closing their last descriptor.
+All descriptor reads are positional. A trap, denial or timeout admits no asset effects.
 
-- **Out: `providerAttachments: { maxPerReply: N }`.** A successful capability result may carry a
-  reserved top-level `attachments: [{mediaType, base64}]`. The session's broker leg removes that key
-  before the result reaches the shell, validates each entry (`image/png`, valid base64, PNG
-  signature, at most 8 MiB decoded, at most `maxPerReply` across the whole session), puts the
-  accepted assets in its bounded disk LRU with temporary delivery pins, and writes back `attached`
-  metadata with a gateway `asset: "chat-asset:<N>"` marker and retained/not-yet-delivered status so the
-  shell and the model see metadata only. The ordinary result fields beside the key are untouched.
-- **In: `chatAssetInputs: [<capability id>, …]`.** A capability input may name one of this
-  conversation's own attachments as the exact string `chat-asset:<N>`, the number from its
-  `Chat Asset #N` reference line. For a listed capability the leg replaces each marker with
-  `data:<mime>;base64,<bytes>` before the proposal is submitted; image media types only. Three bounds
-  apply together: at most **three expansions per invocation**, at most **8.5 MiB decoded per
-  invocation**, and at most **twelve expansions per session** across every invocation it proposes.
-  The session bound exists because expansion happens *before* the broker authorizes anything — without
-  it a script could spend its whole capability budget proposing a listed capability and pull three
-  attachments off the chat service on each one, even if policy denied every call. All three are
-  separate from the model's own four `fetch_chat_asset` calls, so a remix cannot exhaust the agent's
-  ability to read its own conversation. A capability *not* listed keeps the string verbatim and
-  decides for itself. Unknown identifiers in the list are a startup failure naming each one.
+**Attach is not send.** An explicit broker-authorized `asset.send` queues a file for this turn's
+reply. Four newly sent assets are permitted per turn. Sent state persists for the lifetime of the
+table entry: duplicate sends, even in later turns, are no-ops; a sent file cannot be removed.
+Removal of an unsent asset closes its unpinned retained file and releases accounting. No failure
+implicitly retries or clears sent state. Empty answer text still delivers queued files; failed
+or cancelled turns deliver none. Delivery disposition is logged as `agent.asset.send`; a failure
+adds one bounded gateway notice to the next turn. An output retention refusal names the failure
+without suggesting a repeat of an already-executed paid capability.
 
-Neither direction can fail a script. A refused attachment leaves `attached: []` (or the entries that
-were accepted) plus one fixed gateway sentence the model reads, and the cause is audited once as
-`agent.provider_attachment.refused` or `agent.chat_asset_input.refused` with a stable reason. A
-refused *input* marker submits no proposal at all and comes back as the interpreter's non-retryable
-refusal, because the marker will not become valid on a retry. Attachment bytes cross broker IPC
-in expanded invocation inputs and provider results. The gateway strips result attachments before
-returning them to the shell or model, and retains no attachment bytes in conversation history or
-durable memory. Broker input spans include expanded attachment data; the gateway's byte-free result
-convention is not a broker-telemetry filter. The reply
-slot is dropped unread when a session fails or is cancelled.
+Limits are **8 MiB decoded per asset, five distinct references / attached outputs and 40 MiB decoded
+per invocation**, 32 table entries per conversation and the configurable 256 MiB default disk LRU.
+An eight-MiB base64 asset may store up to 11,184,812 bytes; identity stays at 8,388,608.
+Disk retention and broker in-flight spool budgets account for actual stored bytes.
+These limits are separate from model-facing fetch limits. Listing metadata does not update LRU
+recency; resolving bytes does. Reclaimed files never refetch or silently substitute older pixels.
 
-Delivery uses each service's native upload path: one Slack three-step external file upload per
-attachment with the answer text as the first upload's `initial_comment`, every attachment on Discord's
-first multipart Create Message, one Telegram multipart `sendPhoto` per attachment with the caption on
-the first, and a base64 `images` array on the local socket that is omitted entirely for a text-only
-reply. Filenames are gateway-owned and carry the attachment's position, so two files in one reply do
-not arrive under one name. WhatsApp uploads each PNG to Graph media and sends the returned image ID;
-its smaller 5,000,000-byte ceiling is checked before any part of the reply is sent. A successful `reply`
-covers the complete text/attachment reply. If Slack, Telegram, WhatsApp, or a split Discord reply accepts only part,
-the session is `reply-failed` and performs no durable record. Persistent history remembers only final
-text; referring to prior pixels requires a fresh invocation.
+Delivery keeps existing native paths: Slack external upload, Discord multipart Create Message,
+Telegram `sendPhoto`, WhatsApp Graph media/image messages, and local base64 JSON. Each upload reads
+a bounded file; the shared native codec converts base64 storage to raw upload bytes, and local
+encodes into its output line. There is no image-format conversion.
+
+| Adapter | Supported declared content types |
+|---|---|
+| Slack, Discord, local | Any concrete syntactically valid media type; no wildcards |
+| Telegram, WhatsApp | `image/png`, `image/jpeg` |
+
+Route instructions should name the adapter's accepted types and tell the model to plan a converter
+when necessary. These are adapter-supported sets, not claims about every upstream feature.
+Unsupported formats refuse before uploading. WhatsApp additionally retains its 5,000,000-byte
+ceiling. Filenames are gateway-generated. Only authenticated reply coordinates select the target;
+a partial delivery fails the reply and suppresses durable recording. Provider result byte envelopes
+are refused by capability name with a message naming `dekopon:asset`.
 
 Slack installations need `files:write` in addition to the existing reply/read scopes. Discord bots
 need **Attach Files** in addition to View/Send/Read History/Send in Threads. Telegram needs no
@@ -493,13 +485,10 @@ The model then calls `fetch_chat_asset(1)`. Because a tool result cannot carry a
 - **Bounds.** 8 MiB per attachment, enforced while the response streams rather than after it, because a reported size is sender-influenced and a chunked response need not declare a length. Four fetches per session. Thirty-two attachments addressable per conversation, evicted oldest-first. A textual file is clamped again on the way into the prompt, at the same 256 KiB a script's output is capped at, with a trailer saying where it was cut: the 8 MiB ceiling is sized for images on the wire, and that much `text/plain` is roughly two million tokens — enough to come back from the provider as a context-length rejection. Every one of these refuses in a sentence the model reads and can answer around, never by failing the session.
 - **Redirects.** The HTTP client refuses redirects globally so a bearer token is never forwarded by policy. Slack's `url_private_download` genuinely redirects to its own file host, so that transport follows exactly one hop and re-attaches the token by hand. Both URLs are checked on one rule, at the single place the token is attached: the URL the event supplied and the `location` after it are parsed rather than prefix-matched, and each must name an allowlisted Slack host over HTTPS on the default port with no credentials in the authority. A refused URL fails the fetch before any request is made.
 - **Ambient proxies.** Every transport's client is built from one `credential_client` shape that sets `no_proxy()`, so an exported `HTTPS_PROXY`, `HTTP_PROXY` or `ALL_PROXY` carries no Slack, Discord, Telegram or WhatsApp token — nor the messages and files it authenticates — through a host nobody named to Dekopon. There is no flag to opt back in; a chat service reachable only through a proxy is unreachable.
-- **Gateway-owned disk LRU, weak references.** Inbound inputs fetch once, then reuse the same
-  private file. Validated generated PNGs receive fresh scoped gateway IDs, with capability/invocation
-  provenance, and join the conversation inventory immediately. The model receives
-  `attached: [{mediaType, bytes, asset: "chat-asset:<N>", retained: true, delivered: false}]`:
-  produced and retained is not transport-delivered. Same-session and later-turn edits can use that
-  marker, including editing a previous edit instead of the original. Provider-supplied reserved
-  `attached`/`attachmentNote` values are removed, never trusted as gateway metadata.
+- **Gateway-owned disk LRU, weak references.** Uploads fetch once; descriptor-backed outputs join
+  the same inventory with capability/invocation provenance. A bounded typed-output note names each
+  retained reference; same-session and later-turn edits can address it without carrying bytes in
+  the shell, prompt transcript or history. Retention and delivery are separate acts.
 - **One configurable residency budget.** `sessions.assetRetentionBytes` defaults to **268435456**
   (256 MiB) across all conversations and generated/inbound assets in this gateway process. **Zero
   disables retention**: newly fetched/generated assets cannot be retained or delivered; text remains
@@ -607,11 +596,12 @@ rolls back new claims so Meta can redeliver.
 PNG/JPEG photos carry one lazy media-ID reference; webhook URLs are ignored. Captions become the
 bounded user text, including an absent/empty caption (the session then receives the reference note).
 No download occurs before routing and fresh session authorization. An image-capable route model
-(`modalities: [image]`) is required to expose numbered references. To edit, also enable
-`chatAssetInputs: [gpt-image.edit]` and `providerAttachments: { maxPerReply: 1 }`, install the external
-GPT-image provider in the broker, and grant its narrow capability there. The model proposes an input
-such as `{"prompt":"Make the sky purple","images":["chat-asset:1"]}`; the existing courier expands it
-before broker authorization. The gateway never receives the GPT-image credential.
+(`modalities: [image]`) is required for model image inspection. To edit, install a handle-aware
+external image provider and the asset command provider in the broker, with narrow capabilities and
+credentials there. References such as `{"images":["chat-asset:1"]}` stay unchanged on proposals;
+the gateway passes the referenced descriptor. Sending the attached result requires a separate
+`asset.send` grant, preferably restricted to the asset provider. The image credential never enters
+the gateway.
 
 At fetch time, Graph `GET /{version}/{media-id}?phone_number_id={phone-number-id}` resolves the
 opaque ID. Metadata JSON is capped at 16 KiB; media ID, MIME, and numeric/string `file_size` must
@@ -621,16 +611,17 @@ other hosts/ports/paths, redirects, and ambient proxies are refused. This is a c
 policy, not a claim that Meta guarantees an exhaustive CDN list; unknown CDN URLs fail closed.
 The process-owned client resolves only Graph and that host, with a 5-second DNS deadline and at
 most 32 public addresses bound to the actual connection (no second unchecked lookup). Each Graph
-or download request has a 15-second deadline; session admission and existing fetch/expansion budgets
-bound concurrency and total work. Downloads enforce the smaller of the caller's bound and
+or download request has a 15-second deadline; session admission, the four model fetches per turn,
+the route's capability-call budget, and each invocation's five input descriptors / 40 MiB decoded-byte
+ceiling bound concurrency and total work. Downloads enforce the smaller of the caller's bound and
 5,000,000 bytes while streaming, then verify the declared length and PNG/JPEG signature. There is
 no image decoding, dimension/color-space guarantee, transcoding, URL caching, or automatic retry.
 
-Provider PNG replies use multipart `POST /{version}/{phone-number-id}/media` with
-`messaging_product=whatsapp` and a gateway-named `file` part of type `image/png`, then an ordinary
-image message with `image.id` (never a model-selected URL). The same 5,000,000-byte ceiling applies;
-a larger PNG accepted by the generic 8 MiB slot is refused before uploading or sending any reply
-part. Text of at most 1,024 Unicode scalars captions the first image; longer text is sent in full as
+Queued PNG/JPEG replies use multipart `POST /{version}/{phone-number-id}/media` with
+`messaging_product=whatsapp` and a gateway-named `file` part carrying the declared PNG/JPEG content type, then an ordinary
+image message with `image.id` (never a model-selected URL). The same 5,000,000-byte ceiling applies
+to decoded upload bytes, independent of identity/base64 storage. All outputs are preflighted before
+uploading or sending any reply part; retention counts stored bytes while invocation limits count decoded bytes. Text of at most 1,024 Unicode scalars captions the first image; longer text is sent in full as
 split text after all images, and empty captions are omitted. Upload acceptance alone is not message
 acceptance, and a message ID is not proof of human delivery. There is no media deletion subsystem;
 Meta's uploaded-media retention applies.
@@ -828,7 +819,7 @@ Each routed message runs one session. On a `oneShot` route — the default, and 
 1. **Admission.** A process-wide semaphore bounds what the daemon costs at once, and a per-`(transport, conversation)` in-flight set, keyed on the same conversation identity the session registry and the memory key use, stops one conversation from queueing work on itself — what a person does when a bot seems slow and they send the same thing again. A rejected message gets `I'm busy — try again shortly.` when `replyOnBusy` is set, and silence otherwise.
 2. **Authorization.** The session opens an attested broker leg with `capabilities(subject, agent, scope)`. If the answer is empty — or the broker refuses, because the attestation was not honored or because policy does not permit this principal to drive this agent — the sender gets `You're not authorized to use this agent.` and **no model call or liveness write is made**. That is the cheapest possible refusal, and one the message text cannot argue with.
 3. **Liveness.** When the transport opted in, one session-owned policy task starts immediately after the fresh grant. The service renders everything; the model supplies no target, wording, emoji, cadence, or timing. The policy owns one message, spends the session's edit budget, seals synchronously before terminal delivery, and returns the service's own indicators to rest afterwards, so cosmetic I/O never delays the reply or holds admission. Two consecutive failures stop that surface for the session; permanent Slack installation failures additionally trip a transport-wide fallback breaker. What it shows is [Liveness, progress, and stopping a run](#liveness-progress-and-stopping-a-run).
-4. **Execution.** On a `persistent` route the session first looks up its conversation under the key in [Scope selects the replay audience](#scope-selects-the-replay-audience). An entry idle past the route's timeout, or built under a granted capability set that differs from the one this message's leg just reported, is dropped rather than used; whatever survives is seeded into the prompt ahead of the new message as compacted `(question, answer)` pairs, oldest dropped first until the window's turn and byte bounds both hold. A shared turn's user text starts with a gateway-authored canonical-participant label, for both the current message and later replay. The lookup happens *after* step 2 because the grant comparison needs a fresh grant to compare against. Then the model client is built from the route's model, the shell runtime is given the attested leg as its only capability dispatch, the credential-free `inspect_agent_config` view is built from the same fresh leg and offered unless the route wrote `inspectAgentConfig: false`, the route's `providerAttachments` slot and `chatAssetInputs` expansion are attached to that leg, and the prompt loop runs on a blocking task with the agent's `instructions` as the system prompt. The agent's catalog skills ride the bound route — read whole into memory when the catalog loaded and shared by every session rather than re-read, so a session never touches the filesystem — and are mounted on every session on that route: a second system message after the instructions lists each by name and description, and the `read_skill` tool loads one skill's instructions, or one of its resource files, on demand. A route with `improvementSuggestions: true` additionally offers `suggest_improvement`; what it records is written to telemetry as `agent.improvement.suggested` and is never relayed to chat, so the sender sees only the answer. Instructions are supplied fresh on every message and never stored, so editing an agent's standing orders takes effect on the next message without rewriting a single remembered conversation. Shell bounds are `dekopon-shell`'s defaults except `maxCapabilityCalls` and the script deadline, which both come from the route. Every model request the session then makes declares a [prompt cache key](#the-prompt-cache-key) — the conversation's on a `persistent` route, the route's on a `oneShot` one.
+4. **Execution.** On a `persistent` route the session first looks up its conversation under the key in [Scope selects the replay audience](#scope-selects-the-replay-audience). An entry idle past the route's timeout, or built under a granted capability set that differs from the one this message's leg just reported, is dropped rather than used; whatever survives is seeded into the prompt ahead of the new message as compacted `(question, answer)` pairs, oldest dropped first until the window's turn and byte bounds both hold. A shared turn's user text starts with a gateway-authored canonical-participant label, for both the current message and later replay. The lookup happens *after* step 2 because the grant comparison needs a fresh grant to compare against. Then the model client is built from the route's model, the shell runtime is given the attested leg as its only capability dispatch, the credential-free `inspect_agent_config` view is built from the same fresh leg and offered unless the route wrote `inspectAgentConfig: false`, the scoped asset table and request-local explicit-send slot are attached to that leg, and the prompt loop runs on a blocking task with the agent's `instructions` as the system prompt. The agent's catalog skills ride the bound route — read whole into memory when the catalog loaded and shared by every session rather than re-read, so a session never touches the filesystem — and are mounted on every session on that route: a second system message after the instructions lists each by name and description, and the `read_skill` tool loads one skill's instructions, or one of its resource files, on demand. A route with `improvementSuggestions: true` additionally offers `suggest_improvement`; what it records is written to telemetry as `agent.improvement.suggested` and is never relayed to chat, so the sender sees only the answer. Instructions are supplied fresh on every message and never stored, so editing an agent's standing orders takes effect on the next message without rewriting a single remembered conversation. Shell bounds are `dekopon-shell`'s defaults except `maxCapabilityCalls` and the script deadline, which both come from the route. Every model request the session then makes declares a [prompt cache key](#the-prompt-cache-key) — the conversation's on a `persistent` route, the route's on a `oneShot` one.
 5. **Answer, silence, and optional durable recording.** A required session's final bounded text and accepted provider attachments go back to chat. An inherited Slack Agent continuation may instead call `decline_chat_reply` before capability work, which commits its user-only in-process turn, removes the progress message, and sends no reply request. On failure the sender gets one fixed line, `The agent could not complete this request.` — a `PromptError` can carry model-chosen text, a provider message, or a transport diagnostic, and chat is the last place any of those belong. The operator reads the category from telemetry. A `persistent` route writes only the textual exchange back as one more in-process remembered turn, trims the window, and restarts the idle clock. A generation lease makes a commit from older in-flight work inert after grant invalidation, empty-grant removal, idle replacement, or capacity eviction, while concurrent work in the same generation appends in completion order. **The fixed failure line and attachment bytes are never stored.** A declined or failed model session records its question with nothing in the in-process answer's place, which is truthful and is what makes a later follow-up answerable; a session refused at step 2 records nothing at all. Optional durable recording happens under the conditions in [Durable memory after transport acceptance](#durable-memory-after-transport-acceptance).
 
 Text is bounded in both directions: inbound to 16 KiB keeping the head (a chat message states its request first), outbound to 8 KiB keeping head and tail (an answer's conclusion is usually its last line). Both truncations say so in the text.

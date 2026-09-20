@@ -77,6 +77,7 @@ fn authorized_for(
 
 fn http_constraints(authority: String, method: &str) -> ExecutionConstraints {
     ExecutionConstraints {
+        asset: None,
         timeout_ms: 5_000,
         max_output_bytes: 1024 * 1024,
         http: Some(HttpConstraints {
@@ -143,6 +144,7 @@ async fn loads_http_provider_and_executes_one_authorized_request() {
                 http_constraints(authority.clone(), "PATCH"),
             ),
             None,
+            Default::default(),
         )
         .await
         .expect("authorized HTTP invocation succeeds");
@@ -202,6 +204,7 @@ async fn jsonplaceholder_read_and_write_use_separate_broker_grants() {
                 http_constraints(get_authority.clone(), "GET"),
             ),
             None,
+            Default::default(),
         )
         .await
         .expect("authorized JSONPlaceholder read succeeds");
@@ -238,6 +241,7 @@ async fn jsonplaceholder_read_and_write_use_separate_broker_grants() {
                 http_constraints(create_authority.clone(), "POST"),
             ),
             None,
+            Default::default(),
         )
         .await
         .expect("authorized JSONPlaceholder write succeeds");
@@ -280,6 +284,7 @@ async fn denies_http_when_authorization_has_no_http_grant() {
                 ExecutionConstraints::default(),
             ),
             None,
+            Default::default(),
         )
         .await
         .expect_err("missing HTTP authorization must fail")
@@ -313,6 +318,7 @@ async fn rejects_a_destination_outside_the_exact_authority_grant() {
                 http_constraints("127.0.0.1:10".to_owned(), "GET"),
             ),
             None,
+            Default::default(),
         )
         .await
         .expect_err("different loopback port must be denied before connection");
@@ -352,6 +358,7 @@ async fn rejects_guest_control_of_authorization_headers() {
                 http_constraints("127.0.0.1:9".to_owned(), "GET"),
             ),
             None,
+            Default::default(),
         )
         .await
         .expect_err("guest authorization header must be rejected before connection")
@@ -388,6 +395,7 @@ async fn guest_code_cannot_mask_a_policy_rejection() {
                 http_constraints("127.0.0.1:10".to_owned(), "GET"),
             ),
             None,
+            Default::default(),
         )
         .await
         .expect_err("host rejection remains terminal after the guest catches the WIT error")
@@ -435,6 +443,7 @@ async fn enforces_response_bytes_while_streaming() {
                 constraints,
             ),
             None,
+            Default::default(),
         )
         .await
         .expect_err("oversized response must fail the invocation")
@@ -473,6 +482,7 @@ async fn returns_redirects_without_following_them() {
                 http_constraints(authority, "GET"),
             ),
             None,
+            Default::default(),
         )
         .await
         .expect("redirect response itself is returned");
@@ -499,6 +509,7 @@ async fn broker_host_also_runs_import_free_components() {
                 ExecutionConstraints::default(),
             ),
             None,
+            Default::default(),
         )
         .await
         .expect("import-free provider runs without an HTTP grant");
@@ -525,6 +536,7 @@ async fn rejects_authorization_bound_to_a_different_provider() {
                 ExecutionConstraints::default(),
             ),
             None,
+            Default::default(),
         )
         .await
         .expect_err("authorization cannot be retargeted to the routed provider")
@@ -901,6 +913,7 @@ async fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
                 capability,
                 json!({"text": "héllo"}),
                 ExecutionConstraints {
+                    asset: None,
                     timeout_ms: 5_000,
                     max_output_bytes: 4_096,
                     http: None,
@@ -909,6 +922,7 @@ async fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
                 },
             ),
             None,
+            Default::default(),
         )
         .await
         .expect("the proposed capability runs");
@@ -1031,6 +1045,7 @@ async fn refuses_a_store_beyond_the_aggregate_memory_ceiling() {
                         constraints,
                     ),
                     None,
+                    Default::default(),
                 )
                 .await
         }
@@ -1051,6 +1066,7 @@ async fn refuses_a_store_beyond_the_aggregate_memory_ceiling() {
                 http_constraints(authority.clone(), "GET"),
             ),
             None,
+            Default::default(),
         )
         .await
         .expect_err("a second concurrent store exceeds the aggregate ceiling")
@@ -1074,6 +1090,7 @@ async fn refuses_a_store_beyond_the_aggregate_memory_ceiling() {
                 http_constraints(authority, "GET"),
             ),
             None,
+            Default::default(),
         )
         .await
         .expect_err("the fixture never answers, but the store is admitted");
@@ -1121,6 +1138,7 @@ async fn a_persistent_compilation_cache_serves_a_second_load() {
         .invoke(
             authorized(capability, json!({"text": "warm"}), constraints_5s()),
             None,
+            Default::default(),
         )
         .await
         .expect("a cached component still invokes");
@@ -1129,6 +1147,7 @@ async fn a_persistent_compilation_cache_serves_a_second_load() {
 
 fn constraints_5s() -> ExecutionConstraints {
     ExecutionConstraints {
+        asset: None,
         timeout_ms: 5_000,
         max_output_bytes: 4_096,
         http: None,
@@ -1159,6 +1178,7 @@ async fn rejects_authorization_that_exceeds_host_ceilings() {
                 },
             ),
             None,
+            Default::default(),
         )
         .await
         .expect_err("authorization cannot widen host timeout")
@@ -1196,6 +1216,7 @@ async fn a_dispatched_call_survives_a_failed_invocation_as_outcome_unknown() {
                 constraints,
             ),
             None,
+            Default::default(),
         )
         .await
         .expect_err("an unanswered request cannot succeed");
@@ -1245,6 +1266,7 @@ fn conditional_write_constraints(
     max_requests: u32,
 ) -> ExecutionConstraints {
     ExecutionConstraints {
+        asset: None,
         timeout_ms: 5_000,
         max_output_bytes: 1024 * 1024,
         http: Some(HttpConstraints {
@@ -1289,6 +1311,7 @@ async fn a_two_request_capability_leaves_two_evidence_entries() {
                 conditional_write_constraints(authority.clone(), &["GET", "POST"], 2),
             ),
             None,
+            Default::default(),
         )
         .await
         .expect("authorized two-call conditional write succeeds");
@@ -1329,6 +1352,7 @@ async fn a_write_without_post_authority_is_a_terminal_policy_rejection() {
                 conditional_write_constraints(authority.clone(), &["GET"], 2),
             ),
             None,
+            Default::default(),
         )
         .await
         .expect_err("a write without POST authority must fail");
@@ -1368,6 +1392,7 @@ async fn a_two_request_capability_over_its_call_budget_trips_the_host_call_limit
                 conditional_write_constraints(authority.clone(), &["GET", "POST"], 1),
             ),
             None,
+            Default::default(),
         )
         .await
         .expect_err("a second call over a one-call grant must fail");
@@ -1576,6 +1601,7 @@ async fn generated_wasm_storage_denials_are_sticky_and_commit_nothing() {
             .parse::<CapabilityId>()
             .expect("capability");
         let constraints = ExecutionConstraints {
+            asset: None,
             timeout_ms: 10_000,
             max_output_bytes: 64 * 1024,
             http: None,
@@ -1615,6 +1641,7 @@ async fn generated_wasm_storage_denials_are_sticky_and_commit_nothing() {
                 ),
                 None,
                 Some(grant),
+                Default::default(),
             )
             .await
             .expect_err("a caught storage denial remains terminal");
@@ -1745,6 +1772,7 @@ async fn automatic_post_return_traps_remain_command_and_invocation_failures() {
                 },
             ),
             None,
+            Default::default(),
         )
         .await
         .expect_err("cleanup trap must not return the lifted success response");
@@ -1787,4 +1815,160 @@ async fn automatic_post_return_yields_to_the_deadline_and_releases_the_store() {
         registry.run_command("cleanup", &[], None).await,
         Err(BrokerHostError::Timeout { .. })
     ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn real_guest_streams_one_and_five_eight_mib_assets_and_attaches_a_read_only_response() {
+    use dekopon_broker_host::asset::AssetInputs;
+    use dekopon_broker_protocol::{AssetEncoding, AssetRow};
+    use dekopon_capability::AssetConstraints;
+    use dekopon_http_host::asset::AssetDirectory;
+    use std::{fs::File, os::unix::fs::FileExt as _};
+    let root = tempfile::tempdir().unwrap();
+    let mut registry = BrokerProviderRegistry::load(
+        [provider_fixture("http-probe-provider.wasm")],
+        BrokerHostLimits {
+            max_memory_bytes: 16 * 1024 * 1024,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    registry.set_assets(AssetDirectory::new(
+        root.path().to_owned(),
+        64 * 1024 * 1024,
+    ));
+    let input = tempfile::NamedTempFile::new().unwrap();
+    input.as_file().set_len(8 * 1024 * 1024).unwrap();
+    // The full 40 MiB upload leaves no decoded budget for a response writer.
+    for (count, response) in [(1, "done"), (5, "")] {
+        let server = LoopbackServer::once(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes());
+        let refs = (1..=count)
+            .map(|id| format!("chat-asset:{id}"))
+            .collect::<Vec<_>>();
+        let inputs = AssetInputs {
+            rows: (1..=count)
+                .map(|id| AssetRow {
+                    id,
+                    content_type: "application/octet-stream".to_owned(),
+                    encoding: AssetEncoding::Identity,
+                    bytes: 8 * 1024 * 1024,
+                    origin: "chat".to_owned(),
+                    sent: false,
+                })
+                .collect(),
+            descriptors: (1..=count)
+                .map(|_| File::open(input.path()).unwrap().into())
+                .collect(),
+            sends_remaining: 0,
+        };
+        let mut constraints = http_constraints(server.authority().to_owned(), "POST");
+        constraints.asset = Some(AssetConstraints {
+            attach: true,
+            ..Default::default()
+        });
+        let output = registry
+            .invoke(
+                authorized(
+                    "http-probe.fetch".parse().unwrap(),
+                    json!({"assetMode": "stream", "references": refs, "uri": server.url()}),
+                    constraints,
+                ),
+                None,
+                inputs,
+            )
+            .await
+            .unwrap();
+        assert_eq!(output.output, json!({"status": 200}));
+        assert_eq!(output.assets.attached.len(), 1);
+        assert_eq!(output.assets.attached[0].descriptor, 0);
+        assert_eq!(output.assets.attached[0].bytes, response.len() as u64);
+        assert_eq!(output.assets.attached[0].content_type, "text/plain");
+        let file = output.assets.files[0].file();
+        let mut bytes = vec![0; response.len()];
+        file.read_exact_at(&mut bytes, 0).unwrap();
+        assert_eq!(bytes, response.as_bytes());
+        assert!(file.write_at(b"x", 0).is_err());
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        let wire = server.request();
+        let start = wire
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+            .unwrap()
+            + 4;
+        let length =
+            dekopon_core::base64::encoded_len(8 * 1024 * 1024).unwrap() as usize * count as usize;
+        assert_eq!(wire.len() - start, length);
+        assert_eq!(dekopon_test_support::content_length(&wire[..start]), length);
+        assert!(server.recorded().is_empty());
+        server.join();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn real_guest_asset_effects_exist_only_on_success_and_caught_denials_stay_terminal() {
+    use dekopon_capability::AssetConstraints;
+    use dekopon_http_host::asset::AssetDirectory;
+    let root = tempfile::tempdir().unwrap();
+    let directory = AssetDirectory::new(root.path().to_owned(), 11);
+    let mut registry = BrokerProviderRegistry::load(
+        [provider_fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .unwrap();
+    registry.set_assets(directory.clone());
+    for mode in ["attach", "fail", "trap", "timeout", "catch-denied"] {
+        let constraints = ExecutionConstraints {
+            timeout_ms: if mode == "timeout" { 10 } else { 5000 },
+            asset: Some(AssetConstraints {
+                attach: mode != "catch-denied",
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let result = registry
+            .invoke(
+                authorized(
+                    "http-probe.fetch".parse().unwrap(),
+                    json!({"assetMode": mode}),
+                    constraints,
+                ),
+                None,
+                Default::default(),
+            )
+            .await;
+        match mode {
+            "attach" => assert_eq!(result.unwrap().assets.attached.len(), 1),
+            "fail" => assert!(matches!(
+                *result.unwrap_err().error,
+                BrokerHostError::ProviderFailure { .. }
+            )),
+            "trap" => assert!(matches!(
+                *result.unwrap_err().error,
+                BrokerHostError::Invoke { .. }
+            )),
+            "timeout" => assert!(matches!(
+                *result.unwrap_err().error,
+                BrokerHostError::Timeout { .. }
+            )),
+            "catch-denied" => assert!(matches!(
+                *result.unwrap_err().error,
+                BrokerHostError::HostCallRejected {
+                    reason: "asset-call-rejected",
+                    ..
+                }
+            )),
+            _ => unreachable!(),
+        }
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        // Exact capacity is available again after every terminal path.
+        directory
+            .allocate()
+            .await
+            .unwrap()
+            .write(vec![0; 11])
+            .await
+            .unwrap();
+    }
 }

@@ -887,6 +887,7 @@ impl ChatDriver for SlackReplier {
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
         let OutboundReply { text, images } = reply;
+        super::hydration::validate_types(&images, super::hydration::AcceptedTypes::Files)?;
         let images = super::hydration::ImageQueue::new(images);
         let ReplyTarget::Slack { channel, thread_ts } = target else {
             return Err(TransportError::Response);

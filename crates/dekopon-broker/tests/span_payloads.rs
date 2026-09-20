@@ -122,10 +122,11 @@ async fn a_proposal_past_the_cap_is_recorded_truncated_beside_its_full_length() 
                 input,
                 secret_use: None,
             },
+            Default::default(),
         )
         .await
         .expect("a permitted capability runs");
-    assert_eq!(result.outcome, InvocationOutcome::Succeeded);
+    assert_eq!(result.result.outcome, InvocationOutcome::Succeeded);
 
     let cap = dekopon_core::MAX_ATTRIBUTE_BYTES;
     let authorize = captured

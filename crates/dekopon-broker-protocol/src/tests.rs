@@ -185,7 +185,7 @@ async fn round_trips_one_strict_bounded_frame() {
         max_frame_bytes: 4 * 1024,
         io_timeout: Duration::from_secs(1),
     };
-    let expected = RequestEnvelope::invoke(None, invocation());
+    let expected = RequestEnvelope::invoke(None, invocation(), vec![], 0);
     let (mut writer, mut reader) = duplex(8 * 1024);
     let write = tokio::spawn({
         let expected = expected.clone();
@@ -323,7 +323,7 @@ async fn one_frame_reaches_the_socket_in_one_write() {
         max_frame_bytes: 4 * 1024,
         io_timeout: Duration::from_secs(1),
     };
-    let request = RequestEnvelope::invoke(None, invocation());
+    let request = RequestEnvelope::invoke(None, invocation(), vec![], 0);
     let mut writer = CountingWriter::default();
     write_frame(&mut writer, &request, limits)
         .await
@@ -461,7 +461,7 @@ async fn a_payload_that_ends_early_is_not_decoded() {
 
 #[test]
 fn wire_invocation_contains_no_identity_or_authority_fields() {
-    let value = serde_json::to_value(RequestEnvelope::invoke(None, invocation()))
+    let value = serde_json::to_value(RequestEnvelope::invoke(None, invocation(), vec![], 0))
         .expect("request serializes");
     let encoded = serde_json::to_string(&value).expect("request JSON renders");
     for prohibited in [
@@ -604,7 +604,7 @@ async fn framing_failures_keep_the_executed_or_not_distinction() {
     });
     let client = BrokerClient::new(&socket, uid, limits).expect("valid client limits");
     let lost = client
-        .invoke(None, invocation())
+        .invoke(None, invocation(), super::InvokeAssets::default())
         .await
         .expect_err("a lost response must fail");
     server.await.expect("server fixture exits");
@@ -631,7 +631,7 @@ async fn framing_failures_keep_the_executed_or_not_distinction() {
     };
     let client = BrokerClient::new(&unread, uid, tight).expect("valid client limits");
     let oversized = client
-        .invoke(None, invocation())
+        .invoke(None, invocation(), super::InvokeAssets::default())
         .await
         .expect_err("an oversized proposal must fail");
     drop(listener);
@@ -1622,14 +1622,27 @@ fn every_verb_is_one_operation_whatever_attestation_accompanies_it() {
                 sample_trace_parent(),
             ),
         ),
-        ("invoke", RequestEnvelope::invoke(None, invocation())),
         (
             "invoke",
-            RequestEnvelope::invoke(Some(unattested.bound_to(invocation().id)), invocation()),
+            RequestEnvelope::invoke(None, invocation(), vec![], 0),
         ),
         (
             "invoke",
-            RequestEnvelope::invoke(Some(chat.bound_to(invocation().id)), invocation()),
+            RequestEnvelope::invoke(
+                Some(unattested.bound_to(invocation().id)),
+                invocation(),
+                vec![],
+                0,
+            ),
+        ),
+        (
+            "invoke",
+            RequestEnvelope::invoke(
+                Some(chat.bound_to(invocation().id)),
+                invocation(),
+                vec![],
+                0,
+            ),
         ),
         (
             "recordDeliveredTurn",
@@ -2211,6 +2224,9 @@ fn retired_reporting_operations_are_refused() {
     }
 }
 
+#[cfg(unix)]
+mod asset_descriptors;
+
 /// One failed result fixture carrying the provider's own answer.
 fn failed_with_detail() -> InvocationResult {
     InvocationResult {
@@ -2241,7 +2257,7 @@ async fn a_failed_invocation_round_trips_the_providers_own_code_and_message() {
         max_frame_bytes: 4 * 1024,
         io_timeout: Duration::from_secs(1),
     };
-    let expected = ResponseEnvelope::invocation(failed_with_detail());
+    let expected = ResponseEnvelope::invocation(failed_with_detail(), vec![], vec![], vec![]);
     let document = serde_json::to_value(&expected).expect("the response serializes");
     assert_eq!(
         document["response"]["result"]["detail"],
@@ -2277,13 +2293,18 @@ fn a_result_without_a_provider_detail_keeps_the_field_off_the_wire() {
         ..failed_with_detail()
     };
 
-    let document = serde_json::to_string(&ResponseEnvelope::invocation(result.clone()))
-        .expect("the response serializes");
+    let document = serde_json::to_string(&ResponseEnvelope::invocation(
+        result.clone(),
+        vec![],
+        vec![],
+        vec![],
+    ))
+    .expect("the response serializes");
 
     assert!(!document.contains("detail"), "{document}");
     assert_eq!(
         serde_json::from_str::<ResponseEnvelope>(&document).expect("it decodes"),
-        ResponseEnvelope::invocation(result)
+        ResponseEnvelope::invocation(result, vec![], vec![], vec![])
     );
 }
 

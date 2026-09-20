@@ -42,7 +42,7 @@ Neither token belongs in the app manifest or a Dekopon configuration file.
    Slack assigned to the app. Use that URL to return directly to these settings later.
 
 Both manifests enable Socket Mode and the App Home messages tab. Both include `files:write` for
-bounded provider-attachment replies; remove it only when no route sets `providerAttachments`. The classic profile adds
+bounded provider-attachment replies; remove it only when no route grants asset.send. The classic profile adds
 `reactions:write` for the explicitly configured fallback; remove that scope and leave liveness off
 if the classic deployment wants final replies only. The Agent profile additionally adds
 `agent_view`, `assistant:write`, and `agent_session_stopped`, plus the `app_home_opened` event Slack
@@ -85,10 +85,10 @@ bot scopes change later, select **Reinstall to Workspace** so the new scopes tak
 Slack's current file path is `files.getUploadURLExternal` → a tokenless upload to Slack's returned,
 origin-checked URL → `files.completeUploadExternal` with the authenticated channel/thread, once per
 attachment. The bot token is attached only to the two fixed Slack Web API calls and never to the
-upload URL. A route must set `providerAttachments` before a capability's files are delivered at all;
-otherwise reply behavior stays text-only and `files:write` is unused. See
-[`../../docs/dekopond.md#provider-attachments-and-chat-asset-inputs`](../../docs/dekopond.md#provider-attachments-and-chat-asset-inputs)
-for the conventions and their bounds.
+upload URL. Files are delivered only after explicit broker authorization of `asset.send`; attaching
+alone retains them. This adapter accepts any concrete valid media type. Route instructions should
+state that accepted set; invalid labels are refused. See
+[asset handles](../../docs/dekopond.md#asset-handles-and-delivery) for the bounds.
 
 ## Configure in-flight liveness
 

@@ -26,5 +26,4 @@ routes:
   - transport: support-whatsapp
     conversation: { kind: [directMessage] }
     agent: image-editor
-    chatAssetInputs: [gpt-image.edit]
-    providerAttachments: { maxPerReply: 1 }
+    # A handle-aware image provider attaches; a separately granted asset.send delivers PNG/JPEG.

@@ -147,7 +147,7 @@ The state claim root stays root-owned `0700` and neither daemon mounts it. With 
 enabled the broker mounts only its own credential subdirectory, and the gateway mounts only the
 configured ChatGPT subdirectory. Neither daemon can rename the other's directory.
 Private subdirectories are `0700`; files are `0600` with one link. Each daemon gets a separate
-`/tmp` volume. The broker alone mounts provider storage.
+`/tmp` volume. The broker alone mounts provider storage. The broker alone mounts broker assets.
 
 Gateway `/tmp` is **disk-backed** `emptyDir`, sized by `volumeSizes.gatewayTmp` (default 320Mi).
 Existing `volumeSizes.tmp` overrides now affect only broker scratch (still tmpfs, default 16Mi);
@@ -175,6 +175,7 @@ action performed by this chart.
 | optional secret source projection | operator-selected absolute path | source-specific | mounted read-only into broker only through `broker.secretSourceVolumes` |
 | `dekopond.yaml` | `/etc/dekopon/dekopond.yaml` | B | init container |
 | broker socket | `/run/dekopon/broker.sock` | protected IPC | the broker, at bind |
+| broker assets | `/var/lib/dekopon-assets` (`brokerAssets.rootPath`) | owned `0700` dir, broker-only disk `emptyDir` | init sets ownership; broker writes spools and outputs; match `brokerAssets` in operator inline `assets` config |
 | agent catalog | `/etc/dekopon-catalog/dekopon.yaml` | E | ConfigMap mount |
 | gateway ChatGPT credential | `/var/lib/dekopon/chatgpt/chatgpt-auth.json` | none | init container, **once**; then `dekopond` owns it |
 | broker ChatGPT credential | `/var/lib/dekopon/broker-chatgpt/chatgpt-auth.json` | A + writable parent | init container, **once**; then `dekopon-brokerd` owns it |

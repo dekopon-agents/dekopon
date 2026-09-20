@@ -44,13 +44,6 @@ pub(crate) struct BoundRoute {
     /// can be a megabyte of text that never changes while the daemon runs.
     pub skills: Arc<[Skill]>,
     pub model: Arc<ModelConfig>,
-    /// Attachments one reply on this route may carry; zero for a route that delivers none.
-    pub provider_attachments: u8,
-    /// Capabilities whose input may name a chat attachment, already checked against the catalog.
-    ///
-    /// Shared rather than cloned for the reason the skills are: a bound route is cloned per message
-    /// and this list never changes while the daemon runs.
-    pub chat_asset_inputs: Arc<[String]>,
     /// Whether this route's sessions may record improvement suggestions.
     pub improvement_suggestions: bool,
     /// Whether this route's sessions are offered `inspect_agent_config`.
@@ -170,12 +163,6 @@ impl RoutingTable {
                 instructions: agent.spec.instructions.clone(),
                 skills: Arc::from(catalog.agent_skills(&route.agent).to_vec()),
                 model: Arc::clone(model),
-                provider_attachments: route.provider_attachments,
-                chat_asset_inputs: route
-                    .chat_asset_inputs
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect(),
                 improvement_suggestions: route.improvement_suggestions,
                 inspect_agent_config: route.inspect_agent_config,
                 limits: PromptLimits {

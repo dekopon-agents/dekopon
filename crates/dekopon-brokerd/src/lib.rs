@@ -7,6 +7,7 @@
 #![cfg(unix)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+mod assets;
 mod config;
 mod credentials;
 mod provider_manager;
@@ -26,9 +27,9 @@ use dekopon_core::error_chain;
 use thiserror::Error;
 
 pub use config::{
-    BrokerdConfig, CONFIG_API_VERSION, ConfigApiVersion, ConfigError, HostLimitsConfig,
-    IdentityMapping, ManagedProviderSetConfig, PeerIdentity, ResolvedConfig, ResolvedTelemetry,
-    ServerLimitsConfig, StorageConfig, TelemetryConfig,
+    AssetsConfig, BrokerdConfig, CONFIG_API_VERSION, ConfigApiVersion, ConfigError,
+    HostLimitsConfig, IdentityMapping, ManagedProviderSetConfig, PeerIdentity, ResolvedConfig,
+    ResolvedTelemetry, ServerLimitsConfig, StorageConfig, TelemetryConfig,
 };
 pub use credentials::{
     CREDENTIALS_API_VERSION, CredentialsError, HARD_MAX_CHATGPT_AUTH_BYTES, HARD_MAX_CREDENTIALS,
@@ -156,7 +157,15 @@ where
             "http plaintext hosts allowed: [{hosts}]"
         );
     }
-    let registry = match config.locked_providers {
+    let asset_directory = match &config.assets {
+        Some(config) => Some(
+            assets::initialize(config)
+                .await
+                .map_err(BrokerdError::Assets)?,
+        ),
+        None => None,
+    };
+    let mut registry = match config.locked_providers {
         Some(sources) => {
             BrokerProviderRegistry::load_locked_with_options(
                 sources,
@@ -177,6 +186,9 @@ where
         }
     }
     .map_err(BrokerdError::Host)?;
+    if let Some(directory) = asset_directory {
+        registry.set_assets(directory);
+    }
     validate_manifest_metadata(
         &registry,
         frame_limits
@@ -404,6 +416,9 @@ pub enum BrokerdError {
     /// Provider storage root/key validation could not start.
     #[error("broker provider storage could not start")]
     Storage(#[source] dekopon_storage_host::StorageHostError),
+    /// Private ephemeral asset directory could not start.
+    #[error("broker assets could not start")]
+    Assets(#[source] assets::AssetsStartupError),
     /// Provider components could not be validated and compiled.
     #[error("broker provider host could not start")]
     Host(#[source] dekopon_broker_host::BrokerHostError),

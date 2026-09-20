@@ -437,7 +437,7 @@ same reason: an operator who fixes one only to be told about the next has to rol
 {{- else -}}
 {{/* Only the broker's own mounts. paths.stateDir is deliberately absent: the broker does not mount
 the claim root, and the whole point of the default is a path underneath it. */}}
-{{- $brokerMounts := dict "paths.configDir" .Values.paths.configDir "paths.runtimeDir" .Values.paths.runtimeDir "temporary directory" "/tmp" "packaged default providers" "/opt/dekopon/providers" "packaged optional providers" "/opt/dekopon/optional-providers" "packaged executables" "/usr/local/bin" "packaged documentation" "/usr/share/doc/dekopon" -}}
+{{- $brokerMounts := dict "brokerAssets.rootPath" .Values.brokerAssets.rootPath "paths.configDir" .Values.paths.configDir "paths.runtimeDir" .Values.paths.runtimeDir "temporary directory" "/tmp" "packaged default providers" "/opt/dekopon/providers" "packaged optional providers" "/opt/dekopon/optional-providers" "packaged executables" "/usr/local/bin" "packaged documentation" "/usr/share/doc/dekopon" -}}
 {{- if include "dekopon.brokerChatgptEnabled" . -}}
 {{- $_ := set $brokerMounts "the broker ChatGPT credential directory" (include "dekopon.brokerChatgptDir" .) -}}
 {{- end -}}
@@ -478,7 +478,7 @@ broker that lands mid-invocation. */}}
 {{- fail (printf "terminationGracePeriodSeconds is %d, but the containers stop in sequence: %s, and drainBudget.bufferSeconds adds %d s for SIGTERM delivery, telemetry flush, and the sidecar stop that only begins once the gateway's container is gone. That needs %d seconds. At %d the kubelet SIGKILLs whichever daemon is still draining, which for the broker is mid-invocation. Raise terminationGracePeriodSeconds to %d, or lower a shutdownGraceMs." $budgetSeconds $drains $bufferSeconds $requiredSeconds $budgetSeconds $requiredSeconds) -}}
 {{- end -}}
 
-{{- $chartPaths := dict "paths.gatewayConfigDir" .Values.paths.gatewayConfigDir "paths.configDir" .Values.paths.configDir "paths.runtimeDir" .Values.paths.runtimeDir "paths.stateDir" .Values.paths.stateDir "paths.catalogDir" .Values.paths.catalogDir -}}
+{{- $chartPaths := dict "brokerAssets.rootPath" .Values.brokerAssets.rootPath "paths.gatewayConfigDir" .Values.paths.gatewayConfigDir "paths.configDir" .Values.paths.configDir "paths.runtimeDir" .Values.paths.runtimeDir "paths.stateDir" .Values.paths.stateDir "paths.catalogDir" .Values.paths.catalogDir -}}
 {{- range $name, $path := $chartPaths -}}
 {{- if or (not (regexMatch "^/([A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$" $path)) (ne (clean $path) $path) -}}
 {{- fail (printf "%s must be a canonical absolute path of safe non-dot segments with no repeated or trailing slash, got %q" $name $path) -}}
@@ -514,7 +514,7 @@ broker that lands mid-invocation. */}}
 {{- $_ := set $bootstrapNames .file true -}}
 {{- end -}}
 
-{{- $secretSourceNames := dict "gateway-config" true "gateway-tmp" true "config-source" true "config" true "runtime" true "state" true "tmp" true "catalog" true "provider-storage" true -}}
+{{- $secretSourceNames := dict "broker-assets" true "gateway-config" true "gateway-tmp" true "config-source" true "config" true "runtime" true "state" true "tmp" true "catalog" true "provider-storage" true -}}
 {{- range .Values.broker.secretSourceVolumes -}}
 {{- $source := . -}}
 {{- if or (not .name) (not .mountPath) (not (kindIs "map" .volume)) -}}
@@ -568,7 +568,7 @@ broker that lands mid-invocation. */}}
 {{- fail (printf "providerStorage.rootPath must not contain . or .. segments, got %q" $storagePath) -}}
 {{- end -}}
 {{- end -}}
-{{- $ownedMounts := dict "paths.gatewayConfigDir" (clean .Values.paths.gatewayConfigDir) "paths.configDir" (clean .Values.paths.configDir) "paths.runtimeDir" (clean .Values.paths.runtimeDir) "paths.stateDir" (clean .Values.paths.stateDir) "paths.catalogDir" (clean .Values.paths.catalogDir) "temporary directory" "/tmp" "projected configuration source" "/dekopon-source" "packaged default providers" "/opt/dekopon/providers" "packaged optional providers" "/opt/dekopon/optional-providers" "packaged executables" "/usr/local/bin" "packaged documentation" "/usr/share/doc/dekopon" -}}
+{{- $ownedMounts := dict "brokerAssets.rootPath" (clean .Values.brokerAssets.rootPath) "paths.gatewayConfigDir" (clean .Values.paths.gatewayConfigDir) "paths.configDir" (clean .Values.paths.configDir) "paths.runtimeDir" (clean .Values.paths.runtimeDir) "paths.stateDir" (clean .Values.paths.stateDir) "paths.catalogDir" (clean .Values.paths.catalogDir) "temporary directory" "/tmp" "projected configuration source" "/dekopon-source" "packaged default providers" "/opt/dekopon/providers" "packaged optional providers" "/opt/dekopon/optional-providers" "packaged executables" "/usr/local/bin" "packaged documentation" "/usr/share/doc/dekopon" -}}
 {{- range $ownedName, $ownedPath := $ownedMounts -}}
 {{- if or (eq (clean $storagePath) $ownedPath) (hasPrefix (printf "%s/" (clean $storagePath)) $ownedPath) (hasPrefix (printf "%s/" $ownedPath) (clean $storagePath)) -}}
 {{- fail (printf "providerStorage.rootPath (%s) must not equal, contain, or be contained by chart-owned %s (%s); overlapping volume mounts shadow files" $storagePath $ownedName $ownedPath) -}}
@@ -662,6 +662,8 @@ Arguments: dict "ctx" $ "sidecar" bool
     - name: provider-storage
       mountPath: {{ $.Values.providerStorage.rootPath }}
 {{- end }}
+    - name: broker-assets
+      mountPath: {{ $.Values.brokerAssets.rootPath }}
     - name: tmp
       mountPath: /tmp
 {{- end -}}

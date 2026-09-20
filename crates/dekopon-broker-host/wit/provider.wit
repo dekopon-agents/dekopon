@@ -4,7 +4,8 @@ package dekopon:broker-provider@0.3.0;
 /// and the host wall clock readable during an invocation.
 world provider {
     include dekopon:provider/provider@0.3.0;
-    import dekopon:http/client@1.0.0;
+    import dekopon:asset/asset@0.1.0;
+    import dekopon:http/client@1.1.0;
     import dekopon:storage/jsonl@0.1.0;
     import dekopon:storage/durable-files@0.1.0;
     import dekopon:clock/wall@1.0.0;

@@ -16,7 +16,7 @@ use std::{
 
 use dekopon_agent::{
     BrokerLeg, BrokerLegError, CancelSource, IdSequence, ProgressEvent, ProgressSink, ShellRuntime,
-    attachment::{ChatAssetInputs, ReplyAttachments},
+    attachment::{AssetDeliveryDisposition, ChatAssetInputs, ReplyAttachments},
     meta::{AgentConfigView, MemoryConfigView, MemoryScopeView, SessionConfigView, SkillView},
     prompt::{
         CancellationProbe, History, PromptError, ReplyDisposition, SessionInputs,
@@ -823,6 +823,15 @@ async fn session(
         (Some(instructions), None) => Some(instructions.to_owned()),
         (None, None) => None,
     };
+    let accepted_types = match &message.reply {
+        crate::transport::ReplyTarget::Telegram { .. }
+        | crate::transport::ReplyTarget::WhatsApp { .. } => "image/png and image/jpeg",
+        _ => "any concrete syntactically valid media type (no wildcards)",
+    };
+    let instructions = Some(format!(
+        "{}\n\n[Gateway assets: this reply adapter accepts {accepted_types}. Plan a converter for other formats; attaching retains a file but only a separately authorized asset.send delivers it. References use chat-asset:<N>, never data URLs.]",
+        instructions.as_deref().unwrap_or_default()
+    ));
     // Numbered here rather than in the transport: the identifier belongs to the store, and two
     // transports minting their own would collide inside one conversation.
     let images_supported = route.model.accepts_images();
@@ -839,6 +848,12 @@ async fn session(
         Some(note) => bound_inbound(&format!("{}\n\n{note}", message.text)),
         None => message.text.clone(),
     };
+    // Keep the bounded gateway notice ahead of user text so both this truncator and shared
+    // participant attribution below preserve it, even when the inbound text fills the budget.
+    let text = match runner.assets.take_delivery_notice(&asset_access) {
+        Some(note) => bound_inbound(&format!("{note}\n{text}")),
+        None => text,
+    };
     // Shared transcript turns carry gateway-authored provenance from the authenticated transport
     // subject. The prefix is rendered only after the ordinary private prompt has been assembled,
     // leaving one-shot and private persistent prompt bytes unchanged.
@@ -846,9 +861,8 @@ async fn session(
         Some(MemoryScope::SharedConversation) => attributed_prompt(&message.subject, &text),
         Some(MemoryScope::PrivateConversation) | None => text,
     };
-    // Shared rather than owned by the prompt loop alone: the same reader serves the model's own
-    // attachment tool and, on a route that lists capabilities, the broker leg's marker expansion.
-    // Each spends its own budget; they share only the store, the generation fence, and the bounds.
+    // Shared rather than owned by the prompt loop alone: model fetches and universal capability
+    // references share the store and generation fence, not readability or invocation budgets.
     let assets = Arc::new(SessionAssets::new(
         Arc::clone(&runner.assets),
         asset_access,
@@ -885,26 +899,16 @@ async fn session(
     // parked on, so the blocking loop reaches its next cancellation check instead of waiting out
     // a broker that is still working.
     let leg = leg.with_cancel_signal(cancellation.signal());
-    // Request-local and dropped with the session: an attachment the route cannot deliver never
-    // becomes bytes this process holds, and a cancelled or failed session drops the slot unread.
-    let attachments = Arc::new(
-        ReplyAttachments::new(route.provider_attachments).with_store(
-            Arc::clone(&assets) as Arc<dyn dekopon_agent::attachment::GeneratedAssetStore>
-        ),
-    );
-    let leg = if route.provider_attachments > 0 {
-        leg.with_provider_attachments(Arc::clone(&attachments))
-    } else {
-        leg
-    };
-    let leg = if route.chat_asset_inputs.is_empty() {
-        leg
-    } else {
-        leg.with_chat_asset_inputs(ChatAssetInputs::new(
-            Arc::clone(&assets) as Arc<dyn dekopon_agent::attachment::ChatAssetSource>,
-            route.chat_asset_inputs.to_vec(),
-        ))
-    };
+    let attachments = Arc::new(ReplyAttachments::new(
+        asset::MAX_SENDS_PER_TURN,
+        Arc::clone(&assets) as Arc<dyn dekopon_agent::attachment::GeneratedAssetStore>,
+        message.transport.to_string(),
+    ));
+    let leg = leg
+        .with_provider_attachments(Arc::clone(&attachments))
+        .with_chat_asset_inputs(ChatAssetInputs::new(
+            Arc::clone(&assets) as Arc<dyn dekopon_agent::attachment::ChatAssetSource>
+        ));
     // The kind decides the budget: what is worth streaming to one reader in a direct message is
     // not what a channel with a hundred of them wants. The route keeps `progressDetail`, which is
     // how much the surface says rather than whether there is one.
@@ -978,6 +982,7 @@ async fn session(
             .with_skills(&skills)
             .with_options(&options)
             .with_assets(assets.as_ref())
+            .with_reply_assets(&session_attachments)
             .with_cancellation(&prompt_cancellation)
             .with_progress(Arc::clone(&progress_sink));
         // The one gate `inspectAgentConfig: false` is. The view is still built above — it reads
@@ -1015,7 +1020,7 @@ async fn session(
     })
     .await;
 
-    let (outcome, turn, attachments) = match result {
+    let (outcome, turn, images) = match result {
         Ok(session) => session,
         Err(_) => {
             if !cancellation.claim_completion() {
@@ -1070,17 +1075,17 @@ async fn session(
         return "declined";
     }
 
-    let (terminal, completed_outcome, delivered_answer) = match outcome {
+    let (terminal, completed_outcome, delivered_answer) = match &outcome {
         Ok(outcome) => {
-            let text = bound_outbound(if outcome.answer.is_empty() {
+            let text = bound_outbound(if outcome.answer.is_empty() && images.is_empty() {
                 EMPTY_REPLY
             } else {
                 outcome.answer.as_str()
             });
-            let reply = if attachments.is_empty() {
+            let reply = if images.is_empty() {
                 OutboundReply::text(text.clone())
             } else {
-                OutboundReply::with_images(text.clone(), attachments)
+                OutboundReply::with_images(text.clone(), images)
             };
             (Terminal::Answered(reply), "answered", Some(text))
         }
@@ -1111,6 +1116,11 @@ async fn session(
     // The policy writes it, because the policy owns the one message on screen: an answer becomes
     // that message in place where the transport can, and falls back to removing it and replying.
     let delivered = progress.terminal(terminal).await;
+    attachments.finish(match (&outcome, delivered) {
+        (Ok(_), true) => AssetDeliveryDisposition::Delivered,
+        (Ok(_), false) => AssetDeliveryDisposition::Failed,
+        (Err(_), _) => AssetDeliveryDisposition::Abandoned,
+    });
     progress.finish_in_background();
     if delivered {
         if memory_surface.is_some()

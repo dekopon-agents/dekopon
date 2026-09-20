@@ -1,7 +1,9 @@
-package dekopon:http@1.0.0;
+package dekopon:http@1.1.0;
 
 /// Buffered, broker-mediated HTTP for Dekopon provider components.
 interface client {
+    use dekopon:asset/asset@0.1.0.{handle, encoding};
+
     /// One HTTP header. Names are ASCII tokens; values are opaque bytes.
     record header {
         name: string,
@@ -54,4 +56,38 @@ interface client {
 
     /// Executes one authorized, bounded request.
     send: func(request: request) -> result<response, http-error>;
+
+    /// An asset's bytes as one segment of a streamed body, re-encoded by the host on the way out.
+    record asset-part {
+        handle: borrow<handle>,
+        /// The encoding the bytes take on the wire, regardless of how the asset is stored.
+        encoding: encoding,
+    }
+
+    /// One segment of a streamed request body, in order.
+    variant part {
+        literal(list<u8>),
+        asset(asset-part),
+    }
+
+    /// A request whose body is composed by the host at exact length. `maxHttpRequestBytes`
+    /// bounds the literal parts only.
+    record streamed-request {
+        method: string,
+        uri: string,
+        headers: list<header>,
+        body: list<part>,
+    }
+
+    /// A response whose body was spooled to the broker's asset directory and echo-scanned
+    /// before the guest sees it. `body` reads as `encoding: identity`.
+    record streamed-response {
+        status: u16,
+        headers: list<header>,
+        body: handle,
+    }
+
+    /// Executes one authorized request whose body streams from assets. Only `stream` spools;
+    /// `send` stays in memory under `maxHttpResponseBytes`.
+    %stream: func(request: streamed-request) -> result<streamed-response, http-error>;
 }

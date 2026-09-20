@@ -498,6 +498,21 @@ pub struct StorageConstraints {
     pub namespace: StorageNamespace,
 }
 
+/// Exact mutation grants for the conversation's temporary assets.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AssetConstraints {
+    /// Permit attaching newly written assets to the conversation.
+    #[serde(default)]
+    pub attach: bool,
+    /// Permit removing assets that have not been sent.
+    #[serde(default)]
+    pub remove: bool,
+    /// Permit marking assets for external delivery on the reply.
+    #[serde(default)]
+    pub send: bool,
+}
+
 /// Broker-enforced execution limits attached to an authorization.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -512,6 +527,9 @@ pub struct ExecutionConstraints {
     /// Optional exact storage grant. HTTP and storage cannot coexist in v1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<StorageConstraints>,
+    /// Optional asset mutation grant; absence permits reading passed inputs only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset: Option<AssetConstraints>,
     /// Optional effective scope for one separately authorized public DRN.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_use: Option<SecretUseGrant>,
@@ -524,6 +542,7 @@ impl Default for ExecutionConstraints {
             max_output_bytes: 1_048_576,
             http: None,
             storage: None,
+            asset: None,
             secret_use: None,
         }
     }

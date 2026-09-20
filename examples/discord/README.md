@@ -139,14 +139,11 @@ conversation history.
 
 ## Provider attachment replies
 
-A route with `providerAttachments` may attach the gateway-named PNGs an authorized capability
-returned to the first Create Message call as `multipart/form-data`. `payload_json` retains the same
-no-mentions policy and inbound reply reference as text-only JSON; each `files[N]` carries at most
-8 MiB, and the filenames carry each attachment's position so two files do not arrive under one name.
-If Discord accepts that first post and rejects a later split text chunk, Dekopon reports partial
-delivery and performs no durable chat-memory record. No opt-in means a capability's `attachments`
-key is stripped and refused, and requests stay byte-identical to text-only ones. The installation
-needs **Attach Files**, as listed above.
+Explicit broker-authorized `asset.send` queues gateway-named files on the first multipart Create
+Message. This adapter accepts any concrete valid media type; route instructions should state that
+set. Attaching alone never sends. `payload_json` keeps its no-mentions policy and authenticated reply
+reference; a later split-text failure is partial delivery and suppresses durable memory recording.
+The installation needs **Attach Files**, as listed above.
 
 ## Replies
 

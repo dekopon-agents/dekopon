@@ -244,7 +244,7 @@ async fn the_workflow_decision_table_holds_end_to_end() {
                 )
                 .expect("direct context binds");
                 broker
-                    .invoke(&context, None, None, request)
+                    .invoke(&context, None, None, request, Default::default())
                     .await
                     .expect("the proposal is accounted")
             }
@@ -267,13 +267,14 @@ async fn the_workflow_decision_table_holds_end_to_end() {
                         }),
                         Some(&attestation),
                         request,
+                        Default::default(),
                     )
                     .await
                     .expect("the attested proposal is accounted")
             }
         };
         assert_eq!(
-            result.outcome != InvocationOutcome::Denied,
+            result.result.outcome != InvocationOutcome::Denied,
             row.allowed,
             "row {index} ({}) decided the wrong way: {result:?}",
             row.label
@@ -357,10 +358,11 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
                 .bound_to(ordinary.id.clone()),
             ),
             ordinary,
+            Default::default(),
         )
         .await
         .expect("ordinary subject-only chat executes through the upgraded chat operation");
-    assert_eq!(ordinary_result.outcome, InvocationOutcome::Succeeded);
+    assert_eq!(ordinary_result.result.outcome, InvocationOutcome::Succeeded);
 
     assert!(
         broker
@@ -385,9 +387,10 @@ async fn the_agent_prompt_gate_is_a_separate_grant() {
                     .bound_to(proposal.id.clone()),
             ),
             proposal,
+            Default::default(),
         )
         .await
         .expect("a refused agent is still an accounted decision");
-    assert_eq!(refused.outcome, InvocationOutcome::Denied);
-    assert_eq!(refused.error.as_deref(), Some("agent-denied"));
+    assert_eq!(refused.result.outcome, InvocationOutcome::Denied);
+    assert_eq!(refused.result.error.as_deref(), Some("agent-denied"));
 }

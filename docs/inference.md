@@ -42,7 +42,7 @@ Slack event
   -> SSE events stream visible text back to the caller and become AssistantTurn
        caller says stop -> the body is dropped, the connection closes, the turn is Interrupted
   -> tool call? append opaque replay items + tool output and call the model again
-       a result carrying `attachments`? bounded PNGs leave through a byte-free output slot
+       typed output descriptors? files join the scoped table; only authorized asset.send queues delivery
   -> exact bounded text plus any accepted attachments receive complete Slack transport acceptance
      or an optional owned-thread continuation declines and sends no reply
   -> one fresh hidden record request only after an accepted reply and effective durable surface
@@ -254,30 +254,20 @@ subscription endpoint is claimed to emit images; both remain only the orchestrat
 What reaches this document's path is the *delivery* half: a capability the broker authorized returns
 bytes, and the gateway carries them to chat without letting them through the model.
 
-A route opts in with `providerAttachments: { maxPerReply: N }`. The session's broker leg strips the
-reserved `attachments` key from a successful result, decodes at most 8 MiB per entry, validates the
-PNG signature, reserves the gateway disk budget, and registers a scoped conversation asset with a
-temporary delivery pin counted against the route's per-reply ceiling. A spool refusal preserves the successful
-provider outcome and reports attachment refusal, never an automatic paid-call retry. The model reads only `attached` metadata with the gateway `chat-asset:<N>` marker and retained/not-yet-delivered status and, on a refusal, one fixed
-gateway sentence; attachment bytes never become a `ModelMessage`, a tool result, a prompt transcript,
-or part of `PromptOutcome`. No opt-in means the key is still stripped, the bytes are discarded, and
-replies stay byte-identical to text-only ones.
+Provider assets are typed descriptor outputs, admitted only on successful invocation. The gateway
+numbers them in its scoped table and returns a bounded metadata note to the model. Attaching does
+not deliver: `asset.send` is a separately authorized external write, queued for the reply under a
+four-send turn allowance. A failed turn sends none; a failed delivery yields a bounded notice in the
+next turn without retrying. Persistent sent flags make later duplicate sends no-ops.
 
-The inbound direction has a mirror: on a route listing `chatAssetInputs`, the leg expands a
-`chat-asset:<N>` marker in a capability's input to a `data:` URL before proposing, under a
-per-invocation budget separate from the model's own four `fetch_chat_asset` calls. A person's bytes
-reach a capability without passing through the model either.
+Every exact proposal reference is discovered without expansion, pinned and passed read-only beside
+unchanged JSON. Model-facing `fetch_chat_asset` retains its own limits and weak references; encoded
+storage is decoded by the native codec on consumption. Model wire serialization is unchanged here;
+streaming model request bodies is a separate change, not claimed by descriptor integration.
 
-The gateway owns the filename and media type and sends attachments only to the reply coordinates from
-the authenticated inbound envelope. Slack uses one external file-upload sequence per attachment,
-Discord multipart attachments on the first post, Telegram one `sendPhoto` per attachment, and the
-local socket a base64 `images` field omitted entirely when there are none. A receipt means the
-complete text/attachment reply was accepted; a non-atomic later failure is partial delivery and
-suppresses durable recording. Persistent and durable memory keep only final text; generated asset
-metadata remains in the bounded conversation inventory, so later edits can address the prior result.
-Fetched model images and PDFs carry weak references across model turns. Request encoding resolves
-and temporarily pins available bytes; reclaimed parts become explicit gateway release notices,
-without network fallback. See [disk retention and bounds](dekopond.md#chat-assets).
+For adapter types, storage ceilings and transport paths, see
+[asset handles and delivery](dekopond.md#asset-handles-and-delivery). Memory retains text and scoped
+reference notes, never provider payload bytes. A partial native delivery suppresses durable recording.
 
 
 ## Optional durable chat-turn retrieval

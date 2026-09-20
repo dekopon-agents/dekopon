@@ -115,6 +115,9 @@ pub struct BrokerdConfig {
     pub broker_limits: BrokerLimits,
     #[serde(default)]
     pub server_limits: ServerLimitsConfig,
+    /// Optional ephemeral broker asset directory. Presence requires both fields.
+    #[serde(default)]
+    pub assets: Option<AssetsConfig>,
     /// Optional broker-owned provider storage. Presence requires every field.
     #[serde(default)]
     pub storage: Option<StorageConfig>,
@@ -152,6 +155,16 @@ pub struct ManagedProviderSetConfig {
     pub lock_path: PathBuf,
     /// Store containing `blobs/sha256/<component-digest>.wasm`.
     pub store_path: PathBuf,
+}
+
+/// Ephemeral broker asset storage, emptied on every startup.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AssetsConfig {
+    /// Private broker-owned directory; never mounted in the gateway.
+    pub root_path: PathBuf,
+    /// Shared byte budget for active response spools and provider outputs.
+    pub max_in_flight_bytes: u64,
 }
 
 /// Strict broker-owned provider-storage paths and ceilings.
@@ -372,6 +385,7 @@ pub struct ResolvedConfig {
     pub broker_limits: BrokerLimits,
     pub server_limits: ServerLimitsConfig,
     pub storage: Option<StorageConfig>,
+    pub assets: Option<AssetsConfig>,
     pub chat_memory: Option<ChatMemoryConfig>,
     pub telemetry: Option<ResolvedTelemetry>,
 }
@@ -592,6 +606,15 @@ async fn resolve(
             Ok::<_, ConfigError>(storage)
         })
         .transpose()?;
+    let assets = config
+        .assets
+        .map(|mut assets| {
+            assets.root_path =
+                dekopon_storage_host::resolve_storage_root_path(&resolve_path(assets.root_path))
+                    .map_err(|source| ConfigError::AssetsPath { source })?;
+            Ok::<_, ConfigError>(assets)
+        })
+        .transpose()?;
     let chat_memory = config.chat_memory;
     if chat_memory.is_some() && storage.is_none() {
         return Err(ConfigError::ChatMemoryWithoutStorage);
@@ -704,6 +727,21 @@ async fn resolve(
         // config resolution rather than letting a future socket poison the storage layout after
         // the first successful start.
         return Err(ConfigError::StorageStateCollision);
+    }
+    if let Some(assets) = &assets {
+        let overlaps =
+            |path: &Path| path.starts_with(&assets.root_path) || assets.root_path.starts_with(path);
+        if reserved.iter().any(|path| overlaps(path))
+            || providers.iter().any(|path| overlaps(path))
+            || storage
+                .as_ref()
+                .is_some_and(|storage| overlaps(&storage.root_path))
+            || managed_provider_paths
+                .as_ref()
+                .is_some_and(|(_, store)| overlaps(store))
+        {
+            return Err(ConfigError::AssetsStateCollision);
+        }
     }
     if reserved.iter().collect::<BTreeSet<_>>().len() != reserved.len()
         || providers
@@ -859,6 +897,7 @@ async fn resolve(
         broker_limits: config.broker_limits,
         server_limits: config.server_limits,
         storage,
+        assets,
         chat_memory,
         telemetry,
     })
@@ -979,6 +1018,13 @@ pub enum ConfigError {
         #[source]
         source: PlaintextHostError,
     },
+    #[error("could not safely resolve assets.rootPath")]
+    AssetsPath {
+        #[source]
+        source: dekopon_storage_host::StorageHostError,
+    },
+    #[error("assets.rootPath must not overlap broker files, provider storage or provider paths")]
+    AssetsStateCollision,
     #[error("could not safely resolve a configured provider storage path")]
     StoragePath {
         /// The offending path and the reason it was refused.

@@ -1640,7 +1640,7 @@ async fn local_image_answers_fall_back_once_while_text_finalizes_in_place() {
                 .position(|line| line["progress"]["deleted"] == true);
             if with_image {
                 assert!(answer.get("id").is_none(), "owned fallback, not finalize");
-                assert_eq!(answer["images"][0]["filename"], "generated-image.png");
+                assert_eq!(answer["images"][0]["filename"], "asset-1.png");
                 assert_eq!(answer["images"][0]["mediaType"], "image/png");
                 assert_eq!(
                     STANDARD

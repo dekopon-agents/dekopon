@@ -3,5 +3,6 @@ package dekopon:http-probe@0.1.0;
 /// Provider fixture that requires broker-mediated HTTP, reached through its `httpprobe` word.
 world provider {
     include dekopon:provider/provider-cli@0.3.0;
-    import dekopon:http/client@1.0.0;
+    import dekopon:asset/asset@0.1.0;
+    import dekopon:http/client@1.1.0;
 }

@@ -533,8 +533,8 @@ fn ask_when_idle(socket: &Path, subject: &str, text: &str) -> String {
 ///
 /// The broker runs in this process, so each `broker.decision` and `broker.execution` record is a
 /// `dekopon_broker::audit` event on the one process-wide dispatcher. A test takes
-/// [`Audit::exclusive`] before it boots anything and holds it to its end, which is what makes every
-/// record in the capture its own.
+/// [`Audit::exclusive`] before it boots anything and holds it to its end. Background work from a
+/// previous fixture may still emit records, so assertions must identify their subject or session.
 struct Audit {
     capture: &'static CaptureLayer,
     _exclusive: MutexGuard<'static, ()>,
@@ -1091,7 +1091,10 @@ async fn a_persistent_route_answers_a_follow_up_with_the_exchange_before_it() {
                     "Answer in one short sentence. You have no authority of your own.\n\n",
                     "Durable chat memory is available on demand. Use `memory recent --last N` or ",
                     "`memory search --query TEXT`. Searches inspect at most 200 prior turns. Do not ",
-                    "claim recall without retrieving it."
+                    "claim recall without retrieving it.\n\n",
+                    "[Gateway assets: this reply adapter accepts any concrete syntactically valid media type (no wildcards). ",
+                    "Plan a converter for other formats; attaching retains a file but only a separately authorized asset.send delivers it. ",
+                    "References use chat-asset:<N>, never data URLs.]"
                 )
             ),
             ("user", "what broke?"),
@@ -1149,7 +1152,10 @@ async fn explicit_shared_scope_replays_attributed_history_across_two_principals(
                     "Answer in one short sentence. You have no authority of your own.\n\n",
                     "Durable chat memory is available on demand. Use `memory recent --last N` or ",
                     "`memory search --query TEXT`. Searches inspect at most 200 prior turns. Do not ",
-                    "claim recall without retrieving it."
+                    "claim recall without retrieving it.\n\n",
+                    "[Gateway assets: this reply adapter accepts any concrete syntactically valid media type (no wildcards). ",
+                    "Plan a converter for other formats; attaching retains a file but only a separately authorized asset.send delivers it. ",
+                    "References use chat-asset:<N>, never data URLs.]"
                 )
                 .to_owned(),
             ),
@@ -1249,15 +1255,16 @@ async fn an_unmapped_subject_is_refused_before_a_model_is_ever_asked() {
 
     let _directory = fixture.shutdown().await;
     // A refused capability *listing* is not an invocation, so it produces neither a decision nor an
-    // execution record: nothing was ever proposed. The capture is the whole workspace, so the
-    // gateway's own lifecycle records are in it too and the assertion names what must be absent
-    // rather than counting what is present.
+    // execution record for this subject: nothing was ever proposed. A sibling fixture's mapped
+    // subject may still emit background memory records into the process-wide capture after shutdown.
+    let subject = format!("{UNMAPPED_SUBJECT:?}");
     let proposed = audit
         .records()
         .into_iter()
         .filter(|record| {
-            has(record, "audit.event", "\"broker.decision\"")
-                || has(record, "audit.event", "\"broker.execution\"")
+            has(record, "subject", &subject)
+                && (has(record, "audit.event", "\"broker.decision\"")
+                    || has(record, "audit.event", "\"broker.execution\""))
         })
         .collect::<Vec<_>>();
     assert!(proposed.is_empty(), "{proposed:#?}");

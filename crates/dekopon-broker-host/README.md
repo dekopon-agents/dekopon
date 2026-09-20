@@ -1,7 +1,8 @@
 # dekopon-broker-host
 
 Broker-owned asynchronous Wasmtime host for provider components that import the project-owned
-`dekopon:http@1.0.0`, `dekopon:storage@0.1.0`, or `dekopon:clock@1.0.0` interfaces.
+`dekopon:http@1.1.0`, `dekopon:asset@0.1.0`, `dekopon:storage@0.1.0`, or
+`dekopon:clock@1.0.0` interfaces. Buffered HTTP `@1.0.0` remains linked for older components.
 
 This crate is privileged machinery. Its public invocation API consumes one non-cloneable
 `AuthorizedInvocation`; each call receives a fresh bounded store, exact HTTP constraints, and a
@@ -67,7 +68,8 @@ The linker exposes only these imports; generic WASI and unknown imports fail bef
 
 | Import | Answered during | Outside `invoke` |
 |---|---|---|
-| `dekopon:http/client@1.0.0` | an invocation carrying an exact HTTP grant | typed `denied`, then the describe or command-run tripwire |
+| `dekopon:http/client@1.1.0` (`send` and `stream`), buffered `client@1.0.0` | an invocation carrying an exact HTTP grant | typed `denied`, then the describe or command-run tripwire |
+| `dekopon:asset/asset@0.1.0` | invocation-scoped inputs and exact attach/send grants | typed `denied`, then the tripwire |
 | `dekopon:storage/jsonl@0.1.0`, `dekopon:storage/durable-files@0.1.0` | an invocation carrying an exact storage grant of that interface | typed `permission-denied`, then the tripwire |
 | `dekopon:clock/wall@1.0.0` | every invocation; no grant | traps, then the tripwire |
 
@@ -91,7 +93,7 @@ A component importing the clock does not load on a host older than this import: 
 fails with `component imports instance \`dekopon:clock/wall@1.0.0\`, but a matching implementation
 was not found in the linker`.
 
-## Buffered HTTP enforcement
+## Buffered and asset-streamed HTTP enforcement
 
 The host:
 
@@ -104,8 +106,9 @@ The host:
 - disables environment proxies, redirects, and automatic content decompression;
 - rejects guest-controlled authority, framing, hop-by-hop, cookie, and authorization headers;
 - strips hop-by-hop and credential-bearing response headers;
-- preserves other ordered duplicate headers and buffered body bytes;
-- streams native response chunks into a bounded buffer;
+- preserves other ordered duplicate headers and body bytes;
+- keeps buffered `send` unchanged, while `stream` sends literal/asset parts with exact Content-Length
+  and returns a credential-scanned, disk-spooled asset handle;
 - enforces host ceilings in addition to narrower per-invocation request count, request byte,
   response byte, and timeout constraints;
 - returns only bounded provider-safe transport messages and sanitized HTTP evidence metadata.
@@ -124,8 +127,8 @@ resolved bytes ride separately, and the host refuses any credential whose identi
 that commitment. *Committed direction:* the broker's legacy `credential`/`credentialByAgent`
 selection will be replaced by public DRNs; this host retains authorization-bound native injection
 ([migration requirements](../../docs/design.md#legacy-credential-bindings)).
-It supports buffered HTTP request/response exchanges, not CONNECT tunnels,
-upgrades, WebSockets, streaming guest handles, redirects, cookies, or ambient proxy configuration.
+It supports buffered exchanges and bounded asset-backed streaming, not CONNECT tunnels,
+upgrades, WebSockets, arbitrary guest sockets, redirects, cookies, or ambient proxy configuration.
 
 ## Provider storage
 

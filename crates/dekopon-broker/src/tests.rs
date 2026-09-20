@@ -498,6 +498,7 @@ fn capability_authority_commits_exactly_these_fields() {
             "execution.maxOutputBytes",
             "execution.http.present",
             "execution.storage.present",
+            "execution.asset.present",
             "providerArtifactSha256",
         ],
         "the storage authority surface gained or lost a field"
@@ -512,6 +513,7 @@ fn execution_authority_normalizes_sets_but_commits_every_constraint() {
         encoded.finish()
     }
     let baseline = ExecutionConstraints {
+        asset: None,
         timeout_ms: 30_000,
         max_output_bytes: 1_048_576,
         http: Some(HttpConstraints {
@@ -1255,4 +1257,61 @@ fn a_host_failure_no_provider_reported_carries_no_detail() {
     ] {
         assert_eq!(provider_failure_detail(&failure), None);
     }
+}
+
+#[test]
+fn asset_grants_preserve_effect_classes_and_the_http_storage_exclusion() {
+    use dekopon_capability::{
+        AssetConstraints, EffectKind, StorageAccess, StorageConstraints, StorageInterface,
+        StorageNamespace,
+    };
+    let mut set = ConstraintSet {
+        route: CapabilityRoute::Generic,
+        provider: "probe".parse().unwrap(),
+        effect: EffectKind::LocalWrite,
+        risk: dekopon_core::RiskLevel::Low,
+        credential: None,
+        credential_by_agent: Default::default(),
+        constraints: ExecutionConstraints {
+            asset: Some(AssetConstraints {
+                attach: true,
+                remove: true,
+                send: false,
+            }),
+            ..Default::default()
+        },
+    };
+    assert!(super::validate_set_constraints(&set).is_ok());
+    set.constraints.storage = Some(StorageConstraints {
+        interface: StorageInterface::DurableFiles,
+        access: StorageAccess::ReadWrite,
+        namespace: StorageNamespace::Chat,
+    });
+    assert!(super::validate_set_constraints(&set).is_ok());
+    set.constraints.http = Some(dekopon_capability::HttpConstraints {
+        allowed_hosts: vec!["example.com".to_owned()],
+        allowed_methods: vec!["POST".to_owned()],
+        max_requests: 1,
+        max_request_bytes: 1,
+        max_response_bytes: 1,
+        allow_plaintext_loopback: false,
+    });
+    assert!(matches!(
+        super::validate_set_constraints(&set),
+        Err(super::BrokerBuildError::InvalidPolicyConstraints)
+    ));
+    set.constraints.storage = None;
+    set.effect = EffectKind::ExternalWrite;
+    set.constraints.asset.as_mut().unwrap().send = true;
+    assert!(super::validate_set_constraints(&set).is_ok());
+    set.effect = EffectKind::ReadOnly;
+    assert!(matches!(
+        super::validate_set_constraints(&set),
+        Err(super::BrokerBuildError::InvalidPolicyConstraints)
+    ));
+    set.effect = EffectKind::LocalWrite;
+    assert!(matches!(
+        super::validate_set_constraints(&set),
+        Err(super::BrokerBuildError::InvalidPolicyConstraints)
+    ));
 }

@@ -1,6 +1,6 @@
 """OS-process proof of rendered init permissions, not a substitute for ipc_process.rs.
 
-All inputs are disposable fixtures. Both private mounts are deliberately exposed to
+All inputs are disposable fixtures. The private mounts are deliberately exposed to
 both test UIDs here: permissions must deny access even beyond the chart's mount isolation.
 """
 import errno
@@ -80,6 +80,8 @@ def broker():
     for file in ("broker.yaml", "policies.cedar", "broker-credentials.yaml"):
         owned_file("/etc/dekopon/" + file, 0o077)
     write("/var/lib/dekopon-provider-storage/private")
+    write("/var/lib/dekopon-assets/private")
+    owned_file("/var/lib/dekopon-assets/private", 0o022)
     for file in ("/etc/dekopon-gateway/dekopond.yaml", "/gateway-state/chatgpt-auth.json"):
         denied(lambda: read(file), "broker reading " + file)
         denied(lambda: write(file), "broker writing " + file)
@@ -106,7 +108,8 @@ def gateway():
     owned_file("/gateway-state/chatgpt-auth.json", 0o077)
     for file in ("/etc/dekopon/broker.yaml", "/etc/dekopon/policies.cedar",
                  "/etc/dekopon/broker-credentials.yaml",
-                 "/var/lib/dekopon-provider-storage/private"):
+                 "/var/lib/dekopon-provider-storage/private",
+                 "/var/lib/dekopon-assets/private"):
         denied(lambda: read(file), "gateway reading " + file)
         denied(lambda: write(file), "gateway writing " + file)
         denied(lambda: os.unlink(file), "gateway replacing " + file)

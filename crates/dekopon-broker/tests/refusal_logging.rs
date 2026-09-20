@@ -310,11 +310,12 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
                     .bound_to(denied.id.clone()),
             ),
             denied,
+            Default::default(),
         )
         .await
         .expect("a refused agent is still an accounted decision");
-    assert_eq!(refused.outcome, InvocationOutcome::Denied);
-    assert_eq!(refused.error.as_deref(), Some("policy-error"));
+    assert_eq!(refused.result.outcome, InvocationOutcome::Denied);
+    assert_eq!(refused.result.error.as_deref(), Some("policy-error"));
     captured.clear();
 
     // The chat surface the gateway actually opens takes the same path and reports the same way.
@@ -406,12 +407,13 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
                 attestor.as_ref(),
                 Some(&chat_claim(canonical, agent_id).bound_to(identifier.clone())),
                 request,
+                Default::default(),
             )
             .await
             .expect("a refused chat proposal is still an accounted decision");
-        assert_eq!(refused.outcome, InvocationOutcome::Denied);
+        assert_eq!(refused.result.outcome, InvocationOutcome::Denied);
         assert_eq!(
-            refused.error.as_deref(),
+            refused.result.error.as_deref(),
             Some("chat-attestation-denied"),
             "the wire answer is the same literal for every class ({agent_id})"
         );

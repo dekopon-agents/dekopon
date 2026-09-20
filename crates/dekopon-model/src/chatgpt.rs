@@ -2380,7 +2380,7 @@ mod tests {
                 body["input"][0]["content"],
                 json!([
                     {"type": "input_text", "text": "what does this say?"},
-                    {"type": "input_image", "image_url": "data:image/png;base64,UE5H"},
+                    {"type": "input_image", "image_url": format!("data:{};base64,UE5H", "image/png")},
                     {"type": "input_file", "filename": "spec.pdf", "file_data": "data:application/pdf;base64,UERG"},
                 ])
             );

@@ -23,9 +23,7 @@ use dekopon_broker_protocol::{
     ConversationMatch, ConversationMatchProblem, DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES,
     FrameLimits, ProtocolError, ResolvedBrokerSocket,
 };
-use dekopon_core::{
-    AgentId, CapabilityId, ExternalSubject, FileHygieneError, FileTier, read_trusted_file,
-};
+use dekopon_core::{AgentId, ExternalSubject, FileHygieneError, FileTier, read_trusted_file};
 use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
 use serde::Deserialize;
 use thiserror::Error;
@@ -622,19 +620,6 @@ impl ModelConfig {
     }
 }
 
-/// What a route may deliver from the attachments an authorized capability produced.
-///
-/// Provider bytes reaching a chat conversation is new reach, so an owner grants it per route rather
-/// than a provider declaring it. Absence is the default and means a capability result's reserved
-/// `attachments` key is stripped and refused, which is what keeps a newly granted capability from
-/// silently starting to post files.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub struct ProviderAttachmentsConfig {
-    /// Attachments one reply may carry, across every capability call the session makes.
-    pub max_per_reply: u8,
-}
-
 /// The authored `conversation:` block on a route.
 ///
 /// The three [`ConversationMatch`] fields plus the five window keys that used to live under this
@@ -836,15 +821,18 @@ pub struct RouteConfig {
     /// Overrides model-class selection for this route.
     #[serde(default)]
     pub model: Option<String>,
-    /// Lets this route deliver the attachments an authorized capability produced.
-    #[serde(default)]
-    pub provider_attachments: Option<ProviderAttachmentsConfig>,
-    /// Capabilities whose input may name a chat attachment as `chat-asset:<N>`.
-    ///
-    /// A capability absent from this list keeps such a string verbatim, and the provider decides
-    /// what to do with it. Listing one is what lets a sender's attachment bytes reach it.
-    #[serde(default)]
-    pub chat_asset_inputs: Vec<CapabilityId>,
+    #[serde(
+        default,
+        rename = "providerAttachments",
+        deserialize_with = "refuse_provider_attachments"
+    )]
+    _retired_provider_attachments: (),
+    #[serde(
+        default,
+        rename = "chatAssetInputs",
+        deserialize_with = "refuse_chat_asset_inputs"
+    )]
+    _retired_chat_asset_inputs: (),
     /// Offers the `suggest_improvement` tool on this route's sessions.
     ///
     /// Opt-in because the suggestion record carries model-authored text to the telemetry sink
@@ -928,10 +916,6 @@ pub struct ResolvedRoute {
     pub agent: AgentId,
     /// Overrides model-class selection for this route.
     pub model: Option<String>,
-    /// Attachments one reply on this route may carry; zero for a route that delivers none.
-    pub provider_attachments: u8,
-    /// Capabilities whose input may name a chat attachment as `chat-asset:<N>`.
-    pub chat_asset_inputs: Vec<CapabilityId>,
     /// Whether this route's sessions may record improvement suggestions.
     pub improvement_suggestions: bool,
     /// Whether this route's sessions are offered `inspect_agent_config`.
@@ -1396,17 +1380,6 @@ pub(crate) fn resolve(
                 model: model.clone(),
             });
         }
-        // A bound of zero is a bound nobody meant to write: the way to deliver no attachments is
-        // to leave the block out, and writing one that can never accept anything would make a
-        // capability's files vanish with the route looking as though it carried them.
-        if route
-            .provider_attachments
-            .is_some_and(|attachments| attachments.max_per_reply == 0)
-        {
-            problems.push(ConfigProblem::InvalidProviderAttachments {
-                agent: route.agent.to_string(),
-            });
-        }
         if route.limits.max_steps == 0 || route.limits.max_capability_calls == 0 {
             problems.push(ConfigProblem::InvalidRouteLimits {
                 agent: route.agent.to_string(),
@@ -1471,10 +1444,6 @@ pub(crate) fn resolve(
             subjects: route.subjects,
             agent: route.agent,
             model: route.model,
-            provider_attachments: route
-                .provider_attachments
-                .map_or(0, |attachments| attachments.max_per_reply),
-            chat_asset_inputs: route.chat_asset_inputs,
             improvement_suggestions: route.improvement_suggestions,
             inspect_agent_config: route.inspect_agent_config,
             limits: route.limits,
@@ -2042,10 +2011,6 @@ pub enum ConfigProblem {
     UnknownRouteTransport { transport: String },
     #[error("route names unknown model {model:?}")]
     UnknownRouteModel { model: String },
-    #[error(
-        "route for agent {agent:?} declares providerAttachments with maxPerReply 0; omit the block to deliver none"
-    )]
-    InvalidProviderAttachments { agent: String },
     #[error("route for agent {agent:?} must allow at least one step and one capability call")]
     InvalidRouteLimits { agent: String },
     #[error("session bounds must be greater than zero")]
@@ -2157,6 +2122,17 @@ pub(crate) fn render_problems<P: std::error::Error>(problems: &[P]) -> String {
         }
     }
     rendered
+}
+
+fn refuse_provider_attachments<'de, D: serde::Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+    Err(serde::de::Error::custom(
+        "providerAttachments was removed; delivery requires the broker-authorized asset.send capability",
+    ))
+}
+fn refuse_chat_asset_inputs<'de, D: serde::Deserializer<'de>>(_: D) -> Result<(), D::Error> {
+    Err(serde::de::Error::custom(
+        "chatAssetInputs was removed; descriptor-backed references resolve automatically for every proposal; the broker still authorizes each capability and HTTP effect",
+    ))
 }
 
 #[cfg(test)]

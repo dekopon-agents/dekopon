@@ -354,11 +354,12 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
                 secret_use: None,
                 input,
             },
+            Default::default(),
         )
         .await
         .expect("invoke the proposal");
-    assert_eq!(result.outcome, InvocationOutcome::Succeeded);
-    assert_eq!(result.output, Some(json!({"text": "HELLO"})));
+    assert_eq!(result.result.outcome, InvocationOutcome::Succeeded);
+    assert_eq!(result.result.output, Some(json!({"text": "HELLO"})));
     assert_eq!(
         audit.records().await.len(),
         2,
@@ -396,11 +397,14 @@ async fn authenticated_unix_peer_can_inspect_and_invoke_under_policy() {
     assert_eq!(capabilities.len(), 1);
     assert_eq!(capabilities[0].capability.id.as_str(), "cli-probe.upper");
     let result = client
-        .invoke(None, request("invoke-brokerd"))
+        .invoke(None, request("invoke-brokerd"), Default::default())
         .await
         .expect("invoke");
-    assert_eq!(result.outcome, InvocationOutcome::Succeeded);
-    assert_eq!(result.output, Some(json!({"text": "HELLO THROUGH BROKER"})));
+    assert_eq!(result.result.outcome, InvocationOutcome::Succeeded);
+    assert_eq!(
+        result.result.output,
+        Some(json!({"text": "HELLO THROUGH BROKER"}))
+    );
     assert_eq!(audit.records().await.len(), 2);
 
     shutdown_send.send(()).expect("signal clean shutdown");
@@ -520,6 +524,7 @@ when { context.capability == "http-probe.fetch"
         credential: None,
         credential_by_agent: BTreeMap::new(),
         constraints: ExecutionConstraints {
+            asset: None,
             timeout_ms: 5_000,
             max_output_bytes: 64 * 1024,
             http: Some(HttpConstraints {
@@ -583,10 +588,10 @@ when { context.capability == "http-probe.fetch"
         }),
     };
     let result = client
-        .invoke(None, invocation.clone())
+        .invoke(None, invocation.clone(), Default::default())
         .await
         .expect("secret invocation succeeds");
-    assert_eq!(result.outcome, InvocationOutcome::Succeeded);
+    assert_eq!(result.result.outcome, InvocationOutcome::Succeeded);
     let wire = String::from_utf8(wire_receive.await.expect("HTTP wire")).expect("wire text");
     assert!(
         wire.contains("authorization: Bearer brokerd-secret-value"),
@@ -602,10 +607,10 @@ when { context.capability == "http-probe.fetch"
         "method": "GET"
     });
     let denied = client
-        .invoke(None, invocation)
+        .invoke(None, invocation, Default::default())
         .await
         .expect("host refusal is accounted");
-    assert_eq!(denied.outcome, InvocationOutcome::Failed);
+    assert_eq!(denied.result.outcome, InvocationOutcome::Failed);
 
     stop.send(()).expect("stop service");
     service
@@ -665,7 +670,11 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
 
     let client = BrokerClient::new(&socket_path, uid, limits.frame).expect("client starts");
     let ran = client
-        .invoke(None, request("invoke-outcome-unaudited"))
+        .invoke(
+            None,
+            request("invoke-outcome-unaudited"),
+            Default::default(),
+        )
         .await
         .expect_err("a terminal audit failure is not a successful invocation");
     let ClientError::Remote { code, message } = ran else {
@@ -680,7 +689,7 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
     assert_eq!(audit.records().await.len(), 1);
 
     let never_ran = client
-        .invoke(None, request("invoke-never-ran"))
+        .invoke(None, request("invoke-never-ran"), Default::default())
         .await
         .expect_err("a full audit cannot authorize");
     let ClientError::Remote {
@@ -740,11 +749,15 @@ async fn an_attested_invoke_over_the_socket_succeeds_for_an_attestor_peer() {
         .invoke(
             Some(Attestation::for_subject(subject(), agent("chat-agent"))),
             request("invoke-attested-socket"),
+            Default::default(),
         )
         .await
         .expect("attested invocation completes");
-    assert_eq!(result.outcome, InvocationOutcome::Succeeded);
-    assert_eq!(result.output, Some(json!({"text": "HELLO THROUGH BROKER"})));
+    assert_eq!(result.result.outcome, InvocationOutcome::Succeeded);
+    assert_eq!(
+        result.result.output,
+        Some(json!({"text": "HELLO THROUGH BROKER"}))
+    );
 
     let records = audit.records().await;
     assert_eq!(records.len(), 2);
@@ -787,11 +800,12 @@ async fn an_attested_invoke_from_a_peer_without_a_grant_is_denied_not_erred() {
         .invoke(
             Some(Attestation::for_subject(subject(), agent("chat-agent"))),
             request("invoke-ungranted-socket"),
+            Default::default(),
         )
         .await
         .expect("a refused attestation is still a completed invocation response");
-    assert_eq!(result.outcome, InvocationOutcome::Denied);
-    assert_eq!(result.error.as_deref(), Some("attestation-denied"));
+    assert_eq!(result.result.outcome, InvocationOutcome::Denied);
+    assert_eq!(result.result.error.as_deref(), Some("attestation-denied"));
 
     let records = audit.records().await;
     assert_eq!(records.len(), 1);
@@ -847,6 +861,8 @@ async fn mismatched_attestation_binding_is_a_protocol_error() {
             ),
         }),
         request("invoke-bound-identifier"),
+        vec![],
+        0,
     );
     write_frame(&mut stream, &envelope, limits.frame)
         .await
@@ -1095,4 +1111,228 @@ async fn default_startup_tolerates_names_no_loaded_provider_declares() {
         .await
         .expect_err("an undeclared principal refuses startup even when tolerating");
     assert!(matches!(error, BrokerdError::Policy { .. }), "{error:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_non_invoke_frame_with_descriptors_is_refused_without_a_broker_decision() {
+    use dekopon_broker_protocol::DescriptorStream;
+    use std::os::fd::AsFd as _;
+    let uid = current_uid();
+    let directory = tempfile::tempdir().unwrap();
+    let socket_path = directory.path().join("broker.sock");
+    let listener = UnixListener::bind(&socket_path).unwrap();
+    let (broker, audit) = broker().await;
+    let identities = BTreeMap::from([(
+        uid,
+        MappedPeer {
+            context: context("caller"),
+            attestor: None,
+        },
+    )]);
+    let limits = server_limits();
+    let server = BrokerServer::new(broker, identities, limits).unwrap();
+    let (shutdown_send, shutdown_receive) = oneshot::channel();
+    let task = tokio::spawn(server.serve(listener, shutdown_on(shutdown_receive)));
+    let stream = UnixStream::connect(&socket_path).await.unwrap();
+    let mut stream = DescriptorStream::new(stream);
+    let file = tempfile::tempfile().unwrap();
+    stream
+        .write_frame(
+            &RequestEnvelope::capabilities(None),
+            &[file.as_fd()],
+            limits.frame,
+        )
+        .await
+        .unwrap();
+    let (response, descriptors) = stream
+        .read_frame::<ResponseEnvelope>(limits.frame)
+        .await
+        .unwrap();
+    assert!(descriptors.is_empty());
+    assert!(
+        matches!(response.response, BrokerResponse::Error { code, .. } if code == ERROR_INVALID_REQUEST)
+    );
+    assert!(audit.records().await.is_empty());
+    shutdown_send.send(()).unwrap();
+    task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn successful_asset_descriptors_and_send_effects_cross_the_real_server_with_ordinary_audit() {
+    use dekopon_broker_protocol::{AssetEncoding, AssetRow, InvokeAssets};
+    use dekopon_capability::AssetConstraints;
+    use dekopon_http_host::asset::AssetDirectory;
+    use std::os::unix::fs::FileExt as _;
+    let uid = current_uid();
+    let directory = private_directory();
+    let socket_path = directory.path().join("broker.sock");
+    let assets_root = directory.path().join("assets");
+    fs::create_dir(&assets_root).unwrap();
+    let listener = bind_fixture(&socket_path);
+    let mut registry = BrokerProviderRegistry::load(
+        [provider_fixture("http-probe-provider.wasm")],
+        BrokerHostLimits::default(),
+    )
+    .await
+    .unwrap();
+    let asset_directory = AssetDirectory::new(assets_root.clone(), 1024);
+    registry.set_assets(asset_directory.clone());
+    let capability: CapabilityId = "http-probe.purge".parse().unwrap();
+    let provider: ProviderId = "http-probe".parse().unwrap();
+    let world = PolicyWorld::new(
+        ["caller".parse::<PrincipalId>().unwrap()],
+        [(capability.clone(), provider.clone())],
+    )
+    .unwrap();
+    let engine = PolicyEngine::new(r#"permit(principal == Dekopon::Principal::"caller", action == Dekopon::Action::"http-probe.purge", resource == Dekopon::Provider::"http-probe");"#, &world).unwrap();
+    let catalog = ConstraintCatalog::new([(
+        capability.clone(),
+        ConstraintSet {
+            route: CapabilityRoute::Generic,
+            provider,
+            effect: EffectKind::ExternalWrite,
+            risk: RiskLevel::High,
+            credential: None,
+            credential_by_agent: Default::default(),
+            constraints: ExecutionConstraints {
+                asset: Some(AssetConstraints {
+                    attach: true,
+                    send: true,
+                    remove: false,
+                }),
+                ..Default::default()
+            },
+        },
+    )])
+    .unwrap();
+    let audit = Arc::new(InMemoryAuditLog::new(16).unwrap());
+    let broker = Arc::new(
+        Broker::new(
+            registry,
+            "broker-test".parse().unwrap(),
+            "policy-test".to_owned(),
+            engine,
+            catalog,
+            CredentialStore::empty(),
+            IdentityDirectory::empty(),
+            Arc::clone(&audit),
+            BrokerLimits::default(),
+        )
+        .unwrap(),
+    );
+    let limits = server_limits();
+    let server = BrokerServer::new(
+        broker,
+        BTreeMap::from([(
+            uid,
+            MappedPeer {
+                context: context("caller"),
+                attestor: None,
+            },
+        )]),
+        limits,
+    )
+    .unwrap();
+    let (stop, stopped) = oneshot::channel();
+    let task = tokio::spawn(server.serve(listener, shutdown_on(stopped)));
+    let client = BrokerClient::new(&socket_path, uid, limits.frame).unwrap();
+    let mut invocation = request("attach-asset");
+    invocation.capability = capability.clone();
+    invocation.input = json!({"assetMode": "attach"});
+    let attached = client
+        .invoke(None, invocation, InvokeAssets::default())
+        .await
+        .unwrap();
+    assert_eq!(attached.result.outcome, InvocationOutcome::Succeeded);
+    assert_eq!(attached.attached.len(), 1);
+    assert_eq!(attached.descriptors.len(), 1);
+    let file = std::fs::File::from(attached.descriptors.into_iter().next().unwrap());
+    let mut bytes = [0; 11];
+    file.read_exact_at(&mut bytes, 0).unwrap();
+    assert_eq!(&bytes, b"asset probe");
+    assert!(file.write_at(b"x", 0).is_err());
+    assert_eq!(fs::read_dir(&assets_root).unwrap().count(), 0);
+    let mut invocation = request("send-asset");
+    invocation.capability = capability.clone();
+    invocation.input = json!({"assetMode": "send", "reference": "chat-asset:1"});
+    let sent = client
+        .invoke(
+            None,
+            invocation,
+            InvokeAssets {
+                rows: vec![AssetRow {
+                    id: 1,
+                    content_type: "text/plain".to_owned(),
+                    encoding: AssetEncoding::Identity,
+                    bytes: 11,
+                    origin: "provider:http-probe.purge".to_owned(),
+                    sent: false,
+                }],
+                descriptors: vec![file.into()],
+                sends_remaining: 1,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(sent.result.outcome, InvocationOutcome::Succeeded);
+    assert_eq!(sent.sent, vec![1]);
+    assert!(sent.descriptors.is_empty());
+    assert_eq!(audit.records().await.len(), 4);
+
+    let mut invocation = request("caught-over-budget");
+    invocation.capability = capability.clone();
+    invocation.input = json!({"assetMode": "direct-write", "bytes": 1025});
+    let refused = client
+        .invoke(None, invocation, InvokeAssets::default())
+        .await
+        .unwrap();
+    assert_eq!(refused.result.outcome, InvocationOutcome::Failed);
+    assert_eq!(refused.result.error.as_deref(), Some("over-budget"));
+    assert!(
+        refused.attached.is_empty()
+            && refused.removed.is_empty()
+            && refused.sent.is_empty()
+            && refused.descriptors.is_empty()
+    );
+
+    // Close the receive direction before sending the request: the successful effect's response
+    // must fail to write, not race a cooperative reader. Server shutdown drains the connection.
+    let stream = UnixStream::connect(&socket_path)
+        .await
+        .unwrap()
+        .into_std()
+        .unwrap();
+    stream.shutdown(std::net::Shutdown::Read).unwrap();
+    let mut stream =
+        dekopon_broker_protocol::DescriptorStream::new(UnixStream::from_std(stream).unwrap());
+    let mut invocation = request("failed-asset-response-write");
+    invocation.capability = capability;
+    invocation.input = json!({"assetMode": "attach"});
+    stream
+        .write_frame(
+            &RequestEnvelope::invoke(None, invocation, vec![], 0),
+            &[],
+            limits.frame,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while audit.records().await.len() < 8 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    stop.send(()).unwrap();
+    task.await.unwrap().unwrap();
+    drop(stream);
+    assert_eq!(fs::read_dir(&assets_root).unwrap().count(), 0);
+    // The failed frame must close its output descriptor and release the full shared reservation.
+    asset_directory
+        .allocate()
+        .await
+        .unwrap()
+        .write(vec![0; 1024])
+        .await
+        .unwrap();
 }

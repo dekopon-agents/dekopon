@@ -41,6 +41,7 @@ use tracing::Instrument as _;
 use wasmtime::component::{Component, HasSelf, Linker};
 use wasmtime::{Engine, Store};
 
+pub mod asset;
 mod clock;
 mod cwasm;
 mod http;
@@ -64,6 +65,8 @@ pub(crate) mod bindings {
         exports: { default: async },
         with: {
             "dekopon:storage/durable-files.file": crate::storage::FileResource,
+            "dekopon:asset/asset.handle": crate::asset::HandleResource,
+            "dekopon:asset/asset.writer": crate::asset::WriterResource,
         },
     });
 }
@@ -371,9 +374,12 @@ impl std::error::Error for BrokerInvocationFailure {
 }
 
 /// Successful broker-provider output and bounded HTTP evidence metadata.
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrokerInvocationOutput {
+    /// Successful typed asset effects and their read-only files.
+    #[serde(skip)]
+    pub assets: asset::AssetOutputs,
     /// Provider selected by the trusted capability route.
     pub provider: ProviderId,
     /// Invoked capability.
@@ -462,6 +468,8 @@ impl Runtime {
         let mut linker = Linker::new(&engine);
         bindings::Provider::add_to_linker::<_, HasSelf<_>>(&mut linker, |state| state)
             .map_err(|source| BrokerHostError::Linker { source })?;
+        asset::link_bounded_writer(&mut linker)
+            .map_err(|source| BrokerHostError::Linker { source })?;
         Ok(Self {
             engine_key: cwasm::compatibility_key(&engine),
             engine,
@@ -500,6 +508,7 @@ impl Runtime {
                 http,
                 storage,
                 clock,
+                assets: asset::AssetState::disabled(),
                 table: storage::new_table(),
                 instantiations: 0,
                 _reserved: reserved,
@@ -532,6 +541,7 @@ impl Runtime {
 }
 
 struct StoreState {
+    assets: asset::AssetState,
     limits: memory::MemoryLimiter,
     http: HttpState,
     storage: storage::StorageState,
@@ -548,6 +558,109 @@ struct StoreState {
 }
 
 impl bindings::dekopon::http::client::Host for StoreState {
+    async fn stream(
+        &mut self,
+        request: bindings::dekopon::http::client::StreamedRequest,
+    ) -> wasmtime::Result<
+        Result<
+            bindings::dekopon::http::client::StreamedResponse,
+            bindings::dekopon::http::client::HttpError,
+        >,
+    > {
+        use bindings::dekopon::http::client as wit;
+        let Some(directory) = self.assets.directory()? else {
+            self.assets
+                .reject(bindings::dekopon::asset::asset::ErrorCode::Unconfigured);
+            return Ok(Err(wit::HttpError {
+                code: wit::ErrorCode::Internal,
+                message: "unconfigured: configure assets.rootPath before streaming HTTP".to_owned(),
+            }));
+        };
+        let mut body = Vec::with_capacity(request.body.len());
+        for part in request.body {
+            body.push(match part {
+                wit::Part::Literal(bytes) => dekopon_http_host::Part::Literal(bytes),
+                wit::Part::Asset(part) => {
+                    let part = self.table.get(&part.handle)?.http_part(part.encoding);
+                    if let Err(error) = self.assets.charge_stream(part.decoded_bytes) {
+                        return Ok(Err(wit::HttpError {
+                            code: wit::ErrorCode::RequestTooLarge,
+                            message: error.message,
+                        }));
+                    }
+                    dekopon_http_host::Part::Asset(part)
+                }
+            });
+        }
+        let response = self
+            .http
+            .client
+            .stream(
+                dekopon_http_host::StreamedRequest {
+                    method: request.method,
+                    uri: request.uri,
+                    headers: request
+                        .headers
+                        .into_iter()
+                        .map(|header| dekopon_http_host::Header {
+                            name: header.name,
+                            value: header.value,
+                        })
+                        .collect(),
+                    body,
+                },
+                &directory,
+            )
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(error) => {
+                self.assets.reject(if self.http.client.asset_over_budget() {
+                    bindings::dekopon::asset::asset::ErrorCode::OverBudget
+                } else {
+                    bindings::dekopon::asset::asset::ErrorCode::Io
+                });
+                return Ok(Err(http::map_error(error)));
+            }
+        };
+        let content_type = response
+            .headers
+            .iter()
+            .find(|header| header.name.eq_ignore_ascii_case("content-type"))
+            .and_then(|header| std::str::from_utf8(&header.value).ok())
+            .unwrap_or("application/octet-stream")
+            .to_owned();
+        let handle = match asset::HandleResource::from_output(
+            response.body,
+            content_type,
+            bindings::dekopon::asset::asset::Encoding::Identity,
+            "response".to_owned(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(error) => {
+                self.assets.reject(error.code);
+                return Ok(Err(wit::HttpError {
+                    code: wit::ErrorCode::Internal,
+                    message: error.message,
+                }));
+            }
+        };
+        Ok(Ok(wit::StreamedResponse {
+            status: response.status,
+            headers: response
+                .headers
+                .into_iter()
+                .map(|header| wit::Header {
+                    name: header.name,
+                    value: header.value,
+                })
+                .collect(),
+            body: self.table.push(handle)?,
+        }))
+    }
+
     async fn send(
         &mut self,
         request: bindings::dekopon::http::client::Request,
@@ -961,7 +1074,10 @@ impl BrokerWasmProvider {
             });
         }
         let output = output??;
-        if store.data().http.attempted() || store.data().storage.attempted() {
+        if store.data().http.attempted()
+            || store.data().storage.attempted()
+            || store.data().assets.attempted()
+        {
             return Err(BrokerHostError::RunCommandUsedHostImport {
                 path: self.source.clone(),
             });
@@ -976,6 +1092,10 @@ impl BrokerWasmProvider {
         Ok(output)
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the invocation keeps separate authority grants and native resource ownership"
+    )]
     async fn invoke(
         &self,
         capability: &CapabilityId,
@@ -983,6 +1103,8 @@ impl BrokerWasmProvider {
         constraints: &ExecutionConstraints,
         credential: Option<BoundCredential>,
         storage_transaction: Option<dekopon_storage_host::StorageHandle>,
+        assets: asset::AssetInputs,
+        directory: Option<dekopon_http_host::asset::AssetDirectory>,
     ) -> Result<BrokerInvocationOutput, BrokerInvocationFailure> {
         validate_authorized_constraints(constraints, &self.runtime.limits)?;
         if !self
@@ -1032,6 +1154,15 @@ impl BrokerWasmProvider {
         let mut store = self
             .runtime
             .store(http, storage_state, ClockState::invoke())?;
+        store.data_mut().assets = asset::AssetState::invoke(
+            assets,
+            asset::references(input),
+            constraints.asset.clone().unwrap_or_default(),
+            directory,
+            format!("provider:{capability}"),
+        )
+        .await
+        .map_err(|source| BrokerHostError::AssetInput { source })?;
         // Read the actual initial balance before instantiation, rather than assuming a
         // configured budget was supplied. An unavailable observation is not zero usage.
         let initial_fuel = store.get_fuel().ok();
@@ -1052,6 +1183,15 @@ impl BrokerWasmProvider {
                 operation_timeout,
             )
             .await;
+        store.data().assets.drain().await;
+        // A caught, typed disk failure stays terminal even if later guest work times out or
+        // triggers another host refusal. Never infer exhaustion from cancellation itself.
+        if matches!(
+            store.data().assets.violation(),
+            Some(bindings::dekopon::asset::asset::ErrorCode::OverBudget)
+        ) {
+            executed = Err(BrokerHostError::AssetOverBudget);
+        }
         let commit = executed.is_ok();
         let storage_output = executed
             .as_ref()
@@ -1087,6 +1227,7 @@ impl BrokerWasmProvider {
                 provider: self.manifest.id.clone(),
                 capability: capability.clone(),
                 output,
+                assets: data.assets.finish(),
                 http_calls,
                 storage,
             }),
@@ -1149,6 +1290,13 @@ impl BrokerWasmProvider {
                 reason,
             });
         }
+        if store.data().assets.violation().is_some() {
+            return Err(BrokerHostError::HostCallRejected {
+                provider: self.manifest.id.clone(),
+                capability: capability.clone(),
+                reason: "asset-call-rejected",
+            });
+        }
         if let Some(reason) = store.data().storage.violation() {
             return Err(BrokerHostError::StorageCallRejected {
                 provider: self.manifest.id.clone(),
@@ -1193,6 +1341,7 @@ pub struct BrokerProviderRegistry {
     providers: Vec<BrokerWasmProvider>,
     routes: BTreeMap<CapabilityId, usize>,
     storage_host: Option<StorageHost>,
+    assets: Option<dekopon_http_host::asset::AssetDirectory>,
 }
 
 impl BrokerProviderRegistry {
@@ -1320,6 +1469,7 @@ impl BrokerProviderRegistry {
                 providers,
                 routes,
                 storage_host,
+                assets: None,
             })
         }
         .instrument(span.clone())
@@ -1463,6 +1613,11 @@ impl BrokerProviderRegistry {
             .limits
     }
 
+    /// Installs the broker-owned ephemeral directory shared by all invocations.
+    pub fn set_assets(&mut self, directory: dekopon_http_host::asset::AssetDirectory) {
+        self.assets = Some(directory);
+    }
+
     /// Returns the configured storage host handle, when storage is enabled.
     #[must_use]
     pub fn storage_host(&self) -> Option<StorageHost> {
@@ -1528,8 +1683,10 @@ impl BrokerProviderRegistry {
         &self,
         authorized: AuthorizedInvocation,
         credential: Option<BoundCredential>,
+        assets: asset::AssetInputs,
     ) -> Result<BrokerInvocationOutput, BrokerInvocationFailure> {
-        self.invoke_with_storage(authorized, credential, None).await
+        self.invoke_with_storage(authorized, credential, None, assets)
+            .await
     }
 
     /// Consumes an invocation plus its exact non-forgeable storage grant when storage is enabled.
@@ -1538,6 +1695,7 @@ impl BrokerProviderRegistry {
         authorized: AuthorizedInvocation,
         credential: Option<BoundCredential>,
         storage_grant: Option<StorageGrant>,
+        assets: asset::AssetInputs,
     ) -> Result<BrokerInvocationOutput, BrokerInvocationFailure> {
         let storage_backed = authorized.constraints().storage.is_some();
         let proposal = authorized.proposal();
@@ -1631,6 +1789,8 @@ impl BrokerProviderRegistry {
                 authorized.constraints(),
                 credential,
                 storage_transaction,
+                assets,
+                self.assets.clone(),
             )
             .instrument(span)
             .await
@@ -1715,7 +1875,10 @@ async fn describe_component(
         });
     }
     let manifest = manifest??;
-    if store.data().http.attempted() || store.data().storage.attempted() {
+    if store.data().http.attempted()
+        || store.data().storage.attempted()
+        || store.data().assets.attempted()
+    {
         return Err(BrokerHostError::DescribeUsedHostImport {
             path: source.to_path_buf(),
         });
@@ -1827,6 +1990,16 @@ fn invalid_manifest(source: &Path, message: impl Into<String>) -> BrokerHostErro
 /// Failure to load or execute a broker-owned provider component.
 #[derive(Debug, Error)]
 pub enum BrokerHostError {
+    /// The invocation exhausted native asset disk capacity.
+    #[error("over-budget: broker asset disk capacity exhausted")]
+    AssetOverBudget,
+    /// Passed asset table or file descriptors failed admission.
+    #[error("invalid invocation assets")]
+    AssetInput {
+        #[source]
+        source: asset::AssetAdmissionError,
+    },
+
     /// No components were configured.
     #[error("at least one broker provider component is required")]
     NoProviders,

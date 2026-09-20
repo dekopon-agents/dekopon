@@ -1743,7 +1743,7 @@ mod tests {
                     "role": "user",
                     "content": [
                         {"type": "text", "text": "what does this say?"},
-                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,UE5H"}},
+                        {"type": "image_url", "image_url": {"url": format!("data:{};base64,UE5H", "image/png")}},
                         {"type": "file", "file": {
                             "filename": "spec.pdf",
                             "file_data": "data:application/pdf;base64,UERG"
@@ -1785,7 +1785,8 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&url).expect("the data URL serializes"),
             json!(format!(
-                "data:image/png;base64,{}",
+                "data:{};base64,{}",
+                "image/png",
                 base64::engine::general_purpose::STANDARD.encode(&bytes)
             ))
         );

@@ -160,6 +160,7 @@ async fn a_suspended_authorization_does_not_parent_another_task_s_events() {
                         input: serde_json::json!({"text": "denied"}),
                         secret_use: None,
                     },
+                    Default::default(),
                 )
                 .await
                 .expect("an unconstrained capability is still an accounted decision")
@@ -176,8 +177,11 @@ async fn a_suspended_authorization_does_not_parent_another_task_s_events() {
     release.notify_one();
 
     let result = denial.await.expect("the denial task completes");
-    assert_eq!(result.outcome, InvocationOutcome::Denied);
-    assert_eq!(result.error.as_deref(), Some("unconstrained-capability"));
+    assert_eq!(result.result.outcome, InvocationOutcome::Denied);
+    assert_eq!(
+        result.result.error.as_deref(),
+        Some("unconstrained-capability")
+    );
 
     let unrelated = captured
         .events()

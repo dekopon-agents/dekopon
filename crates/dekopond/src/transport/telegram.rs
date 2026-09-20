@@ -978,6 +978,7 @@ impl ChatDriver for TelegramDriver {
         reply: OutboundReply,
     ) -> Result<(), TransportError> {
         let OutboundReply { text, images } = reply;
+        super::hydration::validate_types(&images, super::hydration::AcceptedTypes::Photos)?;
         let mut images = super::hydration::ImageQueue::new(images);
         let ReplyTarget::Telegram {
             chat_id,
@@ -1144,7 +1145,7 @@ impl TelegramDriver {
         )]
         let part = reqwest::multipart::Part::bytes(image.bytes)
             .file_name(filename)
-            .mime_str("image/png")
+            .mime_str(&image.media_type)
             .map_err(|_| TransportError::Response)?;
         let mut form = reqwest::multipart::Form::new()
             .text("chat_id", chat_id.to_string())

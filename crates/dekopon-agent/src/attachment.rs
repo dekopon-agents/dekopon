@@ -1,1089 +1,681 @@
-//! The two places bytes cross between a capability and a chat conversation.
-//!
-//! Everything on the provider boundary is a JSON string, and the sandboxed shell has no byte type:
-//! printing a multi-megabyte base64 blob would clamp it to a screenful of garbage in the model
-//! transcript and cost the session the tokens anyway. So bytes never travel *through* the model.
-//! Both directions are courier behaviour in the embedding gateway, and neither is authority: the
-//! broker still authorizes every invocation, and an owner still decides per route whether either
-//! convention is live.
-//!
-//! - **Out.** A successful capability result may carry a top-level `attachments` key holding
-//!   `{mediaType, base64}` objects. The session's broker leg removes it, validates each entry, puts
-//!   the accepted disk leases in [`ReplyAttachments`] — a request-local slot that is never a model
-//!   message — and leaves the model metadata only.
-//! - **In.** A capability input may carry the marker `chat-asset:<N>`, naming an attachment the
-//!   sender put on their message. For the capabilities a route lists, the leg expands each marker to
-//!   a `data:` URL through [`ChatAssetSource`] before the proposal is submitted.
+//! Reference-only proposals and descriptor-backed assets. The broker alone authorizes effects.
 
-use std::{fmt, sync::Arc, sync::Mutex};
-
-use base64::{Engine as _, engine::general_purpose::STANDARD};
-use serde::Deserialize;
+use dekopon_broker_protocol::{
+    AssetEncoding, AssetRow, InvokeAssets, MAX_DESCRIPTORS_PER_FRAME, NewAsset,
+};
+use dekopon_core::{
+    base64::{DecoderReader, STANDARD},
+    chat_asset_marker,
+};
+use dekopon_model::asset::{BlobError, DiskBlob};
 use serde_json::Value;
+use std::{
+    fmt,
+    io::Read,
+    os::fd::OwnedFd,
+    sync::{Arc, Mutex},
+};
 use thiserror::Error;
 
-/// Maximum decoded attachment spooled or handed to a chat transport.
 pub use dekopon_model::asset::MAX_ATTACHMENT_BYTES;
-use dekopon_model::asset::{BlobError, DiskBlob};
+/// Decoded bytes referenced by one invocation, independently of JSON frame size.
+pub const MAX_INVOCATION_ASSET_BYTES: usize = dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES;
 
-/// The one media type a delivered attachment may declare.
-///
-/// Public because a progress surface names what it accepted
-/// ([`ProgressEvent::Attachment`](crate::progress::ProgressEvent::Attachment)), and validation —
-/// not the provider's claim — is what fixes it; [`GeneratedImage::media_type`] answers with this
-/// same constant for one image.
-pub const ATTACHMENT_MEDIA_TYPE: &str = "image/png";
-
-const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
-
-/// Checks the shared PNG byte ceiling and signature without creating a scratch file.
-///
-/// # Errors
-/// Returns [`AttachmentRefusal::TooLarge`] or [`AttachmentRefusal::UnsupportedMedia`].
-/// This is signature validation only, not full image decoding.
-pub fn validate_png(data: &[u8]) -> Result<(), AttachmentRefusal> {
-    if data.len() > MAX_ATTACHMENT_BYTES {
-        return Err(AttachmentRefusal::TooLarge);
-    }
-    if !data.starts_with(PNG_SIGNATURE) {
-        return Err(AttachmentRefusal::UnsupportedMedia);
-    }
-    Ok(())
-}
-
-/// Expansions one invocation's input may make.
-///
-/// Three because that is what a remix of a handful of reference images needs, and because each one
-/// is a transport download plus its bytes held in the proposal.
-pub const MAX_CHAT_ASSET_INPUTS: usize = 3;
-
-/// Decoded bytes one invocation's expanded markers may carry in total.
-///
-/// Half a mebibyte under the single-attachment ceiling, so three expansions plus the envelope stay
-/// inside the byte bound a broker frame can carry.
-pub const MAX_CHAT_ASSET_INPUT_BYTES: usize = 8_912_896;
-
-/// Expansions one session may make across every invocation it proposes.
-///
-/// The per-invocation bound alone is not a session bound, and expansion happens **before** the
-/// broker authorizes anything: without this, a script could spend its whole capability budget
-/// proposing a listed capability and pull three attachments off the chat service with the bot token
-/// on every one of them, even if policy then denied every call. Twelve is four full invocations'
-/// worth — enough for a person iterating on a remix, far short of a download loop.
-pub const MAX_CHAT_ASSET_EXPANSIONS_PER_SESSION: usize = 12;
-
-/// The key a capability result carries attachments under, and which the gateway removes.
-const ATTACHMENTS_KEY: &str = "attachments";
-
-/// The key the gateway writes attachment metadata back under.
-const ATTACHED_KEY: &str = "attached";
-
-/// The key the gateway writes its own fixed refusal sentence under.
-const ATTACHMENT_NOTE_KEY: &str = "attachmentNote";
-
-/// One binary attachment a capability result offered, as it arrives on the wire.
-///
-/// Deliberately this crate's own type rather than one imported from the provider SDK. A provider
-/// ships from its own repository against its own pinned SDK version, so what the two sides actually
-/// share is the **JSON shape**, not a Rust type — and depending on the SDK here would compile its
-/// source into this tree's provider fixtures and pull `wit-bindgen` into the gateway's dependency
-/// graph for two string fields. `docs/development.md` and the SDK's README document the schema; this
-/// is the reader, and `deny_unknown_fields` is what keeps the two honest about it.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct ResultAttachment {
-    /// IANA media type of the decoded bytes, such as `image/png`.
-    media_type: String,
-    /// Standard base64 encoding of the bytes themselves.
-    base64: String,
-}
-
-/// One bounded PNG, held only until the embedding chat transport accepts it.
-///
-/// `Debug` reports metadata and never bytes. Provider-produced content is untrusted and can be
-/// several megabytes; formatting it into a model transcript or telemetry record would be both a data
-/// leak and an unbounded operational cost.
+/// One explicitly queued asset, pinned until the transport completes.
 pub struct GeneratedImage {
     data: DiskBlob,
+    content_type: String,
+    encoding: AssetEncoding,
 }
-
 impl GeneratedImage {
-    /// Validates and owns one bounded PNG.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AttachmentRefusal::TooLarge`] past [`MAX_ATTACHMENT_BYTES`] and
-    /// [`AttachmentRefusal::UnsupportedMedia`] when the bytes do not carry the PNG signature,
-    /// whatever media type the producer declared.
-    pub fn from_png(data: Vec<u8>) -> Result<Self, AttachmentRefusal> {
-        validate_png(&data)?;
-        Ok(Self {
-            data: DiskBlob::from_bytes(&data).map_err(AttachmentRefusal::Storage)?,
-        })
-    }
-
-    /// IANA media type fixed by validation rather than by what the provider claimed.
-    #[must_use]
-    pub const fn media_type(&self) -> &'static str {
-        ATTACHMENT_MEDIA_TYPE
-    }
-
-    /// Gateway-owned filename for this attachment's position in one reply.
-    ///
-    /// Neither the model nor the provider can choose a path or a service-visible name. The position
-    /// is in the name because a reply can carry several attachments and a chat service shows a
-    /// person the filename; repeating one name would make two different images look like one file
-    /// posted twice.
-    #[must_use]
-    pub fn filename(&self, index: usize) -> String {
-        if index == 0 {
-            "generated-image.png".to_owned()
-        } else {
-            format!("generated-image-{}.png", index + 1)
+    /// Creates an upload lease from authoritative table metadata.
+    pub fn new(data: DiskBlob, content_type: String, encoding: AssetEncoding) -> Self {
+        Self {
+            data,
+            content_type,
+            encoding,
         }
     }
-
-    /// Materializes raw PNG bytes for the final transport upload.
-    ///
+    /// Convenience constructor for native image producers.
     /// # Errors
-    /// Returns a sanitized scratch IO failure; the provider effect has already executed.
-    pub fn bytes(&self) -> Result<Vec<u8>, BlobError> {
-        self.data.read()
+    /// Refuses bytes exceeding the bounded scratch capacity.
+    pub fn from_png(data: Vec<u8>) -> Result<Self, BlobError> {
+        Ok(Self::new(
+            DiskBlob::from_bytes(&data)?,
+            "image/png".to_owned(),
+            AssetEncoding::Identity,
+        ))
     }
-
-    /// Byte count without materializing the payload.
-    #[must_use]
+    /// The declared label, not a type inferred from content.
+    pub fn media_type(&self) -> &str {
+        &self.content_type
+    }
+    /// A gateway-generated filename; no provider path is used.
+    pub fn filename(&self, index: usize) -> String {
+        let extension = match self.content_type.as_str() {
+            "image/png" => "png",
+            "image/jpeg" => "jpg",
+            "image/webp" => "webp",
+            "image/gif" => "gif",
+            "text/plain" => "txt",
+            "application/pdf" => "pdf",
+            _ => "bin",
+        };
+        format!("asset-{}.{extension}", index + 1)
+    }
+    /// Reads and decodes one bounded upload buffer.
+    /// # Errors
+    /// Refuses changed/truncated descriptors or invalid encoded content.
+    pub fn bytes(&self) -> Result<Vec<u8>, BlobError> {
+        match self.encoding {
+            AssetEncoding::Identity => self.data.read(),
+            AssetEncoding::Base64 => {
+                let start = std::time::Instant::now();
+                let span = tracing::info_span!(
+                    "asset.decode",
+                    bytes = self.data.len(),
+                    duration_us = tracing::field::Empty
+                );
+                span.in_scope(|| {
+                    let len = self.decoded_len()?;
+                    let mut decoded = vec![0; len];
+                    DecoderReader::new(
+                        BlobReader {
+                            blob: &self.data,
+                            offset: 0,
+                        },
+                        &STANDARD,
+                    )
+                    .read_exact(&mut decoded)?;
+                    span.record("duration_us", start.elapsed().as_micros() as u64);
+                    Ok(decoded)
+                })
+            }
+        }
+    }
+    /// Upload byte count from the validated representation, reading at most two stored bytes.
+    /// Call off the async worker, just like `bytes`.
+    /// # Errors
+    /// Refuses unavailable/changed descriptors and invalid base64 length.
+    pub fn decoded_len(&self) -> Result<usize, BlobError> {
+        match self.encoding {
+            AssetEncoding::Identity => Ok(self.data.len()),
+            AssetEncoding::Base64 => {
+                let mut tail = [0; 2];
+                if !self.data.is_empty() {
+                    let offset = self
+                        .data
+                        .len()
+                        .checked_sub(tail.len())
+                        .ok_or(BlobError::Io(std::io::ErrorKind::InvalidData))?;
+                    self.data.read_exact_at(&mut tail, offset as u64)?;
+                }
+                dekopon_core::base64::decoded_len(self.data.len() as u64, &tail)
+                    .map(|len| len as usize) // decoded bytes cannot exceed the bounded stored size
+                    .map_err(|error| match error {
+                        dekopon_core::base64::CodecError::TooLarge => BlobError::TooLarge,
+                        dekopon_core::base64::CodecError::InvalidEncoding => {
+                            BlobError::Io(std::io::ErrorKind::InvalidData)
+                        }
+                    })
+            }
+        }
+    }
+    /// Stored byte count, without reading payloads.
     pub fn len(&self) -> usize {
         self.data.len()
     }
-
-    /// Whether the validated payload is empty (a PNG never is).
-    #[must_use]
+    /// Whether the stored representation is empty.
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
-
-    /// Consumes the image into a transient upload buffer.
-    ///
+    /// Consumes this delivery pin into one upload buffer.
     /// # Errors
-    /// Returns a sanitized scratch IO failure; the provider effect has already executed.
+    /// Returns the same positional read/decoding errors as `bytes`.
     pub fn into_bytes(self) -> Result<Vec<u8>, BlobError> {
-        self.data.read()
+        self.bytes()
     }
 }
-
 impl fmt::Debug for GeneratedImage {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("GeneratedImage")
-            .field("media_type", &self.media_type())
-            .field("bytes", &self.data.len())
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GeneratedImage")
+            .field("content_type", &self.content_type)
+            .field("bytes", &self.len())
             .finish()
     }
 }
-
-/// Why one provider-offered attachment was not delivered.
-///
-/// A refusal never fails the script. The invocation already happened and may already have cost the
-/// account money, so the model is told in one fixed sentence that the bytes did not travel and can
-/// answer around it. [`Self::reason`] is the stable audit value and [`Self::note`] the sentence.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum AttachmentRefusal {
-    /// The provider executed, but the gateway could not retain its attachment.
-    #[error("{0}")]
-    Storage(BlobError),
-    /// The route does not carry provider attachments at all.
-    #[error("this route does not deliver provider attachments")]
-    RouteDisabled,
-    /// The `attachments` value was not a list of `{mediaType, base64}` objects, or the base64 did
-    /// not decode.
-    #[error("attachment was not a decodable base64 attachment list")]
-    InvalidEncoding,
-    /// The declared media type is not deliverable, or the bytes are not what it claimed.
-    #[error("attachment media type is not deliverable")]
-    UnsupportedMedia,
-    /// Decoded bytes exceeded [`MAX_ATTACHMENT_BYTES`].
-    #[error("attachment exceeded the byte bound")]
-    TooLarge,
-    /// The reply already holds as many attachments as the route permits.
-    #[error("the reply already holds as many attachments as this route permits")]
-    PerReplyLimit,
+struct BlobReader<'a> {
+    blob: &'a DiskBlob,
+    offset: usize,
 }
-
-impl AttachmentRefusal {
-    /// Stable low-cardinality audit reason.
-    #[must_use]
-    pub const fn reason(&self) -> &'static str {
-        match self {
-            Self::Storage(_) => "storage",
-            Self::RouteDisabled => "route-disabled",
-            Self::InvalidEncoding => "invalid-encoding",
-            Self::UnsupportedMedia => "unsupported-media",
-            Self::TooLarge => "too-large",
-            Self::PerReplyLimit => "per-reply-limit",
-        }
-    }
-
-    /// The fixed gateway-authored sentence the model reads in place of the bytes.
-    ///
-    /// Fixed text, never a provider diagnostic: a provider message can reflect untrusted upstream
-    /// content, and this string goes straight into the next model request.
-    #[must_use]
-    pub const fn note(&self) -> &'static str {
-        match self {
-            Self::Storage(_) => {
-                "The capability executed, but the gateway could not store its file. It was not delivered. Answer in text; do not repeat the paid call to recover the file."
-            }
-            Self::RouteDisabled => {
-                "This conversation cannot carry attachments, so the file this capability produced \
-                 was discarded. Answer in text."
-            }
-            Self::InvalidEncoding => {
-                "The gateway could not read the file this capability produced, so it was not \
-                 delivered. Answer in text."
-            }
-            Self::UnsupportedMedia => {
-                "The file this capability produced is not a type the gateway delivers, so it was \
-                 discarded. Answer in text."
-            }
-            Self::TooLarge => {
-                "The file this capability produced is larger than the gateway delivers, so it was \
-                 discarded. Answer in text, or ask for a smaller one."
-            }
-            Self::PerReplyLimit => {
-                "This reply already carries every attachment it is allowed, so the newest file was \
-                 discarded. Finish with what is already queued."
-            }
-        }
+impl Read for BlobReader<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let count = out.len().min(self.blob.len().saturating_sub(self.offset));
+        self.blob
+            .read_exact_at(&mut out[..count], self.offset as u64)
+            .map_err(std::io::Error::other)?;
+        self.offset += count;
+        Ok(count)
     }
 }
 
-/// Request-local slot through which validated attachments leave one session.
-///
-/// The bytes never become a model message, part of a prompt outcome, or part of any conversation
-/// history. An embedder takes the slot only after a successful session and drops it on failure or
-/// cancellation, which keeps provider-produced content out of transcripts, persistent history, and
-/// accidental `Debug` output.
-pub struct ReplyAttachments {
-    max_per_reply: usize,
-    images: Mutex<Vec<GeneratedImage>>,
-    registrar: Option<Arc<dyn GeneratedAssetStore>>,
-}
-
-/// Gateway registration of an already validated PNG; the store owns capacity and filenames.
+/// The embedding gateway's scoped table and registration seam.
 pub trait GeneratedAssetStore: Send + Sync {
-    /// Reserves storage before writing, and returns a fresh scoped ID with a temporary delivery pin.
-    ///
+    /// Registers one received descriptor, reserving retention before publication.
     /// # Errors
-    /// Returns retention failure after a provider effect; never authorizes a retry.
+    /// A failure is after the provider effect and must not authorize an automatic retry.
     fn register(
         &self,
-        bytes: &[u8],
+        descriptor: OwnedFd,
+        metadata: &NewAsset,
         capability: &str,
         invocation: &str,
-    ) -> Result<(u64, DiskBlob), BlobError>;
-}
-impl fmt::Debug for ReplyAttachments {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ReplyAttachments")
-            .field("max_per_reply", &self.max_per_reply)
-            .finish_non_exhaustive()
-    }
+    ) -> Result<u64, BlobError>;
+    /// Removes a broker-approved, unsent entry.
+    /// # Errors
+    /// Refuses stale references or storage reclamation failure.
+    fn remove(&self, id: u64) -> Result<(), BlobError>;
+    /// Marks a broker-approved send once and pins its payload.
+    /// # Errors
+    /// Refuses stale/unavailable references. A previously sent entry returns no new pin.
+    fn send(&self, id: u64) -> Result<Option<GeneratedImage>, BlobError>;
+    /// Records a bounded gateway notice for the next turn.
+    fn delivery_failed(&self);
 }
 
+/// Terminal classification of a queued send, independent of broker authorization.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AssetDeliveryDisposition {
+    /// The turn ended without attempting its asset reply.
+    Abandoned,
+    /// The reply was attempted but the transport did not accept it completely.
+    Failed,
+    /// The transport accepted the reply.
+    Delivered,
+}
+
+struct Queued {
+    images: Vec<GeneratedImage>,
+    ids: Vec<u64>,
+    spent: u8,
+    finished: bool,
+}
+/// Request-local delivery pins and remaining-send accounting; attachment never implies send.
+pub struct ReplyAttachments {
+    limit: u8,
+    queued: Mutex<Queued>,
+    registrar: Arc<dyn GeneratedAssetStore>,
+    transport: String,
+}
 impl ReplyAttachments {
-    /// A slot for one reply, carrying at most `max_per_reply` attachments.
-    #[must_use]
-    pub fn new(max_per_reply: u8) -> Self {
+    /// Binds this turn to its scoped table and authenticated transport.
+    pub fn new(limit: u8, registrar: Arc<dyn GeneratedAssetStore>, transport: String) -> Self {
         Self {
-            max_per_reply: max_per_reply as usize,
-            images: Mutex::new(Vec::new()),
-            registrar: None,
+            limit,
+            registrar,
+            transport,
+            queued: Mutex::new(Queued {
+                images: Vec::new(),
+                ids: Vec::new(),
+                spent: 0,
+                finished: false,
+            }),
         }
     }
-
-    /// Registers validated outputs with the embedding gateway before queueing their delivery pin.
-    #[must_use]
-    pub fn with_store(mut self, store: Arc<dyn GeneratedAssetStore>) -> Self {
-        self.registrar = Some(store);
-        self
-    }
-
-    /// Removes everything this session accepted, oldest first.
-    pub fn take(&self) -> Vec<GeneratedImage> {
-        std::mem::take(
-            &mut *self
-                .images
+    /// Allowance is charged once per newly queued table entry, not per provider call.
+    pub fn remaining(&self) -> u8 {
+        self.limit.saturating_sub(
+            self.queued
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .spent,
         )
     }
-
-    /// Accepts one validated attachment, or reports the per-reply ceiling.
-    ///
-    /// The ceiling covers the whole session rather than one invocation: a script that calls the same
-    /// capability in a loop must not be able to widen the reply the route configured.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`AttachmentRefusal::PerReplyLimit`] once the slot is full.
-    pub fn store(&self, image: GeneratedImage) -> Result<(), AttachmentRefusal> {
-        let mut images = self
-            .images
+    /// Whether a final reply has authorized queued files, even if its text is empty.
+    pub fn has_queued(&self) -> bool {
+        !self
+            .queued
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if images.len() >= self.max_per_reply {
-            return Err(AttachmentRefusal::PerReplyLimit);
-        }
-        images.push(image);
-        Ok(())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .images
+            .is_empty()
     }
-}
-
-/// Replaces a capability result's `attachments` key with metadata, reporting what it accepted and
-/// every refusal.
-///
-/// The first answer is the decoded size of each accepted attachment, in offer order — the caller
-/// tells a waiting person what arrived, and [`ATTACHMENT_MEDIA_TYPE`] is what all of them are. The
-/// second is the refusals in the order they happened; the caller audits each one. `slot` is `None`
-/// for a session whose route delivers no attachments, which still strips the key: the bytes must
-/// not reach the shell just because nowhere can accept them.
-pub fn strip_attachments(
-    output: &mut Value,
-    slot: Option<&ReplyAttachments>,
-) -> (Vec<u64>, Vec<AttachmentRefusal>) {
-    strip_attachments_for_invocation(output, slot, "", "")
-}
-
-/// Strips successful provider outputs while associating gateway assets with their invocation.
-pub fn strip_attachments_for_invocation(
-    output: &mut Value,
-    slot: Option<&ReplyAttachments>,
-    capability: &str,
-    invocation: &str,
-) -> (Vec<u64>, Vec<AttachmentRefusal>) {
-    let Some(object) = output.as_object_mut() else {
-        return (Vec::new(), Vec::new());
-    };
-    // These keys are reserved even without an attachments offer; a provider cannot publish a
-    // forged gateway identity or delivery claim by supplying its own metadata.
-    object.remove(ATTACHED_KEY);
-    object.remove(ATTACHMENT_NOTE_KEY);
-    let Some(offered) = object.remove(ATTACHMENTS_KEY) else {
-        return (Vec::new(), Vec::new());
-    };
-    let mut refusals = Vec::new();
-    let mut accepted = Vec::new();
-    let mut delivered = Vec::new();
-    match slot {
-        None => refusals.push(AttachmentRefusal::RouteDisabled),
-        Some(slot) => {
-            match serde_json::from_value::<Vec<ResultAttachment>>(offered) {
-                // The shape is the provider's claim, not a host contract, so a result that used the
-                // reserved key for something else is one refusal rather than a failed invocation.
-                Err(_shape) => refusals.push(AttachmentRefusal::InvalidEncoding),
-                Ok(attachments) => {
-                    for attachment in attachments {
-                        match accept(slot, &attachment, capability, invocation) {
-                            Ok((bytes, id)) => {
-                                delivered.push(bytes as u64);
-                                let mut metadata = serde_json::json!({"mediaType": ATTACHMENT_MEDIA_TYPE, "bytes": bytes});
-                                if let Some(id) = id {
-                                    metadata["asset"] = Value::String(format!("chat-asset:{id}"));
-                                    metadata["retained"] = Value::Bool(true);
-                                    metadata["delivered"] = Value::Bool(false);
-                                }
-                                accepted.push(metadata);
-                            }
-                            Err(refusal) => refusals.push(refusal),
-                        }
+    /// Transfers delivery pins only after a successful turn.
+    pub fn take(&self) -> Vec<GeneratedImage> {
+        std::mem::take(
+            &mut self
+                .queued
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .images,
+        )
+    }
+    /// Applies metadata only after a succeeded invocation, and returns a bounded model note.
+    pub fn receive(
+        &self,
+        attached: Vec<NewAsset>,
+        descriptors: Vec<OwnedFd>,
+        removed: Vec<u64>,
+        sent: Vec<u64>,
+        capability: &str,
+        invocation: &str,
+    ) -> String {
+        let mut note = String::new();
+        for id in removed {
+            if let Err(error) = self.registrar.remove(id) {
+                note.push_str(&format!("[gateway: asset removal refused: {error}]\n"));
+            }
+        }
+        for id in sent {
+            match self.registrar.send(id) {
+                Ok(Some(image)) => {
+                    let mut queued = self
+                        .queued
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if queued.spent < self.limit {
+                        queued.spent += 1;
+                        queued.ids.push(id);
+                        queued.images.push(image);
+                    } else {
+                        tracing::warn!(target: "dekopon_agent::audit", { audit.event = "agent.asset.send", asset.id = id, transport = self.transport, dispatched = false, error = "turn send allowance exhausted" }, "asset send failed");
+                        note.push_str(
+                            "[gateway: turn send allowance exhausted; asset was not queued]\n",
+                        );
+                        self.registrar.delivery_failed();
                     }
+                }
+                Ok(None) => (),
+                Err(error) => {
+                    tracing::warn!(target: "dekopon_agent::audit", { audit.event = "agent.asset.send", asset.id = id, transport = self.transport, dispatched = false, error = %error }, "asset send failed");
+                    note.push_str(&format!(
+                        "[gateway: chat-asset:{id} was not queued: {error}]\n"
+                    ));
+                    let mut queued = self
+                        .queued
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    // This accepted send spent broker allowance even though no upload can start.
+                    queued.spent = queued.spent.saturating_add(1);
+                    self.registrar.delivery_failed();
                 }
             }
         }
+        for (metadata, descriptor) in attached.into_iter().zip(descriptors) {
+            match self.registrar.register(descriptor, &metadata, capability, invocation) {
+                Ok(id) => {
+                    let label: String = metadata.content_type.chars().filter(|c| !c.is_control()).take(128).collect();
+                    note.push_str(&format!("[gateway: chat-asset:{id} ({label}, {} stored bytes) attached, not sent]\n", metadata.bytes));
+                }
+                Err(error) => note.push_str(&format!("[gateway: capability executed but its asset was not retained: {error}; do not repeat the paid call]\n")),
+            }
+        }
+        note
     }
-    object.insert(ATTACHED_KEY.to_owned(), Value::Array(accepted));
-    if let Some(first) = refusals.first() {
-        object.insert(
-            ATTACHMENT_NOTE_KEY.to_owned(),
-            Value::String(first.note().to_owned()),
-        );
+    /// Logs dispatch separately from broker authority; no implicit retry follows failure.
+    pub fn finish(&self, disposition: AssetDeliveryDisposition) {
+        let mut queued = self
+            .queued
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if queued.finished {
+            return;
+        }
+        queued.finished = true;
+        let error = match disposition {
+            AssetDeliveryDisposition::Abandoned => Some("turn ended before reply"),
+            AssetDeliveryDisposition::Failed => Some("delivery failed"),
+            AssetDeliveryDisposition::Delivered => None,
+        };
+        for id in &queued.ids {
+            tracing::info!(target: "dekopon_agent::audit", { audit.event = "agent.asset.send", asset.id = id, transport = self.transport, dispatched = !matches!(disposition, AssetDeliveryDisposition::Abandoned), error }, "asset delivery disposition");
+        }
+        if disposition != AssetDeliveryDisposition::Delivered && !queued.ids.is_empty() {
+            self.registrar.delivery_failed();
+        }
     }
-    (delivered, refusals)
+}
+impl Drop for ReplyAttachments {
+    fn drop(&mut self) {
+        self.finish(AssetDeliveryDisposition::Abandoned);
+    }
 }
 
-/// Validates one offered attachment and stores it, answering with its delivered byte count.
-fn accept(
-    slot: &ReplyAttachments,
-    attachment: &ResultAttachment,
-    capability: &str,
-    invocation: &str,
-) -> Result<(usize, Option<u64>), AttachmentRefusal> {
-    if attachment.media_type != ATTACHMENT_MEDIA_TYPE {
-        return Err(AttachmentRefusal::UnsupportedMedia);
-    }
-    // Checked before decoding: base64 costs four characters for every three bytes, so the encoded
-    // length already rules an oversized attachment out without allocating its decode.
-    if attachment.base64.len() > MAX_ATTACHMENT_BYTES.div_ceil(3) * 4 {
-        return Err(AttachmentRefusal::TooLarge);
-    }
-    #[allow(
-        clippy::map_err_ignore,
-        reason = "base64 DecodeError adds only an offset and the offending byte inside untrusted \
-                  provider bytes; InvalidEncoding already names the failure, and this module never \
-                  puts attachment content in a diagnostic"
-    )]
-    let data = STANDARD
-        .decode(&attachment.base64)
-        .map_err(|_| AttachmentRefusal::InvalidEncoding)?;
-    let bytes = data.len();
-    validate_png(&data)?;
-    let mut images = slot
-        .images
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if images.len() >= slot.max_per_reply {
-        return Err(AttachmentRefusal::PerReplyLimit);
-    }
-    let (image, id) = if let Some(store) = &slot.registrar {
-        let (id, data) = store
-            .register(&data, capability, invocation)
-            .map_err(AttachmentRefusal::Storage)?;
-        (GeneratedImage { data }, Some(id))
-    } else {
-        (GeneratedImage::from_png(data)?, None)
-    };
-    images.push(image);
-    Ok((bytes, id))
-}
-
-/// Why one `chat-asset:<N>` marker could not be expanded into a capability input.
+/// A permanent gateway refusal before broker submission.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ChatAssetRefusal {
-    /// Previously retained bytes were reclaimed; no transport refetch is allowed.
+    /// Descriptor storage refusal, preserving its actionable category.
+    #[error("{0}")]
+    Storage(BlobError),
     #[error("the asset was released; ask the user to resend it or select another asset")]
     Reclaimed,
-    /// The original audience or generation no longer authorizes this reference.
     #[error("the asset is unavailable in this conversation generation")]
     Unauthorized,
-    /// No attachment in this conversation carries that number.
     #[error("the conversation has no attachment with that number")]
     UnknownAsset,
-    /// The attachment is not an image, which is all a capability input may carry.
-    #[error("only image attachments may be passed to a capability")]
+    #[error("the attachment is not readable by this consumer")]
     UnsupportedMedia,
-    /// This invocation already expanded [`MAX_CHAT_ASSET_INPUTS`] markers.
-    #[error("one invocation may expand at most {MAX_CHAT_ASSET_INPUTS} chat attachments")]
+    #[error("one invocation may reference at most five distinct assets")]
     PerInvocationLimit,
-    /// This session already expanded [`MAX_CHAT_ASSET_EXPANSIONS_PER_SESSION`] markers.
-    #[error(
-        "one session may expand at most {MAX_CHAT_ASSET_EXPANSIONS_PER_SESSION} chat attachments"
-    )]
-    SessionLimit,
-    /// The expansions together would exceed [`MAX_CHAT_ASSET_INPUT_BYTES`].
-    #[error("the expanded attachments exceeded the per-invocation byte budget")]
+    #[error("the assets exceed the 40 MiB per-invocation decoded-byte budget")]
     ByteBudget,
-    /// The gateway could not read the attachment's bytes at all.
     #[error("the attachment's bytes could not be read")]
     Unavailable,
+    #[error("data URLs are refused; use chat-asset:<N> instead")]
+    DataUrl,
 }
-
 impl ChatAssetRefusal {
-    /// Stable low-cardinality audit reason.
-    #[must_use]
+    /// Stable audit reason.
     pub const fn reason(&self) -> &'static str {
         match self {
+            Self::Storage(_) => "storage",
             Self::Reclaimed => "reclaimed",
             Self::Unauthorized => "unauthorized",
             Self::UnknownAsset => "unknown-asset",
             Self::UnsupportedMedia => "unsupported-media",
             Self::PerInvocationLimit => "per-invocation-limit",
-            Self::SessionLimit => "session-limit",
             Self::ByteBudget => "byte-budget",
             Self::Unavailable => "unavailable",
+            Self::DataUrl => "data-url",
         }
     }
-
-    /// The fixed gateway-authored clause the model reads instead of a proposal.
-    ///
-    /// Deliberately a clause rather than a whole sentence: the caller prefixes it with who refused,
-    /// so these do not repeat the attribution. A reader has to be able to tell this apart from a
-    /// broker policy denial, which the interpreter reports at the same exit status.
-    #[must_use]
-    pub const fn note(&self) -> &'static str {
-        match self {
-            Self::Reclaimed => {
-                "the requested asset was released from disk retention; ask the user to resend it or choose another asset. No call was submitted and no original image was substituted"
-            }
-            Self::Unauthorized => "that reference is not available in this conversation generation",
-            Self::UnknownAsset => {
-                "no chat attachment in this conversation carries that number, and the reference \
-                 lines above name the ones there are"
-            }
-            Self::UnsupportedMedia => "only image attachments may be passed to a capability",
-            Self::PerInvocationLimit => {
-                "at most three chat attachments may be passed to one call, so split the work"
-            }
-            Self::SessionLimit => {
-                "this session has already passed its limit of twelve chat attachments to \
-                 capabilities, so answer with what you have"
-            }
-            Self::ByteBudget => {
-                "the chat attachments named in this call are together too large for one call"
-            }
-            Self::Unavailable => "that chat attachment's bytes could not be read",
-        }
+    /// Gateway-authored model explanation.
+    pub fn note(&self) -> String {
+        self.to_string()
     }
 }
-
-/// Where a session's broker leg gets one chat attachment's bytes for a capability input.
-///
-/// Separate from the model-facing attachment tool on purpose. That tool spends its own session
-/// budget on showing a *model* a file; this spends the per-invocation and per-session allowances in
-/// [`ChatAssetInputs`] on handing bytes to an authorized capability, and neither side may consume the
-/// other's. An embedder that supplies no source expands no marker, which is what leaves every
-/// other embedder exactly as capable as before.
+/// Scoped resolution for reference-only proposals.
 pub trait ChatAssetSource: Send + Sync {
-    /// Returns one attachment's IANA media type and bytes.
-    ///
-    /// Named apart from the model-facing attachment tool's own `fetch` because an implementor is
-    /// usually the same type serving both, and two methods called `fetch` on one reader would make
-    /// every call site ambiguous about which budget it is spending.
-    ///
+    /// Pins a reference after checking its conversation/generation audience.
     /// # Errors
-    ///
-    /// Returns the stable reason the attachment cannot be handed to a capability.
+    /// Returns a permanent refusal without redownloading released assets.
     fn fetch_for_capability(&self, id: u64) -> Result<(String, DiskBlob), ChatAssetRefusal>;
+    /// The complete bounded table, including non-referenced rows, without touching recency.
+    fn rows(&self) -> Vec<AssetRow>;
 }
-
-/// One route's chat-asset input expansion: which capabilities opted in, and where bytes come from.
-///
-/// Owned rather than borrowed because a session's broker leg outlives every statement of the script
-/// that drives it, and the leg is what expands a marker.
+/// A session's descriptor resolver. Every matching proposal leaf is resolved.
 pub struct ChatAssetInputs {
     source: Arc<dyn ChatAssetSource>,
-    capabilities: Vec<String>,
-    /// Expansions this session has already made, across every invocation.
-    ///
-    /// Lives here rather than in [`ExpansionBudget`] because the leg holding it is the session: one
-    /// `ChatAssetInputs` serves every script a session runs, so this counter is the only place a
-    /// bound on the whole session can be enforced.
-    spent: Mutex<usize>,
+}
+impl ChatAssetInputs {
+    /// Binds a scoped source, never a capability allowlist.
+    pub fn new(source: Arc<dyn ChatAssetSource>) -> Self {
+        Self { source }
+    }
+    /// Collects descriptors in first-occurrence order and pins until the invocation completes.
+    /// # Errors
+    /// Refuses the entire proposal on any unavailable reference or exceeded bound.
+    pub fn prepare(
+        &self,
+        input: &Value,
+        sends_remaining: u8,
+    ) -> Result<(InvokeAssets, Vec<DiskBlob>), ChatAssetRefusal> {
+        let references = references(input)?;
+        let mut pins = Vec::with_capacity(references.len());
+        let mut descriptors = Vec::with_capacity(references.len());
+        for id in &references {
+            let (_, blob) = self.source.fetch_for_capability(*id)?;
+            descriptors.push(blob.descriptor().map_err(ChatAssetRefusal::Storage)?);
+            pins.push(blob);
+        }
+        // Fetch may populate the inventory's stored lengths; take the table after pinning.
+        let rows = self.source.rows();
+        let mut total = 0usize;
+        for (id, blob) in references.iter().zip(&pins) {
+            let row = rows
+                .iter()
+                .find(|row| row.id == *id)
+                .ok_or(ChatAssetRefusal::UnknownAsset)?;
+            let decoded = GeneratedImage::new(blob.clone(), row.content_type.clone(), row.encoding)
+                .decoded_len()
+                .map_err(ChatAssetRefusal::Storage)?;
+            total = input_total(total, decoded)?;
+        }
+        Ok((
+            InvokeAssets {
+                rows,
+                descriptors,
+                sends_remaining,
+            },
+            pins,
+        ))
+    }
+}
+fn input_total(total: usize, bytes: usize) -> Result<usize, ChatAssetRefusal> {
+    total
+        .checked_add(bytes)
+        .filter(|total| *total <= MAX_INVOCATION_ASSET_BYTES)
+        .ok_or(ChatAssetRefusal::ByteBudget)
 }
 
-impl ChatAssetInputs {
-    /// Binds a source to the capability identifiers this route lists.
-    ///
-    /// A capability absent from `capabilities` has its markers left untouched, which is deliberate:
-    /// an unexpanded marker is an ordinary string the provider then rejects as invalid input, and a
-    /// gateway must not decide on a provider's behalf that a string beginning `chat-asset:` was
-    /// meant as one.
-    #[must_use]
-    pub fn new(source: Arc<dyn ChatAssetSource>, capabilities: Vec<String>) -> Self {
-        Self {
-            source,
-            capabilities,
-            spent: Mutex::new(0),
-        }
-    }
-
-    /// Whether this route opted `capability` into marker expansion.
-    #[must_use]
-    pub fn covers(&self, capability: &str) -> bool {
-        self.capabilities.iter().any(|listed| listed == capability)
-    }
-
-    /// Claims one of this session's expansions.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ChatAssetRefusal::SessionLimit`] once the session has spent
-    /// [`MAX_CHAT_ASSET_EXPANSIONS_PER_SESSION`].
-    fn spend_session_allowance(&self) -> Result<(), ChatAssetRefusal> {
-        let mut spent = self
-            .spent
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if *spent >= MAX_CHAT_ASSET_EXPANSIONS_PER_SESSION {
-            return Err(ChatAssetRefusal::SessionLimit);
-        }
-        *spent += 1;
-        Ok(())
-    }
-
-    /// Expands every marker in one invocation's input, under this invocation's own budget.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first refusal. The input is then abandoned rather than half-expanded: a proposal
-    /// carrying one of three requested images is not the call the model asked for.
-    pub fn expand(&self, input: &mut Value) -> Result<usize, ChatAssetRefusal> {
-        self.expand_pinned(input).map(|(count, _pins)| count)
-    }
-
-    /// Expands all requested inputs atomically and returns request-local pins for submission.
-    ///
-    /// # Errors
-    /// Any unavailable member refuses the whole proposal; the original input is unchanged.
-    pub fn expand_pinned(
-        &self,
-        input: &mut Value,
-    ) -> Result<(usize, Vec<DiskBlob>), ChatAssetRefusal> {
-        let mut budget = ExpansionBudget::default();
-        let mut expanded = input.clone();
-        self.walk(&mut expanded, &mut budget)?;
-        *input = expanded;
-        Ok((budget.expanded, budget.pins))
-    }
-
-    fn walk(
-        &self,
-        input: &mut Value,
-        budget: &mut ExpansionBudget,
-    ) -> Result<(), ChatAssetRefusal> {
+/// Finds distinct references without cloning or changing a proposal.
+/// # Errors
+/// Data URLs and more than five distinct references refuse before any file is fetched.
+pub fn references(input: &Value) -> Result<Vec<u64>, ChatAssetRefusal> {
+    fn walk(input: &Value, ids: &mut Vec<u64>) -> Result<(), ChatAssetRefusal> {
         match input {
             Value::String(text) => {
-                if let Some(id) = chat_asset_marker(text) {
-                    *text = self.expanded(id, budget)?;
+                if text
+                    .trim_start()
+                    .get(..5)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+                {
+                    return Err(ChatAssetRefusal::DataUrl);
                 }
-                Ok(())
+                if let Some(id) = chat_asset_marker(text)
+                    && !ids.contains(&id)
+                {
+                    if ids.len() == MAX_DESCRIPTORS_PER_FRAME {
+                        return Err(ChatAssetRefusal::PerInvocationLimit);
+                    }
+                    ids.push(id);
+                }
             }
             Value::Array(items) => {
                 for item in items {
-                    self.walk(item, budget)?;
+                    walk(item, ids)?;
                 }
-                Ok(())
             }
             Value::Object(fields) => {
-                for (_name, value) in fields.iter_mut() {
-                    self.walk(value, budget)?;
+                for value in fields.values() {
+                    walk(value, ids)?;
                 }
-                Ok(())
             }
-            Value::Null | Value::Bool(_) | Value::Number(_) => Ok(()),
+            _ => (),
         }
+        Ok(())
     }
-
-    fn expanded(&self, id: u64, budget: &mut ExpansionBudget) -> Result<String, ChatAssetRefusal> {
-        if budget.expanded >= MAX_CHAT_ASSET_INPUTS {
-            return Err(ChatAssetRefusal::PerInvocationLimit);
-        }
-        // Spent immediately before the download rather than after a successful expansion: the cost
-        // this bounds is the transport fetch, which a later media or byte refusal does not undo.
-        self.spend_session_allowance()?;
-        let (mime, data) = self.source.fetch_for_capability(id)?;
-        if !mime.starts_with("image/") {
-            return Err(ChatAssetRefusal::UnsupportedMedia);
-        }
-        let spent = budget
-            .bytes
-            .checked_add(data.len())
-            .ok_or(ChatAssetRefusal::ByteBudget)?;
-        if spent > MAX_CHAT_ASSET_INPUT_BYTES {
-            return Err(ChatAssetRefusal::ByteBudget);
-        }
-        budget.bytes = spent;
-        budget.expanded += 1;
-        let encoded = STANDARD.encode(
-            data.read()
-                .map_err(|_error| ChatAssetRefusal::Unavailable)?,
-        );
-        budget.pins.push(data);
-        Ok(format!("data:{mime};base64,{encoded}"))
-    }
-}
-
-/// What one invocation has already spent expanding markers.
-#[derive(Default)]
-struct ExpansionBudget {
-    pins: Vec<DiskBlob>,
-    expanded: usize,
-    bytes: usize,
-}
-
-/// Reads `chat-asset:<N>` as the attachment number it names.
-///
-/// An exact match and nothing else. A leading zero, a surrounding sentence, a trailing space, or an
-/// empty number is an ordinary string: widening this would let a gateway rewrite text a person
-/// actually typed.
-fn chat_asset_marker(text: &str) -> Option<u64> {
-    let digits = text.strip_prefix("chat-asset:")?;
-    if digits.is_empty()
-        || digits.starts_with('0')
-        || !digits.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-    digits.parse().ok()
+    let mut ids = Vec::new();
+    walk(input, &mut ids)?;
+    Ok(ids)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use super::*;
 
-    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    #[test]
+    fn decoded_limit_matches_the_shared_contract() {
+        assert_eq!(
+            MAX_INVOCATION_ASSET_BYTES,
+            dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES
+        );
+    }
+
     use serde_json::json;
+    use std::{fs::File, os::unix::fs::FileExt};
 
-    use super::{
-        AttachmentRefusal, ChatAssetInputs, ChatAssetRefusal, DiskBlob, GeneratedImage,
-        MAX_ATTACHMENT_BYTES, MAX_CHAT_ASSET_EXPANSIONS_PER_SESSION, MAX_CHAT_ASSET_INPUT_BYTES,
-        ReplyAttachments, chat_asset_marker, strip_attachments,
-    };
-
-    fn png() -> Vec<u8> {
-        let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
-        bytes.extend_from_slice(b"bounded provider bytes");
-        bytes
+    struct Source {
+        blobs: Vec<DiskBlob>,
     }
-
-    #[test]
-    fn generated_image_debug_never_contains_bytes() {
-        let image = GeneratedImage::from_png(png()).expect("valid PNG fixture");
-        let debugged = format!("{image:?}");
-        assert!(debugged.contains("image/png"), "{debugged}");
-        assert!(debugged.contains("30"), "{debugged}");
-        assert!(!debugged.contains("bounded provider bytes"), "{debugged}");
-    }
-
-    #[test]
-    fn a_reply_attachment_is_named_for_its_position() {
-        let image = GeneratedImage::from_png(png()).expect("valid PNG fixture");
-        assert_eq!(image.filename(0), "generated-image.png");
-        assert_eq!(image.filename(1), "generated-image-2.png");
-    }
-
-    #[test]
-    fn oversized_and_non_png_bytes_are_refused_by_their_own_reasons() {
-        assert_eq!(
-            GeneratedImage::from_png(vec![0; MAX_ATTACHMENT_BYTES + 1]).expect_err("oversized"),
-            AttachmentRefusal::TooLarge
-        );
-        assert_eq!(
-            GeneratedImage::from_png(b"not a png".to_vec()).expect_err("not a PNG"),
-            AttachmentRefusal::UnsupportedMedia
-        );
-    }
-
-    /// The marker is matched exactly. Everything else is text a person may well have typed, and
-    /// rewriting it would be the gateway editing a message rather than expanding a reference.
-    #[test]
-    fn only_an_exact_marker_names_an_attachment() {
-        assert_eq!(chat_asset_marker("chat-asset:2"), Some(2));
-        assert_eq!(chat_asset_marker("chat-asset:12"), Some(12));
-        for text in [
-            "chat-asset:0",
-            "chat-asset:01",
-            "chat-asset:",
-            "chat-asset:1 ",
-            " chat-asset:1",
-            "see chat-asset:1",
-            "chat-asset:-1",
-            "chat-asset:1.0",
-            "chat-asset:one",
-        ] {
-            assert_eq!(chat_asset_marker(text), None, "{text}");
-        }
-    }
-
-    struct FixedAssets {
-        mime: &'static str,
-        bytes: usize,
-    }
-
-    impl super::ChatAssetSource for FixedAssets {
+    impl ChatAssetSource for Source {
         fn fetch_for_capability(&self, id: u64) -> Result<(String, DiskBlob), ChatAssetRefusal> {
-            if id > 8 {
-                return Err(ChatAssetRefusal::UnknownAsset);
-            }
-            Ok((
-                self.mime.to_owned(),
-                DiskBlob::from_bytes(&vec![b'x'; self.bytes]).expect("spool"),
-            ))
+            self.blobs
+                .get(id as usize - 1)
+                .cloned()
+                .map(|blob| ("application/octet-stream".to_owned(), blob))
+                .ok_or(ChatAssetRefusal::UnknownAsset)
+        }
+        fn rows(&self) -> Vec<AssetRow> {
+            self.blobs
+                .iter()
+                .enumerate()
+                .map(|(index, blob)| AssetRow {
+                    id: index as u64 + 1,
+                    content_type: "application/octet-stream".to_owned(),
+                    encoding: AssetEncoding::Identity,
+                    bytes: blob.len() as u64,
+                    origin: "chat".to_owned(),
+                    sent: false,
+                })
+                .collect()
         }
     }
-
     #[test]
-    fn every_marker_in_a_listed_capability_becomes_a_data_url() {
-        let source = FixedAssets {
-            mime: "image/png",
-            bytes: 3,
-        };
-        let inputs = ChatAssetInputs::new(Arc::new(source), vec!["gpt-image.edit".to_owned()]);
-        assert!(inputs.covers("gpt-image.edit"));
-        assert!(!inputs.covers("gpt-image.generate"));
-
-        let mut input = json!({
-            "prompt": "remix these",
-            "images": ["chat-asset:1", "chat-asset:2"],
-            "nested": {"reference": "chat-asset:3", "text": "chat-asset:0"}
-        });
-        assert_eq!(inputs.expand(&mut input).expect("three expansions"), 3);
-        assert_eq!(input["images"][0], "data:image/png;base64,eHh4");
-        assert_eq!(input["nested"]["reference"], "data:image/png;base64,eHh4");
-        assert_eq!(input["nested"]["text"], "chat-asset:0");
-        assert_eq!(input["prompt"], "remix these");
+    fn references_are_distinct_in_first_occurrence_order_and_never_expanded() {
+        let proposal = json!(["chat-asset:2", {"image":"chat-asset:1"}, "chat-asset:2"]);
+        assert_eq!(references(&proposal), Ok(vec![2, 1]));
+        let a = DiskBlob::from_bytes(b"first").unwrap();
+        let b = DiskBlob::from_descriptor(
+            DiskBlob::from_bytes(b"second")
+                .unwrap()
+                .descriptor()
+                .unwrap(),
+            6,
+        )
+        .unwrap();
+        let inputs = ChatAssetInputs::new(Arc::new(Source { blobs: vec![a, b] }));
+        for _ in 0..2 {
+            let (assets, pins) = inputs.prepare(&proposal, 3).unwrap();
+            assert_eq!(assets.rows.len(), 2);
+            assert_eq!(assets.sends_remaining, 3);
+            assert_eq!(pins.len(), 2);
+            for (fd, expected) in assets
+                .descriptors
+                .into_iter()
+                .zip([b"second".as_slice(), b"first".as_slice()])
+            {
+                let file = File::from(fd);
+                assert!(
+                    rustix::io::fcntl_getfd(&file)
+                        .unwrap()
+                        .contains(rustix::io::FdFlags::CLOEXEC)
+                );
+                assert_eq!(
+                    rustix::fs::fcntl_getfl(&file).unwrap() & rustix::fs::OFlags::ACCMODE,
+                    rustix::fs::OFlags::RDONLY
+                );
+                let mut bytes = vec![0; expected.len()];
+                file.read_exact_at(&mut bytes, 0).unwrap();
+                assert_eq!(bytes, expected);
+            }
+        }
+        assert_eq!(proposal[0], "chat-asset:2");
     }
-
     #[test]
-    fn each_budget_refuses_with_its_own_reason() {
-        let small = || FixedAssets {
-            mime: "image/png",
-            bytes: 3,
-        };
-        let listed = || vec!["gpt-image.edit".to_owned()];
-        let mut four = json!([
+    fn five_eight_mib_inputs_fit_and_a_sixth_reference_is_refused_before_fetch() {
+        let inputs = ChatAssetInputs::new(Arc::new(Source {
+            blobs: (0..5)
+                .map(|_| DiskBlob::from_bytes(&vec![0; MAX_ATTACHMENT_BYTES]).unwrap())
+                .collect(),
+        }));
+        let proposal = json!([
             "chat-asset:1",
             "chat-asset:2",
             "chat-asset:3",
-            "chat-asset:4"
+            "chat-asset:4",
+            "chat-asset:5"
         ]);
+        let (assets, pins) = inputs.prepare(&proposal, 4).unwrap();
+        assert_eq!(assets.descriptors.len(), 5);
         assert_eq!(
-            ChatAssetInputs::new(Arc::new(small()), listed())
-                .expand(&mut four)
-                .expect_err("a fourth expansion"),
-            ChatAssetRefusal::PerInvocationLimit
+            pins.iter().map(DiskBlob::len).sum::<usize>(),
+            MAX_INVOCATION_ASSET_BYTES
         );
-
-        let mut unknown = json!(["chat-asset:99"]);
         assert_eq!(
-            ChatAssetInputs::new(Arc::new(small()), listed())
-                .expand(&mut unknown)
-                .expect_err("no such attachment"),
-            ChatAssetRefusal::UnknownAsset
-        );
-
-        let document = FixedAssets {
-            mime: "application/pdf",
-            bytes: 3,
-        };
-        let mut pdf = json!(["chat-asset:1"]);
-        assert_eq!(
-            ChatAssetInputs::new(Arc::new(document), listed())
-                .expand(&mut pdf)
-                .expect_err("not an image"),
-            ChatAssetRefusal::UnsupportedMedia
-        );
-
-        let large = FixedAssets {
-            mime: "image/png",
-            bytes: MAX_CHAT_ASSET_INPUT_BYTES / 2 + 1,
-        };
-        let mut two = json!(["chat-asset:1", "chat-asset:2"]);
-        assert_eq!(
-            ChatAssetInputs::new(Arc::new(large), listed())
-                .expand(&mut two)
-                .expect_err("over the byte budget"),
-            ChatAssetRefusal::ByteBudget
+            references(&json!([
+                "chat-asset:1",
+                "chat-asset:2",
+                "chat-asset:3",
+                "chat-asset:4",
+                "chat-asset:5",
+                "chat-asset:6"
+            ])),
+            Err(ChatAssetRefusal::PerInvocationLimit)
         );
     }
-
-    /// Expansion happens before the broker decides, so the per-invocation bound alone would let a
-    /// script pull three attachments per proposal for as many proposals as its capability budget
-    /// allows — even if policy denied every one of them.
     #[test]
-    fn the_session_ceiling_holds_across_invocations() {
-        let inputs = ChatAssetInputs::new(
-            Arc::new(FixedAssets {
-                mime: "image/png",
-                bytes: 3,
-            }),
-            vec!["gpt-image.edit".to_owned()],
-        );
-
-        // Four full invocations spend the session's twelve.
-        for invocation in 0..4 {
-            let mut input = json!(["chat-asset:1", "chat-asset:2", "chat-asset:3"]);
-            assert_eq!(
-                inputs.expand(&mut input).expect("three expansions"),
-                3,
-                "invocation {invocation}"
-            );
+    fn proposal_data_urls_are_refused_in_every_nested_string_position() {
+        for input in [
+            json!("data:image/png;base64,UE5H"),
+            json!({"nested":["DATA:text/plain;base64,YQ=="]}),
+            json!([" data:image/jpeg;base64,YQ=="]),
+        ] {
+            assert_eq!(references(&input), Err(ChatAssetRefusal::DataUrl));
         }
-
-        let mut thirteenth = json!(["chat-asset:1"]);
+        assert!(ChatAssetRefusal::DataUrl.note().contains("chat-asset:<N>"));
+    }
+    #[test]
+    fn invocation_decoded_byte_budget_accepts_the_edge_and_refuses_one_past() {
         assert_eq!(
-            inputs
-                .expand(&mut thirteenth)
-                .expect_err("the session allowance is spent"),
-            ChatAssetRefusal::SessionLimit
+            input_total(MAX_INVOCATION_ASSET_BYTES - 1, 1),
+            Ok(MAX_INVOCATION_ASSET_BYTES)
         );
         assert_eq!(
-            thirteenth[0], "chat-asset:1",
-            "a refused invocation leaves its input unexpanded"
+            input_total(MAX_INVOCATION_ASSET_BYTES, 1),
+            Err(ChatAssetRefusal::ByteBudget)
+        );
+        assert_eq!(
+            input_total(usize::MAX, 1),
+            Err(ChatAssetRefusal::ByteBudget)
         );
     }
 
-    /// The fetch is what the session bound exists to limit, so a download refused for its media type
-    /// still counts: the bytes already came off the chat service.
     #[test]
-    fn a_refused_expansion_still_spends_the_session_allowance() {
-        let inputs = ChatAssetInputs::new(
-            Arc::new(FixedAssets {
-                mime: "application/pdf",
-                bytes: 3,
-            }),
-            vec!["gpt-image.edit".to_owned()],
-        );
-        for _ in 0..MAX_CHAT_ASSET_EXPANSIONS_PER_SESSION {
-            let mut input = json!(["chat-asset:1"]);
+    fn raw_and_base64_assets_have_the_same_delivery_bytes() {
+        use base64::Engine as _;
+        let raw = b"binary\0payload";
+        for (bytes, encoding) in [
+            (raw.to_vec(), AssetEncoding::Identity),
+            (STANDARD.encode(raw).into_bytes(), AssetEncoding::Base64),
+        ] {
+            let image = GeneratedImage::new(
+                DiskBlob::from_bytes(&bytes).unwrap(),
+                "application/octet-stream".to_owned(),
+                encoding,
+            );
             assert_eq!(
-                inputs.expand(&mut input).expect_err("not an image"),
-                ChatAssetRefusal::UnsupportedMedia
+                image.len(),
+                bytes.len(),
+                "retention still counts stored bytes"
             );
-        }
-        let mut input = json!(["chat-asset:1"]);
-        assert_eq!(
-            inputs
-                .expand(&mut input)
-                .expect_err("the allowance is spent"),
-            ChatAssetRefusal::SessionLimit
-        );
-    }
-
-    #[test]
-    fn a_stripped_result_carries_metadata_and_no_base64() {
-        let slot = ReplyAttachments::new(2);
-        let mut output = json!({
-            "attachments": [{"mediaType": "image/png", "base64": STANDARD.encode(png())}],
-            "image": {"generationId": "gen-1"}
-        });
-        let (accepted, refusals) = strip_attachments(&mut output, Some(&slot));
-        assert_eq!(accepted, vec![30], "the decoded size the caller reports");
-        assert!(refusals.is_empty());
-        assert_eq!(
-            output["attached"],
-            json!([{"mediaType": "image/png", "bytes": 30}])
-        );
-        assert!(output.get("attachments").is_none());
-        assert!(output.get("attachmentNote").is_none());
-        assert_eq!(output["image"]["generationId"], "gen-1");
-        let delivered = slot.take();
-        assert_eq!(delivered.len(), 1);
-        drop(slot);
-        assert_eq!(
-            delivered.into_iter().next().unwrap().into_bytes().unwrap(),
-            png()
-        );
-    }
-
-    #[test]
-    fn provider_success_followed_by_spool_failure_is_attachment_refusal_not_invocation_failure() {
-        const CHILD: &str = "DEKOPON_TEST_SPOOL_FAILURE";
-        if std::env::var_os(CHILD).is_none() {
-            // A separate process supplies an unusable TMPDIR without mutating concurrent tests'
-            // environment. No real disk exhaustion or permissions bypass is required.
-            let directory = tempfile::tempdir().expect("fixture");
-            let not_directory = directory.path().join("not-a-directory");
-            std::fs::write(&not_directory, b"not a directory").expect("fixture");
-            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
-                .args(["--exact", "attachment::tests::provider_success_followed_by_spool_failure_is_attachment_refusal_not_invocation_failure", "--nocapture"])
-                .env(CHILD, "1").env("TMPDIR", &not_directory).env("TMP", &not_directory).env("TEMP", &not_directory)
-                .output().expect("child test");
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            return;
-        }
-        let slot = ReplyAttachments::new(1);
-        let mut output = json!({"executed": true, "attachments": [{"mediaType": "image/png", "base64": STANDARD.encode(png())}]});
-        let (accepted, refused) = strip_attachments(&mut output, Some(&slot));
-        assert!(accepted.is_empty());
-        assert!(matches!(
-            refused.as_slice(),
-            [AttachmentRefusal::Storage(_)]
-        ));
-        assert_eq!(output["executed"], true);
-        assert!(output.get("attachments").is_none());
-        assert!(
-            output["attachmentNote"]
-                .as_str()
-                .unwrap()
-                .contains("capability executed")
-        );
-        assert!(slot.take().is_empty());
-    }
-
-    #[test]
-    fn a_session_without_a_slot_strips_and_refuses_as_route_disabled() {
-        let mut output = json!({"attachments": [{"mediaType": "image/png", "base64": "UE5H"}]});
-        assert_eq!(
-            strip_attachments(&mut output, None),
-            (Vec::new(), vec![AttachmentRefusal::RouteDisabled])
-        );
-        assert_eq!(output["attached"], json!([]));
-        assert_eq!(
-            output["attachmentNote"],
-            AttachmentRefusal::RouteDisabled.note()
-        );
-    }
-
-    #[test]
-    fn each_attachment_refusal_keeps_its_own_reason() {
-        let cases = [
-            (json!("not a list"), AttachmentRefusal::InvalidEncoding),
-            (
-                json!([{"mediaType": "image/png", "base64": "%%%"}]),
-                AttachmentRefusal::InvalidEncoding,
-            ),
-            (
-                json!([{"mediaType": "image/jpeg", "base64": "UE5H"}]),
-                AttachmentRefusal::UnsupportedMedia,
-            ),
-            (
-                json!([{"mediaType": "image/png", "base64": STANDARD.encode(b"not a png")}]),
-                AttachmentRefusal::UnsupportedMedia,
-            ),
-            (
-                json!([{"mediaType": "image/png", "base64": "A".repeat(MAX_ATTACHMENT_BYTES.div_ceil(3) * 4 + 1)}]),
-                AttachmentRefusal::TooLarge,
-            ),
-        ];
-        for (offered, expected) in cases {
-            let slot = ReplyAttachments::new(1);
-            let mut output = json!({"attachments": offered});
-            assert_eq!(
-                strip_attachments(&mut output, Some(&slot)),
-                (Vec::new(), vec![expected]),
-                "{expected:?}"
-            );
-            assert_eq!(output["attached"], json!([]), "{expected:?}");
-            assert_eq!(output["attachmentNote"], expected.note(), "{expected:?}");
+            assert_eq!(image.decoded_len().unwrap(), raw.len());
+            assert_eq!(image.bytes().unwrap(), raw);
+            assert!(!format!("{image:?}").contains("payload"));
         }
     }
-
-    /// The ceiling is the session's, not one result's: two results each offering one attachment to
-    /// a one-attachment route is exactly the case a per-result check would miss.
     #[test]
-    fn the_per_reply_ceiling_holds_across_results() {
-        let slot = ReplyAttachments::new(1);
-        let encoded = STANDARD.encode(png());
-        let mut first = json!({"attachments": [{"mediaType": "image/png", "base64": encoded}]});
-        assert_eq!(
-            strip_attachments(&mut first, Some(&slot)),
-            (vec![30], Vec::new())
-        );
-        let mut second = json!({"attachments": [{"mediaType": "image/png", "base64": encoded}]});
-        assert_eq!(
-            strip_attachments(&mut second, Some(&slot)),
-            (Vec::new(), vec![AttachmentRefusal::PerReplyLimit])
-        );
-        assert_eq!(second["attached"], json!([]));
-        assert_eq!(slot.take().len(), 1);
-    }
-
-    /// A result that is not an object, or carries no attachments, is handed on untouched.
-    #[test]
-    fn a_result_without_attachments_is_left_alone() {
-        let slot = ReplyAttachments::new(1);
-        for mut output in [json!({"ok": true}), json!("plain text"), json!([1, 2])] {
-            let before = output.clone();
-            assert_eq!(
-                strip_attachments(&mut output, Some(&slot)),
-                (Vec::new(), Vec::new())
+    fn decoded_upload_lengths_handle_padding_empty_and_short_invalid_storage() {
+        use base64::Engine as _;
+        for raw in [b"".as_slice(), b"a", b"ab", b"abc"] {
+            let image = GeneratedImage::new(
+                DiskBlob::from_bytes(STANDARD.encode(raw).as_bytes()).unwrap(),
+                "text/plain".to_owned(),
+                AssetEncoding::Base64,
             );
-            assert_eq!(output, before);
+            assert_eq!(image.decoded_len().unwrap(), raw.len());
+            assert_eq!(image.bytes().unwrap(), raw);
+        }
+        for invalid in [b"x".as_slice(), b"xx", b"xxx"] {
+            let image = GeneratedImage::new(
+                DiskBlob::from_bytes(invalid).unwrap(),
+                "text/plain".to_owned(),
+                AssetEncoding::Base64,
+            );
+            assert_eq!(
+                image.decoded_len(),
+                Err(BlobError::Io(std::io::ErrorKind::InvalidData))
+            );
         }
     }
 }

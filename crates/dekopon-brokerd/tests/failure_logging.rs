@@ -275,7 +275,7 @@ async fn framing_audit_and_unmapped_peer_failures_name_their_cause() {
         input: json!({"text": "hello through broker"}),
     };
     client
-        .invoke(None, request)
+        .invoke(None, request, Default::default())
         .await
         .expect_err("a terminal audit failure is not a successful invocation");
     // The connection's own verdict is observed the moment its task finishes, with the server still

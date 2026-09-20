@@ -13,7 +13,11 @@ keywords = ["agents", "capabilities", "security", "types"]
 categories = ["data-structures"]
 include = ["src/**", "README.md", "Cargo.toml"]
 
+[features]
+native = ["dep:base64"]
+
 [dependencies]
+base64 = { workspace = true, optional = true }
 serde.workspace = true
 thiserror.workspace = true
 

@@ -15,7 +15,9 @@ include = ["src/**", "wit/**", "README.md", "Cargo.toml"]
 
 [dependencies]
 dekopon-capability.workspace = true
-dekopon-core.workspace = true
+dekopon-core = { workspace = true, features = ["native"] }
+dekopon-broker-protocol.workspace = true
+rustix.workspace = true
 dekopon-http-host.workspace = true
 dekopon-provider-sdk = { workspace = true, features = ["host"] }
 dekopon-storage-host.workspace = true

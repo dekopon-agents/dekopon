@@ -8,6 +8,26 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Asset handles (next release)
+
+Remove route `providerAttachments` (including `maxPerReply`) and `chatAssetInputs`. Both now refuse
+at configuration load, even an explicitly supplied empty list or null. There is no silent migration:
+all exact proposal references resolve automatically to scoped read-only descriptors, while the broker
+still authorizes capability and HTTP effects. Delivery now requires explicit `asset.send`, with four
+new sends per turn. Grant it narrowly to the asset command provider, not every producer.
+
+Upgrade core/broker/gateway together, then install providers rebuilt for `dekopon:asset` and streamed
+HTTP. Old JSON result envelopes containing a top-level `attachments` array with a `base64` field
+in any entry are refused after execution; ordinary attachment metadata remains provider JSON.
+Old data-URL proposals are refused. Restart both daemons with the compatible provider set; references and queued sends are
+process-local and do not survive restart. Configure broker-owned disk assets separately from gateway
+scratch, sized for in-flight spools plus retained unlinked output files (chart default 320Mi).
+
+There is no implicit send on attach, no retry after failed delivery and no sent-flag reset within an
+asset generation. Telegram/WhatsApp adapters send PNG/JPEG; Slack/Discord/local accept concrete valid
+media types. Route instructions should advertise the types and plan conversion explicitly. Earlier
+version-specific route snippets below are historical and must not be copied into this version.
+
 ## Disk-backed chat assets (0.17.0)
 
 Upgrade the gateway's scratch storage alongside the binary. Chart 0.9.0 uses disk-backed
@@ -689,7 +709,7 @@ the ordinary unknown-tool path and ends the session.
 
 There is no replacement that keeps the old shape. A deployment that wants images needs a provider
 offering an image capability, a constraint set and Cedar statement for it in the broker, and the route
-opt-in above. [`dekopond.md`](dekopond.md#provider-attachments-and-chat-asset-inputs) has the
+opt-in above. [`dekopond.md`](dekopond.md#asset-handles-and-delivery) has the
 conventions and their bounds.
 
 ### 0.11.1 → 0.12.0 — optional public DRNs require a private map and second policy
@@ -963,7 +983,8 @@ update looks like a working deployment with no Working UI.
   configuration using `localhost` for a test override is a startup failure.
 - **A route naming an image generator on the text-only WhatsApp transport is a startup failure**
   rather than a paid-for PNG with no delivery path. (The `imageGenerator:` block itself was removed
-  after 0.12.0. Current WhatsApp routes support `providerAttachments` and bounded image editing;
+  after 0.12.0. Current WhatsApp routes support descriptor-backed PNG/JPEG delivery through authorized
+  `asset.send` and bounded image editing;
   see the [current transport contract](dekopond.md#meta-whatsapp-cloud-api).)
 - **Provider storage and durable chat memory are opt-in and all-or-nothing.** Adding the `storage`
   or `chatMemory` section to `broker.yaml` requires every field in it; omitting the section leaves

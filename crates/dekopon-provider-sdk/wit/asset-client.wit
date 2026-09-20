@@ -1,0 +1,6 @@
+package dekopon:provider@0.3.0;
+
+/// Guest binding world for conversation asset handles.
+world asset-client {
+    import dekopon:asset/asset@0.1.0;
+}

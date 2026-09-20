@@ -7,8 +7,23 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- Broker-host asset resources and exact-length streamed HTTP bodies move file bytes through
+  read-only descriptors instead of provider JSON. Optional broker `assets.rootPath` and
+  `assets.maxInFlightBytes` configure private ephemeral spools with fail-fast disk accounting;
+  asset mutation grants remain broker-authorized and failed invocations return no asset effects.
+
 ### Fixed
 
+- Asset limits count decoded bytes: eight MiB per asset and forty MiB per invocation, including
+  base64-backed files. Disk budgets still charge stored bytes, without changing wire metadata.
+- Charge every streamed asset occurrence, including response-handle replays, to the invocation's
+  shared decoded writer/upload budget before dispatch. Streamed method, URL, headers and literal
+  bytes count against the HTTP request grant; encoded asset bytes retain exact wire accounting.
+- Reclaim unpinned retained files when their asset-table rows are evicted, preserving queued
+  delivery pins and their disk accounting. Refuse retired `attachments[].base64` result envelopes
+  without rejecting ordinary attachment metadata.
 - Check the first Slack file download URL on the same rule as the redirect hop after it, at the one
   place the bot token is attached. A download URL arrives on the authenticated Socket Mode
   connection, so only Slack itself could name a foreign host; it is now parsed rather than
@@ -20,6 +35,15 @@ All notable changes to Dekopon are documented here. The format is based on
 
 - Reuse test-owned compiled Wasm providers across the broker memory authority-rotation
   test's sequential setups, preserving independent authority state and cold-path tests.
+
+- **Breaking (config):** refuse removed route `providerAttachments` and `chatAssetInputs` keys;
+  references resolve automatically, while delivery requires broker-authorized `asset.send`.
+- **Breaking (provider SDK):** asset-producing providers must return typed descriptor outputs through
+  `dekopon:asset`; retired result attachment objects and data-URL proposals are refused, with no shim.
+- **Breaking (behavior):** attach retains but never sends; four new sends per turn, persistent sent
+  flags, positional read-only file handles, and five/40 MiB invocation bounds replace expansion.
+  Output labels are authoritative with metadata-only mismatch logging; Telegram/WhatsApp deliver
+  PNG/JPEG, while file adapters accept concrete valid media types. Failed deliveries are not retried.
 
 - Cut the `input` attribute on `broker.authorize` and `provider.invoke` at 4096 bytes with the
   `…[truncated]` marker and an `input.bytes` sibling carrying the uncut length, the same bound the
@@ -65,6 +89,14 @@ All notable changes to Dekopon are documented here. The format is based on
   copying them for a retry, and build the local transport's answer line without intermediate
   copies of the base64 — one 8 MiB image left 42,008,399 bytes resident there. Disk leases still
   leave the async worker, and caption, ordering, size-refusal and retry behavior are unchanged.
+
+## [dekopon-chart-0.10.0] - 2026-09-20
+
+### Added
+
+- Provision broker-only disk-backed ephemeral asset storage and the corresponding ownership-init
+  volume mount. The gateway never mounts the broker asset directory; descriptor passing remains
+  the cross-process boundary.
 
 ## [0.17.0] - 2026-09-17
 

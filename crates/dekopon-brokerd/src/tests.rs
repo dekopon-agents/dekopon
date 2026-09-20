@@ -1693,3 +1693,66 @@ async fn ipc_group_socket_keeps_private_paths_private_and_replaces_only_safe_sta
     drop(listener);
     fs::remove_file(path).unwrap();
 }
+
+#[test]
+fn assets_config_is_optional_but_present_sections_require_both_keys_and_reject_unknowns() {
+    for document in [
+        json!({"rootPath": "assets"}),
+        json!({"maxInFlightBytes": 1}),
+        json!({"rootPath": "assets", "maxInFlightBytes": 1, "enabled": true}),
+    ] {
+        assert!(serde_json::from_value::<config::AssetsConfig>(document).is_err());
+    }
+    let parsed: config::AssetsConfig =
+        serde_json::from_value(json!({"rootPath": "assets", "maxInFlightBytes": 0})).unwrap();
+    assert_eq!(parsed.max_in_flight_bytes, 0);
+    assert_eq!(parsed.root_path, Path::new("assets"));
+}
+
+#[tokio::test]
+async fn assets_paths_are_resolved_and_refuse_overlap_in_both_directions() {
+    let uid = current_uid();
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("broker.yaml");
+    write_owner_only(
+        &directory.path().join("policies.cedar"),
+        POLICIES.as_bytes(),
+    );
+    write_owner_only(
+        &directory.path().join("cli-probe.wasm"),
+        b"component fixture",
+    );
+    let mut document = attested_document(uid);
+    document["assets"] = json!({"rootPath": "assets", "maxInFlightBytes": 100});
+    write_config(&path, &document);
+    let resolved = config::load(&path, uid).await.unwrap();
+    assert_eq!(
+        resolved.assets.unwrap().root_path,
+        directory.path().canonicalize().unwrap().join("assets")
+    );
+    for assets in [
+        ".",
+        "broker.sock/child",
+        "cli-probe.wasm/child",
+        "policies.cedar/child",
+    ] {
+        document["assets"]["rootPath"] = json!(assets);
+        write_config(&path, &document);
+        assert!(
+            matches!(
+                config::load(&path, uid).await,
+                Err(config::ConfigError::AssetsStateCollision
+                    | config::ConfigError::AssetsPath { .. })
+            ),
+            "{assets}"
+        );
+    }
+    document["assets"]["rootPath"] = json!("assets");
+    fs::create_dir(directory.path().join("assets")).unwrap();
+    document["socketPath"] = json!("assets/broker.sock");
+    write_config(&path, &document);
+    assert!(matches!(
+        config::load(&path, uid).await,
+        Err(config::ConfigError::AssetsStateCollision)
+    ));
+}
