@@ -580,9 +580,16 @@ impl bindings::dekopon::http::client::Host for StoreState {
         for part in request.body {
             body.push(match part {
                 wit::Part::Literal(bytes) => dekopon_http_host::Part::Literal(bytes),
-                wit::Part::Asset(part) => dekopon_http_host::Part::Asset(
-                    self.table.get(&part.handle)?.http_part(part.encoding),
-                ),
+                wit::Part::Asset(part) => {
+                    let part = self.table.get(&part.handle)?.http_part(part.encoding);
+                    if let Err(error) = self.assets.charge_stream(part.decoded_bytes) {
+                        return Ok(Err(wit::HttpError {
+                            code: wit::ErrorCode::RequestTooLarge,
+                            message: error.message,
+                        }));
+                    }
+                    dekopon_http_host::Part::Asset(part)
+                }
             });
         }
         let response = self

@@ -141,7 +141,9 @@ impl Handle {
 
     /// Reads at most 64 KiB of decoded bytes at a decoded offset, without moving the cursor.
     pub fn read_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize, AssetError> {
-        read_into(buffer, |len| self.0.read_at(offset, len).map_err(Into::into))
+        read_into(buffer, |len| {
+            self.0.read_at(offset, len).map_err(Into::into)
+        })
     }
 
     /// Reads the remaining decoded bytes, reserving the stored length when known.
@@ -212,7 +214,7 @@ fn read_all_with(
     mut read: impl FnMut(u32) -> Result<Vec<u8>, AssetError>,
 ) -> Result<Vec<u8>, AssetError> {
     let mut bytes = match stored_bytes {
-        Some(len) => Vec::with_capacity(usize::try_from(len).map_err(|_| AssetError {
+        Some(len) => Vec::with_capacity(usize::try_from(len).map_err(|_overflow| AssetError {
             code: AssetErrorCode::TooLarge,
             message: "asset length does not fit guest memory".into(),
         })?),

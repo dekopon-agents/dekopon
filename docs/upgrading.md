@@ -17,8 +17,9 @@ still authorizes capability and HTTP effects. Delivery now requires explicit `as
 new sends per turn. Grant it narrowly to the asset command provider, not every producer.
 
 Upgrade core/broker/gateway together, then install providers rebuilt for `dekopon:asset` and streamed
-HTTP. Old JSON result envelopes are refused by provider capability name; old data-URL proposals are
-refused. Restart both daemons with the compatible provider set; references and queued sends are
+HTTP. Old JSON result envelopes containing a top-level `attachments` array with a `base64` field
+in any entry are refused after execution; ordinary attachment metadata remains provider JSON.
+Old data-URL proposals are refused. Restart both daemons with the compatible provider set; references and queued sends are
 process-local and do not survive restart. Configure broker-owned disk assets separately from gateway
 scratch, sized for in-flight spools plus retained unlinked output files (chart default 320Mi).
 

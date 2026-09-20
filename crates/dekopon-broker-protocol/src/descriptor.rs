@@ -18,6 +18,9 @@ use tokio::{
 
 use crate::{FrameLimits, MAX_DESCRIPTORS_PER_FRAME, ProtocolError, read_frame, write_frame};
 
+// rustix panics on truncated cmsg data on macOS, so this buffer exceeds either kernel's single-message limit rather than the five-descriptor wire cap.
+const MAX_KERNEL_DESCRIPTORS_PER_MESSAGE: usize = 512;
+
 /// Owned broker socket. Every read, including the frame prefix, receives ancillary data.
 /// Typed callers reject descriptors on operations other than Invoke/Invocation.
 pub struct DescriptorStream {
@@ -25,6 +28,8 @@ pub struct DescriptorStream {
     received: Vec<OwnedFd>,
     sending: Vec<OwnedFd>,
     receive_error: Option<ProtocolError>,
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) descriptor_limit: usize,
 }
 
 impl DescriptorStream {
@@ -35,6 +40,8 @@ impl DescriptorStream {
             received: Vec::new(),
             sending: Vec::new(),
             receive_error: None,
+            #[cfg(all(test, target_os = "linux"))]
+            descriptor_limit: MAX_DESCRIPTORS_PER_FRAME,
         }
     }
 
@@ -78,16 +85,21 @@ impl DescriptorStream {
     }
 
     fn receive(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        let mut space =
-            [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(MAX_DESCRIPTORS_PER_FRAME))];
+        let mut space = [MaybeUninit::uninit();
+            rustix::cmsg_space!(ScmRights(MAX_KERNEL_DESCRIPTORS_PER_MESSAGE))];
         let mut ancillary = RecvAncillaryBuffer::new(&mut space);
         #[cfg(target_os = "linux")]
         let flags = RecvFlags::CMSG_CLOEXEC;
         #[cfg(not(target_os = "linux"))]
         let flags = RecvFlags::empty();
         let message = self.stream.try_io(Interest::READABLE, || {
-            recvmsg(&self.stream, &mut [IoSliceMut::new(bytes)], &mut ancillary, flags)
-                .map_err(io::Error::from)
+            recvmsg(
+                &self.stream,
+                &mut [IoSliceMut::new(bytes)],
+                &mut ancillary,
+                flags,
+            )
+            .map_err(io::Error::from)
         })?;
         let mut descriptors = Vec::new();
         for message in ancillary.drain() {
@@ -105,9 +117,14 @@ impl DescriptorStream {
                 return Err(io::Error::other("could not secure received descriptor"));
             }
         }
+        #[cfg(all(test, target_os = "linux"))]
+        let descriptor_limit = self.descriptor_limit;
+        #[cfg(not(all(test, target_os = "linux")))]
+        let descriptor_limit = MAX_DESCRIPTORS_PER_FRAME;
+        // Unreachable with the kernel-sized buffer; retained as untested defence in depth.
         let error = if message.flags.contains(ReturnFlags::CTRUNC) {
             Some(ProtocolError::DescriptorsTruncated)
-        } else if self.received.len() + descriptors.len() > MAX_DESCRIPTORS_PER_FRAME {
+        } else if self.received.len() + descriptors.len() > descriptor_limit {
             Some(ProtocolError::TooManyDescriptors)
         } else {
             None

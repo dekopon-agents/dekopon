@@ -1622,7 +1622,10 @@ fn every_verb_is_one_operation_whatever_attestation_accompanies_it() {
                 sample_trace_parent(),
             ),
         ),
-        ("invoke", RequestEnvelope::invoke(None, invocation(), vec![], 0)),
+        (
+            "invoke",
+            RequestEnvelope::invoke(None, invocation(), vec![], 0),
+        ),
         (
             "invoke",
             RequestEnvelope::invoke(
@@ -2290,8 +2293,13 @@ fn a_result_without_a_provider_detail_keeps_the_field_off_the_wire() {
         ..failed_with_detail()
     };
 
-    let document = serde_json::to_string(&ResponseEnvelope::invocation(result.clone(), vec![], vec![], vec![]))
-        .expect("the response serializes");
+    let document = serde_json::to_string(&ResponseEnvelope::invocation(
+        result.clone(),
+        vec![],
+        vec![],
+        vec![],
+    ))
+    .expect("the response serializes");
 
     assert!(!document.contains("detail"), "{document}");
     assert_eq!(

@@ -8,8 +8,8 @@ use rustix::net::{SendAncillaryBuffer, SendAncillaryMessage, SendFlags, sendmsg}
 use tokio::{io::Interest, net::UnixStream};
 
 use crate::{
-    AssetEncoding, AssetRow, DescriptorStream, FrameLimits, MAX_ASSET_ROWS, MAX_DESCRIPTORS_PER_FRAME,
-    NewAsset, ProtocolError, RequestEnvelope, ResponseEnvelope,
+    AssetEncoding, AssetRow, DescriptorStream, FrameLimits, MAX_ASSET_ROWS,
+    MAX_DESCRIPTORS_PER_FRAME, NewAsset, ProtocolError, RequestEnvelope, ResponseEnvelope,
     validate_response_descriptors,
 };
 
@@ -21,7 +21,7 @@ fn files(count: usize) -> Vec<std::fs::File> {
 
 async fn raw_frame(stream: &UnixStream, bytes: &[u8], files: &[std::fs::File]) {
     let descriptors: Vec<_> = files.iter().map(|file| file.as_fd()).collect();
-    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(16))];
+    let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(200))];
     loop {
         stream.writable().await.expect("writable fixture");
         let mut ancillary = SendAncillaryBuffer::new(&mut space);
@@ -84,17 +84,70 @@ async fn invoke_round_trips_five_close_on_exec_descriptors() {
     }
 }
 
+#[test]
+fn sixteen_descriptors_are_refused_and_every_one_is_closed() {
+    // Linux counts run alone so unrelated tests cannot change the process-wide total.
+    #[cfg(target_os = "linux")]
+    {
+        const CHILD: &str = "DEKOPON_SIXTEEN_DESCRIPTORS_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(
+                std::env::current_exe().expect("test executable"),
+            )
+            .args([
+                "--exact",
+                "tests::asset_descriptors::sixteen_descriptors_are_refused_and_every_one_is_closed",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .expect("isolated descriptor count test");
+            assert!(status.success());
+            return;
+        }
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime")
+        .block_on(async {
+            let (writer, reader) = UnixStream::pair().expect("socket pair");
+            let mut reader = DescriptorStream::new(reader);
+            let files = files(16);
+            #[cfg(target_os = "linux")]
+            let count = || {
+                std::fs::read_dir("/proc/self/fd")
+                    .expect("fd directory")
+                    .count()
+            };
+            #[cfg(target_os = "linux")]
+            let before = count();
+            raw_frame(&writer, &[0, 0, 0, 2, b'{', b'}'], &files).await;
+            assert!(matches!(
+                reader
+                    .read_frame::<serde_json::Value>(FrameLimits::default())
+                    .await,
+                Err(ProtocolError::TooManyDescriptors)
+            ));
+            #[cfg(target_os = "linux")]
+            assert_eq!(count(), before);
+            // Received raw descriptors are not exposed on refusal; macOS checks the error only.
+        });
+}
+
+#[cfg(target_os = "linux")]
 #[tokio::test]
-async fn truncated_control_data_refuses_the_frame() {
+async fn two_hundred_descriptors_arrive_untruncated_on_linux() {
     let (writer, reader) = UnixStream::pair().expect("socket pair");
     let mut reader = DescriptorStream::new(reader);
-    raw_frame(&writer, &[0, 0, 0, 2, b'{', b'}'], &files(16)).await;
-    assert!(matches!(
-        reader
-            .read_frame::<serde_json::Value>(FrameLimits::default())
-            .await,
-        Err(ProtocolError::DescriptorsTruncated)
-    ));
+    reader.descriptor_limit = 200;
+    let files = files(200);
+    raw_frame(&writer, &[0, 0, 0, 2, b'{', b'}'], &files).await;
+    let (value, received) = reader
+        .read_frame::<serde_json::Value>(FrameLimits::default())
+        .await
+        .expect("all descriptors arrive without CTRUNC");
+    assert_eq!(value, serde_json::json!({}));
+    assert_eq!(received.len(), 200);
 }
 
 #[tokio::test]
@@ -164,7 +217,8 @@ fn typed_rows_and_response_indexes_are_exact() {
         4,
     );
     request.request.validate().expect("row cap inclusive");
-    let request = RequestEnvelope::invoke(None, super::invocation(), vec![row; MAX_ASSET_ROWS + 1], 4);
+    let request =
+        RequestEnvelope::invoke(None, super::invocation(), vec![row; MAX_ASSET_ROWS + 1], 4);
     assert!(matches!(
         request.request.validate(),
         Err(ProtocolError::TooManyAssetRows)
@@ -201,7 +255,8 @@ fn typed_rows_and_response_indexes_are_exact() {
     ));
     let mut wrong = asset;
     wrong.descriptor = 1;
-    let response = ResponseEnvelope::invocation(super::failed_with_detail(), vec![wrong], vec![], vec![]);
+    let response =
+        ResponseEnvelope::invocation(super::failed_with_detail(), vec![wrong], vec![], vec![]);
     assert!(matches!(
         validate_response_descriptors(&response.response, 1),
         Err(ProtocolError::DescriptorIndex)
@@ -273,7 +328,7 @@ fn rejected_frames_close_every_received_descriptor() {
                 reader
                     .read_frame::<RequestEnvelope>(FrameLimits::default())
                     .await,
-                Err(ProtocolError::DescriptorsTruncated)
+                Err(ProtocolError::TooManyDescriptors)
             ));
             assert_eq!(count(), before);
             let response = ResponseEnvelope::capabilities(vec![], vec![]);

@@ -18,6 +18,12 @@ All notable changes to Dekopon are documented here. The format is based on
 
 - Asset limits count decoded bytes: eight MiB per asset and forty MiB per invocation, including
   base64-backed files. Disk budgets still charge stored bytes, without changing wire metadata.
+- Charge every streamed asset occurrence, including response-handle replays, to the invocation's
+  shared decoded writer/upload budget before dispatch. Streamed method, URL, headers and literal
+  bytes count against the HTTP request grant; encoded asset bytes retain exact wire accounting.
+- Reclaim unpinned retained files when their asset-table rows are evicted, preserving queued
+  delivery pins and their disk accounting. Refuse retired `attachments[].base64` result envelopes
+  without rejecting ordinary attachment metadata.
 - Check the first Slack file download URL on the same rule as the redirect hop after it, at the one
   place the bot token is attached. A download URL arrives on the authenticated Socket Mode
   connection, so only Slack itself could name a foreign host; it is now parsed rather than

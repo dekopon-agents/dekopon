@@ -77,6 +77,7 @@ pub struct StreamedResponse {
 #[derive(Clone, Copy)]
 pub(super) struct RequestLengths {
     pub literal: u64,
+    pub decoded_assets: u64,
     pub total: u64,
 }
 
@@ -101,28 +102,43 @@ impl StreamBody {
     fn new(parts: Vec<Part>) -> Result<(Self, RequestLengths), HttpError> {
         let mut lengths = RequestLengths {
             literal: 0,
+            decoded_assets: 0,
             total: 0,
         };
         for part in &parts {
-            let bytes =
-                match part {
-                    Part::Literal(bytes) => {
-                        lengths.literal = lengths
+            let bytes = match part {
+                Part::Literal(bytes) => {
+                    lengths.literal =
+                        lengths
                             .literal
                             .checked_add(bytes.len() as u64)
                             .ok_or_else(|| {
                                 http_error(ErrorCode::RequestTooLarge, "literal length overflow")
                             })?;
-                        bytes.len() as u64
-                    }
-                    Part::Asset(asset) => match asset.wire {
+                    bytes.len() as u64
+                }
+                Part::Asset(asset) => {
+                    lengths.decoded_assets = lengths
+                        .decoded_assets
+                        .checked_add(asset.decoded_bytes)
+                        .filter(|bytes| {
+                            *bytes <= dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES as u64
+                        })
+                        .ok_or_else(|| {
+                            http_error(
+                                ErrorCode::RequestTooLarge,
+                                "asset parts exceed the decoded invocation byte ceiling",
+                            )
+                        })?;
+                    match asset.wire {
                         Representation::Identity => asset.decoded_bytes,
                         Representation::Base64 => base64::encoded_len(asset.decoded_bytes)
                             .map_err(|_overflow| {
                                 http_error(ErrorCode::RequestTooLarge, "encoded length overflow")
                             })?,
-                    },
-                };
+                    }
+                }
+            };
             lengths.total = lengths
                 .total
                 .checked_add(bytes)
@@ -508,7 +524,13 @@ mod tests {
                 allowed_hosts: vec![authority.to_owned()],
                 allowed_methods: vec!["POST".to_owned()],
                 max_requests: 1,
-                max_request_bytes: 2,
+                max_request_bytes: crate::encoded_request_bytes(
+                    "POST",
+                    &format!("http://{authority}/"),
+                    0,
+                    2,
+                )
+                .unwrap(),
                 max_response_bytes: maximum,
                 allow_plaintext_loopback: true,
             },
@@ -611,6 +633,104 @@ mod tests {
         assert!(server.request_text().ends_with("12"));
         assert!(server.recorded().is_empty());
         server.join();
+    }
+
+    #[tokio::test]
+    async fn streamed_headers_accept_the_grant_edge_and_refuse_one_more_without_dispatch() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = AssetDirectory::new(root.path().to_owned(), 1);
+        let server = LoopbackServer::once(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+        let request = |value: &[u8]| StreamedRequest {
+            headers: vec![Header {
+                name: "x-note".to_owned(),
+                value: value.to_vec(),
+            }],
+            ..request(&server, vec![Part::Literal(b"12".to_vec())])
+        };
+        let client = || {
+            let mut client = client(server.authority(), 1024, None);
+            client.grant.as_mut().unwrap().max_request_bytes += ("x-note".len() + 1 + 4) as u64;
+            client
+        };
+        assert_eq!(
+            client()
+                .stream(request(b"aa"), &directory)
+                .await
+                .err()
+                .unwrap()
+                .code,
+            ErrorCode::RequestTooLarge
+        );
+        client().stream(request(b"a"), &directory).await.unwrap();
+        let wire = server.request_text();
+        assert!(wire.contains("x-note: a\r\n"));
+        assert!(wire.ends_with("12"));
+        assert!(server.recorded().is_empty());
+        server.join();
+    }
+
+    #[tokio::test]
+    async fn asset_limit_accepts_the_decoded_edge_and_refuses_one_more_without_dispatch() {
+        use dekopon_core::asset::{MAX_DECODED_ASSET_BYTES, MAX_DECODED_INVOCATION_BYTES};
+        let root = tempfile::tempdir().unwrap();
+        let input = tempfile::NamedTempFile::new().unwrap();
+        input
+            .as_file()
+            .set_len(MAX_DECODED_ASSET_BYTES as u64)
+            .unwrap();
+        for wire in [Representation::Identity, Representation::Base64] {
+            let part = |bytes| {
+                Part::Asset(FilePart {
+                    file: AssetReader::input(File::open(input.path()).unwrap(), Default::default()),
+                    stored: Representation::Identity,
+                    wire,
+                    decoded_bytes: bytes,
+                    id: Some(1),
+                    content_type: "application/octet-stream".to_owned(),
+                })
+            };
+            let body = || {
+                (0..5)
+                    .map(|_| part(MAX_DECODED_ASSET_BYTES as u64))
+                    .collect::<Vec<_>>()
+            };
+            let directory = AssetDirectory::new(root.path().to_owned(), 1);
+            let server =
+                LoopbackServer::once(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n");
+            let mut too_large = client(server.authority(), 1024, None);
+            let mut oversized = body();
+            oversized.push(part(1));
+            assert_eq!(
+                too_large
+                    .stream(request(&server, oversized), &directory)
+                    .await
+                    .err()
+                    .unwrap()
+                    .code,
+                ErrorCode::RequestTooLarge
+            );
+            let mut exact = client(server.authority(), 1024, None);
+            exact
+                .stream(request(&server, body()), &directory)
+                .await
+                .unwrap();
+            let received = server.request();
+            let start = received
+                .windows(4)
+                .position(|bytes| bytes == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            let expected = match wire {
+                Representation::Identity => MAX_DECODED_INVOCATION_BYTES,
+                Representation::Base64 => {
+                    5 * base64::encoded_len(MAX_DECODED_ASSET_BYTES as u64).unwrap() as usize
+                }
+            };
+            assert_eq!(content_length(&received[..start]), expected);
+            assert_eq!(received.len() - start, expected);
+            assert!(server.recorded().is_empty());
+            server.join();
+        }
     }
 
     #[tokio::test]

@@ -1038,8 +1038,13 @@ impl BrokerLeg {
                     InvocationOutcome::Succeeded => {
                         let mut output = result.output.unwrap_or(Value::Null);
                         if output
-                            .as_object()
-                            .is_some_and(|object| object.contains_key("attachments"))
+                            .get("attachments")
+                            .and_then(Value::as_array)
+                            .is_some_and(|attachments| {
+                                attachments
+                                    .iter()
+                                    .any(|attachment| attachment.get("base64").is_some())
+                            })
                         {
                             return CapabilityCallResult::Denied {
                                 reason: format!(
@@ -1857,6 +1862,49 @@ mod tests {
                 invoke(leg, CAPABILITY).await,
                 CapabilityCallResult::Denied {
                     reason: "policy-denied".to_owned()
+                }
+            );
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn ordinary_attachment_metadata_remains_successful_provider_json() {
+            for output in [
+                json!({"subject": "report", "attachments": [{"name": "a.pdf"}]}),
+                json!({"attachments": []}),
+                json!({"attachments": {"count": 1}}),
+            ] {
+                let directory = private_broker_directory();
+                let mut result = result(InvocationOutcome::Succeeded, None);
+                result.output = Some(output.clone());
+                let leg = stub_leg(
+                    directory.path(),
+                    vec![ResponseEnvelope::invocation(result, vec![], vec![], vec![])],
+                )
+                .await;
+                assert_eq!(
+                    invoke(leg, CAPABILITY).await,
+                    CapabilityCallResult::Succeeded(output)
+                );
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_retired_base64_attachment_envelope_is_refused_after_execution() {
+            let directory = private_broker_directory();
+            let mut result = result(InvocationOutcome::Succeeded, None);
+            result.output =
+                Some(json!({"attachments": [{"mediaType": "image/png", "base64": "cG5n"}]}));
+            let leg = stub_leg(
+                directory.path(),
+                vec![ResponseEnvelope::invocation(result, vec![], vec![], vec![])],
+            )
+            .await;
+            assert_eq!(
+                invoke(leg, CAPABILITY).await,
+                CapabilityCallResult::Denied {
+                    reason: format!(
+                        "{CAPABILITY} returned retired result attachments; migrate this provider to dekopon:asset; the capability already executed"
+                    ),
                 }
             );
         }

@@ -1214,12 +1214,12 @@ impl BufferedHttpClient {
                 "HTTP method is not authorized for this invocation",
             ));
         }
+        let bounded_body_bytes =
+            streamed.map_or(request.body.len() as u64, |lengths| lengths.literal);
         let minimum_request_bytes =
-            encoded_request_bytes(method.as_str(), &request.uri, 0, request.body.len() as u64)
+            encoded_request_bytes(method.as_str(), &request.uri, 0, bounded_body_bytes)
                 .ok_or_else(|| http_error(ErrorCode::RequestTooLarge, "request size overflowed"))?;
-        if streamed.map_or(minimum_request_bytes, |lengths| lengths.literal)
-            > grant.max_request_bytes
-        {
+        if minimum_request_bytes > grant.max_request_bytes {
             return Err(http_error(
                 ErrorCode::RequestTooLarge,
                 "request exceeds the authorized byte limit",
@@ -1344,10 +1344,10 @@ impl BufferedHttpClient {
             method.as_str(),
             url.as_str(),
             header_bytes,
-            request.body.len() as u64,
+            bounded_body_bytes,
         )
         .ok_or_else(|| http_error(ErrorCode::RequestTooLarge, "request size overflowed"))?;
-        if streamed.map_or(request_bytes, |lengths| lengths.literal) > grant.max_request_bytes {
+        if request_bytes > grant.max_request_bytes {
             return Err(http_error(
                 ErrorCode::RequestTooLarge,
                 "request exceeds the authorized byte limit",

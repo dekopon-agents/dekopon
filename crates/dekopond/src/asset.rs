@@ -380,7 +380,11 @@ impl AssetStore {
                         entry.assets.push(asset);
                     }
                     while entry.assets.len() > MAX_ASSETS_PER_CONVERSATION {
-                        entry.assets.remove(0);
+                        let evicted = entry.assets.remove(0);
+                        self.retention
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .evict(&(state_key.clone(), evicted.id));
                     }
                     Self::enforce_ceiling(&mut entries, self.conversations);
                 }
@@ -966,6 +970,15 @@ impl Retention {
         }
         Ok(())
     }
+    fn evict(&mut self, key: &RetentionKey) {
+        match self.remove(key) {
+            // Queued deliveries keep their pin and byte charge until later LRU reclamation.
+            Ok(()) | Err(BlobError::Reclaimed | BlobError::Capacity) => (),
+            Err(error) => {
+                tracing::warn!(asset.id = key.1, %error, "could not reclaim evicted asset")
+            }
+        }
+    }
     fn remove(&mut self, key: &RetentionKey) -> Result<(), BlobError> {
         if let Some(entry) = self.resident.get(key) {
             entry.data.reclaim()?;
@@ -1203,7 +1216,10 @@ impl dekopon_agent::attachment::GeneratedAssetStore for SessionAssets {
                 source: Some(AssetSourceRef::Generated { capability: capability.to_owned(), invocation: invocation.to_owned() }),
                 fetched: true, encoding: metadata.encoding, sent: false,
             });
-            while entry.assets.len() > MAX_ASSETS_PER_CONVERSATION { entry.assets.remove(0); }
+            while entry.assets.len() > MAX_ASSETS_PER_CONVERSATION {
+                let evicted = entry.assets.remove(0);
+                retention.evict(&(key.clone(), evicted.id));
+            }
             AssetStore::enforce_ceiling(&mut entries, self.store.conversations);
             if let Some(detected) = detected && detected != metadata.content_type {
                 let label: String = metadata.content_type.chars().filter(|c| !c.is_control()).take(128).collect();
@@ -1422,6 +1438,86 @@ mod retention_tests {
         assert_eq!(store.pin(&access, b, true), Err(BlobError::Reclaimed));
         assert!(store.pin(&access, c, false).unwrap().is_some());
         assert_eq!(store.retention.lock().unwrap().bytes, 6);
+    }
+
+    #[test]
+    fn chat_table_eviction_reclaims_unpinned_residency_but_preserves_delivery_pins() {
+        for pinned in [false, true] {
+            let store = store(1024);
+            let access = access("one");
+            let first = register(&store, &access);
+            let data = store.admit(&access, first, b"aaa").unwrap();
+            let pin = if pinned {
+                Some(data)
+            } else {
+                drop(data);
+                None
+            };
+            for _ in 1..MAX_ASSETS_PER_CONVERSATION {
+                register(&store, &access);
+            }
+            assert_eq!(
+                store.get_inventory(&access).len(),
+                MAX_ASSETS_PER_CONVERSATION
+            );
+            assert_eq!(store.retention.lock().unwrap().bytes, 3);
+            register(&store, &access);
+            assert_eq!(
+                store.get_inventory(&access).len(),
+                MAX_ASSETS_PER_CONVERSATION
+            );
+            assert!(store.get_access(&access, first, Instant::now()).is_none());
+            let retained = store.retention.lock().unwrap();
+            assert_eq!(retained.resident.len(), usize::from(pinned));
+            assert_eq!(retained.bytes, if pinned { 3 } else { 0 });
+            if let Some(pin) = pin {
+                assert_eq!(pin.read().unwrap(), b"aaa");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn generated_table_eviction_reclaims_unpinned_residency_but_preserves_delivery_pins() {
+        for pinned in [false, true] {
+            let store = store(1024);
+            let access = access("one");
+            let session = session(Arc::clone(&store), access.clone());
+            let mut first = None;
+            let mut pin = None;
+            for _ in 0..MAX_ASSETS_PER_CONVERSATION {
+                let (fd, metadata) = received(b"abc", "text/plain", AssetEncoding::Identity);
+                let id = session
+                    .register(fd, &metadata, "asset.attach", "invocation")
+                    .unwrap();
+                if first.is_none() {
+                    first = Some(id);
+                    if pinned {
+                        pin = store.pin(&access, id, false).unwrap();
+                    }
+                }
+            }
+            assert_eq!(
+                store.retention.lock().unwrap().resident.len(),
+                MAX_ASSETS_PER_CONVERSATION
+            );
+            let (fd, metadata) = received(b"abc", "text/plain", AssetEncoding::Identity);
+            session
+                .register(fd, &metadata, "asset.attach", "invocation")
+                .unwrap();
+            assert_eq!(session.rows().len(), MAX_ASSETS_PER_CONVERSATION);
+            assert!(
+                store
+                    .get_access(&access, first.unwrap(), Instant::now())
+                    .is_none()
+            );
+            let retained = store.retention.lock().unwrap();
+            let expected = MAX_ASSETS_PER_CONVERSATION + usize::from(pinned);
+            assert_eq!(retained.resident.len(), expected);
+            assert_eq!(retained.bytes, 3 * expected);
+            if let Some(pin) = pin {
+                assert_eq!(pin.read().unwrap(), b"abc");
+            }
+        }
     }
 
     #[test]

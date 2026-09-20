@@ -1840,8 +1840,9 @@ async fn real_guest_streams_one_and_five_eight_mib_assets_and_attaches_a_read_on
     ));
     let input = tempfile::NamedTempFile::new().unwrap();
     input.as_file().set_len(8 * 1024 * 1024).unwrap();
-    for count in [1, 5] {
-        let server = LoopbackServer::once(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndone");
+    // The full 40 MiB upload leaves no decoded budget for a response writer.
+    for (count, response) in [(1, "done"), (5, "")] {
+        let server = LoopbackServer::once(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes());
         let refs = (1..=count)
             .map(|id| format!("chat-asset:{id}"))
             .collect::<Vec<_>>();
@@ -1881,12 +1882,12 @@ async fn real_guest_streams_one_and_five_eight_mib_assets_and_attaches_a_read_on
         assert_eq!(output.output, json!({"status": 200}));
         assert_eq!(output.assets.attached.len(), 1);
         assert_eq!(output.assets.attached[0].descriptor, 0);
-        assert_eq!(output.assets.attached[0].bytes, 4);
+        assert_eq!(output.assets.attached[0].bytes, response.len() as u64);
         assert_eq!(output.assets.attached[0].content_type, "text/plain");
         let file = output.assets.files[0].file();
-        let mut bytes = [0; 4];
+        let mut bytes = vec![0; response.len()];
         file.read_exact_at(&mut bytes, 0).unwrap();
-        assert_eq!(&bytes, b"done");
+        assert_eq!(bytes, response.as_bytes());
         assert!(file.write_at(b"x", 0).is_err());
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
         let wire = server.request();

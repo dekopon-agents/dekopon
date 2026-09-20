@@ -98,6 +98,7 @@ dependencies = [
 name = "dekopon-provider-http"
 version = "0.17.0"
 dependencies = [
+ "dekopon-provider-sdk",
  "wit-bindgen",
 ]
 
@@ -110,6 +111,7 @@ dependencies = [
  "dekopon-core",
  "serde",
  "serde_json",
+ "wit-bindgen",
 ]
 
 [[package]]

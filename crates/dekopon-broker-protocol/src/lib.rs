@@ -1756,7 +1756,10 @@ impl BrokerClient {
 }
 
 #[cfg(unix)]
-fn validate_response_descriptors(response: &BrokerResponse, count: usize) -> Result<(), ProtocolError> {
+fn validate_response_descriptors(
+    response: &BrokerResponse,
+    count: usize,
+) -> Result<(), ProtocolError> {
     match response {
         BrokerResponse::Invocation { attached, .. } => {
             if attached.len() != count

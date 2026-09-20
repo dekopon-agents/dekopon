@@ -159,6 +159,7 @@ pub(crate) struct AssetState {
     rows: Vec<AssetRow>,
     inputs: Vec<(AssetId, AssetReader)>,
     sends_remaining: u8,
+    /// Decoded writer bytes and every streamed asset occurrence share the invocation budget.
     written: u64,
     outputs: AssetOutputs,
 }
@@ -196,6 +197,21 @@ impl AssetState {
     pub(crate) fn refuse<T>(&mut self, failure: wit::Error) -> Result<T, wit::Error> {
         self.reject(failure.code);
         Err(failure)
+    }
+
+    pub(crate) fn charge_stream(&mut self, decoded_bytes: u64) -> Result<(), wit::Error> {
+        let Some(total) = self
+            .written
+            .checked_add(decoded_bytes)
+            .filter(|bytes| *bytes <= MAX_INVOCATION_BYTES)
+        else {
+            return self.refuse(error(
+                wit::ErrorCode::TooLarge,
+                "streamed asset parts exceed the decoded invocation byte ceiling",
+            ));
+        };
+        self.written = total;
+        Ok(())
     }
 
     pub(crate) fn attempted(&self) -> bool {
@@ -1034,6 +1050,128 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(later.read(handle, 6).await.unwrap().unwrap(), b"abcdef");
+    }
+
+    #[tokio::test]
+    async fn streamed_assets_share_the_invocation_budget_and_response_replay_refuses_before_dispatch()
+     {
+        use crate::bindings::dekopon::http::client as http;
+        use http::Host as _;
+        let root = tempfile::tempdir().unwrap();
+        let input_file = tempfile::NamedTempFile::new().unwrap();
+        input_file.as_file().set_len(MAX_ASSET_BYTES).unwrap();
+        let mut state = state(
+            Some(AssetDirectory::new(root.path().to_owned(), 1024)),
+            AssetConstraints::default(),
+            input(
+                File::open(input_file.path()).unwrap(),
+                MAX_ASSET_BYTES,
+                false,
+            ),
+            vec![1],
+        )
+        .await;
+        let server = dekopon_test_support::LoopbackServer::serving(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: close\r\n\r\nx",
+            2,
+        );
+        state.http = HttpState::invoke(
+            Some(dekopon_capability::HttpConstraints {
+                allowed_hosts: vec![server.authority().to_owned()],
+                allowed_methods: vec!["POST".to_owned()],
+                max_requests: 3,
+                max_request_bytes: 1024,
+                max_response_bytes: 1024,
+                allow_plaintext_loopback: true,
+            }),
+            None,
+            None,
+            Default::default(),
+            Duration::from_secs(30),
+        )
+        .unwrap();
+        let handle = state
+            .open("chat-asset:1".to_owned())
+            .await
+            .unwrap()
+            .unwrap();
+        let request = |handle, count| http::StreamedRequest {
+            method: "POST".to_owned(),
+            uri: server.url(),
+            headers: vec![],
+            body: (0..count)
+                .map(|_| {
+                    http::Part::Asset(http::AssetPart {
+                        handle: Resource::new_borrow(handle),
+                        encoding: wit::Encoding::Base64,
+                    })
+                })
+                .collect(),
+        };
+        state
+            .stream(request(handle.rep(), 4))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(server.request());
+        let response = state
+            .stream(request(handle.rep(), 1))
+            .await
+            .unwrap()
+            .unwrap();
+        drop(server.request());
+        assert_eq!(state.assets.written, MAX_INVOCATION_BYTES);
+        let error = state
+            .stream(request(response.body.rep(), 1))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, http::ErrorCode::RequestTooLarge);
+        assert_eq!(state.assets.violation(), Some(wit::ErrorCode::TooLarge));
+        assert_eq!(state.assets.written, MAX_INVOCATION_BYTES);
+        assert_eq!(state.http.into_evidence().len(), 2);
+        assert!(server.recorded().is_empty());
+        server.join();
+    }
+
+    #[tokio::test]
+    async fn streamed_assets_and_writers_charge_the_same_decoded_counter() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(
+            Some(AssetDirectory::new(root.path().to_owned(), 1024)),
+            AssetConstraints::default(),
+            AssetInputs::default(),
+            vec![],
+        )
+        .await;
+        let writer = state
+            .allocate("text/plain".to_owned(), wit::Encoding::Identity)
+            .await
+            .unwrap()
+            .unwrap();
+        state
+            .assets
+            .charge_stream(MAX_INVOCATION_BYTES - 1)
+            .unwrap();
+        state
+            .write(Resource::new_borrow(writer.rep()), vec![b'x'])
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.assets.written, MAX_INVOCATION_BYTES);
+        assert_eq!(
+            state.assets.charge_stream(1).unwrap_err().code,
+            wit::ErrorCode::TooLarge
+        );
+        assert_eq!(
+            state
+                .write(Resource::new_borrow(writer.rep()), vec![b'x'])
+                .await
+                .unwrap()
+                .unwrap_err()
+                .code,
+            wit::ErrorCode::TooLarge
+        );
     }
 
     #[tokio::test]

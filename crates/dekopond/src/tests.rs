@@ -3424,7 +3424,7 @@ async fn no_model_message_in_a_session_carries_an_attachment_blob() {
 
 /// Old provider result envelopes are refused, never decoded.
 #[tokio::test(flavor = "multi_thread")]
-async fn an_old_provider_is_refused_by_name_without_decoding_its_result() {
+async fn a_retired_base64_result_envelope_is_refused_without_decoding() {
     let directory = temporary();
     let (broker, _observed) = stub_broker(
         directory.path(),
@@ -3432,7 +3432,10 @@ async fn an_old_provider_is_refused_by_name_without_decoding_its_result() {
             probe_listing(),
             upper_proposal("kitty"),
             ResponseEnvelope::invocation(
-                record_output(json!({"attachments": []})),
+                record_output(json!({"attachments": [{
+                    "mediaType": "image/png",
+                    "base64": STANDARD.encode(b"kitty pixels"),
+                }]})),
                 Vec::new(),
                 Vec::new(),
                 Vec::new(),

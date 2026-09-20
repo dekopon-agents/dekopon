@@ -885,6 +885,7 @@ dependencies = [
  "dekopon-capability",
  "dekopon-core",
  "dekopon-provider-sdk",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
@@ -1048,6 +1049,7 @@ dependencies = [
 name = "dekopon-provider-http"
 version = "0.17.0"
 dependencies = [
+ "dekopon-provider-sdk",
  "wit-bindgen 0.62.0",
 ]
 
@@ -1062,6 +1064,7 @@ dependencies = [
  "serde_json",
  "thiserror",
  "wasmtime",
+ "wit-bindgen 0.62.0",
 ]
 
 [[package]]

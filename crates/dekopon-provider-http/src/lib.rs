@@ -455,7 +455,9 @@ fn is_field_value(value: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{HTTP_WIT, Header, HttpError, HttpErrorCode, Part, Request, StreamedRequest, method};
+    use super::{
+        HTTP_WIT, Header, HttpError, HttpErrorCode, Part, Request, StreamedRequest, method,
+    };
 
     #[test]
     fn streamed_builder_validates_and_preserves_part_and_header_order() {
