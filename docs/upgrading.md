@@ -8,7 +8,7 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
-## Asset handles (next release)
+## Asset handles (0.18.0)
 
 Remove route `providerAttachments` (including `maxPerReply`) and `chatAssetInputs`. Both now refuse
 at configuration load, even an explicitly supplied empty list or null. There is no silent migration:

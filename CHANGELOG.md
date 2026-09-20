@@ -7,6 +7,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-09-20
+
 ### Added
 
 - Broker-host asset resources and exact-length streamed HTTP bodies move file bytes through
@@ -91,6 +93,10 @@ All notable changes to Dekopon are documented here. The format is based on
   leave the async worker, and caption, ordering, size-refusal and retry behavior are unchanged.
 
 ## [dekopon-chart-0.10.0] - 2026-09-20
+
+### Changed
+
+- Default application version is now 0.18.0.
 
 ### Added
 

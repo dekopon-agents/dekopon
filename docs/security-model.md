@@ -155,7 +155,7 @@ OTLP trace and log fields carry prompts, model responses, command arguments and 
   during descriptor receipt (Linux uses atomic `MSG_CMSG_CLOEXEC`). Broker policy and HTTP grants still decide effects; descriptor
   access covers only references in this invocation, not the whole metadata table. No byte expansion
   or old route capability-name allowlist remains. Old route opt-ins are refused at configuration
-  load rather than silently ignored; see [upgrading](upgrading.md#asset-handles-next-release).
+  load rather than silently ignored; see [upgrading](upgrading.md#asset-handles-0180).
 - **Attachment does not authorize delivery.** Successful typed outputs join the gateway's bounded
   LRU without a copy; their declared labels are authoritative and decoded-prefix mismatches log only
   metadata. Only broker-approved sends enter a request-local reply queue, bounded to four new sends
