@@ -19,7 +19,7 @@ use thiserror::Error;
 
 pub use dekopon_model::asset::MAX_ATTACHMENT_BYTES;
 /// Decoded bytes referenced by one invocation, independently of JSON frame size.
-pub const MAX_INVOCATION_ASSET_BYTES: usize = 40 * 1024 * 1024;
+pub const MAX_INVOCATION_ASSET_BYTES: usize = dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES;
 
 /// One explicitly queued asset, pinned until the transport completes.
 pub struct GeneratedImage {
@@ -493,6 +493,15 @@ pub fn references(input: &Value) -> Result<Vec<u64>, ChatAssetRefusal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoded_limit_matches_the_shared_contract() {
+        assert_eq!(
+            MAX_INVOCATION_ASSET_BYTES,
+            dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES
+        );
+    }
+
     use serde_json::json;
     use std::{fs::File, os::unix::fs::FileExt};
 

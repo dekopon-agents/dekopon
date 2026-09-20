@@ -13,6 +13,8 @@
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 
+pub mod asset;
+
 /// Shared bounded native base64 plumbing; absent from guest builds.
 #[cfg(feature = "native")]
 pub mod base64;

@@ -23,8 +23,8 @@ use std::{
 };
 use wasmtime::component::Resource;
 
-const MAX_ASSET_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_INVOCATION_BYTES: u64 = 40 * 1024 * 1024;
+const MAX_ASSET_BYTES: u64 = dekopon_core::asset::MAX_DECODED_ASSET_BYTES as u64;
+const MAX_INVOCATION_BYTES: u64 = dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES as u64;
 
 /// A frame's descriptors or table do not satisfy the asset admission contract.
 #[derive(Debug, thiserror::Error)]
@@ -893,6 +893,19 @@ impl wit::Host for StoreState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoded_limits_match_the_shared_contract() {
+        assert_eq!(
+            MAX_ASSET_BYTES,
+            dekopon_core::asset::MAX_DECODED_ASSET_BYTES as u64
+        );
+        assert_eq!(
+            MAX_INVOCATION_BYTES,
+            dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES as u64
+        );
+    }
+
     use crate::{
         BrokerHostLimits, BrokerHostOptions, Runtime, clock::ClockState, http::HttpState,
         storage::StorageState,

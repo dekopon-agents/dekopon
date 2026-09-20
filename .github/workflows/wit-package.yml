@@ -43,7 +43,7 @@ concurrency:
 
 env:
   PROVIDER_WIT_PACKAGE: dekopon:provider@0.3.0
-  HTTP_WIT_PACKAGE: dekopon:http@1.0.0
+  HTTP_WIT_PACKAGE: dekopon:http@1.1.0
   STORAGE_WIT_PACKAGE: dekopon:storage@0.1.0
   CLOCK_WIT_PACKAGE: dekopon:clock@1.0.0
 
@@ -136,7 +136,7 @@ jobs:
             expected=''
             case "$provider" in
               clock-probe) expected='dekopon:clock/wall@1.0.0' ;;
-              http-probe) expected='dekopon:http/client@1.0.0' ;;
+              http-probe) expected=$'"dekopon:asset/asset@0.1.0"\n"dekopon:http/client@1.1.0"' ;;
               storage-probe) expected='dekopon:storage/durable-files@0.1.0' ;;
             esac
             imports="target/wit-package/provider-inspection/$provider.core-imports.txt"
@@ -204,8 +204,11 @@ jobs:
           do
             cmp wit/storage/storage.wit "$mirror"
           done
+          # The SDK-local asset-client world is not part of immutable provider@0.3.0.
+          mkdir -p "$RUNNER_TEMP/provider-publication"
+          cp crates/dekopon-provider-sdk/wit/provider.wit "$RUNNER_TEMP/provider-publication/provider.wit"
           wkg build \
-            --wit-dir crates/dekopon-provider-sdk/wit \
+            --wit-dir "$RUNNER_TEMP/provider-publication" \
             --output target/wit-package/dekopon-provider.wasm \
             --config wkg/config.toml \
             --cache "$RUNNER_TEMP/wkg-build-cache"
@@ -278,7 +281,7 @@ jobs:
             (.worlds[2].exports."run-command".function.result == "string")
           ' target/wit-package/dekopon-provider.json
 
-      - name: Verify buffered HTTP interface
+      - name: Verify buffered and streamed HTTP interfaces
         shell: bash
         run: |
           set -euo pipefail
@@ -286,43 +289,63 @@ jobs:
           wasm-tools validate "$package"
           wasm-tools component wit --json "$package" > target/wit-package/dekopon-http.json
           jq --exit-status --arg package "$HTTP_WIT_PACKAGE" '
-            (.packages | length == 1) and
-            (.packages[0].name == $package) and
-            (.packages[0].interfaces == {"client": 0}) and
-            (.packages[0].worlds == {}) and
-            (.interfaces | length == 1) and
-            (.interfaces[0].name == "client") and
-            ((.interfaces[0].functions | keys) == ["send"]) and
-            (.interfaces[0].functions.send.params == [
-              {"name": "request", "type": 3}
+            (.packages == [
+              {"name": "dekopon:asset@0.1.0", "interfaces": {"asset": 0}, "worlds": {}},
+              {"name": $package, "interfaces": {"client": 1}, "worlds": {}}
             ]) and
-            (.interfaces[0].functions.send.result == 7) and
-            (.types[0].kind == {"list": "u8"}) and
-            (.types[1].kind.record.fields == [
-              {"name": "name", "type": "string"},
-              {"name": "value", "type": 0}
+            (.interfaces | length == 2) and
+            (.interfaces[0].name == "asset") and
+            (.interfaces[1].name == "client") and
+            ((.interfaces[1].functions | keys) == ["send", "stream"]) and
+            (.interfaces[1].functions.send.params == [{"name": "request", "type": 12}]) and
+            (.interfaces[1].functions.send.result == 23) and
+            (.types[9].kind == {"list": "u8"}) and
+            (.types[10].kind.record.fields == [
+              {"name": "name", "type": "string"}, {"name": "value", "type": 9}
             ]) and
-            (.types[3].kind.record.fields | map({name, type}) == [
-              {"name": "method", "type": "string"},
-              {"name": "uri", "type": "string"},
-              {"name": "headers", "type": 2},
-              {"name": "body", "type": 0}
+            (.types[11].kind == {"list": 10}) and
+            (.types[12].kind.record.fields | map({name, type}) == [
+              {"name": "method", "type": "string"}, {"name": "uri", "type": "string"},
+              {"name": "headers", "type": 11}, {"name": "body", "type": 9}
             ]) and
-            (.types[4].kind.record.fields | map({name, type}) == [
+            (.types[13].kind.record.fields | map({name, type}) == [
               {"name": "status", "type": "u16"},
-              {"name": "headers", "type": 2},
-              {"name": "body", "type": 0}
+              {"name": "headers", "type": 11}, {"name": "body", "type": 9}
             ]) and
-            (.types[5].kind.enum.cases | map(.name) == [
+            (.types[14].kind.enum.cases | map(.name) == [
               "invalid-method", "invalid-uri", "invalid-header", "request-too-large",
               "denied", "host-call-limit", "dns", "connect", "tls", "timeout",
               "protocol", "response-too-large", "internal"
             ]) and
-            (.types[6].kind.record.fields == [
-              {"name": "code", "type": 5},
-              {"name": "message", "type": "string"}
+            (.types[15].kind.record.fields == [
+              {"name": "code", "type": 14}, {"name": "message", "type": "string"}
             ]) and
-            (.types[7].kind == {"result": {"ok": 4, "err": 6}}) and
+            (.types[23].kind == {"result": {"ok": 13, "err": 15}}) and
+            (.types[7].kind == {"type": 5}) and
+            (.types[5].kind == "resource") and
+            (.types[8].kind == {"type": 0}) and
+            (.types[0].kind.enum.cases | map(.name) == ["identity", "base64"]) and
+            (.types[16].kind == {"handle": {"borrow": 7}}) and
+            (.types[17].kind.record.fields | map({name, type}) == [
+              {"name": "handle", "type": 16}, {"name": "encoding", "type": 8}
+            ]) and
+            (.types[18].kind.variant.cases == [
+              {"name": "literal", "type": 9}, {"name": "asset", "type": 17}
+            ]) and
+            (.types[19].kind == {"list": 18}) and
+            (.types[20].kind.record.fields == [
+              {"name": "method", "type": "string"}, {"name": "uri", "type": "string"},
+              {"name": "headers", "type": 11}, {"name": "body", "type": 19}
+            ]) and
+            (.types[21].kind == {"handle": {"own": 7}}) and
+            (.types[22].kind.record.fields == [
+              {"name": "status", "type": "u16"},
+              {"name": "headers", "type": 11}, {"name": "body", "type": 21}
+            ]) and
+            (.interfaces[1].functions.stream.params == [{"name": "request", "type": 20}]) and
+            (.interfaces[1].functions.stream.result == 24) and
+            (.types[24].kind == {"result": {"ok": 22, "err": 15}}) and
+            (.types | length == 25) and
             (.worlds == [])
           ' target/wit-package/dekopon-http.json
 
@@ -500,7 +523,31 @@ jobs:
             wasm-tools component wit --json "$component" > "$description"
             # Both answer a command word (`httpprobe`, `placeholder`) through `run-command`.
             exports='["describe", "invoke", "run-command"]'
-            jq --exit-status --argjson exports "$exports" '
+            if [ "$name" = http-probe ]; then
+              jq --exit-status --argjson exports "$exports" '
+                (.packages == [
+                  {"name": "dekopon:asset@0.1.0", "interfaces": {"asset": 0}, "worlds": {}},
+                  {"name": "dekopon:http@1.1.0", "interfaces": {"client": 1}, "worlds": {}},
+                  {"name": "root:component", "interfaces": {}, "worlds": {"root": 0}}
+                ]) and
+                (.worlds | length == 1) and
+                (.worlds[0].name == "root") and
+                (.worlds[0].imports == {
+                  "interface-0": {"interface": {"id": 0}},
+                  "interface-1": {"interface": {"id": 1}}
+                }) and
+                ((.worlds[0].exports | keys) == $exports) and
+                (.interfaces | length == 2) and
+                (.interfaces[0].name == "asset") and
+                ((.interfaces[0].functions | keys) == [
+                  "[method]handle.read", "[method]writer.write", "allocate", "attach", "open", "send"
+                ]) and
+                (.interfaces[1].name == "client") and
+                ((.interfaces[1].functions | keys) == ["send", "stream"])
+              ' "$description"
+            else
+              # The unchanged standalone JSONPlaceholder release remains HTTP@1.0.0 coverage.
+              jq --exit-status --argjson exports "$exports" '
               (.packages | map(.name) == ["dekopon:http@1.0.0", "root:component"]) and
               (.worlds | length == 1) and
               (.worlds[0].name == "root") and
@@ -509,7 +556,8 @@ jobs:
               (.interfaces | length == 1) and
               (.interfaces[0].name == "client") and
               ((.interfaces[0].functions | keys) == ["send"])
-            ' "$description"
+              ' "$description"
+            fi
           done
 
       - name: Verify the clock-importing provider fixture

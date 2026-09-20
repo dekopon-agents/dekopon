@@ -13,7 +13,7 @@ use tempfile::{NamedTempFile, TempDir};
 use thiserror::Error;
 
 /// Decoded per-attachment ceiling shared by inbound assets and provider results.
-pub const MAX_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_ATTACHMENT_BYTES: usize = dekopon_core::asset::MAX_DECODED_ASSET_BYTES;
 /// Largest stored representation: padded base64 of an eight-MiB decoded asset.
 pub const MAX_STORED_ATTACHMENT_BYTES: usize = MAX_ATTACHMENT_BYTES.div_ceil(3) * 4;
 
@@ -416,6 +416,14 @@ fn operation<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decoded_limit_matches_the_shared_contract() {
+        assert_eq!(
+            MAX_ATTACHMENT_BYTES,
+            dekopon_core::asset::MAX_DECODED_ASSET_BYTES
+        );
+    }
 
     #[test]
     fn pathless_descriptors_are_reusable_and_positional_across_invocations() {

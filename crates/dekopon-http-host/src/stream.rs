@@ -20,7 +20,7 @@ use tokio::time::timeout;
 use tracing::Instrument as _;
 
 /// Maximum bytes in one native asset I/O chunk.
-pub const CHUNK_BYTES: usize = 65_536;
+pub const CHUNK_BYTES: usize = dekopon_core::asset::MAX_ASSET_CHUNK_BYTES;
 const RAW_ENCODE_CHUNK: usize = CHUNK_BYTES / 4 * 3;
 
 /// Storage or HTTP-wire representation, independent of content type.
@@ -486,6 +486,12 @@ impl BufferedHttpClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_limit_matches_the_shared_contract() {
+        assert_eq!(CHUNK_BYTES, dekopon_core::asset::MAX_ASSET_CHUNK_BYTES);
+    }
+
     use crate::{BoundCredential, HttpHostCeilings};
     use dekopon_capability::HttpConstraints;
     use dekopon_core::Redacted;

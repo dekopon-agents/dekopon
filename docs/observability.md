@@ -422,8 +422,9 @@ over decoded bytes; the first WIT read of an opened input records its full decod
 bounded positional I/O, once per handle. HTTP retains its inline digest of transmitted bytes.
 Direct WIT writer calls record guest-list length and copied-byte count: oversized lists are
 rejected before a payload copy. These are payload-copy bounds, not process RSS measurements.
-Content-type labels remain authoritative; the single intake sniff/disagreement record is a
-committed gateway integration requirement, not implemented by the broker. Native `asset.encode` and `asset.decode` spans carry `bytes` and
+**Current:** content-type labels remain authoritative; gateway intake compares a bounded decoded
+prefix and emits the existing `gateway.asset.content_type_mismatch` event once on disagreement, with metadata
+only (see [asset handles](dekopond.md#asset-handles-and-delivery)). The broker does not sniff labels. Native `asset.encode` and `asset.decode` spans carry `bytes` and
 `duration_us`. Streamed HTTP uses the same `http.request` span and `accounting.http.request`
 record as buffered HTTP, including refused attempts; its request byte count is the exact total
 body length, while its request grant bounds literal parts only. An `asset.send` capability uses

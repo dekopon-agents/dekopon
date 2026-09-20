@@ -16,7 +16,7 @@ pub mod bindings {
 use bindings::dekopon::asset::asset as wit;
 pub use wit::{Encoding, Info};
 
-const CHUNK_BYTES: usize = 65536;
+const CHUNK_BYTES: usize = dekopon_core::asset::MAX_ASSET_CHUNK_BYTES;
 
 /// Stable failure classes returned by the broker asset host.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -240,6 +240,11 @@ fn write_all_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunk_limit_matches_the_shared_contract() {
+        assert_eq!(CHUNK_BYTES, dekopon_core::asset::MAX_ASSET_CHUNK_BYTES);
+    }
 
     #[test]
     fn error_codes_render_the_wit_names() {

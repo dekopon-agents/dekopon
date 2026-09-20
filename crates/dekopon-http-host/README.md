@@ -1,10 +1,10 @@
 # dekopon-http-host
 
-Statically linked native implementation behind Dekopon's buffered HTTP provider primitive.
+Statically linked native implementation behind Dekopon's buffered `send` and asset-backed `stream` HTTP provider primitives (`dekopon:http@1.1.0`).
 
 This crate is transport machinery for `dekopon-broker-host`, not a provider API and not an authorization engine. A `BufferedHttpClient` consumes one broker-produced `HttpConstraints` grant under independent `HttpHostCeilings`. Disabled contexts deny every call.
 
-The client accepts arbitrary HTTP method tokens and ordered byte-valued headers, while enforcing exact methods and destination authorities, call and byte limits, representable deadlines, bounded public-address DNS checks and pinning, HTTPS by default, loopback-only opt-in plaintext with an explicit port, no redirects, no ambient proxies, no automatic decompression, and sensitive/hop-by-hop header filtering. A separately authorized public DRN adds exact native sink/binding identity, canonical path/query and injection constraints; the host renders strict Basic/Bearer and its credential echo check refuses any response that carries the raw or encoded credential. Response bodies are streamed natively into a bounded buffer.
+The client accepts arbitrary HTTP method tokens and ordered byte-valued headers, while enforcing exact methods and destination authorities, call and byte limits, representable deadlines, bounded public-address DNS checks and pinning, HTTPS by default, loopback-only opt-in plaintext with an explicit port, no redirects, no ambient proxies, no automatic decompression, and sensitive/hop-by-hop header filtering. A separately authorized public DRN adds exact native sink/binding identity, canonical path/query and injection constraints; the host renders strict Basic/Bearer and its credential echo check refuses any response that carries the raw or encoded credential. Buffered `send` responses use a bounded buffer. `stream` sends literal/asset parts with exact Content-Length and spools responses to bounded disk-backed handles, scanning credentials before guest exposure; the request grant counts literal bytes, while asset admission has separate decoded limits. The broker continues linking buffered HTTP `@1.0.0` for older components.
 
 The address bound is a ceiling on the pin set rather than an admission test on the resolver answer: duplicates collapse first and the remainder is truncated, so a dual-stack round-robin destination stays reachable, and every retained address is validated and pinned. Within one execution context, resolution and the built client are reused while the pin set is unchanged—the cache key is the whole `(host, addresses)` pair, so a multi-call capability shares one connection without a client ever being reused for addresses it was not built to reach. Destination authorities use the URL grammar throughout, so an IPv6 literal is written bracketed (`[::1]:8080`).
 
@@ -18,7 +18,8 @@ The crate knows nothing about WIT, Wasmtime stores, provider manifests, authenti
 
 The buffered interface carries an absolute URI, method token, ordered duplicate-preserving
 headers and byte body; responses carry status, ordered headers and bounded bytes. It exposes
-no guest sockets, DNS, filesystem, environment, raw credential imports or streams.
+no guest sockets, DNS, arbitrary filesystem, environment or raw credential imports.
+The additive streaming interface consumes bounded asset handles, not guest paths or network sockets.
 Userinfo and URI fragments are refused. Header syntax/count/bytes, request body and complete
 encoded request size, remaining calls, exact authority/effective port and method are enforced.
 Authority-defining, hop-by-hop, proxy and broker-managed credential headers are not guest controlled.

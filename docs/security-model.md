@@ -150,7 +150,9 @@ OTLP trace and log fields carry prompts, model responses, command arguments and 
   automatically in its authenticated conversation generation; at most five read-only close-on-exec
   descriptors and assets totaling 40 MiB decoded cross per invocation. Paths never come from the model.
   Path-backed files are freshly opened read-only, pathless broker outputs are duplicated read-only,
-  and all readers use positional IO. Broker policy and HTTP grants still decide effects; descriptor
+  and all readers use positional IO. On macOS, received descriptors get `FD_CLOEXEC` immediately
+  via `fcntl`; the accepted non-atomic window relies on neither daemon spawning child processes
+  during descriptor receipt (Linux uses atomic `MSG_CMSG_CLOEXEC`). Broker policy and HTTP grants still decide effects; descriptor
   access covers only references in this invocation, not the whole metadata table. No byte expansion
   or old route capability-name allowlist remains. Old route opt-ins are refused at configuration
   load rather than silently ignored; see [upgrading](upgrading.md#asset-handles-next-release).
