@@ -283,7 +283,8 @@ The shared gateway collects **media-first** inputs after routing/address checks 
 session admission. WhatsApp `debounceMs` is the quiet interval (default **5000ms**), and
 `debounceMaxWaitMs` is the hard maximum from the first media receipt (default **15000ms**).
 Both are unsigned 32-bit millisecond durations (`0..=4294967295`). `debounceMs: 0` disables
-collection entirely and preserves immediate admission/busy behavior; the maximum is then unused.
+collection entirely; the maximum is then unused. Idle inputs use immediate admission, while
+photo-only receipts associated with a persistent WhatsApp run use the late-photo path below.
 When enabled, the maximum must be at least the quiet interval. Invalid types, negative/out-of-range
 integers, incompatible enabled combinations and unrepresentable timer deadlines are refused at
 configuration load. Accepted later photos, captions and standalone text extend that actor's quiet
@@ -311,7 +312,8 @@ envelope, visibly and with a traced cause; already collected members remain inta
 are never split. There is at most one collecting batch per compatible actor key and globally at
 most `sessions.maxConcurrent` batches, independently of execution permits.
 
-At quiet expiry or the hard deadline, whichever comes first, the batch attempts normal admission immediately. An active conversation or
+Except for the persistent WhatsApp late-photo path below, at quiet expiry or the hard deadline,
+whichever comes first, the batch attempts normal admission immediately. An active conversation or
 exhausted execution capacity produces a visible busy reply (also when `replyOnBusy` is false for
 ordinary messages) and disposes the batch. There is **no execution queue**, no waiting for an
 active session, no replay and no cancellation of paid effects. Late media starts a new bounded
@@ -320,7 +322,8 @@ nor native groups guarantee completion when members arrive after dispatch. Whats
 waits at most its configured maximum (15 seconds by default); Telegram waits its fixed 3 seconds.
 Normal inference and transport time remain additional, with no admission waiting.
 
-Fresh broker authorization and generation selection happen only after admission; collection does
+For ordinary requests, fresh broker authorization and generation selection happen only after
+admission; collection does
 not fetch assets, contact the model/provider or publish progress. One lead message owns progress,
 reply target and native delivery identity; other message IDs are not fabricated into an album ID.
 An authenticated stop removes only that actor's pending work and preserves the existing ownership
@@ -328,6 +331,49 @@ rules for active sessions. Shutdown discards pending batches without starting th
 receipt traces retain their input and terminal disposition; the lead-parented execution exports
 causal links to every constituent (see [observability](observability.md)). Asset leases, history
 scope, generation fences and on-demand fetch budgets are unchanged.
+
+### Late photos on persistent WhatsApp routes
+
+Photo-only receipts arriving during a run are associated with that exact run before debounce.
+At flush they open a fresh, chat-scoped broker capability listing, not another model session.
+The gateway requires the same authenticated sender, configured route/agent, complete conversation,
+reply audience, unchanged grant set and live conversation generation. A later normal request
+invalidates an older receipt's intake permission immediately on admission, before its broker
+listing, even if the conversation generation is unchanged. Existing references are not deleted.
+No provider call, asset download, automatic retry or regeneration happens during this intake.
+
+Accepted references join the existing bounded temporary asset inventory. A gateway-authored
+completion notice asks whether the user wants another version including additional photos;
+it does not assert which photos a provider used, that bytes were downloaded, or permanent storage.
+If debounce or authorization finishes after the completion snapshot, that batch receives a separate
+acknowledgment instead, never both notices. Only after successful transport acceptance, one bounded
+gateway follow-up context is saved for the next authorized prompt, so a reply such as “yes” includes
+the question being answered alongside retained asset references. Asset intake closes at admission;
+a previously admitted notice may still finish delivery during that request's authorization, until
+its prompt is seeded. Seeding or generation replacement fences further old notice context. Failed delivery records no such
+question. Failed requests get neutral failure wording. Expired
+references are not described as retained. Normal next requests see still-retained references.
+
+Captioned photos retain ordinary admission/busy handling. Text or a caption trying to join an
+already late-only batch is explicitly refused with instructions to send it after the current
+request completes; previously collected photos remain intact. Cancellation discards pending late
+input and suppresses added notices, but does not delete references already registered solely
+because of the stop. A flushed intake owns authenticated Stop handling from dispatch through its
+broker listing and acknowledgment, even after the original execution completes. One intake owns
+the stopped acknowledgment when no execution does; Stop does not become a model request. Intake
+completion and cancellation arbitrate atomically before registration is released; a completing
+intake cannot claim the stopped acknowledgment for another removed collection. Saturated intake
+also suppresses its refusal when its originating run has already stopped. An
+already transmitted transport operation cannot be rolled back. Shutdown still discards pending collection. One-shot routes and other
+transports keep their existing behavior.
+
+Registration uses the existing eight-reference inventory and lazy byte limits; zero
+`assetRetentionBytes` refuses late retention. Late authorization operations and recent completed-run
+intervals are each independently capped by `sessions.maxConcurrent`. The recent intervals cover
+signed receipts enqueued before completion but dispatched afterwards. Once an interval is evicted,
+a conservative receipt-time watermark refuses ambiguous old photos instead of treating missing
+history as permission to start paid work. Actual newer idle receipts keep normal behavior.
+These handles contain no image bytes, pin no image files, and confer no provider authority.
 
 ## Asset handles and delivery
 
@@ -1018,7 +1064,7 @@ Spans follow [`observability.md`](observability.md):
 | Span | Fields |
 |---|---|
 | `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`, `drop.reason`; the trace root |
-| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `busy`, `failed`, `cancelled`, `reply-failed`) |
+| `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `busy`, `failed`, `cancelled`, `reply-failed`, and the late-photo outcomes below) |
 | `gateway.session` | `agent`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
 
 A message's trace starts in the transport that received it, not at routing: `transport.receive` is opened before the payload is parsed, so Slack's envelope acknowledgment, WhatsApp's signature check and its 200, Telegram's `offset` advance, Discord's addressing decision, the local transport's line parse, and the routing decision itself are all inside it. `gateway.message` nests under it and closes it. `message.id` is the service's own identifier for the turn — a Slack `ts`, a Discord snowflake, a Telegram `message_id`, a WhatsApp `wamid`, the development transport's boot-scoped counter — and a receipt that routes nothing closes without one, which is the trace that answers why a message went unanswered. The sender and the text stay off it; they ride `gateway.message.received` below. A receipt the transport declines to route records `drop.reason` instead — one word for why, such as `self-authored`, `content-withheld`, or `duplicate` — so a message that produced no reply says so in its own trace.

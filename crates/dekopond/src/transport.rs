@@ -132,6 +132,8 @@ pub(crate) struct InboundMessage {
     pub native_group: Option<String>,
     /// Original receipt traces retained only for a collected input (at most eight).
     pub constituents: Vec<tracing::Span>,
+    /// Gateway-only association captured before media debounce, never supplied by a transport.
+    pub late_photos: Option<crate::session::LatePhotoReceipt>,
 }
 
 /// Opens the trace one inbound message rides, at the moment its transport received it.

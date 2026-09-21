@@ -1096,6 +1096,14 @@ reply execution; it is not duplicated across traces. Non-payload counts/outcomes
 membership while original text stays on its own input audit event. Delivery failures remain
 in that shared execution's trace. A single-message, uncollected input keeps its ordinary trace.
 
+Persistent WhatsApp late-photo intake has its own `gateway.message`, linked to its collected
+receipts as above, with no `gateway.session` or model/provider work. Its outcomes are `late-retained`
+(waiting for the running request's completion notice), `late-acknowledged` (separate acknowledgment),
+`late-reply-failed`, `late-refused`, `late-unauthorized`, `late-busy`, `late-history-unavailable`,
+or `stopped`. `gateway_late_photos_retained` records the bounded new `asset.ids`; a
+`gateway_late_photos_refused` record names the authorization, scope, generation or limit reason.
+Each constituent still receives its own terminal `gateway_input_disposition`.
+
 Gateway assets are recorded by reference, declared content type, stored byte count and SHA-256,
 never payload bytes. Gateway conversion uses the same `asset.encode` / `asset.decode` spans as
 native hosts (`bytes`, `duration_us`); `asset.spool` remains the positional scratch-read lifecycle.

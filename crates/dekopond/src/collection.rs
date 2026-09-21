@@ -108,6 +108,15 @@ impl Collector {
             .find(|batch| batch.route == route && compatible(&batch.members[0], &message))
         {
             message.receive_span.in_scope(|| record_received(&message));
+            if batch.members[0].late_photos.is_some() && !message.text.trim().is_empty() {
+                return Offered::Refused(message, "late-instructions");
+            }
+            if !crate::session::LatePhotoReceipt::same_batch(
+                batch.members[0].late_photos.as_ref(),
+                message.late_photos.as_ref(),
+            ) {
+                return Offered::Refused(message, "different-run");
+            }
             if batch.members[0].native_group != message.native_group {
                 return Offered::Refused(message, "incompatible-group");
             }
@@ -238,7 +247,8 @@ fn combined_text<'a>(members: impl Iterator<Item = &'a InboundMessage>) -> Strin
 
 impl Batch {
     fn assemble(mut self) -> InboundMessage {
-        let text = (self.members.len() > 1).then(|| combined_text(self.members.iter()));
+        let text = (self.members.len() > 1 && self.members[0].late_photos.is_none())
+            .then(|| combined_text(self.members.iter()));
         let receipts = self
             .members
             .iter()
@@ -328,6 +338,7 @@ mod tests {
             received_at: Instant::now(),
             native_group: None,
             constituents: Vec::new(),
+            late_photos: None,
         }
     }
     fn collector(millis: u64, capacity: usize) -> Collector {

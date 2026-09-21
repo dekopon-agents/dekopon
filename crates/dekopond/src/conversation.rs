@@ -114,6 +114,9 @@ struct Conversation {
 struct Slot {
     /// Globally non-reused token fencing leases and attachment state issued by this generation.
     generation: u64,
+    input_revision: u64,
+    seed_revision: u64,
+    gateway_notice: Option<&'static str>,
     /// Closed on every replacement/removal so stale sessions cannot publish or fetch assets.
     asset_fence: Arc<AssetFence>,
     /// Exact sorted capability identifiers reported by the fresh legs in this generation.
@@ -147,6 +150,38 @@ pub(crate) struct ConversationSeed<'a> {
     pub assets: AssetAccess,
     /// Generation-fenced append lease. Dropping it without committing stores no turn.
     pub lease: ConversationLease<'a>,
+    pub input: ConversationInput,
+    pub gateway_notice: Option<&'static str>,
+}
+
+/// Receipt association, invalid after any later normal request even in the same generation.
+#[derive(Clone)]
+pub(crate) struct ConversationInput {
+    key: ConversationKey,
+    generation: u64,
+    revision: u64,
+    seed_revision: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum LateAssetRefusal {
+    Missing,
+    StaleInput,
+    GrantChanged,
+    Expired,
+    InventoryUnavailable,
+}
+
+impl LateAssetRefusal {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "missing-generation",
+            Self::StaleInput => "stale-input",
+            Self::GrantChanged => "grant-changed",
+            Self::Expired => "expired",
+            Self::InventoryUnavailable => "inventory-unavailable",
+        }
+    }
 }
 
 /// One generation-fenced right to append a completed prompt turn.
@@ -324,6 +359,9 @@ impl ConversationStore {
                 key.clone(),
                 Slot {
                     generation,
+                    input_revision: 1,
+                    seed_revision: 1,
+                    gateway_notice: None,
                     asset_fence: Arc::clone(&asset_fence),
                     granted: granted.to_vec(),
                     pending: 1,
@@ -331,6 +369,13 @@ impl ConversationStore {
                 },
             );
             return ConversationSeed {
+                gateway_notice: None,
+                input: ConversationInput {
+                    key: key.clone(),
+                    generation,
+                    revision: 1,
+                    seed_revision: 1,
+                },
                 history: History::new(window.limits),
                 cache_key: cache_key::for_conversation(),
                 assets: AssetAccess::persistent(key.clone(), generation, asset_fence),
@@ -348,6 +393,14 @@ impl ConversationStore {
             .slots
             .get_mut(key)
             .expect("the conversation slot was checked above");
+        slot.input_revision = slot
+            .input_revision
+            .checked_add(1)
+            .expect("conversation input revision space exhausted");
+        slot.seed_revision = slot
+            .seed_revision
+            .checked_add(1)
+            .expect("conversation seed revision space exhausted");
         slot.pending = slot
             .pending
             .checked_add(1)
@@ -357,6 +410,13 @@ impl ConversationStore {
             |conversation| (conversation.history.clone(), conversation.cache_key.clone()),
         );
         ConversationSeed {
+            gateway_notice: slot.gateway_notice.take(),
+            input: ConversationInput {
+                key: key.clone(),
+                generation: slot.generation,
+                revision: slot.input_revision,
+                seed_revision: slot.seed_revision,
+            },
             history,
             cache_key,
             assets: AssetAccess::persistent(
@@ -372,6 +432,89 @@ impl ConversationStore {
                 active: true,
             },
         }
+    }
+
+    /// Admission closes old WhatsApp intake before the new request awaits authorization.
+    /// Existing content survives, and an absent generation is never created here.
+    pub fn invalidate_late_input(&self, key: &ConversationKey) {
+        let mut state = self.state.lock().expect("conversation store");
+        if let Some(slot) = state.slots.get_mut(key) {
+            slot.input_revision = slot
+                .input_revision
+                .checked_add(1)
+                .expect("conversation input revision space exhausted");
+        }
+    }
+
+    /// Delivery may finish during the next request's authorization, but not after it seeds.
+    /// Admission closes asset intake; prompt seeding separately consumes delivered context.
+    pub fn remember_gateway_notice(&self, input: &ConversationInput, notice: &'static str) {
+        let mut state = self.state.lock().expect("conversation store");
+        if let Some(slot) = state.slots.get_mut(&input.key)
+            && slot.generation == input.generation
+            && slot.seed_revision == input.seed_revision
+        {
+            slot.gateway_notice = Some(notice);
+        }
+    }
+
+    /// Checks the fresh grant and receipt revision under the store lock; never creates a slot.
+    /// Successful metadata registration keeps an empty conversation alive even if its run stops.
+    pub fn retain_late_assets<T>(
+        &self,
+        input: &ConversationInput,
+        granted: &[String],
+        window: MemoryWindow,
+        cache_key: &str,
+        register: impl FnOnce() -> Option<T>,
+    ) -> Result<T, LateAssetRefusal> {
+        let now = Instant::now();
+        let mut state = self.state.lock().expect("conversation store");
+        let slot = state
+            .slots
+            .get(&input.key)
+            .ok_or(LateAssetRefusal::Missing)?;
+        if slot.generation != input.generation || slot.input_revision != input.revision {
+            return Err(LateAssetRefusal::StaleInput);
+        }
+        let reason = if slot.granted != granted || granted.is_empty() {
+            Some(EvictionReason::GrantChanged)
+        } else if slot
+            .live
+            .as_ref()
+            .is_some_and(|live| expired(live, window.idle_timeout, now))
+        {
+            Some(EvictionReason::Idle)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            if let Some(slot) = state.slots.remove(&input.key) {
+                slot.asset_fence.deactivate();
+                evicted(reason);
+            }
+            return Err(match reason {
+                EvictionReason::GrantChanged => LateAssetRefusal::GrantChanged,
+                EvictionReason::Idle => LateAssetRefusal::Expired,
+                EvictionReason::Capacity => LateAssetRefusal::Missing,
+            });
+        }
+        let result = register().ok_or(LateAssetRefusal::InventoryUnavailable)?;
+        let slot = state
+            .slots
+            .get_mut(&input.key)
+            .ok_or(LateAssetRefusal::Missing)?;
+        let live = slot.live.get_or_insert_with(|| Conversation {
+            history: History::new(window.limits),
+            cache_key: cache_key.to_owned(),
+            touched: now,
+        });
+        live.touched = now;
+        self.enforce_ceiling(&mut state);
+        if !state.slots.contains_key(&input.key) {
+            return Err(LateAssetRefusal::Missing);
+        }
+        Ok(result)
     }
 
     /// Forgets one selected conversation generation outright.
