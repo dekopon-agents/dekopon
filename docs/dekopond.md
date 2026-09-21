@@ -65,7 +65,8 @@ transports:
     liveness: { mode: native, progress: message, cancelButton: true }
   - name: whatsapp
     kind: whatsappCloudApi
-    debounceMs: 3000                      # fixed media-first window; 0 bypasses collection
+    debounceMs: 5000                      # quiet interval; 0 bypasses collection
+    debounceMaxWaitMs: 15000               # maximum from first media receipt
     appSecretEnv: DEKOPOND_WHATSAPP_APP_SECRET
     verifyTokenEnv: DEKOPOND_WHATSAPP_VERIFY_TOKEN
     accessTokenEnv: DEKOPOND_WHATSAPP_ACCESS_TOKEN
@@ -279,13 +280,16 @@ as a secret from its users.
 ## Multi-message media inputs
 
 The shared gateway collects **media-first** inputs after routing/address checks and before
-session admission. WhatsApp `debounceMs` is an unsigned 32-bit millisecond duration (`0..=4294967295`, default `3000`);
-`0` disables collection entirely and preserves immediate admission/busy behavior. Invalid types,
-negative/out-of-range integers and durations that cannot form a timer deadline are refused by
-configuration decoding. A nonzero window starts at the first media receipt and never slides:
-later photos, captions and standalone text can join that actor's open compatible burst, but do not
-extend its deadline. Text arriving first remains immediate. These are heuristic bursts, not
-WhatsApp albums; webhook payload boundaries are not album identities.
+session admission. WhatsApp `debounceMs` is the quiet interval (default **5000ms**), and
+`debounceMaxWaitMs` is the hard maximum from the first media receipt (default **15000ms**).
+Both are unsigned 32-bit millisecond durations (`0..=4294967295`). `debounceMs: 0` disables
+collection entirely and preserves immediate admission/busy behavior; the maximum is then unused.
+When enabled, the maximum must be at least the quiet interval. Invalid types, negative/out-of-range
+integers, incompatible enabled combinations and unrepresentable timer deadlines are refused at
+configuration load. Accepted later photos, captions and standalone text extend that actor's quiet
+deadline, but never beyond the first receipt plus the maximum. Refused inputs do not extend it.
+Text arriving first remains immediate. These are heuristic bursts, not WhatsApp albums; webhook
+payload boundaries are not album identities.
 
 Telegram uses a separate fixed **3-second** window only for authenticated `media_group_id`
 members, because Telegram supplies no group-end marker. Member captions join; ordinary text and
@@ -307,14 +311,14 @@ envelope, visibly and with a traced cause; already collected members remain inta
 are never split. There is at most one collecting batch per compatible actor key and globally at
 most `sessions.maxConcurrent` batches, independently of execution permits.
 
-At the fixed deadline, the batch attempts normal admission immediately. An active conversation or
+At quiet expiry or the hard deadline, whichever comes first, the batch attempts normal admission immediately. An active conversation or
 exhausted execution capacity produces a visible busy reply (also when `replyOnBusy` is false for
 ordinary messages) and disposes the batch. There is **no execution queue**, no waiting for an
 active session, no replay and no cancellation of paid effects. Late media starts a new bounded
 collection; late standalone text has ordinary immediate/busy behavior. Neither heuristic bursts
-nor native groups guarantee completion when members arrive beyond the fixed window. Collection
-latency is the configured window (3 seconds by default), not 30 seconds plus admission waiting;
-normal inference and transport time remain additional.
+nor native groups guarantee completion when members arrive after dispatch. WhatsApp collection
+waits at most its configured maximum (15 seconds by default); Telegram waits its fixed 3 seconds.
+Normal inference and transport time remain additional, with no admission waiting.
 
 Fresh broker authorization and generation selection happen only after admission; collection does
 not fetch assets, contact the model/provider or publish progress. One lead message owns progress,
@@ -356,7 +360,10 @@ per invocation**, 32 table entries per conversation and the configurable 256 MiB
 An eight-MiB base64 asset may store up to 11,184,812 bytes; identity stays at 8,388,608.
 Disk retention and broker in-flight spool budgets account for actual stored bytes.
 These limits are separate from model-facing fetch limits. Listing metadata does not update LRU
-recency; resolving bytes does. Reclaimed files never refetch or silently substitute older pixels.
+recency; resolving bytes does. Unknown inbound lengths are shown as `size unknown` in reference
+notes and as null stored-byte counts in provider listings, not as empty files. Reported or fetched
+lengths, including a genuine zero, remain numeric. Listing never fetches files just to learn their
+size. Reclaimed files retain their last known length and never refetch or silently substitute older pixels.
 
 Delivery keeps existing native paths: Slack external upload, Discord multipart Create Message,
 Telegram `sendPhoto`, WhatsApp Graph media/image messages, and local base64 JSON. Each upload reads

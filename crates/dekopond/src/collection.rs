@@ -14,14 +14,21 @@ const MAX_ENVELOPES: usize = 8;
 const TELEGRAM_GROUP_WINDOW: Duration = Duration::from_secs(3);
 
 pub(crate) struct Collector {
-    windows: BTreeMap<String, Duration>,
+    windows: BTreeMap<String, CollectionWindow>,
     capacity: usize,
     pending: Vec<Batch>,
+}
+
+#[derive(Clone, Copy)]
+struct CollectionWindow {
+    quiet: Duration,
+    max_wait: Duration,
 }
 
 struct Batch {
     route: usize,
     deadline: Instant,
+    hard_deadline: Instant,
     members: Vec<InboundMessage>,
 }
 
@@ -38,8 +45,17 @@ impl Collector {
                 .iter()
                 .filter_map(|transport| match transport {
                     TransportConfig::WhatsappCloudApi {
-                        name, debounce_ms, ..
-                    } => Some((name.clone(), Duration::from_millis(u64::from(*debounce_ms)))),
+                        name,
+                        debounce_ms,
+                        debounce_max_wait_ms,
+                        ..
+                    } => Some((
+                        name.clone(),
+                        CollectionWindow {
+                            quiet: Duration::from_millis(u64::from(*debounce_ms)),
+                            max_wait: Duration::from_millis(u64::from(*debounce_max_wait_ms)),
+                        },
+                    )),
                     _ => None,
                 })
                 .collect(),
@@ -74,9 +90,12 @@ impl Collector {
                 .windows
                 .get(&message.transport)
                 .copied()
-                .filter(|duration| !duration.is_zero()),
+                .filter(|window| !window.quiet.is_zero()),
             ChatTransportKind::Telegram if message.native_group.is_some() => {
-                Some(TELEGRAM_GROUP_WINDOW)
+                Some(CollectionWindow {
+                    quiet: TELEGRAM_GROUP_WINDOW,
+                    max_wait: TELEGRAM_GROUP_WINDOW,
+                })
             }
             _ => None,
         };
@@ -100,6 +119,12 @@ impl Collector {
             {
                 return Offered::Refused(message, "batch-limit");
             }
+            if message.transport_kind == ChatTransportKind::Whatsapp {
+                let Some(deadline) = message.received_at.checked_add(window.quiet) else {
+                    return Offered::Refused(message, "deadline-overflow");
+                };
+                batch.deadline = batch.deadline.max(deadline.min(batch.hard_deadline));
+            }
             batch.members.push(message);
             return Offered::Pending;
         }
@@ -113,12 +138,16 @@ impl Collector {
         if self.pending.len() == self.capacity {
             return Offered::Refused(message, "collection-full");
         }
-        let Some(deadline) = message.received_at.checked_add(window) else {
+        let Some(deadline) = message.received_at.checked_add(window.quiet) else {
+            return Offered::Refused(message, "deadline-overflow");
+        };
+        let Some(hard_deadline) = message.received_at.checked_add(window.max_wait) else {
             return Offered::Refused(message, "deadline-overflow");
         };
         self.pending.push(Batch {
             route,
-            deadline,
+            deadline: deadline.min(hard_deadline),
+            hard_deadline,
             members: vec![message],
         });
         Offered::Pending
@@ -284,7 +313,7 @@ mod tests {
                 .map(|_| PendingAsset {
                     name: "photo.jpg".into(),
                     mime: "image/jpeg".into(),
-                    size: 12,
+                    size: Some(12),
                     source: None,
                 })
                 .collect(),
@@ -303,14 +332,20 @@ mod tests {
     }
     fn collector(millis: u64, capacity: usize) -> Collector {
         Collector {
-            windows: BTreeMap::from([("wa".into(), Duration::from_millis(millis))]),
+            windows: BTreeMap::from([(
+                "wa".into(),
+                CollectionWindow {
+                    quiet: Duration::from_millis(millis),
+                    max_wait: Duration::from_secs(15),
+                },
+            )]),
             capacity,
             pending: Vec::new(),
         }
     }
 
     #[tokio::test(start_paused = true)]
-    async fn media_first_fixed_window_collects_three_photos_and_prompt_without_sliding() {
+    async fn media_first_quiet_window_collects_three_photos_and_prompt() {
         for millis in [3000, 900] {
             let mut collector = collector(millis, 4);
             assert!(matches!(
@@ -335,10 +370,10 @@ mod tests {
             ));
             assert_eq!(
                 collector.deadline(),
-                Some(start + Duration::from_millis(millis))
+                Some(start + Duration::from_millis(2 * millis - 1))
             );
             assert!(collector.take_due(Instant::now()).is_empty());
-            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::time::advance(Duration::from_millis(millis)).await;
             let ready = collector.take_due(Instant::now());
             assert_eq!(ready.len(), 1);
             assert_eq!(ready[0].assets.len(), 3);
@@ -347,6 +382,72 @@ mod tests {
             assert!(ready[0].text.ends_with("edit these\n"));
             assert_eq!(collector.deadline(), None);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn sustained_burst_dispatches_at_configured_hard_deadline_not_after_last_receipt() {
+        for (quiet, maximum) in [(5000, 15000), (900, 2400)] {
+            let mut collector = collector(quiet, 4);
+            collector.windows.get_mut("wa").unwrap().max_wait = Duration::from_millis(maximum);
+            let start = Instant::now();
+            assert!(matches!(
+                collector.offer(0, message(1, "")),
+                Offered::Pending
+            ));
+            // More receipts within each quiet interval cannot postpone the hard deadline.
+            for _ in 0..3 {
+                tokio::time::advance(Duration::from_millis(quiet - 1)).await;
+                assert!(collector.take_due(Instant::now()).is_empty());
+                assert!(matches!(
+                    collector.offer(0, message(1, "")),
+                    Offered::Pending
+                ));
+                if Instant::now() + Duration::from_millis(quiet)
+                    >= start + Duration::from_millis(maximum)
+                {
+                    break;
+                }
+            }
+            let deadline = start + Duration::from_millis(maximum);
+            assert_eq!(collector.deadline(), Some(deadline));
+            assert!(
+                collector
+                    .take_due(deadline - Duration::from_nanos(1))
+                    .is_empty()
+            );
+            assert_eq!(collector.take_due(deadline).len(), 1);
+            assert!(
+                collector
+                    .take_due(deadline + Duration::from_nanos(1))
+                    .is_empty()
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn another_actor_and_refused_overflow_do_not_extend_a_quiet_deadline() {
+        let mut collector = collector(5000, 4);
+        let start = Instant::now();
+        assert!(matches!(
+            collector.offer(0, message(32, "")),
+            Offered::Pending
+        ));
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert!(matches!(
+            collector.offer(0, message(1, "")),
+            Offered::Refused(_, "batch-limit")
+        ));
+        let mut other = message(1, "");
+        other.subject = "whatsapp.15557654321".parse().unwrap();
+        assert!(matches!(collector.offer(0, other), Offered::Pending));
+        assert_eq!(collector.deadline(), Some(start + Duration::from_secs(5)));
+        assert_eq!(
+            collector.take_due(start + Duration::from_secs(5))[0]
+                .assets
+                .len(),
+            32
+        );
+        assert_eq!(collector.deadline(), Some(start + Duration::from_secs(9)));
     }
 
     #[tokio::test(start_paused = true)]
@@ -545,9 +646,13 @@ mod tests {
                 1 => route = 1,
                 2 => {
                     other.transport = "wa-other".into();
-                    collector
-                        .windows
-                        .insert(other.transport.clone(), Duration::from_secs(3));
+                    collector.windows.insert(
+                        other.transport.clone(),
+                        CollectionWindow {
+                            quiet: Duration::from_secs(5),
+                            max_wait: Duration::from_secs(15),
+                        },
+                    );
                 }
                 3 => other.conversation.id = "another".into(),
                 4 => other.conversation.thread = Some("topic".into()),

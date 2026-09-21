@@ -152,9 +152,61 @@ async fn signed_png_and_jpeg_captions_are_lazy_and_optional() {
             assert_eq!(message.text, caption.unwrap_or_default());
             assert_eq!(message.assets.len(), 1);
             assert_eq!(message.assets[0].mime, mime);
+            assert_eq!(message.assets[0].size, None);
             assert_eq!(message.assets[0].source, Some(source(mime)));
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn six_staggered_signed_photos_form_one_lazy_batch_after_the_quiet_interval() {
+    use crate::collection::{Collector, Offered};
+    let config = serde_json::from_value(json!({
+        "name":"wa", "kind":"whatsappCloudApi", "appSecretEnv":"APP",
+        "verifyTokenEnv":"VERIFY", "accessTokenEnv":"ACCESS", "bind":"127.0.0.1:9080",
+        "callbackPath":"/wa", "wabaId":"123", "phoneNumberId":"456", "graphApiVersion":"v25.0"
+    }))
+    .unwrap();
+    let mut collector = Collector::new(&[config], 4);
+    let (state, mut receiver) = super::tests::state_and_receiver();
+    let start = tokio::time::Instant::now();
+    let mut previous = 0;
+    for (index, millis) in [0, 50, 3100, 3230, 3670, 4320].into_iter().enumerate() {
+        tokio::time::advance(Duration::from_millis(millis - previous)).await;
+        previous = millis;
+        assert!(collector.take_due(tokio::time::Instant::now()).is_empty());
+        let mut body = photo_webhook("image/jpeg", (index == 0).then_some("edit all six"));
+        body["entry"][0]["changes"][0]["value"]["messages"][0]["id"] =
+            json!(format!("wamid.photo{index}"));
+        let response = receive_webhook(
+            State(state.clone()),
+            super::tests::signed_request(body.to_string().as_bytes()),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut delivery = receiver.try_recv().unwrap();
+        let message = delivery.messages.pop_front().unwrap();
+        assert_eq!(message.assets[0].size, None);
+        assert!(matches!(collector.offer(0, message), Offered::Pending));
+    }
+    let deadline = start + Duration::from_millis(9320);
+    assert_eq!(collector.deadline(), Some(deadline));
+    assert!(
+        collector
+            .take_due(deadline - Duration::from_nanos(1))
+            .is_empty()
+    );
+    let ready = collector.take_due(deadline);
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].assets.len(), 6);
+    assert_eq!(ready[0].constituents.len(), 6);
+    assert_eq!(ready[0].message_id, "wamid.photo0");
+    assert!(ready[0].text.contains("edit all six"));
+    assert!(
+        collector
+            .take_due(deadline + Duration::from_secs(60))
+            .is_empty()
+    );
 }
 
 #[tokio::test]

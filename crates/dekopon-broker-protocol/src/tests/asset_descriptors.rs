@@ -201,12 +201,29 @@ fn asset_metadata_is_strict_and_sends_remaining_is_camel_case() {
 }
 
 #[test]
+fn asset_row_roundtrip_distinguishes_unknown_zero_and_known_length() {
+    for bytes in [None, Some(0), Some(1234)] {
+        let row = AssetRow {
+            id: 1,
+            content_type: "image/jpeg".into(),
+            encoding: AssetEncoding::Identity,
+            bytes,
+            origin: "chat".into(),
+            sent: false,
+        };
+        let json = serde_json::to_value(&row).unwrap();
+        assert_eq!(json["bytes"], serde_json::to_value(bytes).unwrap());
+        assert_eq!(serde_json::from_value::<AssetRow>(json).unwrap(), row);
+    }
+}
+
+#[test]
 fn typed_rows_and_response_indexes_are_exact() {
     let row = AssetRow {
         id: 1,
         content_type: "image/png".into(),
         encoding: AssetEncoding::Identity,
-        bytes: 0,
+        bytes: Some(0),
         origin: "chat".into(),
         sent: false,
     };

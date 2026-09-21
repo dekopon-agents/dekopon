@@ -1810,7 +1810,7 @@ fn pending_assets(
                     .unwrap_or_default()
                     .trim()
                     .to_ascii_lowercase(),
-                size: attachment["size"].as_u64().unwrap_or_default(),
+                size: attachment["size"].as_u64(),
                 source: source.map(|(attachment_id, url)| AssetSourceRef::Discord {
                     attachment_id: attachment_id.to_owned(),
                     channel_id: channel_id.to_owned(),

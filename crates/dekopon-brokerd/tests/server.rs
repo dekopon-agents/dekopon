@@ -1264,7 +1264,7 @@ async fn successful_asset_descriptors_and_send_effects_cross_the_real_server_wit
                     id: 1,
                     content_type: "text/plain".to_owned(),
                     encoding: AssetEncoding::Identity,
-                    bytes: 11,
+                    bytes: Some(11),
                     origin: "provider:http-probe.purge".to_owned(),
                     sent: false,
                 }],

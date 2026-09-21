@@ -443,7 +443,7 @@ impl TelegramTransport {
             return vec![PendingAsset {
                 name: "photo.jpg".to_owned(),
                 mime: "image/jpeg".to_owned(),
-                size: largest["file_size"].as_u64().unwrap_or_default(),
+                size: largest["file_size"].as_u64(),
                 source: Some(AssetSourceRef::Telegram {
                     file_id: file_id.to_owned(),
                 }),
@@ -458,7 +458,7 @@ impl TelegramTransport {
                     .as_str()
                     .unwrap_or_default()
                     .to_owned(),
-                size: document["file_size"].as_u64().unwrap_or_default(),
+                size: document["file_size"].as_u64(),
                 source: Some(AssetSourceRef::Telegram {
                     file_id: file_id.to_owned(),
                 }),

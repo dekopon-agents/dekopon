@@ -7,6 +7,15 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- Represent unknown chat-asset lengths honestly in model reference notes and provider listings,
+  preserving known zero lengths without downloading files for metadata. Upgrade both daemons
+  together for nullable asset inventory byte counts; provider WIT is unchanged.
+- Collect WhatsApp media bursts until a quiet interval expires, bounded by a configurable maximum
+  from the first receipt. `debounceMs` now defaults to 5000ms and `debounceMaxWaitMs` to 15000ms;
+  zero still bypasses collection. Existing limits, isolation, cancellation and busy disposal remain.
+
 ## [0.18.0] - 2026-09-20
 
 ### Added

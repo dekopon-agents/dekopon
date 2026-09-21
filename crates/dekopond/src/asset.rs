@@ -60,8 +60,8 @@ pub(crate) struct AssetRef {
     pub name: String,
     /// IANA media type as the transport reported it, also untrusted.
     pub mime: String,
-    /// Size the transport reported, used to refuse an oversized fetch before making it.
-    pub size: u64,
+    /// Reported length when known, used to refuse an oversized fetch before making it.
+    pub size: Option<u64>,
     /// How the owning transport resolves this back to bytes, when it can.
     ///
     /// `None` for a file the app cannot see — Slack withholds the id and URL when the token lacks
@@ -486,8 +486,8 @@ pub(crate) struct PendingAsset {
     pub name: String,
     /// Sender-supplied media type.
     pub mime: String,
-    /// Size the transport reported.
-    pub size: u64,
+    /// Size the transport reported; `None` when absent.
+    pub size: Option<u64>,
     /// How to turn this back into bytes, when the transport could say.
     pub source: Option<AssetSourceRef>,
 }
@@ -547,7 +547,9 @@ pub(crate) fn reference_note(registered: &Registered, images_supported: bool) ->
     let mut note = String::from("[gateway: files in this conversation");
     let mut any_fetchable = false;
     for asset in &registered.inventory {
-        let size = kibibytes(asset.size);
+        let size = asset
+            .size
+            .map_or_else(|| "size unknown".to_owned(), kibibytes);
         let name = &asset.name;
         let mime = &asset.mime;
         // Marked so a model asking "is this a good recipe?" reaches for the file that arrived with
@@ -830,12 +832,14 @@ impl SessionAssets {
             // base64 size may exceed the raw download ceiling.
             return Ok((asset, data));
         }
-        if asset.size > MAX_ASSET_BYTES {
-            return Err(AssetFailure::TooLarge { size: asset.size });
+        if let Some(size) = asset.size
+            && size > MAX_ASSET_BYTES
+        {
+            return Err(AssetFailure::TooLarge { size });
         }
-        // Zero and individually impossible admissions do not spend transport IO.
+        // Disabled retention and known impossible admissions do not spend transport IO.
         self.store
-            .check_size(id, asset.size as usize)
+            .check_size(id, asset.size.unwrap_or_default() as usize)
             .map_err(AssetFailure::Storage)?;
         let (Some(fetcher), Some(source)) = (self.fetcher.as_ref(), asset.source.as_ref()) else {
             return Err(AssetFailure::Unavailable);
@@ -1095,7 +1099,7 @@ impl AssetStore {
                     return Ok(Some(resident.data.clone()));
                 }
                 if asset.fetched {
-                    retention.miss(id, asset.size as usize, "reclaimed");
+                    retention.miss(id, asset.size.unwrap_or_default() as usize, "reclaimed");
                     Err(BlobError::Reclaimed)
                 } else {
                     Ok(None)
@@ -1122,11 +1126,12 @@ impl AssetStore {
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 // Record the completed download before any fallible size, cleanup or admission
                 // check: successfully downloaded inputs must never silently fetch twice.
-                entries
+                let asset = entries
                     .get_mut(key)
                     .and_then(|entry| entry.assets.iter_mut().find(|asset| asset.id == id))
-                    .ok_or(BlobError::Unauthorized)?
-                    .fetched = true;
+                    .ok_or(BlobError::Unauthorized)?;
+                asset.fetched = true;
+                asset.size = Some(bytes.len() as u64);
                 retention.check_size(id, bytes.len())?;
                 // Retired/expired inventories lose cache residency, but active pins stay charged until
                 // a later blocking admission can safely dispose their sole remaining cache owner.
@@ -1145,13 +1150,11 @@ impl AssetStore {
                 for key in stale {
                     retention.remove(&key)?;
                 }
-                let asset = entries
-                    .get_mut(key)
-                    .and_then(|entry| entry.assets.iter_mut().find(|asset| asset.id == id))
+                entries
+                    .get(key)
+                    .and_then(|entry| entry.assets.iter().find(|asset| asset.id == id))
                     .ok_or(BlobError::Unauthorized)?;
-                let data = retention.admit((key.clone(), id), bytes)?;
-                asset.size = data.len() as u64;
-                Ok(data)
+                retention.admit((key.clone(), id), bytes)
             })
             .unwrap_or(Err(BlobError::Unauthorized))
     }
@@ -1212,7 +1215,7 @@ impl dekopon_agent::attachment::GeneratedAssetStore for SessionAssets {
                 assets: Vec::new(), touched: Instant::now(), fence: self.access.weak_fence(), delivery_failed: false,
             });
             entry.touched = Instant::now();
-            entry.assets.push(AssetRef { id, name: format!("asset-{id}"), mime: metadata.content_type.clone(), size: metadata.bytes,
+            entry.assets.push(AssetRef { id, name: format!("asset-{id}"), mime: metadata.content_type.clone(), size: Some(metadata.bytes),
                 source: Some(AssetSourceRef::Generated { capability: capability.to_owned(), invocation: invocation.to_owned() }),
                 fetched: true, encoding: metadata.encoding, sent: false,
             });
@@ -1404,7 +1407,7 @@ mod retention_tests {
                 vec![PendingAsset {
                     name: "input.png".into(),
                     mime: "image/png".into(),
-                    size: 3,
+                    size: Some(3),
                     source: Some(AssetSourceRef::Telegram {
                         file_id: "file".into(),
                     }),
@@ -1652,8 +1655,93 @@ mod retention_tests {
         }
     }
     #[tokio::test(flavor = "multi_thread")]
+    async fn unknown_and_known_zero_lengths_stay_distinct_without_listing_downloads() {
+        let store = store(16);
+        let access = access("lengths");
+        let registered = store.assets_for_access(
+            &access,
+            [None, Some(0), Some(2048)]
+                .into_iter()
+                .enumerate()
+                .map(|(index, size)| PendingAsset {
+                    name: format!("input-{index}.png"),
+                    mime: "image/png".into(),
+                    size,
+                    source: Some(AssetSourceRef::WhatsApp {
+                        media_id: "789".into(),
+                        mime: "image/png".into(),
+                    }),
+                })
+                .collect(),
+            true,
+            Instant::now(),
+        );
+        let note = reference_note(&registered, true).unwrap();
+        assert!(note.contains("input-0.png (image/png, size unknown)"));
+        assert!(note.contains("input-1.png (image/png, 0 B)"));
+        assert!(note.contains("input-2.png (image/png, 2 KB)"));
+        let fetcher = Arc::new(Fetcher(std::sync::atomic::AtomicUsize::new(0)));
+        let session = SessionAssets::new(
+            Arc::clone(&store),
+            access.clone(),
+            Some(Arc::clone(&fetcher) as Arc<dyn AssetFetcher>),
+            Handle::current(),
+            true,
+            true,
+        );
+        assert_eq!(
+            session
+                .rows()
+                .iter()
+                .map(|row| row.bytes)
+                .collect::<Vec<_>>(),
+            [None, Some(0), Some(2048)]
+        );
+        assert_eq!(fetcher.0.load(Ordering::Relaxed), 0);
+        tokio::task::spawn_blocking(move || {
+            let id = registered.arrived[0];
+            let (_, blob) = session.fetch_for_capability(id).unwrap();
+            assert_eq!(blob.len(), 3);
+            assert_eq!(session.rows()[0].bytes, Some(3));
+            drop(blob);
+            store
+                .retention
+                .lock()
+                .unwrap()
+                .remove(&(access.key.clone(), id))
+                .unwrap();
+            assert_eq!(
+                session.fetch_for_capability(id).unwrap_err(),
+                ChatAssetRefusal::Reclaimed
+            );
+            assert_eq!(session.rows()[0].bytes, Some(3));
+            assert_eq!(fetcher.0.load(Ordering::Relaxed), 1);
+            // An actually empty downloaded file is still a known zero, not an unknown or miss.
+            let empty_id = registered.arrived[1];
+            let empty = store.admit(&access, empty_id, b"").unwrap();
+            assert_eq!(empty.len(), 0);
+            assert_eq!(session.rows()[1].bytes, Some(0));
+            drop(empty);
+            store
+                .retention
+                .lock()
+                .unwrap()
+                .remove(&(access.key.clone(), empty_id))
+                .unwrap();
+            assert_eq!(
+                session.fetch_for_capability(empty_id).unwrap_err(),
+                ChatAssetRefusal::Reclaimed
+            );
+            assert_eq!(session.rows()[1].bytes, Some(0));
+            assert_eq!(fetcher.0.load(Ordering::Relaxed), 1);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn downloaded_oversize_with_unknown_or_underreported_size_never_redownloads() {
-        for reported_size in [0, 1] {
+        for reported_size in [None, Some(0), Some(1)] {
             let store = store(2);
             let access = access("one");
             let id = store
@@ -1698,6 +1786,7 @@ mod retention_tests {
                     ChatAssetRefusal::Reclaimed
                 );
                 assert_eq!(fetcher.0.load(Ordering::Relaxed), 1);
+                assert_eq!(session.rows()[0].bytes, Some(3));
                 let cache = store.retention.lock().unwrap();
                 assert_eq!(cache.bytes, 0);
                 assert!(cache.resident.is_empty());

@@ -524,7 +524,7 @@ mod tests {
                     id: index as u64 + 1,
                     content_type: "application/octet-stream".to_owned(),
                     encoding: AssetEncoding::Identity,
-                    bytes: blob.len() as u64,
+                    bytes: Some(blob.len() as u64),
                     origin: "chat".to_owned(),
                     sent: false,
                 })

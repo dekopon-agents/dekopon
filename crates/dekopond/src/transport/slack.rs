@@ -1869,7 +1869,7 @@ fn pending_assets(files: &Value) -> Vec<PendingAsset> {
             PendingAsset {
                 name,
                 mime: file["mimetype"].as_str().unwrap_or_default().to_owned(),
-                size: file["size"].as_u64().unwrap_or_default(),
+                size: file["size"].as_u64(),
                 source: source.map(|(file_id, url)| AssetSourceRef::Slack {
                     file_id: file_id.to_owned(),
                     url: url.to_owned(),

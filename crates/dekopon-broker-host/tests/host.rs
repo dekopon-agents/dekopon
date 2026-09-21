@@ -1852,7 +1852,7 @@ async fn real_guest_streams_one_and_five_eight_mib_assets_and_attaches_a_read_on
                     id,
                     content_type: "application/octet-stream".to_owned(),
                     encoding: AssetEncoding::Identity,
-                    bytes: 8 * 1024 * 1024,
+                    bytes: Some(8 * 1024 * 1024),
                     origin: "chat".to_owned(),
                     sent: false,
                 })

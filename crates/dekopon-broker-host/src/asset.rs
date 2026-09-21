@@ -253,7 +253,7 @@ impl AssetState {
                     .map_err(|error| AssetIoError::from(std::io::Error::from(error)))?;
                 if !metadata.is_file()
                     || flags & rustix::fs::OFlags::ACCMODE != rustix::fs::OFlags::RDONLY
-                    || metadata.len() != row.bytes
+                    || Some(metadata.len()) != row.bytes
                 {
                     return Err(AssetAdmissionError::InvalidDescriptor);
                 }
@@ -383,7 +383,7 @@ fn row_info(row: &AssetRow) -> wit::Info {
         id: Some(row.id),
         content_type: row.content_type.clone(),
         encoding: encoding(row.encoding),
-        stored_bytes: Some(row.bytes),
+        stored_bytes: row.bytes,
         seekable: true,
         origin: row.origin.clone(),
         sent: row.sent,
@@ -711,7 +711,13 @@ impl wit::Host for StoreState {
         };
         let info = row_info(row);
         let fd = file.clone();
-        let len = match decoded_length(fd.clone(), info.encoding, row.bytes).await {
+        let Some(bytes) = row.bytes else {
+            return Ok(self.assets.refuse(error(
+                wit::ErrorCode::Internal,
+                "passed descriptor has no stored length",
+            )));
+        };
+        let len = match decoded_length(fd.clone(), info.encoding, bytes).await {
             Ok(len) => len,
             Err(failure) => return Ok(self.assets.refuse(failure)),
         };
@@ -960,12 +966,67 @@ mod tests {
                 id: 1,
                 content_type: "text/plain".to_owned(),
                 encoding: AssetEncoding::Identity,
-                bytes,
+                bytes: Some(bytes),
                 origin: "chat".to_owned(),
                 sent,
             }],
             descriptors: vec![file.into()],
             sends_remaining: 1,
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_preserves_unknown_zero_and_known_lengths_without_descriptors() {
+        let mut state = state(
+            None,
+            AssetConstraints::default(),
+            AssetInputs {
+                rows: [None, Some(0), Some(1234)]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, bytes)| AssetRow {
+                        id: index as u64 + 1,
+                        content_type: "image/jpeg".into(),
+                        encoding: AssetEncoding::Identity,
+                        bytes,
+                        origin: "chat".into(),
+                        sent: false,
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            vec![],
+        )
+        .await;
+        let rows = state.list().await.unwrap();
+        assert_eq!(
+            rows.iter().map(|row| row.stored_bytes).collect::<Vec<_>>(),
+            [None, Some(0), Some(1234)]
+        );
+    }
+
+    #[tokio::test]
+    async fn referenced_descriptor_requires_a_known_exact_length_even_for_empty_files() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        for bytes in [None, Some(1), Some(0)] {
+            let mut inputs = input(File::open(file.path()).unwrap(), 0, false);
+            inputs.rows[0].bytes = bytes;
+            let result = AssetState::invoke(
+                inputs,
+                vec![1],
+                AssetConstraints::default(),
+                None,
+                "chat".into(),
+            )
+            .await;
+            if bytes == Some(0) {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(AssetAdmissionError::InvalidDescriptor)
+                ));
+            }
         }
     }
 
@@ -1378,7 +1439,7 @@ mod tests {
                     id,
                     content_type: "image/png".to_owned(),
                     encoding: AssetEncoding::Base64,
-                    bytes: encoded.len() as u64,
+                    bytes: Some(encoded.len() as u64),
                     origin: "test".to_owned(),
                     sent: false,
                 });
@@ -1744,7 +1805,7 @@ mod tests {
                         id,
                         content_type: "text/plain".to_owned(),
                         encoding: AssetEncoding::Identity,
-                        bytes: 0,
+                        bytes: Some(0),
                         origin: "chat".to_owned(),
                         sent: false,
                     })

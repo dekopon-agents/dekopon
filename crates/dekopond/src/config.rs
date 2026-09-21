@@ -420,12 +420,18 @@ pub enum TransportConfig {
         waba_id: String,
         phone_number_id: String,
         graph_api_version: String,
-        /// Fixed media-first collection window; zero bypasses collection.
+        /// Media-first quiet interval; zero bypasses collection.
         #[serde(
             default = "default_whatsapp_debounce_ms",
-            deserialize_with = "deserialize_debounce_ms"
+            deserialize_with = "deserialize_collection_millis"
         )]
         debounce_ms: u32,
+        /// Maximum collection time from the first media receipt.
+        #[serde(
+            default = "default_whatsapp_debounce_max_wait_ms",
+            deserialize_with = "deserialize_collection_millis"
+        )]
+        debounce_max_wait_ms: u32,
         /// What a running session shows; WhatsApp has typing and nothing else.
         #[serde(default)]
         liveness: LivenessConfig,
@@ -457,10 +463,14 @@ pub enum TransportConfig {
 }
 
 const fn default_whatsapp_debounce_ms() -> u32 {
-    3000
+    5000
 }
 
-fn deserialize_debounce_ms<'de, D: serde::Deserializer<'de>>(
+const fn default_whatsapp_debounce_max_wait_ms() -> u32 {
+    15000
+}
+
+fn deserialize_collection_millis<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<u32, D::Error> {
     let millis = u32::deserialize(deserializer)?;
@@ -469,7 +479,7 @@ fn deserialize_debounce_ms<'de, D: serde::Deserializer<'de>>(
         .is_none()
     {
         return Err(serde::de::Error::custom(
-            "debounceMs cannot be represented as a timer deadline",
+            "collection duration cannot be represented as a timer deadline",
         ));
     }
     Ok(millis)
@@ -1208,12 +1218,16 @@ pub(crate) fn resolve(
                 phone_number_id,
                 graph_api_version,
                 debounce_ms,
+                debounce_max_wait_ms,
                 liveness,
                 graph_endpoint,
             } => {
                 check_env_name(&app_secret_env, &mut problems);
                 check_env_name(&verify_token_env, &mut problems);
                 check_env_name(&access_token_env, &mut problems);
+                if debounce_ms > 0 && debounce_max_wait_ms < debounce_ms {
+                    problems.push(ConfigProblem::InvalidWhatsappDebounce { name: name.clone() });
+                }
                 if !canonical_positive_decimal(&waba_id)
                     || !canonical_positive_decimal(&phone_number_id)
                 {
@@ -1242,6 +1256,7 @@ pub(crate) fn resolve(
                     phone_number_id,
                     graph_api_version,
                     debounce_ms,
+                    debounce_max_wait_ms,
                     liveness,
                     graph_endpoint: Some(graph_endpoint),
                 }
@@ -2007,6 +2022,10 @@ pub enum ConfigProblem {
     InvalidWhatsappCallback { name: String },
     #[error("WhatsApp transport {name:?} must pin a Graph API version such as v23.0")]
     InvalidWhatsappGraphVersion { name: String },
+    #[error(
+        "WhatsApp transport {name} requires debounceMaxWaitMs >= debounceMs when collection is enabled"
+    )]
+    InvalidWhatsappDebounce { name: String },
     #[error("route names unknown transport {transport:?}")]
     UnknownRouteTransport { transport: String },
     #[error("route names unknown model {model:?}")]
