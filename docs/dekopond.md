@@ -338,21 +338,28 @@ Photo-only receipts arriving during a run are associated with that exact run bef
 At flush they open a fresh, chat-scoped broker capability listing, not another model session.
 The gateway requires the same authenticated sender, configured route/agent, complete conversation,
 reply audience, unchanged grant set and live conversation generation. A later normal request
-invalidates an older receipt's intake permission even if the conversation generation is unchanged.
+invalidates an older receipt's intake permission immediately on admission, before its broker
+listing, even if the conversation generation is unchanged. Existing references are not deleted.
 No provider call, asset download, automatic retry or regeneration happens during this intake.
 
 Accepted references join the existing bounded temporary asset inventory. A gateway-authored
 completion notice asks whether the user wants another version including additional photos;
 it does not assert which photos a provider used, that bytes were downloaded, or permanent storage.
 If debounce or authorization finishes after the completion snapshot, that batch receives a separate
-acknowledgment instead, never both notices. Failed requests get neutral failure wording. Expired
+acknowledgment instead, never both notices. Only after successful transport acceptance, one bounded
+gateway follow-up context is saved for the next authorized prompt, so a reply such as “yes” includes
+the question being answered alongside retained asset references. Failed delivery records no such
+question. Failed requests get neutral failure wording. Expired
 references are not described as retained. Normal next requests see still-retained references.
 
 Captioned photos retain ordinary admission/busy handling. Text or a caption trying to join an
 already late-only batch is explicitly refused with instructions to send it after the current
 request completes; previously collected photos remain intact. Cancellation discards pending late
 input and suppresses added notices, but does not delete references already registered solely
-because of the stop. Shutdown still discards pending collection. One-shot routes and other
+because of the stop. A flushed intake owns authenticated Stop handling from dispatch through its
+broker listing and acknowledgment, even after the original execution completes. One intake owns
+the stopped acknowledgment when no execution does; Stop does not become a model request. An
+already transmitted transport operation cannot be rolled back. Shutdown still discards pending collection. One-shot routes and other
 transports keep their existing behavior.
 
 Registration uses the existing eight-reference inventory and lazy byte limits; zero

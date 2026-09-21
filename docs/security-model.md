@@ -187,7 +187,11 @@ The broker authorizes every invocation. A persistent conversation opens a fresh 
 Persistent WhatsApp late-photo intake also opens a fresh chat-scoped capability listing, but never
 executes a model or provider. Receipt-time association names one exact sender/route/audience/run;
 registration additionally requires that run's still-current conversation generation and unchanged
-grant set. A later normal request closes the old intake revision. Bounded completed-run intervals
+grant set. A later normal request closes the old intake revision at admission, before awaiting
+authorization, without deleting existing assets. Flushed intake has its own bounded, authenticated
+cancel ownership through authorization and acknowledgment after the execution ends. A successfully
+delivered gateway follow-up question is retained once in the matching generation for the next
+prompt; failed delivery creates no claimed conversation context. Bounded completed-run intervals
 and a conservative eviction watermark prevent delayed receipts from becoming new paid requests.
 Only metadata is retained; the usual generation fence, inventory ceilings and lazy byte limits
 remain. A completion notice is transport text, not asset.send authority.

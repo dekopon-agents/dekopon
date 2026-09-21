@@ -115,6 +115,7 @@ struct Slot {
     /// Globally non-reused token fencing leases and attachment state issued by this generation.
     generation: u64,
     input_revision: u64,
+    gateway_notice: Option<&'static str>,
     /// Closed on every replacement/removal so stale sessions cannot publish or fetch assets.
     asset_fence: Arc<AssetFence>,
     /// Exact sorted capability identifiers reported by the fresh legs in this generation.
@@ -149,6 +150,7 @@ pub(crate) struct ConversationSeed<'a> {
     /// Generation-fenced append lease. Dropping it without committing stores no turn.
     pub lease: ConversationLease<'a>,
     pub input: ConversationInput,
+    pub gateway_notice: Option<&'static str>,
 }
 
 /// Receipt association, invalid after any later normal request even in the same generation.
@@ -356,6 +358,7 @@ impl ConversationStore {
                 Slot {
                     generation,
                     input_revision: 1,
+                    gateway_notice: None,
                     asset_fence: Arc::clone(&asset_fence),
                     granted: granted.to_vec(),
                     pending: 1,
@@ -363,6 +366,7 @@ impl ConversationStore {
                 },
             );
             return ConversationSeed {
+                gateway_notice: None,
                 input: ConversationInput {
                     key: key.clone(),
                     generation,
@@ -398,6 +402,7 @@ impl ConversationStore {
             |conversation| (conversation.history.clone(), conversation.cache_key.clone()),
         );
         ConversationSeed {
+            gateway_notice: slot.gateway_notice.take(),
             input: ConversationInput {
                 key: key.clone(),
                 generation: slot.generation,
@@ -417,6 +422,29 @@ impl ConversationStore {
                 granted: granted.to_vec(),
                 active: true,
             },
+        }
+    }
+
+    /// Admission closes old WhatsApp intake before the new request awaits authorization.
+    /// Existing content survives, and an absent generation is never created here.
+    pub fn invalidate_late_input(&self, key: &ConversationKey) {
+        let mut state = self.state.lock().expect("conversation store");
+        if let Some(slot) = state.slots.get_mut(key) {
+            slot.input_revision = slot
+                .input_revision
+                .checked_add(1)
+                .expect("conversation input revision space exhausted");
+        }
+    }
+
+    /// One fixed gateway question, recorded only after transport acceptance and replayed once.
+    pub fn remember_gateway_notice(&self, input: &ConversationInput, notice: &'static str) {
+        let mut state = self.state.lock().expect("conversation store");
+        if let Some(slot) = state.slots.get_mut(&input.key)
+            && slot.generation == input.generation
+            && slot.input_revision == input.revision
+        {
+            slot.gateway_notice = Some(notice);
         }
     }
 

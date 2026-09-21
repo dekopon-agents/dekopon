@@ -11,7 +11,9 @@ All notable changes to Dekopon are documented here. The format is based on
 
 - Retain freshly authorized late photo references on persistent WhatsApp routes without restarting
   a busy model/provider or starting a delayed paid run. Completion notices ask whether another
-  version is wanted; captions, cancellation, scope fences and bounded lazy retention remain explicit.
+  version is wanted and remain available as context for a reply such as “yes” only after successful
+  delivery. Stop also cancels outstanding late intake after execution completes; a new admission
+  fences old intake before authorization without deleting existing references.
 - Represent unknown chat-asset lengths honestly in model reference notes and provider listings,
   preserving known zero lengths without downloading files for metadata. Upgrade both daemons
   together for nullable asset inventory byte counts; provider WIT is unchanged.

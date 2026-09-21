@@ -63,6 +63,13 @@ struct Fixture {
 }
 impl Fixture {
     async fn new(responses: Vec<ResponseEnvelope>, turns: Vec<AssistantTurn>) -> Self {
+        Self::with_driver(responses, turns, Arc::new(RecordingDriver::default())).await
+    }
+    async fn with_driver(
+        responses: Vec<ResponseEnvelope>,
+        turns: Vec<AssistantTurn>,
+        driver: Arc<RecordingDriver>,
+    ) -> Self {
         let directory = temporary();
         let mut doc = document(directory.path());
         doc["routes"][0]["memory"] = json!({"mode":"persistent"});
@@ -77,7 +84,6 @@ impl Fixture {
             script: ModelScript::new(turns),
         });
         let runner = runner_with(broker, Arc::new(Arc::clone(&model)), 1);
-        let driver = Arc::new(RecordingDriver::default());
         let running = tokio::spawn(run_session(
             Arc::clone(&runner),
             route.clone(),
@@ -168,7 +174,7 @@ async fn late_photos_busy_retention_is_lazy_and_next_request_sees_inventory_with
     assert_eq!(f.model.script.requests(), 1);
     assert!(f.driver.replies()[0].contains("Would you like another version"));
     assert!(f.driver.replies()[0].contains("have not been downloaded"));
-    f.retain(request("use the additional photo")).await;
+    f.retain(request("yes")).await;
     assert_eq!(f.model.script.requests(), 2);
     let next = f
         .model
@@ -179,6 +185,7 @@ async fn late_photos_busy_retention_is_lazy_and_next_request_sees_inventory_with
         .collect::<Vec<_>>()
         .join("\n");
     assert!(next.contains("Chat Asset #1"));
+    assert!(next.contains("Would you like another version including the additional photos?"));
     assert!(
         !f.model
             .script
@@ -860,4 +867,352 @@ async fn late_photos_repeated_batches_keep_only_the_bounded_inventory() {
             .count(),
         1
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn late_photos_separate_acknowledgment_supplies_the_question_for_yes_without_auto_inference()
+{
+    let mut f = Fixture::new(
+        listings(3, &["cli-probe.upper"]),
+        vec![answer("Done"), answer("Next")],
+    )
+    .await;
+    let late = f.capture(photo(""));
+    f.finish().await;
+    f.retain(late).await;
+    assert_eq!(f.model.script.requests(), 1);
+    f.retain(request("yes")).await;
+    let next = f
+        .model
+        .script
+        .prompt(1)
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(next.contains("Would you like another version including the additional photos?"));
+    assert!(next.contains("Chat Asset #1"));
+    assert_eq!(f.model.script.requests(), 2);
+    assert_eq!(f.capability_requests(), 3);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn late_photos_failed_delivery_does_not_fabricate_a_followup_question_in_either_path() {
+    for separate in [false, true] {
+        let driver = Arc::new(
+            RecordingDriver::default()
+                .failing_replies_from(usize::from(separate), FailureKind::Closed),
+        );
+        let mut f = Fixture::with_driver(
+            listings(3, &["cli-probe.upper"]),
+            vec![answer("Done"), answer("Next")],
+            driver,
+        )
+        .await;
+        let late = f.capture(photo(""));
+        if separate {
+            f.finish().await;
+            f.retain(late).await;
+        } else {
+            f.retain(late).await;
+            f.finish().await;
+        }
+        f.driver = Arc::new(RecordingDriver::default());
+        f.retain(request("yes")).await;
+        let next = f
+            .model
+            .script
+            .prompt(1)
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!next.contains("Would you like another version"));
+        assert!(next.contains("Chat Asset #1"));
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn late_photos_stop_owns_parked_authorization_after_execution_ends_with_or_without_collection()
+ {
+    for collecting in [false, true] {
+        let directory = temporary();
+        let mut doc = document(directory.path());
+        doc["routes"][0]["memory"] = json!({"mode":"persistent"});
+        let config = resolved(directory.path(), &doc).await;
+        let routes =
+            Arc::new(RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).unwrap());
+        let route = routes.route(&request("make")).unwrap().clone();
+        let (broker, reached, release) = parked_broker(
+            directory.path(),
+            listings(1, &["cli-probe.upper"]),
+            listings(1, &["cli-probe.upper"]).remove(0),
+        )
+        .await;
+        let model = Arc::new(LateModel {
+            blocked: BlockedModel::new("unused"),
+            script: ModelScript::new([answer("Done")]),
+        });
+        let runner = runner_with(broker, Arc::new(Arc::clone(&model)), 1);
+        let driver = Arc::new(RecordingDriver::default());
+        // The initial reference must survive a stop aimed only at outstanding late intake.
+        let running = tokio::spawn(run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            photo("make a version"),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        ));
+        model.blocked.wait_until_entered().await;
+        let mut late = photo("");
+        late.late_photos = runner.active_sessions.late_photos(&route, &late);
+        let mut collector = burst_collector(None);
+        if collecting {
+            assert!(matches!(
+                collector.offer(0, late.clone()),
+                crate::collection::Offered::Pending
+            ));
+        }
+        let intake = tokio::spawn(run_session(
+            Arc::clone(&runner),
+            route.clone(),
+            late,
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        ));
+        tokio::time::timeout(Duration::from_secs(5), reached.notified())
+            .await
+            .unwrap();
+        model.blocked.release();
+        running.await.unwrap();
+        let drivers = BTreeMap::from([("dev".into(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
+        let mut sessions = tokio::task::JoinSet::new();
+        crate::dispatch(
+            &runner,
+            &routes,
+            &BTreeMap::new(),
+            &drivers,
+            &["stop".into()],
+            &mut sessions,
+            &mut collector,
+            request("stop"),
+        );
+        tokio::time::timeout(Duration::from_secs(5), intake)
+            .await
+            .unwrap()
+            .unwrap();
+        release.notify_one();
+        while let Some(result) = sessions.join_next().await {
+            result.unwrap();
+        }
+        assert_eq!(driver.replies(), ["Done", crate::session::STOPPED_REPLY]);
+        assert!(collector.deadline().is_none());
+        assert_eq!(model.script.requests(), 1);
+        let input = photo("");
+        let key = ConversationKey::private(
+            &route.agent,
+            "dev",
+            &input.conversation.key(),
+            &input.subject,
+        );
+        let seed = runner.conversations.begin(
+            &key,
+            &["cli-probe.upper".into()],
+            route.memory.window().unwrap(),
+            Instant::now(),
+        );
+        assert_eq!(
+            runner
+                .assets
+                .assets_for_access(&seed.assets, Vec::new(), true, Instant::now())
+                .inventory
+                .len(),
+            1
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn late_photos_stop_during_acknowledgment_suppresses_it_and_retains_registered_photos() {
+    let mut f = Fixture::new(listings(2, &["cli-probe.upper"]), vec![answer("Done")]).await;
+    let late = f.capture(photo(""));
+    f.finish().await;
+    let driver = Arc::new(ParkedReplyDriver::default());
+    let intake = tokio::spawn(run_session(
+        Arc::clone(&f.runner),
+        f.route.clone(),
+        late,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    tokio::time::timeout(Duration::from_secs(5), driver.delivering.notified())
+        .await
+        .unwrap();
+    let input = photo("");
+    let mut stop = CancelRequest {
+        transport: "dev".into(),
+        conversation_id: input.conversation.key(),
+        subject: "whatsapp.16034700183".into(),
+        via: CancelVia::NativeStop,
+    };
+    assert_eq!(
+        f.runner.active_sessions.cancel(&stop),
+        CancelOutcome::NoSession
+    );
+    assert!(
+        !intake.is_finished(),
+        "other sender cannot stop this intake"
+    );
+    stop.subject = input.subject.canonical();
+    assert_eq!(
+        f.runner.active_sessions.cancel(&stop),
+        CancelOutcome::Cancelled
+    );
+    tokio::time::timeout(Duration::from_secs(5), driver.delivering.notified())
+        .await
+        .unwrap();
+    driver.release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), intake)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(driver.delivered(), [crate::session::STOPPED_REPLY]);
+    assert_eq!(f.inventory().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn late_photos_new_admission_fences_old_intake_while_new_authorization_is_parked() {
+    let directory = temporary();
+    let socket = directory.path().join("broker.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (entered, released) = (Arc::clone(&reached), Arc::clone(&release));
+    let broker_task = tokio::spawn(async move {
+        let mut calls = tokio::task::JoinSet::new();
+        for index in 0..3 {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (entered, released) = (Arc::clone(&entered), Arc::clone(&released));
+            calls.spawn(async move {
+                let mut stream = dekopon_broker_protocol::DescriptorStream::new(stream);
+                let (request, _) = stream
+                    .read_frame::<RequestEnvelope>(FrameLimits::default())
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    request.request,
+                    BrokerRequest::Capabilities { .. }
+                ));
+                if index == 1 {
+                    entered.notify_one();
+                    released.notified().await;
+                }
+                stream
+                    .write_frame(
+                        &listings(1, &["cli-probe.upper"]).remove(0),
+                        &[],
+                        FrameLimits::default(),
+                    )
+                    .await
+                    .unwrap();
+            });
+        }
+        while let Some(call) = calls.join_next().await {
+            call.unwrap();
+        }
+    });
+    let broker = ResolvedBroker {
+        socket_path: socket,
+        server_uid: crate::current_uid(),
+        frame: FrameLimits::default(),
+    };
+    let model = Arc::new(LateModel {
+        blocked: BlockedModel::new("unused"),
+        script: ModelScript::new([answer("A done"), answer("B done")]),
+    });
+    let runner = runner_with(broker, Arc::new(Arc::clone(&model)), 1);
+    let mut config = model_config();
+    if let ModelConfig::OpenaiCompatible { modalities, .. } = &mut config {
+        *modalities = vec![crate::config::Modality::Image];
+    }
+    let route = persistent_route(config, window());
+    let driver = Arc::new(RecordingDriver::default());
+    let a = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        photo("A"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    model.blocked.wait_until_entered().await;
+    let mut old = photo("");
+    old.late_photos = runner.active_sessions.late_photos(&route, &old);
+    assert!(old.late_photos.is_some());
+    model.blocked.release();
+    a.await.unwrap();
+    let b = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        request("B"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    tokio::time::timeout(Duration::from_secs(5), reached.notified())
+        .await
+        .unwrap();
+    run_session(
+        Arc::clone(&runner),
+        route,
+        old,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    assert_eq!(model.script.requests(), 1);
+    assert!(driver.replies()[1].contains("not retained"));
+    release.notify_one();
+    b.await.unwrap();
+    broker_task.await.unwrap();
+    let prompt = model
+        .script
+        .prompt(1)
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        prompt.contains("Chat Asset #1"),
+        "old registered content must survive admission"
+    );
+    assert!(
+        !prompt.contains("Chat Asset #2"),
+        "A cannot publish new references during B's auth"
+    );
+    assert!(!prompt.contains("Would you like another version"));
+    assert_eq!(driver.replies()[2], "B done");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn late_photos_flushed_unpolled_intake_already_has_authenticated_stop_ownership() {
+    let mut f = Fixture::new(listings(1, &["cli-probe.upper"]), vec![answer("Done")]).await;
+    let input = f.capture(photo(""));
+    f.finish().await;
+    let pending = run_session(
+        Arc::clone(&f.runner),
+        f.route.clone(),
+        input.clone(),
+        Arc::clone(&f.driver) as Arc<dyn ChatDriver>,
+    );
+    let stale = input;
+    let input = photo("");
+    let stop = CancelRequest {
+        transport: "dev".into(),
+        conversation_id: input.conversation.key(),
+        subject: input.subject.canonical(),
+        via: CancelVia::StopReply,
+    };
+    assert_eq!(
+        f.runner.active_sessions.cancel(&stop),
+        CancelOutcome::Cancelled
+    );
+    pending.await;
+    f.retain(stale).await;
+    assert_eq!(f.driver.replies(), ["Done", crate::session::STOPPED_REPLY]);
+    assert_eq!(f.model.script.requests(), 1);
+    assert_eq!(f.capability_requests(), 1);
 }

@@ -9,7 +9,7 @@ use dekopon_broker_protocol::ChatTransportKind;
 const RETAINED_REPLY: &str = "Additional photo references received during the request are now in this conversation's temporary inventory. They have not been downloaded by this intake step. Would you like another version including the additional photos?";
 const FAILED_RETAINED_REPLY: &str = "Additional photo references received during the request are now in this conversation's temporary inventory. They have not been downloaded by this intake step. The request did not complete successfully; send a new request if you want to use these photos.";
 const EXPIRED_REPLY: &str = "Additional photos arrived during the request, but their references are no longer available in this conversation. Please send them again with your next request.";
-const REFUSED_REPLY: &str = "The additional photos were not retained for this request. Please send them again with your next request.";
+pub(super) const REFUSED_REPLY: &str = "The additional photos were not retained for this request. Please send them again with your next request.";
 
 #[derive(Clone)]
 pub(crate) struct LatePhotos {
@@ -61,6 +61,7 @@ struct State {
     conversation: ConversationKey,
     native_conversation: dekopon_broker_protocol::Conversation,
     pending_notice: bool,
+    intake_stopped: bool,
     reply: ReplyTarget,
     persistent: bool,
     transport_kind: ChatTransportKind,
@@ -94,14 +95,155 @@ impl LatePhotoReceipt {
         route: &BoundRoute,
         message: &InboundMessage,
         driver: &Arc<dyn ChatDriver>,
+        intake: &LateIntake,
     ) -> &'static str {
-        match self {
-            Self::Run(run) => run.retain(runner, route, message, driver).await,
-            Self::HistoryUnavailable => {
-                answer(driver, message, REFUSED_REPLY).await;
-                "late-history-unavailable"
+        let operation = async {
+            match self {
+                Self::Run(run) => run.retain(runner, route, message, driver, intake).await,
+                Self::HistoryUnavailable => {
+                    answer(driver, message, REFUSED_REPLY).await;
+                    "late-history-unavailable"
+                }
+            }
+        };
+        let outcome = tokio::select! {
+            biased;
+            () = intake.control.cancellation.cancelled() => "stopped",
+            () = async {
+                match self {
+                    Self::Run(run) => run.cancellation.cancelled().await,
+                    Self::HistoryUnavailable => std::future::pending().await,
+                }
+            } => "stopped",
+            outcome = operation => outcome,
+        };
+        if intake.control.cancellation.is_cancelled() {
+            intake.stopped(driver, message).await
+        } else {
+            outcome
+        }
+    }
+}
+
+/// One entry per admitted metadata operation; permits bound both entries and broker connections.
+#[derive(Clone, Default)]
+pub(super) struct LateIntakes {
+    entries: Arc<Mutex<Vec<Arc<IntakeControl>>>>,
+}
+
+struct IntakeControl {
+    key: ActiveSessionKey,
+    run: Option<LatePhotos>,
+    subject: dekopon_core::ExternalSubject,
+    cancellation: SessionCancellation,
+    gate: Mutex<()>,
+    announce_stop: std::sync::atomic::AtomicBool,
+}
+
+pub(super) struct LateIntake {
+    control: Arc<IntakeControl>,
+    registry: LateIntakes,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl LateIntakes {
+    pub(super) fn register(
+        &self,
+        gate: &SessionGate,
+        message: &InboundMessage,
+    ) -> Option<LateIntake> {
+        let permit = Arc::clone(&gate.late_permits).try_acquire_owned().ok()?;
+        let control = Arc::new(IntakeControl {
+            run: match &message.late_photos {
+                Some(LatePhotoReceipt::Run(run)) => Some(run.clone()),
+                _ => None,
+            },
+            key: (message.transport.clone(), message.conversation.key()),
+            subject: message.subject.clone(),
+            cancellation: SessionCancellation::new(),
+            gate: Mutex::new(()),
+            announce_stop: std::sync::atomic::AtomicBool::new(false),
+        });
+        self.entries
+            .lock()
+            .expect("late intake registry")
+            .push(Arc::clone(&control));
+        Some(LateIntake {
+            control,
+            registry: self.clone(),
+            _permit: permit,
+        })
+    }
+
+    pub(super) fn cancel(
+        &self,
+        request: &CancelRequest,
+        execution: CancelOutcome,
+    ) -> CancelOutcome {
+        let entries = self.entries.lock().expect("late intake registry");
+        let mut owned = false;
+        let mut cancelled = false;
+        let mut announce = !matches!(
+            execution,
+            CancelOutcome::Cancelled | CancelOutcome::AlreadyCancelled
+        );
+        for control in entries.iter().filter(|control| {
+            control.key.0 == request.transport
+                && control.key.1 == request.conversation_id
+                && control.subject.canonical() == request.subject
+        }) {
+            owned = true;
+            // Stop and synchronous metadata publication have one linearization boundary.
+            let _gate = control.gate.lock().expect("late intake cancellation gate");
+            if !control.cancellation.is_cancelled() {
+                if let Some(run) = &control.run {
+                    run.inner.lock().expect("late photo state").intake_stopped = true;
+                }
+                control.announce_stop.store(announce, Ordering::Release);
+                if control
+                    .cancellation
+                    .cancel(CancelSource::User { via: request.via })
+                {
+                    cancelled = true;
+                    announce = false;
+                }
             }
         }
+        if matches!(
+            execution,
+            CancelOutcome::Cancelled | CancelOutcome::AlreadyCancelled
+        ) {
+            execution
+        } else if cancelled {
+            CancelOutcome::Cancelled
+        } else if owned {
+            CancelOutcome::AlreadyCancelled
+        } else {
+            execution
+        }
+    }
+}
+
+impl Drop for LateIntake {
+    fn drop(&mut self) {
+        self.registry
+            .entries
+            .lock()
+            .expect("late intake registry")
+            .retain(|entry| !Arc::ptr_eq(entry, &self.control));
+    }
+}
+
+impl LateIntake {
+    async fn stopped(
+        &self,
+        driver: &Arc<dyn ChatDriver>,
+        message: &InboundMessage,
+    ) -> &'static str {
+        if self.control.announce_stop.swap(false, Ordering::AcqRel) {
+            answer(driver, message, STOPPED_REPLY).await;
+        }
+        "stopped"
     }
 }
 
@@ -199,6 +341,7 @@ impl LatePhotos {
                 conversation: conversation_key(route, message),
                 native_conversation: message.conversation.clone(),
                 pending_notice: false,
+                intake_stopped: false,
                 reply: message.reply.clone(),
                 persistent: route.memory.window().is_some(),
                 transport_kind: message.transport_kind,
@@ -244,16 +387,14 @@ impl LatePhotos {
         route: &BoundRoute,
         message: &InboundMessage,
         driver: &Arc<dyn ChatDriver>,
+        intake: &LateIntake,
     ) -> &'static str {
-        if self.cancellation.is_cancelled() {
+        if self.cancellation.is_cancelled()
+            || intake.control.cancellation.is_cancelled()
+            || self.inner.lock().expect("late photo state").intake_stopped
+        {
             return "stopped";
         }
-        // Separate from execution admission: a busy model cannot exclude content, but neither
-        // can a flood of metadata-only inputs create unlimited broker connections.
-        let Ok(_permit) = runner.gate.late_permits.try_acquire() else {
-            answer(driver, message, REFUSED_REPLY).await;
-            return "late-busy";
-        };
         let leg = match connect(runner, route, message).await {
             Ok(leg) => leg,
             Err(error) => {
@@ -270,8 +411,16 @@ impl LatePhotos {
         };
         let granted = leg.granted();
         let result = {
+            let _gate = intake
+                .control
+                .gate
+                .lock()
+                .expect("late intake cancellation gate");
             let mut state = self.inner.lock().expect("late photo state");
-            if self.cancellation.is_cancelled() {
+            if self.cancellation.is_cancelled()
+                || intake.control.cancellation.is_cancelled()
+                || state.intake_stopped
+            {
                 return "stopped";
             }
             Self::register(&mut state, runner, route, message, &granted)
@@ -283,6 +432,7 @@ impl LatePhotos {
                     return "stopped";
                 }
                 if answer(driver, message, notice(ending)).await {
+                    self.remember_notice(&runner.conversations, notice(ending));
                     "late-acknowledged"
                 } else {
                     "late-reply-failed"
@@ -367,7 +517,14 @@ impl LatePhotos {
         Ok(state.ending)
     }
 
-    pub(super) fn finish(&self, assets: &AssetStore, succeeded: bool) -> Option<String> {
+    pub(super) fn remember_notice(&self, conversations: &ConversationStore, notice: &'static str) {
+        let state = self.inner.lock().expect("late photo state");
+        if let Some(scope) = &state.scope {
+            conversations.remember_gateway_notice(&scope.input, notice);
+        }
+    }
+
+    pub(super) fn finish(&self, assets: &AssetStore, succeeded: bool) -> Option<&'static str> {
         let mut state = self.inner.lock().expect("late photo state");
         state.ending = if succeeded {
             Ending::Answered
@@ -376,7 +533,7 @@ impl LatePhotos {
         };
         let ids = std::mem::take(&mut state.ids);
         let pending_notice = std::mem::take(&mut state.pending_notice);
-        if self.cancellation.is_cancelled() {
+        if self.cancellation.is_cancelled() || state.intake_stopped {
             return None;
         }
         let scope = state.scope.as_ref()?;
@@ -392,8 +549,7 @@ impl LatePhotos {
                 notice(state.ending)
             } else {
                 EXPIRED_REPLY
-            }
-            .to_owned(),
+            },
         )
     }
 }
