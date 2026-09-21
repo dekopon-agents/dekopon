@@ -1216,3 +1216,162 @@ async fn late_photos_flushed_unpolled_intake_already_has_authenticated_stop_owne
     assert_eq!(f.model.script.requests(), 1);
     assert_eq!(f.capability_requests(), 1);
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn late_photos_delivered_ack_during_next_authorization_enters_that_prompt() {
+    let directory = temporary();
+    let (broker, reached, release) = parked_broker(
+        directory.path(),
+        listings(2, &["cli-probe.upper"]),
+        listings(1, &["cli-probe.upper"]).remove(0),
+    )
+    .await;
+    let model = Arc::new(LateModel {
+        blocked: BlockedModel::new("unused"),
+        script: ModelScript::new([answer("A done"), answer("B done")]),
+    });
+    let runner = runner_with(broker, Arc::new(Arc::clone(&model)), 1);
+    let mut config = model_config();
+    if let ModelConfig::OpenaiCompatible { modalities, .. } = &mut config {
+        *modalities = vec![crate::config::Modality::Image];
+    }
+    let route = persistent_route(config, window());
+    let driver = Arc::new(RecordingDriver::default());
+    let a = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        request("A"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    model.blocked.wait_until_entered().await;
+    let mut old = photo("");
+    old.late_photos = runner.active_sessions.late_photos(&route, &old);
+    model.blocked.release();
+    a.await.unwrap();
+    let ack_driver = Arc::new(ParkedReplyDriver::default());
+    let ack = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        old,
+        Arc::clone(&ack_driver) as Arc<dyn ChatDriver>,
+    ));
+    tokio::time::timeout(Duration::from_secs(5), ack_driver.delivering.notified())
+        .await
+        .unwrap();
+    let b = tokio::spawn(run_session(
+        Arc::clone(&runner),
+        route,
+        request("yes"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    ));
+    tokio::time::timeout(Duration::from_secs(5), reached.notified())
+        .await
+        .unwrap();
+    ack_driver.release.notify_one();
+    ack.await.unwrap();
+    assert!(ack_driver.delivered()[0].contains("Would you like another version"));
+    assert_eq!(
+        model.script.requests(),
+        1,
+        "notice does not start inference"
+    );
+    release.notify_one();
+    b.await.unwrap();
+    let prompt = model
+        .script
+        .prompt(1)
+        .into_iter()
+        .map(|(_, text)| text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(prompt.contains("Would you like another version including the additional photos?"));
+    assert!(prompt.contains("Chat Asset #1"));
+    assert!(prompt.contains("yes"));
+    assert_eq!(model.script.requests(), 2);
+}
+
+#[test]
+fn late_photos_notice_context_is_fenced_after_prompt_seed_or_generation_replacement() {
+    for replace in [false, true] {
+        let store = ConversationStore::new(1);
+        let input = photo("");
+        let key = ConversationKey::private(
+            &"reviewer".parse().unwrap(),
+            "dev",
+            &input.conversation.key(),
+            &input.subject,
+        );
+        let granted = vec!["cli-probe.upper".into()];
+        let first = store.begin(&key, &granted, window(), Instant::now());
+        let old = first.input.clone();
+        first.lease.commit(
+            window(),
+            ConversationTurn::unanswered("A"),
+            &first.cache_key,
+            Instant::now(),
+        );
+        store.invalidate_late_input(&key);
+        if replace {
+            store.remove(&key, EvictionReason::GrantChanged);
+        }
+        let second = store.begin(&key, &granted, window(), Instant::now());
+        assert!(second.gateway_notice.is_none());
+        store.remember_gateway_notice(&old, "This old question must not appear after B seeded.");
+        second.lease.commit(
+            window(),
+            ConversationTurn::unanswered("B"),
+            &second.cache_key,
+            Instant::now(),
+        );
+        let third = store.begin(&key, &granted, window(), Instant::now());
+        assert!(third.gateway_notice.is_none());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn late_photos_saturated_unpolled_intake_never_replies_after_origin_stop() {
+    for execution_completed in [false, true] {
+        let mut f = Fixture::new(listings(1, &["cli-probe.upper"]), vec![answer("Done")]).await;
+        let input = f.capture(photo(""));
+        if execution_completed {
+            f.finish().await;
+        }
+        let holding = run_session(
+            Arc::clone(&f.runner),
+            f.route.clone(),
+            input.clone(),
+            Arc::clone(&f.driver) as Arc<dyn ChatDriver>,
+        );
+        let rejected = run_session(
+            Arc::clone(&f.runner),
+            f.route.clone(),
+            input,
+            Arc::clone(&f.driver) as Arc<dyn ChatDriver>,
+        );
+        let input = photo("");
+        let stop = CancelRequest {
+            transport: "dev".into(),
+            conversation_id: input.conversation.key(),
+            subject: input.subject.canonical(),
+            via: CancelVia::StopReply,
+        };
+        assert_eq!(
+            f.runner.active_sessions.cancel(&stop),
+            CancelOutcome::Cancelled
+        );
+        if !execution_completed {
+            f.finish().await;
+        }
+        holding.await;
+        let stopped = f.driver.replies();
+        assert_eq!(stopped.last().unwrap(), crate::session::STOPPED_REPLY);
+        rejected.await;
+        assert_eq!(
+            f.driver.replies(),
+            stopped,
+            "permit refusal cannot add a post-Stop resend notice"
+        );
+        assert_eq!(f.capability_requests(), 1);
+        assert_eq!(f.model.script.requests(), 1);
+    }
+}

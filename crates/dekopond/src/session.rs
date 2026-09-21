@@ -698,6 +698,9 @@ async fn execute(
 
     if let Some(late) = &message.late_photos {
         let Some(intake) = intake else {
+            if late.is_stopped() {
+                return "stopped";
+            }
             answer(&driver, &message, late_photos::REFUSED_REPLY).await;
             return "late-busy";
         };

@@ -115,6 +115,7 @@ struct Slot {
     /// Globally non-reused token fencing leases and attachment state issued by this generation.
     generation: u64,
     input_revision: u64,
+    seed_revision: u64,
     gateway_notice: Option<&'static str>,
     /// Closed on every replacement/removal so stale sessions cannot publish or fetch assets.
     asset_fence: Arc<AssetFence>,
@@ -159,6 +160,7 @@ pub(crate) struct ConversationInput {
     key: ConversationKey,
     generation: u64,
     revision: u64,
+    seed_revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -358,6 +360,7 @@ impl ConversationStore {
                 Slot {
                     generation,
                     input_revision: 1,
+                    seed_revision: 1,
                     gateway_notice: None,
                     asset_fence: Arc::clone(&asset_fence),
                     granted: granted.to_vec(),
@@ -371,6 +374,7 @@ impl ConversationStore {
                     key: key.clone(),
                     generation,
                     revision: 1,
+                    seed_revision: 1,
                 },
                 history: History::new(window.limits),
                 cache_key: cache_key::for_conversation(),
@@ -393,6 +397,10 @@ impl ConversationStore {
             .input_revision
             .checked_add(1)
             .expect("conversation input revision space exhausted");
+        slot.seed_revision = slot
+            .seed_revision
+            .checked_add(1)
+            .expect("conversation seed revision space exhausted");
         slot.pending = slot
             .pending
             .checked_add(1)
@@ -407,6 +415,7 @@ impl ConversationStore {
                 key: key.clone(),
                 generation: slot.generation,
                 revision: slot.input_revision,
+                seed_revision: slot.seed_revision,
             },
             history,
             cache_key,
@@ -437,12 +446,13 @@ impl ConversationStore {
         }
     }
 
-    /// One fixed gateway question, recorded only after transport acceptance and replayed once.
+    /// Delivery may finish during the next request's authorization, but not after it seeds.
+    /// Admission closes asset intake; prompt seeding separately consumes delivered context.
     pub fn remember_gateway_notice(&self, input: &ConversationInput, notice: &'static str) {
         let mut state = self.state.lock().expect("conversation store");
         if let Some(slot) = state.slots.get_mut(&input.key)
             && slot.generation == input.generation
-            && slot.input_revision == input.revision
+            && slot.seed_revision == input.seed_revision
         {
             slot.gateway_notice = Some(notice);
         }

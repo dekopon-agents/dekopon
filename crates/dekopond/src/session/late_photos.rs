@@ -78,6 +78,16 @@ pub(crate) enum LatePhotoReceipt {
 }
 
 impl LatePhotoReceipt {
+    pub(super) fn is_stopped(&self) -> bool {
+        match self {
+            Self::Run(run) => {
+                run.cancellation.is_cancelled()
+                    || run.inner.lock().expect("late photo state").intake_stopped
+            }
+            Self::HistoryUnavailable => false,
+        }
+    }
+
     pub(crate) fn same_batch(left: Option<&Self>, right: Option<&Self>) -> bool {
         match (left, right) {
             (None, None) => true,
@@ -117,10 +127,10 @@ impl LatePhotoReceipt {
             } => "stopped",
             outcome = operation => outcome,
         };
-        if intake.control.cancellation.is_cancelled() {
-            intake.stopped(driver, message).await
-        } else {
+        if intake.claim_completion() {
             outcome
+        } else {
+            intake.stopped(driver, message).await
         }
     }
 }
@@ -181,7 +191,8 @@ impl LateIntakes {
         execution: CancelOutcome,
     ) -> CancelOutcome {
         let entries = self.entries.lock().expect("late intake registry");
-        let mut owned = false;
+        let mut already_cancelled = false;
+        let mut completing = false;
         let mut cancelled = false;
         let mut announce = !matches!(
             execution,
@@ -192,21 +203,22 @@ impl LateIntakes {
                 && control.key.1 == request.conversation_id
                 && control.subject.canonical() == request.subject
         }) {
-            owned = true;
-            // Stop and synchronous metadata publication have one linearization boundary.
+            // Publication, terminal arbitration and Stop share one linearization boundary.
             let _gate = control.gate.lock().expect("late intake cancellation gate");
-            if !control.cancellation.is_cancelled() {
+            if control
+                .cancellation
+                .cancel(CancelSource::User { via: request.via })
+            {
                 if let Some(run) = &control.run {
                     run.inner.lock().expect("late photo state").intake_stopped = true;
                 }
                 control.announce_stop.store(announce, Ordering::Release);
-                if control
-                    .cancellation
-                    .cancel(CancelSource::User { via: request.via })
-                {
-                    cancelled = true;
-                    announce = false;
-                }
+                cancelled = true;
+                announce = false;
+            } else if control.cancellation.is_cancelled() {
+                already_cancelled = true;
+            } else {
+                completing = true;
             }
         }
         if matches!(
@@ -216,8 +228,10 @@ impl LateIntakes {
             execution
         } else if cancelled {
             CancelOutcome::Cancelled
-        } else if owned {
+        } else if already_cancelled {
             CancelOutcome::AlreadyCancelled
+        } else if completing {
+            CancelOutcome::Completing
         } else {
             execution
         }
@@ -235,6 +249,15 @@ impl Drop for LateIntake {
 }
 
 impl LateIntake {
+    fn claim_completion(&self) -> bool {
+        let _gate = self
+            .control
+            .gate
+            .lock()
+            .expect("late intake cancellation gate");
+        self.control.cancellation.claim_completion()
+    }
+
     async fn stopped(
         &self,
         driver: &Arc<dyn ChatDriver>,
@@ -590,5 +613,110 @@ mod tests {
         );
         assert!(text.len() <= crate::transport::MAX_OUTBOUND_TEXT_BYTES);
         assert!(text.ends_with(FAILED_RETAINED_REPLY));
+    }
+    #[tokio::test]
+    async fn late_photos_completion_and_stop_elect_exactly_one_owner_for_cancelled_collection() {
+        use crate::collection::{Collector, Offered};
+        use dekopon_broker_protocol::{Conversation, ConversationKind};
+        use dekopon_test_support::RecordingDriver;
+        for completion_wins in [false, true] {
+            let subject = dekopon_core::ExternalSubject::whatsapp("16034700182").unwrap();
+            let native = Conversation {
+                kind: ConversationKind::DirectMessage,
+                container: Some("123:456".into()),
+                id: "16034700182".into(),
+                thread: None,
+            };
+            let reply = ReplyTarget::WhatsApp {
+                recipient: "16034700182".into(),
+            };
+            let run = LatePhotos {
+                inner: Arc::new(Mutex::new(State {
+                    route_key: "test-route".into(),
+                    subject: subject.clone(),
+                    conversation: ConversationKey::private(
+                        &"reviewer".parse().unwrap(),
+                        "dev",
+                        &native.key(),
+                        &subject,
+                    ),
+                    native_conversation: native.clone(),
+                    pending_notice: false,
+                    intake_stopped: false,
+                    reply: reply.clone(),
+                    persistent: true,
+                    transport_kind: ChatTransportKind::Whatsapp,
+                    scope: None,
+                    ids: Vec::new(),
+                    ending: Ending::Answered,
+                })),
+                cancellation: SessionCancellation::new(),
+            };
+            assert!(run.cancellation.claim_completion());
+            let message = InboundMessage {
+                transport: "dev".into(),
+                transport_kind: ChatTransportKind::Whatsapp,
+                subject: subject.clone(),
+                conversation: native.clone(),
+                message_id: "wamid.test".into(),
+                text: String::new(),
+                assets: vec![asset::PendingAsset {
+                    name: "photo.png".into(),
+                    mime: "image/png".into(),
+                    size: None,
+                    source: None,
+                }],
+                asset_overflow: false,
+                addressed: None,
+                thread_continuation: None,
+                reply,
+                liveness: None,
+                receive_span: tracing::Span::none(),
+                received_at: tokio::time::Instant::now(),
+                native_group: None,
+                constituents: Vec::new(),
+                late_photos: Some(LatePhotoReceipt::Run(run.clone())),
+            };
+            let config = serde_json::from_value(serde_json::json!({"kind":"whatsappCloudApi", "name":"dev", "appSecretEnv":"APP", "verifyTokenEnv":"VERIFY", "accessTokenEnv":"ACCESS", "bind":"127.0.0.1:9080", "callbackPath":"/wa", "wabaId":"123", "phoneNumberId":"456", "graphApiVersion":"v25.0"})).unwrap();
+            let mut collector = Collector::new(&[config], 1);
+            assert!(matches!(
+                collector.offer(0, message.clone()),
+                Offered::Pending
+            ));
+            let active = ActiveSessions::new(1);
+            let intake = active
+                .intakes
+                .register(&SessionGate::new(1), &message)
+                .unwrap();
+            if completion_wins {
+                assert!(intake.claim_completion());
+            }
+            // Keep the finalized control registered to expose the original check-before-Drop gap.
+            let stop = CancelRequest {
+                transport: "dev".into(),
+                conversation_id: native.key(),
+                subject: subject.canonical(),
+                via: dekopon_agent::CancelVia::StopReply,
+            };
+            assert!(collector.cancel(&stop));
+            let outcome = active.cancel(&stop);
+            let driver = Arc::new(RecordingDriver::default());
+            let courier = Arc::clone(&driver) as Arc<dyn ChatDriver>;
+            if completion_wins {
+                assert_eq!(outcome, CancelOutcome::Completing);
+                assert!(!run.inner.lock().unwrap().intake_stopped);
+                assert!(!intake.control.announce_stop.load(Ordering::Acquire));
+                // Dispatch owns the removed batch's stopped ending when intake is completing.
+                assert!(answer(&courier, &message, STOPPED_REPLY).await);
+                assert!(intake.claim_completion());
+            } else {
+                assert_eq!(outcome, CancelOutcome::Cancelled);
+                assert!(run.inner.lock().unwrap().intake_stopped);
+                assert!(!intake.claim_completion());
+                intake.stopped(&courier, &message).await;
+            }
+            assert_eq!(driver.replies(), [STOPPED_REPLY]);
+            assert!(collector.deadline().is_none());
+        }
     }
 }

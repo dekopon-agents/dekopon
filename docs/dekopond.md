@@ -348,7 +348,9 @@ it does not assert which photos a provider used, that bytes were downloaded, or 
 If debounce or authorization finishes after the completion snapshot, that batch receives a separate
 acknowledgment instead, never both notices. Only after successful transport acceptance, one bounded
 gateway follow-up context is saved for the next authorized prompt, so a reply such as “yes” includes
-the question being answered alongside retained asset references. Failed delivery records no such
+the question being answered alongside retained asset references. Asset intake closes at admission;
+a previously admitted notice may still finish delivery during that request's authorization, until
+its prompt is seeded. Seeding or generation replacement fences further old notice context. Failed delivery records no such
 question. Failed requests get neutral failure wording. Expired
 references are not described as retained. Normal next requests see still-retained references.
 
@@ -358,7 +360,10 @@ request completes; previously collected photos remain intact. Cancellation disca
 input and suppresses added notices, but does not delete references already registered solely
 because of the stop. A flushed intake owns authenticated Stop handling from dispatch through its
 broker listing and acknowledgment, even after the original execution completes. One intake owns
-the stopped acknowledgment when no execution does; Stop does not become a model request. An
+the stopped acknowledgment when no execution does; Stop does not become a model request. Intake
+completion and cancellation arbitrate atomically before registration is released; a completing
+intake cannot claim the stopped acknowledgment for another removed collection. Saturated intake
+also suppresses its refusal when its originating run has already stopped. An
 already transmitted transport operation cannot be rolled back. Shutdown still discards pending collection. One-shot routes and other
 transports keep their existing behavior.
 

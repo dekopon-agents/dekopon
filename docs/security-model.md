@@ -190,8 +190,10 @@ registration additionally requires that run's still-current conversation generat
 grant set. A later normal request closes the old intake revision at admission, before awaiting
 authorization, without deleting existing assets. Flushed intake has its own bounded, authenticated
 cancel ownership through authorization and acknowledgment after the execution ends. A successfully
-delivered gateway follow-up question is retained once in the matching generation for the next
-prompt; failed delivery creates no claimed conversation context. Bounded completed-run intervals
+delivered gateway follow-up question is retained once in the matching generation until the next
+prompt seeds, independently of the earlier asset-intake admission fence. Failed delivery or a
+notice arriving after that seed creates no claimed conversation context. Intake completion and
+cancellation share terminal arbitration; only successful cancellation elects a stopped owner. Bounded completed-run intervals
 and a conservative eviction watermark prevent delayed receipts from becoming new paid requests.
 Only metadata is retained; the usual generation fence, inventory ceilings and lazy byte limits
 remain. A completion notice is transport text, not asset.send authority.
