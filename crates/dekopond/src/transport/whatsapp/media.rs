@@ -11,7 +11,7 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use super::*;
 
 /// Conservative decimal interpretation of Meta's image-specific 5 MB ceiling.
-pub(super) const MAX_IMAGE_BYTES: usize = 5_000_000;
+pub(crate) const MAX_IMAGE_BYTES: usize = 5_000_000;
 pub(super) const MAX_CAPTION_CHARS: usize = 1024;
 const DOWNLOAD_HOST: &str = "lookaside.fbsbx.com";
 const DOWNLOAD_PATH: &str = "/whatsapp_business/attachments/";

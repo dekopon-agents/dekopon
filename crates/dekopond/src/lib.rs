@@ -178,7 +178,7 @@ where
         asset_fetchers,
         liveness: config.liveness.clone(),
         thread_ownership,
-        active_sessions: session::ActiveSessions::default(),
+        active_sessions: session::ActiveSessions::new(config.sessions.max_concurrent),
     });
 
     tracing::info!(
@@ -368,9 +368,9 @@ fn dispatch(
     stop_words: &[String],
     sessions: &mut JoinSet<()>,
     collector: &mut collection::Collector,
-    message: InboundMessage,
+    mut message: InboundMessage,
 ) {
-    let Some((route_id, _route)) = routes.route_index(&message) else {
+    let Some((route_id, route)) = routes.route_index(&message) else {
         // Bots see ambient traffic. Silence is the correct answer, and debug level keeps a busy
         // channel from becoming the daemon's log volume. The conversation rides along because
         // "why did the bot not answer in here" is answered by which kind and which container the
@@ -468,6 +468,7 @@ fn dispatch(
         );
         return;
     }
+    message.late_photos = runner.active_sessions.late_photos(route, &message);
     match collector.offer(route_id, message) {
         collection::Offered::Pending => {}
         collection::Offered::Immediate(message) => {
@@ -479,6 +480,8 @@ fn dispatch(
                 let receipt = message.receive_span.clone();
                 sessions.spawn(async move {
                     let reply = match reason {
+                        "late-instructions" => "Your instruction was not processed. Please send it after the current request completes; the earlier photos are still being collected.",
+                        "different-run" => "This input was not processed because another request's photos are still being collected. Please send it separately after that request completes.",
                         "collection-full" => "Busy collecting other requests. Please try again shortly.",
                         "incompatible-group" => "Another media group is still being collected. Please retry this group separately.",
                         "deadline-overflow" => "Input refused: the configured media collection deadline cannot be represented.",

@@ -312,6 +312,16 @@ impl AssetStore {
         }
     }
 
+    pub(crate) fn retention_enabled(&self) -> bool {
+        self.conversations > 0
+            && self
+                .retention
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .budget
+                > 0
+    }
+
     /// Registers what one message carried and reports what a one-shot model may be shown.
     ///
     /// One-shot routes have no transcript generation. Their attachment state keeps its historical

@@ -233,6 +233,7 @@ impl ModelCache {
 /// person does when a bot seems slow and they send the same thing again.
 pub(crate) struct SessionGate {
     permits: Arc<Semaphore>,
+    late_permits: Semaphore,
     in_flight: Arc<Mutex<BTreeSet<AdmissionKey>>>,
 }
 
@@ -240,6 +241,7 @@ impl SessionGate {
     pub fn new(max_concurrent: usize) -> Self {
         Self {
             permits: Arc::new(Semaphore::new(max_concurrent)),
+            late_permits: Semaphore::new(max_concurrent),
             in_flight: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
@@ -412,10 +414,15 @@ impl Drop for CancellationOnDrop {
     }
 }
 
+mod late_photos;
+pub(crate) use late_photos::{LatePhotoReceipt, LatePhotos};
+
 type ActiveSessionKey = (String, String);
 
 #[derive(Clone)]
 struct ActiveSession {
+    started_at: tokio::time::Instant,
+    late_photos: LatePhotos,
     subject: dekopon_core::ExternalSubject,
     cancellation: SessionCancellation,
 }
@@ -459,19 +466,31 @@ impl CancelOutcome {
 /// Every session registers, not only the ones on a transport with a native Stop control: the stop
 /// word and the wall-clock bound reach a session through this registry, and they exist on every
 /// transport.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct ActiveSessions {
     entries: Arc<Mutex<HashMap<ActiveSessionKey, ActiveSession>>>,
+    recent: Arc<Mutex<late_photos::RecentSessions>>,
 }
 
 impl ActiveSessions {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            entries: Arc::default(),
+            recent: Arc::new(Mutex::new(late_photos::RecentSessions::new(capacity))),
+        }
+    }
+
     fn register(
         &self,
         message: &InboundMessage,
+        route: &BoundRoute,
         cancellation: SessionCancellation,
     ) -> ActiveRegistration {
         let key = (message.transport.clone(), message.conversation.key());
+        let late_photos = LatePhotos::new(route, message, cancellation.clone());
         let session = ActiveSession {
+            started_at: tokio::time::Instant::now(),
+            late_photos: late_photos.clone(),
             subject: message.subject.clone(),
             cancellation: cancellation.clone(),
         };
@@ -493,6 +512,8 @@ impl ActiveSessions {
             }
         };
         ActiveRegistration {
+            recent: Arc::clone(&self.recent),
+            late_photos,
             entries: Arc::clone(&self.entries),
             key,
             cancellation,
@@ -531,6 +552,8 @@ impl ActiveSessions {
 }
 
 struct ActiveRegistration {
+    recent: Arc<Mutex<late_photos::RecentSessions>>,
+    late_photos: LatePhotos,
     entries: Arc<Mutex<HashMap<ActiveSessionKey, ActiveSession>>>,
     key: ActiveSessionKey,
     cancellation: SessionCancellation,
@@ -545,8 +568,12 @@ impl Drop for ActiveRegistration {
         let mut entries = self.entries.lock().expect("active session registry");
         if entries.get(&self.key).is_some_and(|session| {
             Arc::ptr_eq(&session.cancellation.state, &self.cancellation.state)
-        }) {
-            entries.remove(&self.key);
+        }) && let Some(session) = entries.remove(&self.key)
+        {
+            self.recent
+                .lock()
+                .expect("recent session registry")
+                .complete(self.key.clone(), session);
         }
     }
 }
@@ -654,6 +681,10 @@ async fn execute(
         crate::collection::record_received(&message);
     }
 
+    if let Some(late) = &message.late_photos {
+        return late.retain(&runner, &route, &message, &driver).await;
+    }
+
     // One admission slot per conversation, keyed on the same value everything else keys on: the
     // registry, the cancel request, and the memory key are all `Conversation::key()`, so a stop
     // and the session it names can never be filed apart.
@@ -702,9 +733,10 @@ async fn session(
     // wall-clock bound all reach a session through this one registry, and only the first of those
     // is limited to the transports with a native control.
     let cancellation = SessionCancellation::new();
-    let _active_registration = runner
-        .active_sessions
-        .register(message, cancellation.clone());
+    let _active_registration =
+        runner
+            .active_sessions
+            .register(message, route, cancellation.clone());
     let leg = match connect(runner, route, message).await {
         Ok(leg) => leg,
         // A refused attestation never reaches a decision record, so it arrives as a transport-level
@@ -778,9 +810,13 @@ async fn session(
                 cache_key,
                 assets,
                 lease,
+                input,
             } = runner
                 .conversations
                 .begin(&key, &granted, window, Instant::now());
+            _active_registration
+                .late_photos
+                .authorized(input, assets.clone(), cache_key.clone());
             (history, cache_key, Some(lease), assets)
         }
         // A route that remembers nothing has no history lane to name, so its messages route to the
@@ -1029,9 +1065,13 @@ async fn session(
             // The task itself died, so there is no history to trust and nothing to record.
             progress.seal();
             tracing::error!(event = "gateway_session_failed", category = "session-task");
+            let notice = _active_registration
+                .late_photos
+                .finish(&runner.assets, false);
             let replied = progress
-                .terminal(Terminal::Failed(bound_outbound(
+                .terminal(Terminal::Failed(late_photos::append_notice(
                     liveness.templates.failed(),
+                    notice.as_deref(),
                 )))
                 .await;
             progress.finish_in_background();
@@ -1075,6 +1115,9 @@ async fn session(
         return "declined";
     }
 
+    let late_notice = _active_registration
+        .late_photos
+        .finish(&runner.assets, outcome.is_ok());
     let (terminal, completed_outcome, delivered_answer) = match &outcome {
         Ok(outcome) => {
             let text = bound_outbound(if outcome.answer.is_empty() && images.is_empty() {
@@ -1082,6 +1125,7 @@ async fn session(
             } else {
                 outcome.answer.as_str()
             });
+            let text = late_photos::append_notice(&text, late_notice.as_deref());
             let reply = if images.is_empty() {
                 OutboundReply::text(text.clone())
             } else {
@@ -1095,7 +1139,10 @@ async fn session(
                 category = "unreported-capability-work"
             );
             (
-                Terminal::Failed(UNREPORTED_WORK_REPLY.to_owned()),
+                Terminal::Failed(late_photos::append_notice(
+                    UNREPORTED_WORK_REPLY,
+                    late_notice.as_deref(),
+                )),
                 "failed",
                 None,
             )
@@ -1107,7 +1154,10 @@ async fn session(
                 error = %error
             );
             (
-                Terminal::Failed(bound_outbound(liveness.templates.failed())),
+                Terminal::Failed(late_photos::append_notice(
+                    liveness.templates.failed(),
+                    late_notice.as_deref(),
+                )),
                 "failed",
                 None,
             )

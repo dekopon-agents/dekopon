@@ -3046,6 +3046,7 @@ fn message(text: &str) -> InboundMessage {
         received_at: tokio::time::Instant::now(),
         native_group: None,
         constituents: Vec::new(),
+        late_photos: None,
         asset_overflow: false,
     }
 }
@@ -3127,6 +3128,7 @@ fn owned_slack_message(text: &str, inherited: bool) -> InboundMessage {
         received_at: tokio::time::Instant::now(),
         native_group: None,
         constituents: Vec::new(),
+        late_photos: None,
         asset_overflow: false,
     }
 }
@@ -3207,7 +3209,7 @@ fn runner_tracking(
         asset_fetchers: HashMap::new(),
         liveness: fixture_liveness(),
         thread_ownership: HashMap::new(),
-        active_sessions: Default::default(),
+        active_sessions: crate::session::ActiveSessions::new(max_concurrent),
     })
 }
 
@@ -14241,3 +14243,6 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
         );
     }
 }
+
+#[path = "tests/late_photos.rs"]
+mod late_photos;

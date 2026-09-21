@@ -184,6 +184,14 @@ The [current local process boundary](#current-local-process-boundary) applies to
 
 The broker authorizes every invocation. A persistent conversation opens a fresh attested leg per message exactly as a one-shot session does — the same chat-scoped `capabilities` call, the same policy evaluation against the same `via`-scoped rules, the same audit record. No grant is cached, no decision is carried forward, and replayed history reaches the model as prompt text and never reaches the broker as authorization input.
 
+Persistent WhatsApp late-photo intake also opens a fresh chat-scoped capability listing, but never
+executes a model or provider. Receipt-time association names one exact sender/route/audience/run;
+registration additionally requires that run's still-current conversation generation and unchanged
+grant set. A later normal request closes the old intake revision. Bounded completed-run intervals
+and a conservative eviction watermark prevent delayed receipts from becoming new paid requests.
+Only metadata is retained; the usual generation fence, inventory ceilings and lazy byte limits
+remain. A completion notice is transport text, not asset.send authority.
+
 So persistence widens no authority. Everything a model can do with a remembered conversation, it can do with a single message: propose.
 
 ### What persistence widens is duration
