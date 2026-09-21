@@ -34,7 +34,7 @@ pub(super) fn inbound_image(image: &Value) -> Option<PendingAsset> {
     Some(PendingAsset {
         name: format!("photo.{extension}"),
         mime: mime.to_owned(),
-        size: 0, // Webhooks do not promise a length; the lazy reader enforces it.
+        size: None, // Webhooks do not promise a length; the lazy reader enforces it.
         source: Some(AssetSourceRef::WhatsApp {
             media_id: id.to_owned(),
             mime: mime.to_owned(),

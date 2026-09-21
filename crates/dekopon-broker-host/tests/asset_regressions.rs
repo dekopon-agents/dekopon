@@ -168,7 +168,7 @@ async fn direct_wit_lists_are_bounded_before_payload_copy_and_non_http_reads_rec
                 id,
                 content_type: "text/plain".to_owned(),
                 encoding,
-                bytes: bytes.len() as u64,
+                bytes: Some(bytes.len() as u64),
                 origin: "chat".to_owned(),
                 sent: false,
             }],

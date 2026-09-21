@@ -374,6 +374,60 @@ async fn slack_liveness_and_experience_are_explicit_and_strict() {
 }
 
 #[tokio::test]
+async fn whatsapp_collection_durations_validate_together_and_zero_bypasses() {
+    let directory = temporary();
+    let mut doc = document(directory.path());
+    doc["transports"][0] = json!({
+        "name":"dev", "kind":"whatsappCloudApi", "appSecretEnv":"APP",
+        "verifyTokenEnv":"VERIFY", "accessTokenEnv":"ACCESS", "bind":"127.0.0.1:9080",
+        "callbackPath":"/wa", "wabaId":"123", "phoneNumberId":"456", "graphApiVersion":"v25.0"
+    });
+    for (quiet, maximum, valid) in [
+        (5000, 15000, true),
+        (900, 2400, true),
+        (900, 900, true),
+        (900, 899, false),
+        (900, 0, false),
+        (0, 0, true),
+        (0, 1, true),
+        (u32::MAX, u32::MAX, true),
+    ] {
+        doc["transports"][0]["debounceMs"] = json!(quiet);
+        doc["transports"][0]["debounceMaxWaitMs"] = json!(maximum);
+        let result = load(directory.path(), &doc).await;
+        if valid {
+            let config = result.unwrap();
+            assert!(
+                matches!(&config.transports[0], config::TransportConfig::WhatsappCloudApi {
+                debounce_ms, debounce_max_wait_ms, ..
+            } if *debounce_ms == quiet && *debounce_max_wait_ms == maximum)
+            );
+        } else {
+            assert!(reports(&result.unwrap_err(), |problem| matches!(
+                problem,
+                ConfigProblem::InvalidWhatsappDebounce { .. }
+            )));
+        }
+    }
+    for field in ["debounceMs", "debounceMaxWaitMs"] {
+        for invalid in [
+            json!(-1),
+            json!(1.5),
+            json!("5000"),
+            json!(null),
+            json!(u64::from(u32::MAX) + 1),
+        ] {
+            doc["transports"][0][field] = invalid;
+            assert!(matches!(
+                load(directory.path(), &doc).await,
+                Err(ConfigError::Decode { .. })
+            ));
+        }
+        doc["transports"][0][field] = json!(0);
+    }
+}
+
+#[tokio::test]
 async fn whatsapp_configuration_is_explicit_strict_and_pinned() {
     let directory = temporary();
     let mut document = document(directory.path());
@@ -398,6 +452,8 @@ async fn whatsapp_configuration_is_explicit_strict_and_pinned() {
         resolved.transports.first(),
         Some(config::TransportConfig::WhatsappCloudApi {
             callback_path,
+            debounce_ms: 5000,
+            debounce_max_wait_ms: 15000,
             graph_endpoint: Some(endpoint),
             ..
         }) if callback_path == "/webhooks/whatsapp"
@@ -7602,7 +7658,7 @@ async fn a_slack_upload_is_routed_and_described_for_numbering() {
         vec![PendingAsset {
             name: "image.png".to_owned(),
             mime: "image/png".to_owned(),
-            size: 2048,
+            size: Some(2048),
             source: Some(AssetSourceRef::Slack {
                 file_id: "F0123".to_owned(),
                 url: "https://files.slack.com/f/F0123/image.png".to_owned(),
@@ -8751,7 +8807,7 @@ fn pending(name: &str, mime: &str, size: u64) -> PendingAsset {
     PendingAsset {
         name: name.to_owned(),
         mime: mime.to_owned(),
-        size,
+        size: Some(size),
         source: Some(AssetSourceRef::Slack {
             file_id: format!("F-{name}"),
             url: format!("https://files.slack.com/f/{name}"),
@@ -9318,7 +9374,7 @@ fn a_reference_note_numbers_only_what_the_model_can_be_shown() {
             PendingAsset {
                 name: "hidden".to_owned(),
                 mime: String::new(),
-                size: 0,
+                size: Some(0),
                 source: None,
             },
         ],
@@ -9426,7 +9482,7 @@ fn every_prompt_names_the_whole_inventory_not_just_what_just_arrived() {
         vec![PendingAsset {
             name: "recipe.pdf".to_owned(),
             mime: "application/pdf".to_owned(),
-            size: 1024,
+            size: Some(1024),
             source: Some(AssetSourceRef::Slack {
                 file_id: "F-pdf".to_owned(),
                 url: "https://files.slack.com/f/recipe".to_owned(),
@@ -10784,7 +10840,7 @@ async fn a_telegram_photo_is_routed_with_its_largest_size() {
         vec![PendingAsset {
             name: "photo.jpg".to_owned(),
             mime: "image/jpeg".to_owned(),
-            size: 214_000,
+            size: Some(214_000),
             source: Some(AssetSourceRef::Telegram {
                 file_id: "full".to_owned(),
             }),
@@ -10832,7 +10888,7 @@ fn a_document_does_not_need_the_image_modality() {
             PendingAsset {
                 name: "spec.pdf".to_owned(),
                 mime: "application/pdf".to_owned(),
-                size: 5000,
+                size: Some(5000),
                 source: Some(AssetSourceRef::Telegram {
                     file_id: "doc-1".to_owned(),
                 }),
@@ -13288,9 +13344,9 @@ fn burst_photo(text: &str) -> InboundMessage {
 }
 
 #[test]
-fn whatsapp_debounce_is_unsigned_strict_and_defaults_to_three_seconds() {
+fn whatsapp_debounce_is_unsigned_strict_and_defaults_to_five_seconds() {
     use crate::collection::Offered;
-    for (configured, expected) in [(None, 3000), (Some(900), 900), (Some(0), 0)] {
+    for (configured, expected) in [(None, 5000), (Some(900), 900), (Some(0), 0)] {
         let mut collector = burst_collector(configured);
         let photo = burst_photo("");
         let start = photo.received_at;
@@ -13389,7 +13445,7 @@ async fn photo_burst_three_references_and_edit_prompt_make_one_authorized_model_
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn photo_burst_busy_at_fixed_deadline_is_disposed_even_when_busy_replies_disabled() {
+async fn photo_burst_busy_at_collection_deadline_is_disposed_even_when_busy_replies_disabled() {
     let directory = temporary();
     let (broker, mut observed) = stub_broker(directory.path(), Vec::new()).await;
     let models = ModelScript::forbidden();
@@ -13459,7 +13515,7 @@ async fn photo_burst_refreshes_authorization_at_admission_and_registers_no_refus
 }
 
 #[tokio::test(start_paused = true)]
-async fn photo_burst_serve_flushes_at_fixed_deadline_with_one_lead_reply() {
+async fn photo_burst_serve_flushes_after_quiet_interval_with_one_lead_reply() {
     let directory = temporary();
     let mut doc = document(directory.path());
     doc["models"][0]["modalities"] = json!(["image"]);
@@ -13505,7 +13561,7 @@ async fn photo_burst_serve_flushes_at_fixed_deadline_with_one_lead_reply() {
     while sender.capacity() != 8 {
         tokio::task::yield_now().await;
     }
-    tokio::time::advance(Duration::from_millis(2999)).await;
+    tokio::time::advance(Duration::from_millis(4999)).await;
     let mut prompt = burst_photo("please edit all three");
     prompt.assets.clear();
     sender
@@ -13515,6 +13571,8 @@ async fn photo_burst_serve_flushes_at_fixed_deadline_with_one_lead_reply() {
     while sender.capacity() != 8 {
         tokio::task::yield_now().await;
     }
+    assert_eq!(models.requests(), 0);
+    tokio::time::advance(Duration::from_millis(4999)).await;
     assert_eq!(models.requests(), 0);
     tokio::time::advance(Duration::from_millis(1)).await;
     // Model execution uses a real blocking worker; keep the deterministic Tokio clock fixed while

@@ -62,6 +62,11 @@ callers reject descriptors on other variants; the generic frame codec does not i
 `ClientError` and its execution-phase distinction. Metadata and descriptor possession grant no
 provider authority.
 
+An inventory row's `bytes` is nullable: null means unknown, while numeric zero means a known
+empty file. The gateway snapshots rows after resolving referenced inputs; each passed descriptor
+must have a known length matching fstat. Unreferenced unknown rows remain listable without fetches.
+Attached-output lengths remain mandatory. Upgrade both daemons together for this wire change.
+
 `ClientError` distinguishes the phase a framing failure belongs to, because the wire's
 `broker-unavailable` / `outcome-unaudited` split is worth nothing if a client-local timeout erases
 it. A request-phase failure delivered nothing and is safe to resubmit under a fresh invocation

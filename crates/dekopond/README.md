@@ -107,6 +107,11 @@ Configuration, transport semantics, session bounds, telemetry, the conversation 
 and the distinct-UID deployment boundary are documented in
 [`docs/dekopond.md`](../../docs/dekopond.md).
 
+WhatsApp media-first collection uses `debounceMs` (5000ms quiet by default) and
+`debounceMaxWaitMs` (15000ms maximum from the first receipt). Zero quiet time bypasses collection;
+an enabled maximum must be at least the quiet interval. See the
+[multi-message contract](../../docs/dekopond.md#multi-message-media-inputs) for bounds and isolation.
+
 ## Run
 
 ```console

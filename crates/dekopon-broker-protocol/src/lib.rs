@@ -979,8 +979,8 @@ pub struct AssetRow {
     pub content_type: String,
     /// Representation of the stored bytes.
     pub encoding: AssetEncoding,
-    /// Stored byte count.
-    pub bytes: u64,
+    /// Stored byte count, or unknown until the chat file is fetched.
+    pub bytes: Option<u64>,
     /// Source label, not authority.
     pub origin: String,
     /// Whether delivery was already requested.

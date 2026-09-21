@@ -183,7 +183,8 @@ fn whatsapp_example_uses_the_typed_default_media_collection_window() {
     assert!(matches!(
         &config.transports[0],
         dekopond::TransportConfig::WhatsappCloudApi {
-            debounce_ms: 3000,
+            debounce_ms: 5000,
+            debounce_max_wait_ms: 15000,
             ..
         }
     ));

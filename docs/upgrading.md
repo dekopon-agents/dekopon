@@ -8,6 +8,26 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## WhatsApp burst collection and unknown lengths (Unreleased)
+
+Upgrade `dekopond` and `dekopon-brokerd` together. Asset inventory wire rows now carry `bytes: null`
+when a chat service has not reported a length; numeric zero still means a known empty file. An old
+broker rejects null. The alpha protocol remains `v1alpha2`, with no mixed-version compatibility
+promise. The existing `dekopon:asset@0.1.0` WIT already represents unknown stored lengths, so this
+correction needs no provider rebuild. Provider output descriptor lengths remain mandatory.
+
+WhatsApp `debounceMs` now means a **quiet interval**, not a fixed non-sliding window. Its default
+changes from 3000 to 5000ms. New `debounceMaxWaitMs` defaults to 15000ms from the first media
+receipt and must be at least `debounceMs` when collection is enabled. Set both explicitly to tune
+latency; equal values retain a fixed window. `debounceMs: 0` still bypasses collection regardless
+of the maximum. Telegram's fixed three-second native-group window is unchanged.
+
+Explicit values are preserved: an existing `debounceMs: 3000` still has a three-second quiet
+interval and can split a six-photo burst with a 3050ms inter-photo gap. To use the new default,
+remove that explicit value or set it to 5000. A hard maximum prevents sustained input from keeping
+a batch open indefinitely; it does not queue work behind an active session, replay effects, or
+guarantee a complete album. This change does not update deployed configuration automatically.
+
 ## Asset handles (0.18.0)
 
 Remove route `providerAttachments` (including `maxPerReply`) and `chatAssetInputs`. Both now refuse
@@ -45,8 +65,9 @@ again or substituting the original image. Scratch errors do not retry already-ex
 calls. Transient decode/request/upload allocations and filesystem page cache still use memory;
 this release does not claim measured production RAM savings.
 
-WhatsApp now collects media-first bursts for `debounceMs: 3000` by default; set `0` to preserve
-immediate admission. Telegram native media groups use a fixed three-second collection window.
+Version 0.17.0 introduced a fixed WhatsApp media-first window with `debounceMs: 3000`; the
+[Unreleased quiet-interval correction](#whatsapp-burst-collection-and-unknown-lengths-unreleased)
+supersedes that timing. Telegram native media groups retain a fixed three-second collection window.
 See [asset handling](dekopond.md#chat-assets) for the retention and delivery contract.
 
 ## Bounded chat-transport recovery (0.17.0)
