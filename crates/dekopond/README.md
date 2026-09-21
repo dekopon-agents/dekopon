@@ -23,6 +23,12 @@ session with the sandboxed shell plus safe on-demand meta tools, and replies wit
 - **Chat assets** — Slack, Discord, and Telegram photos/files plus WhatsApp PNG/JPEG photos become bounded references
   that a model opens on demand. Discord signed CDN URLs are host-checked, streamed under the same
   8 MiB ceiling, and refreshed from the exact source message after expiry.
+- **WhatsApp photo bursts** — collect until 5000ms of quiet, bounded by 15000ms from the first
+  receipt by default. Persistent routes retain freshly authorized late photo references without
+  restarting busy work or launching a delayed run; completion text or a separate acknowledgment
+  asks whether another version is wanted. Captions keep the ordinary message path, and Stop
+  cancels late intake. References download only on demand. Upgrade both daemons together for
+  nullable inventory lengths; see [0.19.0 upgrading](../../docs/upgrading.md#whatsapp-burst-collection-and-unknown-lengths-0190).
 - **Asset handles** — exact proposal references carry read-only descriptors, never expanded bytes.
   Successful typed outputs join the scoped disk LRU; attaching does not send. Broker-authorized
   `asset.send` queues at most four files per turn, with persistent sent flags and bounded failure

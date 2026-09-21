@@ -7,6 +7,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-09-21
+
 ### Fixed
 
 - Retain freshly authorized late photo references on persistent WhatsApp routes without restarting

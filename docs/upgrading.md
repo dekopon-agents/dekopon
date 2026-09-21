@@ -8,7 +8,7 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
-## WhatsApp burst collection and unknown lengths (Unreleased)
+## WhatsApp burst collection and unknown lengths (0.19.0)
 
 Upgrade `dekopond` and `dekopon-brokerd` together. Asset inventory wire rows now carry `bytes: null`
 when a chat service has not reported a length; numeric zero still means a known empty file. An old
@@ -27,6 +27,13 @@ interval and can split a six-photo burst with a 3050ms inter-photo gap. To use t
 remove that explicit value or set it to 5000. A hard maximum prevents sustained input from keeping
 a batch open indefinitely; it does not queue work behind an active session, replay effects, or
 guarantee a complete album. This change does not update deployed configuration automatically.
+
+Persistent WhatsApp routes now retain freshly authorized photo-only arrivals associated with busy
+work, within the existing conversation asset bounds, without restarting or queuing a model run.
+Completion text or a separate acknowledgment asks whether another version is wanted; the next
+request can use retained references, with downloads still lazy. Captioned messages and one-shot
+routes keep their ordinary handling. Stop cancels late intake, and notices never claim a failed
+run generated an image. No new capability grant or provider rebuild is required.
 
 ## Asset handles (0.18.0)
 
@@ -66,7 +73,7 @@ calls. Transient decode/request/upload allocations and filesystem page cache sti
 this release does not claim measured production RAM savings.
 
 Version 0.17.0 introduced a fixed WhatsApp media-first window with `debounceMs: 3000`; the
-[Unreleased quiet-interval correction](#whatsapp-burst-collection-and-unknown-lengths-unreleased)
+[0.19.0 quiet-interval correction](#whatsapp-burst-collection-and-unknown-lengths-0190)
 supersedes that timing. Telegram native media groups retain a fixed three-second collection window.
 See [asset handling](dekopond.md#chat-assets) for the retention and delivery contract.
 
