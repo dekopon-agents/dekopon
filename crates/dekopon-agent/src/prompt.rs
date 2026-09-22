@@ -13,9 +13,10 @@ use std::{
 };
 
 use dekopon_config::Skill;
+use dekopon_model::error::InferenceError;
 use dekopon_model::model::{
-    ChatModel, CompletionOptions, ContentPart, ModelError, ModelMessage, ModelTool, ModelToolCall,
-    ModelUsage, assistant_message,
+    ChatModel, CompletionOptions, ContentPart, ModelMessage, ModelTool, ModelToolCall, ModelUsage,
+    assistant_message,
 };
 use dekopon_model::{ModelText, TurnEvent};
 use dekopon_shell::ScriptOutcome;
@@ -714,6 +715,7 @@ where
             model.turn = model_turns,
             usage.input_tokens = tracing::field::Empty,
             usage.cached_input_tokens = tracing::field::Empty,
+            usage.cache_write_tokens = tracing::field::Empty,
             usage.output_tokens = tracing::field::Empty,
             usage.reasoning_output_tokens = tracing::field::Empty,
             usage.total_tokens = tracing::field::Empty,
@@ -769,7 +771,7 @@ where
             // exists, so the text the person already read is the only account of the turn there
             // will ever be, and it is written here rather than lost with the connection. Usage is
             // absent by construction: the provider reports it in the final event that never came.
-            Err(ModelError::Interrupted) => {
+            Err(InferenceError::Cancelled) => {
                 tracing::info!(
                     target: "dekopon_agent::audit",
                     {
@@ -830,6 +832,7 @@ where
                 tool_call.count = turn.tool_calls.len(),
                 usage.input_tokens = turn.usage.as_ref().and_then(|usage| usage.input_tokens),
                 usage.cached_input_tokens = turn.usage.as_ref().and_then(|usage| usage.cached_input_tokens),
+                usage.cache_write_tokens = turn.usage.as_ref().and_then(|usage| usage.cache_write_tokens),
                 usage.output_tokens = turn.usage.as_ref().and_then(|usage| usage.output_tokens),
                 usage.reasoning_output_tokens = turn.usage.as_ref().and_then(|usage| usage.reasoning_output_tokens),
                 usage.total_tokens = turn.usage.as_ref().and_then(|usage| usage.total_tokens),
@@ -921,7 +924,7 @@ where
             // A terminal decline does not need tool results, but malformed correlation IDs and
             // arguments are still malformed model output rather than a magic escape hatch.
             for (index, call) in turn.tool_calls.iter().enumerate() {
-                if call.id.trim().is_empty() {
+                if call.id.as_str().trim().is_empty() {
                     reject_tool_call(model_turns, index + 1, "empty-tool-call-id");
                     return Err(PromptError::EmptyToolCallId);
                 }
@@ -977,7 +980,7 @@ where
         for (tool_call_index, call) in turn.tool_calls.into_iter().enumerate() {
             check_cancelled(cancellation)?;
             let tool_call_index = tool_call_index + 1;
-            if call.id.trim().is_empty() {
+            if call.id.as_str().trim().is_empty() {
                 reject_tool_call(model_turns, tool_call_index, "empty-tool-call-id");
                 return Err(PromptError::EmptyToolCallId);
             }
@@ -1709,7 +1712,7 @@ pub enum PromptError {
     ZeroSteps,
     /// A model request failed.
     #[error(transparent)]
-    Model(#[from] ModelError),
+    Model(#[from] InferenceError),
     /// The model selected a tool that was not offered.
     #[error("model requested unknown or unavailable tool {0:?}")]
     UnknownTool(String),
@@ -1841,6 +1844,9 @@ fn record_usage(span: &tracing::Span, usage: &ModelUsage) {
     if let Some(tokens) = usage.cached_input_tokens {
         span.record("usage.cached_input_tokens", tokens);
     }
+    if let Some(tokens) = usage.cache_write_tokens {
+        span.record("usage.cache_write_tokens", tokens);
+    }
     if let Some(tokens) = usage.output_tokens {
         span.record("usage.output_tokens", tokens);
     }
@@ -1872,9 +1878,10 @@ mod tests {
     };
 
     use dekopon_model::TurnEvent;
+    use dekopon_model::error::InferenceError;
     use dekopon_model::model::{
-        AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelFunctionCall, ModelMessage,
-        ModelTool, ModelToolCall, ModelUsage,
+        AssistantTurn, ChatModel, CompletionOptions, ModelFunctionCall, ModelMessage, ModelTool,
+        ModelToolCall, ModelUsage,
     };
     use dekopon_shell::{
         CapabilityCallResult, CapabilityInvoker, CommandRun, ExitCode, ScriptOutcome,
@@ -1966,8 +1973,8 @@ mod tests {
             messages: &[ModelMessage],
             tools: &[ModelTool],
             _options: &CompletionOptions,
-            _on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
-        ) -> Result<AssistantTurn, ModelError> {
+            _on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+        ) -> Result<AssistantTurn, InferenceError> {
             self.observed_tools
                 .lock()
                 .expect("tool observations lock")
@@ -1980,7 +1987,9 @@ mod tests {
                 .lock()
                 .expect("turn lock")
                 .pop_front()
-                .ok_or(ModelError::NoChoices)
+                .ok_or(InferenceError::Protocol(
+                    dekopon_model::error::ProtocolFailure::NoChoices,
+                ))
         }
     }
 
@@ -2017,33 +2026,27 @@ mod tests {
     }
 
     fn script_call(id: &str, script: &str) -> AssistantTurn {
-        AssistantTurn {
-            content: None,
-            tool_calls: vec![ModelToolCall {
-                id: id.to_owned(),
+        AssistantTurn::new(
+            None,
+            vec![ModelToolCall {
+                id: id.into(),
                 kind: "function".to_owned(),
                 function: ModelFunctionCall {
                     name: SCRIPT_TOOL_NAME.to_owned(),
                     arguments: json!({ "script": script }).to_string(),
                 },
             }],
-            usage: None,
-            replay_items: Vec::new(),
-        }
+            None,
+        )
     }
 
     fn answer(text: &str) -> AssistantTurn {
-        AssistantTurn {
-            content: Some(text.to_owned()),
-            tool_calls: Vec::new(),
-            usage: None,
-            replay_items: Vec::new(),
-        }
+        AssistantTurn::new(Some(text.to_owned()), Vec::new(), None)
     }
 
     fn decline_call(id: &str, arguments: Value) -> ModelToolCall {
         ModelToolCall {
-            id: id.to_owned(),
+            id: id.into(),
             kind: "function".to_owned(),
             function: ModelFunctionCall {
                 name: DECLINE_REPLY_TOOL_NAME.to_owned(),
@@ -2053,12 +2056,7 @@ mod tests {
     }
 
     fn decline(arguments: Value) -> AssistantTurn {
-        AssistantTurn {
-            content: None,
-            tool_calls: vec![decline_call("decline-call", arguments)],
-            usage: None,
-            replay_items: Vec::new(),
-        }
+        AssistantTurn::new(None, vec![decline_call("decline-call", arguments)], None)
     }
 
     fn limits(max_steps: u32, max_capability_calls: u32) -> PromptLimits {
@@ -2203,18 +2201,20 @@ mod tests {
             _messages: &[ModelMessage],
             _tools: &[ModelTool],
             _options: &CompletionOptions,
-            on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
-        ) -> Result<AssistantTurn, ModelError> {
+            on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+        ) -> Result<AssistantTurn, InferenceError> {
             if on_event(TurnEvent::ToolCallStarted { index: 0 }).is_break() {
-                // What the real clients do with the same answer: drop the body, which closes the
-                // connection, and report that no turn will arrive.
-                return Err(ModelError::Interrupted);
+                // Real clients cancel the local exchange and drop its response, without
+                // promising pooled-connection closure, and report that no turn will arrive.
+                return Err(InferenceError::Cancelled);
             }
             self.turns
                 .lock()
                 .expect("turn lock")
                 .pop_front()
-                .ok_or(ModelError::NoChoices)
+                .ok_or(InferenceError::Protocol(
+                    dekopon_model::error::ProtocolFailure::NoChoices,
+                ))
         }
     }
 
@@ -2245,19 +2245,21 @@ mod tests {
             _messages: &[ModelMessage],
             _tools: &[ModelTool],
             _options: &CompletionOptions,
-            on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
-        ) -> Result<AssistantTurn, ModelError> {
+            on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+        ) -> Result<AssistantTurn, InferenceError> {
             let events = std::mem::take(&mut *self.events.lock().expect("event lock"));
             for event in events {
                 if on_event(event).is_break() {
-                    return Err(ModelError::Interrupted);
+                    return Err(InferenceError::Cancelled);
                 }
             }
             self.turn
                 .lock()
                 .expect("turn lock")
                 .take()
-                .ok_or(ModelError::NoChoices)
+                .ok_or(InferenceError::Protocol(
+                    dekopon_model::error::ProtocolFailure::NoChoices,
+                ))
         }
     }
 
@@ -2544,7 +2546,7 @@ mod tests {
 
     fn agent_config_tool_call(id: &str, arguments: Value) -> ModelToolCall {
         ModelToolCall {
-            id: id.to_owned(),
+            id: id.into(),
             kind: "function".to_owned(),
             function: ModelFunctionCall {
                 name: AGENT_CONFIG_TOOL_NAME.to_owned(),
@@ -2554,12 +2556,11 @@ mod tests {
     }
 
     fn agent_config_call(arguments: Value) -> AssistantTurn {
-        AssistantTurn {
-            content: None,
-            tool_calls: vec![agent_config_tool_call("config-call", arguments)],
-            usage: None,
-            replay_items: Vec::new(),
-        }
+        AssistantTurn::new(
+            None,
+            vec![agent_config_tool_call("config-call", arguments)],
+            None,
+        )
     }
 
     /// A conversation of `count` answered exchanges, every turn the same size.
@@ -3051,8 +3052,8 @@ mod tests {
             _messages: &[ModelMessage],
             _tools: &[ModelTool],
             options: &CompletionOptions,
-            _on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
-        ) -> Result<AssistantTurn, ModelError> {
+            _on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+        ) -> Result<AssistantTurn, InferenceError> {
             self.observed
                 .lock()
                 .expect("options lock")
@@ -3061,7 +3062,9 @@ mod tests {
                 .lock()
                 .expect("turn lock")
                 .pop_front()
-                .ok_or(ModelError::NoChoices)
+                .ok_or(InferenceError::Protocol(
+                    dekopon_model::error::ProtocolFailure::NoChoices,
+                ))
         }
     }
 
@@ -3553,15 +3556,14 @@ mod tests {
     #[test]
     fn agent_config_can_be_inspected_repeatedly_within_a_turn() {
         let model = ScriptedModel::new([
-            AssistantTurn {
-                content: None,
-                tool_calls: vec![
+            AssistantTurn::new(
+                None,
+                vec![
                     agent_config_tool_call("config-call-1", json!({})),
                     agent_config_tool_call("config-call-2", json!({})),
                 ],
-                usage: None,
-                replay_items: Vec::new(),
-            },
+                None,
+            ),
             answer("done"),
         ]);
         let runtime = RecordingRuntime::new(0);
@@ -3663,19 +3665,18 @@ mod tests {
     }
 
     fn asset_call(id: u64) -> AssistantTurn {
-        AssistantTurn {
-            content: None,
-            tool_calls: vec![ModelToolCall {
-                id: "asset-call".to_owned(),
+        AssistantTurn::new(
+            None,
+            vec![ModelToolCall {
+                id: "asset-call".into(),
                 kind: "function".to_owned(),
                 function: ModelFunctionCall {
                     name: ASSET_TOOL_NAME.to_owned(),
                     arguments: json!({ "id": id }).to_string(),
                 },
             }],
-            usage: None,
-            replay_items: Vec::new(),
-        }
+            None,
+        )
     }
 
     #[test]
@@ -3823,12 +3824,12 @@ mod tests {
 
     #[test]
     fn a_decline_requested_alongside_work_runs_nothing() {
-        let model = ScriptedModel::new([AssistantTurn {
-            content: None,
-            tool_calls: vec![
+        let model = ScriptedModel::new([AssistantTurn::new(
+            None,
+            vec![
                 decline_call("decline-call", json!({})),
                 ModelToolCall {
-                    id: "script-call".to_owned(),
+                    id: "script-call".into(),
                     kind: "function".to_owned(),
                     function: ModelFunctionCall {
                         name: SCRIPT_TOOL_NAME.to_owned(),
@@ -3836,9 +3837,8 @@ mod tests {
                     },
                 },
             ],
-            usage: None,
-            replay_items: Vec::new(),
-        }]);
+            None,
+        )]);
         let runtime = RecordingRuntime::new(1);
         let mut history = History::default();
 
@@ -4023,19 +4023,18 @@ mod tests {
 
     #[test]
     fn rejects_model_selected_tools_that_were_not_offered() {
-        let model = ScriptedModel::new([AssistantTurn {
-            content: None,
-            tool_calls: vec![ModelToolCall {
-                id: "call-1".to_owned(),
+        let model = ScriptedModel::new([AssistantTurn::new(
+            None,
+            vec![ModelToolCall {
+                id: "call-1".into(),
                 kind: "function".to_owned(),
                 function: ModelFunctionCall {
                     name: "echo_echo".to_owned(),
                     arguments: "{}".to_owned(),
                 },
             }],
-            usage: None,
-            replay_items: Vec::new(),
-        }]);
+            None,
+        )]);
         let runtime = RecordingRuntime::new(0);
 
         let error = run_prompt(&model, &runtime, "call the old tool", None, limits(1, 32))
@@ -4048,19 +4047,18 @@ mod tests {
     #[test]
     fn rejects_tool_calls_without_a_string_script_argument() {
         for arguments in [r#"{"command":"echo hi"}"#, r#"{"script":42}"#, "{}"] {
-            let model = ScriptedModel::new([AssistantTurn {
-                content: None,
-                tool_calls: vec![ModelToolCall {
-                    id: "call-1".to_owned(),
+            let model = ScriptedModel::new([AssistantTurn::new(
+                None,
+                vec![ModelToolCall {
+                    id: "call-1".into(),
                     kind: "function".to_owned(),
                     function: ModelFunctionCall {
                         name: SCRIPT_TOOL_NAME.to_owned(),
                         arguments: arguments.to_owned(),
                     },
                 }],
-                usage: None,
-                replay_items: Vec::new(),
-            }]);
+                None,
+            )]);
             let runtime = RecordingRuntime::new(0);
 
             let error = run_prompt(&model, &runtime, "malformed", None, limits(1, 32))
@@ -4079,7 +4077,7 @@ mod tests {
         assert_eq!(MAX_TOOL_CALLS_PER_TURN, 10);
         let tool_calls = (0..MAX_TOOL_CALLS_PER_TURN)
             .map(|index| ModelToolCall {
-                id: format!("call-{index}"),
+                id: format!("call-{index}").into(),
                 kind: "function".to_owned(),
                 function: ModelFunctionCall {
                     name: SCRIPT_TOOL_NAME.to_owned(),
@@ -4087,15 +4085,8 @@ mod tests {
                 },
             })
             .collect();
-        let model = ScriptedModel::new([
-            AssistantTurn {
-                content: None,
-                tool_calls,
-                usage: None,
-                replay_items: Vec::new(),
-            },
-            answer("done"),
-        ]);
+        let model =
+            ScriptedModel::new([AssistantTurn::new(None, tool_calls, None), answer("done")]);
         let runtime = RecordingRuntime::new(0);
 
         let outcome = run_prompt(&model, &runtime, "fan out", None, limits(2, 32))
@@ -4115,7 +4106,7 @@ mod tests {
     fn rejects_eleven_tool_calls_in_one_model_turn() {
         let tool_calls = (0..=MAX_TOOL_CALLS_PER_TURN)
             .map(|index| ModelToolCall {
-                id: format!("call-{index}"),
+                id: format!("call-{index}").into(),
                 kind: "function".to_owned(),
                 function: ModelFunctionCall {
                     name: SCRIPT_TOOL_NAME.to_owned(),
@@ -4123,12 +4114,7 @@ mod tests {
                 },
             })
             .collect();
-        let model = ScriptedModel::new([AssistantTurn {
-            content: None,
-            tool_calls,
-            usage: None,
-            replay_items: Vec::new(),
-        }]);
+        let model = ScriptedModel::new([AssistantTurn::new(None, tool_calls, None)]);
         let runtime = RecordingRuntime::new(0);
 
         let error = run_prompt(&model, &runtime, "fan out", None, limits(1, 32))
@@ -4253,19 +4239,18 @@ mod tests {
 
     #[test]
     fn tool_call_ids_must_correlate() {
-        let model = ScriptedModel::new([AssistantTurn {
-            content: None,
-            tool_calls: vec![ModelToolCall {
-                id: "  ".to_owned(),
+        let model = ScriptedModel::new([AssistantTurn::new(
+            None,
+            vec![ModelToolCall {
+                id: "  ".into(),
                 kind: "function".to_owned(),
                 function: ModelFunctionCall {
                     name: SCRIPT_TOOL_NAME.to_owned(),
                     arguments: json!({ "script": "echo hi" }).to_string(),
                 },
             }],
-            usage: None,
-            replay_items: Vec::new(),
-        }]);
+            None,
+        )]);
         let runtime = RecordingRuntime::new(0);
 
         let error = run_prompt(&model, &runtime, "correlate", None, limits(1, 32))
@@ -4276,19 +4261,18 @@ mod tests {
 
     #[test]
     fn rejects_arguments_that_are_not_a_json_object() {
-        let model = ScriptedModel::new([AssistantTurn {
-            content: None,
-            tool_calls: vec![ModelToolCall {
-                id: "call-1".to_owned(),
+        let model = ScriptedModel::new([AssistantTurn::new(
+            None,
+            vec![ModelToolCall {
+                id: "call-1".into(),
                 kind: "function".to_owned(),
                 function: ModelFunctionCall {
                     name: SCRIPT_TOOL_NAME.to_owned(),
                     arguments: Value::String("echo hi".to_owned()).to_string(),
                 },
             }],
-            usage: None,
-            replay_items: Vec::new(),
-        }]);
+            None,
+        )]);
         let runtime = RecordingRuntime::new(0);
 
         let error = run_prompt(&model, &runtime, "malformed", None, limits(1, 32))
@@ -4338,19 +4322,18 @@ mod tests {
     }
 
     fn tool_call(id: &str, name: &str, arguments: Value) -> AssistantTurn {
-        AssistantTurn {
-            content: None,
-            tool_calls: vec![ModelToolCall {
-                id: id.to_owned(),
+        AssistantTurn::new(
+            None,
+            vec![ModelToolCall {
+                id: id.into(),
                 kind: "function".to_owned(),
                 function: ModelFunctionCall {
                     name: name.to_owned(),
                     arguments: arguments.to_string(),
                 },
             }],
-            usage: None,
-            replay_items: Vec::new(),
-        }
+            None,
+        )
     }
 
     #[test]

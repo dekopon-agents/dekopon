@@ -8,6 +8,11 @@ Dekopon is pre-1.0 and the local broker protocol is `v1alpha2`. There is no comp
 across minor releases, and no automatic migration: the daemons refuse to start on configuration they
 do not understand rather than guessing.
 
+## Typed inference errors (0.20.0)
+
+Rust embedders match `dekopon_model::error::InferenceError` instead of `ModelError`;
+`Interrupted` is now `Cancelled`.
+
 ## WhatsApp burst collection and unknown lengths (0.19.0)
 
 Upgrade `dekopond` and `dekopon-brokerd` together. Asset inventory wire rows now carry `bytes: null`

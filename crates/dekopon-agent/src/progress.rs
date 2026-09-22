@@ -21,7 +21,7 @@
 
 use std::time::Duration;
 
-use dekopon_model::{ModelText, model::ModelError};
+use dekopon_model::{ModelText, error::InferenceError};
 
 use crate::prompt::PromptError;
 
@@ -212,7 +212,7 @@ impl FailureClass {
     #[must_use]
     pub fn of(error: &PromptError) -> Option<Self> {
         match error {
-            PromptError::Cancelled | PromptError::Model(ModelError::Interrupted) => None,
+            PromptError::Cancelled | PromptError::Model(InferenceError::Cancelled) => None,
             PromptError::MaxSteps { .. } => Some(Self::StepBudget),
             PromptError::ZeroSteps => Some(Self::Internal),
             PromptError::Model(_)
@@ -295,7 +295,7 @@ pub trait ProgressSink: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use dekopon_model::model::ModelError;
+    use dekopon_model::error::InferenceError;
 
     use super::{CommandWord, FailureClass, MAX_COMMAND_WORD_CHARS};
     use crate::prompt::PromptError;
@@ -327,7 +327,7 @@ mod tests {
     fn a_cancellation_is_an_outcome_rather_than_a_failure_class() {
         assert_eq!(FailureClass::of(&PromptError::Cancelled), None);
         assert_eq!(
-            FailureClass::of(&PromptError::Model(ModelError::Interrupted)),
+            FailureClass::of(&PromptError::Model(InferenceError::Cancelled)),
             None,
             "an interrupted stream is the session being stopped, not the model failing"
         );
@@ -340,7 +340,9 @@ mod tests {
             Some(FailureClass::StepBudget)
         );
         assert_eq!(
-            FailureClass::of(&PromptError::Model(ModelError::NoChoices)),
+            FailureClass::of(&PromptError::Model(InferenceError::Protocol(
+                dekopon_model::error::ProtocolFailure::NoChoices
+            ))),
             Some(FailureClass::Model)
         );
         assert_eq!(

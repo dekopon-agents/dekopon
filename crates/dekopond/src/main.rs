@@ -36,12 +36,11 @@ const OTEL_TRACE_FILTER: &str = "dekopond=trace,dekopon_agent=trace,dekopon_proc
 /// How long exit may still wait on blocking session work after everything else has stopped.
 ///
 /// The gateway's shutdown grace is the deadline for a session to *finish*; abandoning one only
-/// cancels the async owner's await on its blocking half. The synchronous prompt loop keeps running
-/// until it observes cancellation at its next cooperative checkpoint, which can be on the far side
-/// of a whole synchronous model round trip. Dropping a Tokio runtime waits for every one of those
-/// threads, so the process would exit `shutdownGraceMs` *plus* a model timeout after the signal —
-/// past a pod termination grace that the broker's own drain also has to fit inside. Here the wait
-/// is bounded and the remaining threads are left to die with the process; a model request already
+/// cancels the async owner's await on its blocking half. Model HTTP reads observe cancellation
+/// even on a silent socket, but non-preemptible blocking credential/file operations or other
+/// blocking work can outlive that signal. Dropping a Tokio runtime waits for those threads and
+/// could exceed the pod termination grace that the broker's own drain also has to fit inside.
+/// Here the wait is bounded and the remaining threads are left to die with the process; a request already
 /// in flight was never rollbackable, and waiting for it does not make it so.
 #[cfg(unix)]
 const BLOCKING_EXIT_TIMEOUT: Duration = Duration::from_secs(5);

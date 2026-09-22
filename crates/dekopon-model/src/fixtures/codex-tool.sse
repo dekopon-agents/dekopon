@@ -1,0 +1,11 @@
+data: {"type":"response.output_item.done","item":{"type":"reasoning","id":"rs_1","encrypted_content":"opaque","future_field":"preserved"}}
+
+data: {"type":"response.output_item.added","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"echo_echo","arguments":""}}
+
+data: {"type":"response.function_call_arguments.delta","item_id":"fc_1","delta":"{\"message\":\"hello\"}"}
+
+data: {"type":"response.output_item.done","item":{"type":"function_call","id":"fc_1","call_id":"call_1","name":"echo_echo"}}
+
+data: {"type":"response.completed","response":{"status":"completed","model":"gpt-test","usage":{"input_tokens":20,"output_tokens":5}}}
+
+: end of synthetic response

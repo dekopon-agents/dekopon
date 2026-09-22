@@ -32,12 +32,7 @@ use dekopon_test_support::{
 };
 
 fn turn(text: &str) -> AssistantTurn {
-    AssistantTurn {
-        content: Some(text.to_owned()),
-        tool_calls: Vec::new(),
-        usage: None,
-        replay_items: Vec::new(),
-    }
+    AssistantTurn::new(Some(text.to_owned()), Vec::new(), None)
 }
 
 fn scripted(body: &str) -> Vec<TurnEvent> {
@@ -114,7 +109,7 @@ async fn a_stream_the_caller_breaks_reports_the_interruption_rather_than_a_turn(
     let outcome = running.await.expect("the interrupted stream returns");
     let error = outcome.expect_err("breaking the callback is not an answer");
     assert!(
-        matches!(error, dekopon_model::model::ModelError::Interrupted),
+        matches!(error, dekopon_model::error::InferenceError::Cancelled),
         "the surfaced cause names the interruption: {error}"
     );
     assert_eq!(model.emitted(), 1, "nothing is read past the break");
@@ -151,17 +146,12 @@ async fn a_parked_stream_emits_nothing_at_all_until_it_is_released() {
     );
 }
 
-/// The accepted limit, pinned: a phase that emits nothing cannot be stopped before its deadline.
-///
-/// `docs/chat-progress.md` and `docs/dekopond.md` both promise this in prose — a reasoning phase
-/// sends no events, the loop's cancellation check runs only at an event boundary, and a stop
-/// pressed during one therefore lands at the client's global deadline rather than at the press.
-/// A promise about what does *not* happen is exactly the kind that rots unpinned, so the deadline
-/// here is short and the press is real: the run must still be going after the stop, and the ending
-/// when it finally arrives must be the cancellation rather than the answer the model had ready.
+/// This deliberately parked double has only the synchronous callback, not a transport watch.
+/// It illustrates the limit of a callback-only embedder, not the live async adapters: production
+/// BlockingModel watches session cancellation even while HTTP produces no events.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_parked_no_event_stream_is_interrupted_only_when_its_deadline_elapses() {
-    /// The stand-in for `timeout_global`: long enough to watch the press do nothing, short enough
+async fn a_callback_only_double_without_a_transport_watch_waits_for_its_own_deadline() {
+    /// The double's own deadline: long enough to watch the press do nothing, short enough
     /// to wait out.
     const DEADLINE: Duration = Duration::from_millis(600);
     /// How long the stop is given to fail to interrupt anything.

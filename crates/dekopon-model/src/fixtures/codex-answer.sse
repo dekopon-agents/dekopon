@@ -1,0 +1,5 @@
+data: {"type":"response.output_text.delta","delta":"Echoed hello."}
+
+data: {"type":"response.completed","response":{"status":"completed","model":"gpt-test","usage":{"input_tokens":23,"input_tokens_details":{"cached_tokens":5},"output_tokens":3,"output_tokens_details":{"reasoning_tokens":1},"total_tokens":26}}}
+
+: end of synthetic response

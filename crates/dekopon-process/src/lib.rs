@@ -132,6 +132,12 @@ impl CancelSignal {
         *self.receiver.borrow()
     }
 
+    /// Clones the cancellation watch for consumers outside the process supervisor.
+    #[must_use]
+    pub fn watch(&self) -> watch::Receiver<bool> {
+        self.receiver.clone()
+    }
+
     /// Resolves only once cancellation has been requested.
     async fn cancelled(&mut self) {
         loop {

@@ -28,9 +28,13 @@ use dekopon_broker_protocol::{
     ERROR_STORAGE_BUSY, ERROR_STORAGE_CORRUPT, ERROR_STORAGE_IO, ERROR_STORAGE_QUOTA,
     ERROR_STORAGE_TIMEOUT, ERROR_UNAUTHENTICATED, InvocationOutcome, InvocationResult,
 };
+use dekopon_model::error::InferenceError;
 use dekopon_model::{
-    chatgpt::ChatGptCodexModel,
-    model::{ChatModel, CompletionOptions, ModelError, OpenAiChatModel},
+    blocking::BlockingModel,
+    codex::CodexClient,
+    inference::ModelClient,
+    model::{ChatModel, CompletionOptions},
+    openai::OpenAiClient,
 };
 use dekopon_process::{CancelHandle, CancelSignal};
 use dekopon_shell::{CapabilityInvoker as _, Limits as ShellLimits};
@@ -92,11 +96,19 @@ pub(crate) type SharedModel = Arc<dyn ChatModel + Send + Sync>;
 /// A seam rather than a direct call because the alternative is a test suite that cannot exercise
 /// routing, admission, or authorization without a live model endpoint.
 pub(crate) trait ModelFactory: Send + Sync {
-    fn build(&self, model: &ModelConfig) -> Result<SharedModel, SessionError>;
+    fn build(
+        &self,
+        model: &ModelConfig,
+        runtime: tokio::runtime::Handle,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<SharedModel, SessionError>;
 }
 
 /// The real factory: whatever `models:` configured, constructed by the shared model library.
-pub(crate) struct ConfiguredModels;
+#[derive(Default)]
+pub(crate) struct ConfiguredModels {
+    clients: Mutex<HashMap<String, Arc<ModelClient>>>,
+}
 
 /// The bearer token a configured model's `apiKeyEnv` names, when it names one.
 ///
@@ -108,13 +120,22 @@ pub(crate) struct ConfiguredModels;
 pub(crate) fn model_bearer_token(
     model: &ModelConfig,
 ) -> Result<Option<String>, ModelCredentialError> {
-    let ModelConfig::OpenaiCompatible { api_key_env, .. } = model else {
-        return Ok(None);
+    model_bearer_token_with(model, |variable| std::env::var_os(variable))
+}
+
+pub(crate) fn model_bearer_token_with(
+    model: &ModelConfig,
+    resolve: impl FnOnce(&str) -> Option<std::ffi::OsString>,
+) -> Result<Option<String>, ModelCredentialError> {
+    let variable = match model {
+        ModelConfig::OpenaiCompatible { api_key_env, .. } => api_key_env.as_deref(),
+        ModelConfig::Openrouter { api_key_env, .. } => Some(api_key_env.as_str()),
+        ModelConfig::ChatgptSubscription { .. } => None,
     };
-    let Some(variable) = api_key_env.as_deref() else {
-        return Ok(None);
-    };
-    model_credential(model.name(), variable, std::env::var_os(variable)).map(Some)
+    match variable {
+        Some(variable) => model_credential(model.name(), variable, resolve(variable)).map(Some),
+        None => Ok(None),
+    }
 }
 
 /// Split from the environment read so the rule is reachable without a test mutating this process's
@@ -131,10 +152,19 @@ pub(crate) fn model_credential(
     })
 }
 
-impl ModelFactory for ConfiguredModels {
-    fn build(&self, model: &ModelConfig) -> Result<SharedModel, SessionError> {
+impl ConfiguredModels {
+    fn construct(&self, model: &ModelConfig) -> Result<Arc<ModelClient>, SessionError> {
+        self.construct_with(model, |variable| std::env::var_os(variable))
+    }
+
+    fn construct_with(
+        &self,
+        model: &ModelConfig,
+        mut resolve: impl FnMut(&str) -> Option<std::ffi::OsString>,
+    ) -> Result<Arc<ModelClient>, SessionError> {
         match model {
             ModelConfig::OpenaiCompatible {
+                name,
                 endpoint,
                 model,
                 api_key_env,
@@ -144,10 +174,10 @@ impl ModelFactory for ConfiguredModels {
             } => {
                 let bearer_token = api_key_env
                     .as_deref()
-                    .map(|variable| model_credential(model, variable, std::env::var_os(variable)))
+                    .map(|variable| model_credential(model, variable, resolve(variable)))
                     .transpose()?;
-                Ok(Arc::new(
-                    OpenAiChatModel::new(
+                Ok(Arc::new(ModelClient::OpenAiCompatible(
+                    OpenAiClient::new(
                         endpoint,
                         model,
                         bearer_token,
@@ -156,73 +186,111 @@ impl ModelFactory for ConfiguredModels {
                     // The configured answer to "does this endpoint stream", which is the only
                     // place it is decided: the client defaults to streaming and this turns it off
                     // for the one endpoint an operator found it broken on.
-                    .with_streaming(*stream),
-                ))
+                    .with_streaming(*stream)
+                    .with_name(name),
+                )))
+            }
+            ModelConfig::Openrouter {
+                name,
+                model,
+                api_key_env,
+                timeout_ms,
+                generation,
+                reasoning,
+                routing,
+                cache,
+                ..
+            } => {
+                let token = model_credential(name, api_key_env, resolve(api_key_env))?;
+                let settings = dekopon_model::openrouter::settings::Settings {
+                    generation: generation.clone(),
+                    reasoning: reasoning.clone(),
+                    routing: routing.clone(),
+                    cache: cache.clone(),
+                };
+                Ok(Arc::new(ModelClient::OpenRouter(
+                    dekopon_model::openrouter::OpenRouterClient::new(
+                        model,
+                        token,
+                        std::time::Duration::from_millis(*timeout_ms),
+                        settings,
+                    )?
+                    .with_name(name),
+                )))
             }
             ModelConfig::ChatgptSubscription {
+                name,
                 model,
                 auth_file,
                 timeout_ms,
                 ..
-            } => Ok(Arc::new(ChatGptCodexModel::new(
-                model,
-                auth_file.as_deref(),
-                std::time::Duration::from_millis(*timeout_ms),
-            )?)),
+            } => Ok(Arc::new(ModelClient::Codex(
+                CodexClient::new(
+                    model,
+                    auth_file.as_deref(),
+                    std::time::Duration::from_millis(*timeout_ms),
+                )?
+                .with_name(name),
+            ))),
         }
     }
 }
 
-/// One client per configured model, built on first use and shared by every session after it.
-///
-/// A model client owns an HTTP agent and its connection pool, so rebuilding one per message paid a
-/// fresh TCP and TLS handshake before the first token of every answer — on a Pi talking to a remote
-/// endpoint, more added latency than the routing and authorization ahead of it cost together.
-/// Everything that legitimately varies per message — the prompt cache key, the completion options —
-/// is request-scoped and stays that way.
-///
-/// Keyed by the configured model name, which the loader has already proved unique, so two routes
-/// naming one endpoint share its pool and two endpoints never share a client.
-///
-/// A build failure is not cached, because the two remaining ones are repairable without a restart:
-/// a credential file an operator writes, and a model endpoint that was not listening. An `apiKeyEnv`
-/// naming an unset or blank variable is not among them — this process cannot see a variable exported
-/// after it started — so startup resolves every bound route's model credential before any transport
-/// accepts work, and the daemon refuses to start rather than answering with a tokenless client.
-pub(crate) struct ModelCache {
-    factory: Arc<dyn ModelFactory>,
-    clients: Mutex<HashMap<String, SharedModel>>,
-}
-
-impl ModelCache {
-    pub(crate) fn new(factory: Arc<dyn ModelFactory>) -> Self {
-        Self {
-            factory,
-            clients: Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// The client for one configured model, building it if this is the first message to need it.
-    pub(crate) fn client(&self, model: &ModelConfig) -> Result<SharedModel, SessionError> {
-        if let Some(client) = self
+impl ModelFactory for ConfiguredModels {
+    fn build(
+        &self,
+        model: &ModelConfig,
+        runtime: tokio::runtime::Handle,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<SharedModel, SessionError> {
+        let cached = self
             .clients
             .lock()
             .expect("gateway model clients")
             .get(model.name())
-        {
-            return Ok(Arc::clone(client));
-        }
-        // Built outside the lock: two sessions racing on the first message to one endpoint should
-        // not serialize, and whichever finishes second discards its client rather than replacing a
-        // pool another session is already using.
-        let built = self.factory.build(model)?;
-        Ok(Arc::clone(
-            self.clients
-                .lock()
-                .expect("gateway model clients")
-                .entry(model.name().to_owned())
-                .or_insert(built),
-        ))
+            .cloned();
+        let client = match cached {
+            Some(client) => client,
+            None => {
+                // Build outside the lock; failure leaves no entry. A racing successful builder
+                // keeps the first pool rather than replacing a client already in use.
+                let built = self.construct(model)?;
+                let mut clients = self.clients.lock().expect("gateway model clients");
+                Arc::clone(clients.entry(model.name().to_owned()).or_insert(built))
+            }
+        };
+        let timeout_ms = match model {
+            ModelConfig::ChatgptSubscription { timeout_ms, .. }
+            | ModelConfig::OpenaiCompatible { timeout_ms, .. }
+            | ModelConfig::Openrouter { timeout_ms, .. } => *timeout_ms,
+        };
+        Ok(Arc::new(BlockingModel::new(
+            client,
+            runtime,
+            cancel,
+            std::time::Duration::from_millis(timeout_ms),
+        )))
+    }
+}
+
+/// Session factory seam. Expensive clients are cached by the real factory, never session bridges.
+///
+/// Configured names are unique, pools are shared across sessions, and construction failures are
+/// not cached. A session always supplies its own runtime and cancellation receiver.
+pub(crate) struct ModelCache {
+    factory: Arc<dyn ModelFactory>,
+}
+impl ModelCache {
+    pub(crate) fn new(factory: Arc<dyn ModelFactory>) -> Self {
+        Self { factory }
+    }
+    pub(crate) fn client(
+        &self,
+        model: &ModelConfig,
+        runtime: tokio::runtime::Handle,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<SharedModel, SessionError> {
+        self.factory.build(model, runtime, cancel)
     }
 }
 
@@ -991,6 +1059,9 @@ async fn session(
     // not what a channel with a hundred of them wants. The route keeps `progressDetail`, which is
     // how much the surface says rather than whether there is one.
     let (settings, keep_alive) = liveness.for_kind(message.conversation.kind);
+    // Drop the policy's terminal sender before waking cancellation: an aborted owner must not
+    // race a `Stopped.` reply. The guard still cancels blocking work before registry release.
+    let _cancel_on_drop = CancellationOnDrop(cancellation.clone());
     let (mut progress, sink) = ProgressPolicy::start(ProgressInputs {
         driver: Arc::clone(driver),
         target: message.liveness.clone(),
@@ -1010,10 +1081,6 @@ async fn session(
         agent: route.agent.to_string(),
         max_steps: limits.max_steps,
     });
-    // Declared last so task abortion drops this guard first, marking the blocking loop cancelled
-    // before the policy handle and the registry release the rest of the async session state.
-    let _cancel_on_drop = CancellationOnDrop(cancellation.clone());
-
     // The prompt loop and the interpreter are both synchronous and both can block for a long time
     // — a model round trip, a script that sleeps, a broker call per command. Running that on a
     // runtime worker would stall every other session in the process.
@@ -1039,12 +1106,14 @@ async fn session(
     // Moved into the blocking task so the policy's event queue closes when the loop ends, which is
     // how the policy learns there is nothing more coming without a second signal to keep in step.
     drop(sink);
+    let model_runtime = tokio::runtime::Handle::current();
+    let model_cancel = cancellation.signal().watch();
     let result = tokio::task::spawn_blocking(move || {
         let _entered = blocking_span.enter();
         // Resolved before the accumulator exists, so a model client that cannot be constructed
         // returns without a turn: nothing was asked, so there is no exchange to remember. Only the
         // first message to reach a given endpoint actually builds one.
-        let model = match models.client(&model_config) {
+        let model = match models.client(&model_config, model_runtime, model_cancel) {
             Ok(model) => model,
             Err(error) => return (Err(error), None, Vec::new()),
         };
@@ -1580,11 +1649,9 @@ pub enum SessionError {
     #[error("configured chat transport identifier is invalid")]
     TransportId(#[source] dekopon_core::IdentifierError),
     #[error(transparent)]
-    Model(#[from] ModelError),
+    Model(#[from] InferenceError),
     #[error(transparent)]
     ModelCredential(#[from] ModelCredentialError),
-    #[error(transparent)]
-    ChatGpt(#[from] dekopon_model::chatgpt::ChatGptError),
     #[error(transparent)]
     Prompt(#[from] PromptError),
 }
@@ -1601,8 +1668,104 @@ impl SessionError {
             Self::TransportId(_) => "transport-id",
             Self::Model(_) => "model",
             Self::ModelCredential(_) => "model-credential",
-            Self::ChatGpt(_) => "chatgpt",
             Self::Prompt(error) => error.telemetry_kind(),
         }
+    }
+}
+
+#[cfg(test)]
+mod model_factory_tests {
+    use super::*;
+
+    #[test]
+    fn the_real_factory_constructs_openrouter_and_preserves_its_authored_controls() {
+        let model: ModelConfig = serde_json::from_value(serde_json::json!({"kind":"openrouter", "name":"router", "model":"vendor/model", "apiKeyEnv":"OPENROUTER_API_KEY", "timeoutMs":2000, "generation":{"maxOutputTokens":1}})).unwrap();
+        let factory = ConfiguredModels::default();
+        let built = factory
+            .construct_with(&model, |variable| {
+                assert_eq!(variable, "OPENROUTER_API_KEY");
+                Some("synthetic-key".into())
+            })
+            .unwrap();
+        assert!(matches!(built.as_ref(), ModelClient::OpenRouter(_)));
+        assert!(matches!(
+            factory.construct_with(&model, |_| None),
+            Err(SessionError::ModelCredential(_))
+        ));
+        let mut invalid = model;
+        if let ModelConfig::Openrouter {
+            generation: Some(generation),
+            ..
+        } = &mut invalid
+        {
+            generation.temperature = Some(f64::NAN);
+        }
+        assert!(matches!(
+            factory.construct_with(&invalid, |_| Some("synthetic-key".into())),
+            Err(SessionError::Model(InferenceError::InvalidRequest(
+                dekopon_model::error::RequestError::OpenRouterSetting(_)
+            )))
+        ));
+    }
+
+    fn compatible(name: &str) -> ModelConfig {
+        serde_json::from_value(serde_json::json!({"kind":"openaiCompatible", "name":name, "endpoint":"http://127.0.0.1:9", "model":"fixture", "timeoutMs":2000})).unwrap()
+    }
+
+    #[test]
+    fn the_real_factory_shares_pools_by_configured_name_only() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let factory = ConfiguredModels::default();
+        let bind = |name| {
+            factory
+                .build(
+                    &compatible(name),
+                    runtime.handle().clone(),
+                    tokio::sync::watch::channel(false).1,
+                )
+                .unwrap()
+        };
+        let first = bind("one");
+        let first_pool = Arc::clone(factory.clients.lock().unwrap().get("one").unwrap());
+        let again = bind("one");
+        let other = bind("two");
+        assert!(!Arc::ptr_eq(&first, &again));
+        let clients = factory.clients.lock().unwrap();
+        assert!(Arc::ptr_eq(&first_pool, clients.get("one").unwrap()));
+        assert!(!Arc::ptr_eq(&first_pool, clients.get("two").unwrap()));
+        drop(clients);
+        assert!(!Arc::ptr_eq(&first, &other));
+        assert_eq!(factory.clients.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_failed_client_build_is_not_cached_and_codex_bridges_are_per_session() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let factory = ConfiguredModels::default();
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("auth.json");
+        let config: ModelConfig = serde_json::from_value(serde_json::json!({"kind":"chatgptSubscription", "name":"codex", "model":"fixture", "timeoutMs":2000, "authFile":path})).unwrap();
+        let bind = || {
+            factory.build(
+                &config,
+                runtime.handle().clone(),
+                tokio::sync::watch::channel(false).1,
+            )
+        };
+        assert!(matches!(
+            bind(),
+            Err(SessionError::Model(InferenceError::Authentication(_)))
+        ));
+        assert!(factory.clients.lock().unwrap().is_empty());
+        std::fs::write(path, serde_json::to_vec(&serde_json::json!({"version":1,"access":"synthetic","refresh":"synthetic","expiresAt":u64::MAX,"accountId":"synthetic"})).unwrap()).unwrap();
+        let first = bind().unwrap();
+        let again = bind().unwrap();
+        assert!(!Arc::ptr_eq(&first, &again));
+        let cache = factory.clients.lock().unwrap();
+        assert_eq!(cache.len(), 1);
+        assert!(matches!(
+            cache.get("codex"),
+            Some(client) if matches!(client.as_ref(), ModelClient::Codex(_))
+        ));
     }
 }

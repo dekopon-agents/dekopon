@@ -20,7 +20,7 @@ opentelemetry-appender-tracing.workspace = true
 opentelemetry-http.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

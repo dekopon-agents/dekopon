@@ -34,7 +34,7 @@ Two events record calls that cost money or consume a rate limit:
 
 | Event | Emitted by | Carries |
 |---|---|---|
-| `accounting.model.turn` | `dekopond` | turn index, duration, message and tool-call counts, token usage, outcome, and `error` when the outcome is `failed` |
+| `accounting.model.turn` | `dekopon-agent` | turn index, duration, message and tool-call counts, token usage, outcome, and `error` when the outcome is `failed` |
 | `accounting.http.request` | `dekopon-http-host` | method, authority, status, accounted request/response bytes, outcome, and `error.code`/`error.message` on failure |
 
 Both duplicate span fields: the span answers "why was this request slow", the accounting record
@@ -42,9 +42,12 @@ answers "how many did we make last month". Neither substitutes for broker audit,
 was authorized.
 
 Whatever the model provider reports for usage lands as `usage.input_tokens`,
-`usage.cached_input_tokens`, `usage.output_tokens`, `usage.reasoning_output_tokens`, and
+`usage.cached_input_tokens`, `usage.cache_write_tokens`, `usage.output_tokens`, `usage.reasoning_output_tokens`, and
 `usage.total_tokens` — normalized across the chat-completions and Codex Responses wire shapes — on
-both the `prompt.model_turn` span and the `accounting.model.turn` record.
+the `model.complete` and `prompt.model_turn` spans and the `accounting.model.turn` record.
+OpenRouter prompt tokens already include cached reads; `cache_write_tokens` is optional and is
+not added again to input. Reasoning is a subset of output, not additive. Unreported fields are
+absent, including cache writes on Codex and compatible responses.
 
 `accounting.http.request` carries the same sanitized set as its span and as `HttpCallEvidence`: no
 URL path or query, no headers, no bodies. It fires for every attempt, including one refused before
@@ -57,6 +60,42 @@ The byte counts are `dekopon.http.request.accounted_bytes` and
 `dekopon.http.response.accounted_bytes`, and not the OTel `http.*.body.size` names: the host
 accounts a conservative envelope covering encoding overhead, method, URL, and headers as well as
 the body, so the payload-size name would misreport transfer volume by the size of the headers.
+
+## Model exchange fields
+
+One shared-helper `model.complete` child describes each generation exchange beneath
+`prompt.model_turn`, including Codex's one permitted pre-body 401 refresh/resend. The model
+library uses `tracing` only and installs no subscriber.
+
+| Fields on `model.complete` | Meaning |
+|---|---|
+| `model.name`, `model`, `model.backend`, `model.dialect` | configured name, requested model ID, adapter (`chatgpt-subscription`, `openai-compatible`, `openrouter`) and API dialect (`codex-responses` or `chat-completions`) |
+| `model.returned`, `model.upstream` | sanitized reported model and the last reported OpenRouter provider, only when present |
+| `model.stream`, `cache.style` | local streamed/buffered mode and `automatic`/`explicitPrefix` encoding |
+| `generation.max_output_tokens`, `generation.temperature`, `generation.top_p`, `reasoning.effort` | authored OpenRouter requests, absent when omitted |
+| `routing.allow_fallbacks`, `routing.require_parameters`, `routing.only`, `cache.ttl` | authored routing/TTL hints; `routing.only` is a bounded comma-separated diagnostic |
+| `timing.total_ms` | complete exchange duration, including preparation and permitted refresh/resend |
+| `timing.headers_ms` | most recent send-to-headers duration; a Codex resend replaces the earlier value |
+| `timing.first_event_ms`, `stream.first_delta_ms` | time since adapter exchange starts (before preparation) to first SSE event / first visible text; absent when no such event/text exists |
+| `stream.deltas` | number of visible text fragments; tool-only turns invent no first-text time |
+| `usage.input_tokens`, `usage.output_tokens`, `usage.total_tokens` | normalized reported counters, never invented zeros |
+| `usage.cached_input_tokens`, `usage.cache_write_tokens`, `usage.reasoning_output_tokens` | reported subsets/work, without adding them again to total |
+| `tool_call.count`, `response.bytes` | completed call count on success, bytes consumed by the response reader |
+| `finish.reason`, `output.partial` | reported chat finish reason; partial visible output on failure or successful `length` text |
+| `outcome`, `error`, `error.kind` | `success`/`failed`; failures have a stable category, not raw diagnostic text |
+| `error.phase` | `before-send`, `awaiting-headers` or `reading-body`, when known |
+| `http.status`, `provider.code`, `provider.request_id` | safe known response metadata; status/request ID survive later protocol/cancellation failures |
+
+Failure kinds are `invalid-request`, `unsupported`, `authentication`, `rate-limited`, `provider`,
+`transport`, `protocol`, `attachment`, `cancelled`, `deadline-exceeded`. Retry-After is retained in
+the typed error when it is integer seconds, not an automatic retry instruction. Error body
+previews are stripped of control characters, have in-scope credentials replaced with
+`[REDACTED]`, then are bounded at 16 KiB; a preview cut mid-credential drops the partial token.
+Parser sources are preserved when safe. Credentials, the prompt cache key and private reasoning
+never enter `model.complete` fields, and `traceparent` is not forwarded to the inference endpoint.
+`agent.model.prompt`, `agent.model.answer` and `agent.tool.*` retain their existing audit projections and payload rules.
+
+Requested settings describe what Dekopon encoded, not what a remote provider honored.
 
 ## Provider linear-memory sizing
 
@@ -545,7 +584,7 @@ A route set to `mode: persistent` — the contract is in [`dekopond.md`](dekopon
 changes the meaning of a field that already exists. A route left on the `oneShot` default changes
 nothing here.
 
-**`message.count` is the field.** It appears on the `model.complete` span and on the
+**`message.count` is the field.** It appears on the `prompt.model_turn` span and on the
 `accounting.model.turn` record, and it counts one exchange: the system prompt, the message a person
 sent, and whatever the model and its tool have said back within this session. A session seeded with
 history counts the replayed window *plus* this exchange, so the same field on the same span means
@@ -581,9 +620,10 @@ of every shared prompt sent to the selected model provider independently of tele
 
 ### Reading the prompt cache
 
-Every model request `dekopond` makes declares a `prompt_cache_key` — one per conversation on a
-`persistent` route, one per bound route on a `oneShot` one.
-[`dekopond.md`](dekopond.md#the-prompt-cache-key) has the contract; two things follow for telemetry.
+Every model request declares the key (`prompt_cache_key`; `session_id` on OpenRouter) — one per
+conversation on a `persistent` route, one per bound route on a `oneShot` one. OpenRouter can
+additionally mark an explicit system prefix.
+[`dekopond.md`](dekopond.md#the-prompt-cache-key) has the local key contract; two things follow for telemetry.
 
 **`usage.cached_input_tokens` is how you find out whether it works.** Plot its ratio to
 `usage.input_tokens` on a conversation's second and later turns, the requests that repeat a prefix
@@ -593,8 +633,8 @@ conversation regardless of the key, and what the key buys is the burst inside a 
 window trim rewrites the front of the request and costs a miss by construction, so a run of misses
 on long conversations is `maxTurns` or `maxBytes` doing its job rather than a broken key.
 
-**The key rides its own log event.** It lands on `gateway.session.cache_key`, never a span
-attribute. It carries nothing about the audience by construction, but within one process it joins
+**The key rides its own log event.** It lands on `gateway.session.cache_key` and never enters
+`model.complete` fields. It carries nothing about the audience by construction, but within one process it joins
 one private or shared conversation's turns; it is emitted on its own event so that a key and a
 canonical subject never share a record, which keeps a reader who needs only one of them from seeing
 both.

@@ -13,24 +13,42 @@ use ureq::{Agent, config::ConfigBuilder, typestate::AgentScope};
 /// Bounded owned scratch leases for chat payloads.
 pub mod asset;
 
-/// Native ChatGPT/Codex subscription authentication and Responses transport.
+/// Per-session synchronous bridge.
+pub mod blocking;
+/// Native ChatGPT subscription credentials and device login.
 pub mod chatgpt;
+/// Async Codex Responses inference.
+pub mod codex;
+/// Per-turn cancellation and deadline control.
+pub mod control;
+mod diagnostic;
+/// Typed request, provider, transport, and protocol failures.
+pub mod error;
+mod http;
+/// Shared async inference contract and configured dispatch.
+pub mod inference;
+mod loopback;
 #[cfg(test)]
 mod mock;
-/// Generic chat-model contract and OpenAI-compatible transport.
+/// Portable messages, tool calls and the synchronous prompt-loop contract.
 pub mod model;
-/// The one Server-Sent Events reader both transports read their streams with.
+/// Async OpenAI-compatible chat completions.
+pub mod openai;
+/// OpenRouter streaming, native reasoning replay and authored controls.
+pub mod openrouter;
+/// Bounded async framing shared by generation adapters and offline replay.
 mod sse;
 /// What a turn reports while it is still arriving.
 pub mod stream;
+#[cfg(test)]
+mod trace_capture;
 
 pub use stream::{ModelText, TurnEvent, events_from_transcript};
 
-/// Builds the one HTTP agent shape every transport in this crate uses.
+/// Builds the blocking HTTP agent used only for credential operations.
 ///
-/// The three call sites differ only in their deadline, so the stance lives here rather than being
-/// restated — and silently diverging — at each of them. None of the three settings is ureq's
-/// default:
+/// Async generation applies the same security policy in `http::InferenceHttp`. None of these
+/// settings is ureq's default:
 ///
 /// - `proxy(None)` overrides the `Proxy::try_from_env()` that `ureq`'s `Config::default()`
 ///   installs. Left at the default, an ambient `HTTPS_PROXY`/`ALL_PROXY` would carry the ChatGPT

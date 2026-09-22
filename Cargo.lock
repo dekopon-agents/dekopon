@@ -822,6 +822,7 @@ dependencies = [
  "dekopon-process",
  "dekopon-shell",
  "dekopon-telemetry",
+ "dekopon-test-support",
  "getrandom 0.4.3",
  "rustix",
  "serde",
@@ -998,11 +999,16 @@ version = "0.19.0"
 dependencies = [
  "base64 0.23.1",
  "dekopon-core",
+ "futures-util",
+ "http",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror",
+ "tokio",
  "tracing",
+ "tracing-subscriber",
  "ureq",
 ]
 

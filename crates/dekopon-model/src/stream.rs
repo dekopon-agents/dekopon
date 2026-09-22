@@ -10,7 +10,7 @@ use std::ops::ControlFlow;
 
 use serde_json::Value;
 
-use crate::model::ModelError;
+use crate::error::InferenceError;
 
 /// Model-authored visible answer text.
 ///
@@ -109,17 +109,20 @@ pub enum TurnEvent {
 ///
 /// When the body is not a stream the matching parser accepts. For a recorded transcript that means
 /// the transcript is wrong, not the code reading it.
-pub fn events_from_transcript(body: &str) -> Result<Vec<TurnEvent>, ModelError> {
+pub fn events_from_transcript(body: &str) -> Result<Vec<TurnEvent>, InferenceError> {
     let mut events = Vec::new();
     let mut collect = |event: TurnEvent| -> ControlFlow<()> {
         events.push(event);
         ControlFlow::Continue(())
     };
     if is_responses_transcript(body) {
-        crate::chatgpt::parse_sse(body.as_bytes(), &mut collect)
-            .map_err(|error| ModelError::Response(error.to_string()))?;
+        crate::codex::replay_transcript(body, &mut collect)?;
     } else {
-        crate::model::read_chat_stream(body.as_bytes(), &mut collect)?;
+        crate::openai::replay_transcript(
+            crate::diagnostic::DiagnosticSecrets::default(),
+            body,
+            &mut collect,
+        )?;
     }
     Ok(events)
 }
@@ -207,10 +210,11 @@ mod tests {
         let error = events_from_transcript("data: {\"choices\": [\n\n")
             .expect_err("a truncated JSON payload is not a stream");
 
-        assert!(
-            error.to_string().contains("invalid stream chunk"),
-            "the failure must name what could not be read: {error}"
-        );
+        assert!(matches!(
+            error,
+            crate::error::InferenceError::Protocol(crate::error::ProtocolFailure::Decode(source))
+                if source.is_eof()
+        ));
     }
 
     #[test]

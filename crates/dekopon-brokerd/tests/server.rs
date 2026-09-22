@@ -1323,9 +1323,11 @@ async fn successful_asset_descriptors_and_send_effects_cross_the_real_server_wit
     })
     .await
     .unwrap();
+    // On macOS the half-closed peer can leave the descriptor write waiting for its I/O
+    // deadline. Close it before shutdown so that deadline does not race the equal grace period.
+    drop(stream);
     stop.send(()).unwrap();
     task.await.unwrap().unwrap();
-    drop(stream);
     assert_eq!(fs::read_dir(&assets_root).unwrap().count(), 0);
     // The failed frame must close its output descriptor and release the full shared reservation.
     asset_directory

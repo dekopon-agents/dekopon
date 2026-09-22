@@ -104,6 +104,17 @@ models:
     classes: [reasoning]
     modalities: [image]                       # optional; default none. This is image INPUT only.
 
+  - name: explore
+    kind: openrouter
+    model: anthropic/claude-sonnet-4.5
+    apiKeyEnv: OPENROUTER_API_KEY              # required environment-variable reference, never a value
+    timeoutMs: 120000
+    classes: [general]
+    generation: { maxOutputTokens: 4096 }
+    reasoning: { effort: medium }
+    routing: { allowFallbacks: false, requireParameters: true, only: [anthropic] }
+    cache: { style: explicitPrefix, ttl: 5m }
+
 routes:                                       # first match wins; order matters
   - transport: scientist-slack
     conversation: { kind: [channel, thread], ids: [c0123abc] }
@@ -159,6 +170,42 @@ The `memory:` block — which was called `conversation:` before 0.14.0 — is ta
 
 `improvementSuggestions: true` offers that route's sessions the `suggest_improvement` tool: a bounded channel for the model to tell the operator how the agent could be improved — an instruction that was wrong, a skill or capability it lacked, a limit it hit — at most three times per session. It is off by default because each recorded suggestion is model-authored text written to the telemetry sink as `agent.improvement.suggested`; setting the flag is the consent that puts it there. A suggestion is advisory by construction: no instruction, skill, limit, or grant moves because a model asked, and nothing it records is relayed to chat.
 
+### OpenRouter model settings
+
+The tag is exactly `kind: openrouter`, not `openRouter`. `name`, nonblank `model`, `apiKeyEnv`
+and positive `timeoutMs` are required. Any nonblank model ID is accepted locally; there is no
+catalog. `classes` and `modalities` default to `[]`; `modalities: [image]` means image input only.
+The production URL is fixed at `https://openrouter.ai/api/v1/chat/completions`, with streaming
+always on. `endpoint`, `stream` and `authFile` are not accepted for this kind.
+
+Each optional block is strict, as is the model entry:
+
+| Block | Members and bounds | Wire mapping |
+|---|---|---|
+| `generation` | optional `maxOutputTokens` positive integer, finite `temperature` 0–2 inclusive, finite `topP` >0 and ≤1 | `max_tokens`, `temperature`, `top_p` |
+| `reasoning` | required `effort`: `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max` | `reasoning: {effort}` |
+| `routing` | optional `allowFallbacks`, `requireParameters` booleans; optional nonempty `only` list of nonblank strings | `provider: {allow_fallbacks, require_parameters, only}` |
+| `cache` | required `style`: `automatic` or `explicitPrefix`; optional `ttl`: `5m` or `1h`, only with `explicitPrefix` | explicit system-part `cache_control: {type: ephemeral, ttl?}` |
+
+Omitted members are absent on the wire, not sent as default values. No cache block means automatic
+mode (no marker); an omitted TTL is not invented. Explicit caching marks the last content part of
+the last leading system message, including optional-reply guidance; no leading system message is
+an `InvalidRequest` before sending. Reasoning fragments remain private continuation state, never
+chat progress. The response-cache header `X-OpenRouter-Cache: false` is always sent; there is no
+`usage.include`, `stream_options` or `reasoning.exclude`. The prompt cache key is
+sent as `session_id` for sticky provider routing. Forwarded controls are requests, not guarantees
+that an upstream provider honored them. A provider change mid-conversation is accepted; pin
+`routing.only` when cost or cache locality matters. `allowFallbacks: false` disables failover but
+does not pin routing.
+
+Unknown fields and bad enum spellings are decode refusals. Semantic numeric bounds (including
+non-finite values), empty routing lists/entries and automatic-cache TTLs join the existing
+`ConfigProblem` collection rather than being clamped. Missing/blank credential variables are
+separate `StartupProblem`s at startup. These blocks are refused on
+`chatgptSubscription` and `openaiCompatible`.
+
+Each call has one total `timeoutMs` deadline; see [`inference.md`](inference.md).
+
 ### No secrets in this file
 
 Transports and chat models name **environment variables**, never values, following the precedent `dekopon-telemetry` set for OTLP ingest credentials. A variable name is validated as a name (`[A-Za-z_][A-Za-z0-9_]*`), so pasting a token where a variable name belongs is a startup failure rather than a token sitting in plain text while the daemon reports a missing credential. Missing required variables are reported at startup **by variable name and never by value**, and all three read them through one definition, so a model credential fails exactly the way a chat credential does. A variable exported with a blank value is refused the same way: an empty app secret is an HMAC key anyone can compute, and an empty bearer token is still sent as a header, so presence has to mean a credential rather than an export.
@@ -176,7 +223,7 @@ A gateway that starts and then refuses everything is worse than one that does no
 - a selector that can never name a conversation: an empty or duplicated `kind` list, an empty `ids` list, an id or `container` the transport would never mint, a `container` on Telegram (which has nothing above a chat), a kind the transport never produces (`groupDirectMessage` on Discord, `channel` on WhatsApp), or an `ids` entry in `id:thread` form — a selector names the parent, and the kind list decides whether its threads come with it;
 - `subjects:` beside anything but `kind: [directMessage]`, an empty `subjects:` list, or `memory.scope: sharedConversation` on a `[directMessage]`-only route, where the direct message already is the subject;
 - a `liveness.conversations.<kind>` key for a kind the transport never produces;
-- a missing or blank chat or bound-route model credential environment variable. A model's `apiKeyEnv` is optional and absent means "this endpoint needs no key", which a loopback llama.cpp genuinely does not; naming a variable that is unset or exported blank is the opposite claim, and this process cannot see one exported after it started;
+- a missing or blank chat or bound-route model credential environment variable. An `openaiCompatible` model's `apiKeyEnv` is optional (OpenRouter requires it), and absent means "this endpoint needs no key", which a loopback llama.cpp genuinely does not; naming a variable that is unset or exported blank is the opposite claim, and this process cannot see one exported after it started;
 - an unknown Slack experience, liveness mode/fallback, or field inside those strict blocks; an off
   Slack liveness with a reaction fallback, or a classic app with native liveness and no reaction
   fallback, is also refused because the configured fallback could never take effect;
@@ -457,9 +504,9 @@ Slack's native `processing` state includes a Stop button. The transport acknowle
 `agent_session_stopped` before handling it, derives its user and thread only from Slack's envelope,
 and lets the initiating subject win one atomic race against the normal answer. A Stop prevents
 subsequent model turns and capability invocations, suppresses the stale answer/history commit,
-queues `active`, and sends `Stopped.` An already-running synchronous model request or provider
-effect cannot be rolled back and may finish before the prompt loop reaches its next cooperative
-boundary. A provider command word the script is waiting on is the exception: its broker round
+queues `active`, and sends `Stopped.` In-flight model HTTP sends and reads, including silent
+reasoning, select on the session watch and are cancelled locally. Remote inference or provider
+effects already accepted cannot be rolled back. A provider command word the script is waiting on is the exception: its broker round
 trip runs as one cancellable process node tied to the session's Stop, so the run is aborted and
 joined and the script reads `session-cancelled` instead of waiting the broker out. Unknown,
 duplicate, and other-user Stop events are ignored.
@@ -872,14 +919,14 @@ Each routed message runs one session. On a `oneShot` route — the default, and 
 1. **Admission.** A process-wide semaphore bounds what the daemon costs at once, and a per-`(transport, conversation)` in-flight set, keyed on the same conversation identity the session registry and the memory key use, stops one conversation from queueing work on itself — what a person does when a bot seems slow and they send the same thing again. A rejected message gets `I'm busy — try again shortly.` when `replyOnBusy` is set, and silence otherwise.
 2. **Authorization.** The session opens an attested broker leg with `capabilities(subject, agent, scope)`. If the answer is empty — or the broker refuses, because the attestation was not honored or because policy does not permit this principal to drive this agent — the sender gets `You're not authorized to use this agent.` and **no model call or liveness write is made**. That is the cheapest possible refusal, and one the message text cannot argue with.
 3. **Liveness.** When the transport opted in, one session-owned policy task starts immediately after the fresh grant. The service renders everything; the model supplies no target, wording, emoji, cadence, or timing. The policy owns one message, spends the session's edit budget, seals synchronously before terminal delivery, and returns the service's own indicators to rest afterwards, so cosmetic I/O never delays the reply or holds admission. Two consecutive failures stop that surface for the session; permanent Slack installation failures additionally trip a transport-wide fallback breaker. What it shows is [Liveness, progress, and stopping a run](#liveness-progress-and-stopping-a-run).
-4. **Execution.** On a `persistent` route the session first looks up its conversation under the key in [Scope selects the replay audience](#scope-selects-the-replay-audience). An entry idle past the route's timeout, or built under a granted capability set that differs from the one this message's leg just reported, is dropped rather than used; whatever survives is seeded into the prompt ahead of the new message as compacted `(question, answer)` pairs, oldest dropped first until the window's turn and byte bounds both hold. A shared turn's user text starts with a gateway-authored canonical-participant label, for both the current message and later replay. The lookup happens *after* step 2 because the grant comparison needs a fresh grant to compare against. Then the model client is built from the route's model, the shell runtime is given the attested leg as its only capability dispatch, the credential-free `inspect_agent_config` view is built from the same fresh leg and offered unless the route wrote `inspectAgentConfig: false`, the scoped asset table and request-local explicit-send slot are attached to that leg, and the prompt loop runs on a blocking task with the agent's `instructions` as the system prompt. The agent's catalog skills ride the bound route — read whole into memory when the catalog loaded and shared by every session rather than re-read, so a session never touches the filesystem — and are mounted on every session on that route: a second system message after the instructions lists each by name and description, and the `read_skill` tool loads one skill's instructions, or one of its resource files, on demand. A route with `improvementSuggestions: true` additionally offers `suggest_improvement`; what it records is written to telemetry as `agent.improvement.suggested` and is never relayed to chat, so the sender sees only the answer. Instructions are supplied fresh on every message and never stored, so editing an agent's standing orders takes effect on the next message without rewriting a single remembered conversation. Shell bounds are `dekopon-shell`'s defaults except `maxCapabilityCalls` and the script deadline, which both come from the route. Every model request the session then makes declares a [prompt cache key](#the-prompt-cache-key) — the conversation's on a `persistent` route, the route's on a `oneShot` one.
+4. **Execution.** On a `persistent` route the session first looks up its conversation under the key in [Scope selects the replay audience](#scope-selects-the-replay-audience). An entry idle past the route's timeout, or built under a granted capability set that differs from the one this message's leg just reported, is dropped rather than used; whatever survives is seeded into the prompt ahead of the new message as compacted `(question, answer)` pairs, oldest dropped first until the window's turn and byte bounds both hold. A shared turn's user text starts with a gateway-authored canonical-participant label, for both the current message and later replay. The lookup happens *after* step 2 because the grant comparison needs a fresh grant to compare against. Then the model client is built from the route's model, the shell runtime is given the attested leg as its only capability dispatch, the credential-free `inspect_agent_config` view is built from the same fresh leg and offered unless the route wrote `inspectAgentConfig: false`, the scoped asset table and request-local explicit-send slot are attached to that leg, and the prompt loop runs on a blocking task with the agent's `instructions` as the system prompt. The agent's catalog skills ride the bound route — read whole into memory when the catalog loaded and shared by every session rather than re-read, so a session never touches the filesystem — and are mounted on every session on that route: a second system message after the instructions lists each by name and description, and the `read_skill` tool loads one skill's instructions, or one of its resource files, on demand. A route with `improvementSuggestions: true` additionally offers `suggest_improvement`; what it records is written to telemetry as `agent.improvement.suggested` and is never relayed to chat, so the sender sees only the answer. Instructions are supplied fresh on every message and never stored, so editing an agent's standing orders takes effect on the next message without rewriting a single remembered conversation. Shell bounds are `dekopon-shell`'s defaults except `maxCapabilityCalls` and the script deadline, which both come from the route. Every model request declares a [prompt cache key](#the-prompt-cache-key) (`session_id` on OpenRouter) — the conversation's on a `persistent` route, the route's on a `oneShot` one.
 5. **Answer, silence, and optional durable recording.** A required session's final bounded text and accepted provider attachments go back to chat. An inherited Slack Agent continuation may instead call `decline_chat_reply` before capability work, which commits its user-only in-process turn, removes the progress message, and sends no reply request. On failure the sender gets one fixed line, `The agent could not complete this request.` — a `PromptError` can carry model-chosen text, a provider message, or a transport diagnostic, and chat is the last place any of those belong. The operator reads the category from telemetry. A `persistent` route writes only the textual exchange back as one more in-process remembered turn, trims the window, and restarts the idle clock. A generation lease makes a commit from older in-flight work inert after grant invalidation, empty-grant removal, idle replacement, or capacity eviction, while concurrent work in the same generation appends in completion order. **The fixed failure line and attachment bytes are never stored.** A declined or failed model session records its question with nothing in the in-process answer's place, which is truthful and is what makes a later follow-up answerable; a session refused at step 2 records nothing at all. Optional durable recording happens under the conditions in [Durable memory after transport acceptance](#durable-memory-after-transport-acceptance).
 
 Text is bounded in both directions: inbound to 16 KiB keeping the head (a chat message states its request first), outbound to 8 KiB keeping head and tail (an answer's conclusion is usually its last line). Both truncations say so in the text.
 
 At shutdown, transport readers are aborted and in-flight sessions get `shutdownGraceMs` to finish — a model call is already paid for, and abandoning it means a person watching a chat window never hears back. If the grace expires, dropping each async owner marks its synchronous prompt loop cancelled before aborting the wrapper, so no later model turn or capability call starts. A model request or provider effect already in progress remains non-rollbackable and may finish after the async owner is gone.
 
-**Abandonment is bounded, so exit is too.** A cancelled prompt loop observes its flag at its next cooperative boundary, which can be on the far side of a whole synchronous model round trip, and dropping an async runtime waits for every such thread. The daemon therefore owns its runtime and gives that final wait five seconds before exiting anyway. Without it, worst-case exit is `shutdownGraceMs` plus a model timeout — on the reference deployment 120 s + 120 s — inside a pod termination grace that `dekopon-brokerd`'s own drain has to fit into as well, because the kubelet only starts stopping the broker sidecar once this container is gone. The chart defaults that grace to 270 s and asserts at template time that it covers both drains plus `drainBudget.bufferSeconds`, refusing to render anything shorter ([`charts/dekopon/README.md`](../charts/dekopon/README.md#draining-takes-both-graces-in-sequence)); 240 s of gateway abandonment does not leave the broker its 120 s inside it, and the kubelet SIGKILLs the broker mid-drain.
+**Abandonment is bounded, so exit is too.** The async model transport observes the session watch even during a silent read, while other blocking work (including credential/file IO) can still drain after cancellation; dropping an async runtime waits for its blocking threads. The daemon therefore owns its runtime and gives that final wait five seconds before exiting anyway. Without it, worst-case exit is `shutdownGraceMs` plus a model timeout — on the reference deployment 120 s + 120 s — inside a pod termination grace that `dekopon-brokerd`'s own drain has to fit into as well, because the kubelet only starts stopping the broker sidecar once this container is gone. The chart defaults that grace to 270 s and asserts at template time that it covers both drains plus `drainBudget.bufferSeconds`, refusing to render anything shorter ([`charts/dekopon/README.md`](../charts/dekopon/README.md#draining-takes-both-graces-in-sequence)); 240 s of gateway abandonment does not leave the broker its 120 s inside it, and the kubelet SIGKILLs the broker mid-drain.
 
 **Exhausting one transport is a gateway failure.** Healthy transports keep serving during a peer's
 bounded recovery episode. A permanent refusal, exhausted episode, or reader-task panic stops the
@@ -974,7 +1021,7 @@ The default is 15 minutes, which resolves toward the person because the user-vis
 
 ### The prompt cache key
 
-Every model request carries a `prompt_cache_key`, on both model backends. **It is a routing hint and never an access-control boundary.** It tells the provider which requests are likely to share a leading prefix so they can land on one cache; it authorizes nothing, isolates nothing, and hides nothing. The request carries the whole conversation either way, and a backend that ignores the field returns a byte-identical answer at full price. Two requests sharing a key share nothing else: authorization is asked per message, on a fresh attested leg.
+Every model request carries the key: as `prompt_cache_key` on Codex and OpenAI-compatible backends, as `session_id` on OpenRouter. **It is a routing hint and never an access-control boundary.** It tells the provider which requests are likely to share a leading prefix so they can land on one cache; it authorizes nothing, isolates nothing, and hides nothing. The request carries the whole conversation either way, and a backend that ignores the field still evaluates the whole request without that affinity hint. Two requests sharing a key share nothing else: authorization is asked per message, on a fresh attested leg.
 
 **It carries nothing about the private subject or shared conversation identifier.** The key is an opaque identifier *minted* when the thing it names is created — not either audience coordinate, not a hash of one, not a salted one. A canonical subject can be a phone number, so sending it would hand a model provider the sender's identity in exchange for routing that happens anyway; hashing it does not fix that, because a hash of a stable subject is a stable pseudonym. A configured salt is worse again: a new secret to manage whose only purchase is a pseudonym that survives restarts.
 
