@@ -19,6 +19,7 @@ Read in this order:
    [`native-first-chat-progress.md`](native-first-chat-progress.md) is an **Exploration** proposing native-first selection, independent answer streaming, and bounded fallback; it is not implemented.
    [`chatgpt-credential.md`](chatgpt-credential.md) follows the ChatGPT subscription credential from a local login to a pod.
 6. [`inference.md`](inference.md) — exact model request types and wire shape, prompt-cache optimization and retention caveats, bounded chat history, durable on-demand chat turns, and the broader memory design space.
+   [`multi-llm-implementation-plan.md`](multi-llm-implementation-plan.md) is an **Exploration** for a lean Codex/OpenRouter inference API, with a separate [Fable review brief](multi-llm-fable-review.md); neither describes implemented functionality.
 7. [`observability.md`](observability.md) — gateway and broker OTLP traces, the broker audit record and where it goes, what telemetry excludes, and the OpenObserve development example.
 8. [`improvement.md`](improvement.md) — the operator-driven improvement loop: skills as progressive disclosure of operator-authored knowledge, opt-in `suggest_improvement` records, and what is absent.
 9. [`dekopon-brokerd` contract](../crates/dekopon-brokerd/README.md#boundaries) — the host, policy, credential, and provider-lifecycle authority boundary, with status called out per slice.
