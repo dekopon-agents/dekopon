@@ -737,6 +737,8 @@ async fn execute(
         .instrument(tracing::info_span!(
             "gateway.session",
             agent = %route.agent,
+            gen_ai.agent.name = %route.agent,
+            gen_ai.operation.name = "invoke_agent",
             conversation.kind = message.conversation.kind.as_str(),
             conversation.container = message.conversation.container.as_deref().unwrap_or_default(),
             conversation.id = message.conversation.id.as_str(),

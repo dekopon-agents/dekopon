@@ -7,6 +7,11 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed
+
+- Mark each gateway agent session with canonical OpenTelemetry GenAI agent name and invocation
+  attributes so OpenObserve discovers the configured agent without custom attribute mapping.
+
 ## [0.19.0] - 2026-09-21
 
 ### Fixed

@@ -11715,6 +11715,69 @@ fn assert_trace_opens_at_receipt(
 }
 
 #[tokio::test]
+async fn gateway_session_exports_the_configured_agent_invocation_under_the_message() {
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::{
+        error::OTelSdkResult,
+        trace::{SdkTracerProvider, SpanData, SpanExporter},
+    };
+    use tracing_subscriber::prelude::*;
+
+    #[derive(Clone, Debug, Default)]
+    struct Exported(Arc<Mutex<Vec<SpanData>>>);
+
+    impl SpanExporter for Exported {
+        async fn export(&self, batch: Vec<SpanData>) -> OTelSdkResult {
+            self.0.lock().unwrap().extend(batch);
+            Ok(())
+        }
+    }
+
+    let exported = Exported::default();
+    let provider = SdkTracerProvider::builder()
+        .with_simple_exporter(exported.clone())
+        .build();
+    let _subscriber = tracing_subscriber::registry()
+        .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("agent-invocation-test")))
+        .set_default();
+
+    answer_once(message("identify this invocation")).await;
+    provider.force_flush().unwrap();
+
+    {
+        let spans = exported.0.lock().unwrap();
+        let invocation = spans
+            .iter()
+            .find(|span| span.name == "gateway.session")
+            .expect("agent invocation span exported");
+        let attribute = |key: &str| {
+            invocation
+                .attributes
+                .iter()
+                .find(|item| item.key.as_str() == key)
+                .map(|item| item.value.to_string())
+        };
+        assert_eq!(attribute("gen_ai.agent.name").as_deref(), Some("reviewer"));
+        assert_eq!(
+            attribute("gen_ai.operation.name").as_deref(),
+            Some("invoke_agent")
+        );
+
+        let message = spans
+            .iter()
+            .find(|span| span.name == "gateway.message")
+            .expect("gateway message span exported");
+        assert_eq!(invocation.parent_span_id, message.span_context.span_id());
+        assert_eq!(
+            invocation.span_context.trace_id(),
+            message.span_context.trace_id()
+        );
+    }
+
+    provider.shutdown().unwrap();
+}
+
+#[tokio::test]
 async fn a_slack_envelope_opens_its_trace_before_it_is_acknowledged() {
     let (capture, _subscriber) = capture_spans();
     let socket = spawn_socket_mock(vec![events_envelope(

@@ -202,6 +202,14 @@ for operation_name in transport.receive gateway.message gateway.session broker.i
     }
 done
 
+jq -e --arg service "$service_name" '
+  any(.hits[]?; .service_name == $service and .operation_name == "gateway.session"
+      and .gen_ai_agent_name == "chat-agent"
+      and .gen_ai_operation_name == "invoke_agent")' "$temporary/search.json" >/dev/null || {
+  echo "gateway session missing OpenObserve GenAI agent invocation identity" >&2
+  exit 1
+}
+
 # Completeness, not redaction: the proposal the model made has to be readable in the trace an
 # operator reads back, not only in the process that made it.
 if ! grep -Fq "$sentinel" "$temporary/search.json"; then
