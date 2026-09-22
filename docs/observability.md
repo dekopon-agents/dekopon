@@ -361,7 +361,15 @@ two further spans of its own:
 |---|---|
 | `transport.receive` | `transport.kind` (`slack`, `discord`, `telegram`, `whatsapp`, `local`), `message.id`, `drop.reason`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`; the trace root |
 | `gateway.message` | `transport`, `agent`, `outcome` (`answered`, `declined`, `unauthorized`, `busy`, `failed`, `cancelled`, `reply-failed`) |
-| `gateway.session` | `agent`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
+| `gateway.session` | `agent`, `gen_ai.agent.name`, `gen_ai.operation.name=invoke_agent`, `conversation.kind`, `conversation.container`, `conversation.id`, `conversation.thread`, `conversation.turns`, `conversation.bytes`; wraps the broker leg and the model session |
+
+`gateway.session` is the agent invocation span. Its canonical OpenTelemetry GenAI attributes use
+`gen_ai.agent.name` from the validated, owner-configured route agent and
+`gen_ai.operation.name=invoke_agent`, allowing OpenObserve to discover the configured agent without
+a custom attribute mapping. No separate `gen_ai.agent.id` is emitted because the current agent
+resource has no distinct stable identifier beyond its name. These attributes do not change the
+span's existing parentage: it remains a child of `gateway.message`, and all prompt, broker and
+provider work continues on that message's W3C trace.
 
 `transport.receive` is one span per receipt, opened before the payload is parsed, so Slack's
 envelope acknowledgment, WhatsApp's HMAC signature check and its 200, Telegram's `offset` advance,
@@ -1068,8 +1076,10 @@ inspect traces in the UI.
 `examples/otel-traces/smoke-test.sh` is the repository-level black-box check. It runs real broker
 and gateway processes, a stdlib model stub, and one private local-transport turn that runs
 `probe upper` against the authorized in-tree `cli-probe` provider. It asserts `transport.receive`, `gateway.message`, `gateway.session`,
-`broker.invocation`, `provider.compile`, and `provider.invoke`, including cross-process invocation
-trace continuity from the transport's receipt onward. A
+`broker.invocation`, `provider.compile`, and `provider.invoke`, including the gateway session's
+OpenObserve-normalized `gen_ai_agent_name=chat-agent` and
+`gen_ai_operation_name=invoke_agent` fields and cross-process invocation trace continuity from the
+transport's receipt onward. A
 smoke-only stdout shipper checks ingestion-record counts; complete bounded remote log queries
 independently correlate each daemon's native ID pair with an actual exported span. Startup
 compilation may have a separate trace. Local, shipped, and remote records must exclude payload and

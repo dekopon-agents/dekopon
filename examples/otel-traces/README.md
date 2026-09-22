@@ -30,8 +30,10 @@ shared formatter; records outside valid context have neither ID. The fixture ena
 logging to obtain existing broker compilation records without compiler debug noise.
 
 The bounded queries require `transport.receive`, `gateway.message`, `gateway.session`,
-`broker.invocation`, `provider.compile`, and `provider.invoke`. Receipt/gateway/session/invocation/provider
-invocation share a trace; startup compilation legitimately has its own. Each daemon's independently
+`broker.invocation`, `provider.compile`, and `provider.invoke`. They also require OpenObserve to
+normalize `gateway.session` as the `chat-agent` invocation through `gen_ai_agent_name` and
+`gen_ai_operation_name`. Receipt/gateway/session/invocation/provider invocation share a trace;
+startup compilation legitimately has its own. Each daemon's independently
 retrieved native log pair must match an actual exported span, not a query-manufactured
 ID. Queries fail on partial or saturated results, and remote log counts must equal
 shipped counts. The payload sentinel must *appear* in both complete remote signal
