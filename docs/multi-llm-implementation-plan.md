@@ -1,37 +1,68 @@
 # Multi-LLM API implementation plan
 
-**Status: Exploration, ready for design review.** This is a proposed implementation sequence, not implemented behavior or approval to deploy, record paid calls, or publish a release. Initial source baseline: `3c155fe68e47d4e656f9321d7a0a4dd8b5b0a817`.
+**Status: Exploration, reviewed by Fable on 2026-09-22 and decided.** The review verdict and its
+findings are recorded in the [Fable review brief](multi-llm-fable-review.md). This document is
+the decided input for a `pi-subagent-plan` driver brief; it is not implemented behavior, and it
+is not approval to deploy, record paid calls, or publish a release. Source baseline:
+`3c155fe68e47d4e656f9321d7a0a4dd8b5b0a817` (`origin/main` at v0.19.0). Every locator below is
+`path:line` at that SHA; verify with `git show` before relying on one.
 
 ## Outcome and deliberate limits
 
-Run the **same Dekopon prompt/tool loop** against Codex subscription and OpenRouter, selecting a model in configuration rather than branching orchestration code. Preserve existing OpenAI-compatible endpoints. Make differences visible through typed requests, provider-specific options, useful errors and comparable traces. Keep the library usable without the gateway.
+Run the **same Dekopon prompt/tool loop** against Codex subscription and OpenRouter, selecting a
+model in configuration rather than branching orchestration code. Preserve existing
+OpenAI-compatible endpoints. Make differences visible through typed requests, provider-specific
+options, useful errors and comparable traces. Keep the library usable without the gateway.
 
-This is a small inference-client API, not an agent framework. Borrow the chat gateway's separation of shared policy from protocol adapters, not its older boxed-future implementation style. RubyLLM is the ergonomics benchmark; Rig and genai are useful examples, not proposed orchestration dependencies.
+This is a small inference-client API, not an agent framework. Borrow the chat gateway's
+separation of shared policy from protocol adapters (PR #257's `ChatDriver` + `ProgressPolicy`
+over per-transport code), not the `#[async_trait]`/`BoxFuture` style its `Transport` trait uses
+(`crates/dekopond/src/transport.rs:14-25`). Nothing in `dekopon-model` or `dekopon-agent` uses
+that style today, so there is nothing to migrate away from, only a style not to introduce.
 
-**Ship first:** async inference I/O through `reqwest`; typed core contract; Codex, OpenRouter Chat and existing OpenAI-compatible Chat; safe replay; a few useful cache/reasoning controls; shared instrumentation; offline cassettes; one reusable loop example.
+**Ship first:** async generation I/O through `reqwest`; typed core contract; Codex, OpenRouter
+Chat and the existing OpenAI-compatible Chat; safe replay; two cache modes and a typed reasoning
+control; shared instrumentation; synthetic offline interaction fixtures; one reusable loop
+example.
 
-**Defer:** Vertex Gemini **and Claude**, Bedrock, cache-resource CRUD, direct public OpenAI Responses beyond the existing Codex dialect, embeddings, generated audio/images, batch/realtime APIs, provider-side tools, an online model catalog, automatic fallback/retries, price catalogs, dashboards, benchmark infrastructure and crate extraction/publication. Ordinary image/document input already supported by Dekopon must continue to work.
+**Defer:** Vertex Gemini and Claude, Bedrock, cache-resource CRUD, OpenAI's explicit
+`prompt_cache_breakpoint` vocabulary, direct public OpenAI Responses beyond the existing Codex
+dialect, embeddings, generated audio/images, batch/realtime APIs, provider-side tools, an online
+model catalog, automatic fallback/retries, price catalogs, dashboards, benchmark infrastructure,
+live recording tooling, and crate extraction/publication. Ordinary image/document input already
+supported by Dekopon must continue to work.
 
-Future providers get documented module/trait extension points, not SDK dependencies, config variants with no implementation, or placeholder public types. Repository lints reject `todo!()`/`unimplemented!()` and unused public APIs; represent the requested TODOs in this plan. An unavailable backend fails config decoding/construction, never panics after accepting a chat.
+Future providers get documented module/trait extension points, not SDK dependencies, config
+variants with no implementation, or placeholder public types. `clippy::todo` and
+`clippy::unimplemented` are denied workspace-wide (`Cargo.toml:141-142`); "no unused public API"
+is a review rule, not a lint (`CONTRIBUTING.md:74`: every new public item, dependency, config
+field and error variant needs a non-test consumer in the same PR). An unavailable backend fails
+config decoding/construction, never panics after accepting a chat.
 
 ## 1. Source-grounded decisions
 
 | Current seam | Proposed change |
 |---|---|
-| `dekopon-model::model::ChatModel` is synchronous; two clients use `ureq` | Add one native-async inference trait and shared `reqwest` generation transport; keep a narrow synchronous adapter for the existing loop |
-| `dekopon-agent::prompt` and `ScriptRuntime` are synchronous; gateway runs them in `spawn_blocking` | Retain that ownership model in the first release; no shell or broker-I/O rewrite |
-| `ModelMessage`, calls and replay lean toward OpenAI wire shapes | Introduce role/content enums and private, dialect-bound continuation; preserve current convenience constructors where useful |
-| `ModelText`/`TurnEvent` restrict what can reach chat progress | Preserve their provenance boundary; reasoning/arguments remain internal |
-| `ModelCache` shares clients by configured model; options are request-scoped | Preserve pool/client reuse; immutable model defaults plus per-request affinity/control |
-| `CredentialFile` owns shared Codex refresh, also consumed by broker credentials | Keep that implementation and its lock/write-back semantics; do not migrate account lifecycle just to change inference HTTP |
-| Codex currently refreshes and resends once after HTTP 401 | Make this behavior change explicit: refresh before send; return 401 as a typed failure, no automatic inference resend |
-| Root already has `reqwest` 0.12 with rustls/http2/stream and `futures-util` | Reuse them; add model-crate dependency/features only as needed, no second async HTTP stack |
+| `ChatModel::complete` is synchronous (`crates/dekopon-model/src/model.rs:408-433`); both clients send over `ureq` (`model.rs:9`, `chatgpt.rs:360-378`), including Codex generation | Add one native-async inference trait and a shared `reqwest` generation transport; keep one synchronous adapter for the existing loop |
+| `run_prompt_session` and `ScriptRuntime` are synchronous (`crates/dekopon-agent/src/prompt.rs:501`); the gateway runs the loop on `spawn_blocking` (`crates/dekopond/src/session.rs:1040`) | Retain that ownership model; no shell or broker-I/O rewrite |
+| `ModelMessage` is a private-field struct with a string role (`model.rs:199-210`); `AssistantTurn::replay_items: Vec<Value>` is public but doc-hidden (`model.rs:358-359`) | Role/content enums and a private, dialect-bound continuation; preserve the convenience constructors the loop uses |
+| `ModelText`/`TurnEvent` restrict what reaches chat progress (`crates/dekopon-model/src/stream.rs:28,79`) | Preserve the provenance boundary; reasoning/arguments remain internal |
+| `ModelCache` in the gateway shares clients by configured model name (`crates/dekopond/src/session.rs:192-227`); options are request-scoped | Cache the async clients; build the lightweight blocking bridge per session |
+| `CredentialFile` owns Codex refresh with a cross-process lock (`chatgpt.rs:119-124,270`); `dekopon-brokerd` consumes it too (`crates/dekopon-brokerd/src/credentials.rs:35`) | Keep it, on blocking `ureq`, called from a blocking task; do not migrate account lifecycle |
+| Codex refreshes before send and resends once after HTTP 401 (`chatgpt.rs:412-433`, test at `chatgpt.rs:3134-3177`) | **Keep it** (D4); the generation helper itself never retries |
+| Root already has `reqwest` 0.12 with `blocking`, `http2`, `rustls-tls-webpki-roots`, `stream` and `futures-util` (`Cargo.toml:50,73`) | `dekopon-model` adds `reqwest` (no `blocking`), `tokio`, `futures-util` and `dekopon-process` dependency lines; it has none of them today (`crates/dekopon-model/Cargo.toml:16-25`) |
 
-Do not depend on `dekopon-http-host` to reuse its HTTP code: that is a privileged effect boundary excluded from the gateway. A small unprivileged transport helper in `dekopon-model` is the right boundary.
+Do not depend on `dekopon-http-host`: it is the credential-bound HTTP engine used only by
+`dekopon-broker-host` and `dekopon-brokerd` (`docs/architecture.md:29`), and the gateway does not
+depend on it today. A small unprivileged transport helper in `dekopon-model` is the right
+boundary.
 
 ## 2. Library contract: narrow traits, closed runtime selection
 
-Keep the work in `dekopon-model`, with modules rather than new crates. Representative design notation below omits imports/supporting types; implementation must compile on the pinned toolchain.
+Keep the work in `dekopon-model`, with modules rather than new crates. Design notation below
+omits imports and supporting types; the implementation must compile on the pinned toolchain
+(`rust-toolchain.toml:11`, 1.98.1). None of the proposed names collide with an existing symbol
+(verified by grep across `crates/`).
 
 ```rust
 pub trait InferenceModel: Send + Sync {
@@ -56,54 +87,122 @@ pub struct GenerateRequest<'a> {
 }
 ```
 
-Concrete adapters implement the trait; the enum implements it by matching. The loop need not carry an adapter type parameter through every gateway object. No `async_trait`, boxed-future signatures, dynamic plugin registry or GAT-based public prepared-request hierarchy is needed.
+Concrete adapters implement the trait; the enum implements it by matching. The loop does not
+carry an adapter type parameter. No `async_trait`, boxed-future signatures, dynamic plugin
+registry or GAT-based prepared-request hierarchy.
 
-A single `generate` streams safe progress and returns one complete turn. Collecting without displaying progress uses a no-op observer; do not add a second nonstreaming orchestration path. Preserve `stream:false` for compatible endpoints using a private buffered-response decoder feeding the same normalized result rules.
+A single `generate` streams safe progress and returns one complete turn. Collecting without
+displaying progress uses a no-op observer. Preserve `stream: false` for compatible endpoints
+through a private buffered-response decoder feeding the same normalized result rules.
 
-Inside each adapter, **prepare/validate before HTTP**, using private typed wire structs. A public builder produces structural validity; private preparation checks dialect-specific combinations. Do not expose a generic raw `extra_body`, nor force users to construct SDK wire types.
+Inside each adapter, **prepare/validate before HTTP**, using private typed wire structs. A public
+builder produces structural validity; private preparation checks dialect-specific combinations.
+No generic raw `extra_body`; users never construct wire types.
 
 ### Message, tool and replay types
 
-- Replace string roles plus unrelated optional fields with `ModelMessage::{System, User, Assistant, ToolResults}`. Keep ergonomic constructors and read-only accessors for the current loop.
-- Reuse text/image/document content and scoped `BlobReference` handles. No audio/video/embedding variants without an actual first-release consumer.
-- Use a `ToolCallId` newtype and complete call structs. JSON Schema and arbitrary tool arguments legitimately use `serde_json::Value`; provider options and lifecycle states do not.
-- Preserve ordered assistant content and tool-call order. Completed tool calls are accessible only after a successful terminal reduction; partial argument fragments never become executable calls.
-- Replace application-constructible `replay_items: Vec<Value>` with private `Continuation::{Portable, Codex(...), OpenRouter(...)}`. Private bounded native JSON subtrees may preserve unknown fields losslessly. Bind continuation to the configured client/model/dialect; record actual router upstream when supplied.
-- OpenRouter must preserve structured `reasoning_details`, including signed/encrypted data. Do not reconstruct it from visible reasoning text or discard it because the user does not display reasoning.
-- One authoritative assistant record owns replay and projections. Do not maintain independently editable native and normalized transcripts.
-- Existing compact cross-message history is intentionally portable/lossy; exact continuation applies inside a tool loop. Switching configured providers starts a fresh tool loop, not an implicit replay conversion.
+- Replace the string role plus unrelated optional fields with `ModelMessage::{System, User,
+  Assistant, ToolResults}`. Keep `system`, `user`, `user_with_parts` and `tool` constructors and
+  the read-only accessors the loop uses (`model.rs:215-304`).
+- Reuse text/image/document content and scoped `BlobReference` handles. No audio/video/embedding
+  variants without a first-release consumer.
+- `ToolCallId` newtype (new; no such type exists) and complete call structs. JSON Schema and tool
+  arguments legitimately use `serde_json::Value`; provider options and lifecycle states do not.
+- Preserve ordered assistant content and tool-call order. Completed tool calls are accessible
+  only after a successful terminal reduction; partial argument fragments never become executable
+  calls.
+- Replace the public `AssistantTurn::replay_items: Vec<Value>` with a private
+  `Continuation::{Portable, Codex(..), OpenRouter(..)}`. Bounded native JSON subtrees preserve
+  unknown fields losslessly. Bind continuation to the configured client/model/dialect; record the
+  reported upstream when supplied.
+- OpenRouter preserves the structured `reasoning_details` array verbatim, including
+  `reasoning.encrypted` items, and sends it back unmodified on the assistant message of the next
+  turn (the documented rule: the sequence must match the original output, unmodified).
+- One authoritative assistant record owns replay and projections; no independently editable
+  native and normalized transcripts.
+- Compact cross-message history stays portable and lossy; exact continuation applies inside a
+  tool loop. Switching configured providers starts a fresh tool loop.
 
-`ModelText` remains constructible from provider-visible answer content only inside the model crate. `Debug` and audit rendering of assets/replay are deliberate projections, never the provider wire serializer.
+`ModelText` remains constructible only inside the model crate (`stream.rs:32`). `Debug` and audit
+rendering of assets/replay are deliberate projections, never the wire serializer.
 
 ### Keep the synchronous loop: one explicit bridge
 
-Add `BlockingModel` implementing the existing synchronous `ChatModel`, wrapping a shared `ModelClient`, an explicitly supplied Tokio `Handle`, and request/session cancellation control. Cache only the underlying clients; create the lightweight bridge per session so cancellation/affinity never sticks to the first conversation. It calls `Handle::block_on` **only on the existing blocking session task**, while real network I/O uses async `reqwest`. No new runtime per model/turn and no `block_on` on an async worker thread. The externally reusable API is native async; the bridge is only for synchronous embedders.
+Add `BlockingModel` implementing the existing synchronous `ChatModel`, wrapping a shared
+`Arc<ModelClient>`, an explicitly supplied Tokio `Handle`, and a `TurnControl`. The gateway's
+`ModelCache` stores `Arc<ModelClient>`; the bridge is built per session so cancellation never
+sticks to the first conversation. It calls `Handle::block_on` **only on the existing blocking
+session task**, exactly as the broker leg already does
+(`crates/dekopon-agent/src/lib.rs:1023-1027`, "safe specifically because this runs on a
+spawn_blocking thread"); reuse that comment's framing. No new runtime per model or turn; no
+`block_on` on a runtime worker. The externally reusable API is native async; the bridge exists
+for synchronous embedders.
 
-Audit the callback signature's `Send` bound through existing prompt/test callers. Keep one synchronous prompt loop, not parallel async/sync copies. The standalone example owns a Tokio runtime, then runs the same core loop on `spawn_blocking`. That is sufficient for this release; making the entire shell runtime async is independent future work.
+The observer is `+ Send` because the `generate` future is `Send`, and `ChatModel::complete`'s
+callback (`model.rs:424`, currently `&mut dyn FnMut(TurnEvent) -> ControlFlow<()>` with no `Send`)
+gains the same bound: a `&mut dyn FnMut` object cannot be widened to `+ Send` later. Every
+current callback is already `Send` (`TurnStream` holds only `&dyn ProgressSink` and
+`&dyn CancellationProbe`, both `Send + Sync`), so this is a signature change across the
+implementors listed in §Facts, not a behavior change.
 
-Connect `SessionCancellation` (currently atomic state plus `Notify`) to a race-safe async wait used by `TurnControl`: check/register/check or a retained watch-state notification, not polling/sleeping. The same authoritative cancelled state drives the current probe and the async wait. Put only the small shared cancellation primitive in a dependency-safe lower crate/module; no dependency from model to agent/gateway. Prefer existing Tokio primitives over a new cancellation framework. Verify no lost notification when cancellation precedes registration.
+**Cancellation reuses `dekopon_process::CancelSignal`.** `SessionCancellation` already owns a
+`CancelHandle`/`CancelSignal` pair fired by the winner of `cancel()`
+(`crates/dekopond/src/session.rs:293,337-359`) and exposes `signal()` (`session.rs:382`);
+`CancelSignal` is a `tokio::sync::watch` receiver whose `cancelled()` wait is race-safe but
+private (`crates/dekopon-process/src/lib.rs:99-153`). `TurnControl` wraps a `CancelSignal` plus
+the total deadline; `CancelSignal::cancelled` becomes `pub`. No new primitive, nothing added to
+`dekopon-core` (which is wasm-guest-reachable and carries no tokio,
+`crates/dekopon-core/Cargo.toml:16-27`). `SessionCancellation::cancelled()`
+(`session.rs:369-379`) keeps serving the progress policy; it is not the model's wait.
 
-Dropping/abandoning a gateway session signals cancellation. Async send/read selects that signal and the overall deadline, drops the response, and returns a failure; it does not return a successful partial turn. The blocking loop still owns history, script execution and final arbitration. Cancel does not undo tools already run or guarantee upstream billing stopped.
+Dropping a gateway session signals cancellation (`CancellationOnDrop`, `session.rs:404-415`).
+Async send/read selects that signal and the deadline, drops the response, and returns
+`InferenceError::Cancelled` or `DeadlineExceeded`; never a partial turn. The blocking loop still
+owns history, script execution and terminal arbitration. Cancel does not undo tools already run
+or guarantee upstream billing stopped.
 
 ## 3. One instrumented async HTTP path
 
-Own a small `InferenceHttp` around cloned `reqwest::Client` handles. Construct once per configured client/security policy, not per request. Defaults: rustls verification, bounded connect and total request deadlines, redirects disabled, shared keep-alive pools, no inference retries or automatic fallback. Do not change workspace TLS/features or broker transport defaults unnecessarily.
+Own a small `InferenceHttp` around cloned `reqwest::Client` handles. Construct once per configured
+client, not per request. Defaults: rustls verification, bounded connect and total deadlines
+(`timeoutMs` becomes the total deadline, as it is for `ureq` today), redirects disabled, shared
+keep-alive pools, no retries or fallback. Do not change workspace TLS features or broker transport
+defaults.
 
-The helper owns request send, status/error handling, byte counts, duration and cancellation. Adapters own endpoint/auth headers, serde wire mapping and protocol reducers. Do not build a generic middleware/plugin pipeline. `tracing` plus one helper is enough; a middleware crate is not required merely to instrument requests.
+The helper owns send, status/error handling, byte counts, duration and cancellation. Adapters own
+endpoint/auth headers, serde wire mapping and protocol reducers. No middleware pipeline;
+`tracing` plus one helper is enough.
 
-Use `Serialize`/`Deserialize` derives on **small hand-written wire structs/enums** for fields actually used. Serde is serialization/code generation, not a provider-spec downloader. No build-time OpenAPI fetching, enormous generated SDK model trees or `Value` for entire requests. Tolerate additive unknown response fields; reject unknown required semantic events rather than silently completing a damaged turn. For preserved replay records, retain unknown native fields locally instead of inventing variants globally.
+Use `Serialize`/`Deserialize` derives on small hand-written wire structs for fields actually
+used. No build-time OpenAPI fetching or `Value` for whole requests. Tolerate additive unknown
+response fields; reject unknown required semantic events rather than silently completing a
+damaged turn.
 
-Adapt the existing bounded SSE framing to async chunks and reuse it across Codex/Chat reducers. HTTP chunk boundaries are not SSE/JSON boundaries. Do not collect a whole streaming response; retain existing event/body limits and explicit ownership of accumulated text, arguments and replay. Preserve tolerant Chat decoding already tested for compatible endpoints rather than imposing stricter OpenAI-only assumptions.
+Adapt the bounded SSE framing (`crates/dekopon-model/src/sse.rs`, `MAX_STREAM_BYTES` 16 MiB at
+`sse.rs:24`) to async chunks and reuse it across the Codex and Chat reducers. HTTP chunk
+boundaries are not SSE/JSON boundaries. Retain the existing event/body limits and explicit
+ownership of accumulated text, arguments and replay. Preserve the tolerant Chat decoding already
+tested for llama.cpp/Ollama (`model.rs:1864-1963`).
 
-Preserve attachment handle lifetime checks and current allocation discipline. Do not introduce another cloned prompt/base64 buffer. Reuse current measured request serialization where practical, offloading unavoidable blocking asset reads/encoding from runtime workers. Streaming request uploads can be a later measured optimization; migrating to async is not permission to load entire conversation assets repeatedly.
+Preserve attachment handle lifetime checks (`asset.rs:35-46,170-209`) and the two-pass
+`compact_json_body` serialization (`model.rs:184-193`), already shared by both clients. Blob reads
+stay whole-buffer as today (`asset.rs:302-335`); run them on a blocking task, never on a runtime
+worker, and do not add another cloned prompt/base64 buffer.
 
-**Auth exception:** existing Codex device login/refresh can keep bounded blocking `ureq` temporarily. Call the single `CredentialFile` path on a blocking task, return a redacted token snapshot, and release credential locks before generation HTTP. Do not hold a credential mutex across a streamed answer or duplicate refresh logic. Thus all **generation** requests share async reqwest; this plan does not promise immediate removal of ureq from the workspace. On a 401, invalidate the rejected access snapshot for the next call's preflight refresh without resending the failed turn; retain cross-process refresh serialization. An auth failure remains visible and terminal for that turn.
+**Auth exception:** Codex device login/refresh keeps the bounded blocking `ureq` agent
+(`lib.rs:44`) inside `CredentialFile`. The adapter calls `refresh_if_needed` on a blocking task,
+takes a redacted token snapshot, and holds no credential lock across the streamed answer (the
+in-process mutex is already only held for clone/install, `chatgpt.rs:224-243`). Only generation
+moves to async `reqwest`; ureq stays in the workspace for auth. On HTTP 401 the adapter does what
+it does today: force-refresh once and resend once, before any body byte has been read (D4).
 
 ## 4. A sane configuration surface
 
-Keep the existing `models:` list and route model names. Preserve existing `kind: chatgptSubscription`, `kind: openaiCompatible`, `timeoutMs`, classes and modalities. Add `kind: openrouter` instead of requiring users to disguise it as a generic endpoint.
-
-Illustrative proposed entries (not valid in current releases):
+`models:` entries are the internally tagged `ModelConfig` enum
+(`crates/dekopond/src/config.rs:527-582`: `tag = "kind"`, `deny_unknown_fields`,
+`rename_all_fields = "camelCase"`, no `flatten` anywhere). `kind: openrouter` is its third arm.
+Every helper match (`config.rs:597-631`: `name`, `classes`, `accepts_images`, `timeout_ms`)
+gains the arm. Nested blocks are plain structs with their own `deny_unknown_fields`.
 
 ```yaml
 models:
@@ -121,44 +220,79 @@ models:
     classes: [general]
     generation:
       maxOutputTokens: 4096
+    reasoning:
+      effort: medium
     routing:
       allowFallbacks: false
       requireParameters: true
     cache:
-      mode: providerDefault
+      style: explicitPrefix
+      ttl: 5m
 ```
 
-Changing the route from `primary` to `explore` changes the client, not the loop. OpenRouter uses a fixed trusted base URL; keep custom endpoint configuration on `openaiCompatible`. Codex endpoint and account lifecycle stay pinned. Secret values never appear in YAML; the gateway resolves names/paths into `Redacted`, while library constructors accept caller-provided credentials rather than reading environment/config themselves.
+Changing a route from `primary` to `explore` changes the client, not the loop. OpenRouter uses the
+fixed base URL `https://openrouter.ai/api/v1`; custom endpoints stay on `openaiCompatible`. Codex
+endpoint and account lifecycle stay pinned. Secrets never appear in YAML: the gateway resolves
+`apiKeyEnv` to a plain string exactly as `model_credential` does for `openaiCompatible`
+(`crates/dekopond/src/session.rs:122-132`) and the library constructor wraps it in `Redacted`
+(`model.rs:471-474`). `OpenRouterClient` follows `OpenAiChatModel::new`, taking the caller's
+secret; `ChatGptCodexModel::new` reading `DEKOPON_CHATGPT_AUTH_FILE` itself (`chatgpt.rs:1541`)
+is the one pre-existing exception and stays.
 
-Use tagged config enums with `deny_unknown_fields`; do not rely on unsupported serde flatten/unknown-field combinations. Convert authored config once into validated model settings. Aggregate independent static errors at startup, then refuse startup; “fail fast” does not mean hide the second invalid model behind the first. Defaults and supported omitted fields are documented in one place.
+Validation pushes into the existing aggregated `Vec<ConfigProblem>` (`config.rs:1135`, rendered by
+`render_problems` at `config.rs:2127-2143`) and, for credentials, the existing `StartupProblem`
+collection (`crates/dekopond/src/lib.rs:616-638`). No new first-error path. Defaults and supported
+omitted fields are documented in `docs/dekopond.md` next to the existing `models:` example
+(`docs/dekopond.md:86-105`).
 
-**OpenRouter must remain open to unfamiliar model IDs.** Accept syntactically valid model names without a hardcoded catalog allowlist. Validate things we know locally (bounds, invalid option combinations, Codex-specific unsupported controls); let the actual endpoint reject unknown model/feature combinations with a useful error. No preflight paid probes, no model-registry service. `requireParameters:true` helps routing but is not proof every backend preserves every parameter. Record observed provider and effective local settings; do not label a forwarded setting as remotely honored.
+**OpenRouter stays open to unfamiliar model IDs.** Accept syntactically valid names without a
+catalog. Validate what is known locally (bounds, invalid combinations, Codex-unsupported
+controls); let the endpoint reject unknown model/feature combinations with a useful error. No
+preflight probes. `requireParameters` defaults to false upstream, which means unsupported
+parameters are silently dropped per provider; record effective local settings, never label a
+forwarded setting as remotely honored.
 
-Optional `routing.only` is an endpoint allowlist for repeatable evaluations. Default no automatic router fallback; ordering/allowlists do not guarantee signed reasoning portability. If a reported upstream changes during a bound continuation, fail instead of silently stripping replay. Unknown upstream is recorded as unknown, not promoted to a verified pin.
+`routing.only` is an endpoint allowlist for repeatable evaluations. If a reported upstream changes
+during a bound continuation, fail instead of stripping replay. Unknown upstream is recorded as
+unknown.
 
-Only implement generation knobs actually consumed by both adapter code and a useful call site: output limit; optional validated temperature/top-p where supported; typed reasoning intent/native router settings; existing tool policy. Codex retains its current supported defaults until endpoint-specific support is evidenced; never send public OpenAI parameters there by model-name analogy. Unknown optional remote support is diagnosed on response, not silently dropped. Omit a general best-effort mode from v1: local unsupported controls fail.
+Generation knobs shipped: `maxOutputTokens`; validated `temperature`/`topP`; `reasoning.effort`
+as the closed enum OpenRouter documents (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`,
+`max`); existing tool policy. Codex keeps its current frozen request shape (`store: false`,
+`stream: true`, `tool_choice: auto`, `parallel_tool_calls: true`,
+`include: ["reasoning.encrypted_content"]`, `text.verbosity: low`, optional `prompt_cache_key`;
+`chatgpt.rs:1107-1116`) and refuses every OpenRouter-only block at config validation. No
+best-effort mode: a locally unsupported control fails.
 
-### Cache configuration: modest controls, correct distinctions
+### Cache configuration: two modes
 
-Ship `providerDefault`, `noExplicitControls`, and OpenRouter-native prefix modes below. Request-scoped random affinity continues to come from the conversation/route, not an operator-maintained key. Distinguish router session affinity from upstream fields in the codec.
-
-| Proposed mode | Authored options | Local meaning |
+| Mode | Authored options | Local meaning |
 |---|---|---|
-| `providerDefault` | None | Provider may cache automatically; no claimed lifetime |
-| `noExplicitControls` | None | Omit controls, not a no-retention guarantee |
-| `claudePrefix` | `ttl: 5m \| 1h`, placement `stablePrefix \| automatic` | Explicit stable-prefix marker, or router's top-level automatic placement |
-| `openaiPrefix` | `ttl: 30m`, placement `stablePrefix \| automatic` | Router's native breakpoint/options vocabulary, not Claude controls |
-| `geminiPrefix` | placement `stablePrefix` | Router-managed fixed five-minute cache; no duration selector or named resource |
+| `automatic` (default) | None | No cache fields sent; the upstream may cache automatically |
+| `explicitPrefix` | `ttl: 5m \| 1h`, optional | `cache_control: {type: "ephemeral"[, ttl]}` on the last content part of the system message |
 
-The routine operator example needs none of these advanced modes. A `stablePrefix` anchor is issued by the prompt builder immediately after its stable instruction prefix, before history/current user input. Do not guess array index zero, cache changing timestamps, or duplicate prompts. Library code can accept a typed point at a real block boundary; v1 YAML need not expose arbitrary lists of message indices or mixed TTL plans. If a requested anchor is absent/ineligible, fail before send.
+`explicitPrefix` is the one control OpenRouter documents as a request field. Anthropic upstreams
+honor the marker and the `ttl` (`5m` and `1h` are the only values); Gemini upstreams honor the
+marker with a fixed five-minute lifetime that does not extend on hit; every other upstream
+ignores it. The trace records the requested style, never a remote guarantee. OpenAI's explicit
+vocabulary (`prompt_cache_breakpoint`, restricted to GPT-5.6 and newer) is deferred because
+OpenAI caching is automatic and the "automatic placement" the earlier draft named is not a real
+field. A separate Gemini mode is not needed: it would send the same marker.
 
-Use `ClaudeTtl::{FiveMinutes, OneHour}` and `OpenAiCacheTtl::ThirtyMinutes`, not one global duration enum. Points and exact valid wire options stay coupled to the selected cache style. An unfamiliar model with a router-native style can be forwarded as an explicit experiment; trace the request and fail on rejection, rather than claim a model-capability certification. No automatic mapping from a model-name substring to cache policy.
+The anchor is the end of the system message the prompt builder already emits
+(`crates/dekopon-agent/src/prompt.rs:544`); no public anchor type in v1. `explicitPrefix` with no
+system message fails at prepare, before send. Request-scoped random affinity continues to come
+from the conversation/route (`crates/dekopond/src/cache_key.rs:40-65`), not from an operator key.
 
-Codex rejects all explicit prefix/TTL modes; it supports current affinity only. No direct Gemini named-resource construction/renewal/deletion, response memoization, cache warming or keepalive calls. Send `X-OpenRouter-Cache: false` so a preset cannot accidentally turn a model evaluation into response replay. Exact duration/placement restrictions not needed by these implemented paths stay in future work, not a shipped capability database.
+Codex accepts only `automatic`. No named-resource CRUD, response memoization, warming or
+keepalive. Always send the request header `X-OpenRouter-Cache: false` so a preset cannot turn a
+model evaluation into response replay.
 
 ## 5. Unified errors and compatibility policy
 
-Use a public `thiserror` error with action-oriented variants, private source details where appropriate, and stable low-cardinality `kind()`/`phase()` accessors:
+One public `thiserror` error replaces `ModelError` (`model.rs:1158-1184`) everywhere, including
+the synchronous `ChatModel` and the agent's `PromptError` mapping; `Interrupted` becomes
+`Cancelled`. No parallel error worlds.
 
 ```rust
 pub enum InferenceError {
@@ -169,128 +303,225 @@ pub enum InferenceError {
     Provider(ProviderFailure),
     Transport(TransportFailure),
     Protocol(ProtocolFailure),
+    Attachment(BlobError),
     Cancelled,
     DeadlineExceeded,
 }
 ```
 
-Construct only variants with real consumers. Provider/transport failures carry phase (before send / awaiting headers / reading body), optional HTTP status, provider code, request ID and Retry-After, plus a bounded sanitized diagnostic. Preserve error sources; no string matching on `Display`. Unknown upstream code stays a bounded string inside `ProviderFailure`, not an enum variant per vendor error.
+Construct only variants with real consumers. Provider/transport failures carry phase (before send,
+awaiting headers, reading body), optional HTTP status, provider code, request ID and Retry-After,
+plus a bounded sanitized diagnostic (the existing `MAX_ERROR_BODY_BYTES` cap, `model.rs:1196`).
+Preserve sources; no string matching on `Display`. An unknown upstream code stays a bounded string
+inside `ProviderFailure`.
 
-Streaming error frames under HTTP 200 are failures. EOF is only successful when that dialect's terminal rule is satisfied; a finished text block is not a finished response. Retain trailing usage before completing. HTTP failures and rate limits terminate the turn once; no resend/backoff/failover in the client. Retry metadata is diagnostic, not a promise of safe replay.
+Streaming error frames under HTTP 200 are failures. EOF succeeds only when the dialect's terminal
+rule is satisfied. Retain trailing usage before completing. HTTP failures and rate limits
+terminate the turn once; the only resend anywhere is the Codex 401 auth repair (D4).
 
-A protocol-complete response can still have output-limit/refusal/filter/tool-call finish reasons. Never execute incomplete tool JSON. Keep already displayed partial answer text and trustworthy observed usage separately from successful assistant history. The error path emits one useful failure with its cause, not a fabricated zero-token success.
+A protocol-complete response can still carry output-limit/refusal/filter/tool-call finish
+reasons. Never execute incomplete tool JSON. Keep already displayed partial text and observed
+usage separate from successful history. The error path emits one failure with its cause, not a
+zero-token success.
 
-Compatibility super-cycle: see the trace → reproduce with a small cassette → change one adapter/reducer → run scoped tests/CI → release/deploy through normal owner workflow. Do not implement in-chat repair, parameter guessing or fallback to hide compatibility errors.
+Compatibility cycle: see the trace → write a small synthetic fixture from it → change one
+adapter/reducer → scoped tests → normal owner release. No in-chat repair, parameter guessing or
+fallback.
 
 ## 6. Tracing that allows honest comparison
 
-Reuse `prompt.model_turn` and `accounting.model.turn`; avoid an alternative accounting pipeline. The shared HTTP helper adds one child span per generation exchange. The core library uses `tracing` but never installs a subscriber or OTLP exporter. Gateway/external embedding owns those.
+Reuse `prompt.model_turn` (`prompt.rs:712-724`) and `accounting.model.turn` (`prompt.rs:776,802,
+826`); avoid a second accounting pipeline. The shared helper keeps one `model.complete` child span
+per generation exchange (the name both clients emit today, `chatgpt.rs:404`, `model.rs:512`).
+`dekopon-model` depends on `tracing` only, never `dekopon-telemetry`; `dekopon-agent`'s
+`current_trace_context()` read (`lib.rs:225`) is not a precedent for a subscriber.
 
 | Recorded field group | Semantics |
 |---|---|
-| Identity | Configured model name, requested provider/model, API dialect, returned model/provider when present; unknown stays absent |
-| Controls | Requested/effective-local generation and cache style, requested TTL, stream/buffered mode; no credential or raw affinity identifier |
-| Timing | Total generation duration, headers/first-event/first-visible-text timing, completion outcome; no invented TTFT for tool-only responses |
+| Identity | Configured model name, requested provider/model, API dialect, returned model and upstream provider when present; unknown stays absent |
+| Controls | Requested generation and cache style, requested TTL, stream/buffered mode; no credential or affinity identifier |
+| Timing | Total duration, headers/first-event/first-visible-text timing, outcome; no invented TTFT for tool-only responses |
 | Work | Input/output tokens, cached read/write, reasoning tokens when reported, tool-call count, response bytes |
 | Failure | Stable error kind and phase, status/provider code/request ID when safe, partial-output indicator |
 
-Each metric has one owner: HTTP helper measures transport; reducer reports native usage/finish; agent records session turn/budget. Define the field mapping in `docs/observability.md` during implementation. Keep native provider counters as bounded detail when their meaning differs; absent means unknown, not zero. Normalize included-versus-additive cache tokens per codec, and don't double-count reasoning within output. Preserve existing prompt/answer/tool audit records and trace propagation across the blocking bridge. Never hold an entered span guard across `.await`; instrument futures. Do not forward traceparent to third-party endpoints.
+Only the `usage.*` fields, `stream.deltas`, `stream.first_delta_ms`, counts and the coarse
+`outcome`/`error` string exist today; identity beyond the configured name, controls, response
+bytes, request ID and the whole failure row are new. Each metric has one owner: the helper measures
+transport; the reducer reports native usage/finish; the agent records session turn/budget. Extend
+`docs/observability.md:31-59` and `:948-957` with the mapping. Absent means unknown, not zero.
+Normalize included-versus-additive cache tokens per codec; do not double-count reasoning within
+output. Preserve the existing audit records (`agent.model.prompt`, `agent.model.answer`,
+`agent.tool.*`) and the session span carried across the blocking boundary (`session.rs:867,1041`).
+Never hold an entered span guard across `.await` (`clippy.toml` already denies it); instrument
+futures. Do not forward `traceparent` to inference endpoints.
 
-For comparisons, run the same core-loop example with the same prompt/tool surface/limits and choose another model name. Record a caller-supplied experiment label, not a new evaluator service. Report cold versus subsequent tool turns, cache hits actually reported, tool count, TTFT and elapsed time; do not claim equal tokenizer counts or compare a reasoning provider's first text with another's first transport event. No stored price registry, scorecard automation or p95 benchmark suite in v1. The example uses a harmless local tool; never automatically replay real external effects across providers.
+For comparisons, run the same core-loop example with the same prompt/tool surface/limits and a
+different model name, with a caller-supplied experiment label. Report cold versus subsequent tool
+turns, reported cache hits, tool count, TTFT and elapsed time. No price registry or benchmark
+suite.
 
-## 7. Small VCR proof, not a conformance campaign
+## 7. Offline proof with the fixtures we have
 
-**Preferred first candidate: `httpmock` as a dev-only record/playback server.** It has documented forwarding/recording/playback and keeps the real reqwest stack/parser under test without production middleware. Spend one focused spike confirming our pinned compiler/dependency compatibility, deterministic two-request matching, complete SSE-body preservation and offline-only playback. No new production dependency for test recording. If cassette playback buffers SSE, that is acceptable for deserialization/replay tests, not proof of streaming timing.
+**No VCR dependency.** `crates/dekopon-model/src/mock.rs` already scripts a sequence of loopback
+responses (`json`, `sse`, `failure`, `hang_up`) and records every request
+(`mock.rs:18-122`), and the Codex two-turn replay test already runs against it
+(`chatgpt.rs:2929-2994`). Extend that server, not a third loopback beside
+`dekopon-test-support`'s. `httpmock` would be a new dependency pulling a second
+`hyper-rustls` stack under `[bans] multiple-versions = "deny"` and an MPL-licensed optional
+feature; the spike is removed from scope (D6).
 
-Do not combine several VCR libraries or build a cassette service. If the small spike fails, retain current transcript fixtures plus a tiny loopback response peer; record the reason and stop shopping. A simple crate-local helper is enough. Scope endpoint injection to tests; do not add an arbitrary production Codex endpoint override for fixture convenience.
-
-**Repository fixture policy:** current `AGENTS.md` prohibits committing fetched provider fixtures. Live recordings therefore remain opt-in, local, outside the checkout, using approved disposable prompts/accounts; never auto-record on a cassette miss or in CI. Raw recording must not persist credentials, auth cookies/account identifiers or private conversation content; if the recorder cannot exclude them before writing, do not enable recording. CI gets a few deliberately synthetic public-safe cassettes in the same format, plus existing parser transcripts. Checking in sanitized derivatives of live recordings needs an explicit policy decision; it is not silently authorized by this plan. Keep security policy separate from whether a VCR library is useful.
-
-Minimum new evidence, reusing existing tests wherever possible:
+Fixtures are hand-written synthetic SSE bodies derived from the documented wire shape (or, later,
+from a trace), committed as `include_str!` files. `AGENTS.md:30` still prohibits committing fetched
+provider fixtures; live recording tooling is out of v1, so nothing sanitizes a real capture. The
+four transcript fixtures in `crates/dekopon-test-support/transcripts/` stay as they are.
 
 | Case | Evidence |
 |---|---|
-| Codex two-turn tool exchange | One cassette sequence: completed tool call + encrypted replay placeholder, then final text/usage; assert second request replay and stable prefix |
-| OpenRouter two-turn tool exchange | One cassette sequence with structured reasoning details, tool arguments and final usage; prove both parser and subsequent serialization |
-| Existing OpenAI-compatible behavior | Retain current streaming/buffered regressions; one representative HTTP playback, not every provider brand |
-| Refused/malformed turn | Small table: HTTP 401/429/provider failure, HTTP-200 error event, truncated stream or invalid final tool arguments; typed errors and no extra request |
-| Cache/config validation | Table: defaults, explicit legacy settings, each implemented native style, two simultaneous config errors, Codex TTL rejection and stale/absent anchor |
-| Cancellation/trace boundary | One loopback stalled-body test that cancels without waiting for a socket timeout; one trace assertion for both dialects, missing usage and no credential sentinel |
+| Codex two-turn tool exchange | Port the existing test to the async adapter: completed tool call + encrypted reasoning replay, then final text/usage; assert second-request replay and stable prefix |
+| OpenRouter two-turn tool exchange | One sequence with `reasoning_details` (text + encrypted items), streamed `tool_calls` deltas, the final usage-only chunk (empty delta, repeated `finish_reason`); prove parse and re-serialization |
+| Existing OpenAI-compatible behavior | Keep the streamed/buffered equality table (`model.rs:1864-1963`) |
+| Refused/malformed turn | Table: HTTP 401 (Codex: exactly two requests; OpenRouter: one), 429, provider failure, HTTP-200 error frame, truncated stream, invalid final tool arguments; typed errors, request counts asserted |
+| Config validation | Defaults, each legacy kind, `openrouter` with every block, two simultaneous problems reported together, Codex refusing `cache`/`reasoning`/`routing`, `explicitPrefix` with no system message |
+| Cancellation | One `hang_up`-style stalled body cancelled through `TurnControl` without waiting for the deadline; one deadline test |
+| Traces | One assertion per dialect on the recorded field set, missing usage staying absent, no credential sentinel |
 
-Use one split-chunk parser regression and existing limit-at-edge/one-past tests rather than a combinatorial provider matrix. A cassette cannot prove cancellation timing or remote cache hits. No model quality goldens, snapshots of every trace, property tests for every enum, branch-coverage target or new CI job. The normal package/workspace gates remain authoritative; simplifying tests does not disable required gates.
+Use one split-chunk parser regression and the existing limit tests; add the missing
+"exactly at `MAX_STREAM_BYTES`" companion (`sse.rs` has only the over-limit case). No model quality
+goldens, no provider matrix, no new CI job. Normal package/workspace gates remain authoritative.
 
-## 8. Implementation sequence and ownership
+## 8. Decisions (settled)
 
-One writer owns this coupled model/config/loop integration on a dedicated worktree. These are reviewable milestones, not authorization for parallel writers or a paid multi-agent pipeline. Fable reviews this plan before implementation; normal repository review applies to the later code.
+| # | Decision | Where recorded |
+|---|---|---|
+| D1 | Keep the synchronous loop; `BlockingModel` bridges over `Handle::block_on` on the blocking session task, precedent `dekopon-agent/src/lib.rs:1023-1027` | §2 |
+| D2 | `generate` futures are `Send`; the observer and `ChatModel::complete`'s callback both carry `+ Send` | §2 |
+| D3 | `TurnControl` wraps `dekopon_process::CancelSignal` + deadline; `CancelSignal::cancelled` goes `pub`; nothing enters `dekopon-core` | §2 |
+| D4 | Keep the one-shot Codex 401 refresh-and-resend, inside the Codex adapter, only before any body byte was read; the test asserting two requests stays; no `upgrading.md` entry | §3 |
+| D5 | Cache modes are `automatic` and `explicitPrefix { ttl?: 5m \| 1h }`; anchor is the end of the system message; Codex accepts only `automatic`; OpenAI explicit vocabulary and a Gemini mode deferred | §4 |
+| D6 | No `httpmock`; extend `dekopon-model/src/mock.rs`; fixtures are synthetic `include_str!` files; no live recording tooling | §7 |
+| D7 | OpenRouter wire: fixed base URL; `provider: {allow_fallbacks, require_parameters, only}`; `reasoning: {effort}`; header `X-OpenRouter-Cache: false`; no `usage.include` or `stream_options` (deprecated no-ops); top-level response `provider` optional; `openrouter_metadata` not parsed | §4, §Facts |
+| D8 | `kind: openrouter` is the third `ModelConfig` arm; `apiKeyEnv` required; blocks `generation`, `reasoning`, `routing`, `cache` as nested `deny_unknown_fields` structs; problems join the existing `Vec<ConfigProblem>` | §4 |
+| D9 | One error type: `InferenceError` replaces `ModelError` in every crate; `Interrupted` becomes `Cancelled` | §5 |
+| D10 | `ModelCache` stores `Arc<ModelClient>`; `ChatGptCodexModel` and `OpenAiChatModel` are deleted once their adapters land; `ureq` remains only inside `CredentialFile` | §2, §3 |
+| D11 | The reusable example is `crates/dekopon-agent/examples/compare_models.rs`: owns a runtime, runs `run_prompt_session` on `spawn_blocking` over a harmless local `ScriptRuntime`, takes the model kind/id from arguments and the secret from the environment; the offline proof is the integration test that drives the same loop over both adapters against the mock server | §8 stage 5 |
+| D12 | Fixture placement (in-crate `include_str!` under `dekopon-model`) and every crate-internal name, module layout, buffer size under a stated cap, and test structure are the driver's to decide and report under "Driver decisions" | `AGENTS.md` §Authority |
 
-### A. Establish the seam and replay proof
+## 9. Implementation sequence
 
-Files: model crate modules/tests and manifest; test-support adapters as needed.
+One driver, one worktree, one PR, one commit per stage, each stage ≤ ~1k changed lines with a
+scoped gate while iterating and the full workspace gate at commit (`docs/development.md:240-292`;
+the exact clippy line is `cargo clippy --workspace --all-targets --all-features --locked -- -D
+warnings`, rustdoc is `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
+--locked`). Every stage compiles workspace-wide because the driver updates consumers in the same
+commit; no transitional shims. Rebase onto `origin/main` at the start of each stage. CI runs the
+OTLP OpenObserve smoke job on every crate change automatically
+(`.github/scripts/classify_ci_changes.py` cascades `run_rust` into `run_otel`); it is not a
+discretionary local step. `cargo deny --all-features check` runs whenever `Cargo.toml`,
+`Cargo.lock` or `deny.toml` change.
 
-- Land domain role/call/continuation/error types with real existing-backend consumers.
-- Define the async trait/enum, shared reqwest helper and private serde wire types.
-- Prove the dev-only cassette approach with one existing Codex-shaped exchange; keep the result or the simple transcript fallback, not both elaborate harnesses.
-- Keep old clients working until their replacements are wired; transitional code is deleted in B, not a permanent compatibility framework.
+1. **Types and errors.** `ModelMessage` enum, `ToolCallId`, private `Continuation`,
+   `InferenceError` replacing `ModelError`, `+ Send` on the `ChatModel` callback. Consumers in
+   `dekopon-agent`, `dekopond`, `dekopon-test-support` updated. Exit: workspace green; no public
+   unused type.
+2. **Async transport and the Codex adapter.** `InferenceHttp`, `TurnControl`, async SSE reader,
+   `CodexClient` on `reqwest` with the frozen request shape, `BlockingModel`, `ModelClient` with
+   its first arm; gateway wires the bridge and `SessionCancellation::signal()`;
+   `ChatGptCodexModel` deleted. Ported two-turn, 401, refresh and cancellation tests. Exit: Codex
+   regressions pass on the new path; credentials never enter traces.
+3. **OpenAI-compatible adapter.** `OpenAiClient` on the helper, streamed and buffered; tolerant
+   decoding table retained; `OpenAiChatModel` deleted; `ureq` gone from generation. Exit: the
+   equality table and limit tests pass; `cargo tree -p dekopon-model` shows `ureq` only through
+   the credential path.
+4. **OpenRouter.** Adapter with reasoning/routing/cache codec, replay preservation, error and
+   usage mapping; `kind: openrouter` config, validation, and the two-turn fixture. Exit: the
+   validation table passes; advanced settings map exactly or fail; `X-OpenRouter-Cache: false`
+   asserted.
+5. **Example, tracing, docs.** The example (D11) and its offline integration test; the new trace
+   fields and the mapping in `docs/observability.md`; `docs/inference.md`, `docs/dekopond.md`,
+   crate README, `[Unreleased]` in `CHANGELOG.md` (currently empty). Exit: required CI green,
+   docs describe reality, an outside embedder can construct a client without gateway config or
+   a global subscriber.
 
-**Exit:** scoped model tests compile; one complete request/replay/response path; no public unused cloud variants. **Stop:** if the async bridge requires changing the shell/broker contract, return with the concrete issue rather than silently expanding the milestone.
+**Stops** are the four in `AGENTS.md` §Authority terms: forking, patching or bumping a dependency
+to make something pass; moving a config key/value, wire field or one of D1–D12 away from this
+table; deleting something this plan keeps or keeping what it deletes; owner-only actions
+(releases, tags, publishing, merging, any real call to `chatgpt.com` or `openrouter.ai`).
+Everything inside a crate is the driver's.
 
-### B. Migrate existing clients and connect the loop
+## 10. Facts an implementer must be told
 
-Files: `dekopon-model`, `dekopon-agent` callback/adapter seam, `dekopon-test-support`, gateway `session.rs` and cancellation wiring.
+- `ChatModel` implementors that change with D2 and D9: `model.rs:504`, `chatgpt.rs:396`,
+  `crates/dekopon-test-support/src/model.rs:152`, `crates/dekopon-agent/src/prompt.rs:1961,2200,
+  2242,3048`, `crates/dekopond/src/tests.rs:2267,3274,6380,12391`,
+  `crates/dekopond/src/tests/late_photos.rs:14`. Callers bound `M: ChatModel + ?Sized`
+  (`prompt.rs:244-647`); `SharedModel = Arc<dyn ChatModel + Send + Sync>` (`session.rs:88`).
+- The loop's callback is a local closure over `TurnStream` (`prompt.rs:762-763`), which checks
+  cancellation after every event (`prompt.rs:1153-1160`); that stays the sync-side probe.
+- `dekopon-model` has no `tests/` directory; all tests are inline `#[cfg(test)]` modules, and
+  the model crate's loopback server is `#[cfg(test)]` (`lib.rs:18-19`).
+- OpenRouter streams tool calls as OpenAI-style `tool_calls` deltas with `index`; usage and
+  cost always arrive in a final chunk with an empty delta; `reasoning_details` items carry
+  `type` (`reasoning.text`, `reasoning.summary`, `reasoning.encrypted`), `id`, `format`,
+  `index`; `reasoning.exclude` is prose-only and not in the schema, so it is not shipped;
+  `prompt_tokens_details.cached_tokens` and `cache_write_tokens` are the cache counters.
+- Codex sends `authorization`, `chatgpt-account-id` (decoded from the JWT, `chatgpt.rs:871-884`),
+  `originator: dekopon`, `user-agent`, `openai-beta: responses=experimental`, `accept:
+  text/event-stream` (`chatgpt.rs:363-377`); there is no session header. Replay items are
+  forwarded verbatim as raw values (`chatgpt.rs:1062-1064`).
+- No request ID or response header is read anywhere today; the failure row in §6 is entirely
+  new instrumentation. `ModelUsage` (`model.rs:334-346`) already normalizes both dialects'
+  token names and never invents zero.
+- `expect_used` is not yet denied (`Cargo.toml:154`), but `AGENTS.md` §Panics forbids it on
+  untrusted input; `unwrap_used` and `clone_on_ref_ptr` are denied.
+- `docs/upgrading.md` entries are `## <name> (0.20.0)` prose sections at the top; only the
+  `Interrupted` → `Cancelled` rename and the `InferenceError` surface need one.
+- `docs/chatgpt-credential.md:33-36` documents the forced refresh a 401 triggers; with D4 it
+  stays accurate and gains one sentence saying the turn is resent once.
 
-- Port Codex generation and OpenAI-compatible generation to the helper; preserve subscription auth and attachment/request behavior.
-- Add the explicit blocking adapter and race-safe cancellation link. Keep the existing loop, tool limits, history semantics and terminal arbitration.
-- Remove replaced generation ureq paths; keep auth's one implementation.
-- Make 401 no-resend behavior explicit in tests and upgrading docs.
+## 11. Future extension recipe, not future scaffolding
 
-**Exit:** current backend replay/stream/buffered regressions pass; silent-body cancellation works; credentials never enter traces; clients remain shared. **Stop:** auth lock/refresh behavior changes beyond the scoped token snapshot/invalidation seam require a focused decision, not a duplicate implementation.
-
-### C. OpenRouter, settings and interchangeable evaluation
-
-Files: OpenRouter adapter; gateway config/factory/validation; example config and one small core-loop example.
-
-- Reuse Chat framing/common wire pieces without pretending OpenRouter reasoning/routing is generic OpenAI behavior.
-- Implement strict typed routing/cache settings, replay preservation, error mapping and usage.
-- Add OpenRouter config, startup validation and two-turn cassette.
-- Demonstrate selecting Codex versus an arbitrary OpenRouter model with no loop changes, subscriber owned by the example, and no broker effects.
-
-**Exit:** same example runs offline against both dialects; model IDs are not catalog-whitelisted; advanced settings map exactly or fail; no response memoization. A live sanity check is optional and separately authorized, never a CI requirement.
-
-### D. Observability, documentation and cleanup
-
-Files: existing tracing call sites; `docs/inference.md`, `docs/dekopond.md`, `docs/observability.md`, `docs/upgrading.md`; crate README/examples; `[Unreleased]` changelog.
-
-- Consolidate timing/usage/error attribution with the existing turn spans and accounting.
-- Run scoped tests while iterating, then normal selected CI gates once on the assembled head. Run the existing OTLP smoke gate when the tracing changes require it; do not invent a second harness.
-- Remove transitional clients/adapters with no remaining consumer. Document exactly which auth path remains blocking and why.
-- Review the source-to-doc field mapping, all error exits, no retries, and primary gateway/broker dependency boundaries.
-
-**Exit:** required CI passes, implementation docs describe reality, no hidden fallback, and an outside embedder can construct a client without gateway configuration or a global subscriber. Preserve normal artifact cleanup/ownership rules. No benchmark campaign is a completion gate.
-
-## 9. Future extension recipe, not future scaffolding
-
-A new provider should normally add: one concrete client implementing `InferenceModel`; private serde request/response types and reducer; one enum/factory arm; relevant config conversion; unified error/usage mapping; one representative two-turn cassette. Shared loop, HTTP observation and accounting should not change unless the provider exposes genuinely new semantics.
+A new provider adds: one concrete client implementing `InferenceModel`; private serde
+request/response types and reducer; one enum/factory arm; config conversion; error/usage
+mapping; one two-turn fixture. Shared loop, HTTP observation and accounting do not change unless
+the provider exposes new semantics.
 
 When actually implementing Bedrock or Vertex, add only the needed types then:
 
-- Bedrock Converse has `cachePoint` unions and non-SSE AWS event streams; use a mature signing/event codec, not hand-rolled crypto. An SDK exception to the HTTP helper needs a reason and the same observation contract, not premature transport abstraction now.
-- Vertex Gemini uses native parts/thought signatures; named content is prompt input with separate retained-resource authority, not a cache hint. Resource lifecycle remains deferred.
-- Vertex Claude uses Anthropic Messages via its own publisher endpoint; not Gemini JSON. Different lifetime rules stay in provider-specific enums.
-- Unknown provider fields belong in private lossless continuation where necessary, not in every public message or a universal map of settings.
+- Bedrock Converse has `cachePoint` unions and non-SSE AWS event streams; use a mature
+  signing/event codec. An SDK exception to the helper needs a reason and the same observation
+  contract.
+- Vertex Gemini uses native parts/thought signatures; named content is prompt input with separate
+  retained-resource authority. Resource lifecycle remains deferred.
+- Vertex Claude uses Anthropic Messages via its own publisher endpoint; different lifetime rules
+  stay in provider-specific enums.
+- Unknown provider fields belong in private lossless continuation, not in every public message.
 
-Reuse outside Dekopon means keeping configuration discovery, routing, subscriber/exporter setup and tool execution out of `dekopon-model`. Existing small domain/asset dependencies are acceptable; extraction to a new package is an earned later decision, not a prerequisite. Provide rustdoc and one usable example, not a new SDK platform.
+Reuse outside Dekopon means keeping configuration discovery, routing, subscriber setup and tool
+execution out of `dekopon-model`. Extraction to a new package is an earned later decision.
 
-## 10. Definition of done and review boundary
+## 12. Definition of done and review boundary
 
-The implementation succeeds when Codex and OpenRouter run the same core loop with shared async generation transport/tracing, typed settings/replay/errors, bounded streaming/cancellation and a few offline interaction proofs. Existing compatible clients, asset safety, tool authorization and Codex credential ownership must survive. Runtime provider incompatibility can fail clearly and be repaired outside the chat; undocumented behavior need not be solved in advance.
+The implementation succeeds when Codex and OpenRouter run the same core loop with shared async
+generation transport/tracing, typed settings/replay/errors, bounded streaming/cancellation and
+the offline proofs in §7. Existing compatible clients, asset safety, tool authorization and
+Codex credential ownership survive. Runtime provider incompatibility fails clearly and is
+repaired outside the chat.
 
-The review companion is [Fable review brief](multi-llm-fable-review.md). It asks whether this plan is implementable and appropriately small, not whether it pre-solves the entire cache catalog.
+The next step is a `pi-subagent-plan` driver brief built from §8–§10, rehearsed, then driven
+with `pi-drive`; the landed PR gets one fresh Fable adversarial review. The review companion is
+the [Fable review brief](multi-llm-fable-review.md).
 
 ### Reference points
 
-- [Current inference path](inference.md), [gateway config](dekopond.md), [observability](observability.md), [credential ownership](chatgpt-credential.md), [development gates](development.md).
+- [Current inference path](inference.md), [gateway config](dekopond.md),
+  [observability](observability.md), [credential ownership](chatgpt-credential.md),
+  [development gates](development.md).
 - [Gateway unification PR #257](https://github.com/dekopon-agents/dekopon/pull/257).
-- [OpenRouter prompt caching](https://openrouter.ai/docs/guides/best-practices/prompt-caching), [reasoning](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens), [routing](https://openrouter.ai/docs/guides/routing/provider-selection), [response caching](https://openrouter.ai/docs/guides/features/response-caching).
-- [httpmock recording](https://httpmock.rs/record-and-playback/recording/) and [playback](https://httpmock.rs/record-and-playback/playback/): documentation evidence only, compatibility not yet tested.
+- [OpenRouter prompt caching](https://openrouter.ai/docs/guides/best-practices/prompt-caching),
+  [reasoning](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens),
+  [routing](https://openrouter.ai/docs/guides/routing/provider-selection),
+  [response caching](https://openrouter.ai/docs/guides/features/response-caching),
+  [OpenAPI schema](https://openrouter.ai/openapi.json) (the authority where prose and schema
+  disagree).
 
-Cloud/research findings inform extension points; they are not an implementation requirement to copy a large provider/model table into code. No benchmark, live call, cassette recording or compiled prototype was performed for this plan.
+No benchmark, live call or compiled prototype was performed for this plan.

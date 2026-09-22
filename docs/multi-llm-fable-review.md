@@ -1,6 +1,28 @@
 # Fable review brief: multi-LLM implementation plan
 
-**Status: Exploration.** Review the [implementation plan](multi-llm-implementation-plan.md) before implementation. This is a design review, not authorization to implement, deploy, record paid calls, change fixture policy or broaden scope.
+**Status: Exploration; review completed 2026-09-22.** The assignment below was run by Fable against the [implementation plan](multi-llm-implementation-plan.md) at source baseline `3c155fe6`, with six read-only fact-checkers over the model, loop, config, policy, OpenRouter and docs seams. The record follows; the assignment and criteria stay as the contract a later adversarial review of the landed PR is held to. This is a design review, not authorization to implement, deploy, record paid calls, change fixture policy or broaden scope.
+
+## Review record
+
+**Verdict: READY WITH NONBLOCKING NOTES**, applied in place. The plan was implementable; every finding was a fact the source contradicted or a mode with no real wire field, and each was corrected in the plan rather than left as a note. Decisions D1–D12 in plan §8 are the owner-facing outcome.
+
+Findings, all corrected in the plan:
+
+- **`regression`, §3 and §8-B (401 resend).** The plan proposed removing the one-shot refresh-and-resend after HTTP 401 (`crates/dekopon-model/src/chatgpt.rs:422-435`, test at `:3134-3177`). A 401 arrives before any inference, nothing is billed, and the resend is what covers a token rotated by `dekopon-brokerd` between preflight and send. Removing it traded a working, tested behavior for a principle about inference retries that does not apply. Kept (D4).
+- **`goal-breaking`, §4 cache table.** `openaiPrefix` named a `placement: automatic` value that is not a field in OpenAI's native vocabulary, and that vocabulary is restricted to GPT-5.6 and newer; `geminiPrefix` would send the same `cache_control` marker as the Claude mode; `providerDefault` and `noExplicitControls` had identical wire behavior. Five modes became two (D5). The stable-prefix anchor is the system message the prompt builder already emits, so no public anchor type is needed.
+- **`guideline`, §7 (`httpmock`).** A new dependency with a second `hyper-rustls` stack under `[bans] multiple-versions = "deny"` and an MPL-licensed optional feature, while `crates/dekopon-model/src/mock.rs` already scripts response sequences and records requests, and the Codex two-turn test already runs on it. Spike removed (D6).
+- **`contract`, §2 (cancellation).** The plan described building a race-safe async wait; `SessionCancellation` already fires a `dekopon_process::CancelSignal` from `cancel()` and exposes it (`crates/dekopond/src/session.rs:293,337-382`). The plan also pointed the primitive at "a lower crate", which in practice is `dekopon-core`, wasm-reachable and tokio-free. `TurnControl` wraps the existing signal (D3).
+- **`contract`, §2 (observer `Send`).** The proposed async observer is `+ Send`; the existing `ChatModel::complete` callback is not, and a `&mut dyn FnMut` cannot be widened later. Every current callback is already `Send`, so the sync signature gains the bound (D2), with the implementor list in plan §10.
+- **`optional`, intro.** "Repository lints reject unused public APIs" is a review rule (`CONTRIBUTING.md:74`), not a lint; only `todo`/`unimplemented`/`unwrap_used`/`clone_on_ref_ptr` are denied. Corrected.
+- **`optional`, §2.** "Application-constructible `replay_items`" is true of `AssistantTurn` (public, doc-hidden) and not of `ModelMessage` (private). Corrected.
+- **`optional`, §4.** Codex's constructor reads `DEKOPON_CHATGPT_AUTH_FILE` itself (`chatgpt.rs:1541`); the "constructors take caller-provided credentials" rule now names it as the exception.
+- **`optional`, §6.** Only `usage.*`, `stream.*`, counts and a coarse `outcome`/`error` exist today; identity beyond the configured name, controls, response bytes, request ID and the failure row are new. Stated as new.
+- **`optional`, §8-D.** The OTLP smoke job runs on every crate change by classifier cascade; it is not a discretionary step. Corrected.
+- **`optional`, D7.** OpenRouter's schema has no flat top-level `provider` on responses (upstream identity is under `openrouter_metadata`), `reasoning.exclude` is prose-only, and `usage: {include: true}` is a deprecated no-op with usage always in a final empty-delta chunk. Recorded as facts.
+
+Removed or deferred: the `httpmock` spike, three cache modes, the 401 behavior change and its upgrading entry, the public anchor type, the Gemini mode. Nothing was added that the first draft did not already imply.
+
+Owner decisions still open: none that block a driver brief. D4 (keep the resend) and D5 (two cache modes) reverse choices in the first draft and are the two an owner would most plausibly overturn.
 
 ## Copyable assignment
 
