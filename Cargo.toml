@@ -62,7 +62,7 @@ libc = "0.2.189"
 # discarded in silence. Each exporting binary filters the `opentelemetry` target off its own OTLP
 # layer, so these records reach stdout/stderr only and cannot feed export failures back into export.
 opentelemetry = { version = "0.32.0", default-features = false, features = ["internal-logs", "logs", "trace"] }
-opentelemetry-appender-tracing = "0.32.0"
+opentelemetry-appender-tracing = "0.33.0"
 opentelemetry-http = { version = "0.32.0", default-features = false }
 # `tls-webpki-roots` gives the tonic channel a TLS connector, matching the webpki-only stance the
 # rest of the workspace takes; without it an `https://` endpoint under `grpc` fails at export time.
