@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -10,8 +11,8 @@ use dekopon_broker::{
     ContextError,
 };
 use dekopon_broker_host::{
-    BrokerHostLimits, BrokerHostOptions, DEFAULT_MAX_TOTAL_MEMORY_BYTES, LockedProviderSource,
-    PlaintextHostError, PlaintextHosts,
+    BrokerHostLimits, BrokerHostOptions, DEFAULT_MAX_TOTAL_MEMORY_BYTES, InternalHttpsTrust,
+    LockedProviderSource, PlaintextHostError, PlaintextHosts,
 };
 use dekopon_broker_protocol::{
     DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, ProtocolError,
@@ -145,6 +146,15 @@ pub struct HttpConfig {
     /// `allowPlaintextLoopback`; this only decides whether the native host will speak plaintext
     /// to it once the authorization already allows the destination.
     pub plaintext_hosts: Vec<String>,
+    /// Exact private HTTPS authority and broker-mounted CA bundle (public certs only).
+    pub internal_https: Vec<InternalHttpsConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct InternalHttpsConfig {
+    pub authority: String,
+    pub ca_file: PathBuf,
 }
 
 /// Paths for one generated provider lock and its immutable blob store.
@@ -792,6 +802,31 @@ async fn resolve(
     // broker that will deny a request the operator is sure they permitted.
     let plaintext_hosts = PlaintextHosts::new(&config.http.plaintext_hosts)
         .map_err(|source| ConfigError::InvalidPlaintextHost { source })?;
+    if config.http.internal_https.len() > 8 {
+        return Err(ConfigError::InvalidInternalHttps);
+    }
+    let mut internal_https = Vec::new();
+    for entry in &config.http.internal_https {
+        if !entry.ca_file.is_absolute() {
+            return Err(ConfigError::InvalidInternalHttps);
+        }
+        let metadata = std::fs::metadata(&entry.ca_file)
+            .map_err(|_error| ConfigError::InvalidInternalHttps)?;
+        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 65_536 {
+            return Err(ConfigError::InvalidInternalHttps);
+        }
+        let pem =
+            std::fs::read(&entry.ca_file).map_err(|_error| ConfigError::InvalidInternalHttps)?;
+        let profile = InternalHttpsTrust::new(&entry.authority, pem)
+            .map_err(|_error| ConfigError::InvalidInternalHttps)?;
+        if internal_https
+            .iter()
+            .any(|existing: &InternalHttpsTrust| existing.authority == profile.authority)
+        {
+            return Err(ConfigError::InvalidInternalHttps);
+        }
+        internal_https.push(profile);
+    }
     let host_limits = config.host_limits.runtime();
     if host_limits.max_timeout.is_zero() {
         return Err(ConfigError::InvalidHostLimits);
@@ -891,6 +926,7 @@ async fn resolve(
                 .map(|(_, store)| store.join("cwasm")),
             max_total_memory_bytes: config.host_limits.max_total_memory_bytes,
             plaintext_hosts: plaintext_hosts.clone(),
+            internal_https: Arc::new(internal_https),
         },
         plaintext_hosts,
         worst_case_guest_memory_bytes,
@@ -1018,6 +1054,10 @@ pub enum ConfigError {
         #[source]
         source: PlaintextHostError,
     },
+    #[error(
+        "http.internalHttps requires unique exact DNS authorities and readable nonempty PEM CA files (64 KiB maximum)"
+    )]
+    InvalidInternalHttps,
     #[error("could not safely resolve assets.rootPath")]
     AssetsPath {
         #[source]

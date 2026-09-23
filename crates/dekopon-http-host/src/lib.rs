@@ -284,6 +284,45 @@ fn is_bare_hostname(entry: &str) -> bool {
         && !entry.ends_with(['-', '.'])
 }
 
+/// Broker-owned, exact HTTPS authority with a private CA. This is never supplied by a guest.
+/// Only private unicast addresses are eligible, even if DNS changes after startup.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InternalHttpsTrust {
+    pub authority: String,
+    pub pem: Arc<Vec<u8>>,
+}
+
+impl InternalHttpsTrust {
+    pub fn new(authority: &str, pem: Vec<u8>) -> Result<Self, &'static str> {
+        let url = Url::parse(&format!("https://{authority}"))
+            .map_err(|_error| "authority must be a DNS hostname and explicit port")?;
+        let host = url.host_str().ok_or("authority must have a hostname")?;
+        if url.username() != ""
+            || url.password().is_some()
+            || url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+            || url.port().is_none()
+            || !is_bare_hostname(host)
+            || host.parse::<IpAddr>().is_ok()
+            || !authority
+                .eq_ignore_ascii_case(&format!("{host}:{}", url.port().unwrap_or_default()))
+        {
+            return Err("authority must be an exact DNS hostname and explicit port");
+        }
+        if pem.is_empty()
+            || pem.len() > 65_536
+            || reqwest::Certificate::from_pem_bundle(&pem).map_or(true, |certs| certs.is_empty())
+        {
+            return Err("CA bundle must contain valid PEM certificates under 64 KiB");
+        }
+        Ok(Self {
+            authority: authority.to_ascii_lowercase(),
+            pem: Arc::new(pem),
+        })
+    }
+}
+
 /// Independent native host settings that authorization cannot widen.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpHostCeilings {
@@ -303,6 +342,8 @@ pub struct HttpHostCeilings {
     /// the same reason they do: it is the broker owner's file, and no authorization can add an
     /// entry to it. Empty is the loopback-only rule.
     pub plaintext_hosts: PlaintextHosts,
+    /// Exact, owner-configured private HTTPS authorities and their root bundles.
+    pub internal_https: Arc<Vec<InternalHttpsTrust>>,
 }
 
 impl Default for HttpHostCeilings {
@@ -314,6 +355,7 @@ impl Default for HttpHostCeilings {
             max_headers: DEFAULT_MAX_HEADERS,
             max_header_bytes: DEFAULT_MAX_HEADER_BYTES,
             plaintext_hosts: PlaintextHosts::default(),
+            internal_https: Arc::new(Vec::new()),
         }
     }
 }
@@ -1391,15 +1433,22 @@ impl BufferedHttpClient {
                 ),
             ));
         }
-        if url.scheme() == "https"
-            && addresses
+        if url.scheme() == "https" {
+            let internal = self
+                .ceilings
+                .internal_https
                 .iter()
-                .any(|address| is_forbidden_public_destination(address.ip()))
-        {
-            return Err(http_error(
-                ErrorCode::Denied,
-                "destination resolved to a non-public address",
-            ));
+                .any(|profile| profile.authority == authority);
+            if !https_addresses_permitted(internal, &addresses) {
+                return Err(http_error(
+                    ErrorCode::Denied,
+                    if internal {
+                        "internal HTTPS requires private unicast addresses"
+                    } else {
+                        "destination resolved to a non-public address"
+                    },
+                ));
+            }
         }
 
         Ok(PreparedRequest {
@@ -1533,14 +1582,31 @@ impl BufferedHttpClient {
         // The client-level deadlines are the remaining budget at build time rather than this
         // call's share, because a reused client cannot re-arm them. Every await in `execute` is
         // already wrapped in a `timeout` against the same deadline, which stays authoritative.
-        let client = reqwest::Client::builder()
+        let authority = addresses
+            .first()
+            .map(|addr| format!("{host}:{}", addr.port()));
+        let internal_trust = self
+            .ceilings
+            .internal_https
+            .iter()
+            .find(|profile| Some(&profile.authority) == authority.as_ref());
+        let mut builder = reqwest::Client::builder()
             .redirect(redirect::Policy::none())
             .no_proxy()
             .connect_timeout(budget)
             .timeout(budget)
-            .resolve_to_addrs(host, addresses)
-            .build()
-            .map_err(|error| map_reqwest_error(&error))?;
+            .resolve_to_addrs(host, addresses);
+        if let Some(profile) = internal_trust {
+            // Do not add this root to the public-WebPKI client or trust public roots
+            // for the private authority. Certificates are validated at broker startup.
+            builder = builder.tls_built_in_root_certs(false);
+            for cert in reqwest::Certificate::from_pem_bundle(&profile.pem)
+                .map_err(|_error| http_error(ErrorCode::Denied, "invalid configured CA bundle"))?
+            {
+                builder = builder.add_root_certificate(cert);
+            }
+        }
+        let client = builder.build().map_err(|error| map_reqwest_error(&error))?;
         self.pinned_client = Some(PinnedClient {
             host: host.to_owned(),
             addresses: addresses.to_vec(),
@@ -1749,6 +1815,24 @@ fn encoded_request_bytes(
         .checked_add(uri.len() as u64)?
         .checked_add(header_bytes)?
         .checked_add(body_bytes)
+}
+
+fn https_addresses_permitted(internal: bool, addresses: &[SocketAddr]) -> bool {
+    !addresses.is_empty()
+        && addresses.iter().all(|address| {
+            if internal {
+                is_private_unicast(address.ip())
+            } else {
+                !is_forbidden_public_destination(address.ip())
+            }
+        })
+}
+
+fn is_private_unicast(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_private() && !ip.is_loopback() && !ip.is_link_local(),
+        IpAddr::V6(ip) => (ip.segments()[0] & 0xfe00) == 0xfc00,
+    }
 }
 
 fn is_forbidden_public_destination(ip: IpAddr) -> bool {
@@ -2137,6 +2221,76 @@ mod tests {
         assert!(!is_forbidden_public_destination(
             "2606:4700:4700::1111".parse().expect("valid fixture")
         ));
+    }
+
+    #[test]
+    fn private_https_profile_requires_exact_authority_and_valid_root() {
+        let pem = include_bytes!("../tests/fixtures/private-root.pem").to_vec();
+        let profile = super::InternalHttpsTrust::new(
+            "OpenObserve-TLS.openobserve.svc.cluster.local:5443",
+            pem.clone(),
+        )
+        .expect("valid root and exact authority");
+        assert_eq!(
+            profile.authority,
+            "openobserve-tls.openobserve.svc.cluster.local:5443"
+        );
+        for authority in [
+            "openobserve-tls.openobserve.svc.cluster.local",
+            "openobserve-tls.openobserve.svc.cluster.local:5443/path",
+            "*.openobserve.svc.cluster.local:5443",
+            "169.254.169.254:5443",
+            "openobserve-tls.openobserve.svc.cluster.local:5443@evil.example:443",
+        ] {
+            assert!(
+                super::InternalHttpsTrust::new(authority, pem.clone()).is_err(),
+                "{authority}"
+            );
+        }
+        assert!(
+            super::InternalHttpsTrust::new(
+                "openobserve-tls.openobserve.svc.cluster.local:5443",
+                b"not pem".to_vec()
+            )
+            .is_err()
+        );
+        assert!(
+            super::InternalHttpsTrust::new(
+                "openobserve-tls.openobserve.svc.cluster.local:5443",
+                vec![b'x'; 65_537]
+            )
+            .is_err()
+        );
+        for address in ["10.43.0.1", "172.16.0.2", "192.168.1.1", "fd00::1"] {
+            assert!(
+                super::is_private_unicast(address.parse().unwrap()),
+                "{address}"
+            );
+        }
+        for address in [
+            "127.0.0.1",
+            "169.254.169.254",
+            "8.8.8.8",
+            "::1",
+            "fe80::1",
+            "2001:db8::1",
+        ] {
+            assert!(
+                !super::is_private_unicast(address.parse().unwrap()),
+                "{address}"
+            );
+        }
+        let private = ["10.43.0.1:5443".parse().unwrap()];
+        let mixed = [
+            "10.43.0.1:5443".parse().unwrap(),
+            "8.8.8.8:5443".parse().unwrap(),
+        ];
+        let public = ["8.8.8.8:443".parse().unwrap()];
+        assert!(super::https_addresses_permitted(true, &private));
+        assert!(!super::https_addresses_permitted(false, &private));
+        assert!(!super::https_addresses_permitted(true, &mixed));
+        assert!(!super::https_addresses_permitted(true, &public));
+        assert!(super::https_addresses_permitted(false, &public));
     }
 
     #[test]

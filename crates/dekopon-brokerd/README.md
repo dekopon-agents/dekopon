@@ -120,6 +120,29 @@ form matches only HTTPS on 443 — and still needs that set's `allowPlaintextLoo
 decides is whether the host will speak plaintext to a destination the authorization already
 permits. Empty, the default, is the loopback-only rule unchanged.
 
+### Private HTTPS for provider HTTP
+
+An operator can permit a *single exact* internal HTTPS authority without turning off
+SSRF protection for other provider calls. The broker reads a public PEM CA bundle at
+startup (up to 64 KiB), refuses missing/invalid input and uses it only for that
+hostname and port. Mount the trust-manager public-root ConfigMap **broker-only**;
+restart the broker when it changes. No private key is mounted. For example:
+
+```yaml
+http:
+  internalHttps:
+    - authority: openobserve-tls.openobserve.svc.cluster.local:5443
+      caFile: /var/run/dekopon-trust/roots.pem
+```
+
+Only private unicast DNS answers are eligible, every address must qualify, and the
+CA replaces public WebPKI roots for that authority. Normal HTTPS still refuses
+private addresses and uses the built-in public roots. A Cedar grant must separately
+allow this exact authority, method and path; the provider cannot select a CA or
+widen the list. DNS pinning, redirect refusal, proxy refusal and byte/time budgets
+are unchanged. This setting affects the broker's provider HTTP client, not gateway
+model transports, OTLP exporters or the separate OCI provider manager.
+
 Host, broker, and server limits have conservative defaults, including a 2 MiB frame ceiling, when
 their entire sections are omitted. `hostLimits` and `brokerLimits` also default field by field, so a
 partial section keeps the absent-section value for everything it does not name — which is what lets

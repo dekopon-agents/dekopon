@@ -50,8 +50,8 @@ mod metadata;
 mod storage;
 use clock::ClockState;
 pub use http::{
-    BoundCredential, HttpCallEvidence, HttpConfigurationError, PlaintextHostError, PlaintextHosts,
-    destinations_cover,
+    BoundCredential, HttpCallEvidence, HttpConfigurationError, InternalHttpsTrust,
+    PlaintextHostError, PlaintextHosts, destinations_cover,
 };
 use http::{HttpCeilings, HttpState};
 pub use metadata::LoadedProviderMetadata;
@@ -193,6 +193,8 @@ pub struct BrokerHostOptions {
     ///
     /// Empty — the default — is the loopback-only rule every deployment starts with.
     pub plaintext_hosts: PlaintextHosts,
+    /// Exact private HTTPS destinations; never populated from provider input.
+    pub internal_https: Arc<Vec<InternalHttpsTrust>>,
 }
 
 impl Default for BrokerHostOptions {
@@ -201,6 +203,7 @@ impl Default for BrokerHostOptions {
             cwasm_dir: None,
             max_total_memory_bytes: Some(DEFAULT_MAX_TOTAL_MEMORY_BYTES),
             plaintext_hosts: PlaintextHosts::default(),
+            internal_https: Arc::new(Vec::new()),
         }
     }
 }
@@ -444,6 +447,7 @@ struct Runtime {
     limits: BrokerHostLimits,
     memory_budget: Option<Arc<MemoryBudget>>,
     plaintext_hosts: PlaintextHosts,
+    internal_https: Arc<Vec<InternalHttpsTrust>>,
 }
 
 impl Runtime {
@@ -483,6 +487,7 @@ impl Runtime {
                 })
             }),
             plaintext_hosts: options.plaintext_hosts.clone(),
+            internal_https: Arc::clone(&options.internal_https),
         })
     }
 
@@ -536,6 +541,7 @@ impl Runtime {
             max_headers: self.limits.max_http_headers,
             max_header_bytes: self.limits.max_http_header_bytes,
             plaintext_hosts: self.plaintext_hosts.clone(),
+            internal_https: Arc::clone(&self.internal_https),
         }
     }
 }

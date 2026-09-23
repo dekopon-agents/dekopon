@@ -9,6 +9,8 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ### Added
 
+- Broker-only, exact-authority private HTTPS CA trust for provider HTTP, with bounded
+  startup PEM validation and private-unicast DNS checks; public HTTPS remains unchanged.
 - `kind: openrouter` models in `dekopond`: OpenRouter streaming inference with strict authored
   generation, reasoning, routing and optional explicit system-prefix cache controls, native
   reasoning replay and `session_id` sticky routing.
