@@ -37,6 +37,7 @@ The operator surface on top:
 - Strict YAML and JSON agent resources, with duplicate, invalid-name and unknown-field detection reported in one refusal.
 - Isolated model-account authentication through `dekopond auth`, with table, wide, JSON, YAML, and name status output.
 - A chat gateway over Slack Socket Mode, Discord Gateway, Telegram long polling, a signed Meta WhatsApp Cloud API webhook with bounded PNG/JPEG photo inputs, and an owner-only local socket. Authenticated messages route to catalog agents while the broker remains the only authority.
+- Provider HTTPS can add CA roots independently of exact-authority non-public egress, and the broker supplies per-provider owner settings only during authorized invocation. A URL-free, bounded OpenObserve provider can now be installed separately; it is **not** bundled or granted by this release. See [upgrading to 0.20.0](docs/upgrading.md#provider-https-and-owner-settings-0200).
 - Persistent WhatsApp routes retain freshly authorized late photo references without restarting a busy model/provider or starting a delayed run. A completion notice or separate acknowledgment asks whether another version is wanted; photos download only on demand. Upgrade both daemons together for nullable asset inventory lengths; see [upgrading to 0.19.0](docs/upgrading.md#whatsapp-burst-collection-and-unknown-lengths-0190).
 - Attachments a person sends: an image or document becomes a numbered chat asset named in the prompt, which a model opens on demand rather than carrying on every turn, under media-type, byte, attempt, and per-conversation limits.
 - Opt-in native liveness after fresh authorization: automatic progress prefers native status or a typing/reaction indicator over redundant progress messages; explicit editable progress and optional answer streaming remain available, driven by one per-session policy task, with Slack Agent Working/Stop sessions and a classic `:tangerine:` reaction fallback. A liveness failure never changes the answer, and a stop — a native Stop, a cancel button, a configured stop word, an operator shutdown, or a wall-clock bound — is cooperative rather than rollback.
@@ -72,12 +73,12 @@ From there, [`examples/conditional-write`](examples/conditional-write/README.md)
 Three provenance-attested archives — macOS on ARM64, and Linux on ARM64 and x86-64 — are attached to each [GitHub release](https://github.com/dekopon-agents/dekopon/releases). Each carries the daemon executables, the example component, and the broker and gateway configuration contracts, with a `.sha256` sidecar beside it:
 
 ```console
-gh release download v0.19.0 --repo dekopon-agents/dekopon \
-  --pattern 'dekopon-0.19.0-aarch64-apple-darwin.tar.gz*'
-shasum -a 256 -c dekopon-0.19.0-aarch64-apple-darwin.tar.gz.sha256
+gh release download v0.20.0 --repo dekopon-agents/dekopon \
+  --pattern 'dekopon-0.20.0-aarch64-apple-darwin.tar.gz*'
+shasum -a 256 -c dekopon-0.20.0-aarch64-apple-darwin.tar.gz.sha256
 gh attestation verify --repo dekopon-agents/dekopon \
-  dekopon-0.19.0-aarch64-apple-darwin.tar.gz
-tar xzf dekopon-0.19.0-aarch64-apple-darwin.tar.gz
+  dekopon-0.20.0-aarch64-apple-darwin.tar.gz
+tar xzf dekopon-0.20.0-aarch64-apple-darwin.tar.gz
 ```
 
 ### crates.io

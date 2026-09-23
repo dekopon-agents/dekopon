@@ -13,6 +13,25 @@ do not understand rather than guessing.
 Rust embedders match `dekopon_model::error::InferenceError` instead of `ModelError`;
 `Interrupted` is now `Cancelled`.
 
+## Provider HTTPS and owner settings (0.20.0)
+
+Broker `http.extraCABundles` adds absolute PEM CA files for **all** provider HTTPS requests;
+`http.nonPublicHttps` separately lists exact DNS authorities with explicit ports that may
+resolve to private-unicast IPs. Neither setting grants a capability or disables the normal
+HTTP host's DNS pinning, redirect refusal or per-capability destination check. A broker started
+with either field on v0.19.0 rejects its configuration. Mount the CA bundle broker-only and
+verify it exists before the new broker starts; no gateway, OTLP or frontend TLS setting changes.
+
+`providerSettings.<provider-id>` is a bounded nonsecret JSON object visible only to the
+matching provider during authorized `invoke`. An older runtime cannot link a provider
+that imports `dekopon:settings/config@0.1.0`. Release/pin the v0.20.0 runtime first,
+then release/pin such a provider artifact and add its settings. For OpenObserve the
+settings hold `url`, `org`, and `stream`; the agent supplies none. Configure a separate
+broker-bound search credential and a narrow Cedar grant before enabling agent queries.
+OpenObserve OSS has no stream-level RBAC: the provider's generated SQL prevents an
+untrusted agent from selecting another stream, but not a compromised provider or direct
+use of its account. Verify the HTTPS peer and negative DNS/TLS cases before rollout.
+
 ## WhatsApp burst collection and unknown lengths (0.19.0)
 
 Upgrade `dekopond` and `dekopon-brokerd` together. Asset inventory wire rows now carry `bytes: null`
