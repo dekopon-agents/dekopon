@@ -120,6 +120,49 @@ form matches only HTTPS on 443 — and still needs that set's `allowPlaintextLoo
 decides is whether the host will speak plaintext to a destination the authorization already
 permits. Empty, the default, is the loopback-only rule unchanged.
 
+### Additional CA trust and non-public HTTPS egress
+
+These are **independent** broker-owned settings. `extraCABundles` adds PEM roots to
+HTTPS certificate validation alongside the built-in public roots; it does not grant
+network access or pin a CA to an authority. Each absolute file is checked at startup
+(64 KiB maximum; at most eight). Mount the trust-manager public-root ConfigMap
+**broker-only** and restart the broker when it changes. No private key is mounted.
+`nonPublicHttps` separately permits exact DNS authorities and explicit ports to
+resolve to private unicast addresses; at most eight entries. For example:
+
+```yaml
+http:
+  extraCABundles:
+    - /var/run/dekopon-trust/roots.pem
+  nonPublicHttps:
+    - openobserve-tls.openobserve.svc.cluster.local:5443
+```
+
+Every DNS answer for a listed authority must be private unicast; a mixed answer,
+loopback or link-local address is refused. Other HTTPS destinations still refuse
+non-public addresses. In either case a Cedar grant must separately allow the
+exact authority, method and path. DNS pinning, redirect refusal, proxy refusal and
+byte/time budgets are unchanged. These settings affect only the broker's provider
+HTTP client, not gateway model transports, OTLP exporters or the OCI provider manager.
+
+### Owner-configured provider settings
+
+`providerSettings` is an optional map from provider ID to a JSON object (at most the configured
+provider limit and 4 KiB each). The broker supplies only the matching object to that provider
+*during invoke*, not to `describe`, `run-command`, the model or other providers. Do not put
+credentials here; credential injection remains broker-owned and DRN-bound. For example:
+
+```yaml
+providerSettings:
+  openobserve:
+    url: https://openobserve-tls.openobserve.svc.cluster.local:5443/openobserve
+    org: default
+    stream: dekopon
+```
+
+Provider settings do not authorize network access. An independent capability grant and its
+HTTP constraints still restrict destination, method, path, request count and credential use.
+
 Host, broker, and server limits have conservative defaults, including a 2 MiB frame ceiling, when
 their entire sections are omitted. `hostLimits` and `brokerLimits` also default field by field, so a
 partial section keeps the absent-section value for everything it does not name — which is what lets

@@ -574,6 +574,64 @@ async fn plaintext_hosts_are_validated_at_startup() {
     // The host that enforces the rule gets the same list; nothing else has to agree with it.
     assert!(resolved.host_options.plaintext_hosts.contains("rpi.lan"));
 
+    let ca_file = directory.path().join("root.pem");
+    fs::write(
+        &ca_file,
+        include_bytes!("../../dekopon-http-host/tests/fixtures/private-root.pem"),
+    )
+    .expect("write public test root");
+    let mut private = document.clone();
+    private["http"] = json!({
+        "extraCABundles": [ca_file],
+        "nonPublicHttps": ["openobserve-tls.openobserve.svc.cluster.local:5443"]
+    });
+    write_config(&path, &private);
+    let resolved = config::load(&path, uid)
+        .await
+        .expect("valid independent HTTPS trust and egress settings");
+    assert_eq!(resolved.host_options.extra_ca_bundles.len(), 1);
+    assert_eq!(resolved.host_options.non_public_https.len(), 1);
+    private["providerSettings"] = json!({"openobserve": {
+        "url": "https://openobserve-tls.openobserve.svc.cluster.local:5443/openobserve",
+        "org": "default", "stream": "dekopon"
+    }});
+    write_config(&path, &private);
+    let resolved = config::load(&path, uid)
+        .await
+        .expect("owner provider settings");
+    assert_eq!(resolved.host_options.provider_settings.len(), 1);
+    assert!(
+        resolved
+            .host_options
+            .provider_settings
+            .values()
+            .next()
+            .unwrap()
+            .contains("dekopon")
+    );
+    private["providerSettings"]["openobserve"] = json!("invalid scalar");
+    write_config(&path, &private);
+    assert!(matches!(
+        config::load(&path, uid).await,
+        Err(config::ConfigError::InvalidProviderSettings)
+    ));
+    private["providerSettings"]["openobserve"] = json!({"url": "https://openobserve-tls.openobserve.svc.cluster.local:5443/openobserve", "org": "default", "stream": "dekopon"});
+    private["http"]["nonPublicHttps"][0] =
+        json!("openobserve-tls.openobserve.svc.cluster.local:5443/path");
+    write_config(&path, &private);
+    assert!(matches!(
+        config::load(&path, uid).await,
+        Err(config::ConfigError::InvalidHttpsConfiguration)
+    ));
+    private["http"]["nonPublicHttps"][0] =
+        json!("openobserve-tls.openobserve.svc.cluster.local:5443");
+    fs::write(&ca_file, b"not pem").expect("replace public test root");
+    write_config(&path, &private);
+    assert!(matches!(
+        config::load(&path, uid).await,
+        Err(config::ConfigError::InvalidHttpsConfiguration)
+    ));
+
     // Each of these is a refusal at boot, naming the entry the operator has to fix.
     for entry in [
         "http://rpi.lan",

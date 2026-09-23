@@ -47,15 +47,17 @@ mod cwasm;
 mod http;
 mod memory;
 mod metadata;
+mod settings;
 mod storage;
 use clock::ClockState;
 pub use http::{
-    BoundCredential, HttpCallEvidence, HttpConfigurationError, PlaintextHostError, PlaintextHosts,
-    destinations_cover,
+    BoundCredential, HttpCallEvidence, HttpConfigurationError, NonPublicHttpsAuthority,
+    PlaintextHostError, PlaintextHosts, destinations_cover,
 };
 use http::{HttpCeilings, HttpState};
 pub use metadata::LoadedProviderMetadata;
 use metadata::identify_bytes;
+use settings::SettingsState;
 
 pub(crate) mod bindings {
     wasmtime::component::bindgen!({
@@ -193,6 +195,12 @@ pub struct BrokerHostOptions {
     ///
     /// Empty — the default — is the loopback-only rule every deployment starts with.
     pub plaintext_hosts: PlaintextHosts,
+    /// Additional HTTPS roots, independent of the destination egress rule.
+    pub extra_ca_bundles: Arc<Vec<Vec<u8>>>,
+    /// Exact private HTTPS destinations; never populated from provider input.
+    pub non_public_https: Arc<Vec<NonPublicHttpsAuthority>>,
+    /// JSON settings keyed by provider ID; readable only by that provider during invoke.
+    pub provider_settings: Arc<BTreeMap<ProviderId, String>>,
 }
 
 impl Default for BrokerHostOptions {
@@ -201,6 +209,9 @@ impl Default for BrokerHostOptions {
             cwasm_dir: None,
             max_total_memory_bytes: Some(DEFAULT_MAX_TOTAL_MEMORY_BYTES),
             plaintext_hosts: PlaintextHosts::default(),
+            extra_ca_bundles: Arc::new(Vec::new()),
+            non_public_https: Arc::new(Vec::new()),
+            provider_settings: Arc::new(BTreeMap::new()),
         }
     }
 }
@@ -444,6 +455,9 @@ struct Runtime {
     limits: BrokerHostLimits,
     memory_budget: Option<Arc<MemoryBudget>>,
     plaintext_hosts: PlaintextHosts,
+    extra_ca_bundles: Arc<Vec<Vec<u8>>>,
+    non_public_https: Arc<Vec<NonPublicHttpsAuthority>>,
+    provider_settings: Arc<BTreeMap<ProviderId, String>>,
 }
 
 impl Runtime {
@@ -483,6 +497,9 @@ impl Runtime {
                 })
             }),
             plaintext_hosts: options.plaintext_hosts.clone(),
+            extra_ca_bundles: Arc::clone(&options.extra_ca_bundles),
+            non_public_https: Arc::clone(&options.non_public_https),
+            provider_settings: Arc::clone(&options.provider_settings),
         })
     }
 
@@ -491,6 +508,7 @@ impl Runtime {
         http: HttpState,
         storage: storage::StorageState,
         clock: ClockState,
+        settings: SettingsState,
     ) -> Result<Store<StoreState>, BrokerHostError> {
         let reserved = match &self.memory_budget {
             Some(budget) => Some(budget.reserve(self.limits.max_memory_bytes).ok_or(
@@ -508,6 +526,7 @@ impl Runtime {
                 http,
                 storage,
                 clock,
+                settings,
                 assets: asset::AssetState::disabled(),
                 table: storage::new_table(),
                 instantiations: 0,
@@ -536,6 +555,8 @@ impl Runtime {
             max_headers: self.limits.max_http_headers,
             max_header_bytes: self.limits.max_http_header_bytes,
             plaintext_hosts: self.plaintext_hosts.clone(),
+            extra_ca_bundles: Arc::clone(&self.extra_ca_bundles),
+            non_public_https: Arc::clone(&self.non_public_https),
         }
     }
 }
@@ -547,6 +568,7 @@ struct StoreState {
     storage: storage::StorageState,
     /// Granted only in an invocation's store; descriptions and command runs are pure.
     clock: ClockState,
+    settings: SettingsState,
     table: wasmtime::component::ResourceTable,
     /// Component instantiations in this store, recorded onto the operation's span when it ends.
     ///
@@ -1018,6 +1040,7 @@ impl BrokerWasmProvider {
             http,
             storage::StorageState::disabled(),
             ClockState::describe(),
+            SettingsState::describe(),
         )?;
         let argv = argv.to_vec();
         let stdin = stdin.map(str::to_owned);
@@ -1068,7 +1091,7 @@ impl BrokerWasmProvider {
         record_store_outcome(&mut store, self.runtime.limits.fuel);
         // A refused clock read traps, so it is checked before the trap surfaces: the tripwire names
         // the cause, where the trap would only report that the guest stopped.
-        if store.data().clock.attempted() {
+        if store.data().clock.attempted() || store.data().settings.attempted() {
             return Err(BrokerHostError::RunCommandUsedHostImport {
                 path: self.source.clone(),
             });
@@ -1151,9 +1174,17 @@ impl BrokerWasmProvider {
             storage::StorageState::disabled,
             storage::StorageState::active,
         );
-        let mut store = self
-            .runtime
-            .store(http, storage_state, ClockState::invoke())?;
+        let mut store = self.runtime.store(
+            http,
+            storage_state,
+            ClockState::invoke(),
+            SettingsState::invoke(
+                self.runtime
+                    .provider_settings
+                    .get(&self.manifest.id)
+                    .cloned(),
+            ),
+        )?;
         store.data_mut().assets = asset::AssetState::invoke(
             assets,
             asset::references(input),
@@ -1838,6 +1869,7 @@ async fn describe_component(
         http,
         storage::StorageState::disabled(),
         ClockState::describe(),
+        SettingsState::describe(),
     )?;
     let operation = async {
         let bindings = pre.instantiate_async(&mut store).await.map_err(|error| {
@@ -1869,7 +1901,7 @@ async fn describe_component(
             });
     record_store_outcome(&mut store, runtime.limits.fuel);
     // As in a command run: a refused clock read traps, and the tripwire names it before the trap.
-    if store.data().clock.attempted() {
+    if store.data().clock.attempted() || store.data().settings.attempted() {
         return Err(BrokerHostError::DescribeUsedHostImport {
             path: source.to_path_buf(),
         });

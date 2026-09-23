@@ -9,4 +9,5 @@ world provider {
     import dekopon:storage/jsonl@0.1.0;
     import dekopon:storage/durable-files@0.1.0;
     import dekopon:clock/wall@1.0.0;
+    import dekopon:settings/config@0.1.0;
 }

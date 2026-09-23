@@ -930,7 +930,7 @@ mod tests {
 
     use crate::{
         BrokerHostLimits, BrokerHostOptions, Runtime, clock::ClockState, http::HttpState,
-        storage::StorageState,
+        settings::SettingsState, storage::StorageState,
     };
     use std::time::Duration;
     use wit::{Host as _, HostHandle as _, HostWriter as _};
@@ -945,7 +945,12 @@ mod tests {
             Runtime::new(BrokerHostLimits::default(), &BrokerHostOptions::default()).unwrap();
         let http = HttpState::describe(runtime.http_ceilings(), Duration::from_secs(5)).unwrap();
         let mut state = runtime
-            .store(http, StorageState::disabled(), ClockState::invoke())
+            .store(
+                http,
+                StorageState::disabled(),
+                ClockState::invoke(),
+                SettingsState::invoke(None),
+            )
             .unwrap()
             .into_data();
         state.assets = AssetState::invoke(
@@ -1764,7 +1769,12 @@ mod tests {
             HttpState::describe(provider.runtime.http_ceilings(), Duration::from_secs(5)).unwrap();
         let mut store = provider
             .runtime
-            .store(http, StorageState::disabled(), ClockState::invoke())
+            .store(
+                http,
+                StorageState::disabled(),
+                ClockState::invoke(),
+                SettingsState::invoke(None),
+            )
             .unwrap();
         store.data_mut().assets = AssetState::invoke(
             AssetInputs::default(),

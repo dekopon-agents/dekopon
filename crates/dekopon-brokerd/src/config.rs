@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     io,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -11,14 +12,14 @@ use dekopon_broker::{
 };
 use dekopon_broker_host::{
     BrokerHostLimits, BrokerHostOptions, DEFAULT_MAX_TOTAL_MEMORY_BYTES, LockedProviderSource,
-    PlaintextHostError, PlaintextHosts,
+    NonPublicHttpsAuthority, PlaintextHostError, PlaintextHosts,
 };
 use dekopon_broker_protocol::{
     DEFAULT_IO_TIMEOUT, DEFAULT_MAX_FRAME_BYTES, FrameLimits, ProtocolError,
 };
 use dekopon_core::{
     Actor, CapabilityId, ExternalSubject, FileHygieneError, FileTier, PROVIDER_COMPONENT_EXTENSION,
-    PrincipalId, read_trusted_file,
+    PrincipalId, ProviderId, read_trusted_file,
 };
 use dekopon_storage_host::StorageLimits;
 use dekopon_telemetry::{ExporterSettings, TelemetryError, Transport};
@@ -106,6 +107,9 @@ pub struct BrokerdConfig {
     /// policy, and refuses to start if policy could ever permit it.
     #[serde(default)]
     pub constraint_sets: BTreeMap<CapabilityId, ConstraintSet>,
+    /// Nonsecret owner settings given only to the named provider during invoke, never to the agent.
+    #[serde(default)]
+    pub provider_settings: BTreeMap<ProviderId, serde_json::Value>,
     /// Broker-owner decisions about the native HTTP host's transport rules.
     #[serde(default)]
     pub http: HttpConfig,
@@ -145,6 +149,11 @@ pub struct HttpConfig {
     /// `allowPlaintextLoopback`; this only decides whether the native host will speak plaintext
     /// to it once the authorization already allows the destination.
     pub plaintext_hosts: Vec<String>,
+    /// Additional root bundles for HTTPS, not tied to or granting any destination.
+    #[serde(rename = "extraCABundles")]
+    pub extra_ca_bundles: Vec<PathBuf>,
+    /// Exact authorities allowed to resolve to private unicast IPs (separate from TLS trust).
+    pub non_public_https: Vec<String>,
 }
 
 /// Paths for one generated provider lock and its immutable blob store.
@@ -792,6 +801,52 @@ async fn resolve(
     // broker that will deny a request the operator is sure they permitted.
     let plaintext_hosts = PlaintextHosts::new(&config.http.plaintext_hosts)
         .map_err(|source| ConfigError::InvalidPlaintextHost { source })?;
+    if config.http.extra_ca_bundles.len() > 8 || config.http.non_public_https.len() > 8 {
+        return Err(ConfigError::InvalidHttpsConfiguration);
+    }
+    let mut extra_ca_bundles = Vec::new();
+    for path in &config.http.extra_ca_bundles {
+        if !path.is_absolute() {
+            return Err(ConfigError::InvalidHttpsConfiguration);
+        }
+        let metadata =
+            std::fs::metadata(path).map_err(|_error| ConfigError::InvalidHttpsConfiguration)?;
+        if !metadata.is_file() || metadata.len() == 0 || metadata.len() > 65_536 {
+            return Err(ConfigError::InvalidHttpsConfiguration);
+        }
+        let pem = std::fs::read(path).map_err(|_error| ConfigError::InvalidHttpsConfiguration)?;
+        if reqwest::Certificate::from_pem_bundle(&pem).map_or(true, |certs| certs.is_empty()) {
+            return Err(ConfigError::InvalidHttpsConfiguration);
+        }
+        extra_ca_bundles.push(pem);
+    }
+    let mut non_public_https = Vec::new();
+    for authority in &config.http.non_public_https {
+        let entry = NonPublicHttpsAuthority::new(authority)
+            .map_err(|_error| ConfigError::InvalidHttpsConfiguration)?;
+        if non_public_https
+            .iter()
+            .any(|existing: &NonPublicHttpsAuthority| existing.authority == entry.authority)
+        {
+            return Err(ConfigError::InvalidHttpsConfiguration);
+        }
+        non_public_https.push(entry);
+    }
+    if config.provider_settings.len() > HARD_MAX_PROVIDERS {
+        return Err(ConfigError::InvalidProviderSettings);
+    }
+    let mut provider_settings = BTreeMap::new();
+    for (id, settings) in &config.provider_settings {
+        if !settings.is_object() {
+            return Err(ConfigError::InvalidProviderSettings);
+        }
+        let json = serde_json::to_string(settings)
+            .map_err(|_error| ConfigError::InvalidProviderSettings)?;
+        if json.len() > 4096 {
+            return Err(ConfigError::InvalidProviderSettings);
+        }
+        provider_settings.insert(id.clone(), json);
+    }
     let host_limits = config.host_limits.runtime();
     if host_limits.max_timeout.is_zero() {
         return Err(ConfigError::InvalidHostLimits);
@@ -891,6 +946,9 @@ async fn resolve(
                 .map(|(_, store)| store.join("cwasm")),
             max_total_memory_bytes: config.host_limits.max_total_memory_bytes,
             plaintext_hosts: plaintext_hosts.clone(),
+            extra_ca_bundles: Arc::new(extra_ca_bundles),
+            non_public_https: Arc::new(non_public_https),
+            provider_settings: Arc::new(provider_settings),
         },
         plaintext_hosts,
         worst_case_guest_memory_bytes,
@@ -1018,6 +1076,14 @@ pub enum ConfigError {
         #[source]
         source: PlaintextHostError,
     },
+    #[error(
+        "http.extraCABundles requires absolute readable PEM files (64 KiB maximum); http.nonPublicHttps requires unique exact DNS authorities"
+    )]
+    InvalidHttpsConfiguration,
+    #[error(
+        "providerSettings must contain at most one bounded JSON object per provider (4 KiB each)"
+    )]
+    InvalidProviderSettings,
     #[error("could not safely resolve assets.rootPath")]
     AssetsPath {
         #[source]
