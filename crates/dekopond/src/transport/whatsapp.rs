@@ -334,7 +334,13 @@ impl ChatTransport for WhatsappTransport {
                 })
                 .with_state(self.state.clone());
             let name = self.name.clone();
-            self.server = Some(tokio::spawn(async move {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "owner: the transport keeps the handle in self.server and joins it in \
+                          next(); connections inside are a JoinSet bounded by \
+                          MAX_WEBHOOK_CONCURRENCY"
+            )]
+            let server = tokio::spawn(async move {
                 let mut connections = tokio::task::JoinSet::new();
                 let connection_limit = Arc::new(Semaphore::new(MAX_WEBHOOK_CONCURRENCY));
                 loop {
@@ -389,7 +395,9 @@ impl ChatTransport for WhatsappTransport {
                                 // beyond the same hard deadline as a buffered webhook request.
                                 #[allow(
                                     clippy::let_underscore_must_use,
-                                    reason = "the outcome is that one untrusted client's connection ended, by deadline or by hanging up; the router already recorded whatever it answered"
+                                    reason = "the outcome is that one untrusted client's \
+                                              connection ended, by deadline or by hanging up; the \
+                                              router already recorded whatever it answered"
                                 )]
                                 let _ = tokio::time::timeout(WEBHOOK_REQUEST_TIMEOUT, connection).await;
                             });
@@ -397,7 +405,8 @@ impl ChatTransport for WhatsappTransport {
                         Some(_) = connections.join_next(), if !connections.is_empty() => {}
                     }
                 }
-            }));
+            });
+            self.server = Some(server);
             Ok(TransportIdentity::default())
         })
     }

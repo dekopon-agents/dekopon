@@ -154,12 +154,21 @@ impl LocalTransport {
         let boot_nonce = self.boot_nonce.clone().unwrap_or_default();
         let inbound = self.sender.clone();
         let driver = Arc::clone(&self.driver);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "owner-only development socket: the connection task ends when its caller \
+                      hangs up or the gateway stops reading; not deployed"
+        )]
         tokio::spawn(async move {
             let (reader, mut writer) = stream.into_split();
             // `Take` re-armed per line rather than per connection: a line ceiling has to bound the
             // buffer *before* it is allocated, and a connection ceiling would end a long dev
             // session after enough short requests.
             let mut reader = BufReader::new(reader).take(MAX_LINE_BYTES);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "owner: the connection task above aborts this writer when its reader ends"
+            )]
             let writes = tokio::spawn(async move {
                 while let Some(reply) = outbound_receive.recv().await {
                     let accepted =

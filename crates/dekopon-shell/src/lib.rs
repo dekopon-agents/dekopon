@@ -123,7 +123,14 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 #![forbid(unsafe_code)]
-
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        reason = "tests spawn, join and drain freely; production sites carry their own expectation"
+    )
+)]
 use std::sync::Arc;
 
 use serde_json::Value;

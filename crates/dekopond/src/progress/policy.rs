@@ -210,6 +210,11 @@ impl ProgressPolicy {
         let surface = Surface::new(inputs, Arc::clone(&coordination), counters);
         // Inside the caller's span, so every record this task writes rides the message's trace
         // rather than opening an orphan the operator cannot tie to a conversation.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "owner: ProgressPolicy holds the handle; finish_in_background detaches only \
+                      post-answer cleanup, bounded by EVENT_QUEUE and each driver call's timeout"
+        )]
         let worker = tokio::spawn(tracing::Instrument::instrument(
             run(surface, events_rx, text_rx, terminal_rx, cancellation),
             tracing::Span::current(),

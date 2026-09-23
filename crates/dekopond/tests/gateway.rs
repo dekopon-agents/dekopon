@@ -9,6 +9,11 @@
 //! The audit records are read the way an operator's log pipeline reads them: as the
 //! `dekopon_broker::audit` events the in-process broker emits.
 
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "tests spawn, join and drain freely"
+)]
 #![cfg(unix)]
 #![allow(clippy::unwrap_used)]
 

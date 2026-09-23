@@ -4,6 +4,14 @@
 //! [`AuthorizedInvocation`], links only the project-owned buffered HTTP and namespace-bound
 //! storage interfaces, and applies the invocation's exact host-call constraints in a fresh store.
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        reason = "tests spawn, join and drain freely; production sites carry their own expectation"
+    )
+)]
 // The sole exception is cwasm::deserialize, after trusted-artifact verification.
 #![deny(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]

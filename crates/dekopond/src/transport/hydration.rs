@@ -143,6 +143,11 @@ impl Drop for ImageQueue {
         };
         let span = tracing::Span::current();
         let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "a destructor has no caller to await; the job only unlinks the scratch images \
+                      it owns"
+        )]
         drop(handle.spawn_blocking(move || {
             tracing::dispatcher::with_default(&dispatch, || span.in_scope(move || drop(remaining)));
         }));

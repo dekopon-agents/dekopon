@@ -13,7 +13,14 @@
 //! this crate parses, and never attached to a span attribute or log field.
 
 #![cfg_attr(test, allow(clippy::unwrap_used))]
-
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        reason = "tests spawn, join and drain freely; production sites carry their own expectation"
+    )
+)]
 mod install;
 
 use std::{fmt, str::FromStr, sync::OnceLock, time::Duration};
@@ -402,6 +409,11 @@ impl OtlpHttpClient {
     fn new(timeout: Duration) -> Result<Self, TelemetryError> {
         // reqwest's blocking client owns a private runtime and refuses to create it from within
         // Dekopon's Tokio runtime. Build it on a plain thread, as the upstream OTLP adapter does.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "joined on the next lines; reqwest's blocking client refuses to build on a \
+                      runtime thread"
+        )]
         let client = std::thread::Builder::new()
             .name("dekopon-otlp-http-client".to_owned())
             .spawn(move || otlp_client_from(reqwest::blocking::Client::builder(), timeout).build())

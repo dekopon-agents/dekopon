@@ -328,6 +328,11 @@ fn submit(job: Job) -> Result<(), CommandFailure> {
     };
 
     let (jobs, queue) = sync_channel::<Job>(1);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "owner: one reused worker per shell thread, never joined because a non-yielding \
+                  filter cannot be stopped; bound: MAX_ABANDONED_WORKERS plus the session ceiling"
+    )]
     std::thread::Builder::new()
         .name("dekopon-shell-jq".to_owned())
         .spawn(move || serve(&queue))

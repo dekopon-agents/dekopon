@@ -6,7 +6,14 @@
 
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
-
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        reason = "tests spawn, join and drain freely; production sites carry their own expectation"
+    )
+)]
 use std::{fmt, io, time::Duration};
 
 #[cfg(unix)]
@@ -224,7 +231,8 @@ impl std::str::FromStr for TraceParent {
 /// Decodes exact-width lowercase hex into `output`.
 #[allow(
     clippy::map_err_ignore,
-    reason = "the guards below already proved exact width and all-lowercase ASCII hex, so the digit-pair ParseIntError is unreachable"
+    reason = "the guards below already proved exact width and all-lowercase ASCII hex, so the \
+              digit-pair ParseIntError is unreachable"
 )]
 fn decode_hex(text: &str, output: &mut [u8]) -> Result<(), TraceParentError> {
     if text.len() != output.len() * 2 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -1231,7 +1239,8 @@ where
     let limits = limits.validate()?;
     #[allow(
         clippy::map_err_ignore,
-        reason = "tokio's Elapsed says only that io_timeout expired, which ProtocolError::Timeout already states"
+        reason = "tokio's Elapsed says only that io_timeout expired, which ProtocolError::Timeout \
+                  already states"
     )]
     let bytes = timeout(limits.io_timeout, async {
         let mut prefix = [0_u8; FRAME_PREFIX_BYTES];
@@ -1342,7 +1351,8 @@ where
     let payload = buffer.payload_len();
     #[allow(
         clippy::map_err_ignore,
-        reason = "TryFromIntError carries only out-of-range, and FrameTooLarge already names the length and the maximum"
+        reason = "TryFromIntError carries only out-of-range, and FrameTooLarge already names the \
+                  length and the maximum"
     )]
     let length = u32::try_from(payload).map_err(|_| ProtocolError::FrameTooLarge {
         length: payload,
@@ -1351,7 +1361,8 @@ where
     buffer.frame[..FRAME_PREFIX_BYTES].copy_from_slice(&length.to_be_bytes());
     #[allow(
         clippy::map_err_ignore,
-        reason = "tokio's Elapsed says only that io_timeout expired, which ProtocolError::Timeout already states"
+        reason = "tokio's Elapsed says only that io_timeout expired, which ProtocolError::Timeout \
+                  already states"
     )]
     timeout(limits.io_timeout, async {
         writer.write_all(&buffer.frame).await?;
@@ -1712,7 +1723,8 @@ impl BrokerClient {
         validate_socket_path(&self.socket, self.expected_server_uid).await?;
         #[allow(
             clippy::map_err_ignore,
-            reason = "tokio's Elapsed says only that io_timeout expired, which ClientError::ConnectTimeout already states"
+            reason = "tokio's Elapsed says only that io_timeout expired, which \
+                      ClientError::ConnectTimeout already states"
         )]
         let stream = timeout(self.limits.io_timeout, UnixStream::connect(&self.socket))
             .await

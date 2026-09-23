@@ -12,7 +12,14 @@
 
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
-
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        reason = "tests spawn, join and drain freely; production sites carry their own expectation"
+    )
+)]
 use std::{
     error::Error,
     fmt,
@@ -408,8 +415,18 @@ impl ProcessRun {
         // `process` into `tokio::spawn`. Once admitted, the supervisor owns the process node and,
         // while the runtime lives, remains responsible for joining, recording, and delivering it
         // even if this outer future is dropped.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "owner: the supervisor, once admitted, joins, records and delivers its node \
+                      even if the caller's future is dropped; bound: ProcessRun admission"
+        )]
         let supervisor = tokio::spawn(
             async move {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "owner: the supervisor below joins this node, and aborts it on \
+                              cancellation"
+                )]
                 let mut task = tokio::spawn(process.run().instrument(node_instrument));
                 let (joined, cancel_requested) = match interruptibility {
                     Interruptibility::NonInterruptible => (task.await, false),

@@ -27,7 +27,14 @@
 
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
-
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        reason = "tests spawn, join and drain freely; production sites carry their own expectation"
+    )
+)]
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -3630,7 +3637,8 @@ where
 
     #[allow(
         clippy::too_many_arguments,
-        reason = "the terminal record takes the exact authorization identity and policy material already in scope; bundling it would create a second partial invocation type"
+        reason = "the terminal record takes the exact authorization identity and policy material \
+                  already in scope; bundling it would create a second partial invocation type"
     )]
     async fn fail_authorized_before_provider(
         &self,
