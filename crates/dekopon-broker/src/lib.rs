@@ -68,7 +68,6 @@ use dekopon_storage_host::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
-use tokio::sync::Mutex;
 use tracing::Instrument as _;
 
 const MAX_POLICY_REVISION_BYTES: usize = 256;
@@ -2111,7 +2110,7 @@ pub trait AuditLog: Send + Sync {
 #[derive(Debug)]
 pub struct InMemoryAuditLog {
     maximum: usize,
-    state: Mutex<Vec<AuditEvent>>,
+    state: std::sync::Mutex<Vec<AuditEvent>>,
 }
 
 impl InMemoryAuditLog {
@@ -2122,19 +2121,19 @@ impl InMemoryAuditLog {
         }
         Ok(Self {
             maximum,
-            state: Mutex::new(Vec::new()),
+            state: std::sync::Mutex::new(Vec::new()),
         })
     }
 
     /// Returns a snapshot in append order.
-    pub async fn records(&self) -> Vec<AuditEvent> {
-        self.state.lock().await.clone()
+    pub fn records(&self) -> Vec<AuditEvent> {
+        self.state.lock().expect("in-memory audit log").clone()
     }
 }
 
 impl AuditLog for InMemoryAuditLog {
     async fn append(&self, event: AuditEvent) -> Result<(), AuditError> {
-        let mut records = self.state.lock().await;
+        let mut records = self.state.lock().expect("in-memory audit log");
         if records.len() >= self.maximum {
             return Err(AuditError::Full {
                 maximum: self.maximum,

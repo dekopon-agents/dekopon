@@ -418,7 +418,7 @@ async fn every_inspection_refusal_names_its_class_and_its_subject() {
             "the wire answer is the same literal for every class ({agent_id})"
         );
 
-        let records = audit.records().await;
+        let records = audit.records();
         let decision = records
             .iter()
             .find_map(|record| match record {
