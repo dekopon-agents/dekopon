@@ -20,7 +20,12 @@ All notable changes to Dekopon are documented here. The format is based on
 - The local development transport bounds its queues and stops answering a caller that stops
   reading.
 - `clippy.toml` bans raw task, thread and unbounded-queue constructors and `Condvar`; production
-  uses carry a site `#[expect]` naming owner and bound. `AGENTS.md` gains a Concurrency section.
+  uses carry a site `#[expect]` naming owner and bound; two remain (the jq worker thread and the
+  progress policy task). `AGENTS.md` gains a Concurrency section.
+- `dekopon-process` joins its node in a `JoinSet` and no longer detaches a supervisor; dropping
+  `ProcessRun::execute` aborts the node. `execute` loses its `on_unobserved` argument, and
+  `dekopon-agent`'s `report_unobserved_command_run` and the `agent.command.unobserved` record are
+  removed: the one caller runs `execute` to completion, so they never fired.
 
 ### Fixed
 

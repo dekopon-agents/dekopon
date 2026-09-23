@@ -32,9 +32,9 @@ pub(super) fn hydrate_images(
 /// one multipart body, uses [`Self::read_all`] and gets the leases back rather than keeping a
 /// second copy against a retry that usually never happens.
 ///
-/// Every lease leaves the async worker either way: each read is its own blocking task, and whatever
-/// is left when this is dropped — a refused upload, an early return, a retry that never came — is
-/// disposed on one too.
+/// Each read is its own blocking task. Whatever is left when this is dropped — a refused upload, an
+/// early return, a retry that never came — is disposed inline: closing a scratch file and removing
+/// its directory is two syscalls, not work worth a thread hop.
 #[derive(Default)]
 pub(super) struct ImageQueue {
     images: VecDeque<GeneratedImage>,
@@ -126,31 +126,6 @@ impl ImageQueue {
         let (taken, read) = join(task.await)?;
         self.images = taken;
         read.map_err(TransportError::from)
-    }
-}
-
-impl Drop for ImageQueue {
-    /// Disposing a lease unlinks a file, which is the blocking work reading one is.
-    fn drop(&mut self) {
-        let remaining = std::mem::take(&mut self.images);
-        if remaining.is_empty() {
-            return;
-        }
-        // Outside a runtime there is no blocking pool to move them to, and disposing them here is
-        // better than leaking the scratch files: `remaining` drops either way.
-        let Ok(handle) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let span = tracing::Span::current();
-        let dispatch = tracing::dispatcher::get_default(Clone::clone);
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "a destructor has no caller to await; the job only unlinks the scratch images \
-                      it owns"
-        )]
-        drop(handle.spawn_blocking(move || {
-            tracing::dispatcher::with_default(&dispatch, || span.in_scope(move || drop(remaining)));
-        }));
     }
 }
 
@@ -409,9 +384,9 @@ mod tests {
         assert!(queue.is_empty());
     }
 
-    /// A refused upload abandons the rest of the reply, and those leases still leave the worker.
+    /// A refused upload abandons the rest of the reply, and those leases are disposed with it.
     #[tokio::test]
-    async fn a_queue_dropped_part_way_disposes_what_is_left_off_the_async_worker() {
+    async fn a_queue_dropped_part_way_disposes_what_is_left() {
         let threads = SpoolThreads::default();
         let _guard = tracing_subscriber::registry()
             .with(threads.clone())
@@ -422,22 +397,21 @@ mod tests {
         drop(queue.next().await.unwrap().unwrap());
         drop(queue);
 
-        // Disposal is a blocking task; a bounded wait makes a broken boundary fail rather than
-        // hang the suite.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while threads.0.lock().unwrap().len() < 3 && std::time::Instant::now() < deadline {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
         let spool_threads = threads.0.lock().unwrap();
         assert_eq!(
             spool_threads.len(),
             3,
             "one read and both final-owner cleanups"
         );
-        assert!(
-            spool_threads
-                .iter()
-                .all(|id| *id != std::thread::current().id())
+        assert_ne!(
+            spool_threads[0],
+            std::thread::current().id(),
+            "reads stay off the worker"
+        );
+        assert_eq!(
+            spool_threads[2],
+            std::thread::current().id(),
+            "the rest drops inline"
         );
     }
 

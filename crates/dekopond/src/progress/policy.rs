@@ -23,7 +23,6 @@ use dekopon_agent::{BudgetLimit, CancelSource, ProgressEvent};
 use dekopon_model::ModelText;
 use tokio::{
     sync::{Notify, mpsc, oneshot, watch},
-    task::JoinHandle,
     time::Instant,
 };
 
@@ -188,7 +187,6 @@ pub(crate) struct ProgressInputs {
 pub(crate) struct ProgressPolicy {
     coordination: Arc<Coordination>,
     terminal: Option<oneshot::Sender<TerminalRequest>>,
-    worker: Option<JoinHandle<()>>,
 }
 
 impl ProgressPolicy {
@@ -212,18 +210,18 @@ impl ProgressPolicy {
         // rather than opening an orphan the operator cannot tie to a conversation.
         #[expect(
             clippy::disallowed_methods,
-            reason = "owner: ProgressPolicy holds the handle; finish_in_background detaches only \
-                      post-answer cleanup, bounded by EVENT_QUEUE and each driver call's timeout"
+            reason = "detached on purpose: post-answer cleanup outlives the session so its \
+                      admission permit frees now; bounded by EVENT_QUEUE and each driver call's \
+                      timeout, and it ends once the terminal request and event queue are done"
         )]
-        let worker = tokio::spawn(tracing::Instrument::instrument(
+        drop(tokio::spawn(tracing::Instrument::instrument(
             run(surface, events_rx, text_rx, terminal_rx, cancellation),
             tracing::Span::current(),
-        ));
+        )));
         (
             Self {
                 coordination,
                 terminal: Some(terminal_tx),
-                worker: Some(worker),
             },
             adapter,
         )
@@ -249,13 +247,6 @@ impl ProgressPolicy {
             return false;
         }
         wait.await.unwrap_or(false)
-    }
-
-    /// Lets service-specific cleanup follow terminal delivery without holding admission.
-    pub(crate) fn finish_in_background(&mut self) {
-        // Dropping a Tokio JoinHandle detaches rather than aborts: the task owns its own bounded
-        // calls and exits after cleanup while the answered session releases its permit now.
-        self.worker.take();
     }
 }
 

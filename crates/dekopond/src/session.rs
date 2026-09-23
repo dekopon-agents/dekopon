@@ -1242,7 +1242,6 @@ async fn session(
                     notice,
                 )))
                 .await;
-            progress.finish_in_background();
             if replied && let Some(notice) = notice {
                 _active_registration
                     .late_photos
@@ -1284,7 +1283,6 @@ async fn session(
         // about a session that ended. The unanswered in-process turn was committed above so a
         // later continuation still sees what the person said.
         progress.terminal(Terminal::Silent).await;
-        progress.finish_in_background();
         return "declined";
     }
 
@@ -1344,7 +1342,6 @@ async fn session(
         (Ok(_), false) => AssetDeliveryDisposition::Failed,
         (Err(_), _) => AssetDeliveryDisposition::Abandoned,
     });
-    progress.finish_in_background();
     if delivered {
         if let Some(notice) = late_notice {
             _active_registration
@@ -1376,7 +1373,6 @@ async fn stopped(
     tracing::info!(event = "gateway_session_cancelled");
     let by = cancellation.source().unwrap_or(CancelSource::Operator);
     progress.terminal(Terminal::Cancelled { by }).await;
-    progress.finish_in_background();
     "cancelled"
 }
 

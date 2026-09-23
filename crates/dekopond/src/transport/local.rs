@@ -16,7 +16,9 @@
 
 use std::{
     collections::BTreeMap,
-    fs, io,
+    fs,
+    future::Future,
+    io,
     os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     sync::{
@@ -38,6 +40,7 @@ use tokio::{
     io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader},
     net::{UnixListener, UnixStream},
     sync::{mpsc, oneshot},
+    task::JoinSet,
 };
 
 use crate::{
@@ -116,6 +119,8 @@ pub(crate) struct LocalTransport {
     sender: mpsc::Sender<TransportEvent>,
     driver: Arc<LocalDriver>,
     connections: AtomicU64,
+    /// One task per open connection; dropping the transport aborts them.
+    serving: JoinSet<()>,
     boot_nonce: Option<String>,
     /// `liveness.mode: native` — an inbound line carries coordinates for transient signals.
     ///
@@ -138,13 +143,14 @@ impl LocalTransport {
             sender,
             driver: Arc::new(LocalDriver::default()),
             connections: AtomicU64::new(1),
+            serving: JoinSet::new(),
             boot_nonce: None,
             native: liveness.mode == LivenessMode::Native,
         }
     }
 
     /// Serves one connection: JSON lines in, JSON lines out, until the caller hangs up.
-    fn serve(&self, stream: UnixStream) {
+    fn serve(&self, stream: UnixStream) -> impl Future<Output = ()> + Send + 'static {
         let connection = self.connections.fetch_add(1, Ordering::Relaxed);
         let (outbound_send, mut outbound_receive) = mpsc::channel::<LocalWrite>(OUTBOUND_BUFFER);
         self.driver.register(connection, outbound_send);
@@ -154,22 +160,16 @@ impl LocalTransport {
         let boot_nonce = self.boot_nonce.clone().unwrap_or_default();
         let inbound = self.sender.clone();
         let driver = Arc::clone(&self.driver);
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "owner-only development socket: the connection task ends when its caller \
-                      hangs up or the gateway's inbound queue closes; not deployed"
-        )]
-        tokio::spawn(async move {
+        async move {
             let (reader, mut writer) = stream.into_split();
             // `Take` re-armed per line rather than per connection: a line ceiling has to bound the
             // buffer *before* it is allocated, and a connection ceiling would end a long dev
             // session after enough short requests.
             let mut reader = BufReader::new(reader).take(MAX_LINE_BYTES);
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "owner: the connection task above aborts this writer when its reader ends"
-            )]
-            let writes = tokio::spawn(async move {
+            // Its own task rather than a `select!` arm: a stop line's acknowledgment is itself a
+            // write, awaited inside the reader. Dropping the set when the reader ends aborts it.
+            let mut writes = JoinSet::new();
+            writes.spawn(async move {
                 while let Some(reply) = outbound_receive.recv().await {
                     let accepted =
                         writer.write_all(&reply.line).await.is_ok() && writer.flush().await.is_ok();
@@ -320,8 +320,7 @@ impl LocalTransport {
                 }
             }
             driver.forget(connection);
-            writes.abort();
-        });
+        }
     }
 }
 
@@ -364,8 +363,10 @@ impl ChatTransport for LocalTransport {
                 tokio::select! {
                     accepted = listener.accept() => {
                         let (stream, _) = accepted.map_err(TransportError::Io)?;
-                        self.serve(stream);
+                        let connection = self.serve(stream);
+                        self.serving.spawn(connection);
                     }
+                    Some(_) = self.serving.join_next(), if !self.serving.is_empty() => {}
                     event = receiver.recv() => {
                         return event.ok_or(TransportError::Closed);
                     }
