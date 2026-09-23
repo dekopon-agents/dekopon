@@ -1,10 +1,7 @@
 //! Wasmtime adapters for the two exact storage interfaces.
 
 use std::{
-    sync::{
-        Arc, Condvar, Mutex,
-        atomic::{AtomicUsize, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
@@ -24,49 +21,11 @@ pub struct FileResource {
 }
 
 #[derive(Debug)]
-struct ActiveJobs {
-    count: AtomicUsize,
-    mutex: Mutex<()>,
-    drained: Condvar,
-}
-
-impl ActiveJobs {
-    fn new() -> Self {
-        Self {
-            count: AtomicUsize::new(0),
-            mutex: Mutex::new(()),
-            drained: Condvar::new(),
-        }
-    }
-    fn enter(self: &Arc<Self>) -> JobGuard {
-        self.count.fetch_add(1, Ordering::AcqRel);
-        JobGuard(Arc::clone(self))
-    }
-    fn wait(&self) {
-        let mut guard = self.mutex.lock().expect("storage job drain");
-        while self.count.load(Ordering::Acquire) != 0 {
-            let (next, _) = self
-                .drained
-                .wait_timeout(guard, Duration::from_millis(25))
-                .expect("storage job drain");
-            guard = next;
-        }
-    }
-}
-
-struct JobGuard(Arc<ActiveJobs>);
-impl Drop for JobGuard {
-    fn drop(&mut self) {
-        if self.0.count.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.0.drained.notify_all();
-        }
-    }
-}
-
-#[derive(Debug)]
 pub(crate) struct ActiveStorage {
+    /// Every native storage effect runs holding this lock, so `finish` taking it is the drain: a
+    /// job orphaned by a cancelled host call either holds it (and `finish` waits, inside its
+    /// deadline) or has not started (and finds the transaction gone).
     transaction: Arc<Mutex<Option<StorageHandle>>>,
-    jobs: Arc<ActiveJobs>,
     finalization_budget: Duration,
 }
 
@@ -92,7 +51,6 @@ impl StorageState {
         Self::Active {
             active: ActiveStorage {
                 transaction: Arc::new(Mutex::new(Some(transaction))),
-                jobs: Arc::new(ActiveJobs::new()),
                 finalization_budget,
             },
             violation: None,
@@ -126,9 +84,7 @@ impl StorageState {
             Self::Active { active, .. } => active,
         };
         let transaction = Arc::clone(&active.transaction);
-        let job = active.jobs.enter();
         let result = match tokio::task::spawn_blocking(move || {
-            let _job = job;
             let mut slot = transaction.lock().expect("storage transaction");
             let transaction = slot
                 .as_mut()
@@ -167,7 +123,6 @@ impl StorageState {
         else {
             return Ok(None);
         };
-        let active_jobs = Arc::clone(&active.jobs);
         let transaction = Arc::clone(&active.transaction);
         let rejected = violation.is_some();
         let deadline = Instant::now()
@@ -180,7 +135,6 @@ impl StorageState {
                       location; `call` above classes the same failure as `Io` for the same reason"
         )]
         let finished = tokio::task::spawn_blocking(move || {
-            active_jobs.wait();
             let transaction = transaction
                 .lock()
                 .expect("storage transaction")
@@ -642,10 +596,12 @@ mod tests {
             .jsonl_append("turns.jsonl", 0, br#"{"provisional":true}"#)
             .expect("provisional append");
         let mut state = StorageState::active(transaction);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(5),
-                state.call(|_transaction| {
+                state.call(move |_transaction| {
+                    started_tx.send(()).expect("test is listening");
                     std::thread::sleep(Duration::from_millis(100));
                     Ok(())
                 }),
@@ -654,6 +610,9 @@ mod tests {
             .is_err(),
             "the host-call future should be cancelled while its blocking job drains"
         );
+        started_rx
+            .recv()
+            .expect("the orphaned job holds the transaction");
         let started = Instant::now();
         assert!(matches!(
             state.finish(true, None).await,

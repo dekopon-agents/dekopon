@@ -43,7 +43,8 @@ use std::{
     fmt,
     fs::File,
     path::{Component, Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, MutexGuard, TryLockError},
+    time::{Duration, Instant},
 };
 
 use dekopon_capability::{StorageAccess, StorageInterface, StorageNamespace};
@@ -70,7 +71,7 @@ use key::{
     DOMAIN_RECORD_ID, commitment, random_bytes, token,
 };
 use layout::{Layout, scan_root_usage, scan_usage, usage_with_directory_entry};
-use namespace::{Namespace, NamespacePlan, Reset};
+use namespace::{Namespace, NamespacePlan, Reset, deadline_after};
 use quota::QuotaLedger;
 
 /// Durable chat-memory continuity behavior.
@@ -455,10 +456,12 @@ impl StorageHost {
                     .collect::<Vec<_>>()
             )
         );
+        // One deadline for every wait this grant makes: the in-process housekeeping lock, then the
+        // base lease in `prepare` or `apply`. Contenders queue behind the base lease held for a
+        // whole invocation, so per-wait timeouts would let the k-th one wait k times over.
+        let deadline = deadline_after(self.inner.limits.lock_timeout_ms)?;
         let namespace_lock = namespace_lock(&self.inner.namespace_locks, &base);
-        let _namespace = namespace_lock
-            .lock()
-            .expect("storage namespace housekeeping lock");
+        let _namespace = lock_before(&namespace_lock, deadline)?;
         let mut namespace_reservation = Some({
             // The observation lock is dropped before any base lease wait, preserving concurrency between
             // distinct namespaces.
@@ -484,7 +487,7 @@ impl StorageHost {
         let mut plan = NamespacePlan::prepare(
             self.inner.layout.namespaces(),
             &request,
-            self.inner.limits.lock_timeout_ms,
+            deadline,
             self.inner.limits.startup_max_entries,
         )?;
         let reset = plan.take_reset();
@@ -511,10 +514,7 @@ impl StorageHost {
                 .namespaces()
                 .entries_bounded(self.inner.limits.startup_max_entries)?,
         );
-        let namespace = match plan.apply(
-            self.inner.layout.namespaces(),
-            self.inner.limits.lock_timeout_ms,
-        ) {
+        let namespace = match plan.apply(self.inner.layout.namespaces(), deadline) {
             Ok(namespace) => namespace,
             Err(error) => {
                 // `apply` may have completed mkdir/rename before a later open or sync failed. A
@@ -602,6 +602,26 @@ impl StorageHost {
     #[must_use]
     pub fn limits(&self) -> &StorageLimits {
         &self.inner.limits
+    }
+}
+
+/// Takes a namespace's housekeeping lock, polling like [`namespace::lock_exclusive`] so the wait
+/// counts against the grant's deadline instead of parking a blocking thread without one.
+fn lock_before(
+    lock: &Mutex<()>,
+    deadline: Instant,
+) -> Result<MutexGuard<'_, ()>, StorageHostError> {
+    loop {
+        match lock.try_lock() {
+            Ok(guard) => return Ok(guard),
+            Err(TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(TryLockError::WouldBlock) => return Err(StorageHostError::Timeout),
+            Err(TryLockError::Poisoned(_)) => {
+                panic!("storage namespace housekeeping lock poisoned")
+            }
+        }
     }
 }
 
