@@ -18,7 +18,7 @@ class ClassifyCiChangesTests(unittest.TestCase):
             "examples/catalog/skills/pull-request-review/references/risk-checklist.md",
         ):
             with self.subTest(path=path):
-                self.assert_selected([path], "run_rust", "run_otel", "run_cli_install", "run_docs")
+                self.assert_selected([path], "run_rust", "run_otel", "run_docs")
 
     def test_prose_selects_only_the_documentation_lane(self) -> None:
         self.assert_selected(["docs/design.md", "README.md"], "run_docs")
@@ -33,21 +33,11 @@ class ClassifyCiChangesTests(unittest.TestCase):
             "run_package",
         )
 
-    def test_workspace_source_preserves_transitive_cli_install_coverage(self) -> None:
+    def test_workspace_source_preserves_transitive_otel_coverage(self) -> None:
         self.assert_selected(
             ["crates/dekopon-policy/src/lib.rs"],
             "run_rust",
             "run_otel",
-            "run_cli_install",
-            "run_docs",
-        )
-
-    def test_direct_binary_source_keeps_path_installation_coverage(self) -> None:
-        self.assert_selected(
-            ["crates/dekopond/src/main.rs"],
-            "run_rust",
-            "run_otel",
-            "run_cli_install",
             "run_docs",
         )
 
@@ -57,7 +47,6 @@ class ClassifyCiChangesTests(unittest.TestCase):
             "run_rust",
             "run_otel",
             "run_package",
-            "run_cli_install",
             "run_dependencies",
             "run_docs",
         )
@@ -68,7 +57,6 @@ class ClassifyCiChangesTests(unittest.TestCase):
             "run_rust",
             "run_otel",
             "run_package",
-            "run_cli_install",
             "run_dependencies",
             "run_docs",
         )
@@ -104,7 +92,6 @@ class ClassifyCiChangesTests(unittest.TestCase):
                     [path],
                     "run_rust",
                     "run_otel",
-                    "run_cli_install",
                     "run_docs",
                 )
 
@@ -113,7 +100,6 @@ class ClassifyCiChangesTests(unittest.TestCase):
             ["examples/otel-traces/smoke-test.sh"],
             "run_rust",
             "run_otel",
-            "run_cli_install",
             "run_docs",
         )
 
@@ -136,7 +122,6 @@ class ClassifyCiChangesTests(unittest.TestCase):
             ["crates/dekopon-policy/src/lib.rs", "charts/dekopon/values.yaml"],
             "run_rust",
             "run_otel",
-            "run_cli_install",
             "run_docs",
             "run_chart",
         )

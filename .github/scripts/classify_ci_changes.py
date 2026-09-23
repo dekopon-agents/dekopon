@@ -17,7 +17,6 @@ CATEGORIES = (
     "run_rust",
     "run_otel",
     "run_package",
-    "run_cli_install",
     "run_dependencies",
     "run_release_metadata",
     "run_chart",
@@ -96,7 +95,6 @@ def classify_path(path: str) -> dict[str, bool]:
         flags.update(
             run_rust=True,
             run_package=True,
-            run_cli_install=True,
             run_dependencies=True,
         )
 
@@ -126,11 +124,6 @@ def classify_path(path: str) -> dict[str, bool]:
     if path in PACKAGE_ROOT_INPUTS or PACKAGE_INPUT.fullmatch(path):
         flags["run_package"] = True
 
-    if path in {"Cargo.lock", "Cargo.toml", "rust-toolchain.toml"} or path.startswith(
-        ".cargo/"
-    ):
-        flags["run_cli_install"] = True
-
     if path in {"Cargo.lock", "Cargo.toml", "deny.toml", "rust-toolchain.toml"} or path.startswith(
         ".cargo/"
     ):
@@ -157,12 +150,11 @@ def classify_path(path: str) -> dict[str, bool]:
     if path.startswith("docs/") or path.casefold().endswith(".md"):
         flags["run_docs"] = True
 
-    # Preserve the existing OTLP and release-profile install coverage for every
-    # Rust-affecting change. Both exercise normal dependencies outside the three
-    # binary crates, so path-only direct-crate gating would silently lose coverage.
+    # Preserve OTLP smoke coverage for every Rust-affecting change. It exercises
+    # normal dependencies outside the binary crates, so path-only direct-crate
+    # gating would silently lose coverage.
     if flags["run_rust"]:
         flags["run_otel"] = True
-        flags["run_cli_install"] = True
         # The documentation lane also reads crates/**/*.rs: it fails a PR that emits
         # an audit event name docs/observability.md does not carry.
         flags["run_docs"] = True

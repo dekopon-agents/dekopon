@@ -231,8 +231,13 @@ fn request(index: usize, capability_id: &str) -> InvocationRequest {
 /// engine directly, so the assertion covers the whole decision path.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_workflow_decision_table_holds_end_to_end() {
+    // Each boot compiles the provider; rows only differ in the mapped principal.
+    let mut brokers = BTreeMap::new();
     for (index, row) in TABLE.iter().enumerate() {
-        let broker = broker(row.principal).await;
+        if !brokers.contains_key(row.principal) {
+            brokers.insert(row.principal, broker(row.principal).await);
+        }
+        let broker = &brokers[row.principal];
         let request = request(index, row.capability);
         let result = match row.via {
             None => {

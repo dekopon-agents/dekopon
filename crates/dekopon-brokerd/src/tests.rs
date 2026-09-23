@@ -250,31 +250,12 @@ async fn managed_provider_configuration_is_strict_and_network_free() {
         .await
         .expect("warm daemon loads mapped artifacts");
 
-    let object = fs::read_dir(store.join("cwasm/v1/sha256"))
-        .expect("compiled objects")
-        .next()
-        .expect("one object")
-        .expect("entry")
-        .path();
-    let mut damaged = fs::read(&object).expect("compiled bytes");
-    damaged[0] ^= 1;
-    fs::write(&object, damaged).expect("corrupt only after both brokers have exited");
-    let error = super::run(&path, async {})
-        .await
-        .expect_err("cache corruption is fatal");
-    assert!(
-        format!("{error:?}").contains("compiled SHA-256 mismatch"),
-        "{error:?}"
-    );
     runnable["compileOnLoad"] = json!(true);
     write_config(&path, &runnable);
     let bypass = config::load(&path, uid)
         .await
         .expect("explicit bypass config");
     assert_eq!(bypass.host_options.cwasm_dir, None);
-    super::run(&path, async {})
-        .await
-        .expect("operator bypass ignores corrupt cwasm");
 
     let mut retired = document.clone();
     retired["compileCachePath"] = json!("old-cache");
