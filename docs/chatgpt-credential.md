@@ -31,8 +31,9 @@ concurrent turn runs on a credential snapshot taken before the lock, and an exte
 second daemon on the same host can open the same file; two arriving near the refresh margin would
 otherwise both present the same refresh token, and OAuth reuse detection can revoke the entire
 token family rather than just failing the second call. The same adoption runs before the forced
-refresh a `401` triggers. If the lock cannot be taken at all — a read-only directory, a filesystem
-without advisory locking — the refresh proceeds uncoordinated and logs
+refresh a `401` triggers. The turn is resent once after that pre-body refresh, within the original
+total deadline. If the lock cannot be taken at all — a read-only directory, a filesystem without
+advisory locking — the refresh proceeds uncoordinated and logs
 `chatgpt_credential_lock_unavailable`, because no turn at all is worse than an uncoordinated one.
 
 **The rotated value should be persisted, and the turn continues either way.** The refresh assigns

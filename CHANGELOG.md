@@ -7,6 +7,23 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- `kind: openrouter` models in `dekopond`: OpenRouter streaming inference with strict authored
+  generation, reasoning, routing and optional explicit system-prefix cache controls, native
+  reasoning replay and `session_id` sticky routing.
+- Reusable async model clients, per-session blocking bridges, `with_loopback_endpoint` test
+  overrides and a `compare_models` embedding example.
+- Model exchange timing, identity, requested controls, cache-write usage and bounded failure context
+  in telemetry, without credentials, affinity identifiers or private reasoning.
+
+### Changed
+
+- Move Codex and OpenAI-compatible generation onto pooled cancellable async HTTP; silent reads
+  observe Stop, and each model call has one total deadline across preparation, send and read.
+- Replace Rust `ModelError` with typed `InferenceError`; `Interrupted` becomes `Cancelled`.
+- Treat chat-completions `content_filter` finishes as provider failures rather than successful text.
+
 ### Fixed
 
 - Mark each gateway agent session with canonical OpenTelemetry GenAI agent name and invocation

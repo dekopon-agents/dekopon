@@ -1,0 +1,8 @@
+: OPENROUTER PROCESSING
+data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}
+
+data: {"choices":[],"usage":{"prompt_tokens":120,"completion_tokens":2,"total_tokens":122}}
+
+data: [DONE]
+
+: fixture end

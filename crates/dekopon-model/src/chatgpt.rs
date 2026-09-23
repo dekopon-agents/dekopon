@@ -1,17 +1,14 @@
-//! ChatGPT/Codex subscription authentication and Responses transport.
+//! ChatGPT subscription credentials and device authorization.
 //!
 //! The implementation uses OpenAI's public Codex device authorization flow. Credentials are
 //! isolated in Dekopon's own auth file; credentials owned by other clients are never imported.
 
 use std::{
-    borrow::Cow,
-    collections::BTreeMap,
     env,
     ffi::OsString,
     fmt,
     fs::{self, File, OpenOptions},
-    io::{self, Read, Write},
-    ops::ControlFlow,
+    io::{self, Write},
     path::{Path, PathBuf},
     sync::Mutex,
     thread,
@@ -25,19 +22,11 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use ureq::Agent;
 
-use crate::{
-    model::{
-        AssistantTurn, ChatModel, CompletionOptions, ContentPart, DataUrl, JSON_CONTENT_TYPE,
-        ModelError, ModelFunctionCall, ModelMessage, ModelTool, ModelToolCall, ModelUsage,
-        compact_json_body, read_error_body, sanitize_diagnostic,
-    },
-    sse::{MAX_STREAM_BYTES, SseError, SseEvent, SseReader},
-    stream::{ModelText, TurnEvent},
-};
+use crate::model::{MAX_ERROR_BODY_BYTES, sanitize_diagnostic};
+use std::io::Read as _;
 
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const AUTH_BASE_URL: &str = "https://auth.openai.com";
-const RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
 const DEVICE_LOGIN_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const REFRESH_MARGIN: Duration = Duration::from_secs(60);
@@ -108,7 +97,7 @@ pub struct ResolvedCredential {
 /// This is the single definition of "use the credential at this path": take the cross-process lock,
 /// adopt a newer record another process wrote, refresh when the access token is inside its margin,
 /// persist the rotated record atomically, and keep going on the in-memory token when that write
-/// fails. [`ChatGptCodexModel`] below is one consumer and the broker's `chatgptSubscription`
+/// fails. [`crate::codex::CodexClient`] is one consumer and the broker's `chatgptSubscription`
 /// credential kind is the other, and they must not diverge: the refresh token rotates, so a second
 /// implementation of this sequence is a second way to brick the credential.
 ///
@@ -149,7 +138,7 @@ impl CredentialFile {
         Self::with_endpoints(auth_path, timeout, ChatGptEndpoints::production())
     }
 
-    fn with_endpoints(
+    pub(crate) fn with_endpoints(
         auth_path: &Path,
         timeout: Duration,
         endpoints: ChatGptEndpoints,
@@ -204,13 +193,37 @@ impl CredentialFile {
     /// exists.
     pub fn current(&self) -> Result<ResolvedCredential, ChatGptError> {
         let mut credentials = self.snapshot();
-        let refresh = self.refresh_if_needed(&mut credentials, false)?;
-        if refresh.is_some() {
-            self.install(&credentials);
-        }
+        let refresh = self.refresh_if_needed(&mut credentials, None)?;
         Ok(ResolvedCredential {
             access: credentials.access.clone(),
             account_id: credentials.account_id.clone(),
+            refresh,
+        })
+    }
+
+    pub(crate) fn unrefreshed(&self) -> Result<ResolvedCredential, ChatGptError> {
+        let credentials = self.snapshot();
+        if needs_refresh(&credentials)? {
+            return Err(ChatGptError::Configuration(
+                "credential needs a refresh, which a loopback endpoint never performs".to_owned(),
+            ));
+        }
+        Ok(ResolvedCredential {
+            access: credentials.access,
+            account_id: credentials.account_id,
+            refresh: None,
+        })
+    }
+
+    pub(crate) fn force_refresh(
+        &self,
+        rejected: &Redacted<String>,
+    ) -> Result<ResolvedCredential, ChatGptError> {
+        let mut credentials = self.snapshot();
+        let refresh = self.refresh_if_needed(&mut credentials, Some(rejected))?;
+        Ok(ResolvedCredential {
+            access: credentials.access,
+            account_id: credentials.account_id,
             refresh,
         })
     }
@@ -219,7 +232,7 @@ impl CredentialFile {
     ///
     /// A consumer's request runs against this snapshot. Holding the guard through a streaming model
     /// call or an authorized provider invocation instead would serialize every caller on one
-    /// request the moment a client is shared, which `CompletionOptions` already names as the
+    /// request the moment a client is shared, which request-scoped completion options already name as the
     /// obvious next optimization.
     fn snapshot(&self) -> ChatGptCredentials {
         self.credentials
@@ -230,16 +243,14 @@ impl CredentialFile {
 
     /// Publishes a rotated credential for the next caller.
     ///
-    /// A concurrent caller may already have installed a newer one, and the older of the two must
-    /// not win: its refresh token is the invalidated predecessor.
+    /// Called under the refresh lock: publication must finish before another caller can rotate
+    /// or adopt. Expiry alone does not order rotations with different token lifetimes.
     fn install(&self, credentials: &ChatGptCredentials) {
         let mut stored = self
             .credentials
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if credentials.expires_at >= stored.expires_at {
-            *stored = credentials.clone();
-        }
+        *stored = credentials.clone();
     }
 
     /// Brings `credentials` up to date, reporting what it took when anything happened.
@@ -252,14 +263,14 @@ impl CredentialFile {
     fn refresh_if_needed(
         &self,
         credentials: &mut ChatGptCredentials,
-        force: bool,
+        rejected: Option<&Redacted<String>>,
     ) -> Result<Option<RefreshOutcome>, ChatGptError> {
-        if !force && !needs_refresh(credentials)? {
+        if rejected.is_none() && !needs_refresh(credentials)? {
             return Ok(None);
         }
         let span = tracing::info_span!(
             "chatgpt.refresh",
-            forced = force,
+            forced = rejected.is_some(),
             outcome = tracing::field::Empty,
             duration_ms = tracing::field::Empty,
             credential.expires_at = tracing::field::Empty,
@@ -268,8 +279,24 @@ impl CredentialFile {
         let started = Instant::now();
 
         let _lock = CredentialLock::acquire(&self.path);
-        let adopted = adopt_stored_credentials(&self.path, credentials);
-        if adopted && !needs_refresh(credentials)? {
+        // Re-read under the refresh lock: another session may have rotated while this one
+        // awaited its 401, including a rotation that could not be persisted.
+        *credentials = self.snapshot();
+        let installed_replacement = rejected
+            .is_some_and(|token| credentials.access.expose() != token.expose())
+            && !needs_refresh(credentials)?;
+        let adopted = !installed_replacement && adopt_stored_credentials(&self.path, credentials);
+        if let Some(rejected) = rejected
+            && credentials.access.expose() == rejected.expose()
+            && let Ok(stored) = load_credentials(&self.path)
+            && stored.access.expose() != rejected.expose()
+            && !needs_refresh(&stored)?
+        {
+            *credentials = stored;
+        }
+        let replaced = rejected.is_none_or(|token| credentials.access.expose() != token.expose());
+        if (adopted || replaced) && !needs_refresh(credentials)? {
+            self.install(credentials);
             record_refresh(
                 &span,
                 RefreshOutcome::Adopted.label(),
@@ -279,15 +306,14 @@ impl CredentialFile {
             return Ok(Some(RefreshOutcome::Adopted));
         }
 
-        let refreshed =
-            match refresh_credentials(&self.agent, &self.endpoints, credentials.refresh.expose()) {
-                Ok(refreshed) => refreshed,
-                Err(error) => {
-                    span.record("outcome", "failed");
-                    span.record("duration_ms", elapsed_ms(started));
-                    return Err(error);
-                }
-            };
+        let refreshed = match refresh_credentials(&self.agent, &self.endpoints, credentials) {
+            Ok(refreshed) => refreshed,
+            Err(error) => {
+                span.record("outcome", "failed");
+                span.record("duration_ms", elapsed_ms(started));
+                return Err(error);
+            }
+        };
         *credentials = refreshed;
         // The provider has already rotated, so the only credential that still works is the one in
         // memory. Failing the turn here would strand it and leave the invalidated predecessor on
@@ -306,147 +332,10 @@ impl CredentialFile {
                 RefreshOutcome::RotatedUnsaved
             }
         };
+        // Publish before releasing the refresh lock, including RotatedUnsaved credentials.
+        self.install(credentials);
         record_refresh(&span, outcome.label(), started, credentials.expires_at);
         Ok(Some(outcome))
-    }
-}
-
-/// ChatGPT subscription model backed by OpenAI's Codex Responses endpoint.
-pub struct ChatGptCodexModel {
-    model: String,
-    credential: CredentialFile,
-}
-
-impl ChatGptCodexModel {
-    /// Loads Dekopon's own ChatGPT credentials and creates a bounded client.
-    pub fn new(
-        model: impl Into<String>,
-        auth_path: Option<&Path>,
-        timeout: Duration,
-    ) -> Result<Self, ChatGptError> {
-        Self::with_endpoints(model, auth_path, timeout, ChatGptEndpoints::production())
-    }
-
-    fn with_endpoints(
-        model: impl Into<String>,
-        auth_path: Option<&Path>,
-        timeout: Duration,
-        endpoints: ChatGptEndpoints,
-    ) -> Result<Self, ChatGptError> {
-        let model = model.into();
-        if model.trim().is_empty() {
-            return Err(ChatGptError::Configuration(
-                "model name must not be empty".to_owned(),
-            ));
-        }
-        let auth_path = resolve_auth_path(auth_path)?;
-        let credential = CredentialFile::with_endpoints(&auth_path, timeout, endpoints)?;
-
-        Ok(Self { model, credential })
-    }
-
-    fn request_turn(
-        &self,
-        credentials: &ChatGptCredentials,
-        messages: &[ModelMessage],
-        tools: &[ModelTool],
-        options: &CompletionOptions,
-        on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
-    ) -> Result<AssistantTurn, ChatGptRequestError> {
-        let body = compact_json_body(&build_request_body(&self.model, messages, tools, options)?)
-            .map_err(|error| {
-            ChatGptRequestError::Transport(format!("request body: {error}"))
-        })?;
-        let response = self
-            .credential
-            .agent
-            .post(&self.credential.endpoints.responses)
-            .header(
-                "authorization",
-                &format!("Bearer {}", credentials.access.expose()),
-            )
-            .header("chatgpt-account-id", &credentials.account_id)
-            .header("originator", "dekopon")
-            .header(
-                "user-agent",
-                &format!("dekopon/{}", env!("CARGO_PKG_VERSION")),
-            )
-            .header("openai-beta", "responses=experimental")
-            .header("accept", "text/event-stream")
-            .content_type(JSON_CONTENT_TYPE)
-            .send(&body)
-            .map_err(|error| ChatGptRequestError::Transport(error.to_string()))?;
-
-        let status = response.status().as_u16();
-        if status == 401 {
-            return Err(ChatGptRequestError::Unauthorized);
-        }
-        if !(200..300).contains(&status) {
-            let detail = read_error_body(response);
-            return Err(ChatGptRequestError::Status { status, detail });
-        }
-
-        parse_sse(response.into_parts().1.into_reader(), on_event).map_err(|error| match error {
-            ChatGptError::Interrupted => ChatGptRequestError::Interrupted,
-            other => ChatGptRequestError::Protocol(other.to_string()),
-        })
-    }
-}
-
-impl ChatModel for ChatGptCodexModel {
-    fn complete(
-        &self,
-        messages: &[ModelMessage],
-        tools: &[ModelTool],
-        options: &CompletionOptions,
-        on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
-    ) -> Result<AssistantTurn, ModelError> {
-        let span = tracing::info_span!(
-            "model.complete",
-            model = %self.model,
-            model.backend = "chatgpt-subscription",
-            message.count = messages.len(),
-            tool.count = tools.len()
-        );
-        let _entered = span.enter();
-        let mut credentials = self.credential.snapshot();
-        if self
-            .credential
-            .refresh_if_needed(&mut credentials, false)
-            .map_err(|error| ModelError::Request(error.to_string()))?
-            .is_some()
-        {
-            self.credential.install(&credentials);
-        }
-
-        match self.request_turn(&credentials, messages, tools, options, &mut *on_event) {
-            Ok(turn) => Ok(turn),
-            Err(ChatGptRequestError::Unauthorized) => {
-                if self
-                    .credential
-                    .refresh_if_needed(&mut credentials, true)
-                    .map_err(|error| ModelError::Request(error.to_string()))?
-                    .is_some()
-                {
-                    self.credential.install(&credentials);
-                }
-                self.request_turn(&credentials, messages, tools, options, on_event)
-                    .map_err(turn_failure)
-            }
-            Err(error) => Err(turn_failure(error)),
-        }
-    }
-}
-
-/// Renders a failed turn as the caller's error.
-///
-/// An interruption keeps its own identity all the way out: the caller asked for it, and reporting
-/// it as a request failure would put a cancelled turn in the same bucket as a dead endpoint.
-fn turn_failure(error: ChatGptRequestError) -> ModelError {
-    match error {
-        ChatGptRequestError::Interrupted => ModelError::Interrupted,
-        ChatGptRequestError::Attachment(error) => ModelError::Attachment(error),
-        other => ModelError::Request(other.to_string()),
     }
 }
 
@@ -597,12 +486,13 @@ pub fn export_credentials(
 }
 
 #[derive(Clone)]
-struct ChatGptEndpoints {
+pub(crate) struct ChatGptEndpoints {
     device_code: String,
     device_token: String,
     token: String,
     verification_url: String,
-    responses: String,
+    #[cfg(test)]
+    pub(crate) responses: String,
 }
 
 impl ChatGptEndpoints {
@@ -612,12 +502,13 @@ impl ChatGptEndpoints {
             device_token: format!("{AUTH_BASE_URL}/api/accounts/deviceauth/token"),
             token: format!("{AUTH_BASE_URL}/oauth/token"),
             verification_url: format!("{AUTH_BASE_URL}/codex/device"),
-            responses: RESPONSES_URL.to_owned(),
+            #[cfg(test)]
+            responses: crate::codex::RESPONSES_URL.to_owned(),
         }
     }
 
     #[cfg(test)]
-    fn local(base: &str) -> Self {
+    pub(crate) fn local(base: &str) -> Self {
         let base = base.trim_end_matches('/');
         Self {
             device_code: format!("{base}/device-code"),
@@ -761,7 +652,7 @@ fn poll_device_login(
                 verifier: Redacted::new(response.code_verifier),
             });
         }
-        let body = read_error_body(response);
+        let body = read_error_body(response, crate::diagnostic::DiagnosticSecrets::default());
         let error_code = oauth_error_code(&body);
         if status == 403
             || status == 404
@@ -805,22 +696,26 @@ fn exchange_authorization(
             ("code_verifier", authorization.verifier.expose().as_str()),
             ("redirect_uri", DEVICE_REDIRECT_URI),
         ],
+        crate::diagnostic::DiagnosticSecrets::new(Some(&authorization.code))
+            .with_previous(&authorization.verifier),
     )
 }
 
 fn refresh_credentials(
     agent: &Agent,
     endpoints: &ChatGptEndpoints,
-    refresh: &str,
+    credentials: &ChatGptCredentials,
 ) -> Result<ChatGptCredentials, ChatGptError> {
     request_token(
         agent,
         &endpoints.token,
         [
             ("grant_type", "refresh_token"),
-            ("refresh_token", refresh),
+            ("refresh_token", credentials.refresh.expose().as_str()),
             ("client_id", CLIENT_ID),
         ],
+        crate::diagnostic::DiagnosticSecrets::new(Some(&credentials.refresh))
+            .with_previous(&credentials.access),
     )
 }
 
@@ -828,11 +723,12 @@ fn request_token<'a, const N: usize>(
     agent: &Agent,
     endpoint: &str,
     form: [(&'a str, &'a str); N],
+    secrets: crate::diagnostic::DiagnosticSecrets<'_>,
 ) -> Result<ChatGptCredentials, ChatGptError> {
     let mut response = agent
         .post(endpoint)
         .send_form(form)
-        .map_err(|error| ChatGptError::Request(error.to_string()))?;
+        .map_err(|error| ChatGptError::Request(secrets.sanitize(&error.to_string())))?;
     let status = response.status().as_u16();
     if !(200..300).contains(&status) {
         // The OAuth `error` code is the whole diagnostic here: `invalid_grant` says the refresh
@@ -841,18 +737,18 @@ fn request_token<'a, const N: usize>(
         // on it — the broker turns a revoked family into a permanent failure an operator must fix
         // and everything else into a transient one — and re-parsing a rendered string to do that
         // would be a second definition of the same fact.
-        let body = read_error_body(response);
-        let code = oauth_error_code(&body);
+        let body = read_error_body(response, secrets);
+        let code = oauth_error_code(&body).map(|value| secrets.sanitize(&value));
         return Err(ChatGptError::TokenRefused {
             status,
-            detail: oauth_detail(&body, code.as_deref()),
+            detail: secrets.sanitize(&oauth_detail(&body, code.as_deref())),
             code,
         });
     }
     let token = response
         .body_mut()
         .read_json::<TokenResponse>()
-        .map_err(|error| ChatGptError::Protocol(error.to_string()))?;
+        .map_err(|error| ChatGptError::Protocol(secrets.sanitize(&error.to_string())))?;
     if token.access_token.expose().is_empty() || token.refresh_token.expose().is_empty() {
         return Err(ChatGptError::Protocol(
             "token response omitted required credentials".to_owned(),
@@ -888,572 +784,39 @@ fn extract_account_id(access: &str) -> Result<String, ChatGptError> {
         .ok_or_else(|| ChatGptError::Protocol("access token omitted ChatGPT account ID".to_owned()))
 }
 
-/// One Responses-API request, borrowed from the turn it describes.
-///
-/// A typed body rather than `json!`: building the request as a `Value` copies every message into it
-/// through `to_value`, and on a turn carrying a screenshot that copy is the image again. Field
-/// order here is the wire order, which a `Value` body left to whether `serde_json`'s
-/// `preserve_order` feature was unified into the build.
-#[derive(Debug, Serialize)]
-struct ResponsesRequest<'a> {
-    model: &'a str,
-    store: bool,
-    stream: bool,
-    instructions: String,
-    input: Vec<ResponsesItem<'a>>,
-    tools: Vec<ResponsesTool<'a>>,
-    tool_choice: &'static str,
-    parallel_tool_calls: bool,
-    include: [&'static str; 1],
-    text: ResponsesText,
-    /// Serialized only when a key exists, so a keyless request carries no such field at all.
-    /// `prompt_cache_key` routes toward a warm prefix and authorizes nothing; the conversation
-    /// itself is already in `input` either way.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    prompt_cache_key: Option<&'a str>,
-}
-
-#[derive(Debug, Serialize)]
-struct ResponsesText {
-    verbosity: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-struct ResponsesTool<'a> {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    name: &'a str,
-    description: &'a str,
-    parameters: &'a Value,
-}
-
-/// One entry of the `input` array.
-///
-/// Untagged because a replayed item is whatever the API sent last turn and already carries its own
-/// `type`; the rest name theirs.
-#[derive(Debug, Serialize)]
-#[serde(untagged)]
-enum ResponsesItem<'a> {
-    Replay(&'a Value),
-    Message(ResponsesMessage<'a>),
-    FunctionCall(ResponsesFunctionCall<'a>),
-    FunctionCallOutput(ResponsesFunctionCallOutput<'a>),
-}
-
-#[derive(Debug, Serialize)]
-struct ResponsesMessage<'a> {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    role: &'static str,
-    content: Vec<ResponsesContent<'a>>,
-}
-
-#[derive(Debug, Serialize)]
-struct ResponsesFunctionCall<'a> {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    call_id: &'a str,
-    name: &'a str,
-    arguments: &'a str,
-}
-
-#[derive(Debug, Serialize)]
-struct ResponsesFunctionCallOutput<'a> {
-    #[serde(rename = "type")]
-    kind: &'static str,
-    call_id: &'a str,
-    output: &'a str,
-}
-
-/// One part of a message's `content` array.
-#[derive(Debug, Serialize)]
-#[serde(tag = "type")]
-enum ResponsesContent<'a> {
-    #[serde(rename = "input_text")]
-    InputText { text: Cow<'a, str> },
-    #[serde(rename = "input_image")]
-    InputImage { image_url: DataUrl<'a> },
-    #[serde(rename = "input_file")]
-    InputFile {
-        filename: &'a str,
-        file_data: DataUrl<'a>,
-    },
-    #[serde(rename = "output_text")]
-    OutputText {
-        text: &'a str,
-        /// Always empty, and always present: the API requires the key on an assistant message.
-        annotations: [Value; 0],
-    },
-}
-
-/// The `content` array for one user message, text-only or multimodal.
-///
-/// The Responses API has taken an array here since before attachments existed, which is why this
-/// transport needs one function rather than the wire-message type the chat-completions path grew.
-fn responses_content(
-    message: &ModelMessage,
-) -> Result<Vec<ResponsesContent<'_>>, crate::asset::BlobError> {
-    let Some(parts) = message.parts() else {
-        return Ok(vec![ResponsesContent::InputText {
-            text: message.content().unwrap_or_default().into(),
-        }]);
-    };
-    parts
-        .iter()
-        .map(|part| {
-            let bytes = match part {
-                ContentPart::Image { data, .. } | ContentPart::File { data, .. } => {
-                    match data.read() {
-                        Ok(bytes) => Some(bytes),
-                        Err(
-                            crate::asset::BlobError::Reclaimed
-                            | crate::asset::BlobError::Unauthorized,
-                        ) => {
-                            return Ok(ResponsesContent::InputText {
-                                text: data.release_notice().into(),
-                            });
-                        }
-                        Err(error) => return Err(error),
-                    }
-                }
-                ContentPart::Text(_) => None,
-            };
-            Ok(match part {
-                ContentPart::Text(text) => ResponsesContent::InputText { text: text.into() },
-                ContentPart::Image { mime, .. } => ResponsesContent::InputImage {
-                    image_url: DataUrl::new(mime, bytes.unwrap_or_default()),
-                },
-                ContentPart::File { name, mime, .. } => ResponsesContent::InputFile {
-                    filename: name,
-                    file_data: DataUrl::new(mime, bytes.unwrap_or_default()),
-                },
-            })
-        })
-        .collect()
-}
-
-fn build_request_body<'a>(
-    model: &'a str,
-    messages: &'a [ModelMessage],
-    tools: &'a [ModelTool],
-    options: &'a CompletionOptions,
-) -> Result<ResponsesRequest<'a>, crate::asset::BlobError> {
-    let instructions = messages
-        .iter()
-        .filter(|message| message.role() == "system")
-        .filter_map(ModelMessage::content)
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    let instructions = if instructions.trim().is_empty() {
-        "You are a helpful assistant. Use only the supplied function tools when a tool is needed."
-            .to_owned()
-    } else {
-        instructions
-    };
-    let mut input = Vec::new();
-    for message in messages {
-        match message.role() {
-            "system" => {}
-            "user" => input.push(ResponsesItem::Message(ResponsesMessage {
-                kind: "message",
-                role: "user",
-                content: responses_content(message)?,
-            })),
-            "assistant" if !message.replay_items().is_empty() => {
-                input.extend(message.replay_items().iter().map(ResponsesItem::Replay));
-            }
-            "assistant" => {
-                if let Some(content) = message.content().filter(|content| !content.is_empty()) {
-                    input.push(ResponsesItem::Message(ResponsesMessage {
-                        kind: "message",
-                        role: "assistant",
-                        content: vec![ResponsesContent::OutputText {
-                            text: content,
-                            annotations: [],
-                        }],
-                    }));
-                }
-                for call in message.tool_calls() {
-                    input.push(ResponsesItem::FunctionCall(ResponsesFunctionCall {
-                        kind: "function_call",
-                        call_id: &call.id,
-                        name: &call.function.name,
-                        arguments: &call.function.arguments,
-                    }));
-                }
-            }
-            "tool" => input.push(ResponsesItem::FunctionCallOutput(
-                ResponsesFunctionCallOutput {
-                    kind: "function_call_output",
-                    call_id: message.tool_call_id().unwrap_or_default(),
-                    output: message.content().unwrap_or_default(),
-                },
-            )),
-            _ => {}
-        }
-    }
-    let tools = tools
-        .iter()
-        .map(|tool| ResponsesTool {
-            kind: "function",
-            name: &tool.name,
-            description: &tool.description,
-            parameters: &tool.parameters,
-        })
-        .collect::<Vec<_>>();
-
-    Ok(ResponsesRequest {
-        model,
-        store: false,
-        stream: true,
-        instructions,
-        input,
-        tools,
-        tool_choice: "auto",
-        parallel_tool_calls: true,
-        include: ["reasoning.encrypted_content"],
-        text: ResponsesText { verbosity: "low" },
-        prompt_cache_key: options.prompt_cache_key(),
-    })
-}
-
-#[derive(Default)]
-struct StreamState {
-    text: String,
-    replay_items: Vec<Value>,
-    calls: BTreeMap<String, PendingCall>,
-    call_order: Vec<String>,
-    completed: bool,
-    usage: Option<ModelUsage>,
-}
-
-/// Responses-API `usage` object from the `response.completed` event. Every field defaults for the
-/// same reason as the chat-completions shape: a partial report still prices the call.
-#[derive(Debug, Deserialize)]
-struct WireResponsesUsage {
-    #[serde(default)]
-    input_tokens: Option<u64>,
-    #[serde(default)]
-    output_tokens: Option<u64>,
-    #[serde(default)]
-    total_tokens: Option<u64>,
-    #[serde(default)]
-    input_tokens_details: Option<WireInputTokensDetails>,
-    #[serde(default)]
-    output_tokens_details: Option<WireOutputTokensDetails>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WireInputTokensDetails {
-    #[serde(default)]
-    cached_tokens: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct WireOutputTokensDetails {
-    #[serde(default)]
-    reasoning_tokens: Option<u64>,
-}
-
-impl From<WireResponsesUsage> for ModelUsage {
-    fn from(usage: WireResponsesUsage) -> Self {
-        Self {
-            input_tokens: usage.input_tokens,
-            cached_input_tokens: usage
-                .input_tokens_details
-                .and_then(|details| details.cached_tokens),
-            output_tokens: usage.output_tokens,
-            reasoning_output_tokens: usage
-                .output_tokens_details
-                .and_then(|details| details.reasoning_tokens),
-            total_tokens: usage.total_tokens,
-        }
-    }
-}
-
-#[derive(Default)]
-struct PendingCall {
-    item_id: String,
-    call_id: String,
-    name: String,
-    arguments: String,
-    replayed: bool,
-}
-
-/// Reads one Responses stream into a turn, reporting visible text as it arrives.
-///
-/// The framing is [`SseReader`]'s; what the events mean is this function's. `on_event` returning
-/// [`ControlFlow::Break`] abandons the stream: returning drops the reader, which drops the body
-/// and closes the connection instead of leaving a half-read response in the pool.
-pub(crate) fn parse_sse(
-    reader: impl Read,
-    on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
-) -> Result<AssistantTurn, ChatGptError> {
-    let mut events = SseReader::new(reader);
-    let mut state = StreamState::default();
-    while let Some(event) = events.next_event().map_err(stream_failure)? {
-        let SseEvent::Data(data) = event else {
-            break;
-        };
-        if process_sse_data(data, &mut state, on_event)?.is_break() {
-            return Err(ChatGptError::Interrupted);
-        }
-    }
-    if !state.completed {
-        return Err(ChatGptError::Protocol(
-            "ChatGPT response stream ended before response.completed".to_owned(),
-        ));
-    }
-
-    let mut tool_calls = Vec::new();
-    for item_id in state.call_order {
-        let Some(call) = state.calls.remove(&item_id) else {
-            continue;
-        };
-        if call.call_id.is_empty() || call.name.is_empty() {
-            return Err(ChatGptError::Protocol(
-                "ChatGPT emitted an incomplete function call".to_owned(),
-            ));
-        }
-        serde_json::from_str::<Value>(&call.arguments).map_err(|source| {
-            ChatGptError::Protocol(format!(
-                "ChatGPT emitted invalid arguments for {}: {source}",
-                call.name
-            ))
-        })?;
-        tool_calls.push(ModelToolCall {
-            id: call.call_id,
-            kind: "function".to_owned(),
-            function: ModelFunctionCall {
-                name: call.name,
-                arguments: call.arguments,
-            },
-        });
-    }
-    let content = (!state.text.trim().is_empty()).then_some(state.text);
-    if content.is_none() && tool_calls.is_empty() {
-        return Err(ChatGptError::Protocol(
-            "ChatGPT returned neither text nor tool calls".to_owned(),
-        ));
-    }
-    Ok(AssistantTurn {
-        content,
-        tool_calls,
-        usage: state.usage,
-        replay_items: state.replay_items,
-    })
-}
-
-/// Maps a framing failure onto the errors this transport has always reported for them.
-fn stream_failure(error: SseError) -> ChatGptError {
-    match error {
-        SseError::TooLarge => ChatGptError::Protocol(format!(
-            "ChatGPT response exceeded {MAX_STREAM_BYTES} bytes"
-        )),
-        SseError::Read { source } => ChatGptError::Stream { source },
-    }
-}
-
-fn process_sse_data(
-    data: &str,
-    state: &mut StreamState,
-    on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
-) -> Result<ControlFlow<()>, ChatGptError> {
-    let event = serde_json::from_str::<Value>(data)
-        .map_err(|source| ChatGptError::Protocol(format!("invalid SSE event: {source}")))?;
-    let kind = event
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    match kind {
-        "response.output_item.added" => {
-            if let Some(item) = event.get("item") {
-                // The wire numbers output items, not calls; the position this call takes in the
-                // finished turn is the number both backends can answer.
-                let started = state.call_order.len();
-                remember_call(item, state);
-                if state.call_order.len() > started {
-                    let index = u32::try_from(started).unwrap_or(u32::MAX);
-                    if on_event(TurnEvent::ToolCallStarted { index }).is_break() {
-                        return Ok(ControlFlow::Break(()));
-                    }
-                }
-            }
-        }
-        "response.output_text.delta" => {
-            if let Some(delta) = event
-                .get("delta")
-                .and_then(Value::as_str)
-                .filter(|delta| !delta.is_empty())
-            {
-                state.text.push_str(delta);
-                if on_event(TurnEvent::TextDelta(ModelText::from_model(
-                    delta.to_owned(),
-                )))
-                .is_break()
-                {
-                    return Ok(ControlFlow::Break(()));
-                }
-            }
-        }
-        "response.function_call_arguments.delta" => {
-            let item_id = event.get("item_id").and_then(Value::as_str);
-            let delta = event
-                .get("delta")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if let Some(call) = pending_call_mut(state, item_id) {
-                call.arguments.push_str(delta);
-            }
-        }
-        "response.function_call_arguments.done" => {
-            let item_id = event.get("item_id").and_then(Value::as_str);
-            let arguments = event
-                .get("arguments")
-                .and_then(Value::as_str)
-                .filter(|arguments| !arguments.is_empty());
-            if let Some(arguments) = arguments
-                && let Some(call) = pending_call_mut(state, item_id)
-            {
-                call.arguments = arguments.to_owned();
-            }
-        }
-        "response.output_item.done" => {
-            if let Some(item) = event.get("item") {
-                finish_item(item, state)?;
-            }
-        }
-        "response.completed" => {
-            let status = event
-                .get("response")
-                .and_then(|response| response.get("status"))
-                .and_then(Value::as_str)
-                .unwrap_or("completed");
-            if status != "completed" {
-                return Err(ChatGptError::Protocol(format!(
-                    "ChatGPT response finished with status {status}"
-                )));
-            }
-            // Usage is accounting, not content: a malformed report is dropped rather than failing
-            // a turn whose text and tool calls arrived intact.
-            state.usage = event
-                .get("response")
-                .and_then(|response| response.get("usage"))
-                .and_then(|usage| serde_json::from_value::<WireResponsesUsage>(usage.clone()).ok())
-                .map(ModelUsage::from);
-            state.completed = true;
-        }
-        "response.failed" | "response.incomplete" | "error" => {
-            return Err(ChatGptError::Protocol(format_provider_error(&event)));
-        }
-        _ => {}
-    }
-    Ok(ControlFlow::Continue(()))
-}
-
-fn remember_call(item: &Value, state: &mut StreamState) {
-    if item.get("type").and_then(Value::as_str) != Some("function_call") {
-        return;
-    }
-    let item_id = item
-        .get("id")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_owned();
-    if item_id.is_empty() {
-        return;
-    }
-    if !state.calls.contains_key(&item_id) {
-        state.call_order.push(item_id.clone());
-    }
-    let call = state.calls.entry(item_id.clone()).or_default();
-    call.item_id = item_id;
-    update_call(call, item);
-}
-
-fn update_call(call: &mut PendingCall, item: &Value) {
-    if let Some(value) = item.get("call_id").and_then(Value::as_str) {
-        call.call_id = value.to_owned();
-    }
-    if let Some(value) = item.get("name").and_then(Value::as_str) {
-        call.name = value.to_owned();
-    }
-    if let Some(value) = item
-        .get("arguments")
-        .and_then(Value::as_str)
-        .filter(|value| !value.is_empty())
-    {
-        call.arguments = value.to_owned();
-    }
-}
-
-fn pending_call_mut<'a>(
-    state: &'a mut StreamState,
-    item_id: Option<&str>,
-) -> Option<&'a mut PendingCall> {
-    if let Some(item_id) = item_id {
-        return state.calls.get_mut(item_id);
-    }
-    let item_id = state.call_order.last()?.clone();
-    state.calls.get_mut(&item_id)
-}
-
-fn finish_item(item: &Value, state: &mut StreamState) -> Result<(), ChatGptError> {
-    match item.get("type").and_then(Value::as_str) {
-        Some("reasoning") => state.replay_items.push(item.clone()),
-        Some("message") => {
-            if state.text.is_empty() {
-                state.text = item
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|part| part.get("text").and_then(Value::as_str))
-                    .collect::<String>();
-            }
-            state.replay_items.push(item.clone());
-        }
-        Some("function_call") => {
-            remember_call(item, state);
-            let item_id = item.get("id").and_then(Value::as_str).unwrap_or_default();
-            let call = state.calls.get_mut(item_id).ok_or_else(|| {
-                ChatGptError::Protocol("function call omitted item ID".to_owned())
-            })?;
-            update_call(call, item);
-            if !call.replayed {
-                let mut replay = item.clone();
-                if let Some(object) = replay.as_object_mut() {
-                    object.insert(
-                        "arguments".to_owned(),
-                        Value::String(call.arguments.clone()),
-                    );
-                }
-                state.replay_items.push(replay);
-                call.replayed = true;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn format_provider_error(event: &Value) -> String {
-    sanitize_diagnostic(
-        event
-            .pointer("/error/message")
-            .or_else(|| event.get("message"))
-            .and_then(Value::as_str)
-            .unwrap_or("ChatGPT response failed"),
-    )
-}
-
 /// Renders a failed OAuth response as a diagnostic, preferring its `error` code.
 ///
 /// A token or device-authorization failure answers with `{"error": "...", "error_description":
 /// "..."}`. Neither field carries credential material — the whole point of the response is that no
 /// credential was issued — and the code is the part that names the failure.
+/// Reads the body of a non-2xx response as a bounded, log-safe diagnostic.
+///
+/// The credential agent sets `http_status_as_error(false)` so OAuth refusals retain their
+/// bounded details instead of only `ureq`'s status code.
+fn read_error_body(
+    response: ureq::http::Response<ureq::Body>,
+    secrets: crate::diagnostic::DiagnosticSecrets<'_>,
+) -> String {
+    let mut bytes = Vec::new();
+    let read = response
+        .into_parts()
+        .1
+        .into_reader()
+        .take(MAX_ERROR_BODY_BYTES + 1)
+        .read_to_end(&mut bytes);
+    let text = if read.is_err() || bytes.len() > MAX_ERROR_BODY_BYTES as usize {
+        secrets.sanitize_truncated(&bytes)
+    } else {
+        secrets.sanitize(&String::from_utf8_lossy(&bytes))
+    };
+    if text.trim().is_empty() {
+        return "no response body".to_owned();
+    }
+    text
+}
+
 fn oauth_failure_detail(response: ureq::http::Response<ureq::Body>) -> String {
-    let body = read_error_body(response);
+    let body = read_error_body(response, crate::diagnostic::DiagnosticSecrets::default());
     let code = oauth_error_code(&body);
     oauth_detail(&body, code.as_deref())
 }
@@ -1587,7 +950,7 @@ fn exported_path(value: Option<OsString>) -> Option<PathBuf> {
     value.filter(|value| !value.is_empty()).map(PathBuf::from)
 }
 
-fn resolve_auth_path(explicit: Option<&Path>) -> Result<PathBuf, ChatGptError> {
+pub(crate) fn resolve_auth_path(explicit: Option<&Path>) -> Result<PathBuf, ChatGptError> {
     resolve_auth_path_named(explicit, DEFAULT_AUTH_FILE_NAME)
 }
 
@@ -1883,23 +1246,6 @@ fn unix_time() -> Result<u64, ChatGptError> {
         .map_err(|_| ChatGptError::Configuration("system clock is before Unix epoch".to_owned()))
 }
 
-#[derive(Debug, Error)]
-enum ChatGptRequestError {
-    #[error("{0}")]
-    Attachment(#[from] crate::asset::BlobError),
-    #[error("ChatGPT authorization expired")]
-    Unauthorized,
-    #[error("ChatGPT request failed: {0}")]
-    Transport(String),
-    #[error("ChatGPT returned HTTP {status}: {detail}")]
-    Status { status: u16, detail: String },
-    #[error("invalid ChatGPT response: {0}")]
-    Protocol(String),
-    /// The caller's event callback asked to stop, and the response body was dropped.
-    #[error("ChatGPT turn interrupted by its caller")]
-    Interrupted,
-}
-
 /// Failure while authenticating or using a ChatGPT subscription.
 #[derive(Debug, Error)]
 pub enum ChatGptError {
@@ -1991,19 +1337,6 @@ pub enum ChatGptError {
     /// Login took too long.
     #[error("ChatGPT device login timed out after 15 minutes")]
     LoginTimeout,
-    /// Reading the streaming response failed.
-    #[error("could not read ChatGPT response stream")]
-    Stream {
-        /// Stream error.
-        #[source]
-        source: io::Error,
-    },
-    /// The caller's event callback asked to stop, and the response body was dropped.
-    ///
-    /// A cancellation rather than a failure, and the one turn outcome that is neither an answer
-    /// nor a problem with the endpoint.
-    #[error("ChatGPT turn interrupted by its caller")]
-    Interrupted,
 }
 
 #[cfg(test)]
@@ -2014,20 +1347,47 @@ mod tests {
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
+    use crate::codex::{CodexClient, replay_transcript, request_body_json};
+    use crate::{
+        control::TurnControl,
+        inference::{GenerateRequest, InferenceModel},
+    };
     use dekopon_core::Redacted;
+    use std::ops::ControlFlow;
 
     use super::{
-        AUTH_VERSION, AuthPathEnvironment, ChatGptCodexModel, ChatGptCredentials, ChatGptEndpoints,
-        ChatGptError, ControlFlow, CredentialFile, DEFAULT_AUTH_FILE_NAME, OsString, PathBuf,
-        RefreshOutcome, build_request_body, credential_lock_path, export_credentials,
-        exported_path, extract_account_id, load_credentials, login_with_endpoints, logout,
-        parse_sse, save_credentials, status,
+        AUTH_VERSION, AuthPathEnvironment, ChatGptCredentials, ChatGptEndpoints, ChatGptError,
+        CredentialFile, DEFAULT_AUTH_FILE_NAME, OsString, PathBuf, RefreshOutcome,
+        credential_lock_path, export_credentials, exported_path, extract_account_id,
+        load_credentials, login_with_endpoints, logout, save_credentials, status,
     };
     use crate::{
         mock::{MockResponse, MockServer},
-        model::{ChatModel as _, CompletionOptions, ContentPart, ModelMessage, ModelTool},
+        model::{CompletionOptions, ContentPart, ModelMessage, ModelTool},
         stream::TurnEvent,
     };
+
+    async fn generate_turn(
+        model: &CodexClient,
+        messages: &[ModelMessage],
+        tools: &[ModelTool],
+        options: &CompletionOptions,
+        observe: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+    ) -> Result<crate::model::AssistantTurn, crate::error::InferenceError> {
+        let control =
+            TurnControl::new(tokio::sync::watch::channel(false).1, Duration::from_secs(2))?;
+        model
+            .generate(
+                GenerateRequest {
+                    messages,
+                    tools,
+                    options,
+                },
+                observe,
+                &control,
+            )
+            .await
+    }
 
     /// The callback for a turn whose deltas are not what the test is about.
     fn ignored(_event: TurnEvent) -> ControlFlow<()> {
@@ -2174,7 +1534,7 @@ mod tests {
     fn missing_credentials_point_to_the_operator_auth_command() {
         let temp = TempDir::new().expect("temporary directory");
         let path = temp.path().join("missing-auth.json");
-        let error = match ChatGptCodexModel::new("gpt-test", Some(&path), Duration::from_secs(1)) {
+        let error = match CodexClient::new("gpt-test", Some(&path), Duration::from_secs(1)) {
             Ok(_) => panic!("missing credentials must fail"),
             Err(error) => error,
         };
@@ -2230,20 +1590,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn builds_codex_responses_payload_with_replay_items() {
-        let mut assistant = crate::model::AssistantTurn {
-            content: None,
-            tool_calls: Vec::new(),
-            usage: None,
-            replay_items: vec![json!({
-                "type": "reasoning",
-                "id": "rs_1",
-                "encrypted_content": "opaque"
-            })],
-        };
+    #[tokio::test]
+    async fn builds_codex_responses_payload_with_native_items() {
+        let mut assistant = crate::model::AssistantTurn::new(None, Vec::new(), None)
+            .with_codex_continuation(
+                vec![json!({
+                    "type": "reasoning",
+                    "id": "rs_1",
+                    "encrypted_content": "opaque"
+                })],
+                crate::model::ClientIdentity::new(),
+                None,
+            );
         assistant.tool_calls.push(crate::model::ModelToolCall {
-            id: "call-1".to_owned(),
+            id: "call-1".into(),
             kind: "function".to_owned(),
             function: crate::model::ModelFunctionCall {
                 name: "echo_echo".to_owned(),
@@ -2266,6 +1626,7 @@ mod tests {
             }],
             &CompletionOptions::default(),
         )
+        .await
         .expect("request body");
 
         assert_eq!(body["instructions"], "Be concise");
@@ -2274,32 +1635,10 @@ mod tests {
         assert_eq!(body["input"][2]["type"], "function_call_output");
     }
 
-    /// One built request read back as the JSON it is sent as.
-    ///
-    /// The body is a typed borrowed struct now, so the assertions below go through the same
-    /// `compact_json_body` the transport sends — which makes each of them a check on the bytes on
-    /// the wire rather than on an intermediate value nothing transmits.
-    fn request_body_json(
-        model: &str,
-        messages: &[ModelMessage],
-        tools: &[ModelTool],
-        options: &CompletionOptions,
-    ) -> Result<Value, crate::asset::BlobError> {
-        let body = build_request_body(model, messages, tools, options)?;
-        let encoded = super::compact_json_body(&body).expect("the request body serializes");
-        Ok(serde_json::from_slice(&encoded).expect("a compact request body is JSON"))
-    }
-
     /// Serializes one request fragment so a comparison is over the bytes a provider's prefix cache
-    /// would hash rather than over two parsed values that merely agree.
-    ///
-    /// Both sides always come from this same binary, which is what keeps this a relation between
-    /// two computed values instead of a golden string: `serde_json`'s `preserve_order` feature
-    /// reaches this crate through a dev-dependency, and under resolver 3 dev-dependency features
-    /// unify into `cargo test` but not `cargo build`. Object key order is therefore deterministic
-    /// within either binary — which is all prefix stability needs — but not necessarily the same
-    /// order in both, so a literal expected body would fail for a reason that has nothing to do
-    /// with the property under test.
+    /// would hash. Both sides come from this binary: whether `serde_json`'s `preserve_order` is on
+    /// depends on which packages are built together (dekopon-brokerd's cedar-policy-core enables
+    /// it), so a literal expected body would not be stable.
     fn request_text(fragment: &Value) -> String {
         serde_json::to_string(fragment).expect("serialize request fragment")
     }
@@ -2322,18 +1661,20 @@ mod tests {
     /// the function call as opaque replay items, plus the same call surfaced as a tool call.
     fn scripted_turn(turn: u32, call_id: &str, script: &str) -> crate::model::AssistantTurn {
         let arguments = json!({"script": script}).to_string();
-        crate::model::AssistantTurn {
-            content: None,
-            tool_calls: vec![crate::model::ModelToolCall {
-                id: call_id.to_owned(),
+        crate::model::AssistantTurn::new(
+            None,
+            vec![crate::model::ModelToolCall {
+                id: call_id.into(),
                 kind: "function".to_owned(),
                 function: crate::model::ModelFunctionCall {
                     name: "bash".to_owned(),
                     arguments: arguments.clone(),
                 },
             }],
-            usage: None,
-            replay_items: vec![
+            None,
+        )
+        .with_codex_continuation(
+            vec![
                 json!({
                     "type": "reasoning",
                     "id": format!("rs_{turn}"),
@@ -2347,11 +1688,13 @@ mod tests {
                     "arguments": arguments,
                 }),
             ],
-        }
+            crate::model::ClientIdentity::new(),
+            None,
+        )
     }
 
-    #[test]
-    fn attachments_become_responses_input_parts() {
+    #[tokio::test]
+    async fn attachments_become_responses_input_parts() {
         // The Responses path has emitted a `content` array since before attachments existed, so
         // this is the one site that had to learn the new part types.
         let messages = [ModelMessage::user_with_parts(vec![
@@ -2374,6 +1717,7 @@ mod tests {
         for _ in 0..3 {
             let body =
                 request_body_json("gpt-5-codex", &cloned, &[], &CompletionOptions::default())
+                    .await
                     .expect("request body");
 
             assert_eq!(
@@ -2392,21 +1736,20 @@ mod tests {
     /// The body is a typed borrowed struct rather than `json!` now, and an assistant message with
     /// text — the one item every other test here reaches through a replayed item instead — is
     /// where a silent shape change would hide.
-    #[test]
-    fn every_input_item_keeps_the_shape_the_responses_api_is_sent() {
-        let assistant = crate::model::AssistantTurn {
-            content: Some("here you go".to_owned()),
-            tool_calls: vec![crate::model::ModelToolCall {
-                id: "call-9".to_owned(),
+    #[tokio::test]
+    async fn every_input_item_keeps_the_shape_the_responses_api_is_sent() {
+        let assistant = crate::model::AssistantTurn::new(
+            Some("here you go".to_owned()),
+            vec![crate::model::ModelToolCall {
+                id: "call-9".into(),
                 kind: "function".to_owned(),
                 function: crate::model::ModelFunctionCall {
                     name: "bash".to_owned(),
                     arguments: r#"{"script":"ls"}"#.to_owned(),
                 },
             }],
-            usage: None,
-            replay_items: Vec::new(),
-        };
+            None,
+        );
         let messages = vec![
             ModelMessage::user("what is here?"),
             crate::model::assistant_message(&assistant),
@@ -2419,6 +1762,7 @@ mod tests {
             &[bash_tool()],
             &CompletionOptions::default(),
         )
+        .await
         .expect("request body");
 
         assert_eq!(
@@ -2447,8 +1791,8 @@ mod tests {
         assert_eq!(body["parallel_tool_calls"], true);
     }
 
-    #[test]
-    fn a_text_only_user_message_keeps_its_single_input_text_part() {
+    #[tokio::test]
+    async fn a_text_only_user_message_keeps_its_single_input_text_part() {
         // Unchanged shape for every request that carries no attachment.
         let body = request_body_json(
             "gpt-5-codex",
@@ -2456,6 +1800,7 @@ mod tests {
             &[],
             &CompletionOptions::default(),
         )
+        .await
         .expect("request body");
 
         assert_eq!(
@@ -2464,8 +1809,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn an_appended_turn_extends_the_request_input_and_leaves_its_prefix_untouched() {
+    #[tokio::test]
+    async fn an_appended_turn_extends_the_request_input_and_leaves_its_prefix_untouched() {
         // Automatic prefix caching keys on the leading bytes of a request: it pays only when turn
         // N+1 is turn N with more appended and nothing at all rewritten. The prompt loop appends
         // and never edits, so this holds today by construction — the point of pinning it is that a
@@ -2478,6 +1823,7 @@ mod tests {
         ];
         let mut bodies = vec![
             request_body_json("gpt-test", &messages, &tools, &CompletionOptions::default())
+                .await
                 .expect("request body"),
         ];
         for (turn, script) in [(1, "ls | wc -l"), (2, "ls -a | wc -l")] {
@@ -2487,6 +1833,7 @@ mod tests {
             messages.push(ModelMessage::tool(call_id.as_str(), "12\n"));
             bodies.push(
                 request_body_json("gpt-test", &messages, &tools, &CompletionOptions::default())
+                    .await
                     .expect("request body"),
             );
         }
@@ -2519,8 +1866,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_system_message_anywhere_in_history_rewrites_the_front_of_the_request() {
+    #[tokio::test]
+    async fn a_system_message_anywhere_in_history_rewrites_the_front_of_the_request() {
         // `build_request_body` hoists *every* system message into the top-level `instructions`
         // field, wherever it sits in the list, and emits nothing for it in `input`. A system
         // message injected mid-conversation therefore appends nothing and edits the very first
@@ -2540,9 +1887,11 @@ mod tests {
         injected.insert(2, ModelMessage::system("Prefer relative paths."));
 
         let plain = request_body_json("gpt-test", &history, &tools, &CompletionOptions::default())
+            .await
             .expect("request body");
         let hoisted =
             request_body_json("gpt-test", &injected, &tools, &CompletionOptions::default())
+                .await
                 .expect("request body");
 
         assert_eq!(
@@ -2557,8 +1906,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_repeated_system_message_silently_doubles_the_instructions() {
+    #[tokio::test]
+    async fn a_repeated_system_message_silently_doubles_the_instructions() {
         // Nothing deduplicates and nothing complains. A caller that re-seeds the system prompt onto
         // a conversation that already carries one sends the whole thing twice: double the
         // instruction tokens on every subsequent turn, a prefix that no longer matches anything
@@ -2571,6 +1920,7 @@ mod tests {
         ];
 
         let body = request_body_json("gpt-test", &messages, &[], &CompletionOptions::default())
+            .await
             .expect("request body");
 
         assert_eq!(body["instructions"], format!("{system}\n\n{system}"));
@@ -2581,11 +1931,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn codex_requests_never_ask_the_provider_to_retain_the_conversation() {
+    #[tokio::test]
+    async fn codex_requests_never_ask_the_provider_to_retain_the_conversation() {
         // `store: false` is a data-retention decision rather than a tuning knob. Nothing about a
         // session is kept server-side, which is precisely why the transport has to carry encrypted
-        // reasoning back itself through `replay_items` and ask for it with `include`. Flipping the
+        // reasoning back itself through `native_items` and ask for it with `include`. Flipping the
         // literal would move conversation content into someone else's storage while every test
         // here kept passing, so the assertion is written to be deleted deliberately rather than
         // edged past.
@@ -2596,6 +1946,7 @@ mod tests {
             &[],
             &CompletionOptions::default(),
         )
+        .await
         .expect("request body");
         let resumed = request_body_json(
             "gpt-test",
@@ -2607,6 +1958,7 @@ mod tests {
             &[bash_tool()],
             &CompletionOptions::default(),
         )
+        .await
         .expect("request body");
 
         for body in [&opening, &resumed] {
@@ -2627,14 +1979,15 @@ mod tests {
         ]
     }
 
-    #[test]
-    fn a_request_without_a_cache_key_carries_no_cache_field_at_all() {
+    #[tokio::test]
+    async fn a_request_without_a_cache_key_carries_no_cache_field_at_all() {
         // No caller supplies a key yet, so this is the body every real request still has: an
         // absent key must serialize away completely rather than as a null or an empty string.
         // Anything else would be a wire change shipped by a feature nobody has switched on.
         let messages = cached_conversation();
         let tools = vec![bash_tool()];
         let plain = request_body_json("gpt-test", &messages, &tools, &CompletionOptions::default())
+            .await
             .expect("request body");
 
         assert!(
@@ -2654,17 +2007,19 @@ mod tests {
             &tools,
             &CompletionOptions::default().with_prompt_cache_key("   "),
         )
+        .await
         .expect("request body");
         assert_eq!(request_text(&blank), request_text(&plain));
     }
 
-    #[test]
-    fn a_cache_key_adds_one_field_and_disturbs_nothing_else() {
+    #[tokio::test]
+    async fn a_cache_key_adds_one_field_and_disturbs_nothing_else() {
         // The key is worth nothing if setting it edits the very prefix it is meant to match. Every
         // field the previous request had must survive unchanged; the key may only be added.
         let messages = cached_conversation();
         let tools = vec![bash_tool()];
         let plain = request_body_json("gpt-test", &messages, &tools, &CompletionOptions::default())
+            .await
             .expect("request body");
         let keyed = request_body_json(
             "gpt-test",
@@ -2672,6 +2027,7 @@ mod tests {
             &tools,
             &CompletionOptions::default().with_prompt_cache_key("session-7"),
         )
+        .await
         .expect("request body");
 
         assert_eq!(keyed["prompt_cache_key"], "session-7");
@@ -2691,8 +2047,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_codex_transport_sends_a_cache_key_only_when_a_caller_supplies_one() {
+    #[tokio::test]
+    async fn the_codex_transport_sends_a_cache_key_only_when_a_caller_supplies_one() {
         // Proves the plumbing reaches the socket and that plain `complete` still does not: the
         // trait's keyless entry point delegates with default options, so today's callers send
         // exactly what they sent before.
@@ -2717,7 +2073,7 @@ mod tests {
             },
         )
         .expect("save credentials");
-        let model = ChatGptCodexModel::with_endpoints(
+        let model = CodexClient::with_endpoints(
             "gpt-test",
             Some(&path),
             Duration::from_secs(2),
@@ -2726,17 +2082,24 @@ mod tests {
         .expect("model client");
         let messages = vec![ModelMessage::user("hello")];
 
-        model
-            .complete(&messages, &[], &CompletionOptions::default(), &mut ignored)
-            .expect("keyless turn");
-        model
-            .complete(
-                &messages,
-                &[],
-                &CompletionOptions::default().with_prompt_cache_key("session-7"),
-                &mut ignored,
-            )
-            .expect("keyed turn");
+        generate_turn(
+            &model,
+            &messages,
+            &[],
+            &CompletionOptions::default(),
+            &mut ignored,
+        )
+        .await
+        .expect("keyless turn");
+        generate_turn(
+            &model,
+            &messages,
+            &[],
+            &CompletionOptions::default().with_prompt_cache_key("session-7"),
+            &mut ignored,
+        )
+        .await
+        .expect("keyed turn");
 
         // Substrings rather than a body comparison: the exact spacing is the HTTP client's
         // choice, and what matters here is only which request carried the key.
@@ -2760,7 +2123,7 @@ mod tests {
             "data: [DONE]\n\n"
         );
 
-        let turn = parse_sse(stream.as_bytes(), &mut ignored).expect("valid response stream");
+        let turn = replay_transcript(stream, &mut ignored).expect("valid response stream");
 
         assert_eq!(turn.tool_calls.len(), 1);
         assert_eq!(turn.tool_calls[0].function.name, "echo_echo");
@@ -2768,12 +2131,14 @@ mod tests {
             turn.tool_calls[0].function.arguments,
             r#"{"message":"hello"}"#
         );
-        assert_eq!(turn.replay_items[0]["type"], "reasoning");
-        assert_eq!(turn.replay_items[1]["arguments"], r#"{"message":"hello"}"#);
+        let items = turn.codex_items().expect("native continuation");
+        assert_eq!(items[0]["type"], "reasoning");
+        assert_eq!(items[1]["arguments"], r#"{"message":"hello"}"#);
         assert_eq!(
             turn.usage,
             Some(crate::model::ModelUsage {
                 input_tokens: Some(120),
+                cache_write_tokens: None,
                 cached_input_tokens: Some(100),
                 output_tokens: Some(30),
                 reasoning_output_tokens: Some(7),
@@ -2802,7 +2167,7 @@ mod tests {
             ControlFlow::Continue(())
         };
 
-        let turn = parse_sse(stream.as_bytes(), &mut sink).expect("valid response stream");
+        let turn = replay_transcript(stream, &mut sink).expect("valid response stream");
 
         assert_eq!(turn.content.as_deref(), Some("Looking it up"));
         assert_eq!(
@@ -2818,8 +2183,8 @@ mod tests {
     #[test]
     fn a_callback_that_breaks_abandons_the_turn_and_reports_the_interruption() {
         // Failure path: the caller stopped the turn, so the surfaced cause must say so rather than
-        // reading as a dead endpoint, and nothing after the break may be parsed — the body is
-        // dropped, which is what closes the connection on a live one.
+        // reading as a dead endpoint, and nothing after the break may be parsed. A live client
+        // cancels the local exchange and drops its response, not necessarily the pooled connection.
         let stream = concat!(
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"half an\"}\n\n",
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\" answer\"}\n\n",
@@ -2831,13 +2196,11 @@ mod tests {
             ControlFlow::Break(())
         };
 
-        let error = parse_sse(stream.as_bytes(), &mut sink).expect_err("the caller said stop");
+        let error = replay_transcript(stream, &mut sink).expect_err("the caller said stop");
 
-        assert!(matches!(error, ChatGptError::Interrupted), "{error:?}");
-        assert_eq!(
-            error.to_string(),
-            "ChatGPT turn interrupted by its caller",
-            "an interrupted turn must not read as an endpoint failure"
+        assert!(
+            matches!(error, crate::error::InferenceError::Cancelled),
+            "{error:?}"
         );
         assert_eq!(
             recorded(&events),
@@ -2846,14 +2209,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_stopped_subscription_turn_is_an_interruption_rather_than_a_request_failure() {
+    #[tokio::test]
+    async fn a_stopped_subscription_turn_is_an_interruption_rather_than_a_request_failure() {
         let server = MockServer::start(vec![MockResponse::sse(&completion_stream("stopped"))]);
         let temp = TempDir::new().expect("temporary directory");
         let path = temp.path().join("auth.json");
         save_credentials(&path, &credential_fixture("acct-test", "refresh", u64::MAX))
             .expect("save credentials");
-        let model = ChatGptCodexModel::with_endpoints(
+        let model = CodexClient::with_endpoints(
             "gpt-test",
             Some(&path),
             Duration::from_secs(2),
@@ -2861,16 +2224,17 @@ mod tests {
         )
         .expect("model client");
 
-        let error = model
-            .complete(
-                &[ModelMessage::user("hello")],
-                &[],
-                &CompletionOptions::default(),
-                &mut |_event: TurnEvent| -> ControlFlow<()> { ControlFlow::Break(()) },
-            )
-            .expect_err("the caller said stop");
+        let error = generate_turn(
+            &model,
+            &[ModelMessage::user("hello")],
+            &[],
+            &CompletionOptions::default(),
+            &mut |_event: TurnEvent| -> ControlFlow<()> { ControlFlow::Break(()) },
+        )
+        .await
+        .expect_err("the caller said stop");
 
-        assert_eq!(error, crate::model::ModelError::Interrupted);
+        assert!(matches!(error, crate::error::InferenceError::Cancelled));
     }
 
     #[test]
@@ -2880,7 +2244,7 @@ mod tests {
             "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
         );
 
-        let turn = parse_sse(stream.as_bytes(), &mut ignored).expect("valid response stream");
+        let turn = replay_transcript(stream, &mut ignored).expect("valid response stream");
 
         assert_eq!(turn.usage, None);
     }
@@ -2925,19 +2289,10 @@ mod tests {
         assert!(requests[2].contains("code_verifier=verifier-1"));
     }
 
-    #[test]
-    fn subscription_model_replays_reasoning_and_correlates_tool_results() {
-        let first = concat!(
-            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\",\"encrypted_content\":\"opaque\"}}\n\n",
-            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"echo_echo\",\"arguments\":\"\"}}\n\n",
-            "data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_1\",\"delta\":\"{\\\"message\\\":\\\"hello\\\"}\"}\n\n",
-            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"id\":\"fc_1\",\"call_id\":\"call_1\",\"name\":\"echo_echo\"}}\n\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
-        );
-        let second = concat!(
-            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Echoed hello.\"}\n\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
-        );
+    #[tokio::test]
+    async fn subscription_model_replays_reasoning_and_correlates_tool_results() {
+        let first = include_str!("fixtures/codex-tool.sse");
+        let second = include_str!("fixtures/codex-answer.sse");
         let server = MockServer::start(vec![MockResponse::sse(first), MockResponse::sse(second)]);
         let temp = TempDir::new().expect("temporary directory");
         let path = temp.path().join("auth.json");
@@ -2952,7 +2307,7 @@ mod tests {
             },
         )
         .expect("save credentials");
-        let model = ChatGptCodexModel::with_endpoints(
+        let model = CodexClient::with_endpoints(
             "gpt-test",
             Some(&path),
             Duration::from_secs(2),
@@ -2966,35 +2321,59 @@ mod tests {
         }];
         let mut messages = vec![ModelMessage::user("echo hello")];
 
-        let tool_turn = model
-            .complete(
-                &messages,
-                &tools,
-                &CompletionOptions::default(),
-                &mut ignored,
-            )
-            .expect("tool turn");
-        assert_eq!(tool_turn.tool_calls[0].id, "call_1");
+        let tool_turn = generate_turn(
+            &model,
+            &messages,
+            &tools,
+            &CompletionOptions::default(),
+            &mut ignored,
+        )
+        .await
+        .expect("tool turn");
+        assert_eq!(tool_turn.tool_calls[0].id.as_str(), "call_1");
         messages.push(crate::model::assistant_message(&tool_turn));
         messages.push(ModelMessage::tool("call_1", r#"{"message":"hello"}"#));
-        let answer = model
-            .complete(
-                &messages,
-                &tools,
-                &CompletionOptions::default(),
-                &mut ignored,
-            )
-            .expect("answer turn");
+        let answer = generate_turn(
+            &model,
+            &messages,
+            &tools,
+            &CompletionOptions::default(),
+            &mut ignored,
+        )
+        .await
+        .expect("answer turn");
 
         assert_eq!(answer.content.as_deref(), Some("Echoed hello."));
+        assert_eq!(answer.usage.expect("usage").input_tokens, Some(23));
         let requests = server.requests.lock().expect("request lock");
+        assert_eq!(requests.len(), 2);
+        let bodies = requests
+            .iter()
+            .map(|request| {
+                serde_json::from_str::<Value>(request.split_once("\r\n\r\n").unwrap().1).unwrap()
+            })
+            .collect::<Vec<_>>();
+        for key in [
+            "model",
+            "instructions",
+            "tools",
+            "tool_choice",
+            "store",
+            "stream",
+        ] {
+            assert_eq!(bodies[0][key], bodies[1][key]);
+        }
+        assert_eq!(bodies[0]["input"][0], bodies[1]["input"][0]);
+        assert_eq!(bodies[1]["input"][1]["future_field"], "preserved");
+        assert_eq!(bodies[1]["input"][2]["arguments"], r#"{"message":"hello"}"#);
+        assert_eq!(bodies[1]["input"][3]["call_id"], "call_1");
         assert!(requests[1].contains("opaque"));
         assert!(requests[1].contains("function_call_output"));
         assert!(requests[1].contains("call_1"));
     }
 
-    #[test]
-    fn subscription_model_refreshes_expired_credentials_before_inference() {
+    #[tokio::test]
+    async fn subscription_model_refreshes_expired_credentials_before_inference() {
         let refreshed_access = fake_access("acct-refreshed");
         let server = MockServer::start(vec![
             MockResponse::json(json!({
@@ -3020,7 +2399,7 @@ mod tests {
             },
         )
         .expect("save credentials");
-        let model = ChatGptCodexModel::with_endpoints(
+        let model = CodexClient::with_endpoints(
             "gpt-test",
             Some(&path),
             Duration::from_secs(2),
@@ -3028,14 +2407,15 @@ mod tests {
         )
         .expect("model client");
 
-        let turn = model
-            .complete(
-                &[ModelMessage::user("hello")],
-                &[],
-                &CompletionOptions::default(),
-                &mut ignored,
-            )
-            .expect("model turn");
+        let turn = generate_turn(
+            &model,
+            &[ModelMessage::user("hello")],
+            &[],
+            &CompletionOptions::default(),
+            &mut ignored,
+        )
+        .await
+        .expect("model turn");
 
         assert_eq!(turn.content.as_deref(), Some("refreshed"));
         let credentials = load_credentials(&path).expect("refreshed credentials persisted");
@@ -3075,14 +2455,14 @@ mod tests {
     /// what the first wrote rather than spend a token the provider has already retired. The mock
     /// endpoint scripts exactly one response: a client that refreshes anyway consumes it with a
     /// token request and fails the turn.
-    #[test]
-    fn a_credential_another_process_rotated_is_adopted_rather_than_refreshed_again() {
+    #[tokio::test]
+    async fn a_credential_another_process_rotated_is_adopted_rather_than_refreshed_again() {
         let server = MockServer::start(vec![MockResponse::sse(&completion_stream("adopted"))]);
         let temp = TempDir::new().expect("temporary directory");
         let path = temp.path().join("auth.json");
         save_credentials(&path, &credential_fixture("acct-old", "refresh-old", 0))
             .expect("save credentials");
-        let model = ChatGptCodexModel::with_endpoints(
+        let model = CodexClient::with_endpoints(
             "gpt-test",
             Some(&path),
             Duration::from_secs(2),
@@ -3095,14 +2475,15 @@ mod tests {
         )
         .expect("another process completes its refresh");
 
-        let turn = model
-            .complete(
-                &[ModelMessage::user("hello")],
-                &[],
-                &CompletionOptions::default(),
-                &mut ignored,
-            )
-            .expect("the adopted credential must serve the turn");
+        let turn = generate_turn(
+            &model,
+            &[ModelMessage::user("hello")],
+            &[],
+            &CompletionOptions::default(),
+            &mut ignored,
+        )
+        .await
+        .expect("the adopted credential must serve the turn");
 
         assert_eq!(turn.content.as_deref(), Some("adopted"));
         let requests = server.requests();
@@ -3130,8 +2511,8 @@ mod tests {
     }
 
     /// The same adoption on the forced path: a 401 must not become a second rotation either.
-    #[test]
-    fn an_unauthorized_turn_adopts_a_newer_stored_credential_before_retrying() {
+    #[tokio::test]
+    async fn an_unauthorized_turn_adopts_a_newer_stored_credential_before_retrying() {
         let server = MockServer::start(vec![
             MockResponse::failure(401, json!({"error": {"code": "expired"}})),
             MockResponse::sse(&completion_stream("retried")),
@@ -3144,7 +2525,7 @@ mod tests {
             &credential_fixture("acct-old", "refresh-old", u64::MAX - 1),
         )
         .expect("save credentials");
-        let model = ChatGptCodexModel::with_endpoints(
+        let model = CodexClient::with_endpoints(
             "gpt-test",
             Some(&path),
             Duration::from_secs(2),
@@ -3157,14 +2538,15 @@ mod tests {
         )
         .expect("another process completes its refresh");
 
-        let turn = model
-            .complete(
-                &[ModelMessage::user("hello")],
-                &[],
-                &CompletionOptions::default(),
-                &mut ignored,
-            )
-            .expect("the retry must use the adopted credential");
+        let turn = generate_turn(
+            &model,
+            &[ModelMessage::user("hello")],
+            &[],
+            &CompletionOptions::default(),
+            &mut ignored,
+        )
+        .await
+        .expect("the retry must use the adopted credential");
 
         assert_eq!(turn.content.as_deref(), Some("retried"));
         let requests = server.requests();
@@ -3180,8 +2562,8 @@ mod tests {
     /// server has already invalidated the predecessor, so the in-memory copy is the only credential
     /// that works, and returning the write error would drop it.
     #[cfg(unix)]
-    #[test]
-    fn a_rotated_credential_completes_the_turn_when_the_write_fails() {
+    #[tokio::test]
+    async fn a_rotated_credential_completes_the_turn_when_the_write_fails() {
         use std::os::unix::fs::PermissionsExt as _;
 
         let server = MockServer::start(vec![
@@ -3196,7 +2578,7 @@ mod tests {
         let path = temp.path().join("auth.json");
         save_credentials(&path, &credential_fixture("acct-old", "refresh-old", 0))
             .expect("save credentials");
-        let model = ChatGptCodexModel::with_endpoints(
+        let model = CodexClient::with_endpoints(
             "gpt-test",
             Some(&path),
             Duration::from_secs(2),
@@ -3206,12 +2588,14 @@ mod tests {
 
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o500))
             .expect("make the credential directory unwritable");
-        let turn = model.complete(
+        let turn = generate_turn(
+            &model,
             &[ModelMessage::user("hello")],
             &[],
             &CompletionOptions::default(),
             &mut ignored,
-        );
+        )
+        .await;
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700))
             .expect("restore the credential directory");
 
@@ -3285,8 +2669,8 @@ mod tests {
     }
 
     /// `invalid_grant` means a human has to log in again; a bare `HTTP 400` could be anything.
-    #[test]
-    fn a_rejected_refresh_reports_the_oauth_error_code() {
+    #[tokio::test]
+    async fn a_rejected_refresh_reports_the_oauth_error_code() {
         let server = MockServer::start(vec![MockResponse::failure(
             400,
             json!({"error": "invalid_grant", "error_description": "refresh token is expired"}),
@@ -3295,7 +2679,7 @@ mod tests {
         let path = temp.path().join("auth.json");
         save_credentials(&path, &credential_fixture("acct-old", "refresh-old", 0))
             .expect("save credentials");
-        let model = ChatGptCodexModel::with_endpoints(
+        let model = CodexClient::with_endpoints(
             "gpt-test",
             Some(&path),
             Duration::from_secs(2),
@@ -3303,18 +2687,23 @@ mod tests {
         )
         .expect("model client");
 
-        let error = model
-            .complete(
-                &[ModelMessage::user("hello")],
-                &[],
-                &CompletionOptions::default(),
-                &mut ignored,
-            )
-            .expect_err("a rejected refresh must fail the turn");
+        let error = generate_turn(
+            &model,
+            &[ModelMessage::user("hello")],
+            &[],
+            &CompletionOptions::default(),
+            &mut ignored,
+        )
+        .await
+        .expect_err("a rejected refresh must fail the turn");
 
+        assert!(
+            matches!(&error, crate::error::InferenceError::Provider(failure)
+            if failure.status == Some(400)
+                && failure.diagnostic.contains("invalid_grant")
+                && failure.diagnostic.contains("refresh token is expired"))
+        );
         let message = error.to_string();
-        assert!(message.contains("invalid_grant"), "{message}");
-        assert!(message.contains("refresh token is expired"), "{message}");
         assert!(
             !message.contains("refresh-old"),
             "the credential reached the error message: {message}"
@@ -3363,8 +2752,8 @@ mod tests {
         assert_eq!(server.requests().len(), 4);
     }
 
-    #[test]
-    fn subscription_model_sends_required_headers_and_decodes_text() {
+    #[tokio::test]
+    async fn subscription_model_sends_required_headers_and_decodes_text() {
         let server = MockServer::start(vec![MockResponse::sse(concat!(
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
             "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"id\":\"msg_1\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}}\n\n",
@@ -3385,22 +2774,19 @@ mod tests {
         .expect("save credentials");
         let mut endpoints = ChatGptEndpoints::local(&server.base_url());
         endpoints.responses = format!("{}/responses", server.base_url());
-        let model = ChatGptCodexModel::with_endpoints(
-            "gpt-test",
-            Some(&path),
-            Duration::from_secs(2),
-            endpoints,
-        )
-        .expect("model client");
+        let model =
+            CodexClient::with_endpoints("gpt-test", Some(&path), Duration::from_secs(2), endpoints)
+                .expect("model client");
 
-        let turn = model
-            .complete(
-                &[ModelMessage::user("hello")],
-                &[],
-                &CompletionOptions::default(),
-                &mut ignored,
-            )
-            .expect("model turn");
+        let turn = generate_turn(
+            &model,
+            &[ModelMessage::user("hello")],
+            &[],
+            &CompletionOptions::default(),
+            &mut ignored,
+        )
+        .await
+        .expect("model turn");
 
         assert_eq!(turn.content.as_deref(), Some("hello"));
         let request = server.requests.lock().expect("request lock")[0].clone();
@@ -3697,8 +3083,8 @@ mod tests {
 
         assert!(matches!(refused, ChatGptError::NotLoggedIn { .. }));
     }
-    #[test]
-    fn responses_released_history_is_explicit_but_io_failure_is_not_hidden() {
+    #[tokio::test]
+    async fn responses_released_history_is_explicit_but_io_failure_is_not_hidden() {
         struct Missing(crate::asset::BlobError);
         impl crate::asset::BlobSource for Missing {
             fn pin(&self) -> Result<crate::asset::DiskBlob, crate::asset::BlobError> {
@@ -3712,7 +3098,8 @@ mod tests {
             }])
         };
         let message = message_for(crate::asset::BlobError::Reclaimed);
-        let wire = serde_json::to_value(super::responses_content(&message).unwrap())
+        let wire = request_body_json("test", &[message], &[], &CompletionOptions::default())
+            .await
             .unwrap()
             .to_string();
         assert!(
@@ -3721,6 +3108,11 @@ mod tests {
         );
         assert!(!wire.contains("image_url"));
         let message = message_for(crate::asset::BlobError::LengthChanged);
-        assert!(super::responses_content(&message).is_err());
+        assert!(matches!(
+            request_body_json("test", &[message], &[], &CompletionOptions::default()).await,
+            Err(crate::error::InferenceError::Attachment(
+                crate::asset::BlobError::LengthChanged
+            ))
+        ));
     }
 }

@@ -138,24 +138,19 @@ impl ConversationTurn {
 
     /// Renders this exchange as the messages a later session replays.
     ///
-    /// The empty `replay_items` here is load-bearing, not incidental. The ChatGPT backend gives an
-    /// assistant message two mutually exclusive serializations: a message carrying replay items is
-    /// emitted as *only* those items, and its `content` and `tool_calls` are discarded. An
-    /// assistant message reconstructed from remembered text must therefore carry no replay items,
-    /// or the remembered answer would vanish from the request without an error. The field is not
-    /// readable from outside `dekopon-model`, so this end of the contract is held by never putting
-    /// anything in it: history stores text and reconstructs the text-only shape.
+    /// History reconstructs a portable turn from text, never a native continuation. Codex emits
+    /// a native continuation instead of its portable projection, so carrying one across this
+    /// deliberately lossy boundary could silently replace the remembered answer.
     fn replay_into(&self, messages: &mut Vec<ModelMessage>) {
         messages.push(ModelMessage::user(&self.user));
         if let Some(answer) = &self.answer {
             // The remembered answer is by construction the turn that ended *without* tool calls,
             // so this reconstructs the only assistant message shape history ever holds.
-            messages.push(assistant_message(&AssistantTurn {
-                content: Some(answer.clone()),
-                tool_calls: Vec::new(),
-                usage: None,
-                replay_items: Vec::new(),
-            }));
+            messages.push(assistant_message(&AssistantTurn::new(
+                Some(answer.clone()),
+                Vec::new(),
+                None,
+            )));
         }
     }
 }

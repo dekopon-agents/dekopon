@@ -10,19 +10,19 @@ use std::{
     time::Duration,
 };
 
+use dekopon_model::error::InferenceError;
 use dekopon_model::{
     ModelText, TurnEvent,
-    model::{AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelMessage, ModelTool},
+    model::{AssistantTurn, ChatModel, CompletionOptions, ModelMessage, ModelTool},
 };
 use tokio::sync::Notify;
 
 /// Longest a scripted stream waits for its next release before the fixture, not the subject, fails.
 ///
-/// This stands in for `timeout_global` on the real client: a Responses stream that goes silent
-/// through the reasoning phase is bounded by nothing else, and a test that asserts "cancel lands
-/// only at the deadline" needs a deadline that actually arrives. A test whose subject *is* that
-/// deadline names a short one of its own through [`ScriptedStreamModel::parked`]; this is the
-/// ceiling for every other release, where waiting at all means the test has already failed.
+/// This deliberately callback-only double has no transport cancellation watch. A test of its
+/// parked wait supplies a short deadline through [`ScriptedStreamModel::parked`]; this ceiling
+/// bounds every other fixture release. Production adapters instead interrupt silent HTTP reads
+/// through `TurnControl`, so this wait does not model their cancellation latency.
 const PARK_CEILING: Duration = Duration::from_secs(30);
 
 /// A [`ChatModel`] that replays recorded stream events one at a time, on demand.
@@ -62,7 +62,7 @@ impl ScriptedStreamModel {
     ///
     /// When the transcript is not a body either backend's parser accepts, which is the fixture
     /// being wrong rather than the subject.
-    pub fn from_transcript(body: &str, turn: AssistantTurn) -> Result<Self, ModelError> {
+    pub fn from_transcript(body: &str, turn: AssistantTurn) -> Result<Self, InferenceError> {
         Ok(Self::scripted(
             dekopon_model::events_from_transcript(body)?,
             turn,
@@ -90,12 +90,10 @@ impl ScriptedStreamModel {
 
     /// A stream that sends nothing at all until it is released or `deadline` elapses.
     ///
-    /// This is the Codex reasoning phase: the request is open, the socket is silent, and the
-    /// event-boundary cancellation check has no boundary to run at. A cancel here lands at the
-    /// deadline and nowhere earlier, and that is a property to pin rather than to fix — which is
-    /// why the deadline is the caller's to choose: it stands in for the client's `timeout_global`,
-    /// and a test that has to outlast it cannot spend the fixture's own half-minute ceiling doing
-    /// so.
+    /// This double only checks cancellation through event callbacks; its fixture wait has no
+    /// transport watch. The caller chooses a short deadline to test that deliberate limitation
+    /// without waiting for the fixture ceiling. Production adapters use `TurnControl` to cancel
+    /// silent HTTP reads without waiting for an event or the deadline.
     #[must_use]
     pub fn parked(turn: AssistantTurn, deadline: Duration) -> Self {
         Self {
@@ -138,8 +136,8 @@ impl ScriptedStreamModel {
     fn wait_for_release(&self) {
         #[allow(
             clippy::let_underscore_must_use,
-            reason = "the deadline elapsing is this fixture's stand-in for timeout_global, which \
-                      is the outcome the parked-stream test asserts on rather than an error"
+            reason = "this fixture's own deadline elapsing is the outcome the parked-stream \
+                      test asserts on rather than an error"
         )]
         let _ = self
             .gate
@@ -155,8 +153,8 @@ impl ChatModel for ScriptedStreamModel {
         _messages: &[ModelMessage],
         _tools: &[ModelTool],
         _options: &CompletionOptions,
-        on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
-    ) -> Result<AssistantTurn, ModelError> {
+        on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+    ) -> Result<AssistantTurn, InferenceError> {
         self.asked.notify_one();
         let scripted = std::mem::take(&mut *self.events.lock().expect("scripted events"));
         for event in scripted {
@@ -165,9 +163,9 @@ impl ChatModel for ScriptedStreamModel {
             self.count.fetch_add(1, Ordering::SeqCst);
             self.emitted.notify_one();
             if flow.is_break() {
-                // The real client drops the body here, which closes the connection; nothing
-                // further is read and no turn exists to report.
-                return Err(ModelError::Interrupted);
+                // Production clients cancel the local exchange and drop its response, without
+                // guaranteeing closure of the pooled connection; no turn exists to report.
+                return Err(InferenceError::Cancelled);
             }
         }
         self.wait_for_release();

@@ -101,7 +101,7 @@ Who emits what:
 
 `FailureClass::of` derives a class from `PromptError` with a `match` naming every variant, so a new
 error kind is a compile error rather than a silent `Internal`. It answers `None` for a
-cancellation, including a model stream that reported `Interrupted`: a stop is an outcome, and the
+cancellation, including a model stream that reported `Cancelled`: a stop is an outcome, and the
 loop reports it as `Cancelled { by }` instead.
 
 ### Nothing else can travel
@@ -218,7 +218,8 @@ one. Nothing is persisted: a restart forgets every progress message.
 
 ## Streaming the model
 
-`dekopon-model` stays blocking and synchronous. `ChatModel::complete` takes a callback:
+The prompt loop stays synchronous. `BlockingModel` bridges `ChatModel::complete` to async
+`InferenceModel::generate` using an explicit tokio handle on the blocking session task:
 
 ```rust
 fn complete(
@@ -226,21 +227,22 @@ fn complete(
     messages: &[ModelMessage],
     tools: &[ModelTool],
     options: &CompletionOptions,
-    on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
-) -> Result<AssistantTurn, ModelError>;
+    on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+) -> Result<AssistantTurn, InferenceError>;
 ```
 
 One method, not two. Streaming is not a mode a caller opts into: an implementation that cannot
 stream calls `on_event` zero times and returns the same `AssistantTurn`, so there are never two
-paths to keep in agreement. `ControlFlow::Break` drops the response body — which closes the
-connection rather than returning it to the pool — and the call answers `ModelError::Interrupted`.
+paths to keep in agreement. `ControlFlow::Break` drops the in-flight response and the call answers
+`InferenceError::Cancelled`. This cancels the local exchange, not necessarily the whole pooled
+connection and never the remote work already accepted.
 
 The loop's closure does three things: it appends each fragment to the turn's cumulative
 `ModelText`, emits `TextDelta` with the running character count until the cumulative text passes
 the outbound answer bound, and returns `Break` when the cancellation probe says the session was
 stopped.
 
-On `Interrupted` there is no `AssistantTurn` to record, so the closure's cumulative text is the
+On `Cancelled` there is no `AssistantTurn` to record, so the closure's cumulative text is the
 only account of the turn there will ever be: the loop records `agent.model.answer` with that
 partial text and `stream.interrupted = true`, `accounting.model.turn` with `outcome = interrupted`
 and no usage — the provider reports usage in the final event that never arrived — and returns the
@@ -249,7 +251,7 @@ session's cancelled error. `prompt.model_turn` carries `stream.deltas` and, when
 complete answer lacks and would put a log line on the trace per token.
 
 `stream` is a field on OpenAI-compatible model entries only, defaulting to on; a subscription
-backend whose endpoint is Server-Sent Events end to end always streams and has no such field, since
+or OpenRouter backend always streams and has no such field, since
 a parsed-but-unhonored field is worse than no field. The chat-completions accumulator tolerates
 what real servers send: a null delta content on the role chunk, a null usage on every chunk, a
 whole tool-call argument object in one fragment, and a repeated index treated as a new call once
@@ -286,15 +288,17 @@ message that replaces the button with `Stopping…` and empty components: one ca
 atomically so a second press is impossible, no follow-up edit, and no reply lock taken.
 
 An operator shutdown is the one origin that writes nothing. The grace period expiring aborts the
-session task, so its locals drop — the cancellation guard first, then the progress handle — and the
-policy task's biased select sees the terminal receiver closed and runs only its cleanup: the
-service's indicators return to rest and the last progress line stays exactly as it was. Nothing
+session task, so its locals drop — the progress handle closes the terminal channel before the
+cancellation guard wakes blocking work — and the policy task's biased select sees the terminal
+receiver closed and runs only its cleanup: the service's indicators return to rest and the last progress line stays exactly as it was. Nothing
 survives the process either, because a progress message is session state and a restart forgets it.
 
-What cannot be interrupted: a read waiting on a silent socket, and a broker invocation already
-inside the client. In both cases the person still sees the stopped line immediately, because the
-policy renders on the compare-and-swap rather than when the loop notices, and the orphaned work
-drains in the background with its answer suppressed.
+The model transport selects on the session watch while sending and reading, so a silent socket
+can be cancelled without waiting for an event or the total deadline. Each call has its own total
+deadline; Codex's permitted refresh/resend spends the same window. The progress policy renders
+Stop independently of when transport cleanup finishes. Dropping the local request does not roll
+back remote inference or provider effects. Blocking credential/file work may still drain; no
+partial successful turn is manufactured from the text already displayed.
 
 ## Configuration
 
@@ -347,10 +351,9 @@ each have their own counted record. Every name is listed in
 
 ## Accepted limits
 
-- **A silent stream cannot be interrupted.** A backend in a phase that emits no events — a
-  reasoning phase is tens of seconds of exactly that — gives the callback nothing to run between,
-  so a stop lands at the client's global deadline. The person still sees the stopped line at once.
-  There is no cancel token, request handle, or socket shutdown on the HTTP client to add.
+- **Cancellation is not rollback.** Silent generation reads are cancellable, but a remote
+  request already accepted may still consume quota, and credential/file blocking tasks can finish
+  after their caller stops. Already accepted provider effects cannot be undone by Stop.
 - **A restart leaves a stale surface.** A progress message says "working on it" on a run nobody is
   doing any more, and a button press while the gateway is down shows the service's own interaction
   failure. Nothing is persisted and nothing cleans it up; the trace explains it.
@@ -373,9 +376,11 @@ reasoning to a person, which the `ModelText` type makes structurally impossible.
 The local transport is the reference driver: it implements every capability object and its line
 stream is what the gateway integration tests read. Beyond it, the fixtures that matter are a
 runtime that parks inside a script after reporting a tool start, a model that emits a scripted
-sequence of fragments with a rendezvous between them, a model that emits nothing at all so the
-parked-stream limit above stays pinned, recorded stream transcripts for both backends, and a
-recording driver with per-capability failure injection. Time is paused for budgets and ticks.
+sequence of fragments with a rendezvous between them, and a callback-only model that emits nothing
+so the double's cooperative-cancellation limitation stays pinned. Real socket tests separately
+prove silent-body cancellation for Codex, OpenAI-compatible and OpenRouter; synthetic transcripts
+cover all three adapters. A recording driver provides per-capability failure injection. Time is
+paused for budgets and ticks.
 
 The matrix worth keeping: every cancel origin against every stage (before the first turn, between
 fragments, during a parked tool, during delivery); a second cancel ignored; another subject's press

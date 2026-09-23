@@ -6,7 +6,12 @@ struct LateModel {
     script: Arc<ModelScript>,
 }
 impl ModelFactory for Arc<LateModel> {
-    fn build(&self, _: &ModelConfig) -> Result<SharedModel, SessionError> {
+    fn build(
+        &self,
+        _: &ModelConfig,
+        _runtime: tokio::runtime::Handle,
+        _cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<SharedModel, SessionError> {
         Ok(Arc::new(LateModelHandle(Arc::clone(self))))
     }
 }
@@ -17,8 +22,8 @@ impl ChatModel for LateModelHandle {
         messages: &[ModelMessage],
         tools: &[ModelTool],
         options: &CompletionOptions,
-        on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
-    ) -> Result<AssistantTurn, ModelError> {
+        on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+    ) -> Result<AssistantTurn, InferenceError> {
         BlockedHandle(Arc::clone(&self.0.blocked)).complete(messages, tools, options, on_event)?;
         ScriptedModel(Arc::clone(&self.0.script)).complete(messages, tools, options, on_event)
     }

@@ -30,11 +30,12 @@ use dekopon_broker_protocol::{
 };
 use dekopon_config::LocalCatalog;
 use dekopon_core::ExternalSubject;
+use dekopon_model::error::InferenceError;
 use dekopon_model::{
     TurnEvent,
     model::{
-        AssistantTurn, ChatModel, CompletionOptions, ModelError, ModelFunctionCall, ModelMessage,
-        ModelTool, ModelToolCall,
+        AssistantTurn, ChatModel, CompletionOptions, ModelFunctionCall, ModelMessage, ModelTool,
+        ModelToolCall,
     },
 };
 use dekopon_test_support::{
@@ -2256,7 +2257,12 @@ impl ModelScript {
 }
 
 impl ModelFactory for Arc<ModelScript> {
-    fn build(&self, _model: &ModelConfig) -> Result<SharedModel, SessionError> {
+    fn build(
+        &self,
+        _model: &ModelConfig,
+        _runtime: tokio::runtime::Handle,
+        _cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<SharedModel, SessionError> {
         self.builds.fetch_add(1, Ordering::SeqCst);
         Ok(Arc::new(ScriptedModel(Arc::clone(self))))
     }
@@ -2274,8 +2280,8 @@ impl ChatModel for ScriptedModel {
         messages: &[ModelMessage],
         tools: &[ModelTool],
         options: &CompletionOptions,
-        _on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
-    ) -> Result<AssistantTurn, ModelError> {
+        _on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+    ) -> Result<AssistantTurn, InferenceError> {
         assert!(!self.0.forbidden, "this session must never reach a model");
         self.0
             .prompts
@@ -2299,91 +2305,84 @@ impl ChatModel for ScriptedModel {
             .expect("scripted turn lock")
             .pop_front()
             .flatten()
-            .ok_or(ModelError::NoChoices)
+            .ok_or(InferenceError::Protocol(
+                dekopon_model::error::ProtocolFailure::NoChoices,
+            ))
     }
 }
 
 fn answer(text: &str) -> AssistantTurn {
-    AssistantTurn {
-        content: Some(text.to_owned()),
-        tool_calls: Vec::new(),
-        usage: None,
-        replay_items: Vec::new(),
-    }
+    AssistantTurn::new(Some(text.to_owned()), Vec::new(), None)
 }
 
 /// The tool the gateway used to offer and no longer does.
 fn generate_image(prompt: &str) -> AssistantTurn {
-    AssistantTurn {
-        content: None,
-        tool_calls: vec![ModelToolCall {
-            id: "image-call".to_owned(),
+    AssistantTurn::new(
+        None,
+        vec![ModelToolCall {
+            id: "image-call".into(),
             kind: "function".to_owned(),
             function: ModelFunctionCall {
                 name: "generate_image".to_owned(),
                 arguments: json!({"prompt": prompt}).to_string(),
             },
         }],
-        usage: None,
-        replay_items: Vec::new(),
-    }
+        None,
+    )
 }
 
 fn script_call(script: &str) -> AssistantTurn {
-    AssistantTurn {
-        content: None,
-        tool_calls: vec![ModelToolCall {
-            id: "script-call".to_owned(),
+    AssistantTurn::new(
+        None,
+        vec![ModelToolCall {
+            id: "script-call".into(),
             kind: "function".to_owned(),
             function: ModelFunctionCall {
                 name: "bash".to_owned(),
                 arguments: json!({"script": script}).to_string(),
             },
         }],
-        usage: None,
-        replay_items: Vec::new(),
-    }
+        None,
+    )
 }
 
 fn decline_reply() -> AssistantTurn {
-    AssistantTurn {
-        content: None,
-        tool_calls: vec![ModelToolCall {
-            id: "decline-call".to_owned(),
+    AssistantTurn::new(
+        None,
+        vec![ModelToolCall {
+            id: "decline-call".into(),
             kind: "function".to_owned(),
             function: ModelFunctionCall {
                 name: DECLINE_REPLY_TOOL_NAME.to_owned(),
                 arguments: "{}".to_owned(),
             },
         }],
-        usage: None,
-        replay_items: Vec::new(),
-    }
+        None,
+    )
 }
 
 /// One model turn asking for a mounted skill's body.
 fn read_skill(name: &str) -> AssistantTurn {
-    AssistantTurn {
-        content: None,
-        tool_calls: vec![ModelToolCall {
-            id: format!("skill-{name}"),
+    AssistantTurn::new(
+        None,
+        vec![ModelToolCall {
+            id: format!("skill-{name}").into(),
             kind: "function".to_owned(),
             function: ModelFunctionCall {
                 name: SKILL_TOOL_NAME.to_owned(),
                 arguments: json!({"name": name}).to_string(),
             },
         }],
-        usage: None,
-        replay_items: Vec::new(),
-    }
+        None,
+    )
 }
 
 /// One model turn tapping the glass.
 fn suggest_improvement() -> AssistantTurn {
-    AssistantTurn {
-        content: None,
-        tool_calls: vec![ModelToolCall {
-            id: "suggestion-1".to_owned(),
+    AssistantTurn::new(
+        None,
+        vec![ModelToolCall {
+            id: "suggestion-1".into(),
             kind: "function".to_owned(),
             function: ModelFunctionCall {
                 name: IMPROVEMENT_TOOL_NAME.to_owned(),
@@ -2398,9 +2397,8 @@ fn suggest_improvement() -> AssistantTurn {
                 .to_string(),
             },
         }],
-        usage: None,
-        replay_items: Vec::new(),
-    }
+        None,
+    )
 }
 
 /// Writes one small skill under `root` and loads it the way the catalog would.
@@ -2431,19 +2429,18 @@ fn tool_message(models: &ModelScript, index: usize) -> String {
 }
 
 fn inspect_agent_config() -> AssistantTurn {
-    AssistantTurn {
-        content: None,
-        tool_calls: vec![ModelToolCall {
-            id: "config-call".to_owned(),
+    AssistantTurn::new(
+        None,
+        vec![ModelToolCall {
+            id: "config-call".into(),
             kind: "function".to_owned(),
             function: ModelFunctionCall {
                 name: AGENT_CONFIG_TOOL_NAME.to_owned(),
                 arguments: "{}".to_owned(),
             },
         }],
-        usage: None,
-        replay_items: Vec::new(),
-    }
+        None,
+    )
 }
 
 /// One liveness target as the short string the shared recorder logs.
@@ -3264,7 +3261,12 @@ impl BlockedModel {
 }
 
 impl ModelFactory for Arc<BlockedModel> {
-    fn build(&self, _model: &ModelConfig) -> Result<SharedModel, SessionError> {
+    fn build(
+        &self,
+        _model: &ModelConfig,
+        _runtime: tokio::runtime::Handle,
+        _cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<SharedModel, SessionError> {
         Ok(Arc::new(BlockedHandle(Arc::clone(self))))
     }
 }
@@ -3282,8 +3284,8 @@ impl ChatModel for BlockedHandle {
         _messages: &[ModelMessage],
         _tools: &[ModelTool],
         _options: &CompletionOptions,
-        _on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
-    ) -> Result<AssistantTurn, ModelError> {
+        _on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+    ) -> Result<AssistantTurn, InferenceError> {
         if let Some(sender) = self.0.entered.lock().expect("entered lock").take() {
             let _ = sender.send(());
         }
@@ -4386,19 +4388,18 @@ async fn aborting_the_async_session_cancels_later_blocking_tool_work() {
         ],
     )
     .await;
-    let model = BlockedModel::with_turn(AssistantTurn {
-        content: None,
-        tool_calls: vec![ModelToolCall {
-            id: "late-tool".to_owned(),
+    let model = BlockedModel::with_turn(AssistantTurn::new(
+        None,
+        vec![ModelToolCall {
+            id: "late-tool".into(),
             kind: "function".to_owned(),
             function: ModelFunctionCall {
                 name: "bash".to_owned(),
                 arguments: json!({"script": "probe upper --text late"}).to_string(),
             },
         }],
-        usage: None,
-        replay_items: Vec::new(),
-    });
+        None,
+    ));
     let driver = Arc::new(RecordingDriver::default());
     let session = tokio::spawn(run_session(
         runner_with(
@@ -4438,7 +4439,8 @@ async fn aborting_the_async_session_cancels_later_blocking_tool_work() {
             .is_err(),
         "the cancellation guard prevents the model's late tool call reaching the broker"
     );
-    assert!(driver.replies().is_empty());
+    let replies = driver.replies();
+    assert!(replies.is_empty(), "an aborted owner delivered {replies:?}");
 }
 
 /// The catalog's skills ride the bound route, so a session never touches the filesystem.
@@ -5150,10 +5152,9 @@ async fn a_one_shot_route_starts_from_an_empty_prompt_every_message() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn one_client_serves_every_message_routed_to_the_same_model() {
-    // A model client owns an HTTP agent and its connection pool, so a client per message paid a
-    // fresh TCP and TLS handshake before the first token of every answer. Sharing is only correct
-    // because the prompt cache key is request-scoped, which the cache-key tests above pin down.
+async fn each_session_obtains_its_own_model_binding() {
+    // The real factory caches the pooled client; this seam is invoked per session so its
+    // blocking bridge cannot retain another session's cancellation receiver.
     let directory = temporary();
     let (broker, _observed) =
         stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
@@ -5174,8 +5175,8 @@ async fn one_client_serves_every_message_routed_to_the_same_model() {
     assert_eq!(models.requests(), 2, "both messages reached the model");
     assert_eq!(
         models.builds(),
-        1,
-        "the second message reused the first message's client"
+        2,
+        "each message received a session binding"
     );
 }
 
@@ -5561,8 +5562,15 @@ async fn a_failed_session_records_the_question_it_could_not_answer() {
 struct UnbuildableModel;
 
 impl ModelFactory for UnbuildableModel {
-    fn build(&self, _model: &ModelConfig) -> Result<SharedModel, SessionError> {
-        Err(SessionError::Model(ModelError::NoChoices))
+    fn build(
+        &self,
+        _model: &ModelConfig,
+        _runtime: tokio::runtime::Handle,
+        _cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<SharedModel, SessionError> {
+        Err(SessionError::Model(InferenceError::Protocol(
+            dekopon_model::error::ProtocolFailure::NoChoices,
+        )))
     }
 }
 
@@ -6372,7 +6380,12 @@ async fn a_one_shot_route_sends_every_sender_to_the_route_s_own_lane() {
 struct KeylessModel;
 
 impl ModelFactory for KeylessModel {
-    fn build(&self, _model: &ModelConfig) -> Result<SharedModel, SessionError> {
+    fn build(
+        &self,
+        _model: &ModelConfig,
+        _runtime: tokio::runtime::Handle,
+        _cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<SharedModel, SessionError> {
         Ok(Arc::new(Self))
     }
 }
@@ -6383,8 +6396,8 @@ impl ChatModel for KeylessModel {
         messages: &[ModelMessage],
         _tools: &[ModelTool],
         _options: &CompletionOptions,
-        _on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
-    ) -> Result<AssistantTurn, ModelError> {
+        _on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+    ) -> Result<AssistantTurn, InferenceError> {
         Ok(answer(
             messages
                 .last()
@@ -12220,7 +12233,12 @@ async fn parked_broker(
 /// configured model is exactly what the fixture wants: every session in a test releases events from
 /// the same script, which is what makes "the stream stopped at this event" an assertion at all.
 impl ModelFactory for Arc<dekopon_test_support::ScriptedStreamModel> {
-    fn build(&self, _model: &ModelConfig) -> Result<SharedModel, SessionError> {
+    fn build(
+        &self,
+        _model: &ModelConfig,
+        _runtime: tokio::runtime::Handle,
+        _cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<SharedModel, SessionError> {
         Ok(Arc::clone(self) as SharedModel)
     }
 }
@@ -12438,7 +12456,12 @@ impl ModelFactory for Arc<ParkedBuild> {
         reason = "both halves are the test's own rendezvous: an unobserved entry signal fails \
                   wait_until_building, and a release that never arrives is bounded by the timeout"
     )]
-    fn build(&self, _model: &ModelConfig) -> Result<SharedModel, SessionError> {
+    fn build(
+        &self,
+        _model: &ModelConfig,
+        _runtime: tokio::runtime::Handle,
+        _cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<SharedModel, SessionError> {
         if let Some(sender) = self.entered.lock().expect("entered lock").take() {
             let _ = sender.send(());
         }
@@ -12457,8 +12480,8 @@ impl ChatModel for ParkedBuildHandle {
         _messages: &[ModelMessage],
         _tools: &[ModelTool],
         _options: &CompletionOptions,
-        _on_event: &mut dyn FnMut(TurnEvent) -> ControlFlow<()>,
-    ) -> Result<AssistantTurn, ModelError> {
+        _on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
+    ) -> Result<AssistantTurn, InferenceError> {
         self.0.requests.fetch_add(1, Ordering::SeqCst);
         Ok(answer("the turn nobody asked for"))
     }
@@ -13135,17 +13158,18 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
         ]).collect()).await;
         let models = ModelScript::new((0..3).flat_map(|edit| {
             [
-                AssistantTurn {
-                    tool_calls: vec![ModelToolCall {
-                        id: "asset-call".to_owned(),
+                AssistantTurn::new(
+                    Some(String::new()),
+                    vec![ModelToolCall {
+                        id: "asset-call".into(),
                         kind: "function".to_owned(),
                         function: ModelFunctionCall {
                             name: "fetch_chat_asset".to_owned(),
                             arguments: json!({"id":edit + 1}).to_string(),
                         },
                     }],
-                    ..answer("")
-                },
+                    None,
+                ),
                 script_call(&format!(
                     "gpt-image edit --prompt 'purple sky' --image chat-asset:{}",
                     edit + 1
@@ -14029,8 +14053,9 @@ async fn generated_only_session_publishes_fetch_tool_and_reuses_result_before_ne
     ]).await;
     let models = ModelScript::new([
         script_call("gpt-image edit --prompt first"),
-        AssistantTurn {
-            tool_calls: vec![ModelToolCall {
+        AssistantTurn::new(
+            Some(String::new()),
+            vec![ModelToolCall {
                 id: "generated-fetch".into(),
                 kind: "function".into(),
                 function: ModelFunctionCall {
@@ -14038,8 +14063,8 @@ async fn generated_only_session_publishes_fetch_tool_and_reuses_result_before_ne
                     arguments: "{\"id\":1}".into(),
                 },
             }],
-            ..answer("")
-        },
+            None,
+        ),
         script_call("gpt-image edit --prompt 'edit result' --image chat-asset:1"),
         answer("Two produced images."),
     ]);

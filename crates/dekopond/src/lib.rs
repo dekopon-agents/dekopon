@@ -164,7 +164,7 @@ where
 
     let runner = Arc::new(SessionRunner {
         broker: config.broker.clone(),
-        models: Arc::new(ModelCache::new(Arc::new(ConfiguredModels))),
+        models: Arc::new(ModelCache::new(Arc::new(ConfiguredModels::default()))),
         gate: SessionGate::new(config.sessions.max_concurrent),
         reply_on_busy: config.sessions.reply_on_busy,
         conversations: ConversationStore::new(config.sessions.max_conversations),
@@ -601,6 +601,54 @@ where
     }
 }
 
+fn model_credential_problems<'a>(
+    models: impl IntoIterator<Item = &'a config::ModelConfig>,
+    mut resolve: impl FnMut(
+        &config::ModelConfig,
+    ) -> Result<Option<String>, session::ModelCredentialError>,
+) -> Vec<StartupProblem> {
+    models
+        .into_iter()
+        .filter_map(|model| resolve(model).err().map(StartupProblem::ModelCredential))
+        .collect()
+}
+
+#[cfg(test)]
+mod openrouter_startup_tests {
+    use super::*;
+
+    #[test]
+    fn missing_and_blank_openrouter_credentials_are_startup_problems_not_config_problems() {
+        let model = config::ModelConfig::Openrouter {
+            name: "router".into(),
+            model: "vendor/model".into(),
+            api_key_env: "OPENROUTER_API_KEY".into(),
+            timeout_ms: 1000,
+            classes: Vec::new(),
+            modalities: Vec::new(),
+            generation: None,
+            reasoning: None,
+            routing: None,
+            cache: None,
+        };
+        for value in [None, Some(std::ffi::OsString::from("  "))] {
+            let problems = model_credential_problems([&model], |model| {
+                session::model_bearer_token_with(model, |variable| {
+                    assert_eq!(variable, "OPENROUTER_API_KEY");
+                    value.clone()
+                })
+            });
+            assert!(
+                matches!(problems.as_slice(), [StartupProblem::ModelCredential(error)] if error.variable == "OPENROUTER_API_KEY" && error.model == "router")
+            );
+        }
+        let problems = model_credential_problems([&model], |model| {
+            session::model_bearer_token_with(model, |_| Some("synthetic-key".into()))
+        });
+        assert!(problems.is_empty());
+    }
+}
+
 /// Resolves every credential this daemon holds and builds every transport, before any of them
 /// authenticates.
 ///
@@ -614,12 +662,7 @@ where
 /// Every problem is collected, so an operator who forgot two secrets in a deployment manifest is
 /// told about both at once.
 fn prepare(config: &ResolvedConfig, routes: &RoutingTable) -> Result<Prepared, DekopondError> {
-    let mut problems = Vec::new();
-    for model in routes.bound_models() {
-        if let Err(source) = model_bearer_token(model) {
-            problems.push(StartupProblem::ModelCredential(source));
-        }
-    }
+    let mut problems = model_credential_problems(routes.bound_models(), model_bearer_token);
     let mut transports = Vec::with_capacity(config.transports.len());
     for spec in &config.transports {
         match build_transport(spec) {

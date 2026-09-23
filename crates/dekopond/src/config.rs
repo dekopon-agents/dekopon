@@ -562,6 +562,21 @@ pub enum ModelConfig {
         #[serde(default)]
         modalities: Vec<Modality>,
     },
+    /// OpenRouter chat completions with immutable authored controls.
+    Openrouter {
+        name: String,
+        model: String,
+        api_key_env: String,
+        timeout_ms: u64,
+        #[serde(default)]
+        classes: Vec<String>,
+        #[serde(default)]
+        modalities: Vec<Modality>,
+        generation: Option<dekopon_model::openrouter::settings::Generation>,
+        reasoning: Option<dekopon_model::openrouter::settings::Reasoning>,
+        routing: Option<dekopon_model::openrouter::settings::Routing>,
+        cache: Option<dekopon_model::openrouter::settings::Cache>,
+    },
     /// OpenAI's Codex Responses endpoint using Dekopon's own device-flow credential file.
     ChatgptSubscription {
         name: String,
@@ -599,7 +614,9 @@ impl ModelConfig {
     #[must_use]
     pub fn name(&self) -> &str {
         match self {
-            Self::OpenaiCompatible { name, .. } | Self::ChatgptSubscription { name, .. } => name,
+            Self::OpenaiCompatible { name, .. }
+            | Self::ChatgptSubscription { name, .. }
+            | Self::Openrouter { name, .. } => name,
         }
     }
 
@@ -608,7 +625,8 @@ impl ModelConfig {
     pub fn accepts_images(&self) -> bool {
         match self {
             Self::OpenaiCompatible { modalities, .. }
-            | Self::ChatgptSubscription { modalities, .. } => modalities.contains(&Modality::Image),
+            | Self::ChatgptSubscription { modalities, .. }
+            | Self::Openrouter { modalities, .. } => modalities.contains(&Modality::Image),
         }
     }
 
@@ -616,16 +634,17 @@ impl ModelConfig {
     #[must_use]
     pub fn classes(&self) -> &[String] {
         match self {
-            Self::OpenaiCompatible { classes, .. } | Self::ChatgptSubscription { classes, .. } => {
-                classes
-            }
+            Self::OpenaiCompatible { classes, .. }
+            | Self::ChatgptSubscription { classes, .. }
+            | Self::Openrouter { classes, .. } => classes,
         }
     }
 
     fn timeout_ms(&self) -> u64 {
         match self {
             Self::OpenaiCompatible { timeout_ms, .. }
-            | Self::ChatgptSubscription { timeout_ms, .. } => *timeout_ms,
+            | Self::ChatgptSubscription { timeout_ms, .. }
+            | Self::Openrouter { timeout_ms, .. } => *timeout_ms,
         }
     }
 }
@@ -1302,10 +1321,39 @@ pub(crate) fn resolve(
             continue;
         }
         if model.timeout_ms() == 0 {
-            problems.push(ConfigProblem::InvalidModelTimeout { name });
+            problems.push(ConfigProblem::InvalidModelTimeout { name: name.clone() });
+        }
+        if let ModelConfig::Openrouter {
+            model: id,
+            generation,
+            reasoning,
+            routing,
+            cache,
+            ..
+        } = model
+        {
+            if id.trim().is_empty() {
+                problems.push(ConfigProblem::EmptyModelId { name: name.clone() });
+            }
+            let settings = dekopon_model::openrouter::settings::Settings {
+                generation: generation.clone(),
+                reasoning: reasoning.clone(),
+                routing: routing.clone(),
+                cache: cache.clone(),
+            };
+            problems.extend(settings.problems().into_iter().map(|problem| {
+                ConfigProblem::OpenRouterSetting {
+                    name: name.clone(),
+                    problem,
+                }
+            }));
         }
         if let ModelConfig::OpenaiCompatible {
             api_key_env: Some(variable),
+            ..
+        }
+        | ModelConfig::Openrouter {
+            api_key_env: variable,
             ..
         } = model
         {
@@ -1945,6 +1993,15 @@ pub enum ConfigError {
 /// [`ConfigError::Invalid`], which owns the source path they all share.
 #[derive(Debug, Error)]
 pub enum ConfigProblem {
+    /// An OpenRouter model identifier is required, without a catalog restriction.
+    #[error("model {name:?} requires a nonempty model identifier")]
+    EmptyModelId { name: String },
+    /// One invalid authored OpenRouter control, collected with every other config problem.
+    #[error("model {name:?}: {problem}")]
+    OpenRouterSetting {
+        name: String,
+        problem: dekopon_model::openrouter::settings::SettingsProblem,
+    },
     #[error("gateway configuration must declare at least one transport")]
     NoTransports,
     #[error("gateway configuration must declare at least one model")]
@@ -2461,6 +2518,155 @@ mod tests {
          \x20   conversation: { kind: [directMessage] }\n\
          \x20   agent: reviewer\n";
 
+    fn router_document(kind: &str, blocks: &str) -> String {
+        format!(
+            "{HEAD}models:\n  - name: router\n    kind: {kind}\n    model: any/model\n    apiKeyEnv: OPENROUTER_API_KEY\n    timeoutMs: 1000\n{blocks}{TAIL}"
+        )
+    }
+
+    #[test]
+    fn openrouter_defaults_and_every_authored_block_decode_without_new_legacy_keys() {
+        let default = super::decode(router_document("openrouter", "").as_bytes()).unwrap();
+        assert!(
+            matches!(&default.models[0], ModelConfig::Openrouter { classes, modalities, generation: None, reasoning: None, routing: None, cache: None, .. } if classes.is_empty() && modalities.is_empty())
+        );
+        let authored = super::decode(router_document("openrouter", "    classes: [general]\n    modalities: [image]\n    generation: {maxOutputTokens: 4096, temperature: 2.0, topP: 1.0}\n    reasoning: {effort: max}\n    routing: {allowFallbacks: false, requireParameters: true, only: [alpha]}\n    cache: {style: explicitPrefix, ttl: 1h}\n").as_bytes()).unwrap();
+        assert!(authored.models[0].accepts_images());
+        assert_eq!(authored.models[0].classes(), &["general"]);
+        assert!(
+            resolve(
+                authored,
+                PathBuf::from("/tmp/gateway.yaml"),
+                &BrokerSocketDiscovery::new(None, None, Some(PathBuf::from("/run/user/501")), None),
+                501
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            super::decode(router_document("openRouter", "").as_bytes()),
+            Err(ConfigError::Decode { .. })
+        ));
+        for field in [
+            "endpoint: https://example.test",
+            "stream: false",
+            "authFile: secret",
+            "generation: {extra: 1}",
+            "reasoning: {effort: medium, extra: 1}",
+            "routing: {extra: true}",
+            "cache: {style: automatic, extra: 1}",
+            "reasoning: {}",
+            "cache: {}",
+            "reasoning: {effort: extreme}",
+            "cache: {style: explicitPrefix, ttl: 2h}",
+            "generation: {maxOutputTokens: -1}",
+            "generation: {maxOutputTokens: 0}",
+        ] {
+            assert!(
+                matches!(
+                    super::decode(
+                        router_document("openrouter", &format!("    {field}\n")).as_bytes()
+                    ),
+                    Err(ConfigError::Decode { .. })
+                ),
+                "{field}"
+            );
+        }
+        for kind in ["chatgptSubscription", "openaiCompatible"] {
+            for block in [
+                "generation: {}",
+                "reasoning: {effort: medium}",
+                "routing: {}",
+                "cache: {style: automatic}",
+            ] {
+                let mut document = router_document(kind, &format!("    {block}\n"));
+                if kind == "chatgptSubscription" {
+                    document = document.replace("    apiKeyEnv: OPENROUTER_API_KEY\n", "");
+                } else {
+                    document = document.replace(
+                        "    timeoutMs:",
+                        "    endpoint: http://127.0.0.1:1234/v1\n    timeoutMs:",
+                    );
+                }
+                assert!(
+                    matches!(
+                        super::decode(document.as_bytes()),
+                        Err(ConfigError::Decode { .. })
+                    ),
+                    "{kind} {block}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn openrouter_collects_all_numeric_routing_and_cache_problems_together() {
+        let document = router_document(
+            "openrouter",
+            "    generation: {temperature: .nan, topP: 0.0}\n    routing: {only: [alpha, ' ']}\n    cache: {style: automatic, ttl: 5m}\n",
+        );
+        let config = super::decode(document.as_bytes()).unwrap();
+        let error = resolve(
+            config,
+            PathBuf::from("/tmp/gateway.yaml"),
+            &BrokerSocketDiscovery::new(None, None, Some(PathBuf::from("/run/user/501")), None),
+            501,
+        )
+        .unwrap_err();
+        let ConfigError::Invalid { problems, .. } = error else {
+            panic!("expected collected semantic problems");
+        };
+        let actual = problems
+            .iter()
+            .filter_map(|problem| match problem {
+                super::ConfigProblem::OpenRouterSetting { problem, .. } => Some(*problem),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        use dekopon_model::openrouter::settings::SettingsProblem::*;
+        assert_eq!(actual, vec![Temperature, TopP, EmptyProvider, AutomaticTtl]);
+    }
+
+    #[test]
+    fn openrouter_rejects_an_empty_model_empty_only_and_nonfinite_controls() {
+        for (blocks, expected) in [
+            (
+                "    generation: {temperature: .inf}\n",
+                dekopon_model::openrouter::settings::SettingsProblem::Temperature,
+            ),
+            (
+                "    generation: {topP: .nan}\n",
+                dekopon_model::openrouter::settings::SettingsProblem::TopP,
+            ),
+            (
+                "    routing: {only: []}\n",
+                dekopon_model::openrouter::settings::SettingsProblem::EmptyOnly,
+            ),
+        ] {
+            let config = super::decode(
+                router_document("openrouter", blocks)
+                    .replace("model: any/model", "model: ' '")
+                    .as_bytes(),
+            )
+            .unwrap();
+            let error = resolve(
+                config,
+                PathBuf::from("/tmp/gateway.yaml"),
+                &BrokerSocketDiscovery::new(None, None, Some(PathBuf::from("/run/user/501")), None),
+                501,
+            )
+            .unwrap_err();
+            let ConfigError::Invalid { problems, .. } = error else {
+                panic!("expected semantic problems");
+            };
+            assert!(
+                problems
+                    .iter()
+                    .any(|problem| matches!(problem, super::ConfigProblem::EmptyModelId { .. }))
+            );
+            assert!(problems.iter().any(|problem| matches!(problem, super::ConfigProblem::OpenRouterSetting { problem, .. } if *problem == expected)));
+        }
+    }
+
     /// Only the kind that has a choice about streaming carries the switch, and its default is on.
     ///
     /// The default is the half worth pinning: a model block written before streaming existed
@@ -2492,7 +2698,7 @@ mod tests {
             .iter()
             .filter_map(|model| match model {
                 ModelConfig::OpenaiCompatible { stream, .. } => Some(*stream),
-                ModelConfig::ChatgptSubscription { .. } => None,
+                ModelConfig::ChatgptSubscription { .. } | ModelConfig::Openrouter { .. } => None,
             })
             .collect();
         assert_eq!(

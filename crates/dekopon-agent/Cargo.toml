@@ -33,10 +33,15 @@ tokio.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+dekopon-test-support = { path = "../dekopon-test-support" }
 base64.workspace = true
 dekopon-capability.workspace = true
 rustix.workspace = true
 tempfile.workspace = true
+
+[[example]]
+name = "compare_models"
+test = true
 
 [lints]
 workspace = true

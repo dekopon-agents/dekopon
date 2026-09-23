@@ -1,6 +1,6 @@
 //! A scripted loopback HTTP endpoint for transport tests.
 //!
-//! Both transports in this crate are ureq clients, and the behavior worth pinning is what they put
+//! The clients use real HTTP sockets, and the behavior worth pinning is what they put
 //! on the wire and what they do with what comes back — including a connection that dies mid-flight,
 //! which no in-process fake can produce.
 
@@ -22,15 +22,88 @@ pub(crate) struct MockResponse {
     /// Closes the connection after reading the request instead of answering, which is what a
     /// dropped packet or a reset TLS session looks like to the client.
     hang_up: bool,
+    delivery: Delivery,
+    headers: Vec<(&'static str, String)>,
+    header_gate: Option<HeaderGate>,
+}
+
+struct HeaderGate {
+    ready: tokio::sync::oneshot::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+enum Delivery {
+    Whole,
+    Split(usize),
+    Interrupted(usize),
+    Stalled {
+        ready: tokio::sync::oneshot::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    },
 }
 
 impl MockResponse {
+    pub(crate) fn held_before_headers(
+        mut self,
+    ) -> (
+        Self,
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (ready, observed) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        self.header_gate = Some(HeaderGate {
+            ready,
+            release: released,
+        });
+        (self, observed, release)
+    }
+
+    pub(crate) fn interrupted_at(mut self, bytes: usize) -> Self {
+        self.delivery = Delivery::Interrupted(bytes);
+        self
+    }
+
+    pub(crate) fn split(mut self, bytes_per_write: usize) -> Self {
+        self.delivery = Delivery::Split(bytes_per_write);
+        self
+    }
+
+    pub(crate) fn header(mut self, name: &'static str, value: &str) -> Self {
+        self.headers.push((name, value.to_owned()));
+        self
+    }
+
+    pub(crate) fn stalled(
+        self,
+    ) -> (
+        Self,
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (ready, observed) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        (
+            Self {
+                delivery: Delivery::Stalled {
+                    ready,
+                    release: released,
+                },
+                ..self
+            },
+            observed,
+            release,
+        )
+    }
     pub(crate) fn json(body: Value) -> Self {
         Self {
             status: 200,
             content_type: "application/json",
             body: body.to_string(),
             hang_up: false,
+            delivery: Delivery::Whole,
+            headers: Vec::new(),
+            header_gate: None,
         }
     }
 
@@ -40,6 +113,9 @@ impl MockResponse {
             content_type: "text/event-stream",
             body: body.to_owned(),
             hang_up: false,
+            delivery: Delivery::Whole,
+            headers: Vec::new(),
+            header_gate: None,
         }
     }
 
@@ -50,6 +126,9 @@ impl MockResponse {
             content_type: "application/json",
             body: body.to_string(),
             hang_up: false,
+            delivery: Delivery::Whole,
+            headers: Vec::new(),
+            header_gate: None,
         }
     }
 
@@ -59,6 +138,9 @@ impl MockResponse {
             content_type: "text/plain",
             body: String::new(),
             hang_up: true,
+            delivery: Delivery::Whole,
+            headers: Vec::new(),
+            header_gate: None,
         }
     }
 }
@@ -79,7 +161,8 @@ impl MockServer {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let thread_requests = Arc::clone(&requests);
         let handle = thread::spawn(move || {
-            for response in responses {
+            let mut held = Vec::new();
+            for mut response in responses {
                 let Ok((mut stream, _)) = listener.accept() else {
                     break;
                 };
@@ -90,15 +173,19 @@ impl MockServer {
                 if response.hang_up {
                     continue;
                 }
-                write!(
-                    stream,
-                    "HTTP/1.1 {} OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    response.status,
-                    response.content_type,
-                    response.body.len(),
-                    response.body
-                )
-                .expect("write response");
+                if let Some(gate) = response.header_gate.take() {
+                    held.push(thread::spawn(move || {
+                        let _receiver_closed = gate.ready.send(());
+                        let _released_or_dropped =
+                            gate.release.recv_timeout(Duration::from_secs(5));
+                        write_response(&mut stream, response);
+                    }));
+                } else {
+                    write_response(&mut stream, response);
+                }
+            }
+            for worker in held {
+                worker.join().expect("held response thread");
             }
         });
         Self {
@@ -115,6 +202,54 @@ impl MockServer {
     /// Every request the endpoint received, in order.
     pub(crate) fn requests(&self) -> Vec<String> {
         self.requests.lock().expect("request lock").clone()
+    }
+}
+
+fn write_response(stream: &mut TcpStream, response: MockResponse) {
+    let headers = response
+        .headers
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect::<String>();
+    if write!(
+        stream,
+        "HTTP/1.1 {} OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n{}\r\n",
+        response.status,
+        response.content_type,
+        response.body.len(),
+        headers
+    )
+    .is_err()
+    {
+        return;
+    }
+    match response.delivery {
+        Delivery::Whole => {
+            let _closed = stream.write_all(response.body.as_bytes());
+        }
+        Delivery::Interrupted(bytes) => {
+            let prefix = response
+                .body
+                .as_bytes()
+                .get(..bytes)
+                .expect("fixture prefix");
+            let _closed = stream.write_all(prefix);
+        }
+        Delivery::Split(size) => {
+            stream
+                .set_nodelay(true)
+                .expect("disable Nagle for split regression");
+            for chunk in response.body.as_bytes().chunks(size) {
+                if stream.write_all(chunk).is_err() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
+        }
+        Delivery::Stalled { ready, release } => {
+            let _receiver_closed = ready.send(());
+            let _released_or_dropped = release.recv_timeout(Duration::from_secs(5));
+        }
     }
 }
 
