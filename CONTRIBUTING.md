@@ -68,11 +68,11 @@ These recurring failure patterns are review requirements, not just lint suggesti
 - Classify errors on the axis callers act on: retryable versus permanent and executed versus not-executed. Never report permanent exhaustion as transient, completed work as timed out, or exit successfully with daemon work dead.
 - Report every validation conflict together, then fail; never stop at the first conflict or use last-wins duplicate keys.
 - Never hold `Entered`/`EnteredSpan` guards across `.await`; use `.instrument(span)` or `in_scope`.
-- Bound everything that grows or blocks and give it an owner. Enforce peer-claimed lengths rather than preallocating from them; deduplicate or evict state retained across turns; give spawned threads, connections, and network reads deadlines and exit observers.
+- Bound everything that grows or blocks and give it an owner, following [AGENTS.md § Concurrency](AGENTS.md#concurrency). Admit before spawning; a blocking job that can outlive its caller carries its permit. Enforce peer-claimed lengths rather than preallocating from them; deduplicate or evict state retained across turns; give spawned threads, connections, and network reads deadlines and exit observers.
 - Construct expensive HTTP/model clients, Wasmtime engines, linkers, compiled components, and workers once at process or session scope, not per request or invocation.
 - Every new public item, dependency, config field, and error variant needs a non-test consumer in the same PR; otherwise make it private or delete it. Parsed-but-unread config and unreachable variants are not scaffolding to retain.
 - Keep one definition per fact. A validator or constant mirroring an authority must share the definition or carry an equality-pinning test; a mirror must not accept what the authority rejects.
-- Preserve the lints defined in [`Cargo.toml`](Cargo.toml) and [`clippy.toml`](clippy.toml), including the bans on `dbg!`, `todo!`, and `unimplemented!`. Any justified allowance is site-scoped with a reason explaining why it is safe, never widened to a module or crate.
+- Preserve the lints defined in [`Cargo.toml`](Cargo.toml) and [`clippy.toml`](clippy.toml), including the bans on `dbg!`, `todo!`, and `unimplemented!`. Any justified allowance is site-scoped with a reason explaining why it is safe, never widened to a module or crate. The one exception is the concurrency bans in `clippy.toml`, which tests lift at each crate root and integration-test file.
 
 ## Pull requests
 
