@@ -302,6 +302,10 @@ impl ModelCache {
 pub(crate) struct SessionGate {
     permits: Arc<Semaphore>,
     late_permits: Arc<Semaphore>,
+    /// Refusal, busy and stopped replies waiting on a chat service. They are not sessions, but on
+    /// Discord they queue on the same REST lock as real answers, so a flood of them would delay
+    /// the answers they are refusing on behalf of.
+    refusals: Arc<Semaphore>,
     in_flight: Arc<Mutex<BTreeSet<AdmissionKey>>>,
 }
 
@@ -310,6 +314,7 @@ impl SessionGate {
         Self {
             permits: Arc::new(Semaphore::new(max_concurrent)),
             late_permits: Arc::new(Semaphore::new(max_concurrent)),
+            refusals: Arc::new(Semaphore::new(max_concurrent)),
             in_flight: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
@@ -327,6 +332,22 @@ impl SessionGate {
             key,
             in_flight: Arc::clone(&self.in_flight),
         })
+    }
+}
+
+impl SessionGate {
+    /// Reserves one pending refusal reply, or `None` when enough are already waiting on a chat
+    /// service. The message's trace already carries its disposition, so a skipped reply loses
+    /// only the courtesy text, never the record.
+    pub fn refusal(&self) -> Option<OwnedSemaphorePermit> {
+        let permit = Arc::clone(&self.refusals).try_acquire_owned().ok();
+        if permit.is_none() {
+            tracing::info!(
+                event = "gateway_refusal_reply_skipped",
+                reason = "refusals-full"
+            );
+        }
+        permit
     }
 }
 
@@ -769,7 +790,9 @@ async fn execute(
             if late.is_stopped() {
                 return "stopped";
             }
-            answer(&driver, &message, late_photos::REFUSED_REPLY).await;
+            if let Some(_reply) = runner.gate.refusal() {
+                answer(&driver, &message, late_photos::REFUSED_REPLY).await;
+            }
             return "late-busy";
         };
         return late
@@ -783,7 +806,9 @@ async fn execute(
     let key = (message.transport.clone(), message.conversation.key());
     let Some(admission) = runner.gate.admit(key) else {
         tracing::info!(event = "gateway_session_rejected", reason = "busy");
-        if runner.reply_on_busy || !message.constituents.is_empty() {
+        if (runner.reply_on_busy || !message.constituents.is_empty())
+            && let Some(_reply) = runner.gate.refusal()
+        {
             answer(&driver, &message, BUSY_REPLY).await;
         }
         return "busy";
