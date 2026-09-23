@@ -163,3 +163,19 @@ lto = "thin"
 strip = "symbols"
 # Preserve cross-crate optimization while letting release runners codegen in parallel.
 codegen-units = 4
+
+# Every broker boot compiles provider components with Cranelift. Unoptimized, that compile is
+# ~90% of `cargo test` CPU; optimizing just the compiler crates cuts suite CPU 8x.
+[profile.dev.package]
+cranelift-codegen = { opt-level = 3 }
+cranelift-bforest = { opt-level = 3 }
+cranelift-entity = { opt-level = 3 }
+cranelift-frontend = { opt-level = 3 }
+cranelift-control = { opt-level = 3 }
+cranelift-bitset = { opt-level = 3 }
+cranelift-assembler-x64 = { opt-level = 3 }
+regalloc2 = { opt-level = 3 }
+wasmparser = { opt-level = 3 }
+wasmtime-environ = { opt-level = 3 }
+wasmtime-internal-cranelift = { opt-level = 3 }
+gimli = { opt-level = 3 }
