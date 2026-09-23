@@ -1,7 +1,9 @@
 #![allow(clippy::unwrap_used)]
 
 use std::{
+    collections::BTreeMap,
     path::{Path, PathBuf},
+    sync::Arc,
     time::Duration,
 };
 
@@ -19,6 +21,66 @@ use dekopon_storage_host::{ContinuityPolicy, StorageGrantRequest, StorageHost, S
 use dekopon_test_support::{LoopbackServer, provider_fixture, snapshot_tree};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
+
+/// An opt-in cross-repository compatibility smoke for the locally built OpenObserve component.
+/// CI can set OPENOBSERVE_COMPONENT_PATH to an independently built, immutable artifact.
+#[tokio::test]
+async fn owner_configured_openobserve_component_links_and_has_no_sql_command() {
+    let Ok(component) = std::env::var("OPENOBSERVE_COMPONENT_PATH") else {
+        return;
+    };
+    let options = BrokerHostOptions {
+        provider_settings: Arc::new(BTreeMap::from([(
+            "openobserve".parse().expect("valid provider ID"),
+            json!({"url":"not-a-url-secret","org":"default","stream":"dekopon"}).to_string(),
+        )])),
+        ..Default::default()
+    };
+    let registry = BrokerProviderRegistry::load_with_options(
+        [component],
+        BrokerHostLimits::default(),
+        None,
+        &options,
+    )
+    .await
+    .expect("broker must link the settings import and describe the provider");
+    assert_eq!(registry.manifests().count(), 1);
+    let sql = registry
+        .run_command(
+            "openobserve",
+            &["sql".to_owned(), "--help".to_owned()],
+            None,
+        )
+        .await
+        .expect("unknown SQL action is rendered as an error");
+    assert!(matches!(sql, CommandRunOutcome::Rendered { status: 2, .. }));
+    let usage = registry
+        .run_command(
+            "broker",
+            &["usage".to_owned(), "--since".to_owned(), "1h".to_owned()],
+            None,
+        )
+        .await
+        .expect("bounded command proposals work without reading settings");
+    assert!(matches!(usage, CommandRunOutcome::Proposed { .. }));
+    let error = registry
+        .invoke(
+            authorized(
+                "openobserve.trace".parse().expect("valid capability"),
+                json!({"sinceSeconds": 3600, "traceId": "0af7651916cd43dd8448eb211c80319c"}),
+                http_constraints("example.com".to_owned(), "POST"),
+            ),
+            None,
+            Default::default(),
+        )
+        .await
+        .expect_err("invalid configured endpoint must fail before any request");
+    assert!(matches!(
+        *error.error,
+        BrokerHostError::ProviderFailure { .. }
+    ));
+    assert!(!error.to_string().contains("not-a-url-secret"));
+}
 
 fn host_fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

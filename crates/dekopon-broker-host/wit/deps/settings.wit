@@ -1,0 +1,7 @@
+package dekopon:settings@0.1.0;
+
+/// Owner-authored, per-provider settings. Only available during invoke.
+interface config {
+    /// JSON settings for the currently invoked provider, if configured.
+    get: func() -> option<string>;
+}
