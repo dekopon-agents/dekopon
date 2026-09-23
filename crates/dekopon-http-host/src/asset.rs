@@ -345,7 +345,8 @@ mod tests {
     use std::os::unix::fs::FileExt as _;
 
     // Observe the exact release boundary, not merely the eventual post-error state. Inode
-    // identity avoids mistaking unrelated concurrent reuse of the FD number for a live writer.
+    // identity avoids mistaking unrelated concurrent reuse of the FD number for a live writer;
+    // the caller must keep that inode allocated so its number cannot be recycled either.
     #[derive(Debug)]
     pub(super) struct ReleaseProbe {
         descriptor: PathBuf,
@@ -395,6 +396,10 @@ mod tests {
         // macOS exposes a virtual device through /dev/fd; compare within that namespace.
         assert_eq!(visible.ino(), metadata.ino());
         let identity = (visible.dev(), visible.ino());
+        // Once the writer closes, a concurrent test can take both its FD number and, on ext4, its
+        // freed inode number, so the probe would see the same identity through a different file.
+        // A second description keeps the inode allocated: only the writer's FD can then match.
+        let _inode_pin = fd.try_clone().unwrap();
         let path = path.to_path_buf();
         // Leave the writer's real file open but unlinked, and a removable dangling path.
         // Reopen now deterministically fails without permissions or process-wide exhaustion.
