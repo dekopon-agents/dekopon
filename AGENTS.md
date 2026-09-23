@@ -153,10 +153,25 @@ The workspace already carries the mature crate; wrapping it is one function, re-
 
 ### Tests
 
-The name states the invariant, the primitives are real, and every limit is tested at the edge and one past it.
+The name states the invariant and the primitives are real; one test per behaviour, not one per boundary.
 
-- Yes: `fn a_rejected_frame_leaves_no_open_descriptors()` over `UnixStream::pair()`; `fn an_asset_of_exactly_the_ceiling_is_accepted()` beside `fn one_byte_over_the_ceiling_is_refused()` asserting `matches!(err, AssetError::TooLarge)`.
-- No: `fn test_frame_2()`, `mockall::mock! { Broker }`, `assert!(err.to_string().contains("too large"))`.
+- Yes: `fn a_rejected_frame_leaves_no_open_descriptors()` over `UnixStream::pair()`; `fn an_oversized_asset_is_refused()` asserting `matches!(err, AssetError::TooLarge)`; order and structure asserted, time driven by tokio's paused clock.
+- No: `fn test_frame_2()`, `mockall::mock! { Broker }`, `assert!(err.to_string().contains("too large"))`, exactly-the-ceiling beside one-over twins, a 1 ns-over timeout cap, `assert!(elapsed < Duration::from_millis(50))`, production bytes canonicalized so a golden fixture is stable (compare parsed `Value`s instead).
+- An example's `#[cfg(test)]` module runs under `cargo test --lib --bins --tests` only when its `[[example]]` sets `test = true`.
+
+### Wire formats
+
+Providers add events, item types and fields without notice; a client that refuses them breaks on someone else's deploy.
+
+- Yes: an unknown SSE event or response item is skipped with a trace; a known event with a malformed body is `ProtocolFailure`.
+- No: `_ => return Err(ProtocolFailure::UnknownEvent(..))`; a test asserting an unknown event is fatal; pinning state to provider behaviour that no other client of the same API relies on.
+
+### Size
+
+The less code a change adds, the less there is to be wrong.
+
+- Yes: the tight type (`NonZeroU32`) at the parse boundary; redaction as a substitution (strip controls, replace exact secrets longest-first, truncate, drop a trailing partial secret when the read was cut).
+- No: `Option<i64>` so an invalid count can "join the semantic errors"; a byte budget on an error excerpt; redaction that blanks the whole body; a per-item linear scan or a buffer rescanned on every chunk.
 
 ### Comments
 
@@ -196,10 +211,9 @@ a finding until the line that leaks is named. A claim in the editor's report ("m
 **Two fix passes.** An editor gets two resumed passes on `FIX REQUIRED`. A third `FIX REQUIRED`
 reports the lane as blocked with both verdicts side by side; the disagreement is the owner's.
 
-**The lane report** ends with two fixed headings. `Choices I made`: every place the editor read
+**The lane report** ends with one fixed heading, `Choices I made`: every place the editor read
 the brief's intent over its text and did something the text did not say, one line each with the
-sentence it overrode. `Limits`: one table of every ceiling constant the lane added or moved: name,
-value, the test that hits it and the test one past it.
+sentence it overrode.
 
 **Comment findings.** Every added or edited comment is read against Comments. One that does not
 state a constraint the code cannot show is a `guideline` finding, and the fix is deletion, not
@@ -210,4 +224,5 @@ makes a new primitive redundant; "this could race" is not a finding until the in
 
 **The PR reviewer** reads the assembled change for what only the whole shows: one definition per
 fact across lanes, seams matching on both sides, deletions complete, docs describing only the new
-behaviour, CHANGELOG bullets present. It does not re-run the per-lane rubric.
+behaviour, CHANGELOG bullets present (`Fixed` only for bugs in released code), work that grows with
+a stream, wire parsers that refuse the unknown. It does not re-run the per-lane rubric.
