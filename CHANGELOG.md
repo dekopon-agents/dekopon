@@ -7,8 +7,13 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-09-23
+
 ### Added
 
+- Broker-owned, invoke-only per-provider settings via `providerSettings` and
+  `dekopon:settings/config@0.1.0`; agents cannot supply the OpenObserve endpoint,
+  organization or stream through this interface.
 - Broker-only additional CA bundles for provider HTTPS (alongside public roots), separately
   configured from exact-authority non-public HTTPS egress with private-unicast DNS checks.
 - `kind: openrouter` models in `dekopond`: OpenRouter streaming inference with strict authored
