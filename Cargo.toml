@@ -67,7 +67,7 @@ opentelemetry-http = { version = "0.32.0", default-features = false }
 # `tls-webpki-roots` gives the tonic channel a TLS connector, matching the webpki-only stance the
 # rest of the workspace takes; without it an `https://` endpoint under `grpc` fails at export time.
 opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "http-proto", "internal-logs", "logs", "tls-webpki-roots", "trace"] }
-opentelemetry_sdk = { version = "0.32.0", default-features = false, features = ["internal-logs", "logs", "trace"] }
+opentelemetry_sdk = { version = "0.33.0", default-features = false, features = ["internal-logs", "logs", "trace"] }
 # The engine `jaq-std`'s `regex` feature already links into `dekopon-shell`. `grep -E`/`sed -E` use
 # that one directly rather than adding a second regex engine to the graph.
 regex-bites = "0.1.6"
