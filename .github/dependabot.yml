@@ -1,13 +1,10 @@
 version: 2
 updates:
   - package-ecosystem: cargo
-    directories:
-      - /
-      - /examples/providers/cli-probe
-      - /examples/providers/clock-probe
-      - /examples/providers/http-probe
-      - /examples/providers/memory-reservation-probe
-      - /examples/providers/storage-probe
+    # Root only. The examples/providers/* workspaces build checked-in wasm fixtures that
+    # wit-package.yml rebuilds and compares byte for byte, so a lockfile-only bump there can
+    # never pass; they are bumped by hand alongside a fixture regen.
+    directory: /
     groups:
       component-stack:
         patterns:
@@ -16,6 +13,10 @@ updates:
           - "wasm*"
           - "wit-parser"
           - "cranelift*"
+      cargo:
+        update-types:
+          - minor
+          - patch
     schedule:
       interval: weekly
       day: monday
@@ -26,6 +27,10 @@ updates:
 
   - package-ecosystem: github-actions
     directory: /
+    groups:
+      actions:
+        patterns:
+          - "*"
     schedule:
       interval: weekly
       day: monday
