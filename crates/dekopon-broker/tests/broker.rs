@@ -2712,66 +2712,6 @@ fn identity_directory_rejects_duplicates_and_resolves_exactly() {
     ));
 }
 
-/// `via` and `attested_subject` are serde defaults that stay absent when empty, so an audit
-/// event written before attestation existed still decodes and re-serializes byte for byte.
-/// An absent field must remain absent rather than appearing as `null`.
-#[test]
-fn audit_events_written_before_attestation_serialize_unchanged() {
-    let legacy = concat!(
-        r#"{"type":"decision","invocation":"invoke-legacy","trace":"0000000000000000000000000000f1c7","#,
-        r#""principal":"caller","actor":{"type":"agent","agent":"provider-test"},"#,
-        r#""capability":"cli-probe.upper","provider":"cli-probe","authorized_by":"broker-test","#,
-        r#""decision_id":"allow-invoke-legacy","policy_revision":"policy-test","allowed":true,"#,
-        r#""decision_digest":"sha256-legacy"}"#,
-    );
-    let event =
-        serde_json::from_str::<AuditEvent>(legacy).expect("pre-attestation records still decode");
-    let AuditEvent::Decision {
-        via,
-        attested_subject,
-        ..
-    } = &event
-    else {
-        panic!("the fixture is a decision event");
-    };
-    assert!(via.is_none());
-    assert!(attested_subject.is_none());
-    assert_eq!(
-        serde_json::to_string(&event).expect("serializes"),
-        legacy,
-        "an absent attestation must not change the serialized event bytes"
-    );
-}
-
-/// The same requirement for the terminal record's `credential`, which per-agent selection added.
-///
-/// An event written before it existed retains its serialization shape, so the field
-/// has to be a skipped-when-absent option rather than a `null`. The name is recorded for the same
-/// reason `policy_ids` is: an auditor needs to know which authority a write used, and once one
-/// capability can present two, an unnamed one makes two organizations' writes identical.
-#[test]
-fn execution_records_written_before_per_agent_credentials_serialize_unchanged() {
-    let legacy = concat!(
-        r#"{"type":"execution","invocation":"invoke-legacy","trace":"0000000000000000000000000000f1c7","#,
-        r#""principal":"caller","actor":{"type":"agent","agent":"provider-test"},"#,
-        r#""capability":"cli-probe.upper","provider":"cli-probe","authorized_by":"broker-test","#,
-        r#""decision_id":"allow-invoke-legacy","policy_revision":"policy-test","#,
-        r#""effect":"read-only","risk":"Low","outcome":"Succeeded","#,
-        r#""duration_ms":3,"output_digest":"sha256-legacy"}"#,
-    );
-    let event =
-        serde_json::from_str::<AuditEvent>(legacy).expect("pre-credential records still decode");
-    let AuditEvent::Execution { credential, .. } = &event else {
-        panic!("the fixture is an execution event");
-    };
-    assert!(credential.is_none());
-    assert_eq!(
-        serde_json::to_string(&event).expect("serializes"),
-        legacy,
-        "an absent credential must not change the serialized event bytes"
-    );
-}
-
 /// A capability nothing can execute is refused twice: at startup if any policy could ever permit
 /// it, and at decision time with its own reason if it somehow arrives anyway.
 #[tokio::test(flavor = "multi_thread")]

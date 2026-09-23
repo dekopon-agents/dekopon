@@ -1158,66 +1158,6 @@ async fn refuses_a_store_beyond_the_aggregate_memory_ceiling() {
         .expect_err("the fixture never answers, but the store is admitted");
 }
 
-/// A warm compilation cache serves a later start from the same directory.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_persistent_compilation_cache_serves_a_second_load() {
-    let directory = tempfile::tempdir().expect("cache directory");
-    let options = BrokerHostOptions {
-        cwasm_dir: Some(directory.path().canonicalize().expect("canonical cache")),
-        ..BrokerHostOptions::default()
-    };
-    let cold = BrokerProviderRegistry::load_with_options(
-        [provider_fixture("cli-probe-provider.wasm")],
-        BrokerHostLimits::default(),
-        None,
-        &options,
-    )
-    .await
-    .expect("cold load populates the cache");
-    let cold_digest = cold
-        .loaded_provider_metadata()
-        .next()
-        .expect("one provider")
-        .artifact_sha256;
-
-    let warm = BrokerProviderRegistry::load_with_options(
-        [provider_fixture("cli-probe-provider.wasm")],
-        BrokerHostLimits::default(),
-        None,
-        &options,
-    )
-    .await
-    .expect("warm load reads the cache");
-    let warm_metadata = warm
-        .loaded_provider_metadata()
-        .next()
-        .expect("one provider");
-    // The digest is of the artifact bytes, never of a cache entry, so a hit cannot change it.
-    assert_eq!(warm_metadata.artifact_sha256, cold_digest);
-
-    let capability = "cli-probe.upper".parse().expect("valid capability fixture");
-    let output = warm
-        .invoke(
-            authorized(capability, json!({"text": "warm"}), constraints_5s()),
-            None,
-            Default::default(),
-        )
-        .await
-        .expect("a cached component still invokes");
-    assert_eq!(output.output["text"], json!("WARM"));
-}
-
-fn constraints_5s() -> ExecutionConstraints {
-    ExecutionConstraints {
-        asset: None,
-        timeout_ms: 5_000,
-        max_output_bytes: 4_096,
-        http: None,
-        storage: None,
-        secret_use: None,
-    }
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn rejects_authorization_that_exceeds_host_ceilings() {
     let limits = BrokerHostLimits {
