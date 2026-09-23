@@ -70,11 +70,9 @@ The reusable agent session layer consumed by `dekopond` and external embeddings 
   as `CommandRun::Denied { "session-cancelled" }`. The same signal read synchronously refuses a
   capability call the script starts *after* the Stop, with the same reason and before any proposal
   exists; that is a cooperative boundary rather than a refusal decision, which stays the broker's.
-- `command_run_from_outcome` and `report_unobserved_command_run` — the one mapping from
-  a provider's `CommandRunOutcome` onto the shell's `CommandRun`, carrying any secret use the
-  provider's proposal names through to the broker-only invocation path, and the one
-  `agent.command.unobserved` record for a run whose caller was dropped, shared by the
-  broker leg and external embeddings.
+- `command_run_from_outcome` — the one mapping from a provider's `CommandRunOutcome` onto the
+  shell's `CommandRun`, carrying any secret use the provider's proposal names through to the
+  broker-only invocation path.
 - `IdSequence` — one session's W3C trace and the collision-free invocation identifiers that
   extend it, adopted from the exporting span or minted when the process exports nothing, as
   described in

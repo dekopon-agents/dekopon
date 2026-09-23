@@ -2,7 +2,6 @@ use std::{
     collections::HashMap,
     io,
     sync::{Arc, Mutex, OnceLock},
-    task::{Context as TaskContext, Poll, Waker},
 };
 
 use tokio::sync::oneshot;
@@ -18,14 +17,14 @@ async fn typed_success_and_operation_error_are_preserved() {
         || async { Ok::<_, io::Error>(42_u8) },
     );
     assert!(matches!(
-        ProcessRun::execute(success, |_| {}).await,
+        ProcessRun::execute(success).await,
         ProcessOutcome::Completed(Ok(42))
     ));
 
     let failure = process_fn(ProcessMetadata::non_interruptible("error-test"), || async {
         Err::<(), _>(io::Error::other("typed operation cause"))
     });
-    match ProcessRun::execute(failure, |_| {}).await {
+    match ProcessRun::execute(failure).await {
         ProcessOutcome::Completed(Err(error)) => {
             assert_eq!(error.kind(), io::ErrorKind::Other);
             assert_eq!(error.to_string(), "typed operation cause");
@@ -42,7 +41,7 @@ async fn panic_preserves_the_tokio_task_failure() {
         Ok::<_, io::Error>(())
     });
 
-    let error = match ProcessRun::execute(process, |_| {}).await {
+    let error = match ProcessRun::execute(process).await {
         ProcessOutcome::TaskFailed(error) => error,
         _ => panic!("unexpected panic outcome"),
     };
@@ -201,7 +200,7 @@ async fn trace_fields_are_fixed_and_payload_free() {
         },
     );
     assert!(matches!(
-        ProcessRun::execute(process, |_| {}).await,
+        ProcessRun::execute(process).await,
         ProcessOutcome::Completed(Ok(()))
     ));
 
@@ -237,7 +236,7 @@ async fn trace_fields_are_fixed_and_payload_free() {
         },
     );
     assert!(matches!(
-        ProcessRun::execute(cancellable, |_| {}).await,
+        ProcessRun::execute(cancellable).await,
         ProcessOutcome::Completed(Ok(()))
     ));
     drop(handle);
@@ -264,135 +263,6 @@ async fn trace_fields_are_fixed_and_payload_free() {
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn admission_then_drop_delivers_exact_operation_error_to_observer() {
-    let (started_sender, started_receiver) = oneshot::channel();
-    let (observed_sender, observed_receiver) = oneshot::channel();
-    let process = process_fn(
-        ProcessMetadata::non_interruptible("admission-test"),
-        move || async move {
-            started_sender.send(()).expect("start observer remains");
-            Err::<(), _>(io::Error::other("exact abandoned operation cause"))
-        },
-    );
-    let mut execute = Box::pin(ProcessRun::execute(process, move |outcome| {
-        assert!(
-            observed_sender.send(outcome).is_ok(),
-            "abandoned outcome observer remains"
-        );
-    }));
-
-    // A current-thread runtime cannot poll the spawned supervisor until this task yields. One
-    // manual poll therefore admits the supervisor and transfers process ownership, then returns
-    // Pending on the outcome receiver while the process itself has not started yet.
-    let waker = Waker::noop();
-    let mut context = TaskContext::from_waker(waker);
-    assert!(matches!(
-        std::future::Future::poll(execute.as_mut(), &mut context),
-        Poll::Pending
-    ));
-    drop(execute);
-
-    started_receiver.await.expect("supervised process starts");
-    match observed_receiver.await.expect("observer receives outcome") {
-        ProcessOutcome::Completed(Err(error)) => {
-            assert_eq!(error.to_string(), "exact abandoned operation cause");
-        }
-        _ => panic!("observer received the wrong abandoned outcome"),
-    }
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn queued_outcome_drop_delivers_exact_error_to_observer() {
-    let capture = CaptureLayer::global();
-    let terminal = capture.terminal("queued-outcome-test");
-    let (started_sender, started_receiver) = oneshot::channel();
-    let (observed_sender, observed_receiver) = oneshot::channel();
-    let process = process_fn(
-        ProcessMetadata::non_interruptible("queued-outcome-test"),
-        move || async move {
-            started_sender.send(()).expect("start observer remains");
-            Err::<(), _>(io::Error::other("exact queued operation cause"))
-        },
-    );
-    let mut execute = Box::pin(ProcessRun::execute(process, move |outcome| {
-        assert!(
-            observed_sender.send(outcome).is_ok(),
-            "queued outcome observer remains"
-        );
-    }));
-    let waker = Waker::noop();
-    let mut context = TaskContext::from_waker(waker);
-    assert!(matches!(
-        std::future::Future::poll(execute.as_mut(), &mut context),
-        Poll::Pending
-    ));
-
-    started_receiver.await.expect("supervised process starts");
-    // The terminal trace record is made immediately before the envelope send. Because both run in
-    // one supervisor poll on this current-thread runtime, observing this signal proves the outcome
-    // is queued before this test regains control and drops the unpolled execute future.
-    terminal.await.expect("supervisor records terminal outcome");
-    drop(execute);
-
-    match observed_receiver
-        .await
-        .expect("observer receives queued outcome")
-    {
-        ProcessOutcome::Completed(Err(error)) => {
-            assert_eq!(error.to_string(), "exact queued operation cause");
-        }
-        _ => panic!("observer received the wrong queued outcome"),
-    }
-}
-
-#[tokio::test]
-async fn caller_abort_then_process_panic_delivers_raw_join_error_to_observer() {
-    let (started_sender, started_receiver) = oneshot::channel();
-    let (release_sender, release_receiver) = oneshot::channel();
-    let (observed_sender, observed_receiver) = oneshot::channel();
-    let process = process_fn(
-        ProcessMetadata::non_interruptible("abandoned-panic-test"),
-        move || async move {
-            started_sender.send(()).expect("start observer remains");
-            release_receiver.await.expect("panic release remains");
-            panic!("exact abandoned panic payload");
-            #[allow(unreachable_code)]
-            Ok::<_, io::Error>(())
-        },
-    );
-    let caller = tokio::spawn(async move {
-        ProcessRun::execute(process, move |outcome| {
-            assert!(
-                observed_sender.send(outcome).is_ok(),
-                "abandoned panic observer remains"
-            );
-        })
-        .await
-    });
-    started_receiver.await.expect("process starts");
-    caller.abort();
-    let caller_error = match caller.await {
-        Err(error) => error,
-        Ok(_) => panic!("outer execute caller completed after abort"),
-    };
-    assert!(caller_error.is_cancelled());
-
-    release_sender
-        .send(())
-        .expect("surviving supervisor still owns the process");
-    let error = match observed_receiver.await.expect("observer receives panic") {
-        ProcessOutcome::TaskFailed(error) => error,
-        _ => panic!("observer received the wrong abandoned panic outcome"),
-    };
-    assert!(error.is_panic());
-    let payload = error.into_panic();
-    assert_eq!(
-        payload.downcast_ref::<&'static str>(),
-        Some(&"exact abandoned panic payload")
-    );
-}
-
 fn joined_trace(capture: &CaptureLayer) -> String {
     capture
         .0
@@ -408,7 +278,7 @@ async fn a_cancel_signal_aborts_a_cancellable_process_and_records_cancelled() {
     let terminal = capture.terminal("cancel-test");
     let (started_sender, started_receiver) = oneshot::channel();
     // The parked receiver's sender stays alive for the whole test, so the process can only leave
-    // its await through the supervisor's abort.
+    // its await through the abort.
     let (_park_sender, park_receiver) = oneshot::channel::<()>();
     let (handle, signal) = CancelSignal::pair();
     let process = process_fn(
@@ -421,7 +291,7 @@ async fn a_cancel_signal_aborts_a_cancellable_process_and_records_cancelled() {
             Ok::<_, io::Error>(())
         },
     );
-    let execute = tokio::spawn(ProcessRun::execute(process, |_| {}));
+    let execute = tokio::spawn(ProcessRun::execute(process));
 
     started_receiver.await.expect("process starts");
     handle.cancel();
@@ -433,7 +303,7 @@ async fn a_cancel_signal_aborts_a_cancellable_process_and_records_cancelled() {
     };
     assert!(error.is_cancelled());
     assert!(!error.is_panic());
-    terminal.await.expect("supervisor records terminal outcome");
+    terminal.await.expect("execute records terminal outcome");
 
     let trace = joined_trace(&capture);
     assert!(
@@ -456,11 +326,11 @@ async fn a_completed_process_wins_over_a_late_signal() {
         || async { Ok::<_, io::Error>(7_u8) },
     );
 
-    let outcome = ProcessRun::execute(process, |_| {}).await;
+    let outcome = ProcessRun::execute(process).await;
     handle.cancel();
 
     assert!(matches!(outcome, ProcessOutcome::Completed(Ok(7))));
-    terminal.await.expect("supervisor records terminal outcome");
+    terminal.await.expect("execute records terminal outcome");
     let trace = joined_trace(&capture);
     assert!(
         trace.contains("process.kind=\"late-signal-test\";process.outcome=\"succeeded\";"),
@@ -475,7 +345,7 @@ async fn a_never_signal_leaves_a_cancellable_process_joined() {
     let process = process_fn(
         ProcessMetadata::cancellable("never-signal-test", CancelSignal::never()),
         || async {
-            // Yield so the supervisor observes the closed signal while the node still runs.
+            // Yield so execute observes the closed signal while the node still runs.
             for _ in 0..8 {
                 tokio::task::yield_now().await;
             }
@@ -484,10 +354,10 @@ async fn a_never_signal_leaves_a_cancellable_process_joined() {
     );
 
     assert!(matches!(
-        ProcessRun::execute(process, |_| {}).await,
+        ProcessRun::execute(process).await,
         ProcessOutcome::Completed(Ok("joined"))
     ));
-    terminal.await.expect("supervisor records terminal outcome");
+    terminal.await.expect("execute records terminal outcome");
     let trace = joined_trace(&capture);
     assert!(
         trace.contains(
@@ -515,7 +385,7 @@ async fn dropping_every_cancel_handle_does_not_cancel() {
             Ok::<_, io::Error>(())
         },
     );
-    let execute = tokio::spawn(ProcessRun::execute(process, |_| {}));
+    let execute = tokio::spawn(ProcessRun::execute(process));
 
     started_receiver.await.expect("process starts");
     drop(handle);
@@ -547,46 +417,4 @@ fn a_synchronous_boundary_reads_the_request_without_awaiting_it() {
     drop(handle);
     assert!(signal.is_cancelled());
     assert!(!CancelSignal::never().is_cancelled());
-}
-
-#[tokio::test(flavor = "current_thread")]
-async fn an_abandoned_cancelled_outcome_reaches_the_observer() {
-    let (started_sender, started_receiver) = oneshot::channel();
-    let (_park_sender, park_receiver) = oneshot::channel::<()>();
-    let (observed_sender, observed_receiver) = oneshot::channel();
-    let (handle, signal) = CancelSignal::pair();
-    let process = process_fn(
-        ProcessMetadata::cancellable("abandoned-cancel-test", signal),
-        move || async move {
-            started_sender.send(()).expect("start observer remains");
-            park_receiver
-                .await
-                .expect("the park sender outlives the process");
-            Ok::<_, io::Error>(())
-        },
-    );
-    let mut execute = Box::pin(ProcessRun::execute(process, move |outcome| {
-        assert!(
-            observed_sender.send(outcome).is_ok(),
-            "abandoned cancel observer remains"
-        );
-    }));
-
-    // As in the admission test: one manual poll admits the supervisor and transfers process
-    // ownership before this outer future is dropped.
-    let waker = Waker::noop();
-    let mut context = TaskContext::from_waker(waker);
-    assert!(matches!(
-        std::future::Future::poll(execute.as_mut(), &mut context),
-        Poll::Pending
-    ));
-    drop(execute);
-
-    started_receiver.await.expect("supervised process starts");
-    handle.cancel();
-    let error = match observed_receiver.await.expect("observer receives outcome") {
-        ProcessOutcome::TaskFailed(error) => error,
-        ProcessOutcome::Completed(_) => panic!("observer received the wrong abandoned outcome"),
-    };
-    assert!(error.is_cancelled());
 }
