@@ -207,6 +207,7 @@ jobs:
       # Retain Cargo's harness: process-per-test nextest scheduling regressed these tests.
       - name: Compile workspace tests
         run: cargo test --workspace --all-features --locked --no-run
+      # Cargo.toml builds Cranelift optimized in dev: this step went from ~17 min to ~2 (#334).
       - name: Run workspace tests
         run: cargo test --workspace --all-features --locked --lib --bins --tests
       # Stable Cargo cannot precompile doctests with --no-run. Run them exactly once here.
@@ -400,12 +401,11 @@ jobs:
             --metadata "$RUNNER_TEMP/metadata.json" \
             --plan .github/release-crates.txt \
             --changelog CHANGELOG.md
-      # Source-only changes are already compiled and tested from the same explicit src/** package
-      # include sets. Archive verification is reserved for inputs that can change package contents,
-      # dependency rewriting, build scripts, or publication metadata.
+      # Archive contents and metadata only. The test lane already builds these sources, so PRs skip
+      # the cold verify rebuild; release.yml still verifies before publishing.
       - name: Package every publishable crate
         if: ${{ needs.changes.outputs.run_package != 'false' }}
-        run: cargo package --workspace --locked
+        run: cargo package --workspace --locked --no-verify
       - name: Test package-cache cleanup
         if: ${{ needs.changes.outputs.run_package != 'false' }}
         run: .github/scripts/prepare-package-cache.sh
