@@ -950,7 +950,7 @@ fn exported_path(value: Option<OsString>) -> Option<PathBuf> {
     value.filter(|value| !value.is_empty()).map(PathBuf::from)
 }
 
-pub(crate) fn resolve_auth_path(explicit: Option<&Path>) -> Result<PathBuf, ChatGptError> {
+pub fn resolve_auth_path(explicit: Option<&Path>) -> Result<PathBuf, ChatGptError> {
     resolve_auth_path_named(explicit, DEFAULT_AUTH_FILE_NAME)
 }
 
@@ -2977,9 +2977,14 @@ mod tests {
         )
         .expect("the credential opens");
 
-        let refused = credential.current().expect_err("an unlocked refresh is refused");
+        let refused = credential
+            .current()
+            .expect_err("an unlocked refresh is refused");
 
-        assert!(matches!(refused, ChatGptError::LockAuth { .. }), "{refused:?}");
+        assert!(
+            matches!(refused, ChatGptError::LockAuth { .. }),
+            "{refused:?}"
+        );
         assert!(server.requests().is_empty(), "the refresh token was spent");
         assert_eq!(
             load_credentials(&path).expect("stored").refresh.expose(),

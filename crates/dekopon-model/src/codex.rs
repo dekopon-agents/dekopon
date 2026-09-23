@@ -53,6 +53,26 @@ impl CodexClient {
         Self::validate(&model, timeout)?;
         let path = resolve_auth_path(auth_path).map_err(AuthError::Credential)?;
         let credential = CredentialFile::open(&path, timeout).map_err(AuthError::Credential)?;
+        Self::configured(
+            model,
+            Arc::new(credential),
+            timeout,
+            RESPONSES_URL.to_owned(),
+        )
+    }
+
+    /// A client over a credential another client already holds.
+    ///
+    /// Clients on one credential file must share one [`CredentialFile`]: a rotation that could not
+    /// be written back lives only in the instance that performed it, and a sibling instance would
+    /// then spend the refresh token the provider just retired.
+    pub fn with_credential(
+        model: impl Into<String>,
+        credential: Arc<CredentialFile>,
+        timeout: Duration,
+    ) -> Result<Self, InferenceError> {
+        let model = model.into();
+        Self::validate(&model, timeout)?;
         Self::configured(model, credential, timeout, RESPONSES_URL.to_owned())
     }
 
@@ -68,7 +88,7 @@ impl CodexClient {
 
     fn configured(
         model: String,
-        credential: CredentialFile,
+        credential: Arc<CredentialFile>,
         timeout: Duration,
         endpoint: String,
     ) -> Result<Self, InferenceError> {
@@ -76,7 +96,7 @@ impl CodexClient {
             name: model.clone(),
             model,
             identity: ClientIdentity::new(),
-            credential: Arc::new(credential),
+            credential,
             http: InferenceHttp::new(timeout)?,
             endpoint,
             loopback: false,
@@ -114,7 +134,7 @@ impl CodexClient {
         let endpoint = endpoints.responses.clone();
         let credential = CredentialFile::with_endpoints(&path, timeout, endpoints)
             .map_err(AuthError::Credential)?;
-        Self::configured(model, credential, timeout, endpoint)
+        Self::configured(model, Arc::new(credential), timeout, endpoint)
     }
 
     async fn credential(

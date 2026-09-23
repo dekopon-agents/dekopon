@@ -26,7 +26,8 @@ predecessor, and any copy of the file taken before that refresh is dead.
 **A refresh is serialized across processes.** `CredentialFile::refresh_if_needed` takes an exclusive advisory lock
 on a sibling `chatgpt-auth.json.lock` before refreshing, then re-reads the credential file and
 adopts the stored record when its `expiresAt` is later than the one in memory. That is the whole
-defence against the rotation trap: `dekopond` shares one client per configured model, but each
+defence against the rotation trap: `dekopond` shares one client per configured model and one
+`CredentialFile` per auth file across models, but each
 concurrent turn runs on a credential snapshot taken before the lock, and an external embedding or a
 second daemon on the same host can open the same file; two arriving near the refresh margin would
 otherwise both present the same refresh token, and OAuth reuse detection can revoke the entire
