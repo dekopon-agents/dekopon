@@ -417,8 +417,9 @@ impl ProcessRun {
         // even if this outer future is dropped.
         #[expect(
             clippy::disallowed_methods,
-            reason = "owner: the supervisor, once admitted, joins, records and delivers its node \
-                      even if the caller's future is dropped; bound: ProcessRun admission"
+            reason = "owner: the supervisor joins, records and delivers its node even if this \
+                      future is dropped; bound: one supervisor per tool call, sequential in the \
+                      caller's prompt loop"
         )]
         let supervisor = tokio::spawn(
             async move {

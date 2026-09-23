@@ -157,7 +157,7 @@ impl LocalTransport {
         #[expect(
             clippy::disallowed_methods,
             reason = "owner-only development socket: the connection task ends when its caller \
-                      hangs up or the gateway stops reading; not deployed"
+                      hangs up or the gateway's inbound queue closes; not deployed"
         )]
         tokio::spawn(async move {
             let (reader, mut writer) = stream.into_split();

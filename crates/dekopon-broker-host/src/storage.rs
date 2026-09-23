@@ -23,8 +23,8 @@ pub struct FileResource {
 #[derive(Debug)]
 pub(crate) struct ActiveStorage {
     /// Every native storage effect runs holding this lock, so `finish` taking it is the drain: a
-    /// job orphaned by a cancelled host call either holds it (and `finish` waits, inside its
-    /// deadline) or has not started (and finds the transaction gone).
+    /// job orphaned by a cancelled host call either holds it (and `finish` waits for it, then
+    /// refuses to commit past its deadline) or has not started (and finds the transaction gone).
     transaction: Arc<Mutex<Option<StorageHandle>>>,
     finalization_budget: Duration,
 }

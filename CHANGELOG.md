@@ -17,14 +17,16 @@ All notable changes to Dekopon are documented here. The format is based on
   the base lease, rather than one timeout per wait.
 - Attachment downloads have a 60 s end-to-end deadline, and a stalled one no longer blocks other
   conversations' attachment reads.
-- The local development transport bounds its queues and drops a caller that stops reading.
+- The local development transport bounds its queues and stops answering a caller that stops
+  reading.
 - `clippy.toml` bans raw task, thread and unbounded-queue constructors and `Condvar`; production
   uses carry a site `#[expect]` naming owner and bound. `AGENTS.md` gains a Concurrency section.
 
 ### Fixed
 
 - `jq halt`, `halt(n)` and `halt_error` exited `dekopond`; they now fail the command.
-- The jq abandoned-worker count could wrap below zero when a worker panicked.
+- The jq abandoned-worker count could wrap below zero when a worker finished between its
+  abandonment being published and charged.
 
 ## [0.20.0] - 2026-09-23
 
