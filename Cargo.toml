@@ -61,14 +61,14 @@ libc = "0.2.189"
 # removed: without it every export failure — expired token, missing header, receiver down — is
 # discarded in silence. Each exporting binary filters the `opentelemetry` target off its own OTLP
 # layer, so these records reach stdout/stderr only and cannot feed export failures back into export.
-opentelemetry = { version = "0.32.0", default-features = false, features = ["internal-logs", "logs", "trace"] }
-opentelemetry-appender-tracing = "0.32.0"
-opentelemetry-http = { version = "0.32.0", default-features = false }
+opentelemetry = { version = "0.33.0", default-features = false, features = ["internal-logs", "logs", "trace"] }
+opentelemetry-appender-tracing = "0.33.0"
+opentelemetry-http = { version = "0.33.0", default-features = false }
 # `tls-webpki-roots` gives the tonic channel a TLS connector, matching the webpki-only stance the
 # rest of the workspace takes; without it an `https://` endpoint under `grpc` fails at export time.
 # `tls-ring` is what exposes `with_tls_config`, used to add OTEL_EXPORTER_OTLP_CERTIFICATE's root.
-opentelemetry-otlp = { version = "0.32.0", default-features = false, features = ["grpc-tonic", "http-proto", "internal-logs", "logs", "tls-ring", "tls-webpki-roots", "trace"] }
-opentelemetry_sdk = { version = "0.32.0", default-features = false, features = ["internal-logs", "logs", "trace"] }
+opentelemetry-otlp = { version = "0.33.0", default-features = false, features = ["grpc-tonic", "http-proto", "internal-logs", "logs", "tls-ring", "tls-webpki-roots", "trace"] }
+opentelemetry_sdk = { version = "0.33.0", default-features = false, features = ["internal-logs", "logs", "trace"] }
 # The engine `jaq-std`'s `regex` feature already links into `dekopon-shell`. `grep -E`/`sed -E` use
 # that one directly rather than adding a second regex engine to the graph.
 regex-bites = "0.1.6"
@@ -85,7 +85,7 @@ time = { version = "0.3.55", features = ["formatting", "macros"] }
 tokio = { version = "1.49.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 tracing = { version = "0.1.44", default-features = false, features = ["std"] }
-tracing-opentelemetry = { version = "0.33.0", default-features = false }
+tracing-opentelemetry = { version = "0.34.0", default-features = false }
 tracing-subscriber ={ version = "0.3.23", features = ["env-filter", "fmt", "json"] }
 ureq = { version = "3.3.0", default-features = false, features = ["json", "rustls"] }
 url = "2.5.8"
