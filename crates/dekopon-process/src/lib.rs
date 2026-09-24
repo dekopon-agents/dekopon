@@ -283,7 +283,7 @@ pub enum ProcessOutcome<Output, OperationError> {
 /// One-run/one-node Tokio execution boundary.
 ///
 /// The run and node identities exist only as trace fields; Tokio task IDs are not application
-/// identity. The node runs in a one-task [`JoinSet`](tokio::task::JoinSet) owned by the `execute`
+/// identity. The node runs in a one-task [`JoinSet`] owned by the `execute`
 /// future, so dropping that future aborts the node; the one caller drives it to completion with
 /// `block_on`, which never drops it early.
 ///
