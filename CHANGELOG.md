@@ -7,6 +7,16 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- Persistent routes rebuild a window that is not in memory from `memory.recall`: `journal` (a
+  gateway-owned JSONL transcript under `sessions.journal`, bounded by `forgetAfterMs` and a
+  whole-directory `maxBytes`) or `platform` (Slack and Discord message history). Idle expiry and
+  restarts no longer mean forgetting, and recalled windows keep their `Chat Asset #N` attachments.
+  `gateway.session` records `conversation.recall_source`, `.recalled_turns` and `.carried_assets`.
+- The classic Slack manifest requests `channels:history`, `groups:history` and `mpim:history` for
+  platform recall; reinstall the app to grant them.
+
 ## [0.21.0] - 2026-09-24
 
 ### Added

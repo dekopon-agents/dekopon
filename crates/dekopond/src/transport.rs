@@ -446,6 +446,30 @@ pub(crate) trait ChatDriver: Send + Sync {
     fn cancel_button(&self) -> Option<&dyn CancelButton> {
         None
     }
+
+    fn history(&self) -> Option<&dyn ChatHistory> {
+        None
+    }
+}
+
+/// Messages the chat service shows in a conversation, oldest first, strictly before `before`.
+#[async_trait]
+pub(crate) trait ChatHistory: Send + Sync {
+    async fn recent(
+        &self,
+        conversation: &Conversation,
+        before: &str,
+        limit: usize,
+    ) -> Result<Vec<PastMessage>, TransportError>;
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PastMessage {
+    pub from_bot: bool,
+    pub author: String,
+    pub text: String,
+    pub assets: Vec<PendingAsset>,
+    pub at: std::time::SystemTime,
 }
 
 pub(crate) trait AssetFetcher: Send + Sync {

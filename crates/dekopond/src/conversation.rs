@@ -1,5 +1,5 @@
-//! This history lives only in the gateway's memory, never persisted or forwarded to the broker, so
-//! the most sensitive conversation text never reaches the broker's more privileged process.
+//! Conversation text is never forwarded to the broker, so it stays out of the privileged process;
+//! only the gateway's own journal writes it to disk, and only when an operator configures one.
 
 use std::{
     collections::HashMap,
@@ -10,6 +10,7 @@ use std::{
 
 use dekopon_agent::prompt::{ConversationTurn, History};
 use dekopon_core::{AgentId, ExternalSubject};
+use sha2::{Digest, Sha256};
 
 use crate::{
     asset::{AssetAccess, AssetFence},
@@ -56,6 +57,29 @@ impl ConversationKey {
             audience: ConversationAudience::Shared,
         }
     }
+
+    /// A digest, so a journal directory listing names no subject or native conversation id.
+    pub fn journal_stem(&self) -> String {
+        let mut digest = Sha256::new();
+        for part in [self.agent.as_str(), &self.transport, &self.conversation] {
+            digest.update((part.len() as u64).to_be_bytes());
+            digest.update(part.as_bytes());
+        }
+        match &self.audience {
+            ConversationAudience::Private(subject) => {
+                let canonical = subject.canonical();
+                digest.update([1]);
+                digest.update((canonical.len() as u64).to_be_bytes());
+                digest.update(canonical.as_bytes());
+            }
+            ConversationAudience::Shared => digest.update([0]),
+        }
+        digest
+            .finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
 }
 
 struct Conversation {
@@ -92,6 +116,8 @@ pub(crate) struct ConversationSeed<'a> {
     pub lease: ConversationLease<'a>,
     pub input: ConversationInput,
     pub gateway_notice: Option<&'static str>,
+    /// True only for the call that created this generation, which alone restores recalled assets.
+    pub created: bool,
 }
 
 /// This input becomes invalid after any later normal request, even within the same generation, so
@@ -140,7 +166,7 @@ impl ConversationLease<'_> {
         turn: ConversationTurn,
         declared_cache_key: &str,
         now: Instant,
-    ) {
+    ) -> bool {
         let mut state = self.store.state.lock().expect("conversation store");
         let current = state
             .slots
@@ -170,6 +196,7 @@ impl ConversationLease<'_> {
             self.store.enforce_ceiling(&mut state);
         }
         self.active = false;
+        current
     }
 }
 
@@ -236,11 +263,30 @@ impl ConversationStore {
         }
     }
 
+    /// Whether `begin` would continue a window already in memory, making a recall pointless.
+    pub fn resident(
+        &self,
+        key: &ConversationKey,
+        granted: &[String],
+        window: MemoryWindow,
+        now: Instant,
+    ) -> bool {
+        let state = self.state.lock().expect("conversation store");
+        state.slots.get(key).is_some_and(|slot| {
+            slot.granted == granted
+                && slot
+                    .live
+                    .as_ref()
+                    .is_some_and(|conversation| !expired(conversation, window.idle_timeout, now))
+        })
+    }
+
     pub fn begin(
         &self,
         key: &ConversationKey,
         granted: &[String],
         window: MemoryWindow,
+        recalled: Option<History>,
         now: Instant,
     ) -> ConversationSeed<'_> {
         let mut state = self.state.lock().expect("conversation store");
@@ -268,9 +314,21 @@ impl ConversationStore {
             }
         }
 
+        let recalled = recalled.filter(|history| !history.is_empty());
         if !state.slots.contains_key(key) {
             let generation = allocate_generation(&mut state);
             let asset_fence = Arc::new(AssetFence::new());
+            let cache_key = cache_key::for_conversation();
+            let live = recalled.map(|history| Conversation {
+                history,
+                cache_key: cache_key.clone(),
+                touched: now,
+            });
+            let history = live.as_ref().map_or_else(
+                || History::new(window.limits),
+                |conversation| conversation.history.clone(),
+            );
+            let adopted = live.is_some();
             state.slots.insert(
                 key.clone(),
                 Slot {
@@ -281,10 +339,14 @@ impl ConversationStore {
                     asset_fence: Arc::clone(&asset_fence),
                     granted: granted.to_vec(),
                     pending: 1,
-                    live: None,
+                    live,
                 },
             );
+            if adopted {
+                self.enforce_ceiling(&mut state);
+            }
             return ConversationSeed {
+                created: true,
                 gateway_notice: None,
                 input: ConversationInput {
                     key: key.clone(),
@@ -292,8 +354,8 @@ impl ConversationStore {
                     revision: 1,
                     seed_revision: 1,
                 },
-                history: History::new(window.limits),
-                cache_key: cache_key::for_conversation(),
+                history,
+                cache_key,
                 assets: AssetAccess::persistent(key.clone(), generation, asset_fence),
                 lease: ConversationLease {
                     store: self,
@@ -321,11 +383,21 @@ impl ConversationStore {
             .pending
             .checked_add(1)
             .expect("pending conversations are bounded by session admission");
+        if slot.live.is_none()
+            && let Some(history) = recalled
+        {
+            slot.live = Some(Conversation {
+                history,
+                cache_key: cache_key::for_conversation(),
+                touched: now,
+            });
+        }
         let (history, cache_key) = slot.live.as_ref().map_or_else(
             || (History::new(window.limits), cache_key::for_conversation()),
             |conversation| (conversation.history.clone(), conversation.cache_key.clone()),
         );
         ConversationSeed {
+            created: false,
             gateway_notice: slot.gateway_notice.take(),
             input: ConversationInput {
                 key: key.clone(),

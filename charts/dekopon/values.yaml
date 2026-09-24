@@ -392,6 +392,13 @@ gateway:
     # container's arguments.
     reseed: false
 
+  # The gateway's conversation journal (dekopond `sessions.journal`), a directory on the state
+  # claim so windows survive a reschedule. Point `sessions.journal.path` at mountPath.
+  journal:
+    enabled: false
+    subdir: gateway-journal
+    mountPath: /var/lib/dekopond/journal
+
   # dekopond.yaml names environment variable NAMES, never values, so every chat and model
   # credential is an ordinary secretKeyRef with no file hygiene involved. Example:
   #

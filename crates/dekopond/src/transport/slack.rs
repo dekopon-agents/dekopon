@@ -4,10 +4,10 @@
 use std::{
     collections::{HashSet, VecDeque},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use async_trait::async_trait;
@@ -28,12 +28,12 @@ use crate::{
     config::{LivenessSettings, SLACK_ENDPOINT, SlackExperience, SlackLivenessFallback},
     progress::ProgressText,
     transport::{
-        AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver,
+        AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver, ChatHistory,
         ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageRef, NativeStatus,
-        OutboundReply, ProgressLimits, ProgressMessage, ReplyTarget, SeenIds, Status, StreamLimits,
-        StreamedText, TextStream, ThreadClaim, ThreadContinuation, ThreadOwnership, TransportError,
-        TransportEvent, TransportIdentity, asset_buffer, bound_inbound, credential_client,
-        floor_boundary, receive_span, record_conversation, reserve_for_chunk,
+        OutboundReply, PastMessage, ProgressLimits, ProgressMessage, ReplyTarget, SeenIds, Status,
+        StreamLimits, StreamedText, TextStream, ThreadClaim, ThreadContinuation, ThreadOwnership,
+        TransportError, TransportEvent, TransportIdentity, asset_buffer, bound_inbound,
+        credential_client, floor_boundary, receive_span, record_conversation, reserve_for_chunk,
     },
 };
 
@@ -62,6 +62,7 @@ const MAX_TRACKED_REACTIONS: usize = 256;
 const MAX_TRACKED_CHANNEL_KINDS: usize = 512;
 const MAX_TRACKED_STREAMS: usize = 64;
 const STREAM_TRUNCATION_MARKER: &str = "…";
+const HISTORY_PAGE_LIMIT: usize = 200;
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -111,6 +112,7 @@ impl SlackTransport {
                 added_reactions: Mutex::new(Tracked::new(MAX_TRACKED_REACTIONS)),
                 progress_cooldown_until: Mutex::new(None),
                 streams: Mutex::new(Tracked::new(MAX_TRACKED_STREAMS)),
+                bot_user: OnceLock::new(),
             }),
             socket: None,
             identity: TransportIdentity::default(),
@@ -626,6 +628,7 @@ impl ChatTransport for SlackTransport {
     fn connect(&mut self) -> BoxFuture<'_, Result<TransportIdentity, TransportError>> {
         Box::pin(async move {
             let (user_id, team_id) = self.auth_test().await?;
+            self.replier.bot_user.get_or_init(|| user_id.clone());
             self.identity = TransportIdentity {
                 user_id: Some(user_id),
                 handle: None,
@@ -683,6 +686,7 @@ pub(crate) struct SlackReplier {
     added_reactions: Mutex<Tracked<()>>,
     progress_cooldown_until: Mutex<Option<Instant>>,
     streams: Mutex<Tracked<StreamState>>,
+    bot_user: OnceLock<String>,
 }
 
 #[async_trait]
@@ -778,6 +782,86 @@ impl ChatDriver for SlackReplier {
 
     fn cancel_button(&self) -> Option<&dyn CancelButton> {
         (self.experience == SlackExperience::Classic).then_some(self as &dyn CancelButton)
+    }
+
+    fn history(&self) -> Option<&dyn ChatHistory> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl ChatHistory for SlackReplier {
+    async fn recent(
+        &self,
+        conversation: &Conversation,
+        before: &str,
+        limit: usize,
+    ) -> Result<Vec<PastMessage>, TransportError> {
+        let bot = self.bot_user.get().ok_or(TransportError::Closed)?;
+        let channel = conversation.id.to_ascii_uppercase();
+        if channel.is_empty() || !channel.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return Err(TransportError::Response);
+        }
+        let cutoff = slack_instant(before).ok_or(TransportError::Response)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(thread) = conversation.thread.as_deref() else {
+            let page_limit = limit.min(HISTORY_PAGE_LIMIT).to_string();
+            let page = self
+                .history_page(
+                    "conversations.history",
+                    &[
+                        ("channel", channel.as_str()),
+                        ("latest", before),
+                        ("inclusive", "false"),
+                        ("limit", page_limit.as_str()),
+                    ],
+                )
+                .await?;
+            let mut recalled = past_messages(&page, bot, cutoff)?;
+            recalled.reverse();
+            return Ok(recalled);
+        };
+        if !canonical_timestamp(thread) {
+            return Err(TransportError::Response);
+        }
+        let page_limit = HISTORY_PAGE_LIMIT.to_string();
+        let mut recalled = VecDeque::with_capacity(limit.min(HISTORY_PAGE_LIMIT));
+        let mut cursor = String::new();
+        loop {
+            let mut query = vec![
+                ("channel", channel.as_str()),
+                ("ts", thread),
+                ("latest", before),
+                ("inclusive", "false"),
+                ("limit", page_limit.as_str()),
+            ];
+            if !cursor.is_empty() {
+                query.push(("cursor", cursor.as_str()));
+            }
+            let page = self.history_page("conversations.replies", &query).await?;
+            // Slack repeats the thread root at the head of every page.
+            for message in past_messages(&page, bot, cutoff)? {
+                if recalled
+                    .back()
+                    .is_some_and(|last: &PastMessage| message.at <= last.at)
+                {
+                    continue;
+                }
+                recalled.push_back(message);
+                if recalled.len() > limit {
+                    recalled.pop_front();
+                }
+            }
+            cursor = page["response_metadata"]["next_cursor"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            if cursor.is_empty() {
+                return Ok(recalled.into());
+            }
+        }
     }
 }
 
@@ -1338,6 +1422,36 @@ impl SlackReplier {
         check_ok(response).await
     }
 
+    async fn history_page(
+        &self,
+        method: &str,
+        query: &[(&str, &str)],
+    ) -> Result<Value, TransportError> {
+        if self.progress_cooldown().is_some() {
+            return Err(TransportError::Service {
+                code: "ratelimited".to_owned(),
+            });
+        }
+        let response = self
+            .http
+            .get(format!("{}/api/{method}", self.endpoint))
+            .query(query)
+            .header(
+                "authorization",
+                format!("Bearer {}", self.bot_token.expose()),
+            )
+            .send()
+            .await
+            .map_err(|source| TransportError::Request(Box::new(source)))?;
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            self.begin_cooldown(retry_after(response.headers()));
+            return Err(TransportError::Service {
+                code: "ratelimited".to_owned(),
+            });
+        }
+        check_ok(response).await
+    }
+
     fn progress_cooldown(&self) -> Option<Duration> {
         let until = (*self
             .progress_cooldown_until
@@ -1691,6 +1805,55 @@ async fn post_form(
     check_ok(response).await
 }
 
+fn past_messages(
+    page: &Value,
+    bot: &str,
+    cutoff: SystemTime,
+) -> Result<Vec<PastMessage>, TransportError> {
+    let messages = page["messages"]
+        .as_array()
+        .ok_or(TransportError::Response)?;
+    Ok(messages
+        .iter()
+        .filter_map(|message| past_message(message, bot))
+        .filter(|message| message.at < cutoff)
+        .collect())
+}
+
+fn past_message(message: &Value, bot: &str) -> Option<PastMessage> {
+    if let Some(subtype) = message["subtype"].as_str()
+        && !REQUEST_SUBTYPES.contains(&subtype)
+    {
+        return None;
+    }
+    let user = message["user"].as_str()?;
+    let at = slack_instant(message["ts"].as_str()?)?;
+    let text = bound_inbound(message["text"].as_str().unwrap_or_default());
+    let assets = pending_assets(&message["files"]);
+    if text.trim().is_empty() && assets.is_empty() {
+        return None;
+    }
+    Some(PastMessage {
+        from_bot: user == bot,
+        author: user.to_owned(),
+        text,
+        assets,
+        at,
+    })
+}
+
+fn slack_instant(ts: &str) -> Option<SystemTime> {
+    if !canonical_timestamp(ts) {
+        return None;
+    }
+    let (seconds, micros) = ts.split_once('.')?;
+    let since_epoch = Duration::new(
+        seconds.parse().ok()?,
+        micros.parse::<u32>().ok()?.checked_mul(1_000)?,
+    );
+    SystemTime::UNIX_EPOCH.checked_add(since_epoch)
+}
+
 fn canonical_timestamp(value: &str) -> bool {
     value.split_once('.').is_some_and(|(seconds, fraction)| {
         seconds.len() == 10
@@ -1740,16 +1903,18 @@ mod driver_tests {
     use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
     use super::{
-        CANCEL_ACTION_ID, ConversationKind, MAX_TRACKED_REACTIONS, MAX_TRACKED_STREAMS,
-        PROGRESS_MAX_CHARS, SLACK_REQUEST_TIMEOUT, SlackReplier, SlackTransport, Tracked,
+        CANCEL_ACTION_ID, Conversation, ConversationKind, HISTORY_PAGE_LIMIT,
+        MAX_TRACKED_REACTIONS, MAX_TRACKED_STREAMS, OnceLock, PROGRESS_MAX_CHARS,
+        SLACK_REQUEST_TIMEOUT, SlackReplier, SlackTransport, Tracked,
     };
     use crate::{
         config::{LivenessSettings, SlackExperience, SlackLivenessFallback, TemplateOverrides},
         progress::{ProgressDetail, ProgressText, Templates},
         transport::{
-            AckToken, CancelButton, CancelPress, ChatDriver, InboundReaction, LivenessTarget,
-            MessageRef, NativeStatus, OutboundReply, ProgressMessage, Status, StreamedText,
-            TextStream, TransportError, TransportEvent, credential_client, receive_span,
+            AckToken, CancelButton, CancelPress, ChatDriver, ChatHistory as _, InboundReaction,
+            LivenessTarget, MessageRef, NativeStatus, OutboundReply, ProgressMessage, Status,
+            StreamedText, TextStream, TransportError, TransportEvent, credential_client,
+            receive_span,
         },
     };
 
@@ -1758,6 +1923,7 @@ mod driver_tests {
     const DIRECT_CHANNEL: &str = "D0123ABC";
     const GROUP_CHANNEL: &str = "G0123ABC";
     const USER: &str = "U9XYZ";
+    const BOT_USER: &str = "UBOT123";
     const SUBJECT: &str = "slack.t0123abc.u9xyz";
     const CONVERSATION: &str = "c0123abc:1700000000.000001";
     const INBOUND_TS: &str = "1700000000.000001";
@@ -1804,6 +1970,7 @@ mod driver_tests {
             added_reactions: Mutex::new(Tracked::new(MAX_TRACKED_REACTIONS)),
             progress_cooldown_until: Mutex::new(None),
             streams: Mutex::new(Tracked::new(MAX_TRACKED_STREAMS)),
+            bot_user: OnceLock::from(BOT_USER.to_owned()),
         }
     }
 
@@ -2782,6 +2949,254 @@ mod driver_tests {
             inside.conversation.key(),
             "the opening question and the answers to it are one exchange"
         );
+    }
+
+    fn direct_conversation() -> Conversation {
+        Conversation {
+            kind: ConversationKind::DirectMessage,
+            container: Some(TEAM.to_ascii_lowercase()),
+            id: DIRECT_CHANNEL.to_ascii_lowercase(),
+            thread: None,
+        }
+    }
+
+    fn thread_conversation() -> Conversation {
+        Conversation {
+            kind: ConversationKind::Thread,
+            container: Some(TEAM.to_ascii_lowercase()),
+            id: CHANNEL.to_ascii_lowercase(),
+            thread: Some(INBOUND_TS.to_owned()),
+        }
+    }
+
+    fn said(user: &str, ts: &str, text: &str) -> Value {
+        json!({ "type": "message", "user": user, "ts": ts, "text": text })
+    }
+
+    fn photo() -> Value {
+        json!([{
+            "id": "F0PHOTO",
+            "name": "cat.png",
+            "mimetype": "image/png",
+            "size": 42,
+            "url_private_download": "http://127.0.0.1:1/files/cat.png",
+        }])
+    }
+
+    #[tokio::test]
+    async fn a_direct_message_is_recalled_oldest_first_from_conversations_history() {
+        let mock = spawn_slack_mock(|path, _| {
+            assert!(path.starts_with("/api/conversations.history?"), "{path}");
+            let mut with_photo = said(USER, "1700000000.000003", "look");
+            with_photo["subtype"] = json!("file_share");
+            with_photo["files"] = photo();
+            let mut joined = said(USER, "1700000000.000002", "joined");
+            joined["subtype"] = json!("channel_join");
+            (
+                200,
+                json!({ "ok": true, "messages": [
+                    said(USER, POSTED_TS, "the trigger itself"),
+                    said(BOT_USER, "1700000000.000004", "a cat"),
+                    with_photo,
+                    joined,
+                    said(USER, INBOUND_TS, "hello"),
+                ]}),
+            )
+        });
+        let replier = replier(&mock.base, SlackExperience::Classic);
+
+        let recalled = replier
+            .history()
+            .expect("Slack reads its own history")
+            .recent(&direct_conversation(), POSTED_TS, 3)
+            .await
+            .expect("the history reads");
+
+        let path = &mock.calls()[0].0;
+        assert_eq!(
+            path,
+            &format!(
+                "/api/conversations.history?channel={DIRECT_CHANNEL}&latest={POSTED_TS}&inclusive=false&limit=3"
+            )
+        );
+        let texts = recalled
+            .iter()
+            .map(|message| {
+                (
+                    message.from_bot,
+                    message.author.as_str(),
+                    message.text.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            [
+                (false, USER, "hello"),
+                (false, USER, "look"),
+                (true, BOT_USER, "a cat"),
+            ]
+        );
+        assert!(recalled.windows(2).all(|pair| pair[0].at < pair[1].at));
+    }
+
+    #[tokio::test]
+    async fn a_recalled_attachment_is_the_asset_the_inbound_path_would_have_built() {
+        let mock = spawn_slack_mock(|path, _| {
+            if path.starts_with("/api/conversations.history?") {
+                let mut shared = said(USER, INBOUND_TS, "look");
+                shared["subtype"] = json!("file_share");
+                shared["files"] = photo();
+                return (200, json!({ "ok": true, "messages": [shared] }));
+            }
+            (200, json!({ "ok": true }))
+        });
+        let mut transport = transport(&mock.base, SlackExperience::Classic);
+        let inbound = transport
+            .routable(
+                TEAM,
+                &json!({
+                    "type": "message",
+                    "subtype": "file_share",
+                    "channel": DIRECT_CHANNEL,
+                    "channel_type": "im",
+                    "user": USER,
+                    "ts": INBOUND_TS,
+                    "text": "look",
+                    "files": photo(),
+                }),
+                &Span::none(),
+            )
+            .await
+            .expect("readable")
+            .expect("routable");
+
+        let recalled = replier(&mock.base, SlackExperience::Classic)
+            .recent(&direct_conversation(), POSTED_TS, 10)
+            .await
+            .expect("the history reads");
+
+        assert_eq!(recalled.len(), 1);
+        assert_eq!(recalled[0].assets, inbound.assets);
+    }
+
+    #[tokio::test]
+    async fn a_thread_keeps_only_the_newest_replies_across_pages_without_repeating_the_root() {
+        let root = said(USER, INBOUND_TS, "question");
+        let mock = spawn_slack_mock(move |path, _| {
+            let page = if path.contains("cursor=") {
+                json!({ "ok": true, "messages": [
+                    root.clone(),
+                    said(USER, "1700000000.000003", "second"),
+                    said(BOT_USER, "1700000000.000004", "third"),
+                ]})
+            } else {
+                json!({ "ok": true, "messages": [
+                    root.clone(),
+                    said(BOT_USER, "1700000000.000002", "first"),
+                ], "response_metadata": { "next_cursor": "bmV4dA==" } })
+            };
+            (200, page)
+        });
+
+        let recalled = replier(&mock.base, SlackExperience::Agent)
+            .recent(&thread_conversation(), POSTED_TS, 3)
+            .await
+            .expect("the history reads");
+
+        let paths = mock
+            .calls()
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect::<Vec<_>>();
+        let first = format!(
+            "/api/conversations.replies?channel={CHANNEL}&ts={INBOUND_TS}&latest={POSTED_TS}&inclusive=false&limit={HISTORY_PAGE_LIMIT}"
+        );
+        assert_eq!(
+            paths,
+            [first.clone(), format!("{first}&cursor=bmV4dA%3D%3D")]
+        );
+        let texts = recalled
+            .iter()
+            .map(|message| message.text.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(texts, ["first", "second", "third"]);
+        assert!(recalled[0].from_bot && !recalled[1].from_bot && recalled[2].from_bot);
+    }
+
+    #[tokio::test]
+    async fn a_history_read_asks_for_at_most_one_page_of_slacks_recommended_size() {
+        let mock = spawn_slack_mock(|_, _| (200, json!({ "ok": true, "messages": [] })));
+        let replier = replier(&mock.base, SlackExperience::Classic);
+
+        replier
+            .recent(&direct_conversation(), POSTED_TS, HISTORY_PAGE_LIMIT)
+            .await
+            .expect("the history reads");
+        replier
+            .recent(&direct_conversation(), POSTED_TS, HISTORY_PAGE_LIMIT + 1)
+            .await
+            .expect("the history reads");
+
+        let limits = mock
+            .calls()
+            .into_iter()
+            .map(|(path, _)| path.rsplit_once("limit=").expect("a limit").1.to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            limits,
+            [
+                HISTORY_PAGE_LIMIT.to_string(),
+                HISTORY_PAGE_LIMIT.to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_history_read_is_an_error_naming_slacks_code() {
+        let mock =
+            spawn_slack_mock(|_, _| (200, json!({ "ok": false, "error": "channel_not_found" })));
+
+        let refused = replier(&mock.base, SlackExperience::Classic)
+            .recent(&direct_conversation(), POSTED_TS, 10)
+            .await;
+
+        assert!(
+            matches!(&refused, Err(TransportError::Service { code }) if code == "channel_not_found"),
+            "{refused:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_throttled_history_read_fails_and_holds_the_shared_cooldown() {
+        let mock = spawn_slack_mock(|_, _| (429, json!({ "ok": false, "error": "ratelimited" })));
+        let replier = replier(&mock.base, SlackExperience::Classic);
+
+        let throttled = replier.recent(&direct_conversation(), POSTED_TS, 10).await;
+        let held = replier.recent(&thread_conversation(), POSTED_TS, 10).await;
+
+        for result in [&throttled, &held] {
+            assert!(
+                matches!(result, Err(TransportError::Service { code }) if code == "ratelimited"),
+                "{result:?}"
+            );
+        }
+        assert_eq!(
+            mock.calls().len(),
+            1,
+            "the cooldown suppresses the next read"
+        );
+        assert!(replier.progress_cooldown().is_some());
+    }
+
+    #[tokio::test]
+    async fn history_is_unreadable_until_the_bot_knows_who_it_is() {
+        let mut replier = replier(UNREACHABLE, SlackExperience::Classic);
+        replier.bot_user = OnceLock::new();
+
+        let early = replier.recent(&direct_conversation(), POSTED_TS, 10).await;
+
+        assert!(matches!(early, Err(TransportError::Closed)), "{early:?}");
     }
 
     #[test]

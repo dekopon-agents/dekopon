@@ -18,6 +18,7 @@ mod cache_key;
 mod collection;
 mod config;
 mod conversation;
+mod journal;
 mod progress;
 mod routes;
 mod session;
@@ -41,10 +42,11 @@ use tracing::Instrument as _;
 
 pub use config::{
     CONFIG_API_VERSION, ConfigApiVersion, ConfigError, ConfigProblem, ConversationMatchConfig,
-    DEFAULT_STOP_WORDS, DekopondConfig, HARD_MAX_CONFIG_BYTES, KeepAliveConfig, LivenessConfig,
-    LivenessMode, LivenessOverride, LivenessSettings, MemoryConfig, MemoryPolicy, MemoryScope,
-    MemoryWindow, ProgressSurface, ResolvedConfig, ResolvedRoute, ResolvedTelemetry,
-    SlackExperience, SlackLivenessFallback, TelemetryConfig, TemplateOverrides, TransportConfig,
+    DEFAULT_FORGET_AFTER, DEFAULT_STOP_WORDS, DekopondConfig, HARD_MAX_CONFIG_BYTES, JournalConfig,
+    KeepAliveConfig, LivenessConfig, LivenessMode, LivenessOverride, LivenessSettings,
+    MemoryConfig, MemoryPolicy, MemoryScope, MemoryWindow, ProgressSurface, RecallSource,
+    ResolvedConfig, ResolvedJournal, ResolvedRoute, ResolvedTelemetry, SlackExperience,
+    SlackLivenessFallback, TelemetryConfig, TemplateOverrides, TransportConfig,
 };
 pub use routes::{RouteError, RouteProblem};
 pub use session::SessionError;
@@ -126,12 +128,29 @@ where
         readers.spawn(read_transport(Box::new(transport), sender.clone()));
     }
 
+    let journal = match config.journal.clone() {
+        Some(journal) => Some(Arc::new(
+            tokio::task::spawn_blocking(move || {
+                journal::Journal::open(&journal.dir, journal.max_bytes)
+            })
+            .await
+            .map_err(DekopondError::TransportTask)?
+            .map_err(|error| DekopondError::Journal {
+                kind: match error {
+                    journal::JournalError::Io { kind } => kind,
+                    journal::JournalError::Corrupt => std::io::ErrorKind::InvalidData,
+                },
+            })?,
+        )),
+        None => None,
+    };
     let runner = Arc::new(SessionRunner {
         broker: config.broker.clone(),
         models: Arc::new(ModelCache::new(Arc::new(ConfiguredModels::default()))),
         gate: SessionGate::new(config.sessions.max_concurrent),
         reply_on_busy: config.sessions.reply_on_busy,
         conversations: ConversationStore::new(config.sessions.max_conversations),
+        journal,
         assets: Arc::new(AssetStore::with_retention(
             config.sessions.max_conversations,
             ASSET_IDLE_TIMEOUT,
@@ -706,6 +725,8 @@ pub enum DekopondError {
     TransportTask(#[source] tokio::task::JoinError),
     #[error("every chat transport ended; the gateway can no longer be reached")]
     TransportsLost,
+    #[error("conversation journal directory is unusable: {kind}")]
+    Journal { kind: std::io::ErrorKind },
 }
 
 #[derive(Debug, Error)]

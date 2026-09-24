@@ -121,6 +121,14 @@ than configured: an emptyDir here would turn seed-once into seed-per-reschedule.
 {{- if and .Values.gateway.enabled .Values.gateway.chatgpt.enabled -}}true{{- end -}}
 {{- end -}}
 
+{{- define "dekopon.journalEnabled" -}}
+{{- if and .Values.gateway.enabled .Values.gateway.journal.enabled -}}true{{- end -}}
+{{- end -}}
+
+{{- define "dekopon.journalDir" -}}
+{{- printf "%s/%s" .Values.paths.stateDir .Values.gateway.journal.subdir -}}
+{{- end -}}
+
 {{- define "dekopon.brokerChatgptSecretName" -}}
 {{- printf "%s-broker-chatgpt" (include "dekopon.fullname" .) -}}
 {{- end -}}
@@ -415,6 +423,30 @@ operator who fixes one only to be told about the next has to roll the release tw
 {{- if $problems -}}
 {{- fail (printf "broker.chatgpt is misconfigured: %s" (join "; " $problems)) -}}
 {{- end -}}
+{{- end -}}
+
+{{- if include "dekopon.journalEnabled" . -}}
+{{- $problems := list -}}
+{{- $subdir := .Values.gateway.journal.subdir -}}
+{{- if or (not (regexMatch "^[A-Za-z0-9._-]+$" $subdir)) (eq $subdir ".") (eq $subdir "..") -}}
+{{- $problems = append $problems (printf "gateway.journal.subdir must be one non-dot path segment joined onto paths.stateDir, got %q" $subdir) -}}
+{{- end -}}
+{{- $taken := dict "gateway.chatgpt.subdir" (and (include "dekopon.chatgptEnabled" .) .Values.gateway.chatgpt.subdir) "broker.chatgpt.subdir" (and (include "dekopon.brokerChatgptEnabled" .) .Values.broker.chatgpt.subdir) "broker.providerSet.subdir" (and (include "dekopon.providerSetEnabled" .) .Values.broker.providerSet.subdir) -}}
+{{- range $name, $other := $taken -}}
+{{- if eq $other $subdir -}}
+{{- $problems = append $problems (printf "gateway.journal.subdir and %s are both %q; each daemon owns its own subtree of the claim" $name $subdir) -}}
+{{- end -}}
+{{- end -}}
+{{- $mount := .Values.gateway.journal.mountPath -}}
+{{- if or (not (regexMatch "^/([A-Za-z0-9._-]+/)*[A-Za-z0-9._-]+$" $mount)) (ne (clean $mount) $mount) -}}
+{{- $problems = append $problems (printf "gateway.journal.mountPath must be a canonical absolute path, got %q" $mount) -}}
+{{- end -}}
+{{- if $problems -}}
+{{- fail (printf "gateway.journal is misconfigured: %s" (join "; " $problems)) -}}
+{{- end -}}
+{{- end -}}
+{{- if and .Values.gateway.journal.enabled (not .Values.gateway.enabled) -}}
+{{- fail "gateway.journal.enabled has no effect without gateway.enabled" -}}
 {{- end -}}
 
 {{/* The managed provider set. Collected the same way broker.chatgpt's problems are, and for the

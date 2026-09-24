@@ -197,6 +197,17 @@ spec:
                 rc=1
               fi
 {{- end }}
+{{- if include "dekopon.journalEnabled" . }}
+
+              [ -d "{{ include "dekopon.journalDir" . }}" ] || mkdir -p "{{ include "dekopon.journalDir" . }}"
+              chown "$gateway_uid:$gateway_gid" "{{ include "dekopon.journalDir" . }}"
+              chmod 0700 "{{ include "dekopon.journalDir" . }}"
+              got=$(stat -c '%u:%a:%F' "{{ include "dekopon.journalDir" . }}")
+              if [ "$got" != "$gateway_uid:700:directory" ]; then
+                echo "{{ include "dekopon.journalDir" . }}: got $got, want $gateway_uid:700:directory" >&2
+                rc=1
+              fi
+{{- end }}
 {{- if include "dekopon.providerSetEnabled" . }}
 
               # The managed provider set's directory on the claim. The chart writes nothing into
@@ -339,6 +350,11 @@ spec:
             - name: state
               mountPath: {{ $chatgptDir }}
               subPath: {{ .Values.gateway.chatgpt.subdir }}
+{{- end }}
+{{- if include "dekopon.journalEnabled" . }}
+            - name: state
+              mountPath: {{ .Values.gateway.journal.mountPath }}
+              subPath: {{ .Values.gateway.journal.subdir }}
 {{- end }}
             - name: gateway-tmp
               mountPath: /tmp

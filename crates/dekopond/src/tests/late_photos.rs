@@ -157,6 +157,7 @@ impl Fixture {
             &key,
             &["cli-probe.upper".into()],
             self.route.memory.window().unwrap(),
+            None,
             Instant::now(),
         );
         self.runner
@@ -826,7 +827,7 @@ fn late_photos_expired_conversation_refuses_before_metadata_registration() {
     );
     let granted = vec!["cli-probe.upper".into()];
     let old = Instant::now() - window().idle_timeout - Duration::from_secs(1);
-    let seed = store.begin(&key, &granted, window(), old);
+    let seed = store.begin(&key, &granted, window(), None, old);
     let receipt = seed.input;
     seed.lease.commit(
         window(),
@@ -1018,6 +1019,7 @@ async fn late_photos_stop_owns_parked_authorization_after_execution_ends_with_or
             &key,
             &["cli-probe.upper".into()],
             route.memory.window().unwrap(),
+            None,
             Instant::now(),
         );
         assert_eq!(
@@ -1303,7 +1305,7 @@ fn late_photos_notice_context_is_fenced_after_prompt_seed_or_generation_replacem
             &input.subject,
         );
         let granted = vec!["cli-probe.upper".into()];
-        let first = store.begin(&key, &granted, window(), Instant::now());
+        let first = store.begin(&key, &granted, window(), None, Instant::now());
         let old = first.input.clone();
         first.lease.commit(
             window(),
@@ -1315,7 +1317,7 @@ fn late_photos_notice_context_is_fenced_after_prompt_seed_or_generation_replacem
         if replace {
             store.remove(&key, EvictionReason::GrantChanged);
         }
-        let second = store.begin(&key, &granted, window(), Instant::now());
+        let second = store.begin(&key, &granted, window(), None, Instant::now());
         assert!(second.gateway_notice.is_none());
         store.remember_gateway_notice(&old, "This old question must not appear after B seeded.");
         second.lease.commit(
@@ -1324,7 +1326,7 @@ fn late_photos_notice_context_is_fenced_after_prompt_seed_or_generation_replacem
             &second.cache_key,
             Instant::now(),
         );
-        let third = store.begin(&key, &granted, window(), Instant::now());
+        let third = store.begin(&key, &granted, window(), None, Instant::now());
         assert!(third.gateway_notice.is_none());
     }
 }

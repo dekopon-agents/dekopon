@@ -96,8 +96,7 @@ impl History {
     }
 
     #[must_use]
-    #[cfg(test)]
-    pub(crate) fn from_turns(
+    pub fn from_turns(
         limits: HistoryLimits,
         turns: impl IntoIterator<Item = ConversationTurn>,
     ) -> Self {

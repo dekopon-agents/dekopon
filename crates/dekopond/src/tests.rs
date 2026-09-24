@@ -50,9 +50,10 @@ use crate::{
     asset::{self, AssetAccess, AssetSourceRef, AssetStore, PendingAsset, SessionAssets},
     cache_key,
     config::{
-        self, ConfigError, ConfigProblem, DEFAULT_SCRIPT_TIMEOUT_MS, LivenessConfig, LivenessMode,
-        LivenessOverride, LivenessSettings, MemoryPolicy, MemoryScope, MemoryWindow, ModelConfig,
-        ProgressSurface, ResolvedBroker, ResolvedLiveness, SlackExperience, SlackLivenessFallback,
+        self, ConfigError, ConfigProblem, DEFAULT_FORGET_AFTER, DEFAULT_SCRIPT_TIMEOUT_MS,
+        LivenessConfig, LivenessMode, LivenessOverride, LivenessSettings, MemoryPolicy,
+        MemoryScope, MemoryWindow, ModelConfig, ProgressSurface, RecallSource, ResolvedBroker,
+        ResolvedLiveness, SlackExperience, SlackLivenessFallback,
     },
     conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
     progress::{KeepAlive, ProgressDetail, ProgressText},
@@ -206,6 +207,8 @@ async fn an_explicit_shared_scope_survives_resolution_and_route_binding() {
             max_turns: 12,
             max_bytes: 64 * 1024,
         },
+        recall: RecallSource::None,
+        forget_after: DEFAULT_FORGET_AFTER,
     });
     assert_eq!(resolved.routes[0].memory, expected);
 
@@ -526,6 +529,23 @@ async fn native_liveness_is_off_unless_a_transport_opts_in() {
 }
 
 #[tokio::test]
+async fn a_configured_journal_makes_journal_recall_the_default_and_resolves_its_path() {
+    let directory = temporary();
+    let mut document = document(directory.path());
+    document["sessions"] = json!({"journal": {"path": "journal", "maxBytes": 1024}});
+    document["routes"][0]["memory"] = json!({"mode": "persistent"});
+    let resolved = load(directory.path(), &document)
+        .await
+        .expect("a journaled persistent route resolves");
+
+    let window = resolved.routes[0].memory.window().expect("persistent");
+    assert_eq!(window.recall, RecallSource::Journal);
+    let journal = resolved.journal.expect("journal");
+    assert_eq!(journal.max_bytes, 1024);
+    assert!(journal.dir.is_absolute() && journal.dir.ends_with("journal"));
+}
+
+#[tokio::test]
 async fn a_persistent_route_resolves_its_documented_window_defaults() {
     let directory = temporary();
     let mut document = document(directory.path());
@@ -541,6 +561,8 @@ async fn a_persistent_route_resolves_its_documented_window_defaults() {
             max_turns: 12,
             max_bytes: 64 * 1024,
         },
+        recall: RecallSource::None,
+        forget_after: DEFAULT_FORGET_AFTER,
     });
     assert_eq!(resolved.routes[0].memory, expected);
 
@@ -798,6 +820,73 @@ async fn invalid_configurations_fail_closed_at_startup() {
                     matches!(problem, ConfigProblem::SharedMemoryOnDmRoute { .. })
                 })
             },
+        ),
+        (
+            "platform recall on a transport with no history API",
+            mutate(|document| {
+                document["routes"][0]["memory"] =
+                    json!({"mode": "persistent", "recall": "platform"});
+            }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::PlatformRecallUnsupported { .. })
+                })
+            },
+        ),
+        (
+            "journal recall with no journal configured",
+            mutate(|document| {
+                document["routes"][0]["memory"] =
+                    json!({"mode": "persistent", "recall": "journal"});
+            }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::JournalRecallWithoutJournal { .. })
+                })
+            },
+        ),
+        (
+            "a recall horizon on a route that recalls nothing",
+            mutate(|document| {
+                document["routes"][0]["memory"] =
+                    json!({"mode": "persistent", "forgetAfterMs": 60_000});
+            }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::ForgetAfterWithoutRecall { .. })
+                })
+            },
+        ),
+        (
+            "a zero recall horizon",
+            mutate(|document| {
+                document["sessions"] = json!({"journal": {"path": "journal", "maxBytes": 1024}});
+                document["routes"][0]["memory"] = json!({"mode": "persistent", "forgetAfterMs": 0});
+            }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::InvalidMemoryBounds { .. })
+                })
+            },
+        ),
+        (
+            "a zero journal byte cap",
+            mutate(|document| {
+                document["sessions"] = json!({"journal": {"path": "journal", "maxBytes": 0}});
+            }),
+            |error| {
+                reports(error, |problem| {
+                    matches!(problem, ConfigProblem::InvalidJournalBytes)
+                })
+            },
+        ),
+        (
+            "an unknown recall source",
+            mutate(|document| {
+                document["routes"][0]["memory"] =
+                    json!({"mode": "persistent", "recall": "telepathy"});
+            }),
+            |error| matches!(error, ConfigError::Decode { .. }),
         ),
         (
             "a liveness override keyed on a kind that does not exist",
@@ -2811,6 +2900,8 @@ fn window() -> MemoryWindow {
             max_turns: 12,
             max_bytes: 64 * 1024,
         },
+        recall: RecallSource::None,
+        forget_after: DEFAULT_FORGET_AFTER,
     }
 }
 
@@ -3004,6 +3095,7 @@ fn runner_tracking(
         gate: SessionGate::new(max_concurrent),
         reply_on_busy: true,
         conversations: ConversationStore::new(max_conversations),
+        journal: None,
         assets: Arc::new(AssetStore::new(
             max_conversations,
             Duration::from_secs(60 * 60),
@@ -3501,6 +3593,7 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
         &key,
         &granted(&["memory.chat.recent", "memory.chat.search"]),
         window(),
+        None,
         Instant::now(),
     );
     assert_eq!(remembered.history.turns().len(), 1);
@@ -4812,7 +4905,7 @@ fn commit(
 ) {
     let ConversationSeed {
         cache_key, lease, ..
-    } = store.begin(key, granted, window, now);
+    } = store.begin(key, granted, window, None, now);
     lease.commit(window, turn, &cache_key, now);
 }
 
@@ -5359,14 +5452,26 @@ fn an_idle_conversation_is_dropped_and_the_next_message_starts_fresh() {
         start,
     );
 
-    let warm = store.begin(&key, &allowed, window(), start + Duration::from_secs(899));
+    let warm = store.begin(
+        &key,
+        &allowed,
+        window(),
+        None,
+        start + Duration::from_secs(899),
+    );
     assert_eq!(
         warm.history.len(),
         1,
         "inside the timeout the exchange is replayed"
     );
 
-    let cold = store.begin(&key, &allowed, window(), start + Duration::from_secs(900));
+    let cold = store.begin(
+        &key,
+        &allowed,
+        window(),
+        None,
+        start + Duration::from_secs(900),
+    );
     assert!(
         cold.history.is_empty(),
         "past the timeout the next message starts fresh"
@@ -5417,18 +5522,24 @@ fn the_conversation_ceiling_evicts_the_least_recently_used_rather_than_refusing(
     assert_eq!(store.tracked(), 2, "the ceiling holds");
     assert!(
         store
-            .begin(&keys[1], &allowed, window(), now)
+            .begin(&keys[1], &allowed, window(), None, now)
             .history
             .is_empty(),
         "the least recently used conversation is the one that goes"
     );
     assert_eq!(
-        store.begin(&keys[0], &allowed, window(), now).history.len(),
+        store
+            .begin(&keys[0], &allowed, window(), None, now)
+            .history
+            .len(),
         2,
         "the conversation somebody is still having survives"
     );
     assert_eq!(
-        store.begin(&keys[2], &allowed, window(), now).history.len(),
+        store
+            .begin(&keys[2], &allowed, window(), None, now)
+            .history
+            .len(),
         1
     );
 }
@@ -5444,6 +5555,8 @@ fn each_window_bound_drops_the_oldest_exchange_on_its_own() {
             max_turns: 2,
             max_bytes: 64 * 1024,
         },
+        recall: RecallSource::None,
+        forget_after: DEFAULT_FORGET_AFTER,
     };
     let by_bytes = MemoryWindow {
         scope: MemoryScope::PrivateConversation,
@@ -5452,6 +5565,8 @@ fn each_window_bound_drops_the_oldest_exchange_on_its_own() {
             max_turns: 12,
             max_bytes: 40,
         },
+        recall: RecallSource::None,
+        forget_after: DEFAULT_FORGET_AFTER,
     };
 
     for (window, name) in [(by_turns, "turn bound"), (by_bytes, "byte bound")] {
@@ -5467,7 +5582,7 @@ fn each_window_bound_drops_the_oldest_exchange_on_its_own() {
                 now,
             );
         }
-        let history = store.begin(&key, &allowed, window, now).history;
+        let history = store.begin(&key, &allowed, window, None, now).history;
         assert_eq!(history.len(), 2, "{name} keeps two exchanges");
         assert_eq!(
             history.turns()[0].user(),
@@ -5507,8 +5622,8 @@ fn two_sessions_sharing_one_conversation_both_land_their_exchange() {
     let allowed = granted(&["cli-probe.upper"]);
     let now = Instant::now();
 
-    let first = store.begin(&key, &allowed, window(), now);
-    let second = store.begin(&key, &allowed, window(), now);
+    let first = store.begin(&key, &allowed, window(), None, now);
+    let second = store.begin(&key, &allowed, window(), None, now);
     assert!(first.history.is_empty() && second.history.is_empty());
     let ConversationSeed {
         cache_key: first_cache_key,
@@ -5534,7 +5649,7 @@ fn two_sessions_sharing_one_conversation_both_land_their_exchange() {
         now,
     );
 
-    let resumed = store.begin(&key, &allowed, window(), now);
+    let resumed = store.begin(&key, &allowed, window(), None, now);
     assert_eq!(resumed.history.len(), 2);
     assert_eq!(resumed.history.turns()[0].user(), "what broke?");
     assert_eq!(resumed.history.turns()[1].user(), "still there?");
@@ -5615,14 +5730,17 @@ fn shared_history_cannot_cross_agent_transport_or_conversation_boundaries() {
     ] {
         assert!(
             store
-                .begin(&isolated, &allowed, window(), now)
+                .begin(&isolated, &allowed, window(), None, now)
                 .history
                 .is_empty(),
             "one changed boundary component must start a clean shared conversation"
         );
     }
     assert_eq!(
-        store.begin(&origin, &allowed, window(), now).history.len(),
+        store
+            .begin(&origin, &allowed, window(), None, now)
+            .history
+            .len(),
         1,
         "the exact shared key still reaches its own turn"
     );
@@ -5644,8 +5762,8 @@ fn a_stale_wider_grant_commit_cannot_overwrite_its_replacement_generation() {
         now,
     );
 
-    let stale = store.begin(&key, &wide, window(), now + Duration::from_secs(1));
-    let fresh = store.begin(&key, &narrow, window(), now + Duration::from_secs(2));
+    let stale = store.begin(&key, &wide, window(), None, now + Duration::from_secs(1));
+    let fresh = store.begin(&key, &narrow, window(), None, now + Duration::from_secs(2));
     assert!(fresh.history.is_empty(), "the changed grant starts clean");
     let fresh_cache_key = fresh.cache_key.clone();
     fresh.lease.commit(
@@ -5661,7 +5779,7 @@ fn a_stale_wider_grant_commit_cannot_overwrite_its_replacement_generation() {
         now + Duration::from_secs(4),
     );
 
-    let resumed = store.begin(&key, &narrow, window(), now + Duration::from_secs(5));
+    let resumed = store.begin(&key, &narrow, window(), None, now + Duration::from_secs(5));
     assert_eq!(resumed.history.len(), 1);
     assert_eq!(resumed.history.turns()[0].user(), "fresh question");
     assert_eq!(resumed.cache_key, fresh_cache_key);
@@ -5681,7 +5799,7 @@ fn a_stale_commit_cannot_recreate_history_after_an_empty_grant_removes_it() {
         ConversationTurn::completed("old question", "old answer"),
         now,
     );
-    let stale = store.begin(&key, &allowed, window(), now + Duration::from_secs(1));
+    let stale = store.begin(&key, &allowed, window(), None, now + Duration::from_secs(1));
     let stale_cache_key = stale.cache_key.clone();
 
     assert!(store.remove(&key, EvictionReason::GrantChanged));
@@ -5693,7 +5811,7 @@ fn a_stale_commit_cannot_recreate_history_after_an_empty_grant_removes_it() {
     );
 
     assert_eq!(store.tracked(), 0);
-    let cold = store.begin(&key, &allowed, window(), now + Duration::from_secs(3));
+    let cold = store.begin(&key, &allowed, window(), None, now + Duration::from_secs(3));
     assert!(cold.history.is_empty());
     assert_ne!(cold.cache_key, stale_cache_key);
 }
@@ -5713,7 +5831,13 @@ fn a_capacity_evicted_generation_cannot_be_resurrected_by_late_work() {
         ConversationTurn::completed("first", "answer one"),
         now,
     );
-    let stale = store.begin(&first_key, &allowed, window(), now + Duration::from_secs(1));
+    let stale = store.begin(
+        &first_key,
+        &allowed,
+        window(),
+        None,
+        now + Duration::from_secs(1),
+    );
     let stale_cache_key = stale.cache_key.clone();
     commit(
         &store,
@@ -5734,7 +5858,13 @@ fn a_capacity_evicted_generation_cannot_be_resurrected_by_late_work() {
     assert_eq!(store.tracked(), 1);
     assert!(
         store
-            .begin(&first_key, &allowed, window(), now + Duration::from_secs(4))
+            .begin(
+                &first_key,
+                &allowed,
+                window(),
+                None,
+                now + Duration::from_secs(4)
+            )
             .history
             .is_empty(),
         "the evicted generation stays forgotten"
@@ -5745,6 +5875,7 @@ fn a_capacity_evicted_generation_cannot_be_resurrected_by_late_work() {
                 &second_key,
                 &allowed,
                 window(),
+                None,
                 now + Duration::from_secs(4)
             )
             .history
@@ -5768,8 +5899,20 @@ fn an_idle_replacement_is_not_overwritten_by_an_older_lease() {
         ConversationTurn::completed("old", "old answer"),
         now,
     );
-    let stale = store.begin(&key, &allowed, window(), now + Duration::from_secs(899));
-    let fresh = store.begin(&key, &allowed, window(), now + Duration::from_secs(900));
+    let stale = store.begin(
+        &key,
+        &allowed,
+        window(),
+        None,
+        now + Duration::from_secs(899),
+    );
+    let fresh = store.begin(
+        &key,
+        &allowed,
+        window(),
+        None,
+        now + Duration::from_secs(900),
+    );
     let fresh_cache_key = fresh.cache_key.clone();
     fresh.lease.commit(
         window(),
@@ -5784,7 +5927,13 @@ fn an_idle_replacement_is_not_overwritten_by_an_older_lease() {
         now + Duration::from_secs(901),
     );
 
-    let resumed = store.begin(&key, &allowed, window(), now + Duration::from_secs(901));
+    let resumed = store.begin(
+        &key,
+        &allowed,
+        window(),
+        None,
+        now + Duration::from_secs(901),
+    );
     assert_eq!(resumed.history.len(), 1);
     assert_eq!(resumed.history.turns()[0].user(), "new");
     assert_eq!(resumed.cache_key, fresh_cache_key);
@@ -5863,6 +6012,7 @@ fn a_cache_key_carries_nothing_about_the_sender() {
         &key,
         &granted(&["cli-probe.upper"]),
         window(),
+        None,
         Instant::now(),
     );
 
@@ -5883,7 +6033,7 @@ fn an_evicted_conversation_comes_back_with_a_new_cache_key() {
     let allowed = granted(&["cli-probe.upper"]);
     let start = Instant::now();
 
-    let first = store.begin(&key, &allowed, window(), start);
+    let first = store.begin(&key, &allowed, window(), None, start);
     let first_cache_key = first.cache_key.clone();
     first.lease.commit(
         window(),
@@ -5892,13 +6042,25 @@ fn an_evicted_conversation_comes_back_with_a_new_cache_key() {
         start,
     );
 
-    let warm = store.begin(&key, &allowed, window(), start + Duration::from_secs(60));
+    let warm = store.begin(
+        &key,
+        &allowed,
+        window(),
+        None,
+        start + Duration::from_secs(60),
+    );
     assert_eq!(
         warm.cache_key, first_cache_key,
         "a live conversation stays in the lane its own turns warmed"
     );
 
-    let cold = store.begin(&key, &allowed, window(), start + Duration::from_secs(900));
+    let cold = store.begin(
+        &key,
+        &allowed,
+        window(),
+        None,
+        start + Duration::from_secs(900),
+    );
     assert!(
         cold.history.is_empty(),
         "the idle timeout dropped the entry"
@@ -5926,11 +6088,11 @@ fn grant_empty_and_capacity_invalidation_each_rotate_the_cache_lane() {
         now,
     );
     let before_grant_change = grant_store
-        .begin(&grant_key, &wider, window(), now)
+        .begin(&grant_key, &wider, window(), None, now)
         .cache_key
         .clone();
     let after_grant_change = grant_store
-        .begin(&grant_key, &allowed, window(), now)
+        .begin(&grant_key, &allowed, window(), None, now)
         .cache_key
         .clone();
     assert_ne!(
@@ -5949,12 +6111,12 @@ fn grant_empty_and_capacity_invalidation_each_rotate_the_cache_lane() {
         now,
     );
     let before_removal = removed_store
-        .begin(&removed_key, &allowed, window(), now)
+        .begin(&removed_key, &allowed, window(), None, now)
         .cache_key
         .clone();
     assert!(removed_store.remove(&removed_key, EvictionReason::GrantChanged));
     let after_removal = removed_store
-        .begin(&removed_key, &allowed, window(), now)
+        .begin(&removed_key, &allowed, window(), None, now)
         .cache_key
         .clone();
     assert_ne!(
@@ -5974,7 +6136,7 @@ fn grant_empty_and_capacity_invalidation_each_rotate_the_cache_lane() {
         now,
     );
     let before_capacity = capacity_store
-        .begin(&displaced, &allowed, window(), now)
+        .begin(&displaced, &allowed, window(), None, now)
         .cache_key
         .clone();
     commit(
@@ -5986,7 +6148,13 @@ fn grant_empty_and_capacity_invalidation_each_rotate_the_cache_lane() {
         now + Duration::from_secs(1),
     );
     let after_capacity = capacity_store
-        .begin(&displaced, &allowed, window(), now + Duration::from_secs(2))
+        .begin(
+            &displaced,
+            &allowed,
+            window(),
+            None,
+            now + Duration::from_secs(2),
+        )
         .cache_key
         .clone();
     assert_ne!(
@@ -8482,7 +8650,7 @@ fn a_stale_shared_session_cannot_publish_or_fetch_across_a_grant_generation_race
     let narrow = granted(&["cli-probe.upper"]);
     let now = Instant::now();
 
-    let first = conversations.begin(&key, &wide, window(), now);
+    let first = conversations.begin(&key, &wide, window(), None, now);
     let old_access = first.assets.clone();
     let registered = store.assets_for_access(
         &old_access,
@@ -8499,7 +8667,7 @@ fn a_stale_shared_session_cannot_publish_or_fetch_across_a_grant_generation_race
         now,
     );
 
-    let stale = conversations.begin(&key, &wide, window(), now + Duration::from_secs(1));
+    let stale = conversations.begin(&key, &wide, window(), None, now + Duration::from_secs(1));
     assert_eq!(
         stale.cache_key, first_cache_key,
         "another participant with the same grant stays on the shared cache lane"
@@ -8532,7 +8700,7 @@ fn a_stale_shared_session_cannot_publish_or_fetch_across_a_grant_generation_race
         )
     });
     barrier.wait();
-    let fresh = conversations.begin(&key, &narrow, window(), now + Duration::from_secs(2));
+    let fresh = conversations.begin(&key, &narrow, window(), None, now + Duration::from_secs(2));
     let _racing_result = racing_publication.join().expect("asset race completes");
 
     assert!(
@@ -8585,7 +8753,7 @@ fn idle_replacement_retires_attachment_metadata_and_numbering() {
     let key = private_conversation_key("dev", "idle-assets", SUBJECT);
     let allowed = granted(&["cli-probe.upper"]);
     let now = Instant::now();
-    let first = conversations.begin(&key, &allowed, window(), now);
+    let first = conversations.begin(&key, &allowed, window(), None, now);
     let old_access = first.assets.clone();
     store.assets_for_access(
         &old_access,
@@ -8601,7 +8769,13 @@ fn idle_replacement_retires_attachment_metadata_and_numbering() {
         now,
     );
 
-    let fresh = conversations.begin(&key, &allowed, window(), now + Duration::from_secs(900));
+    let fresh = conversations.begin(
+        &key,
+        &allowed,
+        window(),
+        None,
+        now + Duration::from_secs(900),
+    );
     assert!(fresh.history.is_empty());
     assert!(
         store
@@ -8627,7 +8801,7 @@ fn capacity_eviction_retires_attachment_access_for_in_flight_sessions() {
     let second_key = private_conversation_key("dev", "second-assets", SUBJECT);
     let now = Instant::now();
 
-    let first = conversations.begin(&first_key, &allowed, window(), now);
+    let first = conversations.begin(&first_key, &allowed, window(), None, now);
     let old_access = first.assets.clone();
     store.assets_for_access(
         &old_access,
@@ -8642,8 +8816,13 @@ fn capacity_eviction_retires_attachment_access_for_in_flight_sessions() {
         &first_cache_key,
         now,
     );
-    let in_flight =
-        conversations.begin(&first_key, &allowed, window(), now + Duration::from_secs(1));
+    let in_flight = conversations.begin(
+        &first_key,
+        &allowed,
+        window(),
+        None,
+        now + Duration::from_secs(1),
+    );
     let in_flight_access = in_flight.assets.clone();
 
     commit(
@@ -8673,8 +8852,13 @@ fn capacity_eviction_retires_attachment_access_for_in_flight_sessions() {
         "an in-flight session cannot republish after its generation was displaced"
     );
 
-    let replacement =
-        conversations.begin(&first_key, &allowed, window(), now + Duration::from_secs(4));
+    let replacement = conversations.begin(
+        &first_key,
+        &allowed,
+        window(),
+        None,
+        now + Duration::from_secs(4),
+    );
     let registered = store.assets_for_access(
         &replacement.assets,
         vec![pending("returned.png", "image/png", 30)],
@@ -8694,7 +8878,7 @@ fn asset_lru_removal_cannot_alias_a_number_within_a_live_generation() {
     let second_key = private_conversation_key("dev", "second-live-assets", SUBJECT);
     let now = Instant::now();
 
-    let first = conversations.begin(&first_key, &allowed, window(), now);
+    let first = conversations.begin(&first_key, &allowed, window(), None, now);
     assert_eq!(
         store
             .assets_for_access(
@@ -8718,6 +8902,7 @@ fn asset_lru_removal_cannot_alias_a_number_within_a_live_generation() {
         &second_key,
         &allowed,
         window(),
+        None,
         now + Duration::from_secs(1),
     );
     store.assets_for_access(
@@ -8726,7 +8911,13 @@ fn asset_lru_removal_cannot_alias_a_number_within_a_live_generation() {
         true,
         now + Duration::from_secs(1),
     );
-    let resumed = conversations.begin(&first_key, &allowed, window(), now + Duration::from_secs(2));
+    let resumed = conversations.begin(
+        &first_key,
+        &allowed,
+        window(),
+        None,
+        now + Duration::from_secs(2),
+    );
     let replacement = store.assets_for_access(
         &resumed.assets,
         vec![pending("later.png", "image/png", 30)],
@@ -8767,7 +8958,7 @@ async fn empty_grant_removal_blocks_stale_metadata_and_byte_fetches() {
     let key = private_conversation_key("dev", "removed-assets", SUBJECT);
     let allowed = granted(&["cli-probe.upper"]);
     let now = Instant::now();
-    let first = conversations.begin(&key, &allowed, window(), now);
+    let first = conversations.begin(&key, &allowed, window(), None, now);
     let old_access = first.assets.clone();
     let registered = store.assets_for_access(
         &old_access,
@@ -8820,7 +9011,7 @@ async fn empty_grant_removal_blocks_stale_metadata_and_byte_fetches() {
             .is_none()
     );
 
-    let fresh = conversations.begin(&key, &allowed, window(), now + Duration::from_secs(1));
+    let fresh = conversations.begin(&key, &allowed, window(), None, now + Duration::from_secs(1));
     let replacement = store.assets_for_access(
         &fresh.assets,
         vec![pending("new.png", "image/png", 10)],
@@ -8869,7 +9060,7 @@ async fn bytes_finishing_after_generation_retirement_are_discarded() {
     let key = private_conversation_key("dev", "racing-byte-fetch", SUBJECT);
     let allowed = granted(&["cli-probe.upper"]);
     let now = Instant::now();
-    let seed = conversations.begin(&key, &allowed, window(), now);
+    let seed = conversations.begin(&key, &allowed, window(), None, now);
     let access = seed.assets.clone();
     let registered = store.assets_for_access(
         &access,
@@ -12680,6 +12871,7 @@ async fn whatsapp_asset_numbers_cannot_cross_conversations_or_retired_generation
         &key,
         &granted(&["gpt-image.edit"]),
         window(),
+        None,
         Instant::now(),
     );
     let registered = store.assets_for_access(&seed.assets, inbound.assets, true, Instant::now());
@@ -13633,3 +13825,280 @@ async fn a_delivery_notice_survives_full_multibyte_input_and_shared_attribution_
 
 #[path = "tests/late_photos.rs"]
 mod late_photos;
+
+fn recall_window(recall: RecallSource) -> MemoryWindow {
+    MemoryWindow { recall, ..window() }
+}
+
+fn journaled_runner(
+    broker: ResolvedBroker,
+    models: Arc<dyn ModelFactory>,
+    journal: &Path,
+) -> Arc<SessionRunner> {
+    Arc::new(SessionRunner {
+        broker,
+        models: Arc::new(ModelCache::new(models)),
+        gate: SessionGate::new(4),
+        reply_on_busy: true,
+        conversations: ConversationStore::new(1024),
+        journal: Some(Arc::new(
+            crate::journal::Journal::open(journal, 1 << 20).expect("journal"),
+        )),
+        assets: Arc::new(AssetStore::new(1024, Duration::from_secs(60 * 60))),
+        asset_fetchers: HashMap::new(),
+        liveness: fixture_liveness(),
+        thread_ownership: HashMap::new(),
+        active_sessions: crate::session::ActiveSessions::new(4),
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_journaled_window_survives_a_restart_of_the_gateway() {
+    let directory = temporary();
+    let journal = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([
+        answer("Two things broke."),
+        answer("The second one was the database."),
+    ]);
+    let driver = Arc::new(RecordingDriver::default());
+    let route = persistent_route(model_config(), recall_window(RecallSource::Journal));
+
+    for text in ["what broke?", "and the second one?"] {
+        let restarted = journaled_runner(
+            broker.clone(),
+            Arc::new(Arc::clone(&models)) as Arc<dyn ModelFactory>,
+            journal.path(),
+        );
+        run_session(
+            restarted,
+            route.clone(),
+            message(text),
+            Arc::clone(&driver) as Arc<dyn ChatDriver>,
+        )
+        .await;
+    }
+
+    assert_eq!(
+        models.prompt(1),
+        transcript(&[
+            ("system", &expected_asset_instructions()),
+            ("user", "what broke?"),
+            ("assistant", "Two things broke."),
+            ("user", "and the second one?"),
+        ]),
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn photos_from_an_idle_expired_window_are_still_named_on_the_next_message() {
+    let directory = temporary();
+    let journal = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([answer("Nice photos."), answer("Here they are again.")]);
+    let driver = Arc::new(RecordingDriver::default());
+    let runner = journaled_runner(
+        broker,
+        Arc::new(Arc::clone(&models)) as Arc<dyn ModelFactory>,
+        journal.path(),
+    );
+    let route = persistent_route(
+        model_config(),
+        MemoryWindow {
+            idle_timeout: Duration::from_millis(1),
+            ..recall_window(RecallSource::Journal)
+        },
+    );
+    let mut photos = message("four photos");
+    photos.assets = (0..4)
+        .map(|index| pending(&format!("photo-{index}.png"), "image/png", 12))
+        .collect();
+
+    run_session(
+        Arc::clone(&runner),
+        route.clone(),
+        photos,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    run_session(
+        Arc::clone(&runner),
+        route,
+        message("do another thing with those four images"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+
+    let prompt = models.prompt(1);
+    let (_, latest) = prompt.last().expect("a user message");
+    for index in 0..4 {
+        assert!(
+            latest.contains(&format!("photo-{index}.png (image/png")),
+            "{latest}"
+        );
+    }
+    assert_eq!(prompt[1], ("user".to_owned(), prompt[1].1.clone()));
+    assert!(prompt[1].1.starts_with("four photos"));
+}
+
+struct HistoryDriver {
+    inner: RecordingDriver,
+    past: Result<Vec<crate::transport::PastMessage>, ()>,
+    asked: Mutex<Vec<(String, usize)>>,
+}
+
+#[async_trait]
+impl ChatDriver for HistoryDriver {
+    async fn reply(
+        &self,
+        target: &ReplyTarget,
+        reply: OutboundReply,
+    ) -> Result<(), TransportError> {
+        self.inner.reply(target, reply).await
+    }
+
+    fn history(&self) -> Option<&dyn crate::transport::ChatHistory> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl crate::transport::ChatHistory for HistoryDriver {
+    async fn recent(
+        &self,
+        _conversation: &Conversation,
+        before: &str,
+        limit: usize,
+    ) -> Result<Vec<crate::transport::PastMessage>, TransportError> {
+        self.asked
+            .lock()
+            .expect("asked")
+            .push((before.to_owned(), limit));
+        self.past.clone().map_err(|()| TransportError::Response)
+    }
+}
+
+fn past(from_bot: bool, author: &str, text: &str) -> crate::transport::PastMessage {
+    crate::transport::PastMessage {
+        from_bot,
+        author: author.to_owned(),
+        text: text.to_owned(),
+        assets: Vec::new(),
+        at: std::time::SystemTime::now(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fresh_thread_session_sees_the_thread_it_was_asked_in() {
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([answer("It is about the outage.")]);
+    let mut screenshot = past(false, "U2", "look at this");
+    screenshot.assets = vec![pending("graph.png", "image/png", 12)];
+    let driver = Arc::new(HistoryDriver {
+        inner: RecordingDriver::default(),
+        past: Ok(vec![
+            past(false, "U1", "the site is down"),
+            past(true, "B1", "Checking."),
+            screenshot,
+        ]),
+        asked: Mutex::new(Vec::new()),
+    });
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let route = persistent_route(model_config(), recall_window(RecallSource::Platform));
+    let inbound = message("read this thread");
+    let trigger = inbound.message_id.clone();
+
+    run_session(
+        runner,
+        route,
+        inbound,
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+
+    assert_eq!(
+        driver.asked.lock().expect("asked").as_slice(),
+        [(trigger, 24)]
+    );
+    let prompt = models.prompt(0);
+    assert_eq!(
+        prompt[1..3],
+        [
+            (
+                "user".to_owned(),
+                "[gateway: chat history, from U1]\nthe site is down".to_owned()
+            ),
+            ("assistant".to_owned(), "Checking.".to_owned()),
+        ]
+    );
+    assert_eq!(
+        prompt[3].1,
+        "[gateway: chat history, from U2]\nlook at this\n[gateway: attached Chat Asset #1 — graph.png]"
+    );
+    assert!(
+        prompt[4].1.contains("graph.png (image/png"),
+        "{}",
+        prompt[4].1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_history_read_still_answers_from_an_empty_window() {
+    let directory = temporary();
+    let (broker, _observed) =
+        stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
+    let models = ModelScript::new([answer("Which thread?")]);
+    let driver = Arc::new(HistoryDriver {
+        inner: RecordingDriver::default(),
+        past: Err(()),
+        asked: Mutex::new(Vec::new()),
+    });
+    let runner = runner(broker, Arc::clone(&models), 4);
+    let route = persistent_route(model_config(), recall_window(RecallSource::Platform));
+
+    run_session(
+        runner,
+        route,
+        message("read this thread"),
+        Arc::clone(&driver) as Arc<dyn ChatDriver>,
+    )
+    .await;
+
+    assert_eq!(driver.inner.replies(), vec!["Which thread?".to_owned()]);
+    assert_eq!(
+        models.prompt(0),
+        transcript(&[
+            ("system", &expected_asset_instructions()),
+            ("user", "read this thread")
+        ]),
+    );
+}
+
+#[test]
+fn a_recalled_window_is_adopted_only_by_the_generation_it_creates() {
+    let store = ConversationStore::new(4);
+    let allowed = granted(&["cli-probe.upper"]);
+    let key = private_conversation_key("dev", "dev", SUBJECT);
+    let now = Instant::now();
+    let recalled = |text: &str| {
+        Some(dekopon_agent::prompt::History::from_turns(
+            window().limits,
+            [ConversationTurn::completed(text, "ok")],
+        ))
+    };
+
+    assert!(!store.resident(&key, &allowed, window(), now));
+    let first = store.begin(&key, &allowed, window(), recalled("from disk"), now);
+    assert!(first.created);
+    assert_eq!(first.history.turns()[0].user(), "from disk");
+    assert!(store.resident(&key, &allowed, window(), now));
+    let second = store.begin(&key, &allowed, window(), recalled("ignored"), now);
+    assert!(!second.created);
+    assert_eq!(second.history.turns()[0].user(), "from disk");
+    assert!(!store.resident(&key, &allowed, window(), now + window().idle_timeout));
+}

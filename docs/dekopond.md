@@ -144,12 +144,17 @@ routes:                                       # first match wins; order matters
       idleTimeoutMs: 900000                   # optional, default 900000 (15 minutes)
       maxTurns: 12                            # optional, default 12 exchanges in the window
       maxBytes: 65536                         # optional, default 65536 replayed history bytes
+      recall: journal                         # optional: none | journal | platform; default journal when sessions.journal is set, else none
+      forgetAfterMs: 604800000                # optional, default 604800000 (7 days); needs recall
 
 sessions:
   maxConcurrent: 4                            # optional, default 4
   replyOnBusy: true                           # optional, default true
   maxConversations: 1024                      # optional, default 1024 tracked
   assetRetentionBytes: 268435456              # optional, process-wide disk budget; 0 disables assets
+  journal:                                    # optional; absent, no conversation text is written to disk
+    path: /var/lib/dekopond/journal           # relative paths resolve against this file
+    maxBytes: 67108864                        # every journal file together; least recently touched evicted
 
 shutdownGraceMs: 120000                       # optional, default 120000
 
@@ -941,9 +946,15 @@ A `persistent` route keeps a bounded history and replays it into the next prompt
 
 ### The history lives in the gateway
 
-This subsection describes the automatic replay window, not the separate on-demand durable provider. The replay window lives in the daemon's memory and nowhere else. It is never written to disk, never sent to the broker, and is lost on restart: `dekopond` comes back with every conversation forgotten, and a person who asks a follow-up across a restart gets a first-message answer.
+This subsection describes the automatic replay window, not the separate on-demand durable provider. The live window sits in the daemon's memory and is never sent to the broker. The broker holds provider credentials and decides every invocation; conversation text there would put the most sensitive content in the system inside the most privileged process. The gateway already read the message and wrote the answer, so keeping the history there adds no new reader.
 
-That placement is the whole point rather than an implementation shortcut. The broker holds provider credentials and decides every invocation; conversation text there would put the most sensitive content in the system inside the most privileged process. The gateway already handles this text — it read the message and it wrote the answer — so keeping the history there adds no new reader.
+`idleTimeoutMs` is how long a window stays in memory, not how long it is remembered. When a message finds no window in memory (first contact, idle expiry, capacity eviction, or a restart), the route's `recall` rebuilds one before the model runs:
+
+- `none` starts empty. It is the default without `sessions.journal`, and it is the only behaviour older releases had.
+- `journal` reads the gateway's own on-disk transcript. With `sessions.journal` set, every committed exchange on a journal route is appended to one JSONL file per state key, named by a SHA-256 of that key: directory `0700`, files `0600`, no fsync. Only the trailing run of exchanges recorded under the message's current grant is recalled, so a narrowed grant never replays output from a wider one. Exchanges older than `forgetAfterMs` are skipped. A file past twice `maxBytes` is rewritten to the window. The oldest files go first once `sessions.journal.maxBytes` is reached. A file that does not parse is deleted, and that message starts empty.
+- `platform` asks the chat service for the conversation's recent messages (Slack `conversations.replies` or `conversations.history`, Discord `GET /channels/{id}/messages`), so the model sees what the person sees, other participants included. It reads at most `min(2 × maxTurns, 100)` messages, waits at most 5 s, and a read that fails answers from an empty window. Only Slack and Discord have a history API; startup refuses `platform` on WhatsApp, Telegram, and local routes. Discord returns other people's text only when the application has the Message Content intent enabled in the Developer Portal; without it, those messages are skipped. Authors are labelled `[gateway: chat history, from <service user id>]`, which is service-reported and not broker-authenticated.
+
+A recalled window brings its attachments with it, under the same `Chat Asset #N` numbers the replayed turns use, and bytes are still fetched only on demand. WhatsApp media ids expire after 7 days, so an older photo is still named but can no longer be opened.
 
 ### Scope selects the replay audience
 
@@ -995,6 +1006,9 @@ The loss is real and worth naming: the model cannot re-read a command it ran thr
 | `idleTimeoutMs` | persistent route | How long an untouched conversation survives; default 900000 |
 | `maxTurns` | persistent route | Exchanges the window replays; default 12 |
 | `maxBytes` | persistent route | Bytes the window replays; default 65536 |
+| `recall` | persistent route | Where a window not in memory is rebuilt from: `none`, `journal`, or `platform` |
+| `forgetAfterMs` | persistent route | Oldest exchange or chat message `recall` may bring back; default 604800000 |
+| `journal.maxBytes` | `sessions:` | Disk every journal file may hold together |
 | `maxConversations` | `sessions:` | Conversations the process tracks at once; default 1024 |
 
 `maxTurns` and `maxBytes` both apply, oldest turns dropping first until both hold. Two bounds because they fail differently: twelve one-line exchanges and twelve paragraph-length ones are the same number of turns and very different prompts.
@@ -1040,7 +1054,7 @@ What the key is worth is measured, not assumed — [`inference.md`](inference.md
 
 ### What this means for retention
 
-On a `persistent` route, chat text sits in `dekopond`'s memory for at least the idle timeout after somebody stops talking — on the default, fifteen minutes of a person's question and the agent's answer. With shared scope, that retained content and its attachment inventory belong to the exact conversation audience rather than one sender. **At least**, because eviction is lazy: an abandoned conversation is dropped by the next lookup on its key or by the ceiling displacing it, so with neither happening the bytes stay in the process until it exits. What a timed-out entry can never do is reach a prompt. The daemon writes none of that conversation text to disk (active attachment payload leases use private temporary files); the operating system's own paging and core-dump behavior are outside what the daemon controls. Another process under the gateway UID is inside its trust domain; see the [current process boundary](#current-process-boundary).
+On a `persistent` route, chat text sits in `dekopond`'s memory for at least the idle timeout after somebody stops talking — on the default, fifteen minutes of a person's question and the agent's answer. With shared scope, that retained content and its attachment inventory belong to the exact conversation audience rather than one sender. **At least**, because eviction is lazy: an abandoned conversation is dropped by the next lookup on its key or by the ceiling displacing it, so with neither happening the bytes stay in the process until it exits. What a timed-out entry can never do is reach a prompt. Without `sessions.journal` the daemon writes none of that conversation text to disk (active attachment payload leases use private temporary files); with it, journal routes keep their windows in the journal directory until the file is compacted, evicted, or deleted by the operator; the operating system's own paging and core-dump behavior are outside what the daemon controls. Another process under the gateway UID is inside its trust domain; see the [current process boundary](#current-process-boundary).
 
 ## Durable memory after transport acceptance
 
