@@ -106,7 +106,8 @@ file rather than a broker that starts and then refuses to serve.
   so those are ordinary `secretKeyRef` entries under `gateway.env` with no file hygiene at all.
 - **`OTEL_EXPORTER_OTLP_HEADERS`.** The broker's `telemetry` block has no credential field by
   design; the OpenTelemetry SDK reads ingest auth from that variable, so a token never enters
-  `broker.yaml`.
+  `broker.yaml`. A receiver on a private CA needs `otlp.caBundle` (a ConfigMap and key of PEM
+  roots), which both daemons read as `OTEL_EXPORTER_OTLP_CERTIFICATE`.
 - **The agent catalog.** Tier E. `dekopond` reads `catalogPath` with a plain `read_to_string`, so a
   ConfigMap volume mounted straight at `paths.catalogDir` is fine and nothing is copied. This holds
   for the catalog file alone. An agent that declares `skills:` needs a daemon binary carrying the

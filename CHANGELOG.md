@@ -7,6 +7,14 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added
+
+- `dekopond` and `dekopon-brokerd` OTLP exporters trust the extra PEM roots named by the standard
+  `OTEL_EXPORTER_OTLP_CERTIFICATE`, beside WebPKI, on both transports; an unreadable or
+  certificate-less file refuses startup.
+- Chart: `otlp.caBundle` (`configMap`, `key`) mounts that bundle into both daemons and sets
+  `OTEL_EXPORTER_OTLP_CERTIFICATE`.
+
 ### Changed
 
 - A ChatGPT refresh that cannot take its cross-process lock now fails with `LockAuth` instead of

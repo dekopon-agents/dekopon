@@ -1142,6 +1142,7 @@ dependencies = [
  "reqwest",
  "serde",
  "thiserror",
+ "tokio",
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",

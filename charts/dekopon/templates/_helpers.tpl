@@ -609,6 +609,10 @@ Arguments: dict "ctx" $ "sidecar" bool
   securityContext:
     {{- toYaml (mergeOverwrite (deepCopy $.Values.securityContext) (dict "runAsUser" ($.Values.podSecurityContext.runAsUser | int) "runAsGroup" ($.Values.podSecurityContext.runAsGroup | int))) | nindent 4 }}
   env:
+{{- if $.Values.otlp.caBundle.configMap }}
+    - name: OTEL_EXPORTER_OTLP_CERTIFICATE
+      value: /etc/dekopon-otlp/ca.pem
+{{- end }}
     {{- with $.Values.broker.env }}
     {{- toYaml . | nindent 4 }}
     {{- end }}
@@ -661,6 +665,11 @@ Arguments: dict "ctx" $ "sidecar" bool
 {{- if $.Values.providerStorage.enabled }}
     - name: provider-storage
       mountPath: {{ $.Values.providerStorage.rootPath }}
+{{- end }}
+{{- if $.Values.otlp.caBundle.configMap }}
+    - name: otlp-ca
+      mountPath: /etc/dekopon-otlp
+      readOnly: true
 {{- end }}
     - name: broker-assets
       mountPath: {{ $.Values.brokerAssets.rootPath }}

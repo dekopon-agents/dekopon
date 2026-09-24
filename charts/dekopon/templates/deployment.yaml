@@ -284,6 +284,10 @@ spec:
             # clearer. Listed first so an operator entry of the same name wins.
             - name: DEKOPON_BROKER_SOCKET
               value: {{ $run }}/broker.sock
+{{- if .Values.otlp.caBundle.configMap }}
+            - name: OTEL_EXPORTER_OTLP_CERTIFICATE
+              value: /etc/dekopon-otlp/ca.pem
+{{- end }}
 {{- if include "dekopon.chatgptEnabled" . }}
             # A chatgptSubscription model with no explicit authFile falls back to
             # $XDG_CONFIG_HOME, then $HOME — which is on the read-only root filesystem, where
@@ -338,6 +342,11 @@ spec:
 {{- end }}
             - name: gateway-tmp
               mountPath: /tmp
+{{- if .Values.otlp.caBundle.configMap }}
+            - name: otlp-ca
+              mountPath: /etc/dekopon-otlp
+              readOnly: true
+{{- end }}
         {{- else }}
         # No gateway, so the broker is the pod's only regular container. A pod needs at least one,
         # and with nothing to order against, the sidecar shape buys nothing.
@@ -386,6 +395,16 @@ spec:
           emptyDir:
             medium: Memory
             sizeLimit: {{ .Values.volumeSizes.tmp }}
+{{- with .Values.otlp.caBundle }}
+{{- if .configMap }}
+        - name: otlp-ca
+          configMap:
+            name: {{ .configMap }}
+            items:
+              - key: {{ required "otlp.caBundle.key is required with otlp.caBundle.configMap" .key }}
+                path: ca.pem
+{{- end }}
+{{- end }}
         - name: broker-assets
           emptyDir:
             sizeLimit: {{ .Values.volumeSizes.brokerAssets }}

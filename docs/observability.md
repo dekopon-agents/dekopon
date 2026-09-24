@@ -297,7 +297,8 @@ unconditionally; over HTTP it is redundant, never harmful.
 
 Standard `OTEL_RESOURCE_ATTRIBUTES` values are attached to both signals, alongside a
 `service.version` carrying the exporting executable's own version. HTTPS endpoints use WebPKI roots
-on both transports, and redirects are disabled so a receiver cannot forward an authorization header
+on both transports, plus any PEM roots in the file `OTEL_EXPORTER_OTLP_CERTIFICATE` names (a
+receiver on a private CA; the chart's `otlp.caBundle` sets it), and redirects are disabled so a receiver cannot forward an authorization header
 to another destination. Plain HTTP suits a loopback development receiver or a trusted isolated
 network only, because headers and telemetry are unencrypted.
 
