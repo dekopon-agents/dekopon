@@ -47,6 +47,16 @@ container-image workflow publishes under the Git tag and the Git tag carries the
 {{- end -}}
 {{- end -}}
 
+{{- define "dekopon.consoleImage" -}}
+{{- with .Values.console.image -}}
+{{- if .digest -}}
+{{- printf "%s@%s" .repository .digest -}}
+{{- else -}}
+{{- printf "%s:%s" .repository (required "console.image.tag or console.image.digest is required with console.enabled" .tag) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+
 {{- define "dekopon.initImage" -}}
 {{- if .Values.initImage.digest -}}
 {{- printf "%s@%s" .Values.initImage.repository .Values.initImage.digest -}}
@@ -288,6 +298,9 @@ that starts and then refuses to serve, which is much harder to read than a templ
 
 {{- if or (hasKey .Values.podSecurityContext "fsGroup") (ne $uid 65532) (ne (.Values.podSecurityContext.runAsGroup | int) 65532) -}}
 {{- fail "chart isolation requires broker UID/GID 65532:65532 and no fsGroup" -}}
+{{- end -}}
+{{- if and .Values.console.enabled (not .Values.gateway.enabled) -}}
+{{- fail "console.enabled needs gateway.enabled: the console reads the gateway's agent catalog" -}}
 {{- end -}}
 {{- if ne (toJson .Values.podSecurityContext.supplementalGroups) "[65534]" -}}
 {{- fail "podSecurityContext.supplementalGroups must be [65534] for IPC only" -}}

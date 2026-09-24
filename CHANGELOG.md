@@ -17,6 +17,17 @@ All notable changes to Dekopon are documented here. The format is based on
 - The classic Slack manifest requests `channels:history`, `groups:history` and `mpim:history` for
   platform recall; reinstall the app to grant them.
 
+## [dekopon-chart-0.12.0] - 2026-09-24
+
+### Added
+
+- `console.enabled` adds an idle `dekopon-console` container (UID 65535, IPC group only, no
+  credentials) for `kubectl exec -it … -c console -- dekopon-console`. Its environment names the
+  broker socket, broker UID 65532, the gateway catalog and optional `console.subject`; the broker
+  config must map UID 65535 with an attestor grant for that subject. Needs `gateway.enabled` and
+  `console.image.tag` or `.digest`.
+- `gateway.journal` mounts a gateway-owned directory of the state claim for `sessions.journal`.
+
 ## [0.21.0] - 2026-09-24
 
 ### Added

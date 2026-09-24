@@ -363,6 +363,41 @@ spec:
               mountPath: /etc/dekopon-otlp
               readOnly: true
 {{- end }}
+{{- if .Values.console.enabled }}
+        - name: console
+          image: {{ include "dekopon.consoleImage" . }}
+          imagePullPolicy: {{ .Values.console.image.pullPolicy }}
+          command: ["dekopon-console", "--idle"]
+          securityContext:
+            {{- toYaml (mergeOverwrite (deepCopy .Values.securityContext) (dict "runAsUser" 65535 "runAsGroup" 65535)) | nindent 12 }}
+          env:
+            - name: DEKOPON_BROKER_SOCKET
+              value: {{ $run }}/broker.sock
+            - name: DEKOPON_BROKER_UID
+              value: {{ $uid | quote }}
+            - name: DEKOPON_CONFIG
+              value: {{ .Values.paths.catalogDir }}/{{ .Values.gateway.catalog.fileName }}
+            - name: HOME
+              value: /tmp
+{{- with .Values.console.subject }}
+            - name: DEKOPON_CONSOLE_SUBJECT
+              value: {{ . | quote }}
+{{- end }}
+            {{- with .Values.console.env }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.console.resources | nindent 12 }}
+          volumeMounts:
+            - name: runtime
+              mountPath: {{ $run }}
+              readOnly: true
+            - name: catalog
+              mountPath: {{ .Values.paths.catalogDir }}
+              readOnly: true
+            - name: console-tmp
+              mountPath: /tmp
+{{- end }}
         {{- else }}
         # No gateway, so the broker is the pod's only regular container. A pod needs at least one,
         # and with nothing to order against, the sidecar shape buys nothing.
@@ -420,6 +455,12 @@ spec:
               - key: {{ required "otlp.caBundle.key is required with otlp.caBundle.configMap" .key }}
                 path: ca.pem
 {{- end }}
+{{- end }}
+{{- if .Values.console.enabled }}
+        - name: console-tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: {{ .Values.volumeSizes.consoleTmp }}
 {{- end }}
         - name: broker-assets
           emptyDir:
