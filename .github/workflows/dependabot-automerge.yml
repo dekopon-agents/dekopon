@@ -1,0 +1,22 @@
+name: Dependabot auto-merge
+
+# pull_request_target grants the write token Dependabot PRs otherwise lack; never check out PR code here.
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    name: queue auto-merge
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Enable rebase auto-merge
+        run: gh pr merge --auto --rebase "$PR_URL"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}

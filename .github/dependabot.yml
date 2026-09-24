@@ -13,6 +13,11 @@ updates:
           - "wasm*"
           - "wit-parser"
           - "cranelift*"
+      # Must precede `cargo`: the otel crates only build at one shared version, breaking 0.x bumps included.
+      opentelemetry:
+        patterns:
+          - "opentelemetry*"
+          - "tracing-opentelemetry"
       cargo:
         update-types:
           - minor
