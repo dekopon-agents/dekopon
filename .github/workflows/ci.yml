@@ -537,6 +537,10 @@ jobs:
           helm template dekopon charts/dekopon \
             -f charts/dekopon/values-pr-summarizer-linter.yaml \
             --set gateway.service.enabled=true > "$RUNNER_TEMP/gateway-service.yaml"
+          helm template dekopon charts/dekopon \
+            -f charts/dekopon/values-pr-summarizer-linter.yaml \
+            --set console.enabled=true --set console.image.tag=v0.1.0 \
+            --set console.subject=discord.1 > "$RUNNER_TEMP/console.yaml"
           # Retired broker UI configuration must fail, never silently disappear.
           if helm template dekopon charts/dekopon --set broker.httpBind=127.0.0.1:8080 > "$RUNNER_TEMP/http-bind.yaml" 2> "$RUNNER_TEMP/http-bind.err"; then
             echo "retired broker listener configuration was accepted" >&2

@@ -461,6 +461,21 @@ rendered before, and a release that enables it must also stop naming `providers`
 collides with either ChatGPT subdirectory, or when `mountPath` is not canonical absolute or would
 overlap another of the broker's own mounts.
 
+## Operator console
+
+`console.enabled` adds a third container that runs `dekopon-console --idle` as UID 65535 from
+`console.image`. It mounts the runtime directory and the gateway catalog read-only and a small
+memory `/tmp`; it reaches the broker only through IPC group 65534 and gets no model, provider or
+gateway credential. Exec starts a fresh process configured by the container environment:
+
+```sh
+kubectl exec -it deploy/dekopon -c console -- dekopon-console
+```
+
+The broker decides what it may do. `broker.yaml` needs an identity for UID 65535 whose attestor
+namespaces cover `console.subject`, and Cedar statements that name that identity's principal as
+`context.via`. With no such statements the console lists agents and is refused everything else.
+
 ## Storage, uninstall, and recovery
 
 The claim carries `helm.sh/resource-policy: keep`, so `helm uninstall` leaves the live model

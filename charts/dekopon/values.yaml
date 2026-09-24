@@ -426,6 +426,30 @@ gateway:
     annotations: {}
 
 # ---------------------------------------------------------------------------------------------
+# Console
+# ---------------------------------------------------------------------------------------------
+# An idle dekopon-console container for `kubectl exec -it deploy/<release> -c console --
+# dekopon-console`. UID 65535 reaches only the broker socket, through the IPC group, and holds no
+# model or provider credential. The broker must map UID 65535 with an attestor grant covering
+# `subject`, and Cedar decides what that `via` may do. Needs gateway.enabled for the catalog.
+console:
+  enabled: false
+  image:
+    repository: ghcr.io/dekopon-agents/dekopon-console
+    tag: ""
+    digest: ""
+    pullPolicy: IfNotPresent
+  # DEKOPON_CONSOLE_SUBJECT for exec sessions; empty means pass --subject.
+  subject: ""
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      memory: 256Mi
+  env: []
+
+# ---------------------------------------------------------------------------------------------
 # Model-credential state
 # ---------------------------------------------------------------------------------------------
 # The seed-once ChatGPT credentials are retained across releases. Audit is not here: it is the
@@ -464,6 +488,7 @@ volumeSizes:
   config: 8Mi
   runtime: 1Mi
   tmp: 16Mi
+  consoleTmp: 16Mi
   # Size for the default gateway sessions.assetRetentionBytes (256 MiB) plus temporary overhead.
   # If increasing the typed gateway config budget, increase this disk volume independently.
   gatewayTmp: 320Mi
