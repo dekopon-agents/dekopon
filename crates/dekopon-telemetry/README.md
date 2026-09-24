@@ -23,9 +23,11 @@ proxy; HTTP appends `/v1/traces` and `/v1/logs` to the configured base endpoint.
 `https://` endpoint using WebPKI roots. The HTTP client is the workspace's own reqwest build with
 redirects disabled, so an authorization header cannot be forwarded to a receiver-selected
 destination, and with ambient proxies disabled, so an exported `HTTPS_PROXY` cannot put the
-`OTEL_EXPORTER_OTLP_HEADERS` ingest credential — or a span — on a host nobody named to Dekopon. A
-collector reachable only through a proxy must be addressed directly; one client serves both signals
-rather than one per signal.
+`OTEL_EXPORTER_OTLP_HEADERS` ingest credential — or a span — on a host nobody named to Dekopon.
+`OTEL_EXPORTER_OTLP_CERTIFICATE`, when set, names a PEM file whose roots are trusted beside WebPKI
+on both transports, for a receiver on a private CA; a file that cannot be read or holds no
+certificate refuses startup. A collector reachable only through a proxy must be addressed directly;
+one client serves both signals rather than one per signal.
 
 ## Export failures
 

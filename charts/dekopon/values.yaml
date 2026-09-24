@@ -87,6 +87,13 @@ initSecurityContext:
 #   <runtimeDir>/broker.sock              0710 dir, 65532:65534; broker binds the 0660 socket
 #   <stateDir>/<chatgpt.subdir>/          0700 dir owned by its daemon; seed-once ChatGPT credential
 #   <catalogDir>/<catalog key>            no checks at all; a plain ConfigMap mount
+# A ConfigMap key holding extra PEM roots both daemons trust for their OTLP exporters, beside the
+# public roots; each gets it as OTEL_EXPORTER_OTLP_CERTIFICATE. For a receiver on a private CA.
+otlp:
+  caBundle:
+    configMap: ""
+    key: ""
+
 paths:
   configDir: /etc/dekopon
   gatewayConfigDir: /etc/dekopon-gateway

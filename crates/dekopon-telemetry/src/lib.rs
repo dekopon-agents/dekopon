@@ -12,7 +12,13 @@
 )]
 mod install;
 
-use std::{fmt, str::FromStr, sync::OnceLock, time::Duration};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+    str::FromStr,
+    sync::OnceLock,
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use opentelemetry::{
@@ -22,6 +28,8 @@ use opentelemetry::{
 use opentelemetry_http::{Bytes, HttpClient, HttpError, Request, Response};
 use opentelemetry_otlp::{
     ExporterBuildError, LogExporter, Protocol, SpanExporter, WithExportConfig, WithHttpConfig,
+    WithTonicConfig,
+    tonic_types::transport::{Certificate, ClientTlsConfig},
 };
 use opentelemetry_sdk::{
     Resource, logs,
@@ -92,6 +100,8 @@ const MAX_QUEUED_LOG_RECORDS: usize = 256;
 
 const MAX_LOG_RECORDS_PER_EXPORT: usize = 64;
 
+pub const CA_CERTIFICATE_ENV: &str = "OTEL_EXPORTER_OTLP_CERTIFICATE";
+
 #[derive(Clone, Debug)]
 pub struct ExporterSettings {
     endpoint: String,
@@ -100,6 +110,7 @@ pub struct ExporterSettings {
     executable_name: String,
     service_version: String,
     timeout: Duration,
+    ca_certificate: Option<Vec<u8>>,
     http_client: OnceLock<OtlpHttpClient>,
 }
 
@@ -151,6 +162,10 @@ impl ExporterSettings {
             "" => env!("CARGO_PKG_VERSION"),
             version => version,
         };
+        let ca_certificate = std::env::var_os(CA_CERTIFICATE_ENV)
+            .filter(|path| !path.is_empty())
+            .map(|path| read_ca_certificate(Path::new(&path)))
+            .transpose()?;
         Ok(Self {
             endpoint: endpoint.to_owned(),
             transport,
@@ -158,6 +173,7 @@ impl ExporterSettings {
             executable_name: executable_name.to_owned(),
             service_version: service_version.to_owned(),
             timeout,
+            ca_certificate,
             http_client: OnceLock::new(),
         })
     }
@@ -196,17 +212,31 @@ impl ExporterSettings {
         if let Some(client) = self.http_client.get() {
             return Ok(client.clone());
         }
-        let client = OtlpHttpClient::new(self.timeout)?;
+        let client = OtlpHttpClient::new(self.timeout, self.ca_certificate.as_deref())?;
         Ok(self.http_client.get_or_init(|| client).clone())
+    }
+
+    fn tonic_tls<B: WithTonicConfig>(&self, builder: B) -> B {
+        match &self.ca_certificate {
+            Some(pem) => builder.with_tls_config(
+                ClientTlsConfig::new()
+                    .with_webpki_roots()
+                    .ca_certificate(Certificate::from_pem(pem)),
+            ),
+            None => builder,
+        }
     }
 
     pub fn tracer_provider(&self) -> Result<SdkTracerProvider, TelemetryError> {
         let builder = SpanExporter::builder();
         let exporter = match self.transport {
-            Transport::Grpc => builder
-                .with_tonic()
-                .with_endpoint(self.endpoint.clone())
-                .with_timeout(self.timeout)
+            Transport::Grpc => self
+                .tonic_tls(
+                    builder
+                        .with_tonic()
+                        .with_endpoint(self.endpoint.clone())
+                        .with_timeout(self.timeout),
+                )
                 .build(),
             Transport::Http => builder
                 .with_http()
@@ -237,10 +267,13 @@ impl ExporterSettings {
     pub fn logger_provider(&self) -> Result<SdkLoggerProvider, TelemetryError> {
         let builder = LogExporter::builder();
         let exporter = match self.transport {
-            Transport::Grpc => builder
-                .with_tonic()
-                .with_endpoint(self.endpoint.clone())
-                .with_timeout(self.timeout)
+            Transport::Grpc => self
+                .tonic_tls(
+                    builder
+                        .with_tonic()
+                        .with_endpoint(self.endpoint.clone())
+                        .with_timeout(self.timeout),
+                )
                 .build(),
             Transport::Http => builder
                 .with_http()
@@ -269,6 +302,22 @@ impl ExporterSettings {
     }
 }
 
+fn read_ca_certificate(path: &Path) -> Result<Vec<u8>, TelemetryError> {
+    let pem = std::fs::read(path).map_err(|source| TelemetryError::CaCertificate {
+        path: path.to_owned(),
+        source,
+    })?;
+    if reqwest::Certificate::from_pem_bundle(&pem)
+        .map_or(true, |certificates| certificates.is_empty())
+    {
+        return Err(TelemetryError::Configuration(format!(
+            "{CA_CERTIFICATE_ENV} names {}, which holds no PEM certificate",
+            path.display()
+        )));
+    }
+    Ok(pem)
+}
+
 fn signal_endpoint(base: &str, signal: &str) -> String {
     format!("{}/v1/{signal}", base.trim_end_matches('/'))
 }
@@ -281,20 +330,32 @@ struct OtlpHttpClient(reqwest::blocking::Client);
 fn otlp_client_from(
     builder: reqwest::blocking::ClientBuilder,
     timeout: Duration,
-) -> reqwest::blocking::ClientBuilder {
-    builder
+    ca_certificate: Option<&[u8]>,
+) -> Result<reqwest::blocking::ClientBuilder, reqwest::Error> {
+    let mut builder = builder
         .timeout(timeout)
         .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
+        .no_proxy();
+    if let Some(pem) = ca_certificate {
+        for certificate in reqwest::Certificate::from_pem_bundle(pem)? {
+            builder = builder.add_root_certificate(certificate);
+        }
+    }
+    Ok(builder)
 }
 
 impl OtlpHttpClient {
-    fn new(timeout: Duration) -> Result<Self, TelemetryError> {
+    fn new(timeout: Duration, ca_certificate: Option<&[u8]>) -> Result<Self, TelemetryError> {
         let client = std::thread::scope(|scope| {
             std::thread::Builder::new()
                 .name("dekopon-otlp-http-client".to_owned())
                 .spawn_scoped(scope, move || {
-                    otlp_client_from(reqwest::blocking::Client::builder(), timeout).build()
+                    otlp_client_from(
+                        reqwest::blocking::Client::builder(),
+                        timeout,
+                        ca_certificate,
+                    )?
+                    .build()
                 })
                 .map_err(TelemetryError::HttpClientThread)?
                 .join()
@@ -377,6 +438,12 @@ pub enum TelemetryError {
     HttpClientThreadPanicked { message: String },
     #[error("could not build OTLP HTTP client")]
     HttpClient(#[source] reqwest::Error),
+    #[error("could not read OTLP CA certificate {}", path.display())]
+    CaCertificate {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("could not build OTLP {signal} exporter")]
     Exporter {
         signal: &'static str,
@@ -389,7 +456,7 @@ pub enum TelemetryError {
 mod tests {
     use super::{
         ExporterSettings, TelemetryError, TraceContextParts, Transport, otlp_client_from,
-        panic_message, remote_context, signal_endpoint,
+        panic_message, read_ca_certificate, remote_context, signal_endpoint,
     };
     use opentelemetry::trace::TraceContextExt as _;
     use std::time::Duration;
@@ -410,7 +477,8 @@ mod tests {
 
         let rendered = format!(
             "{:?}",
-            otlp_client_from(proxied_builder(), Duration::from_secs(10))
+            otlp_client_from(proxied_builder(), Duration::from_secs(10), None)
+                .expect("no certificate to parse")
         );
 
         assert!(
@@ -582,6 +650,50 @@ mod tests {
             settings.http_client.get().is_some(),
             "the client is rebuilt per signal instead of being shared"
         );
+    }
+
+    const PRIVATE_ROOT: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../dekopon-http-host/tests/fixtures/private-root.pem"
+    );
+
+    #[test]
+    fn a_ca_certificate_must_be_a_readable_pem() {
+        assert!(matches!(
+            read_ca_certificate(std::path::Path::new("/nonexistent/otlp-ca.pem")),
+            Err(TelemetryError::CaCertificate { .. })
+        ));
+        assert!(matches!(
+            read_ca_certificate(std::path::Path::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/Cargo.toml"
+            ))),
+            Err(TelemetryError::Configuration(_))
+        ));
+        assert!(read_ca_certificate(std::path::Path::new(PRIVATE_ROOT)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn both_transports_build_exporters_that_trust_an_extra_ca() {
+        for (endpoint, transport) in [
+            ("https://collector.internal:4317", Transport::Grpc),
+            ("https://collector.internal:4318", Transport::Http),
+        ] {
+            let mut settings = ExporterSettings::new(
+                endpoint,
+                transport,
+                "svc",
+                "exe",
+                "1.2.3",
+                Duration::from_secs(5),
+            )
+            .expect("valid settings");
+            settings.ca_certificate = Some(
+                read_ca_certificate(std::path::Path::new(PRIVATE_ROOT)).expect("fixture root"),
+            );
+            settings.tracer_provider().expect("trace exporter builds");
+            settings.logger_provider().expect("log exporter builds");
+        }
     }
 
     #[test]
