@@ -1,5 +1,3 @@
-//! Evaluator behavior tests, including the kept-versus-dropped grammar contract.
-
 use std::{cell::RefCell, time::Duration};
 
 use serde_json::{Value, json};
@@ -9,21 +7,10 @@ use crate::{
     Interpreter, Limits, ScriptOutcome,
 };
 
-/// The one command word the fixture's provider contributes.
 const PROBE: &str = "probe";
 
-/// The help page `probe --help` renders, newline-terminated the way `clap` writes it.
 const PROBE_HELP: &str = "Usage: probe <COMMAND>\n\nCommands:\n  upper  Uppercase text\n";
 
-/// A fixture exposing a few capabilities with distinguishable outcomes, reachable only through its
-/// one command word.
-///
-/// Nothing here loads a component: `probe` is a hand-written stand-in for a provider's own argv
-/// parser. Most subcommands propose one capability the way a real provider's `run-command` would;
-/// the rest stand for the other answers a run can end in. `cli-probe.upper` uppercases its `text`,
-/// so a result can never be mistaken for the argv that produced it; `fixture.object` hands back
-/// the object its flags describe, which is what the grammar tests use to put a structured value in
-/// a pipe.
 #[derive(Default)]
 pub(super) struct Fixture {
     pub(super) calls: RefCell<Vec<(String, Value)>>,
@@ -56,8 +43,6 @@ impl CapabilityInvoker for Fixture {
         word == PROBE
     }
 
-    /// A `clap`-shaped provider command: help and usage errors are rendered text at the status
-    /// `clap` would choose, `-` reads stdin, and every other subcommand maps to one fixed answer.
     fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
         if word != PROBE {
             return None;
@@ -137,8 +122,6 @@ impl CapabilityInvoker for Fixture {
                 error: "provider trapped".to_owned(),
                 detail: None,
             },
-            // What a typed provider failure looks like once the broker has classified it: the
-            // class the exit status comes from, and the provider's own sentence beside it.
             "provider.refused" => CapabilityCallResult::Failed {
                 error: "provider-failure".to_owned(),
                 detail: Some(dekopon_core::ProviderFailureDetail::new(
@@ -155,7 +138,6 @@ impl CapabilityInvoker for Fixture {
     }
 }
 
-/// A proposal carrying no secret-use intent, which is every proposal this fixture makes.
 fn proposal(capability: &str, input: Value) -> CommandRun {
     CommandRun::Proposed {
         capability: capability.to_owned(),
@@ -164,10 +146,6 @@ fn proposal(capability: &str, input: Value) -> CommandRun {
     }
 }
 
-/// Builds the object `probe object --key value ...` describes.
-///
-/// A value that reads as JSON keeps its JSON type, so `--a 1` is a number; anything else is a
-/// string. `None` when the argv is not whole `--key value` pairs.
 fn object_from_flags(flags: &[&str]) -> Option<Value> {
     let mut object = serde_json::Map::new();
     for pair in flags.chunks(2) {
@@ -197,10 +175,6 @@ fn output(script: &str) -> String {
 fn code(script: &str) -> u8 {
     run(script).exit_code.get()
 }
-
-// ---------------------------------------------------------------------------
-// Kept grammar
-// ---------------------------------------------------------------------------
 
 #[test]
 fn assigns_and_expands_variables() {
@@ -253,7 +227,6 @@ fn if_elif_else_selects_one_branch() {
 #[test]
 fn for_loops_iterate_over_words_and_arrays() {
     assert_eq!(output("for x in a b c; do echo $x; done"), "a\nb\nc");
-    // An unquoted `$( )` producing a real JSON array expands element by element.
     assert_eq!(
         output("for x in $(probe object --a 1 --b 2 --c 3 | jq '[.a,.b,.c]'); do echo $x; done"),
         "1\n2\n3"
@@ -282,14 +255,12 @@ fn break_and_continue_respect_nesting_levels() {
         output("for x in 1 2 3; do if [ $x -eq 2 ]; then break; fi; echo $x; done"),
         "1"
     );
-    // `break 2` leaves both loops; only the outer loop's trailing marker should print.
     assert_eq!(
         output(
             "for a in 1 2; do for b in 1 2; do echo $a$b; if [ $b -eq 1 ]; then break 2; fi; done; echo inner-done; done\necho after"
         ),
         "11\nafter"
     );
-    // `continue 2` restarts the outer loop instead of the inner one.
     assert_eq!(
         output(
             "for a in 1 2; do for b in 1 2; do echo $a$b; continue 2; done; echo unreachable; done"
@@ -309,37 +280,29 @@ fn functions_take_positional_parameters_and_return_status() {
 
 #[test]
 fn a_negated_pipeline_inverts_its_status() {
-    // Dispatching `!` as a command word reported "command not found" and inverted every branch.
     assert_eq!(output("if ! false; then echo neg; fi"), "neg");
     assert_eq!(output("if ! true; then echo no; else echo yes; fi"), "yes");
     assert_eq!(output("! false && echo reached"), "reached");
     assert_eq!(code("! true"), 1);
     assert_eq!(code("! false"), 0);
-    // A `!` that is an argument rather than a pipeline prefix is untouched.
     assert_eq!(output("if [ ! -z x ]; then echo arg; fi"), "arg");
 }
 
 #[test]
 fn functions_participate_in_pipelines_in_both_directions() {
-    // A function used to leak its output past the pipe and hand the next command a null.
     assert_eq!(output("f() { echo hi; }\nf | wc -c"), "2");
     assert_eq!(output("g() { cat; }\necho payload | g"), "payload");
-    // A guard that never reads the input must not swallow it before the command that does.
     assert_eq!(
         output("g() { if [ -n \"$1\" ]; then cat; fi; }\necho payload | g yes"),
         "payload"
     );
     assert_eq!(output("f() { echo one; echo two; }\nf | grep one"), "one");
-    // In terminal position a function still streams straight to the output.
     assert_eq!(output("f() { echo one; echo two; }\nf"), "one\ntwo");
-    // A function that produces nothing contributes no phantom line.
     assert_eq!(output("echo a\nq() { true; }\nq\necho b"), "a\nb");
 }
 
 #[test]
 fn a_piped_value_survives_every_stage_and_every_statement_that_shares_it() {
-    // The frame's stdin is shared, not consumed, so each pipeline in a body is offered the same
-    // value however many statements precede it and whether or not they read it.
     assert_eq!(
         output("g() { cat; cat; }\necho payload | g"),
         "payload\npayload"
@@ -348,7 +311,6 @@ fn a_piped_value_survives_every_stage_and_every_statement_that_shares_it() {
         output("g() { true; echo first; cat; }\necho payload | g"),
         "first\npayload"
     );
-    // Structure survives being handed from stage to stage rather than copied into each one.
     assert_eq!(
         output(r#"probe object --a 1 --b two | jq '.b' | cat"#),
         "two"
@@ -357,20 +319,16 @@ fn a_piped_value_survives_every_stage_and_every_statement_that_shares_it() {
         output(r#"g() { cat | jq '.a'; cat | jq '.b'; }; probe object --a 1 --b 2 | g"#),
         "1\n2"
     );
-    // A here-document still replaces whatever a pipe would have supplied.
     assert_eq!(output("echo ignored | cat <<EOF\nbody\nEOF"), "body");
 }
 
 #[test]
 fn prefix_assignments_are_transient_and_applied_after_expansion() {
-    // `x=new echo "[$x]"` must print the *old* value and must not outlive the command.
     assert_eq!(
         output(r#"x=old; x=new echo "[$x]"; echo "after=[$x]""#),
         "[old]\nafter=[old]"
     );
-    // A prefix assignment on a name that did not exist leaves no binding behind.
     assert_eq!(output(r#"DEBUG=1 true; echo "[$DEBUG]""#), "[]");
-    // An assignment with no command word is an ordinary, lasting assignment.
     assert_eq!(output(r#"x=kept; echo "[$x]""#), "[kept]");
 }
 
@@ -378,7 +336,6 @@ fn prefix_assignments_are_transient_and_applied_after_expansion() {
 fn shift_consumes_positional_parameters() {
     assert_eq!(output(r#"f() { shift; echo "$1"; }; f a b"#), "b");
     assert_eq!(output(r#"f() { shift 2; echo "$1 $#"; }; f a b c"#), "c 1");
-    // Shifting past the end fails rather than silently truncating, as in bash.
     assert_eq!(output(r#"f() { shift 5; echo $?; }; f a"#), "1");
     assert_eq!(
         output(r#"f() { while [ $# -gt 0 ]; do echo $1; shift; done; }; f a b c"#),
@@ -388,8 +345,6 @@ fn shift_consumes_positional_parameters() {
 
 #[test]
 fn quoted_all_positional_splits_one_word_per_parameter() {
-    // `for x in "$@"` is the most-trained argument idiom there is; joining it into one word made
-    // the quoted form silently wrong and the unquoted form the only correct one.
     assert_eq!(
         output(r#"f() { for a in "$@"; do echo "[$a]"; done; }; f "one two" three"#),
         "[one two]\n[three]"
@@ -398,12 +353,10 @@ fn quoted_all_positional_splits_one_word_per_parameter() {
         output(r#"f() { count() { echo $#; }; count "$@"; }; f a b c"#),
         "3"
     );
-    // Zero parameters forward as zero words, not one empty one.
     assert_eq!(
         output(r#"f() { count() { echo $#; }; count "$@"; }; f"#),
         "0"
     );
-    // `$*` is the always-joined counterpart, and used to expand to the literal text `$*`.
     assert_eq!(output(r#"f() { echo "[$*]"; }; f a b"#), "[a b]");
     assert_eq!(
         output(r#"f() { count() { echo $#; }; count "$*"; }; f a b"#),
@@ -413,8 +366,6 @@ fn quoted_all_positional_splits_one_word_per_parameter() {
 
 #[test]
 fn diagnostics_inside_a_substitution_still_reach_the_output() {
-    // Only the *value* of `$( )` is captured. Swallowing its errors too left a script with an
-    // empty variable, no explanation, and a `$?` it may never look at.
     let outcome = run(r#"v=$(nosuchcmd); echo "v=[$v] status=$?""#);
     assert!(
         outcome.output.contains("nosuchcmd: command not found"),
@@ -439,19 +390,12 @@ fn diagnostics_inside_a_substitution_still_reach_the_output() {
 
 #[test]
 fn a_capture_drops_a_null_result_the_way_the_output_path_does() {
-    // Outside a capture, a command that produced no value writes nothing. Inside one it used to
-    // become an element of the captured stream, and a capture joins its elements with a newline —
-    // so `true` contributed a blank line whose position depended only on where it sat. bash prints
-    // `a` for both of these.
     assert_eq!(output(r#"x=$(true; echo a); echo "[$x]""#), "[a]");
     assert_eq!(output(r#"x=$(echo a; true); echo "[$x]""#), "[a]");
-    // A command that selected nothing is the same case: `grep` with no match produces no value.
     assert_eq!(
         output(r#"x=$(echo hi | grep zz; echo a); echo "[$x]""#),
         "[a]"
     );
-    // Real output is still joined line by line, and the status a null-valued command reported
-    // still reaches `$?`, because it travels through `last_status` rather than the capture.
     assert_eq!(output(r#"x=$(echo a; echo b); echo "[$x]""#), "[a\nb]");
     assert_eq!(output("x=$(echo a; false); echo $?"), "1");
 }
@@ -471,7 +415,6 @@ inner() { echo $x; }
 outer() { local x=shadowed; inner; }
 outer
 echo $x";
-    // Dynamic scoping: `inner` sees `outer`'s local, and the global is intact afterwards.
     assert_eq!(output(script), "shadowed\nglobal");
 }
 
@@ -517,12 +460,10 @@ fn division_by_zero_is_recoverable_not_fatal() {
 
 #[test]
 fn command_substitution_preserves_structure_only_as_a_whole_rhs() {
-    // Whole-RHS `$( )` keeps the structured value...
     assert_eq!(
         output(r#"r=$(probe object --status 200); echo ${r[status]}"#),
         "200"
     );
-    // ...while an interpolated `$( )` coerces to display form, exactly like bash.
     assert_eq!(
         output(r#"r="x$(probe object --status 200)"; echo $r"#),
         r#"x{"status":200}"#
@@ -531,15 +472,11 @@ fn command_substitution_preserves_structure_only_as_a_whole_rhs() {
 
 #[test]
 fn a_capture_honors_the_newline_a_command_suppressed() {
-    // Assembling a value piecewise with `printf` is a common model idiom, and a capture that joins
-    // every result with "\n" corrupts every one of them: broken URLs, broken JSON fragments, no
-    // diagnostic. bash prints `ab` for both of these.
     assert_eq!(
         output(r#"v=$(printf '%s' a; printf '%s' b); echo "$v""#),
         "ab"
     );
     assert_eq!(output(r#"v=$(echo -n a; echo -n b); echo "$v""#), "ab");
-    // A result that did not suppress its terminator still separates the next one.
     assert_eq!(
         output(r#"v=$(echo a; echo b); echo "$v" | wc -l"#),
         "2".to_owned()
@@ -569,12 +506,10 @@ fn indexing_is_backed_by_real_json() {
 
 #[test]
 fn unquoted_arrays_expand_element_by_element() {
-    // POSIX IFS splitting is dropped; a JSON array is what produces multiple argv words.
     assert_eq!(
         output(r#"a=$(probe object --x x --y y | jq '[.x,.y]'); count() { echo $#; }; count $a"#),
         "2"
     );
-    // A scalar containing spaces stays exactly one word.
     assert_eq!(
         output(r#"s="one two"; count() { echo $#; }; count $s"#),
         "1"
@@ -620,8 +555,6 @@ fn xargs_maps_a_command_over_a_list() {
         r#"probe object --a a --b b | jq '[.a,.b]' | xargs probe upper --text"#,
         &fixture,
     );
-    // One call builds the list, then `xargs` drives one provider command per element, each of
-    // which proposes its own capability call.
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS, "{}", outcome.output);
     assert_eq!(outcome.capability_calls, 3);
     assert_eq!(
@@ -635,15 +568,11 @@ fn xargs_maps_a_command_over_a_list() {
     assert_eq!(outcome.output, r#"[{"text":"A"},{"text":"B"}]"#);
 }
 
-// ---------------------------------------------------------------------------
-// Capability dispatch and exit codes
-// ---------------------------------------------------------------------------
-
 #[test]
 fn a_capability_shaped_word_is_an_ordinary_unknown_command() {
-    // A capability is reached through the command word of the provider that owns it. A word
-    // shaped like a capability identifier is only a word — even one naming a capability this
-    // session holds — so it takes the shell's ordinary "command not found" path and runs nothing.
+    // A capability is only reachable through its provider's command word; a bare
+    // capability-identifier-shaped word is not itself callable, even for a capability this session
+    // holds.
     let fixture = Fixture::default();
     let outcome = Interpreter::new(Limits::default()).run(
         "wikipedia_page --title x; echo $?\ncli-probe.upper --text hi; echo $?",
@@ -661,9 +590,6 @@ fn a_capability_shaped_word_is_an_ordinary_unknown_command() {
     assert_eq!(outcome.capability_calls, 0);
 }
 
-/// The classification alone cannot say which refusal this was, so the provider's own code and
-/// message are appended to it. Without them a model reads `failed: provider-failure` and invents a
-/// reason for an upstream moderation refusal it was never told about.
 #[test]
 fn a_typed_provider_failure_renders_its_code_and_message_after_the_classification() {
     let outcome = Interpreter::new(Limits::default()).run("probe refused", &Fixture::default());
@@ -676,7 +602,6 @@ fn a_typed_provider_failure_renders_its_code_and_message_after_the_classificatio
     assert_eq!(outcome.exit_code, ExitCode::FAILURE);
 }
 
-/// A failure no provider reported keeps the line it always had; nothing is appended to invent one.
 #[test]
 fn a_failure_without_a_provider_detail_renders_the_classification_alone() {
     let outcome = Interpreter::new(Limits::default()).run("probe broken", &Fixture::default());
@@ -699,7 +624,6 @@ fn cap_lists_and_describes_capabilities() {
     assert!(output("cap --list").contains("cli-probe.upper"));
     let described = output("cap --describe cli-probe.upper");
     assert!(described.contains("Uppercases its text"), "{described}");
-    // Using a capability is its provider's `--help`, not a schema.
     assert!(!described.contains("inputSchema"), "{described}");
 }
 
@@ -709,13 +633,8 @@ fn a_function_shadows_a_builtin_only_when_declared_first() {
     assert_eq!(output("echo() { true; }\necho hi"), "");
 }
 
-// ---------------------------------------------------------------------------
-// Dropped grammar: every one of these must fail loudly, not silently
-// ---------------------------------------------------------------------------
-
 #[test]
 fn globbing_is_dropped_and_stays_literal() {
-    // There is no filesystem to glob against, so `*` is an ordinary character.
     assert_eq!(output("echo *"), "*");
     assert_eq!(output("echo a?b"), "a?b");
     assert_eq!(output("echo [abc]"), "[abc]");
@@ -738,7 +657,6 @@ fn backgrounding_is_a_hard_parse_error() {
         "{}",
         outcome.output
     );
-    // Nothing ran: a parse failure rejects the whole script.
     assert!(!outcome.output.contains("after"), "{}", outcome.output);
 }
 
@@ -809,7 +727,6 @@ for name in ready failed other; do\n\
 done";
     assert_eq!(output(script), "go\nstop\nunknown");
 
-    // An alternative list matches on any of its patterns, and no clause below it runs.
     assert_eq!(
         output("case broken in\n ready) echo a ;;\n failed|broken) echo b ;;\n *) echo c ;;\nesac"),
         "b"
@@ -822,7 +739,6 @@ fn case_matches_the_expanded_subject_and_reports_success_when_nothing_matches() 
         output("x=ready\ncase \"$x\" in ready) echo yes ;; esac"),
         "yes"
     );
-    // bash reports success for a `case` no clause matched; "none of the above" is an answer.
     let outcome = run("case nothing in ready) echo yes ;; esac");
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
     assert_eq!(outcome.output, "");
@@ -830,8 +746,6 @@ fn case_matches_the_expanded_subject_and_reports_success_when_nothing_matches() 
 
 #[test]
 fn an_escaped_case_pattern_matches_one_literal_character_like_bash() {
-    // `\*` is bash's spelling for a literal asterisk, exactly like `'*'`. Classifying it as the
-    // `*)` default branch would silently route every subject through the escaped clause.
     let outcome = run("case hello in \\*) echo caught ;; esac");
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
     assert_eq!(outcome.output, "");
@@ -843,8 +757,6 @@ fn an_escaped_case_pattern_matches_one_literal_character_like_bash() {
 
 #[test]
 fn case_composes_with_the_control_flow_around_it() {
-    // `break` inside a `case` inside a loop unwinds the loop, exactly as in bash — the `case` is
-    // not a scope that swallows it.
     assert_eq!(
         output("for n in 1 2 3; do case $n in 2) break ;; *) echo $n ;; esac; done"),
         "1"
@@ -857,8 +769,6 @@ fn case_composes_with_the_control_flow_around_it() {
 
 #[test]
 fn a_case_pattern_assembled_at_run_time_is_still_checked() {
-    // The parser cannot see this pattern's text, so the check happens where the text appears.
-    // Matching `*.json` literally would answer a question the script did not ask.
     let outcome = run("p='*.json'\ncase report.json in $p) echo matched ;; esac");
     assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
     assert!(
@@ -866,16 +776,14 @@ fn a_case_pattern_assembled_at_run_time_is_still_checked() {
         "{}",
         outcome.output
     );
-    // It must not advise quoting. Quoting exempts a metacharacter only while the parser can still
-    // see it; an expanded pattern has already lost its quotes, so `case '*b' in '*'$x)` is rejected
-    // too — and remediation that provably does not work is worse than none.
+    // An error here must not suggest quoting: quoting only exempts a metacharacter while the parser
+    // can still see it, and an expanded pattern has already lost its quotes.
     assert!(
         !outcome.output.contains("quote it as"),
         "{}",
         outcome.output
     );
 
-    // A run-time pattern with no pattern syntax in it matches literally and is left alone.
     assert_eq!(
         output("p=ready\ncase ready in $p) echo matched ;; esac"),
         "matched"
@@ -884,8 +792,6 @@ fn a_case_pattern_assembled_at_run_time_is_still_checked() {
 
 #[test]
 fn case_charges_the_step_budget_like_every_other_construct() {
-    // Each clause tested is a step, so a `case` inside a loop cannot outrun the budget that
-    // bounds the rest of the interpreter.
     let outcome = run_with(
         "while true; do case x in a) : ;; b) : ;; *) : ;; esac; done",
         Limits {
@@ -899,13 +805,8 @@ fn case_charges_the_step_budget_like_every_other_construct() {
 
 #[test]
 fn a_here_document_becomes_the_commands_input_as_one_string() {
-    // The newline that ended the last body line is dropped, so `cat <<EOF` prints what bash prints
-    // rather than one extra blank line: a value in this shell is not newline-terminated.
     assert_eq!(output("cat <<EOF\nalpha\nbeta\nEOF"), "alpha\nbeta");
 
-    // The body is a JSON *string*, deliberately: a block of literal text is a string in this value
-    // model, and quietly parsing bodies that happen to look like JSON would make `cat <<EOF` mean
-    // two different things depending on its contents. `fromjson` is the explicit way across.
     assert_eq!(
         output("jq -r 'fromjson.name' <<EOF\n{\"name\": \"dekopon\"}\nEOF"),
         "dekopon"
@@ -923,24 +824,20 @@ fn a_here_document_becomes_the_commands_input_as_one_string() {
 fn a_here_document_interpolates_unless_its_delimiter_is_quoted() {
     assert_eq!(output("id=7\ncat <<EOF\nid=$id\nEOF"), "id=7");
     assert_eq!(output("id=7\ncat <<'EOF'\nid=$id\nEOF"), "id=$id");
-    // A command substitution inside a body runs, like any other double-quoted context.
     assert_eq!(output("cat <<EOF\nvalue=$(echo inner)\nEOF"), "value=inner");
 }
 
 #[test]
 fn a_here_document_replaces_what_a_pipe_would_have_supplied() {
-    // A redirection is applied after the pipe in bash, so the here-document wins.
     assert_eq!(
         output("echo piped | cat <<EOF\nredirected\nEOF"),
         "redirected"
     );
-    // And the rest of the operator's line stays ordinary shell.
     assert_eq!(output("cat <<EOF | wc -l\na\nb\nEOF"), "2");
 }
 
 #[test]
 fn a_here_document_body_charges_the_value_byte_ceiling() {
-    // Nothing new may materialize bytes outside the ceiling that bounds this interpreter's memory.
     let body = "x".repeat(4096);
     let outcome = run_with(
         &format!("cat <<EOF\n{body}\nEOF"),
@@ -959,8 +856,6 @@ fn a_here_document_body_charges_the_value_byte_ceiling() {
 
 #[test]
 fn the_clock_is_not_a_command_this_shell_has() {
-    // There is no provider for "what time is it" and no command word to go through, so the word is
-    // simply not a command here — indistinguishable from any other word nothing provides.
     let outcome = run("date");
     assert_eq!(outcome.exit_code, ExitCode::NOT_FOUND);
     assert!(
@@ -972,8 +867,6 @@ fn the_clock_is_not_a_command_this_shell_has() {
 
 #[test]
 fn array_expansion_is_backed_by_real_json() {
-    // `${NAME[@]}` is not bash's sparse-array emulation; it selects the elements of a real JSON
-    // array, which is what an unquoted `$NAME` holding one already spreads into.
     assert_eq!(
         output(
             r#"arr=$(probe object --a x --b y | jq '[.a,.b]')
@@ -995,7 +888,6 @@ echo ${#arr[@]}"#
         ),
         "2"
     );
-    // A quoted `"${NAME[@]}"` holding one element stays one word, spaces and all.
     assert_eq!(
         output(
             r#"arr=$(probe object --a "one two" | jq '[.a]')
@@ -1005,19 +897,12 @@ for item in "${arr[@]}"; do echo "[$item]"; done"#
     );
 }
 
-// ---------------------------------------------------------------------------
-// `read`
-// ---------------------------------------------------------------------------
-
 #[test]
 fn while_read_walks_every_line_and_then_stops() {
-    // The idiom this exists for. `read` consumes through the enclosing stage's cursor, so each
-    // iteration sees the next line and end of input is what ends the loop.
     assert_eq!(
         output(r#"probe fetch | jq -r .bodyText | while read line; do echo "[$line]"; done"#),
         "[alpha]\n[beta]\n[alpha]"
     );
-    // And the loop keeps what it assigned, because nothing forked.
     assert_eq!(
         output(
             r#"count=0
@@ -1030,7 +915,6 @@ echo $count"#
 
 #[test]
 fn read_reports_end_of_input_as_a_status_not_a_diagnostic() {
-    // A message here would be one per loop, every loop.
     let outcome = run("echo one | while read line; do echo $line; done");
     assert_eq!(outcome.output, "one");
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
@@ -1039,8 +923,6 @@ fn read_reports_end_of_input_as_a_status_not_a_diagnostic() {
 
 #[test]
 fn read_binds_several_names_by_splitting_on_whitespace() {
-    // A rule local to `read`, not a return of IFS word splitting: the remainder lands in the last
-    // name, as bash does.
     assert_eq!(
         output(
             r#"echo "alpha beta gamma delta" | { read -r first second rest; echo "1=$first 2=$second rest=$rest"; }"#
@@ -1055,7 +937,6 @@ fn read_binds_several_names_by_splitting_on_whitespace() {
 
 #[test]
 fn a_piped_read_is_its_own_one_shot_source() {
-    // `echo | read` consumes from the pipe, not from anything the enclosing scope holds.
     assert_eq!(output("echo hello | read x\necho $x"), "hello");
 }
 
@@ -1076,10 +957,6 @@ fn read_refuses_what_it_does_not_implement() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Shell options
-// ---------------------------------------------------------------------------
-
 #[test]
 fn errexit_ends_the_script_at_the_first_untested_failure() {
     let outcome = run("set -e\necho before\nnosuchcmd\necho after");
@@ -1088,7 +965,6 @@ fn errexit_ends_the_script_at_the_first_untested_failure() {
     assert!(!outcome.output.contains("after"), "{outcome:?}");
     assert!(outcome.output.contains("`set -e` is on"), "{outcome:?}");
 
-    // Off by default, and `set +e` turns it back off.
     assert!(output("nosuchcmd\necho after").contains("after"));
     assert!(
         output("set -e\nset +e\nnosuchcmd\necho after").contains("after"),
@@ -1098,12 +974,9 @@ fn errexit_ends_the_script_at_the_first_untested_failure() {
 
 #[test]
 fn errexit_leaves_a_tested_status_alone() {
-    // Bash's three exemptions, each one a position where the script is already asking whether the
-    // command failed. Tripping there would break the very idiom used to handle failure.
     for script in [
         "set -e\nif nosuchcmd; then echo yes; else echo handled; fi\necho after",
         "set -e\nnosuchcmd || echo handled\necho after",
-        // `if a && b` nests two exemptions.
         "set -e\nif true && nosuchcmd; then echo handled; else echo handled; fi\necho after",
     ] {
         let outcome = run(script);
@@ -1124,7 +997,6 @@ fn errexit_leaves_a_tested_status_alone() {
         code("set -e\nwhile nosuchcmd; do echo body; done\necho after"),
         0
     );
-    // The final operand of a chain is *not* exempt: nothing is asking about it.
     let outcome = run("set -e\ntrue && nosuchcmd\necho after");
     assert_eq!(outcome.exit_code.get(), 127);
     assert!(!outcome.output.contains("after"), "{outcome:?}");
@@ -1140,7 +1012,6 @@ fn nounset_refuses_a_name_nothing_ever_set() {
     );
     assert!(!outcome.output.contains("after"), "{outcome:?}");
 
-    // The expansions written to handle an absent value must not be what trips it.
     assert_eq!(output("set -u\necho ${missing:-fallback}"), "fallback");
     assert_eq!(output("set -u\necho \"[${missing+set}]\""), "[]");
     assert_eq!(output("set -u\nx=\necho \"[$x]\""), "[]");
@@ -1148,8 +1019,6 @@ fn nounset_refuses_a_name_nothing_ever_set() {
 
 #[test]
 fn pipefail_reports_the_rightmost_stage_that_failed() {
-    // Without it, a command that never ran hides behind a `jq` that was handed nothing and
-    // succeeded anyway — the exact shape a model writes and then misreads.
     assert_eq!(code("nosuchcmd | jq ."), 0);
     assert_eq!(code("set -o pipefail\nnosuchcmd | jq ."), 127);
     assert_eq!(code("set -o pipefail\necho hi | jq ."), 0);
@@ -1187,18 +1056,12 @@ fn set_refuses_every_option_it_does_not_enforce() {
             outcome.output
         );
     }
-    // The long spellings of the three that are real do work.
     assert_eq!(code("set -o errexit\nnosuchcmd"), 127);
     assert_eq!(code("set -o nounset\necho $missing"), 1);
 }
 
-// ---------------------------------------------------------------------------
-// `[[ ... ]]`
-// ---------------------------------------------------------------------------
-
 #[test]
 fn double_brackets_run_the_same_tests_single_ones_do() {
-    // Same code underneath, so the two spellings can never disagree about an operator.
     for (double, single) in [
         ("[[ -n x ]]", "[ -n x ]"),
         ("[[ -z \"\" ]]", "[ -z \"\" ]"),
@@ -1225,12 +1088,10 @@ fn double_brackets_add_the_connectives_single_ones_lack() {
         output("x=5\n[[ $x -gt 1 && $x -lt 10 ]] && echo between"),
         "between"
     );
-    // `&&` short-circuits, so the right side is never evaluated for an unset name.
     assert_eq!(
         output("[[ -n \"$missing\" && $missing -eq 1 ]] || echo skipped"),
         "skipped"
     );
-    // And it composes into the constructs that take a condition.
     assert_eq!(output("if [[ -n x ]]; then echo yes; fi"), "yes");
     assert_eq!(
         output("i=0\nwhile [[ $i -lt 2 ]]; do echo $i; i=$(( i + 1 )); done"),
@@ -1240,8 +1101,6 @@ fn double_brackets_add_the_connectives_single_ones_lack() {
 
 #[test]
 fn an_unquoted_expansion_inside_double_brackets_is_one_word() {
-    // The promise `[[ ]]` makes over `[ ]`: a value that spreads into several words elsewhere is
-    // still one operand here.
     assert_eq!(
         output(
             r#"v=$(probe object --a "one two" | jq '[.a]')
@@ -1253,16 +1112,12 @@ fn an_unquoted_expansion_inside_double_brackets_is_one_word() {
 
 #[test]
 fn comparison_operands_inside_double_brackets_stay_literal() {
-    // In bash the right operand of `==` is a glob. Comparing it literally would answer this
-    // wrongly and silently, so the metacharacter is named instead.
     let outcome = run("f=report.json\n[[ $f == *.json ]] && echo matched");
     assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
     assert!(outcome.output.contains("glob in bash"), "{outcome:?}");
     assert!(!outcome.output.contains("matched"), "{outcome:?}");
 
-    // Quoting is the way through while the parser can still see it.
     assert_eq!(output("f='*'\n[[ $f == '*' ]] && echo literal"), "literal");
-    // One assembled at run time is caught when it expands.
     let outcome = run("p='*.json'\nf=report.json\n[[ $f == $p ]] && echo matched");
     assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
     assert!(
@@ -1270,7 +1125,6 @@ fn comparison_operands_inside_double_brackets_stay_literal() {
         "{outcome:?}"
     );
 
-    // Regex matching names itself rather than being read as a string comparison.
     let outcome = run("[[ abc =~ a.c ]]");
     assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
     assert!(outcome.output.contains("regex matching"), "{outcome:?}");
@@ -1286,18 +1140,11 @@ fn a_malformed_double_bracket_condition_names_what_is_wrong() {
             .contains("at most three operands")
     );
     assert!(run("[[ ( -n x ]]").output.contains("expected `)`"));
-    // File tests stay refused, with the same message `test` gives.
     assert!(run("[[ -f x ]]").output.contains("no filesystem"));
 }
 
-// ---------------------------------------------------------------------------
-// Compound commands as pipeline stages
-// ---------------------------------------------------------------------------
-
 #[test]
 fn a_compound_command_can_be_a_pipeline_stage() {
-    // The shape this whole change exists for. `cat` inside the loop body reads the value piped
-    // into the loop, which is the same rule a function body already followed.
     assert_eq!(
         output(
             r#"probe object --a 1 | while [ -n "$(cat | jq -r .a)" ]; do echo saw; break; done"#
@@ -1320,9 +1167,6 @@ fn a_compound_command_can_be_a_pipeline_stage() {
 
 #[test]
 fn a_piped_compound_stage_keeps_the_variables_it_assigns() {
-    // bash runs this in a subshell and throws the assignment away, which is the single most
-    // notorious trap in the language. There are no subshells here, so it simply works — and a
-    // model writing the obvious thing gets the obvious result.
     assert_eq!(
         output(
             r#"total=0
@@ -1335,8 +1179,6 @@ echo $total"#
 
 #[test]
 fn a_compound_stage_feeding_a_pipe_collects_everything_it_emitted() {
-    // Each statement inside emits separately, so without collecting them the next stage would see
-    // only the last one.
     assert_eq!(output("{ echo a; echo b; } | wc -l"), "2");
     assert_eq!(output("for x in 1 2 3; do echo $x; done | wc -l"), "3");
     assert_eq!(output("{ echo a; echo b; } > buf\ncat buf | wc -l"), "2");
@@ -1344,15 +1186,12 @@ fn a_compound_stage_feeding_a_pipe_collects_everything_it_emitted() {
 
 #[test]
 fn a_brace_group_runs_in_the_current_scope_and_is_one_branch() {
-    // The idiom braces exist for.
     let outcome = run("nosuchcmd || { echo handled; exit 3; }\necho unreachable");
     assert_eq!(outcome.exit_code.get(), 3);
     assert!(outcome.output.contains("handled"), "{outcome:?}");
     assert!(!outcome.output.contains("unreachable"), "{outcome:?}");
 
-    // No subshell, so an assignment inside is still an assignment outside.
     assert_eq!(output("{ x=inside; }\necho $x"), "inside");
-    // A group reports the status of its last command, like bash.
     assert_eq!(output("{ true; false; } && echo yes || echo no"), "no");
 }
 
@@ -1370,23 +1209,16 @@ fn a_compound_stage_carries_its_own_redirections() {
     assert_eq!(after.trim(), "2");
 }
 
-// ---------------------------------------------------------------------------
-// Parameter expansion
-// ---------------------------------------------------------------------------
-
 #[test]
 fn default_and_alternate_expansions_follow_bash_including_the_colon() {
     assert_eq!(output("echo ${missing:-fallback}"), "fallback");
     assert_eq!(output("x=set\necho ${x:-fallback}"), "set");
-    // The colon is the whole distinction: `:-` also substitutes for a name holding nothing,
-    // `-` only for a name nothing ever assigned.
     assert_eq!(output("x=\necho ${x:-fallback}"), "fallback");
     assert_eq!(output("x=\necho \"[${x-fallback}]\""), "[]");
 
     assert_eq!(output("x=set\necho ${x:+present}"), "present");
     assert_eq!(output("echo \"[${missing:+present}]\""), "[]");
 
-    // A default may itself be an expansion, and a bare substitution keeps its structure.
     assert_eq!(output("y=inner\necho ${x:-$y}"), "inner");
     assert_eq!(
         output("v=${x:-$(probe object --a 1)}\necho ${v[a]}"),
@@ -1397,13 +1229,10 @@ fn default_and_alternate_expansions_follow_bash_including_the_colon() {
 
 #[test]
 fn a_whole_right_hand_side_expansion_keeps_the_value_it_names() {
-    // `copy=$obj` has to keep the object, or the very indexing this value model exists for stops
-    // surviving one assignment.
     assert_eq!(
         output("obj=$(probe object --a 1)\ncopy=$obj\necho ${copy[a]}"),
         "1"
     );
-    // Glued to anything else it is text again, as it must be.
     assert_eq!(
         output("obj=$(probe object --a 1)\njoined=x$obj\necho $joined"),
         r#"x{"a":1}"#
@@ -1414,8 +1243,6 @@ fn a_whole_right_hand_side_expansion_keeps_the_value_it_names() {
 fn assign_expansion_binds_the_name_it_substituted_for() {
     assert_eq!(output("echo ${x:=first}\necho $x"), "first\nfirst");
     assert_eq!(output("x=kept\necho ${x:=other}\necho $x"), "kept\nkept");
-    // Assigning *through* an index has nowhere to write, so it says so rather than dropping the
-    // write on the floor.
     let outcome = run("obj=$(probe object --a 1)\necho ${obj[b]:=x}");
     assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
     assert!(outcome.output.contains("cannot assign through an index"));
@@ -1423,8 +1250,6 @@ fn assign_expansion_binds_the_name_it_substituted_for() {
 
 #[test]
 fn a_required_expansion_ends_the_script_rather_than_carrying_on_empty() {
-    // The point of `${x:?}` is to stop. Reporting a status and continuing with an empty string
-    // would leave a script believing it had the value it just asserted it needed.
     let outcome = run("echo ${token:?no credential in scope}\necho after");
     assert_eq!(outcome.exit_code, ExitCode::FAILURE);
     assert!(
@@ -1434,7 +1259,6 @@ fn a_required_expansion_ends_the_script_rather_than_carrying_on_empty() {
     assert!(!outcome.output.contains("after"), "{outcome:?}");
 
     assert_eq!(output("token=ok\necho ${token:?missing}"), "ok");
-    // Without a message of its own it still names the parameter.
     assert!(
         run("echo ${token:?}")
             .output
@@ -1446,10 +1270,7 @@ fn a_required_expansion_ends_the_script_rather_than_carrying_on_empty() {
 fn length_counts_what_the_value_actually_is() {
     assert_eq!(output("x=hello\necho ${#x}"), "5");
     assert_eq!(output("echo ${#missing}"), "0");
-    // Real JSON, so an array counts elements and an object counts keys — a string's character
-    // count would be an answer about its JSON text rather than about the value.
     assert_eq!(output("obj=$(probe object --a 1 --b 2)\necho ${#obj}"), "2");
-    // Characters, not bytes.
     assert_eq!(output("x=héllo\necho ${#x}"), "5");
 }
 
@@ -1457,9 +1278,7 @@ fn length_counts_what_the_value_actually_is() {
 fn prefix_suffix_and_replacement_operate_on_literal_text() {
     assert_eq!(output("p=owner/repo\necho ${p#owner/}"), "repo");
     assert_eq!(output("p=owner/repo\necho ${p%/repo}"), "owner");
-    // A pattern that does not match leaves the value alone, as bash does.
     assert_eq!(output("p=owner/repo\necho ${p#nope}"), "owner/repo");
-    // The doubled forms are the same request: a literal pattern matches in exactly one way.
     assert_eq!(output("p=owner/repo\necho ${p##owner/}"), "repo");
     assert_eq!(output("p=owner/repo\necho ${p%%/repo}"), "owner");
 
@@ -1470,21 +1289,17 @@ fn prefix_suffix_and_replacement_operate_on_literal_text() {
 
 #[test]
 fn a_metacharacter_in_an_expansion_pattern_is_rejected_rather_than_matched_literally() {
-    // Same rule as a `grep`, `sed`, or `case` pattern, and for the same reason: a partial
-    // wildcard is exactly what a literal matcher answers wrongly and silently.
     for script in ["p=a/b\necho ${p##*/}", "p=a.json\necho ${p%.*}"] {
         let outcome = run(script);
         assert_eq!(outcome.exit_code, ExitCode::SYNTAX, "{script}");
         assert!(outcome.output.contains("literal text"), "{script}");
     }
-    // One assembled at run time is caught when it expands, where quoting can no longer help.
     let outcome = run("star='*'\np=a.json\necho ${p%$star}");
     assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
     assert!(
         outcome.output.contains("quoting cannot exempt"),
         "{outcome:?}"
     );
-    // Quoting is the way through, as everywhere else.
     assert_eq!(output("p='*.json'\necho ${p#'*'}"), ".json");
 }
 
@@ -1496,14 +1311,8 @@ fn nested_parameter_expansions_have_a_ceiling_rather_than_a_stack_overflow() {
     assert!(outcome.output.contains("nested deeper"), "{outcome:?}");
 }
 
-// ---------------------------------------------------------------------------
-// The two streams
-// ---------------------------------------------------------------------------
-
 #[test]
 fn a_redirected_stderr_leaves_the_combined_output() {
-    // The diagnostic is real — the exit code proves the command failed — but the script asked for
-    // it to go somewhere else, and it went there.
     let outcome = run("nosuchcmd 2>/dev/null\necho done");
     assert_eq!(outcome.output, "done");
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
@@ -1522,8 +1331,6 @@ fn stderr_redirects_into_a_named_buffer_that_cat_reads_back() {
 
 #[test]
 fn a_value_sent_to_stderr_escapes_a_command_substitution() {
-    // `echo oops >&2` is how a script reports a problem without polluting what it returns. The
-    // line still reaches the reader; it just stops being the substitution's value.
     let outcome = run(r#"x=$(echo oops >&2; echo kept)
 echo "[$x]""#);
     assert!(outcome.output.contains("oops"), "{outcome:?}");
@@ -1532,7 +1339,6 @@ echo "[$x]""#);
 
 #[test]
 fn two_to_one_merges_diagnostics_into_the_value_a_substitution_captures() {
-    // The idiom this exists for: capture *why* something failed, not just that it did.
     let outcome = run(r#"x=$(nosuchcmd 2>&1)
 echo "[$x]""#);
     assert!(outcome.output.contains("command not found]"), "{outcome:?}");
@@ -1540,8 +1346,8 @@ echo "[$x]""#);
 
 #[test]
 fn two_to_one_leaves_a_quiet_command_s_value_and_its_type_alone() {
-    // Merging is what a *diagnostic* forces; with none there is nothing to merge, and an object
-    // must not be flattened into its own JSON text just because `2>&1` was written.
+    // 2>&1 merges output only when there is an actual diagnostic to merge; otherwise a structured
+    // value must not be flattened into its own JSON text.
     assert_eq!(output("echo hi 2>&1"), "hi");
     assert_eq!(
         output("probe object --a 1 2>&1 | jq -r .a"),
@@ -1563,7 +1369,6 @@ fn both_streams_can_land_in_one_buffer() {
 fn dev_null_discards_on_write_and_reads_empty() {
     assert_eq!(output("echo hi > /dev/null\necho after"), "after");
     assert_eq!(output("cat /dev/null"), "");
-    // And it needs no prior write, unlike every other buffer name.
     assert!(output("cat nosuchbuffer").contains("no such buffer"));
 }
 
@@ -1579,8 +1384,8 @@ fn a_redirection_covers_the_whole_body_of_the_function_it_is_written_on() {
 
 #[test]
 fn a_fatal_diagnostic_is_never_swallowed_by_a_redirection() {
-    // The script is ending and the capture is about to be abandoned. If `2>` could eat this line,
-    // a model would see an empty result with no explanation at all.
+    // A fatal diagnostic must not be swallowed by a stderr redirect, or a model would see an empty
+    // result with no explanation.
     let outcome = run_with(
         "loop() { loop; }\nloop 2>/dev/null",
         Limits {
@@ -1593,8 +1398,6 @@ fn a_fatal_diagnostic_is_never_swallowed_by_a_redirection() {
 
 #[test]
 fn a_redirection_target_still_has_to_be_one_word() {
-    // An unquoted expansion holding a JSON array is what produces several words here; there is no
-    // IFS to split a string on.
     let outcome = run("x=$(probe object --a one --b two | jq '[.a,.b]')\necho hi > $x");
     assert_ne!(outcome.exit_code, ExitCode::SUCCESS);
     assert!(
@@ -1605,28 +1408,20 @@ fn a_redirection_target_still_has_to_be_one_word() {
 
 #[test]
 fn shell_shapes_this_interpreter_cannot_honor_are_rejected_by_their_own_name() {
-    // Each of these used to succeed quietly, or fail while naming the wrong feature. The message
-    // has to identify what the script actually wrote, or it sends a reader to the wrong fix.
     for (script, expected) in [
-        // Backticks: the second-most-common substitution form in real bash.
         ("echo `echo hi`", "backtick command substitution"),
         ("x=`date`", "backtick command substitution"),
-        // Descriptors beyond the two streams that exist.
         ("echo hi 3>/dev/null", "only descriptors 1"),
         ("cat 0< buf", "input duplication"),
-        // A shell option this shell does not enforce is refused by name rather than accepted and
-        // ignored, which is the failure that kept `set` out entirely before.
         ("set -x\necho after", "option -x is not supported"),
         (
             "set -o noclobber\necho after",
             "-o noclobber is not supported",
         ),
-        // Paren-shaped constructs are four different features, not one subshell.
         ("i=0; ((i++))", "arithmetic command"),
         ("arr=(a b c)", "bash array literals"),
         ("for ((i=0; i<3; i++)); do echo $i; done", "C-style"),
         ("(echo hi)", "subshells"),
-        // Arithmetic operators name themselves rather than a stray character.
         ("echo $((2 ** 3))", "`**` is not supported"),
         ("echo $((i++))", "`++` is not supported"),
         ("echo $((i += 2))", "compound assignment"),
@@ -1646,15 +1441,12 @@ fn shell_shapes_this_interpreter_cannot_honor_are_rejected_by_their_own_name() {
 
 #[test]
 fn a_non_ascii_character_in_arithmetic_is_named_as_itself() {
-    // Casting the raw byte reported 'Ã', the first UTF-8 byte of 'é' — a character the script
-    // never wrote, in a project whose diagnostics are the product.
     let outcome = run("echo $(( 1 é 2 ))");
     assert!(outcome.output.contains("'é'"), "{}", outcome.output);
 }
 
 #[test]
 fn a_text_builtin_that_selected_nothing_emits_nothing() {
-    // An empty result used to render as a blank line, which also spent a line of the ceiling.
     assert_eq!(
         output("echo start; echo a | grep zzz; echo end"),
         "start\nend"
@@ -1664,10 +1456,6 @@ fn a_text_builtin_that_selected_nothing_emits_nothing() {
         "start\n0\nend"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Sandbox limits
-// ---------------------------------------------------------------------------
 
 #[test]
 fn the_step_budget_stops_an_unbounded_loop() {
@@ -1724,21 +1512,14 @@ fn the_capability_call_cap_is_independent_of_the_step_budget() {
 
 #[test]
 fn deeply_nested_input_is_a_syntax_error_rather_than_a_dead_process() {
-    // Every recursive production runs on the native stack before any budget exists, so an
-    // unbounded one aborts the process with SIGABRT — no exit code, no outcome, no audit line.
-    // `Interpreter::run` documents that a script failure is a script *outcome*; these prove it.
     for script in [
-        // `$(( ( ( ... ) ) ))`: ArithParser::parse_primary re-enters the precedence chain.
         format!("echo $(( {}1{} ))", "(".repeat(4_000), ")".repeat(4_000)),
-        // `$( $( ... ) )`: convert_part re-enters the whole parser.
         format!("echo {}echo hi{}", "$(".repeat(2_000), ")".repeat(2_000)),
-        // `if ... then`: parse_if re-enters parse_program.
         format!(
             "{}echo x{}",
             "if true; then ".repeat(2_000),
             "; fi".repeat(2_000)
         ),
-        // The same nesting reached through an index expression.
         format!(
             "echo ${{name[{}echo 1{}]}}",
             "$(".repeat(1_000),
@@ -1758,15 +1539,12 @@ fn deeply_nested_input_is_a_syntax_error_rather_than_a_dead_process() {
             outcome.output
         );
     }
-    // Ordinary nesting is untouched by the ceiling.
     assert_eq!(output("echo $(( ((((1 + 1)))) ))"), "2");
     assert_eq!(output("echo $(echo $(echo $(echo deep)))"), "deep");
 }
 
 #[test]
 fn the_value_byte_ceiling_stops_runaway_string_growth() {
-    // Doubling a string is one cheap step and twice the memory, so every ceiling that counts
-    // operations leaves memory unbounded: 26 of these lines reach a gigabyte in 250 steps.
     let outcome = run_with(
         "x=aaaaaaaaaaaaaaaa\ni=0\nwhile [ $i -lt 30 ]; do x=\"$x$x\"; i=$(( i + 1 )); done\necho done",
         Limits {
@@ -1782,7 +1560,6 @@ fn the_value_byte_ceiling_stops_runaway_string_growth() {
     );
     assert!(!outcome.output.contains("done"), "{}", outcome.output);
 
-    // A named buffer written in a loop is the same amplification through a different door.
     let outcome = run_with(
         "x=aaaaaaaaaaaaaaaa\ni=0\nwhile [ $i -lt 30 ]; do x=\"$x$x\"; echo $x > buf; i=$(( i + 1 )); done",
         Limits {
@@ -1792,7 +1569,6 @@ fn the_value_byte_ceiling_stops_runaway_string_growth() {
     );
     assert_eq!(outcome.exit_code, ExitCode::SYNTAX);
 
-    // A realistic script stays far inside the default ceiling.
     assert_eq!(
         run("x=hello; y=\"$x $x\"; echo $y").exit_code,
         ExitCode::SUCCESS
@@ -1801,7 +1577,6 @@ fn the_value_byte_ceiling_stops_runaway_string_growth() {
 
 #[test]
 fn the_deadline_bounds_slow_capability_calls_not_only_long_scripts() {
-    /// An invoker whose calls cost wall clock rather than steps, like a real provider.
     struct Slow;
 
     impl CapabilityInvoker for Slow {
@@ -1833,9 +1608,6 @@ fn the_deadline_bounds_slow_capability_calls_not_only_long_scripts() {
         }
     }
 
-    // A few steps per command line times the 32-call default budget stays under 128 steps, so a
-    // clock sampled every 128th step was structurally unreachable for the workload that most needs
-    // it: a straight-line script of slow calls used to overrun its deadline and report success.
     let script = "slow call\n".repeat(32);
     let outcome = Interpreter::new(Limits {
         timeout: Duration::from_millis(60),
@@ -1881,7 +1653,6 @@ fn output_ceilings_truncate_keeping_head_and_tail() {
         "{}",
         outcome.output
     );
-    // A truncated script still completes; truncation is not a failure.
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
 }
 
@@ -1899,16 +1670,11 @@ fn a_single_oversized_line_cannot_bypass_the_byte_ceiling() {
     assert!(outcome.output.len() < 400, "{}", outcome.output);
 }
 
-// ---------------------------------------------------------------------------
-// Provider command words
-// ---------------------------------------------------------------------------
-
 #[test]
 fn a_provider_command_help_page_is_stdout_exit_0_and_capturable() {
     let fixture = Fixture::default();
     let outcome = Interpreter::new(Limits::default()).run("probe --help", &fixture);
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
-    // One trailing newline folds into the value model; printing adds it back exactly once.
     assert_eq!(
         outcome.output,
         "Usage: probe <COMMAND>\n\nCommands:\n  upper  Uppercase text"
@@ -1935,7 +1701,6 @@ fn a_provider_command_usage_error_is_a_diagnostic_with_exit_2() {
         "error: unrecognized subcommand 'bogus'\n\nUsage: probe <COMMAND>\n[] 2"
     );
     assert_eq!(outcome.capability_calls, 0);
-    // Diagnostics stay on the diagnostic stream, so `2>` redirects them like any other.
     assert_eq!(
         output("probe bogus 2> log; echo \"status $?\"; cat log"),
         "status 2\nerror: unrecognized subcommand 'bogus'\n\nUsage: probe <COMMAND>"
@@ -1954,14 +1719,12 @@ fn a_provider_command_reads_piped_text_verbatim_and_values_as_json() {
         *fixture.calls.borrow(),
         vec![
             ("cli-probe.upper".to_owned(), json!({"text": "hello"})),
-            // The producer of the object, then the object as the provider saw it: compact JSON.
             ("fixture.object".to_owned(), json!({"a": 1})),
             ("cli-probe.upper".to_owned(), json!({"text": "{\"a\":1}"})),
             ("cli-probe.upper".to_owned(), json!({"text": "flag"})),
         ]
     );
     assert_eq!(outcome.capability_calls, 4);
-    // Nothing piped is `None`, not an empty string: the provider can tell the two apart.
     assert_eq!(
         output("probe upper -; echo $?"),
         "probe: no input was piped for -\n2"
@@ -1993,8 +1756,6 @@ fn a_provider_command_decline_is_a_usage_error() {
     assert_eq!(outcome.capability_calls, 0);
 }
 
-/// A run that never reached the provider's answer takes the exit codes a capability call takes
-/// for the same two facts, so the model reads "retry later" or "stop" rather than "fix the argv".
 #[test]
 fn a_command_run_that_errored_or_was_refused_is_not_a_usage_error() {
     let errored = run("probe errored; echo $?");
@@ -2039,7 +1800,6 @@ fn rendered_output_obeys_the_output_ceiling() {
         "{}",
         outcome.output
     );
-    // Rendered bytes also count as materialized value bytes, like anything a script holds.
     let outcome = run_with(
         "probe --help",
         Limits {
@@ -2057,10 +1817,6 @@ fn rendered_output_obeys_the_output_ceiling() {
 
 #[test]
 fn the_process_environment_never_leaks_into_a_script() {
-    // `PATH` is genuinely set in this test process, so reading it back as empty proves isolation
-    // rather than merely proving that some arbitrary name is unset. (`std::env::set_var` is unsafe
-    // under edition 2024 and this crate forbids `unsafe`; the runner's black-box CLI test sets a
-    // real custom variable on a child process to cover that angle too.)
     assert!(
         std::env::var_os("PATH").is_some(),
         "this test is only meaningful when PATH is set in the host process"
@@ -2069,13 +1825,11 @@ fn the_process_environment_never_leaks_into_a_script() {
     assert_eq!(outcome.output, "[]\n[]\n[]");
     assert_eq!(outcome.exit_code, ExitCode::SUCCESS);
 
-    // Only the script's own assignments seed the namespace.
     assert_eq!(run(r#"PATH=mine; echo "[$PATH]""#).output, "[mine]");
 }
 
 #[test]
 fn a_normal_multi_step_script_fits_comfortably_in_the_defaults() {
-    // A realistic 5-to-10-step plan with nested loops must not trip any default ceiling.
     let script = "\
 summarize() {
   local total=0
@@ -2103,7 +1857,6 @@ cap --list | jq length";
     assert!(outcome.output.contains("1-0"), "{}", outcome.output);
     assert!(outcome.output.contains("3-2"), "{}", outcome.output);
     assert!(outcome.output.contains("10"), "{}", outcome.output);
-    // The fixture grants six capabilities.
     assert!(
         outcome.output.trim_end().ends_with('6'),
         "{}",

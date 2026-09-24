@@ -1,5 +1,3 @@
-//! Startup owns and discards the contents of the broker's private ephemeral asset root.
-
 use crate::config::AssetsConfig;
 use dekopon_http_host::asset::AssetDirectory;
 use std::{
@@ -55,7 +53,8 @@ pub async fn initialize(config: &AssetsConfig) -> Result<AssetDirectory, AssetsS
         for entry in fs::read_dir(&root).map_err(io_error)? {
             let entry = entry.map_err(io_error)?;
             let kind = entry.file_type().map_err(io_error)?;
-            // Symlinks are entries to unlink, never directories to traverse.
+            // Uses file_type, not metadata, so a symlink is unlinked rather than followed into
+            // remove_dir_all and deleted recursively.
             if kind.is_dir() {
                 fs::remove_dir_all(entry.path()).map_err(io_error)?;
             } else {

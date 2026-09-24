@@ -93,16 +93,10 @@ fn generated_image() -> GeneratedImage {
     GeneratedImage::from_png(png).expect("generated PNG fixture")
 }
 
-/// One reply's worth of provider attachments.
 fn generated_images(count: usize) -> Vec<GeneratedImage> {
     (0..count).map(|_| generated_image()).collect()
 }
 
-// ---------------------------------------------------------------------------
-// Configuration
-// ---------------------------------------------------------------------------
-
-/// A minimal well-formed configuration document every strict-decode case mutates.
 fn document(directory: &Path) -> Value {
     json!({
         "apiVersion": config::CONFIG_API_VERSION,
@@ -131,7 +125,6 @@ fn document(directory: &Path) -> Value {
     })
 }
 
-/// Writes one configuration document where the daemon's own hygiene checks will accept it.
 fn write_config(directory: &Path, document: &Value) -> PathBuf {
     let path = directory.join("dekopond.json");
     fs::write(
@@ -150,23 +143,12 @@ async fn load(
     config::load(write_config(directory, document), crate::current_uid()).await
 }
 
-/// One refused configuration: what it is called, the document, and which refusal it must be.
-///
-/// The predicate is the whole point of the tuple. `is_err()` alone passes when a fixture typo trips
-/// strict decoding before it ever reaches the check the case is named after, and it keeps passing
-/// if the check stops being called at all.
 type RefusalCase = (&'static str, Value, fn(&ConfigError) -> bool);
 
-/// Whether one aggregated refusal names this problem among the ones it reports.
-///
-/// The whole file is scanned before it is refused, so a case asserts that its problem is *in* the
-/// report rather than that it is the only thing in it — a fixture with a second mistake would
-/// otherwise fail the case it is named after.
 fn reports(error: &ConfigError, matcher: fn(&ConfigProblem) -> bool) -> bool {
     matches!(error, ConfigError::Invalid { problems, .. } if problems.iter().any(matcher))
 }
 
-/// The one problem a refused route binding reported.
 fn only_route_problem(error: &RouteError) -> &RouteProblem {
     assert_eq!(
         error.problems.len(),
@@ -200,8 +182,6 @@ async fn a_complete_configuration_resolves_with_documented_defaults() {
     assert_eq!(resolved.shutdown_grace, Duration::from_secs(120));
     assert_eq!(resolved.broker.server_uid, 501);
     assert!(resolved.telemetry.is_none());
-    // A route remembers nothing unless an operator says so, which is exactly the behavior every
-    // route had before conversations existed.
     assert_eq!(resolved.sessions.max_conversations, 1024);
     assert_eq!(resolved.routes[0].memory, MemoryPolicy::OneShot);
 }
@@ -210,10 +190,6 @@ async fn a_complete_configuration_resolves_with_documented_defaults() {
 async fn an_explicit_shared_scope_survives_resolution_and_route_binding() {
     let directory = temporary();
     let mut document = document(directory.path());
-    // Not a `[directMessage]`-only route: sharing a window there is the startup refusal
-    // `SharedMemoryOnDmRoute` (the direct message already is the subject), which the
-    // invalid-configuration table covers. `kind: any` is a route that also serves channels and
-    // group DMs, where a shared audience is a real choice an operator makes.
     document["routes"][0]["conversation"] = json!({"kind": "any"});
     document["routes"][0]["memory"] = json!({
         "mode": "persistent",
@@ -275,12 +251,6 @@ async fn retired_asset_route_keys_refuse_even_explicit_empty_configuration() {
     }
 }
 
-/// `apiKeyEnv` has three meanings and they used to have one outcome.
-///
-/// Absent means "this endpoint needs no key", which a loopback llama.cpp genuinely does not. Unset
-/// and exported-but-blank became "no bearer token" too: the gateway started clean, every answer came
-/// back 401, and nothing anywhere named the variable. The cached client made it survive until a
-/// restart, so exporting the key afterwards did not help either.
 #[test]
 fn a_model_api_key_variable_is_absent_or_usable_and_never_silently_empty() {
     let variable = "DEKOPOND_TEST_MODEL_KEY_4F1A62";
@@ -295,22 +265,18 @@ fn a_model_api_key_variable_is_absent_or_usable_and_never_silently_empty() {
         modalities: Vec::new(),
     };
 
-    // No field at all is a deliberate configuration, not a missing credential.
     assert!(
         model_bearer_token(&model(None))
             .expect("an endpoint that needs no key is not a startup failure")
             .is_none()
     );
 
-    // A set variable is the token, unchanged.
     assert_eq!(
         model_credential("fast", variable, Some(OsString::from("sk-live-1")))
             .expect("a set variable is the token"),
         "sk-live-1"
     );
 
-    // Both failures name the variable and the model, never the value, and keep which problem it
-    // was: "export it" and "you exported nothing" are different operator actions.
     for (value, problem) in [
         (None, "is not set"),
         (Some(OsString::from("   ")), "is set to an empty value"),
@@ -324,7 +290,6 @@ fn a_model_api_key_variable_is_absent_or_usable_and_never_silently_empty() {
         assert!(cause.to_string().contains(problem), "{cause}");
     }
 
-    // A named field pointing at an unset variable refuses through the startup entry point too.
     assert!(
         std::env::var_os(variable).is_none(),
         "fixture must stay unset"
@@ -589,8 +554,6 @@ async fn a_persistent_route_resolves_its_documented_window_defaults() {
     );
 }
 
-/// One table, one property: a configuration that says something the daemon does not understand, or
-/// that no deployment could satisfy, fails at startup rather than at the first chat message.
 #[tokio::test]
 async fn invalid_configurations_fail_closed_at_startup() {
     let directory = temporary();
@@ -630,9 +593,6 @@ async fn invalid_configurations_fail_closed_at_startup() {
             |error| matches!(error, ConfigError::Decode { .. }),
         ),
         (
-            // The gateway block and the route flag are both gone. A configuration that still names
-            // either one is a startup refusal carrying the unknown field's name, not a gateway that
-            // quietly ignores an operator's intention to draw.
             "a retired imageGenerator gateway block",
             mutate(|document| {
                 document["imageGenerator"] = json!({
@@ -686,10 +646,8 @@ async fn invalid_configurations_fail_closed_at_startup() {
             |error| matches!(error, ConfigError::Decode { .. }),
         ),
         (
-            // serde's internally tagged *unit* variants accept and discard every key beside the
-            // tag, so this once decoded cleanly and threw the channel away — leaving an operator
-            // reading their own file convinced the route was scoped to one channel while it in
-            // fact claimed every direct message on the transport.
+            // Serde's internally tagged unit variants silently accept and discard extra keys, so a
+            // channel field beside directMessage would decode cleanly while being ignored.
             "a channel on a directMessage route",
             mutate(|document| {
                 document["routes"][0]["conversation"] =
@@ -772,7 +730,6 @@ async fn invalid_configurations_fail_closed_at_startup() {
             },
         ),
         (
-            // The 0.13 spelling: `match:` is the route field that became `conversation:`.
             "a retired route match block",
             mutate(|document| {
                 document["routes"][0]["match"] = json!({"kind": "directMessage"});
@@ -784,7 +741,6 @@ async fn invalid_configurations_fail_closed_at_startup() {
             },
         ),
         (
-            // The other half of the rename: the window that used to live under this name.
             "a memory window written under the match block",
             mutate(|document| {
                 document["routes"][0]["conversation"] =
@@ -915,9 +871,6 @@ async fn invalid_configurations_fail_closed_at_startup() {
             },
         ),
         (
-            // A window bound that can never take effect is far more likely a mode typo than an
-            // intention, and reading it as one silently would produce a bot that forgets everything
-            // while its configuration says otherwise.
             "a window bound on a oneShot route",
             mutate(|document| {
                 document["routes"][0]["memory"] = json!({"mode": "oneShot", "maxTurns": 12});
@@ -963,9 +916,8 @@ async fn invalid_configurations_fail_closed_at_startup() {
             },
         ),
         (
-            // A secret in the field that names a variable is the mistake this rejects loudest: it
-            // would otherwise be read as a variable name, come back unset, and look like a
-            // deployment problem while sitting in a config file in plain text.
+            // A secret placed where a variable name belongs is read as an unset variable name,
+            // hiding a plaintext credential inside the config file.
             "credential value where a variable name belongs",
             mutate(|document| {
                 document["transports"][0] = json!({
@@ -1060,7 +1012,8 @@ async fn invalid_configurations_fail_closed_at_startup() {
             },
         ),
         (
-            // Userinfo makes the authority read as loopback while the socket connects elsewhere.
+            // URL userinfo can make an authority read as loopback while the socket actually
+            // connects elsewhere.
             "a loopback-looking endpoint that resolves elsewhere",
             mutate(|document| {
                 document["transports"][0] = json!({
@@ -1090,11 +1043,6 @@ async fn invalid_configurations_fail_closed_at_startup() {
     }
 }
 
-/// Every mistake in one file, in one refusal.
-///
-/// The property `docs/design.md` mandates and `dekopon-config` already keeps: an operator who wrote
-/// three zeros fixes three and restarts once, instead of rediscovering the next one after every
-/// restart. Three simultaneous problems, three lines, one startup failure.
 #[tokio::test]
 async fn every_configuration_problem_is_reported_before_the_file_is_refused() {
     let directory = temporary();
@@ -1123,7 +1071,6 @@ async fn every_configuration_problem_is_reported_before_the_file_is_refused() {
         ConfigProblem::InvalidSessionLimits
     )));
 
-    // And the operator reads all three off one line rather than off three restarts.
     let rendered = error.to_string();
     assert!(
         rendered.contains("3 validation problems found"),
@@ -1137,11 +1084,6 @@ async fn every_configuration_problem_is_reported_before_the_file_is_refused() {
     assert!(rendered.contains("session bounds"), "{rendered}");
 }
 
-/// A list that failed is not blamed on the routes that name it.
-///
-/// `dekopon-config` skips its reference pass when a resource never reached its set, because a
-/// missing transport reported once by its real name beats the same failure reported again for
-/// every route pointing at it. The gateway owes an operator the same signal-to-noise.
 #[tokio::test]
 async fn routes_are_not_blamed_for_a_transport_list_that_failed_itself() {
     let directory = temporary();
@@ -1180,9 +1122,6 @@ async fn routes_are_not_blamed_for_a_transport_list_that_failed_itself() {
         "the route named the transport the operator meant to name: {error}"
     );
 
-    // A duplicate is the other case, and it is deliberately not the same one: the first
-    // declaration is still in the name set, so the route it resolves against is real and the
-    // reference check keeps running.
     let mut duplicate = document(directory.path());
     duplicate["transports"] = json!([
         { "name": "dev", "kind": "local", "socketPath": directory.path().join("dev.sock") },
@@ -1209,12 +1148,6 @@ async fn routes_are_not_blamed_for_a_transport_list_that_failed_itself() {
     )));
 }
 
-/// Two missing chat credentials cost one restart, and neither service is spoken to.
-///
-/// Reading a token inside the connect loop meant the daemon authenticated to the first transport,
-/// then died on the second — so an operator who forgot two secrets paid two crash loops, each one
-/// having already opened a socket with the token it did have. Both are resolved before anything
-/// connects, and the mock endpoints prove nothing dialled them.
 #[tokio::test]
 async fn every_missing_transport_credential_is_named_before_anything_connects() {
     const SLACK_APP_TOKEN: &str = "DEKOPOND_TEST_MISSING_SLACK_APP_4F1B02";
@@ -1228,8 +1161,6 @@ async fn every_missing_transport_credential_is_named_before_anything_connects() 
     }
 
     let directory = temporary();
-    // Loopback stand-ins for Slack and Telegram. Neither is ever served: an accepted connection
-    // here is the regression this test exists for.
     let slack = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback Slack stand-in");
     let telegram = std::net::TcpListener::bind("127.0.0.1:0").expect("loopback Telegram stand-in");
     for listener in [&slack, &telegram] {
@@ -1359,7 +1290,6 @@ async fn aggregate_telegram_connect_failures_never_render_bot_tokens() {
     use std::error::Error as _;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
-    // Both sentinels are synthetic. One peer closes before headers; the other truncates the body.
     let tokens = [
         "synthetic-telegram-token-first",
         "synthetic-telegram-token-second",
@@ -1460,10 +1390,6 @@ async fn aggregate_telegram_connect_failures_never_render_bot_tokens() {
     );
 }
 
-/// Every Bot API call carries the bot token in its path, so every failure of one is a place the
-/// credential can escape through `TransportError`'s `Debug`. This drives each credential-bearing
-/// call to a failure and proves the rendered error never contains the token, while the peer
-/// asserts the token really was on the wire.
 #[tokio::test]
 async fn telegram_call_failures_never_render_bot_tokens() {
     use std::error::Error as _;
@@ -1477,11 +1403,7 @@ async fn telegram_call_failures_never_render_bot_tokens() {
         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{described}",
         described.len()
     );
-    // A hundred promised bytes and one delivered: the send succeeds and the read that follows it
-    // fails, which is the other half of the sites that hold a credential-bearing URL.
     let truncated = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\n{";
-    // One entry per connection the transport is about to open, in order: the request line it must
-    // send, and what this peer answers before closing. `None` closes without a byte.
     let script: Vec<(String, Option<String>)> = vec![
         (format!("GET /bot{TOKEN}/getUpdates?"), None),
         (format!("GET /bot{TOKEN}/getFile?"), None),
@@ -1684,7 +1606,6 @@ async fn a_loopback_endpoint_override_is_accepted_for_tests() {
 async fn an_oversized_configuration_is_refused_before_it_is_parsed() {
     let directory = temporary();
     let path = directory.path().join("dekopond.json");
-    // Valid JSON, just far past the ceiling: the point is that the byte cap decides, not the parser.
     let mut document = document(directory.path());
     document["routes"][0]["agent"] = json!("reviewer");
     let padding = "p".repeat(crate::HARD_MAX_CONFIG_BYTES + 16);
@@ -1707,8 +1628,8 @@ async fn an_oversized_configuration_is_refused_before_it_is_parsed() {
 
 #[tokio::test]
 async fn a_group_writable_configuration_is_refused() {
-    // This file names the agents chat messages may reach. Another user being able to rewrite it is
-    // the same class of problem as another user being able to rewrite broker policy.
+    // A group-writable config file lets another user redirect which agents chat messages reach, the
+    // same trust violation as rewriting broker policy.
     let directory = temporary();
     let path = directory.path().join("dekopond.json");
     fs::write(
@@ -1746,10 +1667,6 @@ fn the_broker_socket_falls_back_to_the_documented_discovery_default() {
         PathBuf::from("/run/user/1000/dekopon/broker.sock")
     );
 }
-
-// ---------------------------------------------------------------------------
-// Routing
-// ---------------------------------------------------------------------------
 
 fn catalog_text(enabled: bool, model_class: Option<&str>) -> String {
     let class = model_class.map_or(String::new(), |class| format!("  modelClass: {class}\n"));
@@ -1791,7 +1708,6 @@ async fn routes_bind_to_a_catalog_agent_and_a_class_matched_model() {
     assert_eq!(route.description, "Reviews things");
     assert_eq!(route.model_class.as_deref(), Some("reasoning"));
     assert_eq!(route.model.name(), "local-qwen");
-    // Standing orders travel from the catalog into the session as the system prompt.
     assert_eq!(
         route.instructions.as_deref(),
         Some("Answer briefly and never claim authority.")
@@ -1800,9 +1716,6 @@ async fn routes_bind_to_a_catalog_agent_and_a_class_matched_model() {
 
 #[tokio::test]
 async fn every_bound_route_gets_its_own_prompt_cache_lane() {
-    // A route's lane is its instructions and its tools, and two routes are two of those even when
-    // they name the same agent — the second route here differs only in what it matches, and the
-    // daemon must still not merge their prefixes into one lane.
     let directory = temporary();
     let mut document = document(directory.path());
     document["routes"]
@@ -1826,8 +1739,6 @@ async fn every_bound_route_gets_its_own_prompt_cache_lane() {
 
     assert!(!direct.cache_key.trim().is_empty());
     assert_ne!(direct.cache_key, channel.cache_key);
-    // And a restart is a new lane: nothing about the key survives the process that minted it, so it
-    // never becomes a durable identifier for the traffic a route carries.
     let rebound = RoutingTable::bind(&config, &catalog).expect("both routes bind again");
     assert_ne!(
         rebound
@@ -1843,7 +1754,6 @@ async fn a_route_no_catalog_can_satisfy_fails_at_startup() {
     let directory = temporary();
     let config = resolved(directory.path(), &document(directory.path())).await;
 
-    // Unknown agent.
     let empty = LocalCatalog::from_str(
         Path::new("dekopon.yaml"),
         "apiVersion: dekopon.dev/v1alpha1\nkind: Agent\nmetadata:\n  name: someone-else\nspec:\n  description: x\n",
@@ -1854,21 +1764,18 @@ async fn a_route_no_catalog_can_satisfy_fails_at_startup() {
         ref error if matches!(only_route_problem(error), RouteProblem::UnknownAgent { .. })
     ));
 
-    // Disabled agent: present in the catalog and deliberately not schedulable.
     assert!(matches!(
         RoutingTable::bind(&config, &catalog(false, Some("reasoning")))
             .expect_err("a disabled agent is a startup failure"),
         ref error if matches!(only_route_problem(error), RouteProblem::DisabledAgent { .. })
     ));
 
-    // A class no configured model offers.
     assert!(matches!(
         RoutingTable::bind(&config, &catalog(true, Some("vision")))
             .expect_err("an unmatched model class is a startup failure"),
         ref error if matches!(only_route_problem(error), RouteProblem::NoModelForClass { .. })
     ));
 
-    // No class and no override: nothing selects a model.
     assert!(matches!(
         RoutingTable::bind(&config, &catalog(true, None))
             .expect_err("an agent with no class and no override is a startup failure"),
@@ -1876,10 +1783,6 @@ async fn a_route_no_catalog_can_satisfy_fails_at_startup() {
     ));
 }
 
-/// Every unsatisfiable route, in one refusal.
-///
-/// Binding scans the whole table for the reason `resolve` scans the whole file: a deployment whose
-/// catalog disabled one agent and never declared the other is one restart, not two.
 #[tokio::test]
 async fn every_unsatisfiable_route_is_reported_in_one_refusal() {
     let directory = temporary();
@@ -1990,8 +1893,6 @@ async fn a_channel_route_with_no_channel_matches_every_channel() {
     let table =
         RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("route binds");
 
-    // Two channels this configuration never names, and a channel created after the daemon started
-    // would be a third. Enumerating them is exactly what leaving `channel` out avoids.
     assert!(
         table
             .route(&routed("dev", ConversationKind::Channel, "c0123abc"))
@@ -2002,8 +1903,6 @@ async fn a_channel_route_with_no_channel_matches_every_channel() {
             .route(&routed("dev", ConversationKind::Channel, "c9999zzz"))
             .is_some()
     );
-    // Wide, not indiscriminate. A direct message is not a channel, so no catch-all swallows one,
-    // and the transport name still bounds the whole thing.
     assert!(
         table
             .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
@@ -2018,8 +1917,6 @@ async fn a_channel_route_with_no_channel_matches_every_channel() {
 
 #[tokio::test]
 async fn a_named_channel_route_declared_before_a_catch_all_keeps_its_own_channel() {
-    // The configuration an operator writes for "special handling in #incidents, the default
-    // everywhere else". Declaration order is the only rule: first match wins, as it always has.
     let directory = temporary();
     let mut document = document(directory.path());
     let routes = document["routes"].as_array_mut().expect("routes array");
@@ -2055,7 +1952,6 @@ async fn a_named_channel_route_declared_before_a_catch_all_keeps_its_own_channel
             .ids,
         None
     );
-    // And the catch-all sitting above it takes nothing away from the direct-message route.
     assert_eq!(
         table
             .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
@@ -2091,16 +1987,11 @@ fn a_shared_channel_message_counts_as_addressed_only_when_it_names_the_bot() {
     assert!(!telegram.is_addressed("status?"));
 }
 
-// ---------------------------------------------------------------------------
-// Text bounds
-// ---------------------------------------------------------------------------
-
 #[test]
 fn untrusted_inbound_text_is_bounded_before_it_reaches_a_model() {
     let short = "hello";
     assert_eq!(bound_inbound(short), short);
 
-    // Multi-byte on purpose: a naive byte slice here panics rather than truncating.
     let long = "é".repeat(MAX_INBOUND_TEXT_BYTES);
     let bounded = bound_inbound(&long);
     assert!(
@@ -2145,29 +2036,12 @@ fn an_exported_but_blank_credential_is_refused_by_name() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Sessions
-// ---------------------------------------------------------------------------
-
-/// A model whose turns are fixed in advance, recording every request it received.
 struct ModelScript {
-    /// Scripted turns, where `None` is a request this model refuses to answer.
     turns: Mutex<VecDeque<Option<AssistantTurn>>>,
-    /// Every message list this model was handed, in order.
-    ///
-    /// Recorded rather than counted because a conversation is an assertion about *what* a later
-    /// session replayed and in which order, which a request count cannot express.
     prompts: Mutex<Vec<Vec<ModelMessage>>>,
-    /// The model tools offered on each request, in order.
     tools: Mutex<Vec<Vec<ModelTool>>>,
-    /// The prompt cache key each request declared, in the same order.
-    ///
-    /// Recorded from the options the loop actually passed rather than from a serialized body:
-    /// `ureq` pretty-prints what it sends, so a captured request is not comparable to a locally
-    /// serialized one, and every value compared here is computed in this binary.
     cache_keys: Mutex<Vec<Option<String>>>,
     requests: AtomicUsize,
-    /// How many times a client was constructed for this script, which is the sharing assertion.
     builds: AtomicUsize,
     forbidden: bool,
 }
@@ -2177,7 +2051,6 @@ impl ModelScript {
         Self::scripted(turns.into_iter().map(Some))
     }
 
-    /// A script in which some requests fail, so one message can break and the next recover.
     fn scripted(turns: impl IntoIterator<Item = Option<AssistantTurn>>) -> Arc<Self> {
         Arc::new(Self {
             turns: Mutex::new(turns.into_iter().collect()),
@@ -2190,8 +2063,6 @@ impl ModelScript {
         })
     }
 
-    /// A model that must never be reached. Calling it fails the test rather than returning an error
-    /// a session could recover from and hide.
     fn forbidden() -> Arc<Self> {
         Arc::new(Self {
             turns: Mutex::new(VecDeque::new()),
@@ -2223,10 +2094,6 @@ impl ModelScript {
             .collect()
     }
 
-    /// The cache key one request declared, failing the test when it declared none.
-    ///
-    /// A missing key is a failure rather than a `None` to compare, because two requests that both
-    /// sent nothing would satisfy every "same key" assertion below while carrying no key at all.
     fn cache_key(&self, index: usize) -> String {
         let keys = self.cache_keys.lock().expect("recorded cache keys");
         keys.get(index)
@@ -2235,7 +2102,6 @@ impl ModelScript {
             .unwrap_or_else(|| panic!("request {index} declared a prompt cache key"))
     }
 
-    /// One request's messages as `(role, content)` pairs, in the order the model saw them.
     fn prompt(&self, index: usize) -> Vec<(String, String)> {
         let prompts = self.prompts.lock().expect("recorded prompts");
         let messages = prompts
@@ -2244,8 +2110,6 @@ impl ModelScript {
         messages
             .iter()
             .map(|message| {
-                // `ModelMessage`'s fields are private and its serialized form is the contract the
-                // backends read, so this asserts on exactly what would go on the wire.
                 let value = serde_json::to_value(message).expect("a message serializes");
                 (
                     value["role"].as_str().unwrap_or_default().to_owned(),
@@ -2271,10 +2135,6 @@ impl ModelFactory for Arc<ModelScript> {
 struct ScriptedModel(Arc<ModelScript>);
 
 impl ChatModel for ScriptedModel {
-    /// A model that cannot stream calls `on_event` zero times and answers with the whole turn,
-    /// which is the degradation the one-method trait is for: every assertion below is about what
-    /// the gateway asked for and what it got back, and none of them changes because no deltas
-    /// arrived.
     fn complete(
         &self,
         messages: &[ModelMessage],
@@ -2315,7 +2175,6 @@ fn answer(text: &str) -> AssistantTurn {
     AssistantTurn::new(Some(text.to_owned()), Vec::new(), None)
 }
 
-/// The tool the gateway used to offer and no longer does.
 fn generate_image(prompt: &str) -> AssistantTurn {
     AssistantTurn::new(
         None,
@@ -2361,7 +2220,6 @@ fn decline_reply() -> AssistantTurn {
     )
 }
 
-/// One model turn asking for a mounted skill's body.
 fn read_skill(name: &str) -> AssistantTurn {
     AssistantTurn::new(
         None,
@@ -2377,7 +2235,6 @@ fn read_skill(name: &str) -> AssistantTurn {
     )
 }
 
-/// One model turn tapping the glass.
 fn suggest_improvement() -> AssistantTurn {
     AssistantTurn::new(
         None,
@@ -2401,7 +2258,6 @@ fn suggest_improvement() -> AssistantTurn {
     )
 }
 
-/// Writes one small skill under `root` and loads it the way the catalog would.
 fn mounted_skill(root: &Path, name: &str) -> dekopon_config::Skill {
     let directory = root.join(name);
     fs::create_dir_all(directory.join("references")).expect("skill directory");
@@ -2418,7 +2274,6 @@ fn mounted_skill(root: &Path, name: &str) -> dekopon_config::Skill {
     dekopon_config::load_skill(&directory).expect("skill loads")
 }
 
-/// The latest tool result one request carried back to the model.
 fn tool_message(models: &ModelScript, index: usize) -> String {
     models
         .prompt(index)
@@ -2443,12 +2298,6 @@ fn inspect_agent_config() -> AssistantTurn {
     )
 }
 
-/// One liveness target as the short string the shared recorder logs.
-///
-/// `dekopon-test-support` holds the recorder and the failure switches; it cannot hold these types,
-/// which are private to this crate. So the rendering lives here, once, and every capability object
-/// below renders through it — a call that reached the wrong conversation then shows up in the log
-/// rather than behind an elided field.
 fn rendered_target(target: &LivenessTarget) -> String {
     match target {
         LivenessTarget::Slack {
@@ -2471,16 +2320,10 @@ fn rendered_target(target: &LivenessTarget) -> String {
     }
 }
 
-/// One message reference as its target plus the service identifier the driver handed back.
 fn rendered_message(message: &MessageRef) -> String {
     format!("{}#{}", rendered_target(&message.target), message.id)
 }
 
-/// The transport error a test's chosen failure stands for.
-///
-/// The shared recorder names the *kind* of failure a test wants because the error type is this
-/// crate's; this is the one place the two vocabularies meet, so a rung that degrades on a rate
-/// limit and one that degrades on a closed socket cannot be written as the same test by accident.
 fn injected(kind: FailureKind) -> TransportError {
     match kind {
         FailureKind::Response => TransportError::Response,
@@ -2717,13 +2560,6 @@ impl ThreadOwnership for RecordingThreadOwnership {
     }
 }
 
-/// A driver whose native status never answers `Working`, so a hung service can be aimed at the one
-/// task that also writes the answer.
-///
-/// The shared recorder answers immediately, which is right for almost everything and useless for
-/// the one property that matters here: that a cosmetic call cannot hold the answer. This one stops
-/// in the middle of `Working` and stays there — `release` exists so the park is a wait rather than
-/// a spin, and the test that owns it deliberately never fires it.
 #[derive(Default)]
 struct DelayedStatusDriver {
     events: Mutex<Vec<&'static str>>,
@@ -2780,7 +2616,6 @@ impl NativeStatus for DelayedStatusDriver {
     }
 }
 
-/// A driver whose every answer is accepted in part, which is not success.
 struct PartialDeliveryDriver;
 
 #[async_trait]
@@ -2794,8 +2629,6 @@ impl ChatDriver for PartialDeliveryDriver {
     }
 }
 
-/// Built through the wire shape rather than the guest type, so this crate keeps its dependency
-/// set free of provider-SDK machinery it never links in production.
 fn capability(id: &str) -> AvailableCapability {
     serde_json::from_value(json!({
         "provider": "cli-probe",
@@ -2839,7 +2672,6 @@ fn record_result(outcome: InvocationOutcome, error: Option<&str>) -> InvocationR
     .expect("record result fixture decodes")
 }
 
-/// A successful result whose output is whatever a provider chose to return.
 fn record_output(output: Value) -> InvocationResult {
     InvocationResult {
         output: Some(output),
@@ -2847,7 +2679,6 @@ fn record_output(output: Value) -> InvocationResult {
     }
 }
 
-/// The listing of a session that reaches `cli-probe.upper` through the provider's `probe` word.
 fn probe_listing() -> ResponseEnvelope {
     ResponseEnvelope::capabilities(
         vec![capability("cli-probe.upper")],
@@ -2855,8 +2686,6 @@ fn probe_listing() -> ResponseEnvelope {
     )
 }
 
-/// The broker's answer to `probe upper --text <text>`: the one proposal that argv maps to, built
-/// through the wire shape like the other broker fixtures here.
 fn upper_proposal(text: &str) -> ResponseEnvelope {
     ResponseEnvelope::command_run(
         serde_json::from_value(json!({
@@ -2868,10 +2697,8 @@ fn upper_proposal(text: &str) -> ResponseEnvelope {
     )
 }
 
-/// Serves a fixed script of broker responses over a private Unix socket.
-///
-/// A real socket rather than an in-memory duplex, because the client authenticates the server by
-/// socket ownership and peer UID before it writes a byte.
+/// A real Unix socket, not an in-memory duplex, is used because the client authenticates the server
+/// by socket ownership and peer UID before a byte is written.
 #[allow(
     clippy::let_underscore_must_use,
     reason = "the stub's observation channel is unbounded and its reply goes to a socket the test \
@@ -2954,21 +2781,14 @@ fn route(model: ModelConfig) -> crate::routes::BoundRoute {
             max_steps: 4,
             max_capability_calls: 8,
         },
-        // No wall clock by default: a route that does not name one is not on a timer, and every
-        // budget test says its own number rather than inheriting a fixture's.
         max_duration: None,
-        // What a route that writes no `scriptTimeoutMs` resolves to, so a fixture script runs under
-        // the same deadline the shipped default gives it.
         script_timeout: Duration::from_millis(DEFAULT_SCRIPT_TIMEOUT_MS),
         progress_detail: ProgressDetail::Plain,
         memory: MemoryPolicy::OneShot,
-        // Minted the way `RoutingTable::bind` mints it, so a test that reuses one bound route
-        // across messages reuses one lane exactly as the daemon does.
         cache_key: cache_key::for_route(),
     }
 }
 
-/// The same route, on a wall clock.
 fn timed_route(model: ModelConfig, max_duration: Duration) -> crate::routes::BoundRoute {
     crate::routes::BoundRoute {
         max_duration: Some(max_duration),
@@ -2976,7 +2796,6 @@ fn timed_route(model: ModelConfig, max_duration: Duration) -> crate::routes::Bou
     }
 }
 
-/// The same route, remembering what it was told.
 fn persistent_route(model: ModelConfig, window: MemoryWindow) -> crate::routes::BoundRoute {
     crate::routes::BoundRoute {
         memory: MemoryPolicy::Persistent(window),
@@ -2984,7 +2803,6 @@ fn persistent_route(model: ModelConfig, window: MemoryWindow) -> crate::routes::
     }
 }
 
-/// Bounds generous enough that only the property under test can drop anything.
 fn window() -> MemoryWindow {
     MemoryWindow {
         scope: MemoryScope::PrivateConversation,
@@ -3012,7 +2830,6 @@ fn model_config() -> ModelConfig {
         timeout_ms: 1_000,
         stream: true,
         classes: vec!["reasoning".to_owned()],
-        // Text only, which is the default and the right one for a local endpoint.
         modalities: Vec::new(),
     }
 }
@@ -3031,14 +2848,10 @@ fn message(text: &str) -> InboundMessage {
         message_id: "0123456789abcdef0123456789abcdef-1-1".to_owned(),
         text: text.to_owned(),
         assets: Vec::new(),
-        // Direct messages ignore addressing. Channel tests opt into structured addressing where
-        // that is the behavior under test.
         addressed: None,
         thread_continuation: None,
         reply: ReplyTarget::Local { connection: 1 },
         liveness: None,
-        // No transport ran, so there is no receipt to hang this message's trace from. A test that
-        // asserts on the trace root drives a real transport instead.
         receive_span: tracing::Span::none(),
         received_at: tokio::time::Instant::now(),
         native_group: None,
@@ -3130,7 +2943,6 @@ fn owned_slack_message(text: &str, inherited: bool) -> InboundMessage {
     }
 }
 
-/// One transport's driver-facing settings, where the mode is the only field a test varies.
 fn liveness_settings(mode: LivenessMode) -> LivenessSettings {
     LivenessSettings {
         mode,
@@ -3138,13 +2950,6 @@ fn liveness_settings(mode: LivenessMode) -> LivenessSettings {
     }
 }
 
-/// What each fixture transport is allowed to show, by transport name.
-///
-/// Native with every surface allowed, because the configuration is the outer gate and the driver is
-/// the inner one: a test says what its session can show by which capability objects its
-/// `RecordingDriver` offers, and an absent transport name here would silently turn every one of
-/// those assertions into "nothing was published". The keep-alive is an hour out so a test about
-/// anything else never races a tick.
 fn fixture_liveness() -> BTreeMap<String, Arc<ResolvedLiveness>> {
     let liveness = Arc::new(ResolvedLiveness {
         settings: LivenessSettings {
@@ -3210,10 +3015,6 @@ fn runner_tracking(
     })
 }
 
-/// A model that reports when it was entered and answers only when a test releases it.
-///
-/// Existing so a test can observe what the gateway had already done *before* the expensive part of
-/// a session began — which is the only way to assert an ordering rather than an outcome.
 struct BlockedModel {
     entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     entered_signal: tokio::sync::Mutex<std::sync::mpsc::Receiver<()>>,
@@ -3321,8 +3122,6 @@ async fn an_authorized_message_reaches_its_agent_and_answers_in_chat() {
     assert_eq!(driver.replies(), vec!["Everything looks fine.".to_owned()]);
     assert_eq!(models.requests(), 1);
 
-    // The gateway asked on the sender's behalf, not its own: the broker sees a subject and an
-    // agent, and maps the subject to a principal itself.
     let request = observed.recv().await.expect("stub broker saw one request");
     let BrokerRequest::Capabilities {
         attestation: Some(claim),
@@ -3412,10 +3211,6 @@ async fn a_provider_attachment_reaches_the_reply_without_entering_the_transcript
     );
 }
 
-/// The longest run of base64-alphabet characters anywhere in the text.
-///
-/// A byte count would not say what is wanted here: what must never appear in a transcript is a
-/// *blob*, and a blob is exactly a long unbroken run of that alphabet.
 fn longest_base64_run(text: &str) -> usize {
     let mut longest = 0_usize;
     let mut run = 0_usize;
@@ -3430,12 +3225,9 @@ fn longest_base64_run(text: &str) -> usize {
     longest
 }
 
-/// The point of the convention: the bytes reach chat and never the model.
 #[tokio::test(flavor = "multi_thread")]
 async fn no_model_message_in_a_session_carries_an_attachment_blob() {
     let directory = temporary();
-    // Well past the shell's own clamping, so a transcript that carried the blob would carry a
-    // recognisable run of it rather than something a 1 KiB threshold could miss.
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     png.extend(std::iter::repeat_n(b'Z', 64 * 1024));
     let (broker, _observed) = stub_broker_assets(
@@ -3482,7 +3274,6 @@ async fn no_model_message_in_a_session_carries_an_attachment_blob() {
     }
 }
 
-/// Old provider result envelopes are refused, never decoded.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_retired_base64_result_envelope_is_refused_without_decoding() {
     let directory = temporary();
@@ -3528,7 +3319,6 @@ async fn a_retired_base64_result_envelope_is_refused_without_decoding() {
     );
 }
 
-/// The meta tool is gone, so the name is simply not a tool this session offers.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_model_call_to_generate_image_is_now_an_unknown_tool() {
     let directory = temporary();
@@ -3732,9 +3522,6 @@ async fn an_owned_unaddressed_thread_message_may_end_without_any_slack_post() {
     );
 }
 
-/// A provider command word answers through the broker leg as the tool it fronts: the help page a
-/// guest renders reaches the model with the status the guest chose, over the run operation, and
-/// proposes nothing to invoke.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
     let directory = temporary();
@@ -3789,12 +3576,6 @@ async fn a_rendered_command_word_reaches_the_model_through_the_broker_leg() {
     assert!(tool.contains("[exit code: 0]"), "{tool}");
 }
 
-/// The route's `limits.scriptTimeoutMs` is the deadline the shell actually runs under, rather than
-/// `dekopon-shell`'s own 30-second default.
-///
-/// Written as a loop because the failure this pins is a script that is *slow* rather than long: a
-/// deadline that never reached the shell would let this run to the step budget instead, and the
-/// line the model reads would name the wrong bound.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_routes_script_deadline_is_what_the_shell_runs_under() {
     let directory = temporary();
@@ -3899,9 +3680,6 @@ async fn one_hidden_record_request_follows_transport_acceptance_and_is_never_ret
         vec![
             memory_surface_response(),
             ResponseEnvelope::error("outcome-unaudited", "do not retry"),
-            // Keep the listener alive for a third exchange. If recording retries, the request is
-            // observed and receives this response instead of merely failing to reconnect after
-            // the fixture exits.
             ResponseEnvelope::error("outcome-unaudited", "still do not retry"),
         ],
     )
@@ -4188,13 +3966,6 @@ async fn authorized_work_publishes_status_until_after_the_durable_reply() {
     );
 }
 
-/// A cosmetic call that never answers cannot hold the session's answer.
-///
-/// The policy task is the only terminal writer, which is what keeps one message from ever having
-/// two authors — so the one thing that has to be bounded is how long a service call inside that
-/// task can make the person wait. This driver never answers its status call at all, which is a hung
-/// endpoint rather than a slow one: the answer still arrives, the refused rung is the breaker's
-/// problem, and the service's own indicator is still returned to rest afterwards.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hung_cosmetic_call_cannot_hold_the_answer_and_cleanup_follows_it() {
     let directory = temporary();
@@ -4231,9 +4002,6 @@ async fn a_hung_cosmetic_call_cannot_hold_the_answer_and_cleanup_follows_it() {
     model.wait_until_entered().await;
     model.release();
 
-    // Ten seconds rather than the deadline itself: what this pins is that the wait is the policy's
-    // own bound and not the driver's silence, and a test that names the number would have to be
-    // edited every time the bound moved.
     tokio::time::timeout(Duration::from_secs(10), session)
         .await
         .expect("a cosmetic call cannot hold the answer past the policy's per-call deadline")
@@ -4276,7 +4044,6 @@ async fn unauthorized_work_never_publishes_liveness() {
     );
 }
 
-/// One cancel request as a named origin would deliver it.
 fn cancel(subject: &str, via: CancelVia) -> crate::transport::CancelRequest {
     crate::transport::CancelRequest {
         transport: "dev".to_owned(),
@@ -4333,8 +4100,8 @@ async fn a_native_stop_wins_the_race_and_suppresses_answer_history_and_durable_r
             .cancel(&cancel(SUBJECT, CancelVia::NativeStop)),
         CancelOutcome::Cancelled
     );
-    // The CAS is won once. A second press — the same person tapping again while the first is
-    // still draining — must reach nothing, or the policy writes `Stopped.` twice.
+    // A second cancel attempt while the first is still draining must be a no-op, or the policy
+    // would write the stopped reply twice.
     assert_eq!(
         runner
             .active_sessions
@@ -4443,7 +4210,6 @@ async fn aborting_the_async_session_cancels_later_blocking_tool_work() {
     assert!(replies.is_empty(), "an aborted owner delivered {replies:?}");
 }
 
-/// The catalog's skills ride the bound route, so a session never touches the filesystem.
 #[tokio::test]
 async fn a_bound_route_carries_the_skills_its_agent_mounts() {
     let directory = temporary();
@@ -4523,7 +4289,6 @@ async fn a_session_lists_mounted_skills_by_summary_and_reads_one_on_demand() {
     let body = tool_message(&models, 1);
     assert!(body.contains("Always count twice."), "{body}");
 
-    // The configuration view names the skill and its files, never their text.
     let view: Value =
         serde_json::from_str(&tool_message(&models, 2)).expect("the meta result is JSON");
     assert_eq!(view["skills"][0]["name"], "counting");
@@ -4670,8 +4435,6 @@ async fn an_authorized_agent_can_inspect_its_credential_free_effective_configura
     assert_eq!(result["security"]["identityIncluded"], false);
     assert!(result.get("principal").is_none());
     assert!(result.get("subject").is_none());
-    // These values exist on the live route/session objects handed to the constructor's caller.
-    // None is an allowed input to the credential-free view itself.
     assert!(!encoded.contains("http://127.0.0.1:1/v1"));
     assert!(!encoded.contains("qwen3"));
     assert!(!encoded.contains(SUBJECT));
@@ -4758,8 +4521,6 @@ async fn a_session_delivers_the_model_answer() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unauthorized_subject_is_refused_before_any_model_call() {
-    // The cheapest possible refusal, and the one that cannot be argued with: the broker already
-    // said this subject reaches nothing through this agent, so there is no question to ask a model.
     let directory = temporary();
     let (broker, _observed) = stub_broker(
         directory.path(),
@@ -4783,9 +4544,6 @@ async fn an_unauthorized_subject_is_refused_before_any_model_call() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_attestation_reads_as_a_refusal_rather_than_a_breakage() {
-    // A broker whose attestor grant does not cover this subject's namespace answers with a
-    // transport-level code instead of an empty capability set. Reporting that as "something broke"
-    // would send someone to an operator over a working refusal.
     let directory = temporary();
     let (broker, _observed) = stub_broker(
         directory.path(),
@@ -4833,7 +4591,6 @@ async fn a_saturated_gateway_says_so_rather_than_queueing_work() {
     let (broker, _observed) = stub_broker(directory.path(), Vec::new()).await;
     let models = ModelScript::forbidden();
     let runner = runner(broker, Arc::clone(&models), 1);
-    // Hold the only permit, exactly as an in-flight session would.
     let _held = runner
         .gate
         .admit(("other".to_owned(), "other".to_owned()))
@@ -4854,19 +4611,13 @@ async fn a_saturated_gateway_says_so_rather_than_queueing_work() {
 
 #[tokio::test]
 async fn one_conversation_runs_one_session_at_a_time() {
-    // A person who thinks a bot is stuck sends the same thing again. Without this, the second copy
-    // becomes a second billed session racing the first in the same thread.
     let gate = SessionGate::new(8);
-    // The conversation key, which is what the registry and the memory key use too: a Slack thread
-    // is `channel:thread`, so the message that opened a thread and the replies inside it hold one
-    // slot rather than two.
     let key = ("slack".to_owned(), "c0123abc:1.0".to_owned());
 
     let first = gate
         .admit(key.clone())
         .expect("the first message is admitted");
     assert!(gate.admit(key.clone()).is_none());
-    // A different thread in the same channel is a different conversation.
     assert!(
         gate.admit(("slack".to_owned(), "c0123abc:2.0".to_owned()))
             .is_some()
@@ -4895,8 +4646,6 @@ async fn concurrency_is_bounded_across_every_conversation() {
 
 #[tokio::test]
 async fn refusal_replies_waiting_on_a_chat_service_are_bounded_apart_from_sessions() {
-    // A stalled chat service must not turn a stream of refused messages into an unbounded pile of
-    // pending replies, and those replies must not spend the slots real sessions run in.
     let gate = SessionGate::new(2);
     let first = gate.refusal().expect("first refusal reply");
     let _second = gate.refusal().expect("second refusal reply");
@@ -4915,8 +4664,8 @@ async fn refusal_replies_waiting_on_a_chat_service_are_bounded_apart_from_sessio
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_session_answers_one_fixed_line_and_never_raw_error_text() {
-    // A `PromptError` can carry model-chosen text, a provider message, or a transport diagnostic.
-    // Chat is the last place any of those belong.
+    // A prompt error can carry model text, a provider message, or a transport diagnostic; none of
+    // those may ever reach chat as the reply.
     let directory = temporary();
     let (broker, _observed) = stub_broker(
         directory.path(),
@@ -4926,7 +4675,6 @@ async fn a_failed_session_answers_one_fixed_line_and_never_raw_error_text() {
         )],
     )
     .await;
-    // An empty script: the first turn fails, which is a broken session rather than a failed script.
     let models = ModelScript::new([]);
     let driver = Arc::new(RecordingDriver::default());
 
@@ -4998,11 +4746,6 @@ async fn a_model_answer_longer_than_chat_accepts_is_bounded_on_the_way_out() {
     assert!(replies[0].ends_with("END"));
 }
 
-// ---------------------------------------------------------------------------
-// Conversations
-// ---------------------------------------------------------------------------
-
-/// The same message from somebody else in the same conversation.
 fn message_from(subject: &str, text: &str) -> InboundMessage {
     InboundMessage {
         subject: subject.parse().expect("canonical subject fixture"),
@@ -5014,7 +4757,6 @@ fn expected_asset_instructions() -> String {
     "Answer briefly.\n\n[Gateway assets: this reply adapter accepts any concrete syntactically valid media type (no wildcards). Plan a converter for other formats; attaching retains a file but only a separately authorized asset.send delivers it. References use chat-asset:<N>, never data URLs.]".to_owned()
 }
 
-/// A prompt written the way a test reads it.
 fn transcript(messages: &[(&str, &str)]) -> Vec<(String, String)> {
     messages
         .iter()
@@ -5022,11 +4764,6 @@ fn transcript(messages: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Every broker request the stub saw, asserting each one was a capability listing.
-///
-/// The count is the assertion that matters: `stub_broker` serves one connection per response, so
-/// "N messages produced N attested `capabilities` envelopes" is what proves authorization is asked again
-/// per message rather than remembered with the conversation.
 fn capability_listings(observed: &mut mpsc::UnboundedReceiver<RequestEnvelope>) -> usize {
     let mut count = 0;
     while let Ok(request) = observed.try_recv() {
@@ -5044,7 +4781,6 @@ fn capability_listings(observed: &mut mpsc::UnboundedReceiver<RequestEnvelope>) 
     count
 }
 
-/// One capability listing per message, so a two-message test needs two of them.
 fn listings(count: usize, capabilities: &[&str]) -> Vec<ResponseEnvelope> {
     (0..count)
         .map(|_| {
@@ -5066,8 +4802,6 @@ fn granted(capabilities: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// Records one exchange for the store tests whose subject is the history rather than the cache
-/// lane, minting the key the way the first session of a conversation supplies it.
 fn commit(
     store: &ConversationStore,
     key: &ConversationKey,
@@ -5084,8 +4818,6 @@ fn commit(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_persistent_route_replays_the_previous_exchange_into_the_next_prompt() {
-    // The whole feature in one assertion: a follow-up that says "and the second one?" is answerable
-    // because the exchange before it is in the prompt, in order, ahead of the new message.
     let directory = temporary();
     let (broker, mut observed) =
         stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
@@ -5132,8 +4864,6 @@ async fn a_persistent_route_replays_the_previous_exchange_into_the_next_prompt()
         ]),
         "instructions first, then what the conversation remembers, then the new message"
     );
-    // Persistence remembers text and never a decision: both messages asked the broker for
-    // themselves.
     assert_eq!(capability_listings(&mut observed), 2);
 }
 
@@ -5173,8 +4903,6 @@ async fn a_one_shot_route_starts_from_an_empty_prompt_every_message() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn each_session_obtains_its_own_model_binding() {
-    // The real factory caches the pooled client; this seam is invoked per session so its
-    // blocking bridge cannot retain another session's cancellation receiver.
     let directory = temporary();
     let (broker, _observed) =
         stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
@@ -5202,8 +4930,8 @@ async fn each_session_obtains_its_own_model_binding() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn two_configured_models_never_share_one_client() {
-    // The key is the configured name the loader already proved unique. Two endpoints sharing a
-    // client would send one route's messages to the other's host.
+    // The client cache key is the model's own configured name; sharing one client between two
+    // endpoints would send one route's messages to the other's host.
     let directory = temporary();
     let (broker, _observed) =
         stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
@@ -5234,8 +4962,6 @@ async fn two_configured_models_never_share_one_client() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn two_senders_in_one_conversation_never_see_each_others_history() {
-    // In a shared channel this is not hypothetical. The admission key has no subject; the default
-    // private history key deliberately does, and this is the difference that makes.
     const OTHER_SUBJECT: &str = "tel.16035550100";
     let directory = temporary();
     let (broker, _observed) =
@@ -5404,7 +5130,6 @@ async fn shared_participant_attribution_counts_against_the_history_byte_window()
         MemoryWindow {
             limits: HistoryLimits {
                 max_turns: 12,
-                // The raw `x`/`ok` exchange fits; its authoritative participant label does not.
                 max_bytes: 16,
             },
             ..shared_window()
@@ -5436,9 +5161,8 @@ async fn shared_participant_attribution_counts_against_the_history_byte_window()
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_narrowed_grant_drops_the_history_it_was_built_under() {
-    // Output fetched under a wider grant is sitting in the window. Narrowing what the subject may
-    // reach without dropping it would keep replaying that output after the capability that produced
-    // it was taken away.
+    // Narrowing a subject's grant must also drop history fetched under the wider one, or revoked
+    // output would keep being replayed from the window.
     let directory = temporary();
     let (broker, _observed) = stub_broker(
         directory.path(),
@@ -5532,9 +5256,6 @@ async fn an_empty_grant_removes_the_conversation_rather_than_only_refusing_the_m
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_session_records_the_question_it_could_not_answer() {
-    // The fixed failure line is this daemon's sentence rather than the agent's, and storing it
-    // would teach the model to keep producing it. The question still happened, though: dropping it
-    // would leave the retry with nothing to refer back to.
     let directory = temporary();
     let (broker, _observed) =
         stub_broker(directory.path(), listings(2, &["cli-probe.upper"])).await;
@@ -5578,7 +5299,6 @@ async fn a_failed_session_records_the_question_it_could_not_answer() {
     );
 }
 
-/// A factory whose model cannot be constructed, which is a session that asks nothing.
 struct UnbuildableModel;
 
 impl ModelFactory for UnbuildableModel {
@@ -5596,8 +5316,6 @@ impl ModelFactory for UnbuildableModel {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_that_never_reached_a_model_remembers_nothing() {
-    // The turn a session commits is the one the prompt loop recorded. A session that failed before
-    // the loop recorded nothing, and must not commit the newest *seeded* turn in its place.
     let directory = temporary();
     let (broker, _observed) =
         stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
@@ -5626,9 +5344,8 @@ async fn a_session_that_never_reached_a_model_remembers_nothing() {
 
 #[test]
 fn an_idle_conversation_is_dropped_and_the_next_message_starts_fresh() {
-    // The clock is a parameter because `tokio::time::pause` does not reach
-    // `std::time::Instant::now()` inside a blocking task, so injecting it is the only way this is
-    // deterministic rather than a sleep.
+    // The clock is injected because pausing tokio's timer does not affect a blocking task's
+    // real-time clock, the only way to stay deterministic without a real sleep.
     let store = ConversationStore::new(8);
     let key = private_conversation_key("dev", "dev", SUBJECT);
     let allowed = granted(&["cli-probe.upper"]);
@@ -5663,8 +5380,6 @@ fn an_idle_conversation_is_dropped_and_the_next_message_starts_fresh() {
 
 #[test]
 fn the_conversation_ceiling_evicts_the_least_recently_used_rather_than_refusing() {
-    // A person talking now matters more than one who stopped an hour ago, so a memory bound must
-    // not become an admission bound.
     let store = ConversationStore::new(2);
     let allowed = granted(&["cli-probe.upper"]);
     let start = Instant::now();
@@ -5681,7 +5396,6 @@ fn the_conversation_ceiling_evicts_the_least_recently_used_rather_than_refusing(
         turn("two"),
         start + Duration::from_secs(1),
     );
-    // Touching the oldest conversation makes the middle one the least recently used.
     commit(
         &store,
         &keys[0],
@@ -5721,8 +5435,6 @@ fn the_conversation_ceiling_evicts_the_least_recently_used_rather_than_refusing(
 
 #[test]
 fn each_window_bound_drops_the_oldest_exchange_on_its_own() {
-    // Two bounds because they fail differently: twelve one-line exchanges and twelve
-    // paragraph-length ones are the same number of turns and very different prompts.
     let allowed = granted(&["cli-probe.upper"]);
     let now = Instant::now();
     let by_turns = MemoryWindow {
@@ -5733,8 +5445,6 @@ fn each_window_bound_drops_the_oldest_exchange_on_its_own() {
             max_bytes: 64 * 1024,
         },
     };
-    // Each exchange below is a ten-byte question and a nine-byte answer, so two fit under this
-    // ceiling and three do not, while the turn count stays well inside `max_turns`.
     let by_bytes = MemoryWindow {
         scope: MemoryScope::PrivateConversation,
         idle_timeout: Duration::from_secs(900),
@@ -5792,10 +5502,6 @@ fn a_history_and_a_revoked_entry_are_two_different_removals() {
 
 #[test]
 fn two_sessions_sharing_one_conversation_both_land_their_exchange() {
-    // Admission control does not serialize this: on Slack a message opening a thread and a reply
-    // inside it admit under different keys and share one conversation identity, so a sender
-    // replying to themselves before the bot answers runs two sessions against one history. Both
-    // read the same seed; neither may erase the other's answer.
     let store = ConversationStore::new(8);
     let key = private_conversation_key("slack", "c0123abc:1700000000.000001", SUBJECT);
     let allowed = granted(&["cli-probe.upper"]);
@@ -5832,10 +5538,6 @@ fn two_sessions_sharing_one_conversation_both_land_their_exchange() {
     assert_eq!(resumed.history.len(), 2);
     assert_eq!(resumed.history.turns()[0].user(), "what broke?");
     assert_eq!(resumed.history.turns()[1].user(), "still there?");
-    // Two sessions opening one new conversation mint two lanes, and the one that created the entry
-    // is the lane the conversation keeps. The loser paid for one cache lookup on one message; the
-    // alternative — the last writer renaming the lane every message — would leave every request
-    // naming a lane no earlier request had ever used.
     assert_ne!(first_cache_key, second_cache_key);
     assert_eq!(resumed.cache_key, first_cache_key);
 }
@@ -6090,8 +5792,8 @@ fn an_idle_replacement_is_not_overwritten_by_an_older_lease() {
 
 #[test]
 fn the_store_prints_counts_rather_than_conversations() {
-    // `History` and `ConversationTurn` both derive `Debug`, so a derived impl here would put whole
-    // conversations into the log stream on one `tracing::debug!(?store)`.
+    // History and ConversationTurn both derive Debug, so a derived Debug on the store would put
+    // whole conversations into a log line.
     let store = ConversationStore::new(8);
     commit(
         &store,
@@ -6109,11 +5811,6 @@ fn the_store_prints_counts_rather_than_conversations() {
     assert!(!rendered.contains(SUBJECT), "{rendered}");
 }
 
-// ---------------------------------------------------------------------------
-// Prompt cache keys
-// ---------------------------------------------------------------------------
-
-/// The same message, in a different conversation on the same transport.
 fn message_in(conversation: &str, text: &str) -> InboundMessage {
     InboundMessage {
         conversation: Conversation {
@@ -6126,7 +5823,6 @@ fn message_in(conversation: &str, text: &str) -> InboundMessage {
     }
 }
 
-/// One message on a named transport in a named conversation, for route-table tests.
 fn routed(transport: &str, kind: ConversationKind, id: &str) -> InboundMessage {
     InboundMessage {
         transport: transport.to_owned(),
@@ -6142,10 +5838,6 @@ fn routed(transport: &str, kind: ConversationKind, id: &str) -> InboundMessage {
 
 #[test]
 fn a_minted_cache_key_is_opaque_and_never_repeats() {
-    // Both prefixes are crate constants and `IdSequence::new` rejects a malformed one, in which
-    // case minting degrades to an empty key that `with_prompt_cache_key` then drops. That failure
-    // is silent by design — a routing hint must not abort a message — so this is the test that
-    // keeps the constants valid.
     let first = cache_key::for_conversation();
     let second = cache_key::for_conversation();
     let route = cache_key::for_route();
@@ -6162,9 +5854,8 @@ fn a_minted_cache_key_is_opaque_and_never_repeats() {
 
 #[test]
 fn a_cache_key_carries_nothing_about_the_sender() {
-    // The whole reason the key is minted rather than derived. A canonical subject can be a phone
-    // number, so sending it — or a hash of it, which is a stable pseudonym — would hand a model
-    // provider the sender's identity in exchange for routing that happens either way.
+    // The cache key is minted, not derived from the sender, since a canonical subject can be a
+    // phone number that even a hash would expose to a model provider.
     const DISTINCTIVE: &str = "tel.15558675309";
     let store = ConversationStore::new(8);
     let key = private_conversation_key("dev", "c0123abc", DISTINCTIVE);
@@ -6182,16 +5873,11 @@ fn a_cache_key_carries_nothing_about_the_sender() {
             seed.cache_key
         );
     }
-    // Nor does the conversation the sender is in, which on a shared channel is barely less
-    // identifying than the sender.
     assert!(!cache_key::for_route().contains("c0123abc"));
 }
 
 #[test]
 fn an_evicted_conversation_comes_back_with_a_new_cache_key() {
-    // Rotation is what keeps the key from becoming a durable pseudonym, and it is also simply
-    // correct: an evicted conversation rebuilds a prompt sharing no prefix with the one it
-    // replaced, so naming the old lane would be a guaranteed miss.
     let store = ConversationStore::new(8);
     let key = private_conversation_key("dev", "dev", SUBJECT);
     let allowed = granted(&["cli-probe.upper"]);
@@ -6311,9 +5997,6 @@ fn grant_empty_and_capacity_invalidation_each_rotate_the_cache_lane() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn one_conversation_keeps_one_cache_key_and_two_conversations_never_share_one() {
-    // The point of the key: the second message of a conversation repeats the whole first exchange
-    // as its prefix, and declaring the same lane is what lets the provider serve that prefix from
-    // its cache instead of reading it again.
     let directory = temporary();
     let (broker, _observed) =
         stub_broker(directory.path(), listings(3, &["cli-probe.upper"])).await;
@@ -6354,10 +6037,6 @@ async fn one_conversation_keeps_one_cache_key_and_two_conversations_never_share_
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_one_shot_route_sends_every_sender_to_the_route_s_own_lane() {
-    // A `oneShot` route's shared prefix is the agent's instructions and the tool definitions —
-    // identical for everyone it answers and containing nothing about any of them — so one lane per
-    // route shares what was already common property. Per-message keys would name a lane holding one
-    // request and give up the only caching a stateless route can have.
     const OTHER_SUBJECT: &str = "tel.16035550100";
     let directory = temporary();
     let (broker, _observed) =
@@ -6365,7 +6044,6 @@ async fn a_one_shot_route_sends_every_sender_to_the_route_s_own_lane() {
     let models = ModelScript::new([answer("one"), answer("two"), answer("three")]);
     let driver = Arc::new(RecordingDriver::default());
     let runner = runner(broker, Arc::clone(&models), 4);
-    // Bound once and cloned per message, exactly as the routing table hands it to a session.
     let route = route(model_config());
 
     for message in [
@@ -6396,7 +6074,6 @@ async fn a_one_shot_route_sends_every_sender_to_the_route_s_own_lane() {
     );
 }
 
-/// A model that never heard of routing metadata, implementing only the required trait method.
 struct KeylessModel;
 
 impl ModelFactory for KeylessModel {
@@ -6429,9 +6106,6 @@ impl ChatModel for KeylessModel {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_model_that_never_heard_of_a_cache_key_still_answers() {
-    // Nothing in `CompletionOptions` is required for a correct answer, and nothing in the event
-    // callback is either: a model that reads neither loses a cache lookup and shows no partial
-    // text, and still answers.
     let directory = temporary();
     let (broker, _observed) =
         stub_broker(directory.path(), listings(1, &["cli-probe.upper"])).await;
@@ -6454,11 +6128,6 @@ async fn a_model_that_never_heard_of_a_cache_key_still_answers() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Dispatch
-// ---------------------------------------------------------------------------
-
-/// An in-memory transport whose messages a test supplies directly.
 struct FakeTransport {
     name: String,
     inbound: mpsc::UnboundedReceiver<InboundMessage>,
@@ -6525,8 +6194,6 @@ async fn a_transport_reader_forwards_messages_and_stops_when_the_transport_does(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_reader_that_stops_because_the_daemon_stopped_is_not_a_dead_transport() {
-    // The other way a reader ends: shutdown drops the routing loop, so the forward fails. Counting
-    // that as a dead transport would announce a degraded gateway on every clean stop.
     let (sender, inbound) = mpsc::unbounded_channel();
     let transport = FakeTransport {
         name: "dev".to_owned(),
@@ -6536,8 +6203,6 @@ async fn a_reader_that_stops_because_the_daemon_stopped_is_not_a_dead_transport(
     let (routed, mut received) = mpsc::channel(1);
     let reader = tokio::spawn(crate::read_transport(Box::new(transport), routed));
 
-    // Let connection notification finish before closing the route. Otherwise the reader can
-    // exit at that first send and drop the fixture's input before we enqueue the message.
     assert!(matches!(
         received.recv().await,
         Some(TransportEvent::Connected { .. })
@@ -6552,14 +6217,8 @@ async fn a_reader_that_stops_because_the_daemon_stopped_is_not_a_dead_transport(
         .expect("routing shutdown is not failure");
 }
 
-/// The stop-word list for tests about routing rather than cancellation.
-///
-/// Empty on purpose: these tests assert which messages start a session, and a matcher that can
-/// never fire is how the two questions stay separate. Cancellation has its own tests, and they say
-/// their own words.
 const NO_STOP_WORDS: &[String] = &[];
 
-/// Everything `serve` needs when the test is about why it stopped rather than what it routed.
 async fn idle_routing_loop(directory: &Path) -> (Arc<SessionRunner>, Arc<RoutingTable>) {
     let document = document(directory);
     let config = resolved(directory, &document).await;
@@ -6572,9 +6231,6 @@ async fn idle_routing_loop(directory: &Path) -> (Arc<SessionRunner>, Arc<Routing
 
 #[tokio::test(flavor = "multi_thread")]
 async fn losing_every_transport_ends_the_daemon_as_a_failure() {
-    // Every reader gone and nobody asked for a shutdown: a gateway whose workspaces all fell off
-    // their tokens has nothing left to answer with, and reporting success would let a supervisor
-    // treat that as a clean run.
     let directory = temporary();
     let (runner, routes) = idle_routing_loop(directory.path()).await;
     let (sender, receiver) = mpsc::channel(4);
@@ -6667,8 +6323,6 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
         "ambient traffic must not start a session"
     );
 
-    // Discord's structured mentions are authoritative. Presentation text cannot turn an explicit
-    // `mentions` miss into a wakeup.
     let mut structurally_unaddressed = message("<@U0BOTBOT> presentation text");
     structurally_unaddressed.conversation = Conversation {
         kind: ConversationKind::Channel,
@@ -6689,7 +6343,6 @@ async fn ambient_channel_traffic_is_ignored_unless_it_names_the_bot() {
     );
     assert_eq!(sessions.len(), 0, "structured addressing must win");
 
-    // A message on a channel with no route is ignored just as quietly.
     let mut elsewhere = message("<@U0BOTBOT> hello");
     elsewhere.conversation = Conversation {
         kind: ConversationKind::Channel,
@@ -6793,10 +6446,6 @@ async fn a_transport_owned_thread_continuation_bypasses_only_the_repeat_mention(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
-    // The property a route matching every channel must not quietly cost: a route decides *which*
-    // agent answers, and the mention decides *whether* anything answers at all. Widening the first
-    // leaves the second exactly where it was, or the bot would run a session on every message in
-    // every channel it sits in.
     let directory = temporary();
     let mut document = document(directory.path());
     document["routes"][0]["conversation"] = json!({"kind": ["channel"]});
@@ -6818,7 +6467,6 @@ async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
     let repliers = BTreeMap::from([("dev".to_owned(), Arc::clone(&driver) as Arc<dyn ChatDriver>)]);
     let mut sessions = tokio::task::JoinSet::new();
 
-    // A channel this configuration never names, which is the whole point of the catch-all.
     let mut ambient = message("just chatting with my colleagues");
     ambient.conversation = Conversation {
         kind: ConversationKind::Channel,
@@ -6849,7 +6497,6 @@ async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
         id: "c9999zzz".to_owned(),
         thread: None,
     };
-    // Discord supplies this from its authenticated `mentions` array rather than presentation text.
     addressed.addressed = Some(true);
     crate::dispatch(
         &runner,
@@ -6866,12 +6513,6 @@ async fn a_catch_all_channel_route_still_waits_to_be_summoned() {
     while sessions.join_next().await.is_some() {}
 }
 
-/// A local line reaches a `channel` route without a mention, because the socket is the address.
-///
-/// Driven through `dispatch` rather than the route table: the table matched this line all along,
-/// and what dropped it was the routing loop's ambient-traffic rule, which has no mention grammar
-/// to satisfy on a line-delimited JSON request. Every kind but `directMessage` was therefore
-/// unreachable from the one transport that can produce them all.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_local_channel_line_reaches_its_route_without_a_mention() {
     let directory = temporary();
@@ -6916,7 +6557,6 @@ async fn a_local_channel_line_reaches_its_route_without_a_mention() {
     let (broker, _observed) = stub_broker(directory.path(), Vec::new()).await;
     let runner = runner(broker, ModelScript::forbidden(), 4);
     let driver = Arc::new(RecordingDriver::default());
-    // A bot identity whose mention syntax this line deliberately does not carry.
     let identities = BTreeMap::from([(
         "dev".to_owned(),
         TransportIdentity {
@@ -6946,11 +6586,6 @@ async fn a_local_channel_line_reaches_its_route_without_a_mention() {
     while sessions.join_next().await.is_some() {}
 }
 
-// ---------------------------------------------------------------------------
-// Slack Socket Mode
-// ---------------------------------------------------------------------------
-
-/// The next routable message from any transport, failing the test rather than hanging on it.
 fn expect_message(event: TransportEvent) -> InboundMessage {
     let TransportEvent::Message(message) = event else {
         panic!("expected a message event");
@@ -6966,10 +6601,6 @@ async fn next_message(transport: &mut dyn ChatTransport) -> InboundMessage {
     expect_message(event)
 }
 
-/// A loopback HTTP mock serving Slack's token-only methods.
-///
-/// Hand-rolled rather than a framework: this has to answer exactly what the transport asks for and
-/// record it, and a real socket is what proves the request left the process.
 struct HttpMock {
     base: String,
     calls: Arc<Mutex<Vec<(String, String)>>>,
@@ -6977,7 +6608,6 @@ struct HttpMock {
 }
 
 impl HttpMock {
-    /// Paths and request bodies the transport sent, in order.
     fn calls(&self) -> Vec<(String, String)> {
         self.calls.lock().expect("mock call log").clone()
     }
@@ -6987,7 +6617,6 @@ impl HttpMock {
     }
 }
 
-/// Serves loopback HTTP until the test drops, answering through `handler`.
 #[allow(
     clippy::let_underscore_must_use,
     reason = "a mock that cannot finish writing its canned response leaves the transport under \
@@ -7050,10 +6679,6 @@ where
     }
 }
 
-/// A raw-body loopback mock for attachment downloads and non-200 responses.
-///
-/// Its call records retain request headers rather than bodies so CDN credential boundaries can be
-/// asserted directly.
 struct RawHttpMock {
     base: String,
     calls: Arc<Mutex<Vec<(String, String)>>>,
@@ -7119,10 +6744,6 @@ where
     }
 }
 
-/// The same loopback mock with response headers the handler chooses.
-///
-/// A redirect is a status and a `location` together, which is the one shape [`spawn_raw_http_mock`]
-/// cannot answer.
 #[allow(
     clippy::let_underscore_must_use,
     reason = "a mock that cannot finish writing its canned response leaves the transport under \
@@ -7185,7 +6806,6 @@ where
     }
 }
 
-/// The same request with raw headers retained for credential-boundary assertions.
 async fn read_http_request_parts(
     stream: &mut tokio::net::TcpStream,
 ) -> Option<(String, String, String)> {
@@ -7225,19 +6845,15 @@ async fn read_http_request_parts(
         }
         bytes.extend_from_slice(&buffer[..count]);
     }
-    // Multipart image bodies contain arbitrary bytes. Lossy rendering preserves every ASCII
-    // boundary/header/JSON field tests assert on while still letting the mock answer a PNG upload.
     let body = String::from_utf8_lossy(&bytes[header_end..]).into_owned();
     Some((path, headers, body))
 }
 
-/// Everything one mock Socket Mode connection recorded and can be told to send.
 struct SocketMock {
     url: String,
     acks: mpsc::UnboundedReceiver<String>,
 }
 
-/// Serves one Socket Mode connection: greets, sends `frames`, and reports every ack it received.
 fn spawn_socket_mock(frames: Vec<Value>) -> SocketMock {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("socket mock binds");
     let address = listener.local_addr().expect("socket mock address");
@@ -7305,10 +6921,8 @@ fn direct_message(user: &str, ts: &str, text: &str) -> Value {
     })
 }
 
-/// One shared-channel message, threaded when `thread_ts` is given.
-///
-/// Slack sends `thread_ts` only on replies *inside* a thread; the message that starts one arrives
-/// without it, which is exactly the asymmetry the conversation identity has to absorb.
+/// Slack sends thread_ts only on replies inside a thread; the message that starts one arrives
+/// without it.
 fn channel_message(user: &str, ts: &str, thread_ts: Option<&str>, text: &str) -> Value {
     let mut event = json!({
         "type": "message",
@@ -7324,10 +6938,6 @@ fn channel_message(user: &str, ts: &str, thread_ts: Option<&str>, text: &str) ->
     event
 }
 
-/// One `app_mention`, in Slack's own shape: the event carries no `channel_type` at all.
-///
-/// Which is why the transport asks `conversations.info` what the conversation is — a fixture that
-/// fabricated the field would test a payload Slack never sends.
 fn app_mention(user: &str, ts: &str, thread_ts: Option<&str>, text: &str) -> Value {
     let mut event = channel_message(user, ts, thread_ts, text);
     event["type"] = json!("app_mention");
@@ -7338,7 +6948,6 @@ fn app_mention(user: &str, ts: &str, thread_ts: Option<&str>, text: &str) -> Val
     event
 }
 
-/// One Telegram transport pointed at loopback mocks, with every liveness surface off.
 fn telegram(endpoint: &str) -> crate::transport::telegram::TelegramTransport {
     telegram_with(endpoint, LivenessMode::Off)
 }
@@ -7356,8 +6965,6 @@ fn telegram_with(
     .expect("telegram transport builds")
 }
 
-/// The Bot API mock every polling test needs: one fixed `getMe`, one batch of updates on the
-/// first poll, and an empty result after it.
 fn telegram_handler(updates: Vec<Value>) -> impl Fn(&str, &str) -> Value + Send + Sync + 'static {
     move |path, _body| {
         if path.contains("getMe") {
@@ -7407,9 +7014,6 @@ fn slack_handler(sockets: Vec<String>) -> impl Fn(&str, &str) -> Value + Send + 
             json!({"ok": true, "url": url})
         }
         "/api/chat.postMessage" => json!({"ok": true, "ts": "1700000000.000100"}),
-        // The kind of a conversation an `app_mention` never names. `d…` is a direct message here
-        // only because a fixture has to answer something; the gateway reads the flags, never the
-        // identifier's first letter.
         _ if path.starts_with("/api/conversations.info?channel=") => {
             let channel = path.rsplit('=').next().unwrap_or_default();
             json!({"ok": true, "channel": {
@@ -7426,9 +7030,8 @@ fn slack_handler(sockets: Vec<String>) -> impl Fn(&str, &str) -> Value + Send + 
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slack_envelope_is_acknowledged_before_the_session_that_answers_it() {
-    // Slack redelivers in about three seconds and a session runs for far longer, so acknowledging
-    // after the work would guarantee duplicates rather than merely risk them. The model here
-    // blocks until the test has already observed the ack, which is the ordering under test.
+    // Slack redelivers an unacknowledged event in about three seconds, far sooner than a session
+    // can finish, so acknowledging after the work would guarantee duplicate replies.
     let directory = temporary();
     let mut socket = spawn_socket_mock(vec![events_envelope(
         "envelope-1",
@@ -7466,7 +7069,6 @@ async fn a_slack_envelope_is_acknowledged_before_the_session_that_answers_it() {
         driver,
     ));
 
-    // The model has been entered and is still blocked, so no answer has been produced yet.
     model.wait_until_entered().await;
     let ack = tokio::time::timeout(Duration::from_secs(5), socket.acks.recv())
         .await
@@ -7487,7 +7089,6 @@ async fn a_slack_envelope_is_acknowledged_before_the_session_that_answers_it() {
     let body = serde_json::from_str::<Value>(&posted.1).expect("post body is JSON");
     assert_eq!(body["text"], "All good.");
     assert_eq!(body["channel"], "d0123abc");
-    // A direct message has no thread to join, and answering in one would hide the reply.
     assert!(body.get("thread_ts").is_none(), "{body}");
 }
 
@@ -7514,8 +7115,6 @@ async fn a_redelivered_slack_envelope_is_routed_once() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slack_disconnect_reconnects_on_a_fresh_socket() {
-    // Slack rotates sockets on its own schedule. A disconnect is routine, and a transport that
-    // treated it as a failure would go quiet until someone restarted the daemon.
     let second = spawn_socket_mock(vec![events_envelope(
         "envelope-2",
         direct_message("u9xyz", "1700000000.000002", "after reconnect"),
@@ -7545,7 +7144,6 @@ async fn a_slack_disconnect_reconnects_on_a_fresh_socket() {
     );
 }
 
-/// A socket that negotiates and then says nothing: the handshake succeeds, the greeting never comes.
 fn spawn_mute_socket_mock() -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("socket mock binds");
     let address = listener.local_addr().expect("socket mock address");
@@ -7560,7 +7158,6 @@ fn spawn_mute_socket_mock() -> String {
         let Ok(_socket) = tokio_tungstenite::accept_async(stream).await else {
             return;
         };
-        // Held open, negotiated, and mute for as long as the test runs.
         std::future::pending::<()>().await;
     });
     format!("ws://{address}")
@@ -7568,10 +7165,6 @@ fn spawn_mute_socket_mock() -> String {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_silent_slack_socket_is_abandoned_rather_than_waited_on_forever() {
-    // A half-open connection — a NAT table forgetting the flow, a partition with no RST — reads
-    // exactly like a healthy socket with nothing to say. Slack pings about every 30 seconds and
-    // never goes quiet on its own, so silence past the deadline is a dead path: without one, the
-    // reader waits on it forever and every route on this workspace goes silent with no log line.
     let second = spawn_socket_mock(vec![events_envelope(
         "envelope-2",
         direct_message("u9xyz", "1700000000.000002", "after the wedge"),
@@ -7601,8 +7194,6 @@ async fn a_silent_slack_socket_is_abandoned_rather_than_waited_on_forever() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slack_socket_that_never_greets_fails_inside_open() {
-    // The same wedge one round earlier: neither the handshake nor the `hello` wait had a deadline
-    // of its own, so a URL that accepts a connection and then stops parks `connect` for good.
     let http = spawn_http_mock(slack_handler(vec![spawn_mute_socket_mock()]));
     let mut transport = slack(&http.base).with_deadline(Duration::from_millis(100));
 
@@ -7620,8 +7211,6 @@ async fn a_slack_socket_that_never_greets_fails_inside_open() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn slack_messages_the_bot_itself_posted_are_never_routed() {
-    // Both checks matter: another app's post carries `bot_id`, and this app's own post arrives with
-    // the bot's user identifier and no `bot_id` at all. Either one routing would be a loop.
     let socket = spawn_socket_mock(vec![
         events_envelope(
             "envelope-1",
@@ -7660,9 +7249,6 @@ async fn slack_messages_the_bot_itself_posted_are_never_routed() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slack_upload_is_routed_and_described_for_numbering() {
-    // The transport reports what arrived and stops there. Numbering belongs to the asset store,
-    // because two transports minting their own identifiers would collide inside one conversation,
-    // so the reference line a model reads is composed later by the session.
     let socket = spawn_socket_mock(vec![events_envelope(
         "envelope-1",
         json!({
@@ -7704,8 +7290,6 @@ async fn a_slack_upload_is_routed_and_described_for_numbering() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slack_upload_with_no_comment_is_still_a_request() {
-    // An upload posted with no comment carries an empty `text`, and the attachment is the whole
-    // message. Dropping it would be the same silence the subtype filter used to produce.
     let socket = spawn_socket_mock(vec![events_envelope(
         "envelope-1",
         json!({
@@ -7736,9 +7320,6 @@ async fn a_slack_upload_with_no_comment_is_still_a_request() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slack_file_the_app_cannot_see_is_described_without_a_source() {
-    // Slack withholds the id and the URL for a file the token has no access to. It is still
-    // described, because "there is something here I cannot open" is a better answer than silence —
-    // and it carries no source, so nothing can try to fetch it.
     let socket = spawn_socket_mock(vec![events_envelope(
         "envelope-1",
         json!({
@@ -7764,8 +7345,6 @@ async fn a_slack_file_the_app_cannot_see_is_described_without_a_source() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn slack_subtypes_that_are_events_about_a_message_are_still_dropped() {
-    // The allowlist has to stay an allowlist. An edit, a deletion, and a channel join are events
-    // *about* messages, and routing any of them would answer a question twice or answer nobody.
     let socket = spawn_socket_mock(vec![
         events_envelope(
             "envelope-1",
@@ -7818,8 +7397,6 @@ async fn slack_subtypes_that_are_events_about_a_message_are_still_dropped() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slack_message_with_neither_text_nor_a_file_is_not_a_request() {
-    // Text became optional so an uncommented upload could route. Nothing else may ride in on that:
-    // an empty message is not a question and must not start a session.
     let socket = spawn_socket_mock(vec![
         events_envelope(
             "envelope-1",
@@ -7847,10 +7424,6 @@ async fn a_slack_message_with_neither_text_nor_a_file_is_not_a_request() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slack_thread_and_the_message_that_opened_it_are_one_conversation() {
-    // The failure this field exists to prevent. Slack omits `thread_ts` on the message that starts
-    // a thread and sends it on every reply inside one, while the bot answers that first message
-    // *in* a thread rooted at it. Anything keyed on `thread` therefore files the opening question
-    // apart from every answer to it, orphaning the first turn of every threaded conversation.
     let socket = spawn_socket_mock(vec![
         events_envelope(
             "envelope-1",
@@ -7888,7 +7461,6 @@ async fn a_slack_thread_and_the_message_that_opened_it_are_one_conversation() {
     let reply = next_message(&mut transport).await;
     let elsewhere = next_message(&mut transport).await;
 
-    // The asymmetry itself, so the derivation below has something to be right about.
     assert_eq!(opening.conversation.kind, ConversationKind::Channel);
     assert_eq!(reply.conversation.kind, ConversationKind::Thread);
 
@@ -7903,7 +7475,6 @@ async fn a_slack_thread_and_the_message_that_opened_it_are_one_conversation() {
         elsewhere.conversation.key(),
         "two threads in one channel are two conversations"
     );
-    // The identity is the thread the *answer* joins, which is why it survives the first turn.
     assert_eq!(
         opening.reply,
         ReplyTarget::Slack {
@@ -7915,8 +7486,6 @@ async fn a_slack_thread_and_the_message_that_opened_it_are_one_conversation() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slack_direct_message_is_one_conversation_across_its_messages() {
-    // A DM has no thread to join and the transport deliberately answers outside one, so the whole
-    // conversation is the DM channel and stays that way however many messages arrive in it.
     let socket = spawn_socket_mock(vec![
         events_envelope(
             "envelope-1",
@@ -7953,8 +7522,6 @@ async fn a_slack_direct_message_is_one_conversation_across_its_messages() {
 async fn slack_agent_continues_only_an_exact_claimed_sender_thread() {
     let root = "1700000000.000001";
     let socket = spawn_socket_mock(vec![
-        // Channel-history scopes deliver this ambient top-level message. It must disappear inside
-        // the transport before routing, authorization, telemetry payloads, or a model.
         events_envelope(
             "envelope-ambient",
             channel_message("u9xyz", "1700000000.000000", None, "ambient"),
@@ -8278,9 +7845,6 @@ async fn slack_permanently_degrades_agent_status_to_owned_tangerine_reactions() 
             .await
             .liveness
             .expect("liveness target");
-        // The degrade is readable in the capability object itself: an installation Slack has
-        // refused the Agent status for stops advertising one, so a later session never spends a
-        // call finding that out again. Two sessions, one refusal.
         match driver.status() {
             Some(status) => {
                 assert_eq!(session, 0, "the refusal is remembered across sessions");
@@ -8413,8 +7977,6 @@ async fn slack_lost_reaction_response_never_grants_cleanup_ownership() {
             serde_json::to_vec(&json!({"ok": true, "url": socket_url.clone()}))
                 .expect("socket response serializes"),
         ),
-        // The service may have accepted the add even though the response was lost/malformed. The
-        // only safe ownership rule is to leave the possible marker rather than remove old state.
         "/api/reactions.add" => (200, "application/json", b"not-json".to_vec()),
         "/api/reactions.remove" => (200, "application/json", br#"{"ok":true}"#.to_vec()),
         _ => (404, "application/json", br#"{"ok":false}"#.to_vec()),
@@ -8531,16 +8093,10 @@ async fn slack_agent_stop_events_are_acknowledged_and_decoded_as_control_not_pro
     assert_eq!(acknowledged, ["stop-envelope", "stop-envelope-alias"]);
 }
 
-// ---------------------------------------------------------------------------
-// Slack markdown rendering
-// ---------------------------------------------------------------------------
-
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slack_answer_is_posted_as_a_markdown_block() {
-    // A model writes CommonMark. Slack's `text` field is mrkdwn, a proprietary syntax where bold is
-    // `*one asterisk*`, so an answer posted through it alone arrives with `**bold**` rendered as
-    // four literal asterisks. The `markdown` block hands the translation to Slack, which is the one
-    // party that knows what its own client renders.
+    // A model writes CommonMark, but Slack's text field uses mrkdwn, where bold is one asterisk, so
+    // posting through it alone renders double asterisks literally.
     let directory = temporary();
     let socket = spawn_socket_mock(vec![events_envelope(
         "envelope-1",
@@ -8577,11 +8133,8 @@ async fn a_slack_answer_is_posted_as_a_markdown_block() {
         .find(|(path, _)| path == "/api/chat.postMessage")
         .expect("the answer was posted to chat");
     let body = serde_json::from_str::<Value>(&posted.1).expect("post body is JSON");
-    // Verbatim: anything this process rewrote would be a second translation of what Slack is about
-    // to translate, and the table would not survive one.
     assert_eq!(body["blocks"][0]["type"], "markdown");
     assert_eq!(body["blocks"][0]["text"], answer_text);
-    // The fallback a push notification shows, which is the one place blocks do not render.
     assert_eq!(body["text"], answer_text);
     assert_eq!(body["channel"], "d0123abc");
 }
@@ -8636,10 +8189,6 @@ async fn a_slack_429_delays_the_identical_answer_once_without_reply_failure() {
         channel: "C1".into(),
         thread_ts: Some("1700000000.000001".into()),
     };
-    // Thread-local rather than attached to the session's own future: the answer is written by the
-    // policy task, because that task is the only writer of one message, and a dispatcher attached
-    // to one future never reaches a task spawned out of it. A `current_thread` runtime polls that
-    // task on this thread, which is the scoping that does reach it.
     let (capture, _subscriber) = capture_spans();
     tokio::time::timeout(
         Duration::from_secs(10),
@@ -8665,8 +8214,6 @@ async fn a_slack_429_delays_the_identical_answer_once_without_reply_failure() {
     assert!(!recorded.contains("reply-failed"), "{recorded}");
     assert_eq!(recorded.matches("gateway_reply_rate_limited").count(), 1);
     assert!(recorded.contains("retry_after_seconds=1"), "{recorded}");
-    // The inbound text is on the trace, the way every message is. The bot token is not, and never
-    // was: a credential is goal 1's exclusion and is independent of how much a span carries.
     assert!(recorded.contains("question-payload-sentinel"), "{recorded}");
     assert!(!recorded.contains("bot-token"), "{recorded}");
 }
@@ -8744,7 +8291,6 @@ fn slack_generated_upload_urls_are_origin_bounded() {
     ));
 }
 
-/// Two attachments are two uploads, and the answer text is posted once.
 #[tokio::test(flavor = "multi_thread")]
 async fn slack_uploads_each_attachment_and_comments_only_on_the_first() {
     let base = Arc::new(Mutex::new(String::new()));
@@ -8834,10 +8380,6 @@ async fn slack_and_telegram_never_accept_non_success_http_statuses() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Chat assets
-// ---------------------------------------------------------------------------
-
 fn pending(name: &str, mime: &str, size: u64) -> PendingAsset {
     PendingAsset {
         name: name.to_owned(),
@@ -8856,8 +8398,6 @@ fn asset_store() -> AssetStore {
 
 #[test]
 fn one_shot_asset_ids_are_monotonic_and_still_resolve_only_in_their_scope() {
-    // The number is the whole interface a model has to an attachment, so it has to mean one file
-    // for as long as the reference line naming it is still being replayed.
     let store = asset_store();
     let now = Instant::now();
     let first = store.assets_for(
@@ -8875,7 +8415,6 @@ fn one_shot_asset_ids_are_monotonic_and_still_resolve_only_in_their_scope() {
     assert_eq!(first.inventory[0].id, 1);
     assert_eq!(second.arrived, vec![2]);
 
-    // A different one-shot conversation gets a fresh ID and cannot see the first one's files.
     let other = store.assets_for(
         &private_conversation_key("dev", "c2", SUBJECT),
         vec![pending("c.png", "image/png", 30)],
@@ -8960,8 +8499,6 @@ fn a_stale_shared_session_cannot_publish_or_fetch_across_a_grant_generation_race
         now,
     );
 
-    // This access models another participant already admitted under the shared generation's wider
-    // grant. Race one late publication against the next participant's narrower fresh grant.
     let stale = conversations.begin(&key, &wide, window(), now + Duration::from_secs(1));
     assert_eq!(
         stale.cache_key, first_cache_key,
@@ -9044,7 +8581,6 @@ fn a_stale_shared_session_cannot_publish_or_fetch_across_a_grant_generation_race
 #[test]
 fn idle_replacement_retires_attachment_metadata_and_numbering() {
     let conversations = ConversationStore::new(8);
-    // Longer than the transcript timeout so only the conversation generation can retire it.
     let store = AssetStore::new(4, Duration::from_secs(3_600));
     let key = private_conversation_key("dev", "idle-assets", SUBJECT);
     let allowed = granted(&["cli-probe.upper"]);
@@ -9190,7 +8726,6 @@ fn asset_lru_removal_cannot_alias_a_number_within_a_live_generation() {
         true,
         now + Duration::from_secs(1),
     );
-    // The attachment ceiling removed the first inventory, but its transcript generation remains.
     let resumed = conversations.begin(&first_key, &allowed, window(), now + Duration::from_secs(2));
     let replacement = store.assets_for_access(
         &resumed.assets,
@@ -9422,8 +8957,6 @@ fn a_reference_note_numbers_only_what_the_model_can_be_shown() {
         note.contains("Chat Asset #1 — shot.png (image/png, 2 KB)"),
         "{note}"
     );
-    // Named, and named as unreadable. Ignoring it is what produced the flat denial in the first
-    // place; a number it cannot use would be worse.
     assert!(note.contains("clip.mov"), "{note}");
     assert!(!note.contains("Chat Asset #2"), "{note}");
     assert!(
@@ -9436,8 +8969,6 @@ fn a_reference_note_numbers_only_what_the_model_can_be_shown() {
 
 #[test]
 fn a_model_that_cannot_be_shown_images_is_offered_no_asset_number() {
-    // The route's model decides this, not the media type. A local endpoint handed an image either
-    // errors or invents an answer, and the default for `modalities` is deliberately empty.
     let store = asset_store();
     let registered = store.assets_for(
         &private_conversation_key("dev", "c1", SUBJECT),
@@ -9455,11 +8986,6 @@ fn a_model_that_cannot_be_shown_images_is_offered_no_asset_number() {
 
 #[test]
 fn an_attachment_stays_fetchable_on_later_messages_that_carry_none() {
-    // The bug this pins, observed in a real conversation: someone sends a screenshot, the model
-    // looks at it and answers, and then the *next* message withdraws the tool because that message
-    // carried no attachment of its own. The reference line is still in replayed history, so the
-    // model is left able to name `Chat Asset #1` and unable to open it — and answers from the
-    // description it produced a turn ago rather than saying it cannot see. That reads as lying.
     let store = asset_store();
     let now = Instant::now();
     let first = store.assets_for(
@@ -9470,7 +8996,6 @@ fn an_attachment_stays_fetchable_on_later_messages_that_carry_none() {
     );
     assert!(first.fetchable);
 
-    // The follow-up: no attachment, same conversation.
     let second = store.assets_for(
         &private_conversation_key("dev", "c1", SUBJECT),
         Vec::new(),
@@ -9492,7 +9017,6 @@ fn an_attachment_stays_fetchable_on_later_messages_that_carry_none() {
         Some("shot.png".to_owned())
     );
 
-    // A conversation that never had one still offers nothing.
     let elsewhere = store.assets_for(
         &private_conversation_key("dev", "c2", SUBJECT),
         Vec::new(),
@@ -9504,12 +9028,6 @@ fn an_attachment_stays_fetchable_on_later_messages_that_carry_none() {
 
 #[test]
 fn every_prompt_names_the_whole_inventory_not_just_what_just_arrived() {
-    // The bug this pins, observed in a real conversation: a PDF is sent, ordinary chatter follows,
-    // and nine messages later the model answers that it has never been sent a PDF. It was telling
-    // the truth about the prompt it could see. The reference line naming `Chat Asset #3` lived only
-    // in the turn that carried it, and a twelve-turn history window had trimmed that turn away —
-    // while the store still held the file for another hour. A number a model cannot see is a file
-    // it cannot open.
     let store = asset_store();
     let now = Instant::now();
     store.assets_for(
@@ -9527,7 +9045,6 @@ fn every_prompt_names_the_whole_inventory_not_just_what_just_arrived() {
         now,
     );
 
-    // Chatter. None of these messages carries anything.
     for _ in 0..9 {
         store.assets_for(
             &private_conversation_key("dev", "c1", SUBJECT),
@@ -9537,7 +9054,6 @@ fn every_prompt_names_the_whole_inventory_not_just_what_just_arrived() {
         );
     }
 
-    // A later message brings its own file, and the note still has to name both.
     let registered = store.assets_for(
         &private_conversation_key("dev", "c1", SUBJECT),
         vec![pending("shot.png", "image/png", 2048)],
@@ -9548,8 +9064,6 @@ fn every_prompt_names_the_whole_inventory_not_just_what_just_arrived() {
 
     assert!(note.contains("Chat Asset #1 — recipe.pdf"), "{note}");
     assert!(note.contains("Chat Asset #2 — shot.png"), "{note}");
-    // Marked, so "is this a good recipe?" reaches for the file that came with the question rather
-    // than one from twenty messages ago.
     assert!(
         note.contains("shot.png (image/png, 2 KB) — attached to this message"),
         "{note}"
@@ -9562,8 +9076,6 @@ fn every_prompt_names_the_whole_inventory_not_just_what_just_arrived() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unknown_asset_number_is_refused_in_words_rather_than_by_failing() {
-    // A model that asked for the wrong number can say so and carry on. Ending the session would
-    // turn a recoverable turn into the fixed failure line.
     let store = Arc::new(asset_store());
     store.assets_for(
         &private_conversation_key("dev", "c1", SUBJECT),
@@ -9588,8 +9100,6 @@ async fn an_unknown_asset_number_is_refused_in_words_rather_than_by_failing() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_stops_opening_attachments_once_its_budget_is_spent() {
-    // Four is a working allowance, not a tour of the conversation. The refusal is readable so the
-    // model answers with what it has rather than retrying.
     let store = Arc::new(asset_store());
     let arriving = (0..8)
         .map(|index| pending(&format!("shot{index}.png"), "image/png", 10))
@@ -9610,8 +9120,6 @@ async fn a_session_stops_opening_attachments_once_its_budget_is_spent() {
     );
 
     let refusal = tokio::task::spawn_blocking(move || {
-        // No fetcher is wired, so each of these fails for its own reason; what matters is that the
-        // budget is spent by the attempt rather than by the success.
         for id in 1..=4 {
             #[allow(
                 clippy::let_underscore_must_use,
@@ -9627,11 +9135,6 @@ async fn a_session_stops_opening_attachments_once_its_budget_is_spent() {
     assert!(refusal.contains("already opened"), "{refusal}");
 }
 
-/// A capability input and a model's own reading are separate allowances on purpose.
-///
-/// The model's four-fetch budget is about how much of the conversation it may read; the capability
-/// allowance is about how much one invocation may carry. Spending one from the other would let a
-/// remix exhaust the agent's ability to look at its own attachments.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_capability_input_does_not_spend_the_model_attachment_budget() {
     let store = Arc::new(asset_store());
@@ -9654,8 +9157,6 @@ async fn a_capability_input_does_not_spend_the_model_attachment_budget() {
     );
 
     let refusals = tokio::task::spawn_blocking(move || {
-        // No fetcher is wired, so every read fails at the same late check; what is asserted is
-        // which budget each attempt spent.
         let capability_side = (1..=6)
             .map(|id| assets.fetch_for_capability(id).expect_err("no fetcher"))
             .collect::<Vec<_>>();
@@ -9677,7 +9178,6 @@ async fn a_capability_input_does_not_spend_the_model_attachment_budget() {
     );
 }
 
-/// Every proposal marker resolves without changing JSON, independently of capability names.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_chat_asset_marker_resolves_without_expansion_or_a_capability_allowlist() {
     struct FixedFetcher(Vec<u8>);
@@ -9729,10 +9229,9 @@ async fn a_chat_asset_marker_resolves_without_expansion_or_a_capability_allowlis
 fn a_download_url_away_from_slack_is_not_followed() {
     use crate::transport::slack::is_slack_file_url;
 
-    // `credential_client` refuses redirects globally so a bearer token is never forwarded by
-    // policy. Every hop this transport takes by hand — the URL the event supplied as much as the
-    // `location` after it — has to check the host itself, and a prefix comparison would accept the
-    // lookalike below.
+    // The transport's credential client refuses redirects globally, but every hop this code follows
+    // by hand must check the real host itself, since a prefix comparison would accept a lookalike
+    // domain.
     assert!(is_slack_file_url(
         "https://files.slack.com/f/F0123/shot.png",
         config::SLACK_ENDPOINT
@@ -9749,23 +9248,18 @@ fn a_download_url_away_from_slack_is_not_followed() {
         "https://evil.test/?x=files.slack.com",
         config::SLACK_ENDPOINT
     ));
-    // Credentials in the authority must not smuggle a host past the check either.
     assert!(!is_slack_file_url(
         "https://files.slack.com@evil.test/f/F0123",
         config::SLACK_ENDPOINT
     ));
-    // Plaintext would put the token on the wire in clear.
     assert!(!is_slack_file_url(
         "http://files.slack.com/f/F0123",
         config::SLACK_ENDPOINT
     ));
-    // Slack's own name in front of a port nobody at Slack is listening on.
     assert!(!is_slack_file_url(
         "https://files.slack.com:8443/f/F0123",
         config::SLACK_ENDPOINT
     ));
-    // A stand-in endpoint reaches its own loopback origin, and nothing else — the same rule
-    // `is_slack_upload_url` applies, so production accepts none of it.
     assert!(is_slack_file_url(
         "http://127.0.0.1:9000/files/shot.png",
         "http://127.0.0.1:9000"
@@ -9782,9 +9276,6 @@ fn a_download_url_away_from_slack_is_not_followed() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slack_download_sends_the_bot_token_to_no_other_host() {
-    // The URL arrives on the Socket Mode connection, so supplying a foreign one takes Slack itself
-    // or a man in the middle of it. The token still goes to a checked host either way, on the first
-    // request as much as on the redirect.
     let elsewhere = spawn_raw_http_mock(|_| (200, "image/png", b"foreign bytes".to_vec()));
     let foreign = format!("{}/f/F0123/shot.png", elsewhere.base);
     let offsite = foreign.clone();
@@ -9843,7 +9334,6 @@ async fn a_slack_download_sends_the_bot_token_to_no_other_host() {
         .fetch(&source(format!("{}/f/F0123/offsite.png", files.base)), 1024)
         .await
         .expect_err("a redirect to a foreign host is refused");
-    // Same origin as the endpoint, with credentials in the authority that a browser would send.
     fetcher
         .fetch(
             &source(format!(
@@ -9877,23 +9367,17 @@ async fn a_slack_download_sends_the_bot_token_to_no_other_host() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Discord Gateway
-// ---------------------------------------------------------------------------
-
 const DISCORD_BOT: &str = "111111111111111111";
 const DISCORD_USER: &str = "999999999999999999";
 const DISCORD_CHANNEL: &str = "222222222222222222";
 const DISCORD_GUILD: &str = "777777777777777777";
 const DISCORD_MESSAGE: &str = "333333333333333333";
 
-/// One loopback Discord Gateway, including the control payload the bot sent after Hello.
 struct DiscordSocketMock {
     url: String,
     sent: mpsc::UnboundedReceiver<Value>,
 }
 
-/// Serves one Discord Gateway connection and performs the Hello → Identify/Resume handshake.
 fn spawn_discord_socket_mock(
     frames: Vec<Value>,
     resume_gateway_url: Option<String>,
@@ -10030,9 +9514,6 @@ fn discord_handler(gateway_url: String) -> impl Fn(&str, &str) -> Value + Send +
                 "max_concurrency": 1
             }
         }),
-        // `GET /channels/{id}` is how a guild message learns whether its channel is a channel, a
-        // thread, or a forum post. It is the bare channel path; everything deeper under
-        // `/channels/` is Create Message and friends, which answer with a posted message.
         path if path
             .strip_prefix("/api/v10/channels/")
             .is_some_and(|rest| !rest.trim_end_matches('/').contains('/')) =>
@@ -10128,8 +9609,6 @@ async fn discord_routes_photos_and_files_and_posts_a_no_ping_reply() {
     assert_eq!(message.assets[1].name, "spec.pdf");
     assert_eq!(message.assets[1].mime, "application/pdf");
 
-    // Both an image and a document follow the same bounded lazy fetch path Slack uses. Discord CDN
-    // downloads carry no bot Authorization header; only an expired URL refresh returns to REST.
     let fetcher = transport
         .asset_fetcher()
         .expect("Discord messages can carry assets");
@@ -10190,8 +9669,6 @@ async fn discord_posts_generated_png_as_a_bounded_multipart_attachment() {
                 }]
             })
         } else {
-            // A long answer needs a second text-only message. Failing after the image-bearing first
-            // post must be reported as partial rather than as no delivery.
             json!({})
         }
     });
@@ -10221,7 +9698,6 @@ async fn discord_posts_generated_png_as_a_bounded_multipart_attachment() {
     assert!(multipart.contains(DISCORD_MESSAGE));
 }
 
-/// Both attachments ride the first post, which is the message a person actually reads.
 #[tokio::test(flavor = "multi_thread")]
 async fn discord_posts_every_attachment_on_the_first_message() {
     let http = spawn_http_mock(|path, _body| {
@@ -10363,9 +9839,6 @@ async fn discord_obeys_one_rest_retry_after_before_posting_the_reply() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_discord_rate_limit_wait_releases_the_rest_lock() {
-    // The lock is there to serialize requests, not to serialize waiting. Held across the 429 sleep,
-    // one throttled reply stalled every other session's answer and any model waiting on
-    // `fetch_chat_asset` for as long as Discord asked this one reply to wait.
     let cdn = spawn_raw_http_mock(|path| match path {
         "/fresh/document" => (200, "application/pdf", b"fresh pdf bytes".to_vec()),
         _ => (404, "application/json", br#"{"code":404}"#.to_vec()),
@@ -10411,8 +9884,6 @@ async fn a_discord_rate_limit_wait_releases_the_rest_lock() {
             .expect("Gateway response serializes"),
         ),
         "/api/v10/channels/200000000000000007/messages" => {
-            // One second is long enough that the refresh below could not have finished after it by
-            // accident, and short enough to keep the test quick.
             if observed.fetch_add(1, Ordering::SeqCst) == 0 {
                 (
                     429,
@@ -10467,7 +9938,6 @@ async fn a_discord_rate_limit_wait_releases_the_rest_lock() {
             .expect("the bounded retry still succeeds");
         Instant::now()
     });
-    // The wait only exists once Discord has answered 429, so the refresh has to start after that.
     while posts.load(Ordering::SeqCst) == 0 {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
@@ -10778,15 +10248,10 @@ async fn discord_reconnects_with_resume_before_delivering_more_messages() {
     assert_eq!(resume["d"]["seq"], 1);
 }
 
-// ---------------------------------------------------------------------------
-// Telegram long polling
-// ---------------------------------------------------------------------------
-
 fn telegram_message(user: i64, is_bot: bool, message_id: i64, text: &str) -> Value {
     telegram_chat_message(42, "private", user, is_bot, message_id, text)
 }
 
-/// The same message in a named chat, so a test can tell two conversations apart.
 fn telegram_chat_message(
     chat: i64,
     kind: &str,
@@ -10805,8 +10270,8 @@ fn telegram_chat_message(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn telegram_acknowledges_by_advancing_its_offset() {
-    // There is no ack call: the next poll's offset is the acknowledgment, and it has to advance
-    // past updates the daemon chose not to route or the same bot message returns forever.
+    // Telegram has no separate acknowledgment call; the next poll's offset is the acknowledgment
+    // and must advance past every update, including ones the daemon chose not to route.
     let http = spawn_http_mock(telegram_handler(vec![
         json!({"update_id": 100, "message": telegram_message(7, true, 1, "a bot said this")}),
         json!({"update_id": 101, "message": telegram_message(16034700182_i64, false, 2, "a person asked this")}),
@@ -10828,7 +10293,6 @@ async fn telegram_acknowledges_by_advancing_its_offset() {
     assert_eq!(message.text, "a person asked this");
     assert_eq!(message.subject.canonical(), "telegram.16034700182");
 
-    // The next poll must ask past both updates, including the bot message that was filtered.
     assert!(
         tokio::time::timeout(Duration::from_millis(400), transport.next())
             .await
@@ -10846,9 +10310,6 @@ async fn telegram_acknowledges_by_advancing_its_offset() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_telegram_photo_is_routed_with_its_largest_size() {
-    // A photo arrives as the same image at several sizes, smallest first, and its words live in
-    // `caption` rather than `text`. Reading only `text` made the whole message invisible; taking
-    // the first size would hand a model a thumbnail it cannot read.
     let http = spawn_http_mock(telegram_handler(vec![json!({
         "update_id": 300,
         "message": {
@@ -10885,8 +10346,6 @@ async fn a_telegram_photo_is_routed_with_its_largest_size() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_telegram_document_keeps_its_own_name_and_media_type() {
-    // Unlike a photo, a document is passed through rather than re-encoded, so Telegram reports
-    // both and neither has to be inferred.
     let http = spawn_http_mock(telegram_handler(vec![json!({
         "update_id": 301,
         "message": {
@@ -10905,7 +10364,6 @@ async fn a_telegram_document_keeps_its_own_name_and_media_type() {
     let mut transport = telegram(&http.base);
     transport.connect().await.expect("telegram connects");
 
-    // No caption: the attachment is the whole message, and dropping it would be silence.
     let message = next_message(&mut transport).await;
     assert!(message.text.is_empty());
     assert_eq!(message.assets[0].name, "spec.pdf");
@@ -10914,8 +10372,6 @@ async fn a_telegram_document_keeps_its_own_name_and_media_type() {
 
 #[test]
 fn a_document_does_not_need_the_image_modality() {
-    // Gating a PDF on the vision modality would refuse it to a model perfectly able to read one.
-    // Only images need it.
     let store = asset_store();
     let registered = store.assets_for(
         &private_conversation_key("dev", "c1", SUBJECT),
@@ -10943,8 +10399,6 @@ fn a_document_does_not_need_the_image_modality() {
 
 #[test]
 fn an_unsupported_media_type_is_named_but_never_numbered() {
-    // A chat service will deliver anything. The allowlist is the narrow end of the intersection
-    // with what a model actually accepts.
     let store = asset_store();
     let registered = store.assets_for(
         &private_conversation_key("dev", "c1", SUBJECT),
@@ -11042,9 +10496,8 @@ async fn telegram_liveness_and_replies_stay_inside_the_inbound_topic() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_long_telegram_answer_is_split_instead_of_being_rejected_whole() {
-    // `sendMessage` refuses text over 4,096 UTF-16 units, and the gateway's own outbound bound is
-    // twice that. Before splitting, an ordinary long answer was rejected in full and the person who
-    // asked heard nothing at all.
+    // Telegram's send-message call refuses text over 4,096 UTF-16 units, which is half the
+    // gateway's own outbound bound.
     let http = spawn_http_mock(move |path, _body| {
         if path.contains("getMe") {
             return json!({"ok": true, "result": {"id": 1, "is_bot": true, "username": "dekopon_bot"}});
@@ -11055,8 +10508,6 @@ async fn a_long_telegram_answer_is_split_instead_of_being_rejected_whole() {
             ]});
         }
         if path.contains("sendMessage") {
-            // Every chunk is acknowledged as its own message: acceptance is read out of the
-            // service's answer, so a bare `true` is no longer an accepted delivery.
             return json!({"ok": true, "result": {"message_id": 7, "chat": {"id": -1001}}});
         }
         json!({"ok": true, "result": []})
@@ -11065,8 +10516,8 @@ async fn a_long_telegram_answer_is_split_instead_of_being_rejected_whole() {
     transport.connect().await.expect("Telegram connects");
     let message = next_message(&mut transport).await;
 
-    // Astral characters are the case a scalar-value count gets wrong: 3,000 crabs are 6,000 UTF-16
-    // code units, so a splitter counting characters would post one message Telegram refuses.
+    // Counting Unicode scalar values instead of UTF-16 code units undercounts astral characters
+    // like emoji, which could produce a message Telegram still refuses as too long.
     let long = format!("{}\n{}", "a".repeat(2_000), "🦀".repeat(3_000));
     transport
         .driver()
@@ -11112,8 +10563,6 @@ async fn a_long_telegram_answer_is_split_instead_of_being_rejected_whole() {
 
 #[test]
 fn a_chunk_never_splits_a_character_and_prefers_a_line_break() {
-    // The ceiling is in UTF-16 code units, and a chunk boundary is still a character boundary: an
-    // astral character straddling one would be two halves of a replacement glyph in both clients.
     let text = format!("{}\n{}", "a".repeat(100), "🦀".repeat(2_048));
     let chunks = crate::transport::split_message(&text, 4_096, crate::transport::TextUnit::Utf16);
 
@@ -11133,8 +10582,6 @@ fn a_chunk_never_splits_a_character_and_prefers_a_line_break() {
 
 #[test]
 fn an_empty_answer_still_becomes_one_post() {
-    // Every chat service refuses an empty message. Saying so is better than a silent failure the
-    // sender reads as the bot ignoring them.
     assert_eq!(
         crate::transport::split_message("", 4_096, crate::transport::TextUnit::Utf16),
         vec!["[empty response]".to_owned()]
@@ -11143,8 +10590,6 @@ fn an_empty_answer_still_becomes_one_post() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_telegram_chat_is_one_conversation_and_another_chat_is_another() {
-    // The Bot API puts no thread identifier on a plain message, so a conversation collapses to its
-    // chat: consecutive messages continue one exchange, and a group is not the private chat.
     let http = spawn_http_mock(telegram_handler(vec![
         json!({"update_id": 200, "message": telegram_message(16034700182_i64, false, 1, "first")}),
         json!({"update_id": 201, "message": telegram_message(16034700182_i64, false, 2, "second")}),
@@ -11316,7 +10761,6 @@ async fn telegram_sends_a_declared_jpeg_as_a_photo_in_the_authenticated_topic() 
     assert!(multipart.contains("3"));
 }
 
-/// One `sendPhoto` per attachment, with the caption on the first only.
 #[tokio::test(flavor = "multi_thread")]
 async fn telegram_sends_one_photo_per_attachment_and_captions_the_first() {
     let http = spawn_http_mock(|path, _body| {
@@ -11451,15 +10895,8 @@ async fn telegram_reports_partial_delivery_when_long_image_text_fails_after_the_
     assert_eq!(http.calls().len(), 2);
 }
 
-// ---------------------------------------------------------------------------
-// The development transport
-// ---------------------------------------------------------------------------
-
 #[tokio::test(flavor = "multi_thread")]
 async fn the_local_transport_takes_its_conversation_from_the_caller() {
-    // Nothing here is service-native, so the caller names its own conversation and `dev` is the
-    // default. Deliberately not the connection number: a developer who reconnects is still in the
-    // same conversation, and one client driving several sessions needs to keep them apart.
     let directory = temporary();
     let socket_path = directory.path().join("dev.sock");
     let mut transport = crate::transport::local::LocalTransport::new(
@@ -11512,8 +10949,8 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
     );
     assert_eq!(named.conversation.key(), "session-7");
 
-    // The reply resolves only after the transport writer has completed both `write_all` and
-    // `flush`; reading the exact line from the peer proves the kernel-acceptance crossing.
+    // The reply resolves only after the transport writer completes both its write and its flush,
+    // proving the write actually reached the kernel.
     let reply = tokio::spawn({
         let driver = transport.driver();
         let target = first.reply.clone();
@@ -11587,17 +11024,6 @@ async fn the_local_transport_takes_its_conversation_from_the_caller() {
         .expect("image write and flush are accepted");
 }
 
-// ---------------------------------------------------------------------------
-// The trace opens at transport receipt
-// ---------------------------------------------------------------------------
-
-/// Keeps every workspace span for this thread and the tasks a `current_thread` runtime polls on it.
-///
-/// Thread-local rather than global, because this binary runs these tests beside every other one and
-/// a global subscriber would capture all of them. Thread-local rather than scoped to one future,
-/// because the local and WhatsApp transports build their message inside a task they spawned: a
-/// `current_thread` runtime polls those on this thread, so this is the only scoping that reaches
-/// them. Every test below therefore stays on the default single-threaded runtime.
 fn capture_spans() -> (
     dekopon_test_support::CaptureLayer,
     tracing::subscriber::DefaultGuard,
@@ -11617,7 +11043,6 @@ fn spool_spans_keep_message_parent_and_never_record_payload_or_paths() {
     let (capture, _guard) = capture_spans();
     let session = tracing::info_span!("gateway.session");
     let blob = session.in_scope(|| DiskBlob::from_bytes(b"secret pixel sentinel").expect("spool"));
-    // Reading and cleanup after leaving the scope still belong to the originating message.
     assert_eq!(blob.read().expect("read"), b"secret pixel sentinel");
     drop(blob);
     let text = capture.text();
@@ -11687,7 +11112,6 @@ async fn whatsapp_upload_and_send_spans_remain_children_of_the_message() {
     peer.finish().await;
 }
 
-/// Answers one received message with a scripted model, so the span tree is the whole assertion.
 async fn answer_once(message: InboundMessage) {
     let directory = temporary();
     let (broker, _observed) = stub_broker(
@@ -11707,19 +11131,11 @@ async fn answer_once(message: InboundMessage) {
     .await;
 }
 
-/// Asserts one message's trace starts where its transport received it, not where routing succeeded.
-///
-/// Two claims, and both matter: the receive span names the transport family and the service's own
-/// identifier for the turn, and `gateway.message` hangs from that span rather than opening a trace
-/// of its own. The second is what makes the acknowledgment, the signature check, and the routing
-/// decision reachable from the same trace as the model turn that answered.
 fn assert_trace_opens_at_receipt(
     capture: &dekopon_test_support::CaptureLayer,
     kind: &str,
     message_id: &str,
 ) {
-    // Joined because a span is captured once at creation and once per later `record`: the kind is
-    // known when the span opens and the identifier only after the payload has been parsed.
     let received = capture
         .spans()
         .into_iter()
@@ -11920,7 +11336,6 @@ async fn a_whatsapp_delivery_opens_its_trace_around_the_signature_check() {
     .expect("the delivery serializes");
     let digest = crate::transport::whatsapp::hmac_sha256(b"secret", &body);
     let signature: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    // A raw request rather than a client, so the signed bytes are exactly the bytes posted.
     let mut stream = tokio::net::TcpStream::connect(address)
         .await
         .expect("the callback accepts a connection");
@@ -12171,16 +11586,6 @@ async fn a_local_request_opens_its_trace_on_the_line_it_arrived_on() {
     assert_trace_opens_at_receipt(&capture, "local", &message_id);
 }
 
-// ---------------------------------------------------------------------------
-// Cancellation matrix
-// ---------------------------------------------------------------------------
-
-/// A broker that answers the first `answer_first` requests and then parks on the next connection.
-///
-/// `stub_broker` serves a fixed script and never stalls, which cannot reach the two stages a cancel
-/// has to survive: a session waiting on its capability listing, and a session inside a capability
-/// call. This one accepts the parked connection — so the client is genuinely blocked on a reply
-/// rather than on a connect — and answers it only when the test says so.
 async fn parked_broker(
     directory: &Path,
     answer_first: Vec<ResponseEnvelope>,
@@ -12246,12 +11651,6 @@ async fn parked_broker(
     )
 }
 
-/// The shared streaming model, as the factory a route selects.
-///
-/// `ScriptedStreamModel` lives in `dekopon-test-support` because two suites replay the same
-/// recorded transcripts, while `ModelFactory` is this crate's own seam. One cached client per
-/// configured model is exactly what the fixture wants: every session in a test releases events from
-/// the same script, which is what makes "the stream stopped at this event" an assertion at all.
 impl ModelFactory for Arc<dekopon_test_support::ScriptedStreamModel> {
     fn build(
         &self,
@@ -12263,7 +11662,6 @@ impl ModelFactory for Arc<dekopon_test_support::ScriptedStreamModel> {
     }
 }
 
-/// A driver that parks inside `reply`, so a cancel can be aimed at the delivery window itself.
 #[derive(Default)]
 struct ParkedReplyDriver {
     delivering: tokio::sync::Notify,
@@ -12294,33 +11692,18 @@ impl ChatDriver for ParkedReplyDriver {
     }
 }
 
-/// How long a route on this matrix's clock may run before its own budget stops it.
-///
-/// Real time and a short budget rather than a paused clock: the doubles that hold a session open
-/// park blocking threads and are joined with `block_in_place`, which panics on the current-thread
-/// runtime a paused clock needs. One second is long enough that every stage below is reached first
-/// on a loaded machine, and short enough to wait out five times over.
+/// Real time, not a paused clock, is used because the test doubles park blocking threads joined in
+/// a way that panics under a paused clock on this runtime.
 const WALL_CLOCK: Duration = Duration::from_secs(1);
 
-/// Every way a running session can be stopped, as this matrix delivers each one.
-///
-/// Not five variations on one mechanism: three are a person acting through whichever affordance
-/// their transport offers, one is the embedder dropping the session task out from under the work,
-/// and one is the route's own clock firing inside the policy task. They meet at a single
-/// compare-exchange, and that meeting is what a matrix is for — every origin, at every stage a run
-/// can be interrupted at, ends the same way and costs the same nothing.
 #[derive(Clone, Copy, Debug)]
 enum CancelOrigin {
-    /// The person who asked, through one of the three affordances.
     User(CancelVia),
-    /// A shutdown: the routing loop's `JoinSet` is dropped, which aborts the session task.
     Operator,
-    /// The route's `maxDurationMs`, counted by the policy task from `Started`.
     WallClock,
 }
 
 impl CancelOrigin {
-    /// The whole matrix, in the order the design lists it.
     const EVERY: [Self; 5] = [
         Self::User(CancelVia::NativeStop),
         Self::User(CancelVia::Button),
@@ -12329,7 +11712,6 @@ impl CancelOrigin {
         Self::WallClock,
     ];
 
-    /// The route this origin needs: only the wall clock brings a budget of its own.
     fn route(self) -> crate::routes::BoundRoute {
         match self {
             Self::User(_) | Self::Operator => route(model_config()),
@@ -12337,10 +11719,6 @@ impl CancelOrigin {
         }
     }
 
-    /// Delivers the stop, reporting what an authenticated request found when this origin is one.
-    ///
-    /// `None` for the two nobody asks on a person's behalf: a shutdown aborts the task and the
-    /// drop guard is the cancel, and the clock has been running since `Started`.
     fn deliver(
         self,
         runner: &SessionRunner,
@@ -12356,13 +11734,8 @@ impl CancelOrigin {
         }
     }
 
-    /// Waits until the stop is in effect on the session itself, not merely requested.
-    ///
-    /// The three affordances and the clock all reach the compare-exchange before the call that
-    /// delivered them returns. A shutdown does not: `abort` only schedules the cancellation, and
-    /// the guard that marks the session cancelled runs when the runtime drops the task. Releasing a
-    /// parked double before that lands would let the work resume as though nobody had stopped it,
-    /// and the stage would be asserting on a race rather than on a stop.
+    /// A shutdown's abort only schedules cancellation; the guard marking a session cancelled runs
+    /// later, when the runtime actually drops the task.
     async fn landed(self, session: &tokio::task::JoinHandle<()>) {
         if !matches!(self, Self::Operator) {
             return;
@@ -12376,19 +11749,10 @@ impl CancelOrigin {
         panic!("the aborted session task never unwound");
     }
 
-    /// Whether anything is left alive to tell the person this run ended.
-    ///
-    /// Every origin but the shutdown: aborting the session task drops the policy's terminal channel
-    /// in the same instant it cancels the session, and which of the two the policy task observes
-    /// first is a race nothing settles. Nor should it — the process is going down, and
-    /// `docs/chat-progress.md` lists the stale surface a restart leaves behind as an accepted
-    /// limit. What a shutdown cell pins is the half that is not a race: the work stops, and its
-    /// answer never reaches the person.
     const fn renders_the_ending(self) -> bool {
         !matches!(self, Self::Operator)
     }
 
-    /// Joins a session this origin may have aborted rather than let finish.
     async fn joined(self, session: tokio::task::JoinHandle<()>) {
         match session.await {
             Ok(()) => {}
@@ -12398,11 +11762,6 @@ impl CancelOrigin {
     }
 }
 
-/// Waits until the person has been told the run stopped, and reports whether they were.
-///
-/// Polled rather than signalled, because the writer is the policy's own task: it renders the
-/// ending on the decision rather than when the session unwinds. Every stage below asserts that
-/// while its work is still parked, which is the property that makes a stop feel like one.
 async fn told_it_stopped(driver: &RecordingDriver) -> bool {
     for _ in 0..600 {
         if driver
@@ -12417,12 +11776,6 @@ async fn told_it_stopped(driver: &RecordingDriver) -> bool {
     false
 }
 
-/// A model factory that parks while it resolves its client, then counts every turn it is asked for.
-///
-/// The stage between the grant and the first request, which nothing else reaches: `Started` has
-/// been emitted, the policy task is running and on its clock, and the loop has not yet built a
-/// single message. A stop that lands here must cost nothing, so `requests()` is the assertion;
-/// [`BlockedModel`] parks one layer further in, inside the turn it has already bought.
 struct ParkedBuild {
     entered: Mutex<Option<std::sync::mpsc::Sender<()>>>,
     entered_signal: tokio::sync::Mutex<std::sync::mpsc::Receiver<()>>,
@@ -12464,7 +11817,6 @@ impl ParkedBuild {
         }
     }
 
-    /// Turns this session asked the model for, which a stop before turn 1 must leave at zero.
     fn requests(&self) -> usize {
         self.requests.load(Ordering::SeqCst)
     }
@@ -12507,12 +11859,6 @@ impl ChatModel for ParkedBuildHandle {
     }
 }
 
-/// A session parked on its capability listing is already stoppable, before any grant exists.
-///
-/// Registration happens before `connect`, which is what this pins and what nothing else can: the
-/// broker has not answered, so `Started` has not been emitted and the policy task does not exist
-/// yet, and a person waiting on a slow broker still has to be able to stop what they started. The
-/// stages below all run after the grant, where the rest of the matrix lives.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_parked_on_its_capability_listing_is_stoppable_before_its_grant() {
     for via in [
@@ -12563,12 +11909,6 @@ async fn a_session_parked_on_its_capability_listing_is_stoppable_before_its_gran
     }
 }
 
-/// Stage one: every origin, after the grant and before the first request.
-///
-/// The stage is the point: the session holds its grant and is resolving its model client, so a stop
-/// that lands here must leave the model untouched. `requests()` is therefore the assertion rather
-/// than the reply text — a session that answered `Stopped.` *after* paying for a turn was not
-/// stopped before turn 1, it was stopped after it.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_origin_stops_a_session_before_its_first_model_turn() {
     for origin in CancelOrigin::EVERY {
@@ -12620,11 +11960,6 @@ async fn every_origin_stops_a_session_before_its_first_model_turn() {
     }
 }
 
-/// Stage two: every origin, between two deltas of a stream that is still arriving.
-///
-/// The partial text is the property. The loop owns the cumulative text, so interrupting the turn
-/// must neither throw away the half of the answer the person could already read nor show them a
-/// fragment that arrived after they stopped it.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_origin_stops_a_session_between_the_deltas_of_a_stream() {
     for origin in CancelOrigin::EVERY {
@@ -12652,8 +11987,6 @@ async fn every_origin_stops_a_session_between_the_deltas_of_a_stream() {
             4,
         );
         let mut inbound = message("stream then stop");
-        // The stream is a surface, and a surface needs somewhere to be: with no liveness target the
-        // session is reply-only and there would be no renders to assert on at all.
         inbound.liveness = Some(LivenessTarget::Discord {
             channel_id: "200000000000000001".to_owned(),
             message_id: "300000000000000002".to_owned(),
@@ -12670,10 +12003,6 @@ async fn every_origin_stops_a_session_between_the_deltas_of_a_stream() {
         tokio::time::timeout(Duration::from_secs(5), model.wait_for_event())
             .await
             .expect("the first delta reaches the loop");
-        // The render rather than the event is what the stop has to land after. The policy reads the
-        // cumulative text on its own task and its terminal branch is biased ahead of that read, so a
-        // stop raced against the first render would leave the surface blank and prove nothing about
-        // what the person had already been shown.
         let stream = driver.stream_object().expect("the driver streams");
         tokio::time::timeout(Duration::from_secs(5), stream.wait_for_calls(1))
             .await
@@ -12693,8 +12022,6 @@ async fn every_origin_stops_a_session_between_the_deltas_of_a_stream() {
             driver.rendered()
         );
         model.release_next();
-        // Waited on rather than inferred from the join: an operator's abort resolves the session
-        // handle at once, while the event this assertion is about is still on the loop's thread.
         tokio::time::timeout(Duration::from_secs(5), model.wait_for_event())
             .await
             .expect("the stream hands over the event the stop lands on");
@@ -12726,15 +12053,6 @@ async fn every_origin_stops_a_session_between_the_deltas_of_a_stream() {
     }
 }
 
-/// Stage three: every origin, while a capability call is in flight.
-///
-/// An issued call is never cancelled — the broker finishes it and the result is dropped — so what
-/// this pins is that the *session* does not sit on it. The person is told it stopped while the
-/// orphan is still parked, which is why the release comes after that assertion rather than before.
-///
-/// The park is the broker's rather than [`dekopon_test_support::BlockedRuntime`]'s: a gateway
-/// session builds its own `ShellRuntime` around its broker leg, so the only way in from this side
-/// is a broker that accepts the invocation and answers it when the test says so.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_origin_stops_a_session_inside_a_parked_capability_call() {
     for origin in CancelOrigin::EVERY {
@@ -12790,12 +12108,6 @@ async fn every_origin_stops_a_session_inside_a_parked_capability_call() {
     }
 }
 
-/// Stage four: no origin takes back an answer that is already being delivered.
-///
-/// One atomic decides it, and completion claimed it first. Rendering `Stopped.` over an answer
-/// already on its way is the failure this forbids, and the wall clock is in the matrix here for
-/// the same reason the presses are: its budget elapses while the surface is mid-write, and the
-/// ending it would have stopped is one the session had already claimed.
 #[tokio::test(flavor = "multi_thread")]
 async fn no_origin_takes_back_an_answer_that_is_already_being_delivered() {
     for origin in CancelOrigin::EVERY {
@@ -12820,8 +12132,6 @@ async fn no_origin_takes_back_an_answer_that_is_already_being_delivered() {
             .await
             .expect("the session reaches delivery");
         if matches!(origin, CancelOrigin::WallClock) {
-            // Nothing else can make a budget elapse: the surface is inside the one call this task
-            // makes, so the clock cannot even be read until the answer is out.
             tokio::time::sleep(WALL_CLOCK + Duration::from_millis(500)).await;
         }
 
@@ -12843,10 +12153,6 @@ async fn no_origin_takes_back_an_answer_that_is_already_being_delivered() {
     }
 }
 
-/// Waits until the parked driver has recorded the answer it was holding, and reports what it has.
-///
-/// The delivery runs on the policy task, which outlives a session task the operator aborted, so
-/// "what was delivered" is not readable the instant the session's own handle resolves.
 async fn wait_for_delivery(driver: &ParkedReplyDriver) -> Vec<String> {
     for _ in 0..600 {
         let delivered = driver.delivered();
@@ -12858,10 +12164,6 @@ async fn wait_for_delivery(driver: &ParkedReplyDriver) -> Vec<String> {
     Vec::new()
 }
 
-/// A press from someone other than the person who asked is acknowledged and then ignored.
-///
-/// Both halves matter. The acknowledgment is what keeps the service from showing "this interaction
-/// failed" to a bystander, and the ignoring is what keeps one person from stopping another's work.
 #[tokio::test(flavor = "multi_thread")]
 async fn another_subjects_press_is_acknowledged_and_ignored() {
     let directory = temporary();
@@ -12925,11 +12227,6 @@ async fn another_subjects_press_is_acknowledged_and_ignored() {
     );
 }
 
-/// Every session registers, so every transport has a stop path rather than only Slack's Agent.
-///
-/// Before this, registration happened only when a message carried a native liveness target, which
-/// is why four transports had no way to stop a run at all. The message here carries no liveness
-/// target and the driver has no capability objects: the floor case, and it must still be stoppable.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_with_no_liveness_surface_is_still_registered_and_stoppable() {
     let directory = temporary();
@@ -12971,11 +12268,6 @@ async fn a_session_with_no_liveness_surface_is_still_registered_and_stoppable() 
     assert_eq!(driver.replies(), [crate::session::STOPPED_REPLY]);
 }
 
-// ---------------------------------------------------------------------------
-// Conversations: liveness overrides, the route table, and withheld self-inspection
-// ---------------------------------------------------------------------------
-
-/// `for_kind` overlays one kind's block on the transport's base and changes nothing else.
 #[test]
 fn a_liveness_override_replaces_only_the_fields_it_names_and_the_whole_keep_alive() {
     let base = ResolvedLiveness {
@@ -13016,12 +12308,10 @@ fn a_liveness_override_replaces_only_the_fields_it_names_and_the_whole_keep_aliv
         ..ResolvedLiveness::default()
     };
 
-    // An absent key is the base, byte for byte.
     let (settings, keep_alive) = base.for_kind(ConversationKind::Channel);
     assert_eq!(settings, base.settings);
     assert_eq!(keep_alive, base.keep_alive);
 
-    // A present key overlays only what it names.
     let (settings, keep_alive) = base.for_kind(ConversationKind::DirectMessage);
     assert!(settings.stream, "one reader in a direct message: stream");
     assert_eq!(settings.progress, ProgressSurface::Message);
@@ -13029,8 +12319,6 @@ fn a_liveness_override_replaces_only_the_fields_it_names_and_the_whole_keep_aliv
     assert_eq!(settings.mode, LivenessMode::Native);
     assert_eq!(keep_alive, base.keep_alive, "no cadence was overridden");
 
-    // `keepAlive` replaces the whole block rather than merging field by field: three offsets, a
-    // period, and a ceiling are one cadence, and a merged one is a cadence nobody authored.
     let (settings, keep_alive) = base.for_kind(ConversationKind::Thread);
     assert_eq!(settings, base.settings);
     assert_eq!(
@@ -13043,7 +12331,6 @@ fn a_liveness_override_replaces_only_the_fields_it_names_and_the_whole_keep_aliv
     );
 }
 
-/// Declaration order is precedence, `[channel]` excludes threads, and `subjects` restricts.
 #[tokio::test]
 async fn the_route_table_matches_on_kind_container_id_and_subjects_in_declaration_order() {
     let directory = temporary();
@@ -13065,7 +12352,6 @@ async fn the_route_table_matches_on_kind_container_id_and_subjects_in_declaratio
     let table =
         RoutingTable::bind(&config, &catalog(true, Some("reasoning"))).expect("every route binds");
 
-    // `[channel]` on the named id excludes the threads under it; the catch-all below takes them.
     let named = routed("dev", ConversationKind::Channel, "ops");
     assert_eq!(
         table
@@ -13095,7 +12381,6 @@ async fn the_route_table_matches_on_kind_container_id_and_subjects_in_declaratio
         "`kind: [channel]` excludes the threads under the channel it names"
     );
 
-    // `subjects` restricts and never widens.
     assert!(
         table
             .route(&routed("dev", ConversationKind::DirectMessage, "dev"))
@@ -13111,7 +12396,6 @@ async fn the_route_table_matches_on_kind_container_id_and_subjects_in_declaratio
     );
 }
 
-/// A route with `inspectAgentConfig: false` never offers the tool.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_route_that_withholds_self_inspection_offers_no_such_tool() {
     let directory = temporary();
@@ -13284,8 +12568,6 @@ async fn three_persistent_edits_reuse_each_generated_result_and_deliver_the_same
             assert_eq!(claim.subject.canonical(), "whatsapp.15550000001");
             assert_eq!(claim.scope.expect("scope").transport.as_str(), "wa");
         }
-        // ModelScript clones messages after the session ends: only leases survive, but hydration
-        // is still exact. Each edit fetched the original before invoking the provider.
         {
             let prompts = models.prompts.lock().expect("prompts");
             for edit in 0..3 {
@@ -13684,8 +12966,6 @@ async fn photo_burst_serve_flushes_after_quiet_interval_with_one_lead_reply() {
     tokio::time::advance(Duration::from_millis(4999)).await;
     assert_eq!(models.requests(), 0);
     tokio::time::advance(Duration::from_millis(1)).await;
-    // Model execution uses a real blocking worker; keep the deterministic Tokio clock fixed while
-    // yielding until that worker returns, with an independent wall-clock test failure bound.
     let bound = std::time::Instant::now() + Duration::from_secs(10);
     while driver.replies().is_empty() {
         assert!(
@@ -13949,7 +13229,6 @@ async fn photo_burst_telegram_topic_members_continue_only_their_addressed_native
         reply_to: Some(1),
         message_thread_id: Some(42),
     };
-    // Before an addressed lead, even a valid native member cannot wake the bot.
     crate::dispatch(
         &runner,
         &routes,

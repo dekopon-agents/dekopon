@@ -1,12 +1,5 @@
-//! Owner-only private secret map and broker-side source adapters.
-//!
-//! Public DRNs never appear in a provider's invoke input or in WIT. A provider's run-command
-//! proposal may name one beside the capability it proposes, and the broker authorizes that use
-//! exactly like any other secret use: a separate policy decision and a matching owner-authored
-//! binding, after which only the native HTTP sink receives the resolved bytes. This module parses
-//! physical locators at startup without contacting their backends, then resolves one
-//! already-authorized snapshot per invocation. Bootstrap credentials are strict files and are
-//! never DRN-addressable.
+//! Public DRNs never appear in provider input or WIT; the broker authorizes each secret use
+//! separately, and only the native HTTP sink gets resolved bytes.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -1029,7 +1022,6 @@ impl SecretSource {
     }
 }
 
-/// Parses a strict owner-only map and constructs an executable broker catalog without network I/O.
 pub async fn load(path: &Path, expected_uid: u32) -> Result<SecretCatalog, SecretMapError> {
     let bytes = read_private_file(path, expected_uid, HARD_MAX_SECRET_MAP_BYTES)
         .await
@@ -1300,10 +1292,8 @@ async fn read_token(path: &Path, uid: u32) -> Result<Redacted<String>, SourceErr
     Ok(Redacted::new(text.to_owned()))
 }
 
-/// Reads one private secret-map input: the map itself, or a file-source secret.
-///
-/// The refusal stays one opaque `Insecure` on purpose — a source must not tell a caller which check
-/// refused it — so the structured cause is logged by `classified` rather than returned.
+/// The refusal stays one opaque Insecure error on purpose so a caller can't learn which check
+/// failed; the real cause is only logged.
 async fn read_private_file(path: &Path, uid: u32, maximum: usize) -> Result<Vec<u8>, SourceError> {
     let owned = path.to_path_buf();
     tokio::task::spawn_blocking(move || read_trusted_file(&owned, uid, FileTier::Private, maximum))
@@ -1330,9 +1320,8 @@ async fn read_kubernetes_projection(root: &Path, key: &str) -> Result<Vec<u8>, S
         return Err(SourceError::Insecure);
     }
     if root_metadata.permissions().mode() & 0o022 != 0 {
-        // Kubelet's real AtomicWriter root is commonly 01777. It is safe only when the pod mounted
-        // that volume read-only; accepting the mode on a writable filesystem would let another
-        // process replace `..data` between snapshots. The chart always sets readOnly: true.
+        // Kubelet's AtomicWriter root is commonly mode 01777; that's safe only because the chart
+        // always mounts it read-only, otherwise another process could swap data mid-snapshot.
         let filesystem =
             rustix::fs::statvfs(root).map_err(|source| classified(SourceError::Io, &source))?;
         if !filesystem
@@ -1591,11 +1580,8 @@ fn project(bytes: Vec<u8>, projection: &Projection) -> Result<Vec<u8>, SourceErr
             selected_document_scalar(&value, projection.pointer.as_deref())?
         }
         DocumentFormat::Yaml => {
-            // The generic serde data model erases whether a value came through an alias or custom
-            // tag. Reject their syntax before parsing so a small source cannot expand into a large
-            // alias graph, and so a tag cannot change scalar interpretation behind the selector.
-            // This deliberately conservative grammar may reject these bytes inside quoted YAML;
-            // JSON or raw projection is the escape hatch for such values.
+            // YAML alias and tag syntax is rejected before parsing to block alias-expansion attacks
+            // and hidden scalar reinterpretation; JSON or raw projection is the escape hatch.
             if bytes.iter().any(|byte| matches!(byte, b'&' | b'*' | b'!')) {
                 return Err(SourceError::Malformed);
             }
@@ -1782,10 +1768,8 @@ pub enum SourceError {
     Internal,
 }
 
-/// The first `io::Error` in an error's source chain, or `None` when nothing in it is one.
-///
-/// Only the errno leaves this function. Every wrapper along the chain renders a path, which is
-/// what a secret-source event must never carry, so the chain is walked rather than rendered.
+/// Only the errno is extracted here, because every wrapper in the chain renders a path, which a
+/// secret-source event must never carry.
 fn io_cause<'a>(error: &'a (dyn std::error::Error + 'static)) -> Option<&'a std::io::Error> {
     let mut source = error.source();
     while let Some(current) = source {
@@ -1817,15 +1801,13 @@ fn classified<E: fmt::Debug + 'static>(error: SourceError, source: &E) -> Source
             http.response.status_code = source.status().map(|status| status.as_u16()),
         );
     } else if let Some(source) = any.downcast_ref::<FileHygieneError>() {
-        // An `EACCES` opening a private secret file is a `FileHygieneError::Io`, not an
-        // `io::Error`, so the branch above never sees it and the errno an operator acts on —
-        // denied, missing, or a broken mount — sits one hop down the source chain.
+        // EACCES on a private secret file is a FileHygieneError::Io, not an io::Error, so it skips
+        // the branch above; its errno appears one hop down the chain.
         let cause = io_cause(source);
         tracing::debug!(
             event = "secret_source_cause_classified",
             category = error.category(),
             cause_type = "file-hygiene",
-            // The rendered message carries a path; the check name is the low-cardinality half.
             error.check = source.category(),
             error.kind = ?cause.map(std::io::Error::kind),
             error.errno = cause.and_then(std::io::Error::raw_os_error),
@@ -1840,8 +1822,8 @@ fn classified<E: fmt::Debug + 'static>(error: SourceError, source: &E) -> Source
             error.column = source.column(),
         );
     } else {
-        // Some dependency errors carry secret-derived byte offsets or private endpoints when
-        // rendered. Their concrete type plus the stable category is the safe cause at this site.
+        // Unrecognized dependency error types are logged only by type name and category, since
+        // rendering them directly could leak secret-derived byte offsets.
         tracing::debug!(
             event = "secret_source_cause_classified",
             category = error.category(),
@@ -1914,15 +1896,6 @@ mod tests {
         rustix::process::geteuid().as_raw()
     }
 
-    /// A private secret file the broker cannot open has to keep naming its errno.
-    ///
-    /// It used to: the failure was an `io::Error` and `classified` logged
-    /// `error.errno`. #13 replaced it with a `FileHygieneError`, the downcast stopped matching,
-    /// and the event became `cause_type="file-hygiene" error.check="io"` with nothing saying
-    /// which I/O failure it was — and `EACCES` on a mounted secret, `ENOENT` on one that never
-    /// arrived, and `EIO` on a broken mount are three different things to do next. The refusal
-    /// itself stays one opaque `Io`, because a source must not tell a caller which check refused
-    /// it; only this debug event carries the cause.
     #[test]
     fn a_secret_file_that_cannot_be_opened_still_names_its_errno() {
         use std::fs;
@@ -1938,7 +1911,6 @@ mod tests {
         fs::write(&path, b"secret-bytes-that-must-not-be-logged").expect("write fixture");
         fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod fixture");
 
-        // Whatever this platform's errno for an unreadable file is, that is the one to expect.
         let expected = fs::File::open(&path)
             .expect_err("the fixture cannot be opened by its owner")
             .raw_os_error()
@@ -1959,8 +1931,6 @@ mod tests {
             events.contains(&format!("error.errno={expected}")),
             "the errno left the log again: {events}"
         );
-        // The rendered `FileHygieneError` carries the path and the file carries the secret.
-        // Neither may reach this event, which is why the chain is walked rather than rendered.
         assert!(!events.contains("secret-bytes"), "{events}");
         assert!(!events.contains(&path.display().to_string()), "{events}");
     }

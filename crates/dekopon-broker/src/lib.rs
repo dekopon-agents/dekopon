@@ -79,7 +79,6 @@ use tracing::Instrument as _;
 
 const MAX_POLICY_REVISION_BYTES: usize = 256;
 const MAX_POLICY_SCOPE_ENTRIES: usize = 64;
-/// Maximum owner-authored secret-use bindings one broker retains.
 pub const MAX_SECRET_BINDINGS: usize = 1024;
 const EVIDENCE_HASH_DOMAIN: &[u8] = b"dekopon-evidence-v1\0";
 const POLICY_EVIDENCE_MEDIA_TYPE: &str = "application/vnd.dekopon.policy-decision+json";
@@ -87,41 +86,20 @@ const PROVIDER_EVIDENCE_MEDIA_TYPE: &str = "application/vnd.dekopon.provider-res
 const HTTP_EVIDENCE_MEDIA_TYPE: &str = "application/vnd.dekopon.http-evidence+json";
 const STORAGE_EVIDENCE_MEDIA_TYPE: &str = "application/vnd.dekopon.storage-evidence+json";
 
-/// Capability named by the audited denial when no chat-memory record route is declared.
-///
-/// Deliberately not a decision input: nothing compares a capability identifier to it. A
-/// deployment that declares a [`CapabilityRoute::ChatMemoryRecord`] set names its own capability,
-/// and that name is what a delivered-turn record carries. This is only the label the refusal
-/// record uses when there is no such set to name.
 const UNROUTED_RECORD_CAPABILITY: &str = "memory.chat.record";
-/// Conservative complete line bound for broker-curated dedup records.
-///
-/// The current canonical JSON is 217 bytes including LF. Keeping explicit headroom decouples
-/// composition safety from incidental serde field formatting while remaining a fixed trusted
-/// bound rather than a guest claim.
 const MEMORY_DEDUP_LINE_BYTES: u64 = 256;
-/// Exact minimum canonical turn line with empty text and broker-generated `sha256:` fields.
 const MEMORY_MIN_TURN_LINE_BYTES: u64 = 241;
-/// SDK success/failure envelope around the provider's already-bounded result value.
 const MEMORY_PROVIDER_OUTPUT_OVERHEAD_BYTES: u64 = 1_024;
-/// Curated record/query fields and worst-case JSON string escaping at the component boundary.
 const MEMORY_PROVIDER_INPUT_OVERHEAD_BYTES: u64 = 4 * 1024;
 const MEMORY_QUERY_JSON_EXPANSION: u64 = 6;
-/// Raw/decoded collections, canonical-ABI copies, allocator metadata, and component static state.
 const MEMORY_WORKING_SET_OVERHEAD_BYTES: u64 = 4 * 1024 * 1024;
-/// Smallest serialized `{"turns":[],"truncated":false}` result.
 const MEMORY_MIN_RESULT_BYTES: u64 = 30;
-/// The provider owns exactly the turn and permanent-dedup logical files.
 const MEMORY_LOGICAL_FILES: u64 = 2;
-/// Size/read calls for both files plus two appends and the worst-case replacement.
 const MEMORY_RECORD_FIXED_HOST_CALLS: u64 = 5;
-/// Fixed setup/serde headroom plus a conservative instruction allowance per processed byte.
 const MEMORY_FUEL_BASE: u64 = 10_000_000;
 const MEMORY_FUEL_PER_WORK_BYTE: u64 = 256;
-/// Fixed JSONL chunk requested by the generated memory provider.
 const MEMORY_READ_CHUNK_BYTES: u64 = 256 * 1024;
 
-/// Broker-owned bounds for the optional all-or-nothing durable chat-memory surface.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ChatMemoryConfig {
@@ -141,7 +119,6 @@ pub struct ChatMemoryConfig {
 }
 
 impl ChatMemoryConfig {
-    /// Validates cross-file storage and memory bounds with checked arithmetic.
     pub fn validate(
         &self,
         storage: &dekopon_storage_host::StorageLimits,
@@ -175,9 +152,8 @@ impl ChatMemoryConfig {
         let retained = u64::from(self.max_lookback_turns)
             .checked_mul(self.max_turn_bytes)
             .ok_or(BrokerBuildError::InvalidChatMemory)?;
-        // `read-file` asks for a full CHUNK even on its final partial call, and the host
-        // intentionally charges the requested bound. Round both files independently so a valid
-        // near-threshold store cannot become unreadable only because its length is not aligned.
+        // read-file charges a full CHUNK even on a partial final call, so round each file's read
+        // budget independently rather than summing lengths first.
         let dedup_read_budget = round_up(self.max_dedup_bytes, MEMORY_READ_CHUNK_BYTES)?;
         let turns_read_budget = round_up(self.compaction_threshold_bytes, MEMORY_READ_CHUNK_BYTES)?;
         let read_budget = dedup_read_budget
@@ -192,9 +168,6 @@ impl ChatMemoryConfig {
             .ok_or(BrokerBuildError::InvalidChatMemory)?;
         let write_budget = self
             .compaction_target_bytes
-            // One record appends a bounded turn and one fixed-shape permanent dedup line before
-            // an optional replacement. Account each independently rather than assuming one bound
-            // happens to dominate the other.
             .checked_add(self.max_turn_bytes)
             .and_then(|value| value.checked_add(MEMORY_DEDUP_LINE_BYTES))
             .ok_or(BrokerBuildError::InvalidChatMemory)?;
@@ -202,13 +175,8 @@ impl ChatMemoryConfig {
             .compaction_threshold_bytes
             .checked_add(self.max_turn_bytes)
             .ok_or(BrokerBuildError::InvalidChatMemory)?;
-        // Direct compaction peaks at the threshold plus one bounded append and the live dedup
-        // file. JSONL replacement does not retain an on-disk staged copy.
         let namespace_headroom = threshold_with_append
             .checked_add(self.max_dedup_bytes)
-            // Generation directories, files, authority pointers, and replacement
-            // temporaries. The fixed memory invocation has only two logical files; 32 logical
-            // entry charges conservatively cover its canonical manifest as well.
             .and_then(|value| value.checked_add(32 * 4_096))
             .ok_or(BrokerBuildError::InvalidChatMemory)?;
         if retained > self.compaction_target_bytes
@@ -274,8 +242,6 @@ impl ChatMemoryConfig {
             .ok_or(BrokerBuildError::InvalidChatMemory)
     }
 
-    /// Validates the memory algorithm's serialized-input, result, working-set, and fuel needs
-    /// against the independent component-host ceilings.
     pub fn validate_host_limits(
         &self,
         host: &dekopon_broker_host::BrokerHostLimits,
@@ -310,42 +276,28 @@ fn round_up(value: u64, multiple: u64) -> Result<u64, BrokerBuildError> {
         .ok_or(BrokerBuildError::InvalidChatMemory)
 }
 
-/// Default maximum owner-authored constraint sets in one broker instance.
 pub const DEFAULT_MAX_CONSTRAINT_SETS: usize = 1_024;
 
-/// Identity established by a trusted broker transport.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthenticatedContext {
     principal: PrincipalId,
     actor: Actor,
-    /// The authenticated attestor peer this context was derived through, when it was.
     #[serde(skip_serializing_if = "Option::is_none")]
     via: Option<PrincipalId>,
-    /// The canonical external subject an attested context stands for.
     #[serde(skip_serializing_if = "Option::is_none")]
     attested_subject: Option<ExternalSubject>,
-    /// Invocation-authorized chat transport scope; absent for every legacy operation.
     #[serde(skip_serializing_if = "Option::is_none")]
     chat_scope: Option<ChatScopeClaim>,
 }
 
 impl AuthenticatedContext {
-    /// Binds a transport-authenticated principal to its trusted actor identity.
-    ///
-    /// Human and service actors must carry the same principal established by the transport.
-    /// Agent actors may be represented by an authenticated daemon/service principal and are
-    /// therefore bound by an explicit exact policy rule instead.
     pub fn new(principal: PrincipalId, actor: Actor) -> Result<Self, ContextError> {
         Self::build(principal, actor, None, None, None)
     }
 
-    /// Binds a broker-mapped principal derived through an authenticated attestor peer.
-    ///
-    /// `via` is the attestor's own transport principal, and it is the deny-by-default hinge for
-    /// attested authority: policy rules match `via` exactly, so a rule written for direct peers
-    /// (`via` absent) can never authorize an attested context and vice versa. The same
-    /// human/service principal-match rule applies as for direct contexts.
+    /// `via` is the deny-by-default hinge for attested authority: a policy rule for direct peers
+    /// (`via` absent) can never match an attested context, and vice versa.
     pub fn attested(
         principal: PrincipalId,
         actor: Actor,
@@ -355,7 +307,6 @@ impl AuthenticatedContext {
         Self::build(principal, actor, Some(via), Some(subject), None)
     }
 
-    /// Binds an invocation-authorized chat scope to an attested context.
     pub fn attested_chat(
         principal: PrincipalId,
         actor: Actor,
@@ -389,11 +340,6 @@ impl AuthenticatedContext {
         })
     }
 
-    /// The peer's own context annotated with a subject whose attestation was refused.
-    ///
-    /// Used to attribute an `attestation-denied` or `unmapped-subject` decision: no trusted
-    /// mapping happened, so the decision belongs to the connecting peer, but the canonical
-    /// subject it claimed is still route metadata worth auditing.
     #[must_use]
     fn with_refused_subject(&self, subject: ExternalSubject) -> Self {
         Self {
@@ -405,109 +351,80 @@ impl AuthenticatedContext {
         }
     }
 
-    /// Returns the authenticated peer principal.
     #[must_use]
     pub fn principal(&self) -> &PrincipalId {
         &self.principal
     }
 
-    /// Returns the actor bound by trusted workload mapping.
     #[must_use]
     pub fn actor(&self) -> &Actor {
         &self.actor
     }
 
-    /// Returns the attestor peer this context was derived through, when it was.
     #[must_use]
     pub fn via(&self) -> Option<&PrincipalId> {
         self.via.as_ref()
     }
 
-    /// Returns the canonical external subject this context stands for, when attested.
     #[must_use]
     pub fn attested_subject(&self) -> Option<&ExternalSubject> {
         self.attested_subject.as_ref()
     }
 
-    /// Returns the trusted chat scope, only for new chat operations.
     #[must_use]
     pub fn chat_scope(&self) -> Option<&ChatScopeClaim> {
         self.chat_scope.as_ref()
     }
 }
 
-/// Invalid trusted identity binding.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum ContextError {
-    /// A human/service payload identity disagreed with transport authentication.
     #[error("authenticated principal does not match the human or service actor")]
     PrincipalMismatch,
 }
 
-/// Audited invocation result with successful native asset effects.
 #[derive(Debug)]
 pub struct AssetInvocationResult {
-    /// Existing bounded invocation metadata.
     pub result: InvocationResult,
-    /// Read-only output files and table changes, absent on failure.
     pub assets: dekopon_broker_host::asset::AssetOutputs,
 }
 
-/// Which trusted route the broker executes a capability through.
-///
-/// This is the operator's declaration, not a spelling convention. The reserved durable chat-memory
-/// surface is identified here and nowhere else: a capability is part of it because a constraint set
-/// says so, so naming a capability `memory.chat.export` or a provider `memory-chat` changes nothing
-/// the broker hides or denies, and renaming the shipped provider drops no reservation.
-///
-/// [`Generic`](Self::Generic) is the default and is omitted from serialized configuration, so every
-/// constraint set written before the field existed keeps meaning exactly what it meant.
+/// This route is the operator's explicit declaration, not a naming convention: only constraint-set
+/// membership marks the reserved chat-memory surface, no capability or provider name does.
 #[derive(
     Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
 )]
 #[serde(rename_all = "camelCase")]
 pub enum CapabilityRoute {
-    /// An ordinary capability, reachable by any path policy permits.
     #[default]
     Generic,
-    /// The hidden write half of chat memory, reachable only through the delivered-turn operation.
     ChatMemoryRecord,
-    /// The bounded recent-turns read of chat memory.
     ChatMemoryRecent,
-    /// The bounded literal-search read of chat memory.
     ChatMemorySearch,
 }
 
 impl CapabilityRoute {
-    /// The three roles one deployment must declare together to have a chat-memory surface.
     pub(crate) const CHAT_MEMORY: [Self; 3] = [
         Self::ChatMemoryRecord,
         Self::ChatMemoryRecent,
         Self::ChatMemorySearch,
     ];
 
-    /// Whether this is an ordinary capability the generic paths may list, resolve, and invoke.
     #[must_use]
     pub const fn is_generic(&self) -> bool {
         matches!(self, Self::Generic)
     }
 
-    /// Whether this capability belongs to the reserved chat-memory surface.
     #[must_use]
     pub const fn is_chat_memory(self) -> bool {
         !self.is_generic()
     }
 
-    /// Whether a chat session may propose this capability directly.
-    ///
-    /// Recording is never proposable: it is reachable only from the typed delivered-turn
-    /// operation, after gateway-attested transport acceptance.
     #[must_use]
     pub const fn is_chat_memory_retrieval(self) -> bool {
         matches!(self, Self::ChatMemoryRecent | Self::ChatMemorySearch)
     }
 
-    /// The storage authority a chat-memory role requires of its constraint set.
     const fn chat_memory_access(self) -> Option<StorageAccess> {
         match self {
             Self::Generic => None,
@@ -516,7 +433,6 @@ impl CapabilityRoute {
         }
     }
 
-    /// The stable operator-facing name of this route, as authored and as reported.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -534,71 +450,31 @@ impl fmt::Display for CapabilityRoute {
     }
 }
 
-/// Owner-authored execution constraints for one capability.
-///
-/// A constraint set is not a grant. It answers "if some policy permits this capability, how
-/// narrowly does the broker execute it": which provider route, which trusted classification, which
-/// broker-held credential — for everyone, or per acting agent — and which timeout/output/HTTP
-/// bounds. Cedar decides whether anyone may reach it at all.
-///
-/// Splitting the two is what keeps a policy edit from widening an execution bound. Every field
-/// here is validated at construction against the loaded provider manifest, the component host's
-/// independent ceilings, and the credential store; none of it is reachable from policy text.
+/// A constraint set is not a grant: Cedar policy decides reachability, this only bounds how
+/// narrowly an already-permitted capability executes, so editing policy alone can't widen execution
+/// bounds.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ConstraintSet {
-    /// Which trusted route the broker executes this capability through.
-    ///
-    /// Absent means [`CapabilityRoute::Generic`]. Declaring a chat-memory role is the only thing
-    /// that puts a capability on the reserved surface, and the only thing that takes it off the
-    /// generic listing, resolve, and invoke paths.
     #[serde(default, skip_serializing_if = "CapabilityRoute::is_generic")]
     pub route: CapabilityRoute,
-    /// Expected provider selected by the trusted route.
     pub provider: ProviderId,
-    /// Trusted effect classification, which must match the loaded manifest byte for byte.
     pub effect: EffectKind,
-    /// Trusted risk classification, which must match the loaded manifest byte for byte.
     pub risk: RiskLevel,
-    /// Symbolic name of the broker-held credential presented for this capability's HTTP calls.
-    ///
-    /// Binding is per capability rather than per provider on purpose: the confused-deputy scenario
-    /// is "same provider component, different operation", and only the capability knows both. A
-    /// set with no credential — and no [`credential_by_agent`](Self::credential_by_agent) entry for
-    /// the acting agent — transacts unauthenticated. Construction validates the name against the
-    /// credential store and requires every allowed host to sit inside the credential's destination
-    /// binding.
+    /// Credentials bind per capability rather than per provider to block a confused-deputy attack
+    /// where the same provider component performs a different operation than the one that
+    /// authorized it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential: Option<String>,
-    /// Per-agent overrides of [`credential`](Self::credential), keyed by acting agent.
-    ///
-    /// This is the second axis of credential binding, and it answers a different question from the
-    /// first. `credential` decides which secret an *operation* presents; this decides which secret
-    /// a *caller* presents for that operation, so one capability can reach two organizations
-    /// through two tokens without being duplicated under a second capability namespace.
-    ///
-    /// The key is the agent, because that is the identity the deployment already partitions on:
-    /// routes name agents, so a per-agent credential is per-team and per-channel scoping for free.
-    /// It is also trusted input rather than a caller claim — the agent name arrives in the
-    /// [`AuthenticatedContext`] the broker itself derived from an owner-configured attestor grant,
-    /// never from an invocation payload. A caller with no agent at all, such as a direct
-    /// unprivileged peer carrying [`Actor::Service`], matches no override and takes the default.
-    ///
-    /// Every override is validated at construction exactly as the default is: the name must exist
-    /// in the credential store and its destinations must cover every allowed host of this set.
+    /// This is a second, caller-side credential axis keyed by agent identity from the
+    /// broker-derived trusted context, never a caller claim, letting one capability use different
+    /// secrets per caller.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub credential_by_agent: BTreeMap<AgentId, String>,
-    /// Execution and optional HTTP authority granted when this capability is permitted.
     pub constraints: ExecutionConstraints,
 }
 
 impl ConstraintSet {
-    /// Selects the symbolic credential this set presents for one trusted actor.
-    ///
-    /// An agent actor takes its [`credential_by_agent`](Self::credential_by_agent) entry when the
-    /// set declares one, and otherwise the default; every other actor takes the default. `None`
-    /// means this invocation transacts unauthenticated, which is what a set with no credential at
-    /// all has always meant.
     #[must_use]
     pub fn credential_for(&self, actor: &Actor) -> Option<&str> {
         let selected = match actor {
@@ -608,11 +484,6 @@ impl ConstraintSet {
         selected.or(self.credential.as_ref()).map(String::as_str)
     }
 
-    /// Every credential this set could ever select, for construction-time validation.
-    ///
-    /// Validating the reachable set rather than only the default is what keeps an override from
-    /// being the one credential nobody proved: a name the store does not hold, or destinations
-    /// that do not cover this set's allowed hosts, must refuse startup wherever it appears.
     fn selectable_credentials(&self) -> impl Iterator<Item = &String> {
         self.credential
             .iter()
@@ -620,43 +491,26 @@ impl ConstraintSet {
     }
 }
 
-/// Whether startup refuses configuration that cannot apply, or reports it and continues.
-///
-/// This governs *startup* only. No decision the broker makes afterwards depends on it, and in
-/// particular the runtime `unconstrained-capability` denial is unconditional in both modes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum Leniency {
-    /// Refuse to start. Every mismatch is a [`BrokerBuildError`].
     #[default]
     Strict,
-    /// Start anyway, reporting each mismatch as a [`StartupWarning`].
     Tolerant,
 }
 
-/// Configuration that could not apply, reported instead of refusing startup.
-///
-/// Every variant describes something already inert: the broker behaves identically whether the
-/// offending configuration is present or absent. The warning exists so an operator learns their
-/// config says something the deployment cannot honor.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StartupWarning {
-    /// A constraint set named a capability no loaded provider routes, and was dropped.
     UnroutedConstraintSet {
-        /// The unrouted capability.
         capability: CapabilityId,
     },
-    /// A capability a policy could permit has no constraint set bounding it.
-    ///
-    /// Every invocation of it is denied `unconstrained-capability` before Cedar is consulted, so
-    /// the grant is unreachable rather than unbounded.
+    /// Invocation is denied unconstrained-capability before Cedar is even consulted, so an
+    /// unbounded policy grant is unreachable rather than merely unbounded.
     UnconstrainedCapability {
-        /// The capability with no constraint set.
         capability: CapabilityId,
     },
 }
 
 impl StartupWarning {
-    /// Returns the stable machine-readable reason recorded alongside the message.
     #[must_use]
     pub const fn reason(&self) -> &'static str {
         match self {
@@ -665,7 +519,6 @@ impl StartupWarning {
         }
     }
 
-    /// Returns the capability the warning is about.
     #[must_use]
     pub const fn capability(&self) -> &CapabilityId {
         match self {
@@ -691,31 +544,17 @@ impl fmt::Display for StartupWarning {
     }
 }
 
-/// Every capability this broker knows how to execute, and how.
-///
-/// A capability with no constraint set is not deployable: the broker refuses it before consulting
-/// policy at all. Under [`Leniency::Strict`] it also refuses to start if any policy could ever
-/// permit one; under [`Leniency::Tolerant`] that becomes a [`StartupWarning`] and the invocation-
-/// time refusal — which is the part that actually enforces anything — is unchanged.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ConstraintCatalog {
     sets: BTreeMap<CapabilityId, ConstraintSet>,
 }
 
 impl ConstraintCatalog {
-    /// A catalog holding nothing; every capability invocation then denies
-    /// `unconstrained-capability`.
     #[must_use]
     pub fn empty() -> Self {
         Self::default()
     }
 
-    /// Builds a catalog, rejecting a capability declared twice.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerBuildError::DuplicateConstraintSet`] when one capability appears more than
-    /// once. Two constraint sets for one capability would make execution bounds ambiguous.
     pub fn new(
         entries: impl IntoIterator<Item = (CapabilityId, ConstraintSet)>,
     ) -> Result<Self, BrokerBuildError> {
@@ -728,12 +567,6 @@ impl ConstraintCatalog {
         Ok(Self { sets })
     }
 
-    /// Drops every set naming a capability no loaded provider routes, returning what was dropped.
-    ///
-    /// Used only under [`Leniency::Tolerant`]. Such a set is inert either way — the broker cannot
-    /// execute a capability it has no route for — so removing it changes no decision. It exists so
-    /// an operator can keep constraint sets for a provider they have not dropped in yet without the
-    /// broker refusing to start.
     pub fn retain_routed(&mut self, registry: &BrokerProviderRegistry) -> Vec<CapabilityId> {
         let routed = registry
             .capabilities()
@@ -751,29 +584,19 @@ impl ConstraintCatalog {
         dropped
     }
 
-    /// Returns the constraint set for one capability, if the deployment declared one.
     #[must_use]
     pub fn get(&self, capability: &CapabilityId) -> Option<&ConstraintSet> {
         self.sets.get(capability)
     }
 
-    /// Iterates constraint sets in capability-identifier order.
     pub fn iter(&self) -> impl Iterator<Item = (&CapabilityId, &ConstraintSet)> {
         self.sets.iter()
     }
 
-    /// Returns the capability declared for one chat-memory role, when the deployment declares it.
-    ///
-    /// Unambiguous by construction: [`Self::validate`] refuses a catalog that gives one role two
-    /// constraint sets, so the reserved surface can never be two capabilities deep.
     fn routed(&self, route: CapabilityRoute) -> Option<(&CapabilityId, &ConstraintSet)> {
         self.sets.iter().find(|(_, set)| set.route == route)
     }
 
-    /// Returns the provider every chat-memory route names, when any route is declared.
-    ///
-    /// Also unambiguous by construction: [`Self::validate`] refuses chat-memory routes split
-    /// across two providers, so one provider owns the whole reserved surface or none of it does.
     fn chat_memory_provider(&self) -> Option<&ProviderId> {
         self.sets
             .values()
@@ -781,19 +604,16 @@ impl ConstraintCatalog {
             .map(|set| &set.provider)
     }
 
-    /// Number of declared constraint sets.
     #[must_use]
     pub fn len(&self) -> usize {
         self.sets.len()
     }
 
-    /// Whether the catalog declares nothing.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.sets.is_empty()
     }
 
-    /// Proves every declared set against the loaded routes, host ceilings, and credential store.
     fn validate(
         &self,
         registry: &BrokerProviderRegistry,
@@ -824,10 +644,6 @@ impl ConstraintCatalog {
         Ok(())
     }
 
-    /// Proves the declared chat-memory routes are unambiguous and carry the authority they imply.
-    ///
-    /// Every conflict is reported together. A route mistake is an editing mistake in one file, and
-    /// an operator fixing three of them should need one run rather than three.
     fn validate_routes(&self) -> Result<(), BrokerBuildError> {
         let mut conflicts = Vec::new();
         for route in CapabilityRoute::CHAT_MEMORY {
@@ -880,43 +696,20 @@ impl ConstraintCatalog {
     }
 }
 
-/// An owner-configured credential whose presentable value is produced once per invocation.
-///
-/// Every other credential in the store is fixed at startup, which is the right shape for a personal
-/// access token an operator rotates by hand. A subscription credential is not: its access token
-/// expires on the hour and its refresh token rotates on every renewal, so the value to present is
-/// only knowable at the moment of use.
-///
-/// Resolution is the deploying process's job, not the broker's. `dekopon-brokerd` implements this
-/// over the credential file format and OAuth refresh grant `dekopon-model` already owns; the broker
-/// calls it after authorization and before constructing the execution context, so a refresh is
-/// never an HTTP call the guest's request grant pays for and never appears in evidence.
-///
-/// The implementation is responsible for serializing concurrent resolutions of the same credential:
-/// a refresh token that two callers spend at once is a revoked token family.
+/// Resolved after authorization and before the execution context is built, so a refresh never
+/// appears in evidence; concurrent resolutions of the same credential must be serialized or the
+/// refresh token family is revoked.
 #[async_trait]
 pub trait RefreshingCredential: Send + Sync + fmt::Debug {
-    /// Authorities this credential may be presented to, in `allowedHosts` grammar.
-    ///
-    /// Answered without resolving, because constraint-set coverage is proven at startup: every
-    /// allowed host of a set that names this credential must appear here verbatim.
     fn destinations(&self) -> &[String];
 
-    /// Produces the value to present for one invocation.
     async fn resolve(&self) -> Result<BoundCredential, CredentialRefreshError>;
 }
 
-/// Why a per-invocation credential could not be produced.
-///
-/// The split is the axis a caller acts on. A revoked or reused refresh token cannot be retried into
-/// working — a human has to authorize again — while a transport failure or a 5xx from the token
-/// endpoint is the next invocation's problem and no operator action.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
 pub enum CredentialRefreshError {
-    /// The stored authorization is gone; only an operator re-login restores it.
     #[error("the credential's authorization is gone and must be renewed by an operator")]
     ReauthorizationRequired,
-    /// The refresh did not complete; a later invocation may succeed unchanged.
     #[error("the credential could not be refreshed ({category})")]
     Unavailable {
         /// Low-cardinality failure class, never a message derived from credential material.
@@ -925,7 +718,6 @@ pub enum CredentialRefreshError {
 }
 
 impl CredentialRefreshError {
-    /// Stable, low-cardinality name for telemetry and the invocation's classified reason.
     #[must_use]
     pub const fn category(self) -> &'static str {
         match self {
@@ -934,12 +726,10 @@ impl CredentialRefreshError {
         }
     }
 
-    /// Whether retrying this invocation unchanged could ever succeed.
     const fn permanent(self) -> bool {
         matches!(self, Self::ReauthorizationRequired)
     }
 
-    /// The classified reason the invocation result and the audit record carry.
     const fn reason(self) -> &'static str {
         if self.permanent() {
             "credential-unavailable"
@@ -949,17 +739,9 @@ impl CredentialRefreshError {
     }
 }
 
-/// One entry of the broker's credential store.
-///
-/// Both shapes are owner-authored and destination-bound; they differ only in when the value exists.
 #[derive(Clone, Debug)]
 pub enum StoredCredential {
-    /// Resolved once from owner-only storage at startup.
-    ///
-    /// Boxed because a rendered credential is an order of magnitude larger than a resolver handle,
-    /// and this enum is stored by value for every entry in the store.
     Fixed(Box<BoundCredential>),
-    /// Re-derived per invocation by the deploying process.
     Refreshing(Arc<dyn RefreshingCredential>),
 }
 
@@ -976,12 +758,8 @@ impl From<Arc<dyn RefreshingCredential>> for StoredCredential {
 }
 
 impl StoredCredential {
-    /// Whether one allowed-host scope is covered verbatim by this entry's destinations.
-    ///
-    /// Both arms reach the same comparison `BoundCredential::covers` uses. A refreshing entry has no
-    /// rendered credential to ask at startup, and a second implementation of the comparison could
-    /// accept a host the injector then refuses — which is the runtime mismatch this check exists to
-    /// make unreachable.
+    /// The Refreshing arm must reuse the same coverage comparison Fixed uses, or a covered host
+    /// could later be refused.
     fn covers(&self, allowed_host: &str) -> bool {
         match self {
             Self::Fixed(credential) => credential.covers(allowed_host),
@@ -992,28 +770,17 @@ impl StoredCredential {
     }
 }
 
-/// Broker-held credentials resolvable from constraint sets by symbolic name.
-///
-/// The store is constructed by the deploying process from owner-only storage and handed to the
-/// broker whole; constraint sets refer to entries by name only, so serialized configuration never
-/// contains secret material. Values inside are [`BoundCredential`]s, whose secrets are `Redacted`
-/// end to end, or [`RefreshingCredential`] resolvers that produce one per invocation.
 #[derive(Debug, Default)]
 pub struct CredentialStore {
     entries: BTreeMap<String, StoredCredential>,
 }
 
 impl CredentialStore {
-    /// A store holding no credentials; every credentialed constraint set then fails construction.
     #[must_use]
     pub fn empty() -> Self {
         Self::default()
     }
 
-    /// Builds a store, rejecting duplicate symbolic names.
-    ///
-    /// Entries are `BoundCredential`s, `Arc<dyn RefreshingCredential>`s, or `StoredCredential`s
-    /// directly, so one deploying process can mix the kinds in one pass over its configuration.
     pub fn new<C: Into<StoredCredential>>(
         entries: impl IntoIterator<Item = (String, C)>,
     ) -> Result<Self, BrokerBuildError> {
@@ -1031,7 +798,6 @@ impl CredentialStore {
     }
 }
 
-/// One owner-authored executable binding for a public DRN.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SecretUseBinding {
     pub binding_id: String,
@@ -1047,7 +813,6 @@ pub struct SecretUseBinding {
 }
 
 impl SecretUseBinding {
-    /// Validates the binding's native sink and complete exact scope.
     pub fn validate(&self) -> Result<(), dekopon_capability::SecretUseGrantError> {
         self.grant().validate()
     }
@@ -1090,7 +855,6 @@ impl SecretUseBinding {
     }
 }
 
-/// Bounded secret bytes returned only inside the broker process.
 #[derive(Clone)]
 pub struct SecretMaterial(SecretBytes);
 
@@ -1111,7 +875,6 @@ impl fmt::Debug for SecretMaterial {
     }
 }
 
-/// A private-map adapter that resolves one already-authorized DRN snapshot.
 #[async_trait]
 pub trait SecretResolver: Send + Sync + fmt::Debug {
     async fn resolve(&self, secret: &SecretDrn) -> Result<SecretMaterial, SecretResolutionError>;
@@ -1135,7 +898,6 @@ impl SecretResolver for EmptySecretResolver {
     }
 }
 
-/// Private-map bindings plus the broker-owned resolver that can materialize them.
 pub struct SecretCatalog {
     bindings: Vec<SecretUseBinding>,
     resolver: Arc<dyn SecretResolver>,
@@ -1217,7 +979,6 @@ impl SecretCatalog {
         self.bindings.iter().map(|binding| &binding.secret)
     }
 
-    /// Attaches the owner-authored private-map revision used by authority-bound continuity.
     pub fn with_authority_revision(mut self, revision: String) -> Result<Self, BrokerBuildError> {
         if revision.is_empty()
             || revision.len() > 128
@@ -1288,11 +1049,6 @@ impl SecretCatalog {
     }
 }
 
-/// A retired configuration key, decoded only so a refusal can name what replaced it.
-///
-/// Its own type rather than `serde::de::IgnoredAny` because the grants it sits in derive `Eq`, and
-/// `IgnoredAny` implements only `PartialEq`. It remembers nothing but presence, which is all a
-/// refusal needs.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(from = "serde::de::IgnoredAny")]
 pub struct RetiredKey;
@@ -1303,28 +1059,14 @@ impl From<serde::de::IgnoredAny> for RetiredKey {
     }
 }
 
-/// One owner-authored chat-scope grant: a transport, and the conversations on it.
-///
-/// The same [`ConversationMatch`] a gateway route is written with, so the attestor entry and the
-/// route file read as one table. Default-deny stays intact because `conversation` is required and
-/// `kind: any` is a word an owner types rather than an omission they fall into.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ChatScopeGrant {
-    /// Transport family this grant covers.
     pub kind: ChatTransportKind,
-    /// The configured transport name, which is what a claim carries.
     pub transport: dekopon_core::TransportId,
-    /// The conversations on it. Required; `{ kind: any }` is how an owner says "all of them".
     pub conversation: ConversationMatch,
-    /// Required exactly for `kind: local`, where the subject service is not implied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_subject_service: Option<String>,
-    /// The retired `breadth:` tag, decoded only so the refusal can name its replacement.
-    ///
-    /// Kept as an ignored field rather than deleted outright: `deny_unknown_fields` would refuse an
-    /// 0.13 file with serde's own "unknown field" sentence, which tells an operator nothing about
-    /// what to write instead.
     #[serde(default, skip_serializing)]
     pub breadth: Option<RetiredKey>,
 }
@@ -1367,7 +1109,6 @@ impl ChatScopeGrant {
     }
 }
 
-/// Renders every selector problem in one sentence, semicolon separated.
 fn render_conversation_problems(problems: &[ConversationMatchProblem]) -> String {
     problems
         .iter()
@@ -1376,23 +1117,15 @@ fn render_conversation_problems(problems: &[ConversationMatchProblem]) -> String
         .join("; ")
 }
 
-/// One peer's authority to attest external subjects, scoped to canonical namespaces.
-///
-/// Grants belong to owner-controlled deployment configuration, exactly like peer identity
-/// mapping. A grant does not confer any capability by itself: it only lets the broker derive an
-/// attested context, which still has to match a `via`-scoped policy rule to do anything.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AttestorGrant {
-    /// Canonical-prefix namespaces this peer may attest, matched on segment boundaries.
     pub namespaces: Vec<String>,
-    /// Explicit chat scope authority. Empty preserves legacy subject-only attestation behavior.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub chat_scopes: Vec<ChatScopeGrant>,
 }
 
 impl AttestorGrant {
-    /// Validates namespace grammar: a service name optionally followed by canonical segments.
     pub fn validate(&self) -> Result<(), BrokerBuildError> {
         if self.namespaces.is_empty() || self.namespaces.len() > MAX_POLICY_SCOPE_ENTRIES {
             return Err(BrokerBuildError::InvalidAttestorScope {
@@ -1424,7 +1157,6 @@ impl AttestorGrant {
         Ok(())
     }
 
-    /// Whether this grant covers one canonical subject, on segment boundaries.
     #[must_use]
     pub fn permits(&self, subject: &ExternalSubject) -> bool {
         self.namespaces
@@ -1432,7 +1164,6 @@ impl AttestorGrant {
             .any(|namespace| subject.in_namespace(namespace))
     }
 
-    /// Requires both existing subject namespace authority and one exact/bounded chat grant.
     #[must_use]
     pub fn permits_chat(&self, subject: &ExternalSubject, scope: &ChatScopeClaim) -> bool {
         self.permits(subject)
@@ -1444,27 +1175,19 @@ impl AttestorGrant {
     }
 }
 
-/// Owner-controlled mapping from canonical external subjects to stable principals.
-///
-/// This is the trusted half of chat identity: the transport authenticates *which subject* sent a
-/// message, and this directory alone decides *who that is* inside Dekopon. Unmapped subjects
-/// resolve to nothing and fail closed; principals are never minted on demand.
+/// This directory alone decides identity from an authenticated subject; unmapped subjects fail
+/// closed and principals are never minted on demand.
 #[derive(Debug, Default)]
 pub struct IdentityDirectory {
-    // Keyed by the subject itself rather than its rendered canonical form: the canonical string is
-    // injective over the segments, so the two keys are equivalent, and a lookup on the attested
-    // path no longer allocates one just to throw it away.
     mappings: BTreeMap<ExternalSubject, PrincipalId>,
 }
 
 impl IdentityDirectory {
-    /// A directory with no mappings; every attested proposal then denies `unmapped-subject`.
     #[must_use]
     pub fn empty() -> Self {
         Self::default()
     }
 
-    /// Builds a directory, rejecting duplicate subjects.
     pub fn new(
         entries: impl IntoIterator<Item = (ExternalSubject, PrincipalId)>,
     ) -> Result<Self, BrokerBuildError> {
@@ -1480,27 +1203,19 @@ impl IdentityDirectory {
         Ok(Self { mappings })
     }
 
-    /// Resolves one canonical subject to its stable principal.
     #[must_use]
     pub fn resolve(&self, subject: &ExternalSubject) -> Option<&PrincipalId> {
         self.mappings.get(subject)
     }
 
-    /// Iterates the mapped principals, for construction-time policy validation.
     pub fn principals(&self) -> impl Iterator<Item = &PrincipalId> {
         self.mappings.values()
     }
 }
 
-/// Independent broker limits for owner-authored constraint state.
-///
-/// Every field defaults independently to the value [`BrokerLimits::default`] gives it, which is
-/// the same value an entirely absent `brokerLimits` block produces, so a restated default cannot
-/// drift away from the one the code uses.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct BrokerLimits {
-    /// Maximum owner-authored constraint sets accepted at construction.
     pub max_constraint_sets: usize,
 }
 
@@ -1522,10 +1237,8 @@ fn validate_policy_revision(revision: &str) -> Result<(), BrokerBuildError> {
     Ok(())
 }
 
-/// Renders the trusted routing metadata a policy may condition on.
-///
-/// Every value comes from the broker's own view of the authenticated context. The proposal's input
-/// is deliberately absent, so no policy can be made to depend on a value the caller supplies.
+/// Every value here comes from the broker's own authenticated-context view; caller-supplied
+/// proposal input is deliberately excluded so no policy can be made to depend on it.
 fn policy_context(context: &AuthenticatedContext) -> PolicyContext {
     PolicyContext {
         via: context.via().map(|via| via.as_str().to_owned()),
@@ -1574,15 +1287,9 @@ fn validate_trusted_metadata(
     Ok(())
 }
 
-/// Proves every credentialed constraint set's destination binding at construction time.
-///
-/// The runtime injector refuses destinations outside the binding as defense in depth, but this
-/// check is the load-bearing one: with every `allowedHosts` entry required verbatim in the
-/// credential's destinations, no authorized request can ever reach the runtime mismatch path.
-///
-/// It runs over every credential the set can select — the default and each per-agent override —
-/// because selection happens per invocation and an unproven override is a credential the first
-/// caller to match it would discover at execution time.
+/// This is the load-bearing check requiring every allowedHosts entry verbatim in the credential's
+/// destinations; it also proves every per-agent override, since an unproven one would surface only
+/// as a runtime mismatch when a caller first matches it.
 fn validate_set_credential(
     capability_id: &CapabilityId,
     set: &ConstraintSet,
@@ -1605,8 +1312,8 @@ fn validate_set_credential(
                     capability: capability_id.clone(),
                     name: name.clone(),
                 })?;
-        // Coverage is proven from the entry's declared destinations, which a refreshing entry
-        // answers without resolving: startup must not depend on a reachable token endpoint.
+        // Coverage must be checked from declared destinations only; resolving a refreshing
+        // credential would make startup depend on a live token endpoint.
         for host in &http.allowed_hosts {
             if !credential.covers(host) {
                 return Err(BrokerBuildError::CredentialDestinationMismatch {
@@ -1648,17 +1355,11 @@ fn validate_set_constraints(set: &ConstraintSet) -> Result<(), BrokerBuildError>
     let Some(http) = &constraints.http else {
         return Ok(());
     };
-    // The same grammar the capability gate and the HTTP host enforce. A constraint set this
-    // broker accepted but they rejected would authorize calls nothing can serve.
     http.validate()
         .map_err(|source| BrokerBuildError::InvalidHttpConstraints { source })?;
     Ok(())
 }
 
-/// The model-facing note announcing durable chat memory.
-///
-/// Shared by the live surface and the startup frame ceiling so the check measures the exact bytes
-/// a session would receive.
 fn memory_prompt_note(max_lookback_turns: u32) -> String {
     format!(
         "Durable chat memory is available on demand. Use `memory recent --last N` or `memory \
@@ -1667,34 +1368,18 @@ fn memory_prompt_note(max_lookback_turns: u32) -> String {
     )
 }
 
-/// One thing wrong with the deployment's declared capability routes.
-///
-/// A route is the operator's only handle on the reserved chat-memory surface, so an ambiguous or
-/// under-declared one has no reading the broker may pick for them.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RouteConflict {
-    /// Two or more constraint sets claimed one chat-memory role.
     DuplicateRole {
-        /// The role claimed more than once.
         route: CapabilityRoute,
-        /// Every capability claiming it, in catalog order.
         capabilities: Vec<CapabilityId>,
     },
-    /// Chat-memory routes named more than one provider.
-    ///
-    /// The surface is one component's, all of it or none: a split would let one provider hold the
-    /// write half of a conversation another provider reads back.
-    SplitProvider {
-        /// Every provider named by a chat-memory route.
-        providers: Vec<ProviderId>,
-    },
-    /// A chat-memory route did not declare the chat-namespace JSONL authority its role requires.
+    /// The chat-memory surface belongs to one provider, all of it or none: a split would let one
+    /// provider hold the write half of a conversation another provider reads back.
+    SplitProvider { providers: Vec<ProviderId> },
     MissingChatStorage {
-        /// The capability carrying the route.
         capability: CapabilityId,
-        /// The declared route.
         route: CapabilityRoute,
-        /// The storage access that role must declare.
         access: StorageAccess,
     },
 }
@@ -1735,126 +1420,63 @@ impl fmt::Display for RouteConflict {
     }
 }
 
-/// Failure to construct a coherent broker boundary.
 #[derive(Debug, Error)]
 pub enum BrokerBuildError {
-    /// A broker limit was zero.
     #[error("broker limit {field} must be greater than zero")]
-    ZeroLimit {
-        /// Invalid field.
-        field: &'static str,
-    },
-    /// Policy revision was empty or over its bound.
+    ZeroLimit { field: &'static str },
     #[error("policy revision must contain at most 256 bytes")]
     InvalidPolicyRevision,
-    /// Constraint-set count exceeded the broker ceiling.
     #[error("configuration contains {count} constraint sets; broker maximum is {maximum}")]
-    TooManyConstraintSets {
-        /// Actual count.
-        count: usize,
-        /// Maximum count.
-        maximum: usize,
-    },
-    /// A policy could permit a capability the deployment declared no constraint set for.
-    ///
-    /// Refusing at startup rather than at decision time is the point: a grant nothing knows how to
-    /// execute is a configuration mistake, and the alternative is discovering it in a denial log
-    /// the first time someone exercises the grant.
+    TooManyConstraintSets { count: usize, maximum: usize },
     #[error("policy permits capability {capability}, which has no constraint set")]
-    UnconstrainedCapability {
-        /// Capability referenced by policy with no constraint set.
-        capability: CapabilityId,
-    },
-    /// One capability was given two constraint sets.
+    UnconstrainedCapability { capability: CapabilityId },
     #[error("configuration duplicates a constraint set for capability {capability}")]
-    DuplicateConstraintSet {
-        /// Duplicated capability.
-        capability: CapabilityId,
-    },
-    /// A constraint set named no loaded capability.
+    DuplicateConstraintSet { capability: CapabilityId },
     #[error("constraint set capability {capability} has no loaded provider route")]
-    UnknownCapability {
-        /// Unknown capability.
-        capability: CapabilityId,
-    },
-    /// Trusted provider did not match the loaded route.
+    UnknownCapability { capability: CapabilityId },
     #[error(
         "constraint set expected provider {expected} for {capability}, but route selects {actual}"
     )]
     ProviderMismatch {
-        /// Capability.
         capability: CapabilityId,
-        /// Trusted expected provider.
         expected: ProviderId,
-        /// Loaded route provider.
         actual: ProviderId,
     },
-    /// Trusted effect/risk did not match the component manifest.
     #[error("constraint set metadata {field} does not match loaded capability {capability}")]
     CapabilityMetadataMismatch {
-        /// Capability.
         capability: CapabilityId,
-        /// Mismatched field.
         field: &'static str,
     },
-    /// A constraint set omitted a positive bound or supplied an overbroad scope value.
     #[error("execution constraints are incomplete or overbroad")]
     InvalidPolicyConstraints,
-    /// A constraint set's HTTP scope did not satisfy the grammar the gate and HTTP host enforce.
-    ///
-    /// Separate from [`Self::InvalidPolicyConstraints`] because the grammar names the rule that
-    /// refused the set — an empty host list, an overlong scope — and an operator editing a
-    /// constraint file needs that rule, not the fact that something was wrong somewhere.
     #[error("http execution constraints are invalid")]
     InvalidHttpConstraints {
-        /// The grammar rule that refused the set.
         #[source]
         source: HttpConstraintsError,
     },
-    /// A constraint set attempted to exceed the component host's independent ceilings.
     #[error("execution constraints exceed component host ceilings")]
     HostConstraint {
-        /// Host validation failure.
         #[source]
         source: BrokerHostError,
     },
-    /// A constraint set named a credential the store does not hold.
     #[error("constraint set for {capability} names unknown credential {name:?}")]
     UnknownCredential {
-        /// Capability whose constraint set referenced the credential.
         capability: CapabilityId,
-        /// Symbolic credential name.
         name: String,
     },
-    /// A credentialed constraint set granted no HTTP authority to present the credential over.
     #[error("constraint set for {capability} binds a credential but grants no HTTP authority")]
-    CredentialWithoutHttp {
-        /// Capability whose constraint set referenced the credential.
-        capability: CapabilityId,
-    },
-    /// A credentialed constraint set allowed a host outside the credential's destination binding.
-    ///
-    /// Enforcing coverage at construction is what makes a runtime destination/credential
-    /// mismatch unreachable: every host the set can authorize is a host the credential is
-    /// explicitly bound to.
+    CredentialWithoutHttp { capability: CapabilityId },
     #[error(
         "constraint set for {capability} allows host {host:?} outside credential {name:?} \
          destinations"
     )]
     CredentialDestinationMismatch {
-        /// Capability whose constraint set referenced the credential.
         capability: CapabilityId,
-        /// Symbolic credential name.
         name: String,
-        /// The allowed host missing from the credential's destinations.
         host: String,
     },
-    /// Two credential entries shared one symbolic name.
     #[error("credential store duplicates name {name:?}")]
-    DuplicateCredential {
-        /// Duplicated symbolic name.
-        name: String,
-    },
+    DuplicateCredential { name: String },
     #[error("configuration contains {count} secret bindings; broker maximum is {maximum}")]
     TooManySecretBindings { count: usize, maximum: usize },
     #[error("private secret map revision is invalid")]
@@ -1881,54 +1503,26 @@ pub enum BrokerBuildError {
     SecretBindingWithoutHttp { binding: String },
     #[error("secret binding {binding:?} exceeds its capability HTTP constraints")]
     SecretBindingExceedsCapability { binding: String },
-    /// An attestor grant named an empty, overbroad, or non-canonical namespace.
     #[error("attestor namespace scope {scope:?} is not a canonical subject prefix")]
-    InvalidAttestorScope {
-        /// The offending scope (or entry count when the list itself is invalid).
-        scope: String,
-    },
-    /// An owner-authored chat scope grant was noncanonical, overbroad, or malformed.
+    InvalidAttestorScope { scope: String },
     #[error("attestor chat scope is invalid")]
     InvalidChatScope,
-    /// A chat scope grant still carries the 0.13 `breadth:` tag.
-    ///
-    /// Its own variant because the fix is one sentence an operator can act on: the breadths are
-    /// gone, and the selector that replaces all three is the same one the gateway's routes use.
     #[error(
         "attestor chat scope still names `breadth`, which is gone; write \
          `conversation: {{ kind: [channel], ids: [...] }}` (or `kind: any`) instead"
     )]
     RetiredChatScopeBreadth,
-    /// An owner-authored `conversation:` selector could never name a real conversation.
-    ///
-    /// Carries every problem rather than the first: a selector with a duplicate kind and two
-    /// unusable ids is one refusal naming all three.
     #[error("attestor chat scope conversation is invalid: {}", render_conversation_problems(.problems))]
     InvalidChatScopeConversation {
-        /// Every problem the selector has, in the order they were found.
         problems: Vec<ConversationMatchProblem>,
     },
-    /// A local chat scope grant named a service the external subject grammar does not define.
-    ///
-    /// Separate from [`Self::InvalidChatScope`] because it is the one chat-scope rejection whose
-    /// cause is a free-form operator string rather than a structural rule: the source names the
-    /// offending value, which is what turns a typo in the owner config into a one-line fix.
     #[error("attestor chat scope names an invalid local subject service")]
     InvalidChatScopeService {
-        /// Why the service segment was rejected; its message quotes the offending value.
         #[source]
         source: SubjectError,
     },
-    /// Chat-memory bounds or their composition with storage ceilings are invalid.
     #[error("chat-memory bounds do not compose with provider/storage ceilings")]
     InvalidChatMemory,
-    /// `chatMemory:` is configured but the constraint sets do not route the whole surface.
-    ///
-    /// Its own variant because it is the one chat-memory refusal an upgrade earns by *not* editing
-    /// a file: a deployment that already had `memory.chat.*` capabilities and a `chatMemory:` block
-    /// composed fine until routes replaced name matching. [`Self::InvalidChatMemory`] means
-    /// declared roles whose bounds do not compose; this one means there is nothing declared to
-    /// compose with, and the fix is `route:` lines rather than a bound to widen.
     #[error(
         "chatMemory is configured but no constraint set declares route: {}; the surface is all \
          three roles — chatMemoryRecord, chatMemoryRecent, chatMemorySearch — with exactly one \
@@ -1936,160 +1530,88 @@ pub enum BrokerBuildError {
          docs/upgrading.md",
         roles.iter().map(|role| role.as_str()).collect::<Vec<_>>().join(", ")
     )]
-    UnroutedChatMemory {
-        /// Every chat-memory role no constraint set declares, in role order.
-        roles: Vec<CapabilityRoute>,
-    },
-    /// Declared capability routes were ambiguous or under-declared.
-    ///
-    /// Carries every conflict rather than the first, because a route file is edited as a whole.
+    UnroutedChatMemory { roles: Vec<CapabilityRoute> },
     #[error("constraint sets declare {} conflicting capability route(s): {}", conflicts.len(),
         conflicts.iter().map(ToString::to_string).collect::<Vec<_>>().join("; "))]
-    ConflictingRoutes {
-        /// Every route conflict found, in check order.
-        conflicts: Vec<RouteConflict>,
-    },
-    /// Two identity mappings named one canonical subject.
+    ConflictingRoutes { conflicts: Vec<RouteConflict> },
     #[error("identity mapping duplicates subject {subject:?}")]
-    DuplicateSubjectMapping {
-        /// Duplicated canonical subject.
-        subject: String,
-    },
+    DuplicateSubjectMapping { subject: String },
 }
 
-/// Metadata-only event appended to the broker audit log.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
 pub enum AuditEvent {
-    /// Authorization allowed or denied before provider execution.
     Decision {
-        /// Invocation identifier.
         invocation: InvocationId,
-        /// Trace identifier.
         trace: TraceId,
-        /// Authenticated caller principal.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         principal: Option<PrincipalId>,
-        /// Trusted actor.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<Actor>,
-        /// Attestor peer for attested contexts; absent for direct peers.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         via: Option<PrincipalId>,
-        /// Canonical external subject for attested (or refused-attestation) proposals.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attested_subject: Option<ExternalSubject>,
-        /// Requested capability.
         capability: CapabilityId,
-        /// Public DRN proposed for separate authorization, when any.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         secret: Option<SecretDrn>,
-        /// Native sink proposed with the public DRN.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         secret_sink: Option<SecretSinkKind>,
-        /// Selected provider when a rule matched.
         #[serde(skip_serializing_if = "Option::is_none")]
         provider: Option<ProviderId>,
-        /// Broker principal that owns the authorization transition.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         authorized_by: Option<PrincipalId>,
-        /// Broker decision identifier.
         decision_id: String,
-        /// Evaluated policy revision.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy_revision: Option<String>,
-        /// Identifiers of the Cedar policies that determined this decision.
-        ///
-        /// Empty for a decision no policy reached — a deny-by-default refusal, an attestation
-        /// refusal, or a capability with no constraint set — which is itself the explanation.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         policy_ids: Vec<String>,
-        /// Fingerprint of the policy set and world this decision was evaluated against.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy_digest: Option<String>,
-        /// Whether execution was authorized.
         allowed: bool,
-        /// Stable denial class; absent for an allow.
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
-        /// Digest binding the complete decision material without logging it.
         decision_digest: String,
-        /// Scope commitment for storage records, distinct from physical path tokens.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         storage_scope_commitment: Option<StorageScopeCommitment>,
-        /// Content-free storage evidence, normally present on terminal execution only.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         storage: Option<StorageEvidence>,
     },
-    /// Terminal provider execution metadata.
     Execution {
-        /// Invocation identifier.
         invocation: InvocationId,
-        /// Trace identifier.
         trace: TraceId,
-        /// Authenticated caller principal.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         principal: Option<PrincipalId>,
-        /// Trusted actor.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<Actor>,
-        /// Attestor peer for attested contexts; absent for direct peers.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         via: Option<PrincipalId>,
-        /// Canonical external subject for attested proposals.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attested_subject: Option<ExternalSubject>,
-        /// Executed capability.
         capability: CapabilityId,
-        /// Separately authorized public DRN, when any.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         secret: Option<SecretDrn>,
-        /// Native sink in which the DRN was consumed.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         secret_sink: Option<SecretSinkKind>,
-        /// Trusted selected provider.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider: Option<ProviderId>,
-        /// Broker principal that owned the authorization transition.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         authorized_by: Option<PrincipalId>,
-        /// Broker decision identifier.
         decision_id: String,
-        /// Evaluated policy revision.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy_revision: Option<String>,
-        /// Identifiers of the Cedar policies that authorized this execution.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         policy_ids: Vec<String>,
-        /// Fingerprint of the policy set and world this execution was authorized against.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         policy_digest: Option<String>,
-        /// Trusted effect classification.
         effect: EffectKind,
-        /// Trusted risk classification.
         risk: RiskLevel,
-        /// Symbolic name of the credential this invocation selected; absent when it had none.
-        ///
-        /// The name is owner-authored configuration that already sits in `broker.yaml`, not
-        /// secret material, and recording it is what keeps two external writes to two
-        /// organizations from producing identical records once one capability can present two
-        /// credentials. `credentialInjected` in the HTTP evidence still says whether a given call
-        /// actually presented it; this says which authority the broker selected.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         credential: Option<String>,
-        /// Terminal execution outcome.
         outcome: InvocationOutcome,
-        /// Bounded monotonic execution duration.
         duration_ms: u64,
-        /// Stable public failure class.
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
-        /// The provider's own failure code and message, when `error` classified one.
-        ///
-        /// Metadata the provider wrote about its own refusal, not provider output: an operator
-        /// reconstructing a run from the trace alone otherwise reads `provider-failure` and has
-        /// nowhere to learn that the upstream returned HTTP 400 for moderation. Bounded on both
-        /// construction and decode, and absent for every failure no provider reported.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error_detail: Option<ProviderFailureDetail>,
         /// Digest of successful provider output; output itself is never audited.
@@ -2098,22 +1620,17 @@ pub enum AuditEvent {
         /// Sanitized HTTP metadata; never paths, queries, headers, or bodies.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         http_calls: Vec<HttpCallEvidence>,
-        /// Scope commitment for storage records, distinct from physical path tokens.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         storage_scope_commitment: Option<StorageScopeCommitment>,
-        /// Storage evidence: operation, sync, and quota counts and the exact bytes read and written.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         storage: Option<StorageEvidence>,
     },
 }
 
-/// Asynchronous append boundary owned by a broker deployment.
 pub trait AuditLog: Send + Sync {
-    /// Accepts one event, reporting failure rather than claiming an unrecorded success.
     fn append(&self, event: AuditEvent) -> impl Future<Output = Result<(), AuditError>> + Send;
 }
 
-/// Bounded process-local audit implementation for tests and embedding.
 #[derive(Debug)]
 pub struct InMemoryAuditLog {
     maximum: usize,
@@ -2121,7 +1638,6 @@ pub struct InMemoryAuditLog {
 }
 
 impl InMemoryAuditLog {
-    /// Creates an empty bounded log.
     pub fn new(maximum: usize) -> Result<Self, AuditConfigurationError> {
         if maximum == 0 {
             return Err(AuditConfigurationError::ZeroMaximum);
@@ -2132,7 +1648,6 @@ impl InMemoryAuditLog {
         })
     }
 
-    /// Returns a snapshot in append order.
     pub fn records(&self) -> Vec<AuditEvent> {
         self.state.lock().expect("in-memory audit log").clone()
     }
@@ -2151,12 +1666,8 @@ impl AuditLog for InMemoryAuditLog {
     }
 }
 
-/// The audit sink `dekopon-brokerd` runs with: the log record is the audit, and nothing else is.
-///
-/// Every decision is already a `dekopon_broker::audit` log event inside the live trace before any
-/// sink is reached, so this one keeps nothing. Losing the log exporter loses audit; that is the
-/// accepted consequence of [the constitution's](../../../docs/design.md#non-goals) rejection of
-/// crash-durable audit.
+/// Every decision is already logged in the live trace before any sink runs; this sink keeps nothing
+/// else, so losing the log exporter loses the audit trail entirely, by design.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TraceOnlyAuditLog;
 
@@ -2166,27 +1677,19 @@ impl AuditLog for TraceOnlyAuditLog {
     }
 }
 
-/// Invalid in-memory audit configuration.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum AuditConfigurationError {
-    /// A zero-record log could never audit a request.
     #[error("audit record maximum must be greater than zero")]
     ZeroMaximum,
 }
 
-/// Audit append failure.
 #[derive(Debug, Error)]
 pub enum AuditError {
-    /// Bounded audit storage was exhausted.
     #[error("audit log reached its {maximum}-record bound")]
-    Full {
-        /// Configured maximum.
-        maximum: usize,
-    },
+    Full { maximum: usize },
 }
 
 impl AuditError {
-    /// Stable low-cardinality classification for logs and span fields.
     #[must_use]
     pub const fn category(&self) -> &'static str {
         match self {
@@ -2195,7 +1698,6 @@ impl AuditError {
     }
 }
 
-/// Broker-owned authorization, execution, evidence, and audit coordinator.
 #[derive(Debug)]
 pub struct Broker<A> {
     registry: BrokerProviderRegistry,
@@ -2216,7 +1718,6 @@ impl<A> Broker<A>
 where
     A: AuditLog,
 {
-    /// Builds a broker around an already validated privileged component registry.
     #[allow(
         clippy::too_many_arguments,
         reason = "each trusted input is a separate owner-controlled store; bundling them into one \
@@ -2249,21 +1750,6 @@ where
         .map(|(broker, _)| broker)
     }
 
-    /// Builds a broker, choosing whether configuration that cannot apply refuses startup.
-    ///
-    /// This is the full constructor [`Broker::new`] delegates to with [`Leniency::Strict`].
-    ///
-    /// Under [`Leniency::Tolerant`] two startup refusals become [`StartupWarning`]s instead:
-    /// a constraint set naming a capability no loaded provider routes is dropped, and a capability
-    /// a policy could permit but no constraint set bounds is reported. Neither weakens a decision.
-    /// The runtime `unconstrained-capability` denial is untouched and remains unconditional, so a
-    /// tolerated capability is refused at invocation exactly as a strict deployment refuses it at
-    /// startup — deny-by-default is preserved, only the moment of complaint moves.
-    ///
-    /// # Errors
-    ///
-    /// Every [`BrokerBuildError`] the strict path returns, except the two named above when
-    /// tolerating.
     #[allow(
         clippy::too_many_arguments,
         reason = "each trusted input is a separate owner-controlled store; bundling them into one \
@@ -2291,16 +1777,13 @@ where
         }
         validate_policy_revision(&policy_revision)?;
         if leniency == Leniency::Tolerant {
-            // Drop before validating: a set naming a capability nothing routes has no manifest to
-            // be checked against, so it cannot be proven either way.
+            // Unrouted constraint sets must be dropped before validate runs, since validate cannot
+            // prove a set with no route either way.
             for capability in constraints.retain_routed(&registry) {
                 warnings.push(StartupWarning::UnroutedConstraintSet { capability });
             }
         }
         constraints.validate(&registry, &credentials, limits.max_constraint_sets)?;
-        // Every capability a policy could permit must be executable. The decision path treats a
-        // missing constraint set as a denial anyway, but a grant that can only ever be refused is
-        // a configuration mistake worth refusing to start over.
         for capability in policy.referenced_capabilities() {
             if constraints.get(capability).is_none() {
                 match leniency {
@@ -2336,21 +1819,17 @@ where
         ))
     }
 
-    /// Installs the owner-only private secret map after validating every binding against the
-    /// already validated capability constraint catalog.
     pub fn with_secret_catalog(mut self, secrets: SecretCatalog) -> Result<Self, BrokerBuildError> {
         secrets.validate(&self.constraints)?;
         self.secrets = secrets;
         Ok(self)
     }
 
-    /// The fingerprint of the policy set every decision by this broker is evaluated against.
     #[must_use]
     pub fn policy_digest(&self) -> &str {
         &self.policy_digest
     }
 
-    /// Enables the optional all-or-nothing JSONL chat-memory surface after composition checks.
     pub fn with_chat_memory(mut self, config: ChatMemoryConfig) -> Result<Self, BrokerBuildError> {
         let storage_host = self
             .registry
@@ -2358,9 +1837,6 @@ where
             .ok_or(BrokerBuildError::InvalidChatMemory)?;
         config.validate(storage_host.limits())?;
         config.validate_host_limits(self.registry.host_limits())?;
-        // Storage interface, namespace, and per-role access are proved by
-        // `ConstraintCatalog::validate_routes` before any broker exists, so what is left here is
-        // the part that only the loaded manifest and these bounds can answer.
         let expected = [
             (
                 CapabilityRoute::ChatMemoryRecord,
@@ -2378,10 +1854,8 @@ where
                 RiskLevel::High,
             ),
         ];
-        // Every unrouted role at once, and before the shape checks. A deployment upgrading with
-        // `memory.chat.*` capabilities and a `chatMemory:` block but no `route:` on its constraint
-        // sets is missing all three, and the composition refusal below names none of them: it
-        // would send an operator looking at bounds when the fix is three lines of routing.
+        // This unrouted-role check must run before the shape-check loop below, whose expect call
+        // would panic if a role stayed unrouted.
         let unrouted = expected
             .iter()
             .map(|(route, ..)| *route)
@@ -2415,10 +1889,9 @@ where
                 return Err(BrokerBuildError::InvalidChatMemory);
             }
         }
-        // The routed provider owns exactly the three routed capabilities and nothing else. A
-        // component that declares a fourth route would be reachable under the same storage
-        // authority the memory surface grants, so the surface stays all-or-nothing per component
-        // rather than per capability.
+        // The routed provider must own exactly these three capabilities and no more, since a fourth
+        // route on that same component would be reachable under the storage authority the memory
+        // surface grants it.
         let provider = self
             .constraints
             .chat_memory_provider()
@@ -2440,18 +1913,12 @@ where
         Ok(self)
     }
 
-    /// Whether trusted routing constraints classify this capability as storage-backed.
-    ///
-    /// It selects only how a denial's decision digest is committed; a storage-backed record and
-    /// span carry every field any other one carries. Every chat-memory route declares chat
-    /// storage, so one test answers for both.
     fn capability_uses_storage(&self, capability: &CapabilityId) -> bool {
         self.constraints
             .get(capability)
             .is_some_and(|set| set.constraints.storage.is_some() || set.route.is_chat_memory())
     }
 
-    /// Asks policy whether this context may act on one capability at all.
     fn authorize_capability(
         &self,
         context: &AuthenticatedContext,
@@ -2470,7 +1937,6 @@ where
         })
     }
 
-    /// Separately asks policy whether this context may use one exact public DRN.
     fn authorize_secret_use(
         &self,
         context: &AuthenticatedContext,
@@ -2490,10 +1956,8 @@ where
         })
     }
 
-    /// Asks policy whether this context may drive one agent's session at all.
-    ///
-    /// This is the session gate. Permitting a principal to talk to an agent is now its own
-    /// explicit policy statement rather than a side effect of holding any capability.
+    /// This is the session gate: permitting a principal to talk to an agent is its own explicit
+    /// policy statement, not a side effect of holding any capability.
     fn authorize_agent_prompt(
         &self,
         context: &AuthenticatedContext,
@@ -2508,10 +1972,8 @@ where
         })
     }
 
-    /// The constraint sets policy allows this exact context, one Cedar evaluation each.
-    ///
-    /// Every listing filters this same list. That is what makes a listing identical to the
-    /// decision an invocation would receive: there is only ever one evaluation to disagree with.
+    /// Every capability listing filters this same set of Cedar evaluations, so what is listed can
+    /// never diverge from what an invocation would actually be authorized to do.
     fn authorized_sets(
         &self,
         context: &AuthenticatedContext,
@@ -2526,11 +1988,6 @@ where
             .collect()
     }
 
-    /// Returns the command words this context may use.
-    ///
-    /// A word appears only when policy allows this context at least one capability of the provider
-    /// declaring it, so a session is never told a word exists that it could not use — and a
-    /// principal granted nothing sees an empty vocabulary rather than a map of the deployment.
     #[must_use]
     pub fn command_words(&self, context: &AuthenticatedContext) -> Vec<String> {
         self.reachable_command_words(context, &self.authorized_sets(context))
@@ -2569,33 +2026,8 @@ where
         words
     }
 
-    /// Runs one command word as the command-line program its provider declared.
-    ///
-    /// Ungated on purpose. This is a pure function inside the declaring component — no imports,
-    /// bounded by fuel and timeout — and what it returns is a *proposal*, or text the guest
-    /// rendered itself, which authorizes nothing. Authorization happens where it always happens,
-    /// on the invocation that follows; a caller who runs a word they may not use receives a denial
-    /// one step later, having learned nothing they could not learn by asking for the capability
-    /// directly.
-    ///
-    /// An `attestation` is not a gate on the run either, but it is still a claim, and a claim the
-    /// broker refuses buys nothing: the word answers `UnknownCommandWord` exactly as an undeclared
-    /// word does, because naming it would disclose the surface the refusal withheld. The class
-    /// lands on the broker's own side through `broker_capabilities_refused` instead.
-    ///
-    /// The chat-memory words are offered only to a chat-scoped session whose three memory grants
-    /// are effective; every other caller finds them reserved *before the guest runs*, so a
-    /// reserved provider never renders so much as its help page for them, and a proposal that
-    /// lands on a chat-memory route is refused whatever word produced it. Recording stays
-    /// unreachable from any word.
-    ///
-    /// `stdin` is the value the script piped into the word, already rendered to text; the host
-    /// counts it with the argv against its input bound before a store exists.
-    ///
-    /// # Errors
-    ///
-    /// Returns a host error when no loaded provider declares the word, when the input exceeds the
-    /// host bound, when the guest traps, or when the run reaches for a host import.
+    /// Ungated by design: running a word only produces a proposal or rendered text and authorizes
+    /// nothing; real authorization happens later, at the invocation that follows.
     pub async fn run_command(
         &self,
         peer: &AuthenticatedContext,
@@ -2619,8 +2051,6 @@ where
             None => None,
         };
         let memory_word = self.is_chat_memory_word(word);
-        // Evaluated only for a word that needs the answer: the surface costs three capability
-        // decisions, and every other word a session runs must not pay for them.
         if memory_word
             && !attested.is_some_and(|(context, claim)| {
                 self.memory_surface(&context, &claim.agent).is_some()
@@ -2631,8 +2061,6 @@ where
             });
         }
         let outcome = self.registry.run_command(word, argv, stdin).await?;
-        // Only a proposal names a capability, so only a proposal can land on a route. Rendered text
-        // and a decline route nowhere and were already stopped above if the word was reserved.
         if matches!(
             &outcome,
             CommandRunOutcome::Proposed { capability, .. } if {
@@ -2647,20 +2075,11 @@ where
         Ok(outcome)
     }
 
-    /// Returns only capabilities policy allows for this exact authenticated context.
-    ///
-    /// The listing and the invocation decision come from the same evaluation, so a capability can
-    /// never appear here and then refuse — or be hidden here and then succeed.
     #[must_use]
     pub fn capabilities(&self, context: &AuthenticatedContext) -> Vec<AvailableCapability> {
         self.available_capabilities(&self.authorized_sets(context))
     }
 
-    /// Returns the capability listing and the command words from one authorization pass.
-    ///
-    /// Both halves of a capabilities answer are policy filters over the same constraint sets, and
-    /// a session opens with one. Computing them separately evaluates every set through Cedar
-    /// twice for identical inputs on the broker's most frequent request.
     #[must_use]
     pub fn capability_view(
         &self,
@@ -2697,15 +2116,6 @@ where
         capabilities
     }
 
-    /// The widest capability answer this broker could ever produce.
-    ///
-    /// [`Self::capabilities`], [`Self::command_words`], and the chat surface are all policy
-    /// filters over exactly these values, for every context the broker can build — direct peer,
-    /// attested, or chat. Enumerating those contexts is not possible here: the agent catalog
-    /// belongs to the gateway, and production policy conditions on `context.agent`, so a broker
-    /// that guessed an agent would measure a surface no session ever receives. Bounding them is
-    /// what a startup frame check actually needs, because a ceiling that fits proves that no
-    /// session's answer can overflow the frame.
     #[must_use]
     pub fn capability_ceiling(&self) -> (Vec<AvailableCapability>, Vec<String>) {
         let mut capabilities = self
@@ -2725,9 +2135,6 @@ where
         (capabilities, words)
     }
 
-    /// The chat memory surface a session could be told about, sized for the frame check.
-    ///
-    /// Policy still decides whether any given session sees it; this is only its byte cost.
     #[must_use]
     pub fn chat_memory_ceiling(&self) -> Option<ChatMemorySurface> {
         let config = self.chat_memory.as_ref()?;
@@ -2737,23 +2144,8 @@ where
         })
     }
 
-    /// Returns the capability listing, command words, and chat-memory surface for one context.
-    ///
-    /// Without an `attestation` this is the connected peer's own answer, and it is never refused.
-    /// With one, `None` means the request was refused — no grant, out-of-scope subject, unmapped
-    /// subject, or a policy that does not let this principal drive this agent at all — which
-    /// callers must not conflate with "allowed to ask, granted nothing" (`Some` with an empty
-    /// list). Answering a refused caller with an empty list would tell it whether the subject is
-    /// mapped.
-    ///
-    /// The bare `Option` keeps the wire answer opaque, so the refusal class is reported here
-    /// instead: one `broker_capabilities_refused` event names the class and the canonical subject
-    /// on the broker's own side of the socket, where a session that never invokes would otherwise
-    /// leave no trace of why it saw nothing.
-    ///
-    /// The memory surface is present only for a chat-scoped claim whose three durable-memory
-    /// grants are all effective; the two retrieval capabilities and the reserved words join the
-    /// listing exactly when it is.
+    /// A refused caller's answer must stay None, distinct from Some with an empty list; answering
+    /// either way with an empty list would tell an unmapped subject that it is unmapped.
     #[must_use]
     pub fn capability_surface(
         &self,
@@ -2792,26 +2184,6 @@ where
         Some((capabilities, words, memory))
     }
 
-    /// Evaluates and, when allowed, executes one proposal exactly once.
-    ///
-    /// `peer` is the connected transport identity, `grant` is that peer's owner-configured
-    /// attestor authority (`None` when it has none), and `attestation` is the on-behalf-of claim —
-    /// absent when the peer proposes as itself. The broker — never the peer — performs the
-    /// subject-to-principal mapping. Every refusal is an audited denial with a stable class
-    /// (`attestation-denied` for a missing or out-of-scope grant, `unmapped-subject` for a subject
-    /// the directory does not name), so a compromised or misconfigured gateway leaves a decision
-    /// trail rather than a silent error. A denied `agent.prompt` is reported as
-    /// `agent-denied` under the *attested* context: the attestation itself was honored, and the
-    /// refusal is about who may drive this agent.
-    ///
-    /// Those classes are the audit record's. A chat-scoped claim's refusal answers the peer with
-    /// the single literal `CHAT_REFUSAL` instead, because a session peer able to tell the
-    /// classes apart would read the subject directory and the agent grants out of its own
-    /// denials; an attested non-chat proposal still carries its class on the wire, as it did
-    /// before the class was typed.
-    ///
-    /// The chat-memory routes are reachable only from a chat-scoped claim, and the record route is
-    /// reachable from no proposal at all — [`Broker::record_delivered_turn`] is its only entrance.
     pub async fn invoke(
         &self,
         peer: &AuthenticatedContext,
@@ -2820,18 +2192,14 @@ where
         mut request: InvocationRequest,
         assets: dekopon_broker_host::asset::AssetInputs,
     ) -> Result<AssetInvocationResult, BrokerError> {
-        // Resolved once. The claim decides the context and the refusal together, so a second call
-        // would re-evaluate the `agent.prompt` policy for the same message and throw the class
-        // away in favour of a single flattened reason.
         let (context, mut refusal) = match attestation {
             Some(claim) => self.resolve_context(peer, grant, claim),
             None => (peer.clone(), None),
         };
         let chat = attestation.filter(|claim| claim.scope.is_some());
-        // The class the claim earned belongs to the operator, not to the caller. A chat peer that
-        // could separate `unmapped-subject` from `agent-denied` would read the subject directory
-        // and the agent grants out of its own refusals, so every one of them answers with the same
-        // literal; the audit record and `broker.authorize` keep the class and its policies.
+        // The refusal class belongs to the operator, not the caller: a chat peer able to
+        // distinguish denial classes could read the subject directory and agent grants out of its
+        // own refusals, so every one collapses to the same literal.
         if chat.is_some() {
             refusal = refusal.map(Refusal::opaque);
         }
@@ -2841,8 +2209,6 @@ where
         {
             refusal = Some(unevaluated_refusal(CHAT_REFUSAL));
         }
-        // First refusal wins. The claim decided who this is, so a route check that overwrote it
-        // would report the shape of the capability instead of the reason the caller was refused.
         let route = self.route(&request.capability);
         if refusal.is_none() {
             if let Some(claim) = chat {
@@ -2862,8 +2228,6 @@ where
                     }
                 }
             } else if route.is_chat_memory() {
-                // No chat scope was claimed at all, so the whole durable-memory surface is
-                // structurally out of reach whether or not the caller attested a subject.
                 refusal = Some(unevaluated_refusal("chat-scope-required"));
             }
         }
@@ -2877,10 +2241,6 @@ where
         })
     }
 
-    /// Constructs the hidden record proposal from typed post-acceptance fields only.
-    ///
-    /// Its own entry point on purpose: the record route is refused on [`Broker::invoke`] whatever
-    /// attestation accompanies the proposal, so nothing a model shaped can reach it.
     pub async fn record_delivered_turn(
         &self,
         peer: &AuthenticatedContext,
@@ -2888,11 +2248,7 @@ where
         attestation: &Attestation,
         turn: DeliveredTurnRequest,
     ) -> Result<InvocationResult, BrokerError> {
-        // Resolved once, exactly as the generic path is: the refusal the claim produced is the
-        // most specific one there is, so the later checks only run when the claim held.
         let (context, claim_refusal) = self.resolve_context(peer, grant, attestation);
-        // This entrance is chat-only, so a claim refusal answers exactly as the chat `invoke` path
-        // answers: one fixed literal on the wire, the real class in the audit record.
         let refusal = claim_refusal.map(Refusal::opaque).or_else(|| {
             if !attestation.binds(&turn.id) {
                 Some(unevaluated_refusal(CHAT_REFUSAL))
@@ -2909,8 +2265,6 @@ where
                 None
             }
         });
-        // The operator names this capability by declaring the record route; the fallback only
-        // labels the audited refusal a deployment with no such route already earned above.
         let capability = self
             .constraints
             .routed(CapabilityRoute::ChatMemoryRecord)
@@ -2943,22 +2297,6 @@ where
         .await
     }
 
-    /// Derives the context one attested operation is evaluated — or refused — under.
-    ///
-    /// This is the single place attestation shape is interpreted. A claim with no `scope` derives
-    /// the legacy attested context; a chat claim additionally binds the transport scope that the
-    /// durable-memory surface is checked against. Both answer with the same refusal classes, and
-    /// the context always comes back: a refusal reached before the subject-to-principal mapping is
-    /// attributed to the connecting peer annotated with the subject it claimed, while a refusal
-    /// the `agent.prompt` policy reached is attributed to the attested context it was about.
-    ///
-    /// The refusal exists so a caller can report or audit it once; the wire answer stays the same
-    /// opaque nothing it was. The inspection callers answer `None` and an unknown command word,
-    /// and both chat invocation paths collapse the class into `CHAT_REFUSAL` before it can reach
-    /// a peer — only an attested non-chat proposal carries the class outward, as it did before
-    /// this refusal was typed. The refusal carries the determining `policy_ids` alongside the
-    /// class, because an `agent-denied` or `policy-error` a caller flattens into a bare class is a
-    /// denial with no route back to the rule that made it.
     fn resolve_context(
         &self,
         peer: &AuthenticatedContext,
@@ -2975,11 +2313,6 @@ where
         let actor = Actor::Agent {
             agent: claim.agent.clone(),
         };
-        // `chatScopes` was added for storage namespace authority. An existing subject-only
-        // attestor must keep ordinary chat capabilities working after a gateway upgrade starts
-        // claiming a scope. It receives the legacy context with no trusted chat scope, which makes
-        // the complete durable-memory surface structurally unavailable. Once any chat scope is
-        // authored, the service-specific canonical checks and exact grant apply.
         let derived = match &claim.scope {
             Some(scope) if !grant.chat_scopes.is_empty() => {
                 if !grant.permits_chat(&claim.subject, scope) {
@@ -3005,10 +2338,6 @@ where
                 )
             }
         };
-        // A `ContextError` here means the broker's own trusted state disagreed with itself — it is
-        // unreachable while agent actors carry no principal — and it has nowhere to go that would
-        // not tell a refused caller what it must not learn. It becomes the same stable class every
-        // other unhonored claim gets.
         let Ok(context) = derived else {
             return (refused(), Some(unevaluated_refusal("attestation-denied")));
         };
@@ -3020,20 +2349,12 @@ where
         }
     }
 
-    /// The trusted route declared for one capability; anything undeclared is generic.
-    ///
-    /// An undeclared capability is denied `unconstrained-capability` before policy is consulted,
-    /// so treating it as generic hides nothing a route could have hidden.
     fn route(&self, capability: &CapabilityId) -> CapabilityRoute {
         self.constraints
             .get(capability)
             .map_or(CapabilityRoute::Generic, |set| set.route)
     }
 
-    /// The command words the chat-memory provider declares, and only that provider.
-    ///
-    /// These are the words the chat surface offers when memory is authorized, and the words every
-    /// non-chat path refuses. Nothing here reads a word's spelling.
     fn chat_memory_words(&self) -> Vec<String> {
         let Some(provider) = self.constraints.chat_memory_provider() else {
             return Vec::new();
@@ -3102,9 +2423,8 @@ where
                 }
             },
         );
-        // Principal mapping is not part of continuity. The canonical external subject is already
-        // in the base namespace, while this generation commits only the resulting effective
-        // authority. Remapping the same subject without changing that surface must not rotate.
+        // This authority encoding excludes principal mapping deliberately; remapping the same
+        // subject without changing effective authority must never rotate the generation.
 
         let artifacts = self
             .registry
@@ -3322,8 +2642,6 @@ where
                     "maxResultBytes": config.max_result_bytes,
                 })
             }
-            // Recording is built by the broker from typed post-acceptance fields, never curated
-            // from a proposal, and a generic route has no memory input to curate.
             CapabilityRoute::Generic | CapabilityRoute::ChatMemoryRecord => {
                 return Err("invalid-memory-input");
             }
@@ -3339,8 +2657,6 @@ where
         assets: dekopon_broker_host::asset::AssetInputs,
         outputs: &mut dekopon_broker_host::asset::AssetOutputs,
     ) -> Result<InvocationResult, BrokerError> {
-        // Every capability, storage-backed or not, records who proposed what: a decision a trace
-        // cannot attribute to a proposal is not a run anyone can reconstruct.
         let authorize = tracing::info_span!(
             "broker.authorize",
             invocation = %request.id,
@@ -3358,20 +2674,12 @@ where
         if let Some(via) = context.via() {
             authorize.record("via", tracing::field::display(via));
         }
-        // Provider input is recorded unconditionally, bounded like every other attribute and never
-        // dropped: a trace that omits what was proposed cannot reconstruct the run. It is rendered
-        // through the bound rather than cut afterwards, because a proposal carrying image bytes
-        // would otherwise cost a full copy of them here and another in every installed layer. A
-        // `Redacted` value inside it still renders its marker, because that is a property of the
-        // value rather than of this span.
         let input = dekopon_core::bounded_display(&request.input);
         authorize.record("input", tracing::field::display(input.text()));
         authorize.record("input.bytes", input.bytes());
-        // Instrumented rather than entered with a guard: on every denial this section awaits an
-        // audit append that can suspend. A guard held across that await stays entered on the
-        // worker thread while this task is suspended, so another connection's spans parent under
-        // this request's authorization and this request's own events lose it when the task
-        // resumes elsewhere.
+        // Instrumented rather than entered with a guard, since a guard held across the audit-append
+        // await would stay entered on the worker thread while suspended, misattributing another
+        // connection's spans to this request's authorization.
         let authorized = async {
             if let Some(refusal) = refusal {
                 authorize.record("outcome", refusal.reason);
@@ -3380,11 +2688,9 @@ where
                     .await
                     .map(ControlFlow::Break);
             }
-            // A missing constraint set means there is nothing to execute regardless of what policy
-            // says. Under `Leniency::Strict` this is defense in depth behind the startup check;
-            // under `Leniency::Tolerant` the startup check is only a warning, so this *is* the
-            // enforcement — a capability a policy anticipates but no provider routes dies here.
-            // Do not weaken it into an assertion or fold it into the policy decision.
+            // This check is the actual enforcement under Leniency::Tolerant, not just defense in
+            // depth; never weaken it into an assertion or fold it into the policy decision, or an
+            // unrouted but policy-anticipated capability would stop being denied.
             let Some(mut set) = self.constraints.get(&request.capability).cloned() else {
                 authorize.record("outcome", "unconstrained-capability");
                 return self
@@ -3408,28 +2714,20 @@ where
                     .map(ControlFlow::Break);
             }
             let decision = self.authorize_capability(context, &request.capability, &set);
-            // A policy that errors at evaluation time denies exactly like a policy that does not
-            // match, so the flag is the only thing that separates a broken rule from a working one.
-            // It is a flag rather than the error text on purpose: an explanation must not become a
-            // per-request channel for policy source or entity data.
+            // A policy error denies exactly like a non-match; this is recorded as a flag rather
+            // than the error text so denial explanations can't become a per-request channel leaking
+            // policy source or entity data.
             authorize.record("policy.errors_present", decision.errors_present);
             if !decision.allowed {
                 let reason = denial_reason(&decision, "policy-denied");
                 authorize.record("outcome", reason);
                 if decision.errors_present {
-                    // The invocation identifier only: it joins this event to the authorize span,
-                    // which is where the capability lives.
                     tracing::warn!(
                         event = "broker_policy_evaluation_error",
                         invocation = %request.id,
                         policy.target = "capability",
                     );
                 }
-                // A refusal means policy never ran: the broker asked a question the schema does
-                // not admit, which is a deployment defect rather than an authorization outcome.
-                // It presents as an ordinary `policy-denied` on the wire — the audit reason stays
-                // stable and the denial is still a denial — so this event is the only place the
-                // operator learns the difference.
                 if let Some(cause) = &decision.refusal {
                     tracing::warn!(
                         target: "dekopon_broker::audit",
@@ -3496,8 +2794,6 @@ where
                 }
                 set.constraints.secret_use = Some(self.secrets.grant(&binding));
             } else {
-                // Secret grants are derived only from a typed proposal after the second policy
-                // decision; owner-authored constraint YAML cannot make one ambient.
                 set.constraints.secret_use = None;
             }
             authorize.record("outcome", "allowed");
@@ -3509,8 +2805,6 @@ where
             ControlFlow::Break(denied) => return Ok(denied),
             ControlFlow::Continue(allowed) => allowed,
         };
-        // One span for every execution. A storage-backed one adds `storage`, the namespace its
-        // chat scope lives in, and whether that namespace was reset; it withholds nothing.
         let execute = tracing::info_span!(
             "broker.execute",
             provider = %set.provider,
@@ -3526,9 +2820,6 @@ where
         if set.constraints.storage.is_some() {
             execute.record("storage", true);
         }
-        // The symbolic name only, exactly as the audit record carries it: once one capability can
-        // present two credentials, a trace that names neither cannot say which organization a
-        // write reached. `Redacted` keeps the value itself out of both.
         if let Some(secret) = request.secret_use.as_ref() {
             execute.record("credential", secret.secret().as_str());
         } else if let Some(credential) = set.credential_for(context.actor()) {
@@ -3539,10 +2830,6 @@ where
             .await
     }
 
-    /// Records the refusal's true class in audit and answers the peer with `refusal.wire`.
-    ///
-    /// The two differ only on the chat paths, where every claim refusal answers with one fixed
-    /// literal so a peer cannot read the class off its own denial.
     async fn deny(
         &self,
         context: &AuthenticatedContext,
@@ -3624,7 +2911,6 @@ where
             outcome: InvocationOutcome::Denied,
             output: None,
             error: Some(wire.to_owned()),
-            // A refusal is the broker's own answer; no provider ran to report one.
             detail: None,
             evidence: vec![Evidence {
                 kind: "policy-decision".to_owned(),
@@ -3669,7 +2955,6 @@ where
             InvocationOutcome::Failed,
             0,
             Some(reason.to_owned()),
-            // The provider never ran, so there is no failure of its own to carry.
             None,
             None,
             Vec::new(),
@@ -3705,12 +2990,10 @@ where
         assets: dekopon_broker_host::asset::AssetInputs,
         outputs: &mut dekopon_broker_host::asset::AssetOutputs,
     ) -> Result<InvocationResult, BrokerError> {
-        // Scope/evidence preparation is deliberately non-mutating. The authorization decision is
-        // recorded before `materialize` may create a namespace, rotate a generation
-        // pointer, or update lifecycle state.
+        // Deliberately non-mutating here: the authorization decision must be recorded before
+        // materialize can create a namespace, rotate a generation pointer, or update lifecycle
+        // state.
         let mut storage_preparation = self.prepare_storage_grant(context, &request, &set)?;
-        // The directory this invocation's chat scope lives in, so an operator reading the trace
-        // can go straight to it.
         if let Some(preparation) = &storage_preparation {
             tracing::Span::current().record("storage.namespace", preparation.namespace());
         }
@@ -3854,8 +3137,6 @@ where
         let storage_grant = match storage_preparation.take() {
             None => None,
             Some(preparation) => {
-                // Carried onto the blocking thread so a reset the host logs there lands in this
-                // invocation's trace rather than in no span at all.
                 let span = tracing::Span::current();
                 let materialized = tokio::task::spawn_blocking(move || {
                     span.in_scope(|| preparation.materialize())
@@ -3871,11 +3152,6 @@ where
             }
         };
 
-        // Legacy credentials remain owner-selected by capability/agent. A public DRN is different:
-        // it was untrusted proposal data, passed a separate Cedar decision, matched an owner binding,
-        // and is now resolved exactly once for this invocation. The provider receives neither name
-        // nor bytes; only the native HTTP context receives the rendered credential beside the
-        // authorization that commits to the same DRN/sink/binding.
         let proposed_secret = authorized.proposal().secret_use.clone();
         let legacy_credential_name = set.credential_for(context.actor()).map(str::to_owned);
         let audit_credential = proposed_secret
@@ -3960,11 +3236,8 @@ where
                 }
             }
         } else {
-            // The refreshing kind resolves here rather than at startup, and here rather than inside
-            // the execution context: the renewal is the broker's own HTTPS call, so it must not
-            // consume the guest's `maxRequests`, must not reach `HttpCallEvidence`, and must not be
-            // visible to the component at all. What the audit record carries is unchanged either
-            // way — the symbolic name, and `credentialInjected` on the calls that presented it.
+            // Refreshing credentials must resolve here, never inside the execution context, or the
+            // renewal call would wrongly consume the guest's request budget and evidence.
             match legacy_credential_name
                 .as_deref()
                 .and_then(|name| self.credentials.get(name))
@@ -3974,10 +3247,6 @@ where
                 Some(StoredCredential::Refreshing(source)) => match source.resolve().await {
                     Ok(credential) => Some(credential),
                     Err(failure) => {
-                        // A credential an operator must re-authorize is the one failure here that
-                        // no retry fixes, so it is reported at `error` and classified permanent.
-                        // Either way the broker keeps serving every other capability: one unusable
-                        // credential is not an outage.
                         if failure.permanent() {
                             tracing::error!(
                                 event = "broker_credential_refresh_failed",
@@ -4097,11 +3366,7 @@ where
             }
             Err(failure) => {
                 let error = public_host_error(&failure.error, set.route).to_owned();
-                // The classification says which class of thing went wrong; this says what the
-                // provider itself reported, which is the only copy of the upstream refusal.
                 let detail = provider_failure_detail(&failure.error);
-                // A failure can follow calls that already left the host; their sanitized
-                // metadata belongs in the terminal record exactly as it would on success.
                 let mut evidence = vec![policy_evidence];
                 if let Some(storage) = &failure.storage {
                     evidence.push(Evidence {
@@ -4159,9 +3424,6 @@ where
             }
         };
 
-        // The same sanitized pair the terminal audit record carries. A trace that ends at "the
-        // provider ran" cannot say whether the effect worked, and `error` here is the classified
-        // reason the client is already told, never provider output.
         let execution = tracing::Span::current();
         execution.record(
             "outcome",
@@ -4174,8 +3436,6 @@ where
         if let Some(error) = result.error.as_deref() {
             execution.record("error", error);
         }
-        // Beside the classification, never instead of it: `provider-failure` alone cannot say
-        // which refusal this was, and the trace is where an operator reconstructs the run.
         if let Some(detail) = result.detail.as_ref() {
             execution.record("error.code", detail.code.as_str());
             execution.record("error.message", detail.message.as_str());
@@ -4193,11 +3453,6 @@ where
         Ok(result)
     }
 
-    /// Records one decision in the trace, then offers it to the configured [`AuditLog`].
-    ///
-    /// The log event is the audit record, so it happens exactly once per decision whatever the
-    /// sink is. An embedding's bounded sink still fails closed — a full [`InMemoryAuditLog`]
-    /// refuses the invocation — but by then the decision has already been recorded.
     async fn record_audit(&self, event: AuditEvent) -> Result<(), AuditError> {
         emit_audit_event(&event);
         self.audit.append(event).await
@@ -4212,8 +3467,6 @@ where
     }
 }
 
-/// Versioned length-prefixed authority encoding. Every field has a fixed label and binary value;
-/// no YAML/JSON formatting, map insertion order, path, or telemetry setting can affect it.
 struct AuthorityEncoder {
     bytes: Vec<u8>,
 }
@@ -4280,12 +3533,9 @@ fn risk_tag(value: RiskLevel) -> u8 {
     }
 }
 
-/// The authority one capability contributes to a storage namespace generation.
-///
-/// Every field here is a semantic authority input: changing one re-keys retained storage under a
-/// fresh random generation. The set is deliberately small and deliberately complete — which
-/// capability, through which provider component bytes, at which effect and risk, presenting which
-/// symbolic credential, under which execution constraints.
+/// Every field here is a semantic authority input: changing any one re-keys retained storage under
+/// a fresh generation, and the set is deliberately complete across capability, provider bytes,
+/// effect, risk, credential, and constraints.
 fn encode_capability_authority(
     encoded: &mut AuthorityEncoder,
     capability: &CapabilityId,
@@ -4499,33 +3749,21 @@ fn encode_storage_limits(
     }
 }
 
-/// The one answer a refused chat caller receives, whatever class the broker recorded.
-///
-/// A peer able to tell `unmapped-subject` from `agent-denied` apart would learn from its own
-/// denials whether the broker maps a subject and which agents a principal may drive — the two
-/// facts the opaque answer exists to withhold. The class reaches the operator through the audit
-/// record, `broker.authorize`, and `broker_capabilities_refused` instead.
 const CHAT_REFUSAL: &str = "chat-attestation-denied";
 
-/// A refusal decided before the capability decision, carried into the audited denial.
 struct Refusal {
-    /// The stable class an operator reads in the audit record and in the refusal event.
     reason: &'static str,
-    /// What the refused peer is told, which on the chat paths is deliberately less than `reason`.
     wire: &'static str,
-    /// The policies that determined it, empty for a refusal reached before any evaluation.
     policy_ids: Vec<String>,
 }
 
 impl Refusal {
-    /// Collapses the peer-visible answer to `CHAT_REFUSAL`, leaving the audited class intact.
     fn opaque(mut self) -> Self {
         self.wire = CHAT_REFUSAL;
         self
     }
 }
 
-/// A refusal reached before any policy ran, so no policy identifier can explain it.
 const fn unevaluated_refusal(reason: &'static str) -> Refusal {
     Refusal {
         reason,
@@ -4534,7 +3772,6 @@ const fn unevaluated_refusal(reason: &'static str) -> Refusal {
     }
 }
 
-/// A refusal whose determining policies are in hand and whose class is also the peer's answer.
 fn determined_refusal(reason: &'static str, policy_ids: Vec<String>) -> Refusal {
     Refusal {
         reason,
@@ -4543,10 +3780,6 @@ fn determined_refusal(reason: &'static str, policy_ids: Vec<String>) -> Refusal 
     }
 }
 
-/// The refusal an `agent.prompt` decision produced, keeping the policies that determined it.
-///
-/// Dropping the identifiers here would make a denied session the one decision in the broker that
-/// records its class without recording which rule reached it.
 fn decided_refusal(decision: PolicyDecision, denied: &'static str) -> Refusal {
     determined_refusal(
         denial_reason(&decision, denied),
@@ -4554,11 +3787,6 @@ fn decided_refusal(decision: PolicyDecision, denied: &'static str) -> Refusal {
     )
 }
 
-/// Separates a policy that could not be evaluated from one that simply did not match.
-///
-/// Both deny, and until now both denied identically in audit and telemetry, so a Cedar evaluation
-/// error — an extension call on a malformed value, say — was indistinguishable from a clean
-/// no-match by anything an operator can read.
 const fn denial_reason(decision: &PolicyDecision, denied: &'static str) -> &'static str {
     if decision.errors_present {
         "policy-error"
@@ -4567,11 +3795,6 @@ const fn denial_reason(decision: &PolicyDecision, denied: &'static str) -> &'sta
     }
 }
 
-/// Names why an attested inspection saw nothing, on the broker's own side of the socket.
-///
-/// The response stays opaque — it must not tell a refused caller whether the subject is mapped —
-/// so this event is the only place the refusal class and the canonical subject meet. It is what
-/// makes an unmapped sender diagnosable without a payload-carrying gateway span.
 fn report_inspection_refusal(
     refusal: &Refusal,
     peer: &AuthenticatedContext,
@@ -4588,22 +3811,6 @@ fn report_inspection_refusal(
     );
 }
 
-/// Emits one metadata-only audit record as a structured log event inside the current span.
-///
-/// This event *is* the audit record ([goal 2](../../../docs/design.md#constitution)). It is
-/// emitted from inside `broker.authorize` or `broker.execute`, which descend from the
-/// `broker.invocation` span that adopted the client's `traceparent`, so the console JSON
-/// formatter and the OTLP log bridge stamp the live W3C trace and span ids on it without this
-/// crate linking any telemetry SDK.
-///
-/// Field names follow [`AuditEvent`]'s own names rather than the surrounding span's. Absent is not
-/// null: a denial names no provider, a direct peer no `via` or subject, and every `Option` field
-/// the broker did not know simply disappears, so a present field always means it knew. A
-/// storage-backed record carries every field any other record carries, plus its scope commitment
-/// and storage evidence. Nothing
-/// here can carry secret bytes — `secret` and `credential` are the symbolic names owner
-/// configuration already holds, and the HTTP evidence is the same sanitized set the span carries:
-/// method, authority, status, accounted bytes, and whether a credential was injected.
 fn emit_audit_event(event: &AuditEvent) {
     match event {
         AuditEvent::Decision {
@@ -4625,10 +3832,6 @@ fn emit_audit_event(event: &AuditEvent) {
             reason,
             storage_scope_commitment,
             storage,
-            // The decision digest is the caller's evidence, not something an operator reads here.
-            // The trace reaches the record without being one of its fields: the OTLP log bridge
-            // stamps it as the native trace id, and the stdout JSON formatter renders the
-            // enclosing `broker.invocation` span, which carries it as `trace`.
             decision_digest: _,
             trace: _,
         } => tracing::info!(
@@ -4685,7 +3888,6 @@ fn emit_audit_event(event: &AuditEvent) {
             http_calls,
             storage_scope_commitment,
             storage,
-            // Stamped from the enclosing span, exactly as on `broker.decision` above.
             trace: _,
         } => tracing::info!(
             target: "dekopon_broker::audit",
@@ -4726,7 +3928,6 @@ fn emit_audit_event(event: &AuditEvent) {
     }
 }
 
-/// Which of the three trusted actor kinds a record names, as one low-cardinality token.
 const fn actor_kind(actor: &Actor) -> &'static str {
     match actor {
         Actor::Human { .. } => "human",
@@ -4735,7 +3936,6 @@ const fn actor_kind(actor: &Actor) -> &'static str {
     }
 }
 
-/// The identity inside the actor, which is the principal for two kinds and the agent for the third.
 fn actor_id(actor: &Actor) -> String {
     match actor {
         Actor::Human { principal } | Actor::Service { principal } => principal.to_string(),
@@ -4743,24 +3943,15 @@ fn actor_id(actor: &Actor) -> String {
     }
 }
 
-/// Renders a bounded structured field as JSON, or nothing when it is empty or unrenderable.
-///
-/// An audit record must never fail to be emitted because one of its evidence fields would not
-/// serialize, so a failure drops that field rather than the record.
 fn rendered<T: Serialize>(value: &T) -> Option<String> {
     let json = serde_json::to_string(value).ok()?;
     (json != "[]" && json != "null").then_some(json)
 }
 
-/// Joins policy identifiers into one comma-separated field, or nothing when no policy matched.
 fn joined(ids: &[String]) -> Option<String> {
     (!ids.is_empty()).then(|| ids.join(","))
 }
 
-/// Reports why the configured audit sink refused a decision or an outcome.
-///
-/// The wire code and the connection log carry only a category, so this event is where the cause
-/// reaches the operator.
 fn report_audit_failure(stage: &'static str, invocation: &InvocationId, source: &AuditError) {
     tracing::error!(
         event = "broker_audit_append_failed",
@@ -4834,11 +4025,6 @@ fn execution_event(
     }
 }
 
-/// Returns the provider's own failure code and message, for the one host failure that has them.
-///
-/// Every other `BrokerHostError` is the host's or the broker's account of what went wrong, and
-/// inventing a provider sentence for it would make the field a lie. The pair is bounded here, at
-/// the boundary the provider's untrusted text crosses.
 fn provider_failure_detail(error: &BrokerHostError) -> Option<ProviderFailureDetail> {
     match error {
         BrokerHostError::ProviderFailure { code, message, .. } => {
@@ -4871,12 +4057,10 @@ struct DecisionMaterial<'a> {
     reason: Option<&'a str>,
 }
 
-/// Hashes evidence produced before execution began; a failure means nothing ran.
 fn decision_evidence_digest(label: &str, value: &impl Serialize) -> Result<String, BrokerError> {
     evidence_digest(label, value).map_err(|source| BrokerError::DecisionEvidence { source })
 }
 
-/// Hashes evidence produced after execution began; a failure leaves the outcome unaudited.
 fn outcome_evidence_digest(
     invocation: &InvocationId,
     label: &str,
@@ -4889,8 +4073,6 @@ fn outcome_evidence_digest(
 }
 
 fn evidence_digest(label: &str, value: &impl Serialize) -> Result<String, serde_json::Error> {
-    // Streamed rather than concatenated: the serialized value here is a whole provider response,
-    // up to the host output ceiling, and the joined buffer existed only to be hashed once.
     Ok(digest_parts(
         EVIDENCE_HASH_DOMAIN,
         &[label.as_bytes(), &[0], &serde_json::to_vec(value)?],
@@ -4936,9 +4118,8 @@ fn public_host_error(error: &BrokerHostError, route: CapabilityRoute) -> &'stati
         BrokerHostError::UnknownCapability { .. }
         | BrokerHostError::ProviderDoesNotImplement { .. }
         | BrokerHostError::UnknownCommandWord { .. } => "capability-unavailable",
-        // Startup-only failures. They cannot reach a caller — a broker holding a registry has
-        // already survived them — but naming them keeps this match exhaustive by proof rather than
-        // by a wildcard that would silently absorb a future variant into the wrong public reason.
+        // These startup-only variants are named explicitly rather than wildcarded, so a future
+        // variant can never be silently misclassified here.
         BrokerHostError::ConflictingProviders { .. }
         | BrokerHostError::MissingCommandExport { .. }
         | BrokerHostError::CommandExportSignature { .. }
@@ -5018,91 +4199,61 @@ fn public_host_error(error: &BrokerHostError, route: CapabilityRoute) -> &'stati
     }
 }
 
-/// Failure to evaluate or account for one broker invocation.
 #[derive(Debug, Error)]
 pub enum BrokerError {
-    /// Optional chat memory was not effective for this trusted context.
     #[error("chat memory is unavailable")]
     MemoryUnavailable,
-    /// Trusted memory input construction rejected an impossible shape.
     #[error("chat memory input is invalid")]
     InvalidMemoryInput,
-    /// Storage grant derivation or housekeeping failed before provider execution.
     #[error("broker storage authority failed")]
     Storage {
         #[source]
         source: dekopon_storage_host::StorageHostError,
     },
-    /// The blocking task that materializes the storage grant never returned a result.
-    ///
-    /// Distinct from [`Self::Storage`] because the storage host reported nothing: the task
-    /// panicked or the runtime cancelled it. Folding it into `StorageHostError::Io` sent an
-    /// operator looking at the filesystem for a bug that is in the code. It keeps `Storage`'s
-    /// wire classification — the same preparation step failed, before any provider ran.
     #[error("broker storage materialization did not complete")]
     StorageTask {
-        /// Panic payload or cancellation from the blocking task.
         #[source]
         source: tokio::task::JoinError,
     },
-    /// A validated policy rule could not create authorization state.
     #[error("broker could not create constrained authorization")]
     Authorization {
-        /// Typestate transition failure.
         #[source]
         source: AuthorizationError,
     },
-    /// Decision evidence could not be hashed; execution did not begin.
     #[error("broker could not serialize bounded decision evidence")]
     DecisionEvidence {
-        /// JSON failure.
         #[source]
         source: serde_json::Error,
     },
-    /// Authorization decision could not be audited; execution did not begin.
     #[error("broker could not audit its authorization decision")]
     DecisionAudit {
-        /// Audit failure.
         #[source]
         source: AuditError,
     },
-    /// An authorized pre-provider failure could not append its terminal failed record.
     #[error("broker could not audit an authorized pre-provider failure")]
     AuthorizedFailureAudit {
         #[source]
         source: AuditError,
     },
-    /// Terminal evidence could not be hashed after provider work ended.
     #[error("broker could not serialize terminal evidence for {invocation}")]
     OutcomeEvidence {
-        /// Invocation whose effect may already have completed.
         invocation: InvocationId,
-        /// JSON failure.
         #[source]
         source: serde_json::Error,
     },
-    /// Terminal execution could not be audited after provider work ended.
     #[error("broker could not audit terminal execution for {invocation}")]
     OutcomeAudit {
-        /// Invocation whose effect may already have completed.
         invocation: InvocationId,
-        /// Audit failure.
         #[source]
         source: AuditError,
     },
 }
 
 impl BrokerError {
-    /// Stable pre-execution class for a broker-owned storage failure, when that is what happened.
-    ///
-    /// Nothing executed, so a corrected request may use a fresh invocation identifier — the class
-    /// only says which storage condition an operator has to reconcile first.
     #[must_use]
     pub const fn storage_failure_code(&self) -> Option<&'static str> {
         let source = match self {
             Self::Storage { source } => source,
-            // A join failure never reached the storage host, but it failed the same preparation
-            // step at the same point, so it keeps that step's wire classification.
             Self::StorageTask { .. } => return Some("storage-io"),
             _ => return None,
         };
@@ -5117,24 +4268,14 @@ impl BrokerError {
         })
     }
 
-    /// Whether a storage failure rotated its namespace to a fresh, empty generation.
-    ///
-    /// The same `storage-corrupt` code either way; this is what lets the answer say the stored
-    /// state is gone and an immediate retry will run, instead of asking for reconciliation.
     #[must_use]
     pub fn storage_namespace_reset(&self) -> bool {
         matches!(self, Self::Storage { source } if source.namespace_reset())
     }
 
-    /// Stable class for an exhaustion that no resubmission can outlast.
-    ///
-    /// The retriable class is for a broker that could not complete *this* request. This one
-    /// cannot complete any request: a bounded embedding audit log never evicts during its
-    /// lifetime. A fresh identifier cannot fix that exhaustion; reporting it as
-    /// `broker-unavailable` invites an unbounded retry loop.
-    ///
-    /// A *terminal* audit failure is deliberately absent: [`Self::OutcomeAudit`] is an unaudited
-    /// outcome first, whatever exhausted it, and that classification must not be weakened here.
+    /// This class is for an exhaustion no resubmission can ever outlast, since the bounded audit
+    /// log never evicts; OutcomeAudit is deliberately excluded here since its unaudited-outcome
+    /// classification must not be weakened to this one.
     #[must_use]
     pub const fn capacity_failure_code(&self) -> Option<&'static str> {
         match self {
@@ -5155,17 +4296,9 @@ impl BrokerError {
         }
     }
 
-    /// Invocation whose provider work may already have completed with no terminal audit record.
-    ///
-    /// `Some` exactly when the failure was raised after [`Broker::invoke`] began provider
-    /// execution: the external effect may have taken place, the audit sink refused its outcome,
-    /// and the request must not be resubmitted under any identifier. `None` when
-    /// execution provably never began — which makes resubmission *safe*, not useful:
-    /// [`Self::capacity_failure_code`] separates the failures a retry can outlive from the
-    /// exhaustions it cannot.
-    ///
-    /// Transports are expected to preserve this distinction; collapsing both cases into one
-    /// failure signal invites a resubmission that duplicates a non-idempotent external effect.
+    /// Some means provider execution may already have run with no terminal audit record, so the
+    /// request must never be resubmitted under any identifier since that could duplicate a
+    /// non-idempotent effect; None means resubmission is safe.
     #[must_use]
     pub const fn unaudited_outcome(&self) -> Option<&InvocationId> {
         match self {

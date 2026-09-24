@@ -1,4 +1,3 @@
-//! Gateway serving configuration and isolated model-account commands.
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
@@ -194,9 +193,8 @@ fn dns_name(value: &str, limit: usize, dots: bool) -> Result<String, String> {
                 .chars()
                 .all(|character| alphanumeric(character) || character == '-')
     };
-    // A subdomain is validated per dot-separated label, not as one string: the API server's
-    // regex applies to each label, so `a.-b.c` is rejected there and must be rejected here,
-    // before the credential this name labels has been printed.
+    // Each dot-separated label is validated separately to match the API server's own per-label
+    // regex, and this check runs before the credential the name labels is ever printed.
     let valid = if dots {
         value.split('.').all(label)
     } else {
@@ -303,7 +301,6 @@ mod tests {
         assert!(dns_subdomain("double..dot").is_err());
         assert!(dns_subdomain(&"a".repeat(254)).is_err());
 
-        // A namespace is a label, so dots are not a valid separator there.
         assert!(dns_label("dekopon").is_ok());
         assert!(dns_label("dekopon.agents").is_err());
         assert!(dns_label(&"a".repeat(64)).is_err());

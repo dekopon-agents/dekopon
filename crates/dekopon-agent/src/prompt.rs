@@ -1,10 +1,3 @@
-//! The model tool loop, exposing one sandboxed scripting tool rather than one tool per capability.
-//!
-//! `dekopon-shell` is the interpreter; this module is the model-facing half. Every session offers
-//! [`SCRIPT_TOOL_NAME`], whose single argument is a script. An embedding gateway may additionally
-//! offer credential-free agent configuration and chat-asset tools. Provider work still happens
-//! only inside the script instead of across many small capability-shaped model tools.
-
 use std::{
     fmt,
     ops::ControlFlow,
@@ -39,92 +32,47 @@ mod history;
 pub use crate::{improvement::IMPROVEMENT_TOOL_NAME, skills::SKILL_TOOL_NAME};
 pub use history::{ConversationTurn, DEFAULT_MAX_BYTES, DEFAULT_MAX_TURNS, History, HistoryLimits};
 
-/// Model-facing name of the single scripting tool.
-///
-/// Named for what it resembles rather than what it is. Models have overwhelming priors about a
-/// tool called `bash`, and almost all of them transfer: pipelines, `&&`, `$( )`, exit codes. The
-/// description below spends its length on the places where those priors are wrong.
 pub const SCRIPT_TOOL_NAME: &str = "bash";
 
-/// The tool a model calls to inspect this session's credential-free agent configuration.
 pub const AGENT_CONFIG_TOOL_NAME: &str = "inspect_agent_config";
 
-/// The tool a model calls to look at something a person attached to their message.
 pub const ASSET_TOOL_NAME: &str = "fetch_chat_asset";
 
-/// The tool an optional chat continuation may call to post nothing.
 pub const DECLINE_REPLY_TOOL_NAME: &str = "decline_chat_reply";
 
-/// Tool calls a single model turn may request.
-///
-/// This bound used to cover one capability invocation each, so 32 was a statement about how much
-/// provider work one turn could drive. With one scripting tool it no longer is: a single script
-/// can drive many invocations, so the real work bound moved to
-/// [`PromptLimits::max_capability_calls`], which the interpreter enforces per script and this loop
-/// enforces across the session.
-///
-/// What is left is a well-formedness bound. A scripting tool expresses a multi-step plan *inside*
-/// one script, while embedder-owned meta tools can legitimately fan out over a bounded attachment
-/// set. Ten calls leave room for that parallel work; anything beyond ten is a runaway rather than
-/// a plan.
 const MAX_TOOL_CALLS_PER_TURN: usize = 10;
 
-/// Text one chat asset may contribute to the prompt.
-///
-/// A textual asset arrives as a tool result, and the other tool result a session produces — a
-/// script's combined output — is already capped at this exact ceiling by the interpreter. A
-/// gateway's own asset budget is sized for images on the wire (8 MiB), which as `text/plain` is
-/// roughly two million tokens: handing that to a provider ends the session with a context-length
-/// rejection instead of an answer, which is precisely what the asset design refuses to do.
 const MAX_TEXTUAL_ASSET_BYTES: usize = dekopon_shell::DEFAULT_MAX_OUTPUT_BYTES;
-/// Trusted request-scoped guidance for an unaddressed continuation in an owned chat thread.
+/// Capped at the shell's own output limit so a larger asset would end the session with a provider
+/// context-length rejection instead of an answer.
 const OPTIONAL_REPLY_INSTRUCTION: &str = "This message is an unaddressed continuation inside a \
 chat thread the agent already owns. Reply when doing so would materially help. If no response is \
 needed—for example, the people are talking to each other, acknowledged the result, or already \
 resolved the point—call `decline_chat_reply` instead. That call posts nothing to chat. Do not reply \
 merely to have the last word.";
 
-/// A decline after provider work would hide something the session already did.
 const DECLINE_AFTER_WORK_RESULT: &str = "A chat reply is required because this session already \
 invoked a capability. No tool calls from this turn were run. Provide a concise reply describing \
 what happened instead.";
 
-/// Script execution boundary consumed by the prompt loop.
-///
-/// This deliberately returns no `Result`. A script failure — a parse error, an exhausted budget, a
-/// capability that policy refused — is a script *outcome*, and the model reads it and recovers the
-/// same way it would from a non-zero exit code in a terminal. Only a broken session aborts the
-/// loop.
+/// Returns no Result because a script failure is an outcome the model recovers from, like a nonzero
+/// exit code, not a reason to end the session.
 pub trait ScriptRuntime {
-    /// Runs one model-authored script, invoking at most `max_capability_calls` capabilities.
-    ///
-    /// The ceiling is supplied per call rather than fixed at construction because the prompt loop
-    /// spends one session-wide budget across every script it runs.
     fn run_script(&self, script: &str, max_capability_calls: u32) -> ScriptOutcome;
 
-    /// Returns the command words loaded providers contribute to this session.
-    ///
-    /// Defaulted to none so an embedder with no providers, and every existing implementor, is
-    /// unaffected. What comes back is already filtered to providers the session holds a grant on,
-    /// so a principal granted nothing is never told a word exists.
     fn command_words(&self) -> Vec<String> {
         Vec::new()
     }
 }
 
-/// One attachment, fetched.
 #[derive(Clone, Eq, PartialEq)]
 pub struct FetchedAsset {
-    /// The name the sender gave it.
     pub name: String,
-    /// IANA media type.
     pub mime: String,
-    /// A byte-free reference; gateway references do not pin disk residency.
     pub data: dekopon_model::asset::BlobReference,
 }
 
 impl fmt::Debug for FetchedAsset {
-    /// Summarised rather than printed, for the same reason [`ContentPart`] is.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("FetchedAsset")
@@ -135,105 +83,46 @@ impl fmt::Debug for FetchedAsset {
     }
 }
 
-/// The attachments one conversation can show a model.
-///
-/// Deliberately pull rather than push. A screenshot costs tokens on every turn it appears in, and
-/// most turns do not need to look at it — so the prompt carries a one-line reference and the model
-/// spends the bytes only when it decides the answer depends on them.
-///
-/// Every refusal is a `String` the model reads, never an error that ends the session: an asset that
-/// is too large, expired, or simply not there is something a model can work around by saying so,
-/// and killing a session over it would turn a recoverable answer into silence. The implementation
-/// owns its own budget for the same reason the shell runtime owns its capability budget.
 pub trait AssetSource {
-    /// Returns one asset's bytes, or a reason the model can read.
     fn fetch(&self, id: u64) -> Result<FetchedAsset, String>;
 
-    /// Whether this conversation has any attachments at all.
-    ///
-    /// The tool is not offered when it answers `true`, because a tool that can only fail is a tool
-    /// a model will still try.
     fn is_empty(&self) -> bool;
 }
 
-/// Observes provider-reported token accounting without influencing a model session.
-///
-/// The observer receives one call after every successfully decoded model response, including a
-/// response whose provider omitted usage and a response followed by a later tool/session failure.
-/// It is operational accounting only and must never be used to authorize or alter the session.
 pub trait ModelUsageObserver: Send + Sync {
-    /// Records the provider's report, or `None` when it reported no token counts.
     fn observe(&self, usage: Option<ModelUsage>);
 }
 
-/// Request-scoped cooperative cancellation visible from the synchronous prompt loop.
-///
-/// Cancellation is not rollback: a model request or provider effect already accepted elsewhere may
-/// still finish. The probe prevents the next model turn or tool invocation from starting and lets
-/// an embedding gateway suppress a stale terminal answer.
 pub trait CancellationProbe: Send + Sync {
-    /// Whether the session should stop at its next cooperative boundary.
     fn is_cancelled(&self) -> bool;
 
-    /// What asked for the stop, for an embedder that tracks it.
-    ///
-    /// The loop cannot know: a person's Stop, a shutdown, and a wall-clock budget all arrive as
-    /// the same `true`. An embedder that distinguishes them overrides this and the difference
-    /// reaches [`ProgressEvent::Cancelled`]; the default `None` is reported as
-    /// [`CancelSource::Operator`], which is what "the embedder stopped it and named no origin"
-    /// means.
     fn cancel_source(&self) -> Option<CancelSource> {
         None
     }
 }
 
-/// Bounds on one prompt session.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PromptLimits {
-    /// Maximum model turns, including the turn that produces the final answer.
     pub max_steps: u32,
-    /// Capability invocations the whole session may drive, summed across every script.
     pub max_capability_calls: u32,
 }
 
-/// Whether a completed prompt session should publish its final text.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReplyDisposition {
-    /// Publish the non-empty final answer normally.
     Send,
-    /// Publish nothing because an optional chat continuation explicitly declined.
     Suppress,
 }
 
-/// Result of a completed prompt/tool session.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PromptOutcome {
-    /// Final assistant text; may be empty for deliberate silence or an authorized asset-only reply.
     pub answer: String,
-    /// Whether the embedding surface should deliver `answer`.
     pub disposition: ReplyDisposition,
-    /// Number of model requests made.
     pub model_turns: u32,
-    /// Number of scripts the model ran.
     pub script_calls: u32,
-    /// Capability invocations those scripts drove.
     pub capability_invocations: u32,
-    /// Improvement suggestions the model recorded, when the embedder offered the tool.
-    ///
-    /// Already written to telemetry by the time they arrive here; this copy is for an embedder
-    /// that wants to show them to the operator directly, the way the one-shot runner prints them.
     pub suggestions: Vec<ImprovementSuggestion>,
 }
 
-/// Runs a bounded prompt/tool loop over one scripting tool.
-///
-/// This is synchronous on purpose. Both boundaries it sits between — `ChatModel` and
-/// [`ScriptRuntime`] — are synchronous by design, so the caller runs the whole loop on a blocking
-/// task rather than colouring these signatures `async`.
-///
-/// The session starts from an empty conversation and forgets it on the way out, which is what a
-/// one-shot invocation wants. Use [`run_prompt_with_history`] to continue a conversation across
-/// calls.
 pub fn run_prompt<M, R>(
     model: &M,
     runtime: &R,
@@ -249,27 +138,6 @@ where
     run_prompt_with_history(model, runtime, prompt, system, limits, &mut history)
 }
 
-/// Runs one bounded prompt/tool session as the continuation of an earlier conversation.
-///
-/// `history` is both the input and the output: the remembered exchanges are replayed ahead of
-/// `prompt`, and this session's own exchange is recorded into it before returning. It is an
-/// accumulator rather than a returned value on purpose. A session that fails still consumed the
-/// operator's message, and a signature returning `(PromptOutcome, History)` hands the history back
-/// only on the success path — every caller writing the natural `?` would silently drop the
-/// conversation exactly when a turn had gone wrong and the operator was about to retry. Borrowing
-/// the accumulator makes losing it impossible: whatever the caller does with the `Result`, the
-/// exchange is already recorded. See [`ConversationTurn::unanswered`] for what a failed turn
-/// leaves behind.
-///
-/// `system` is supplied fresh on every call and is never remembered; [`ConversationTurn`] explains
-/// the request corruption that separation prevents. The upside is that editing an agent's
-/// instructions takes effect on the next message without rewriting a single stored conversation.
-/// The matching obligation is on the caller: pass the *same* `system` for every call of one
-/// conversation unless a change is intended. Instructions are hoisted out of the message list
-/// entirely on the ChatGPT path, so changing them — including changing between `None` and
-/// `Some`, since an absent system prompt is replaced by that backend's own default rather than by
-/// nothing — rewrites the front of every subsequent request and discards the provider's prompt
-/// cache for the conversation.
 pub fn run_prompt_with_history<M, R>(
     model: &M,
     runtime: &R,
@@ -293,22 +161,6 @@ where
     )
 }
 
-/// The same conversation continuation, carrying request-scoped routing metadata to every model
-/// call this session makes.
-///
-/// `options` is the [`CompletionOptions`] the loop hands to [`ChatModel::complete`], and it is
-/// deliberately a *request* input rather than session state: nothing in it changes what the model
-/// is asked, only how the provider routes the request that carries it. A caller passing
-/// [`CompletionOptions::default`] gets the byte-identical requests
-/// [`run_prompt_with_history`] has always produced, which is why that function is this one with a
-/// default rather than a separate implementation.
-///
-/// Every turn of the session sends the same options, which is the point of a prompt cache key: the
-/// tool-calling turns within one session share the longest prefix of all, and they are exactly the
-/// requests a per-session key routes to one cache lane.
-///
-/// A model that routes on none of it still answers: every field is optional and an implementation
-/// that ignores one costs the request a cache lookup, never an answer.
 pub fn run_prompt_with_history_and_options<M, R>(
     model: &M,
     runtime: &R,
@@ -332,11 +184,6 @@ where
     )
 }
 
-/// Everything one bounded session needs beyond the model and the script runtime.
-///
-/// A builder rather than more parameters: the entry point above already carries seven, and each
-/// capability a session gains would otherwise add both a parameter and a longer function name to
-/// every caller that does not want it. Fields are private so a later addition stays additive.
 pub struct SessionInputs<'a> {
     prompt: &'a str,
     system: Option<&'a str>,
@@ -354,7 +201,6 @@ pub struct SessionInputs<'a> {
 }
 
 impl<'a> SessionInputs<'a> {
-    /// The two things every session has: what was asked, and what it may spend answering.
     #[must_use]
     pub const fn new(prompt: &'a str, limits: PromptLimits) -> Self {
         Self {
@@ -374,7 +220,6 @@ impl<'a> SessionInputs<'a> {
         }
     }
 
-    /// Allows an empty final text only when explicitly authorized files are queued for delivery.
     #[must_use]
     pub const fn with_reply_assets(
         mut self,
@@ -384,91 +229,60 @@ impl<'a> SessionInputs<'a> {
         self
     }
 
-    /// Mounts operator-authored skills, listed in the system prompt and read on demand.
-    ///
-    /// An empty slice mounts nothing and changes no request: no listing is added and no
-    /// `read_skill` tool is offered, so a session without skills is byte-identical to one built
-    /// before skills existed.
     #[must_use]
     pub const fn with_skills(mut self, skills: &'a [Skill]) -> Self {
         self.skills = skills;
         self
     }
 
-    /// Offers the `suggest_improvement` tool, so the model can tell the operator how to improve it.
-    ///
-    /// Opt-in per session because the suggestion record carries model-authored text. Offering the
-    /// tool is what declares the telemetry sink in scope for that text.
     #[must_use]
     pub const fn with_improvement_suggestions(mut self) -> Self {
         self.improvement_suggestions = true;
         self
     }
 
-    /// Standing instructions, supplied fresh per call and never remembered.
     #[must_use]
     pub const fn with_system(mut self, system: Option<&'a str>) -> Self {
         self.system = system;
         self
     }
 
-    /// Per-request model options, such as a prompt cache key.
     #[must_use]
     pub const fn with_options(mut self, options: &'a CompletionOptions) -> Self {
         self.options = Some(options);
         self
     }
 
-    /// The attachments this conversation can show the model.
     #[must_use]
     pub const fn with_assets(mut self, assets: &'a dyn AssetSource) -> Self {
         self.assets = Some(assets);
         self
     }
 
-    /// Adds an informational observer for provider-reported token accounting.
     #[must_use]
     pub const fn with_usage_observer(mut self, observer: &'a dyn ModelUsageObserver) -> Self {
         self.usage_observer = Some(observer);
         self
     }
 
-    /// Adds the credential-free, subject-specific agent configuration meta tool.
     #[must_use]
     pub const fn with_agent_config(mut self, config: &'a AgentConfigView) -> Self {
         self.agent_config = Some(config);
         self
     }
 
-    /// Adds a request-scoped cooperative cancellation probe.
     #[must_use]
     pub const fn with_cancellation(mut self, cancellation: &'a dyn CancellationProbe) -> Self {
         self.cancellation = Some(cancellation);
         self
     }
 
-    /// Reports what this session is doing to a surface a person is watching.
-    ///
-    /// The third synchronous observer, beside [`Self::with_usage_observer`] and
-    /// [`Self::with_cancellation`], and the only one whose output a person sees. An absent sink is
-    /// a no-op at every seam: the loop builds no event and spends nothing, which is what an
-    /// embedder with nowhere to render gets.
-    ///
-    /// Shared rather than borrowed because the same sink outlives one session's inputs in a
-    /// gateway — it is the endpoint a per-session rendering task reads — and it is
-    /// [`Sync`] because the broker leg emits from the same blocking thread this
-    /// loop runs on.
     #[must_use]
     pub fn with_progress(mut self, sink: Arc<dyn ProgressSink>) -> Self {
         self.progress = Some(sink);
         self
     }
 
-    /// Lets the model decline one unaddressed, transport-owned chat continuation.
-    ///
-    /// This is deliberately request-scoped rather than an agent default: explicit mentions and
-    /// direct messages still require an answer, while a conversational thread follow-up may need
-    /// no last word from the agent.
     #[must_use]
     pub const fn with_optional_reply(mut self) -> Self {
         self.optional_reply = true;
@@ -476,11 +290,6 @@ impl<'a> SessionInputs<'a> {
     }
 }
 
-/// Optional, request-scoped surfaces handed to the inner model loop.
-///
-/// The progress sink is borrowed rather than shared here: [`SessionInputs`] owns the `Arc` for the
-/// length of the call, and keeping these extensions [`Copy`] is what lets every turn pass them on
-/// without a clone per seam.
 #[derive(Clone, Copy)]
 struct SessionExtensions<'a> {
     options: &'a CompletionOptions,
@@ -495,10 +304,6 @@ struct SessionExtensions<'a> {
     improvement_suggestions: bool,
 }
 
-/// Runs one bounded prompt/tool session from a [`SessionInputs`].
-///
-/// The general form of [`run_prompt_with_history_and_options`], which is this function with the
-/// defaults filled in.
 pub fn run_prompt_session<M, R>(
     model: &M,
     runtime: &R,
@@ -528,18 +333,13 @@ where
     let options = options.unwrap_or(&fallback);
     let progress = progress.as_deref();
     if limits.max_steps == 0 {
-        // Nothing is recorded here: a zero-step session builds no request, so the prompt never
-        // reached a model and the conversation must not claim otherwise. A surface waiting on this
-        // session is still told it ended, through the same classification every other exit takes.
         let error = PromptError::ZeroSteps;
         report_end(progress, cancellation, &error);
         return Err(error);
     }
 
-    // Order matters and is fixed here rather than left to callers: instructions first, then the
-    // standing skills listing, then what the conversation remembers, then what the operator just
-    // said. The listing sits with the instructions because it is agent-standing rather than
-    // request-scoped, which keeps a route's cached prompt prefix stable across sessions.
+    // Keep this message order fixed: instructions, skills listing, remembered history, then the
+    // prompt, or prompt caching breaks.
     let mut messages = Vec::new();
     if let Some(system) = system {
         messages.push(ModelMessage::system(system));
@@ -580,11 +380,6 @@ where
     result
 }
 
-/// Drives the model turns for one session and tells a progress surface how it ended.
-///
-/// The two successful exits report [`ProgressEvent::Finished`] where they know what was spent;
-/// every broken one funnels through here, so a surface learns of a stop or a failure exactly once
-/// however deep in the loop it happened.
 fn run_session<M, R>(
     model: &M,
     runtime: &R,
@@ -603,11 +398,6 @@ where
     result
 }
 
-/// Reports one broken session as the stop or the failure it was.
-///
-/// Cancellation is an outcome rather than a failure class, so it is the one exit that names who
-/// asked; the probe is the only thing that can know, and an embedder that does not track it leaves
-/// [`CancelSource::Operator`], which is what stopping a session yourself is.
 fn report_end(
     progress: Option<&dyn ProgressSink>,
     cancellation: Option<&dyn CancellationProbe>,
@@ -626,17 +416,12 @@ fn report_end(
     });
 }
 
-/// Reports one event to the sink an embedder supplied, or does nothing.
 fn emit(progress: Option<&dyn ProgressSink>, event: ProgressEvent) {
     if let Some(sink) = progress {
         sink.emit(event);
     }
 }
 
-/// Drives the model turns for one session over an already-seeded message vector.
-///
-/// Split out so that every exit path — answer, budget exhaustion, refused tool call, transport
-/// failure — funnels back through one caller that records the exchange.
 fn run_turns<M, R>(
     model: &M,
     runtime: &R,
@@ -660,8 +445,6 @@ where
         skills,
         improvement_suggestions,
     } = extensions;
-    // Offered only when this conversation actually carries something. A tool that can only fail is
-    // a tool a model will still call, and every unusable tool costs prompt tokens on every turn.
     let mut model_tools = vec![script_tool(&runtime.command_words())];
     if agent_config.is_some() {
         model_tools.push(agent_config_tool());
@@ -682,34 +465,21 @@ where
         prompt.max_capability_calls = limits.max_capability_calls
     );
     let _session = session_span.enter();
-    // Wall clock for the person waiting, not for a bound: nothing in this loop is timed out by it.
     let session_started = Instant::now();
     let mut script_calls = 0_u32;
     let mut capability_invocations = 0_u32;
-    // Tool calls the model requested across every turn, which is what a finished session reports;
-    // scripts and capability invocations are separate counts and stay separate.
     let mut tool_calls = 0_u32;
-    // How much of the message vector the transcript log has already shipped, so later turns log
-    // what was appended rather than the whole conversation again.
     let mut transcribed = 0_usize;
-    // One full configuration copy per session. Every later call points at it instead of appending
-    // a second, because a tool result stays in the message vector and is re-sent on every turn.
     let mut agent_config_shown = false;
-    // Which skill text is already in the message vector, so a repeat costs a pointer, not a copy.
     let mut skill_reads = SkillReads::default();
-    // What the model has told the operator so far; bounded by the tool itself.
     let mut suggestions = Vec::new();
 
     for model_turns in 1..=limits.max_steps {
         check_cancelled(cancellation)?;
-        // A provider result can register the first asset during this very session.
         model_tools.retain(|tool| tool.name != ASSET_TOOL_NAME);
         if assets.is_some_and(|source| !source.is_empty()) {
             model_tools.push(asset_tool());
         }
-        // Usage fields are declared empty and recorded once the provider answers: token counts
-        // are response data, and they belong on the turn span so a trace query can price a
-        // session without leaving the trace.
         let model_span = tracing::info_span!(
             "prompt.model_turn",
             model.turn = model_turns,
@@ -719,22 +489,10 @@ where
             usage.output_tokens = tracing::field::Empty,
             usage.reasoning_output_tokens = tracing::field::Empty,
             usage.total_tokens = tracing::field::Empty,
-            // Counted rather than recorded one by one: a record per token would put a log line on
-            // the trace for every fragment and say nothing the complete answer does not.
             stream.deltas = tracing::field::Empty,
             stream.first_delta_ms = tracing::field::Empty,
         );
         let model_entered = model_span.enter();
-        // Verbatim transcript rides the log stream rather than span attributes: a conversation is
-        // unbounded text, span attributes are the wrong container for it, and the log stream is
-        // what a backend indexes for full-text search. Both carry the same trace and span IDs, so
-        // a log result still pivots to the turn it belongs to.
-        //
-        // Only the first turn ships the whole thing. Turn N's message vector strictly contains
-        // turn N-1's, so re-shipping it every turn would cost a session O(N^2) payload bytes to
-        // repeat what this turn's `agent.model.answer`, `agent.tool.script`, and
-        // `agent.tool.output` already said. Later turns log the messages appended since the
-        // previous one, so the events of a session still concatenate back into the exact request.
         let scope = if transcribed == 0 { "full" } else { "delta" };
         tracing::info!(
             target: "dekopon_agent::audit",
@@ -756,9 +514,6 @@ where
                 of: limits.max_steps,
             },
         );
-        // The request is streamed and the fragments are watched here rather than inside the model
-        // client: this is the only place that knows the session's cancellation and its progress
-        // surface, and a turn is interruptible exactly as often as it emits an event.
         let mut stream = TurnStream::new(model_turns, model_started, progress, cancellation);
         let completion = {
             let mut on_event = |event| stream.observe(event);
@@ -767,10 +522,6 @@ where
         stream.record_on(&model_span);
         let turn = match completion {
             Ok(turn) => turn,
-            // The callback asked to stop and the client dropped the body. No `AssistantTurn`
-            // exists, so the text the person already read is the only account of the turn there
-            // will ever be, and it is written here rather than lost with the connection. Usage is
-            // absent by construction: the provider reports it in the final event that never came.
             Err(InferenceError::Cancelled) => {
                 tracing::info!(
                     target: "dekopon_agent::audit",
@@ -818,10 +569,6 @@ where
         if let Some(usage) = &turn.usage {
             record_usage(&model_span, usage);
         }
-        // Accounting rather than lifecycle: the `prompt.model_turn` span already says a turn
-        // happened and how long it took. This record exists to outlive trace retention and survive
-        // sampling, because a model turn is a billed call and "how many did we make, at what
-        // latency, for how many tokens" is a question asked long after the trace is gone.
         tracing::info!(
             target: "dekopon_agent::audit",
             {
@@ -921,8 +668,6 @@ where
                 .iter()
                 .any(|call| call.function.name == DECLINE_REPLY_TOOL_NAME);
         if decline_requested {
-            // A terminal decline does not need tool results, but malformed correlation IDs and
-            // arguments are still malformed model output rather than a magic escape hatch.
             for (index, call) in turn.tool_calls.iter().enumerate() {
                 if call.id.as_str().trim().is_empty() {
                     reject_tool_call(model_turns, index + 1, "empty-tool-call-id");
@@ -961,10 +706,8 @@ where
                 });
             }
 
-            // Once a capability ran, silence could conceal an external effect. If no model turn
-            // remains, return a distinct error so the embedding surface can post a fixed warning
-            // not to retry blindly. Otherwise answer every call in this turn without running any
-            // of them, then require the model to report what the earlier work did.
+            // Once a capability has run, the model cannot decline silently, since silence could
+            // conceal an effect that capability already had outside the conversation.
             if model_turns == limits.max_steps {
                 return Err(PromptError::UnreportedCapabilityWork);
             }
@@ -1024,8 +767,8 @@ where
                 fetch_asset_into(&mut messages, source, &call, model_turns, tool_call_index)?;
                 continue;
             }
-            // The model-selected name is deliberately not copied into telemetry: it is untrusted
-            // model output, and an operator reads it from the error on stderr instead.
+            // The model-selected tool name is excluded from telemetry because it is untrusted model
+            // output; an operator reads it from stderr instead.
             if call.function.name != SCRIPT_TOOL_NAME {
                 reject_tool_call(model_turns, tool_call_index, "unknown-tool");
                 return Err(PromptError::UnknownTool(call.function.name));
@@ -1038,14 +781,11 @@ where
                 }
             };
 
-            // Whatever the session has already spent is unavailable to this script, so a model
-            // cannot widen its own budget by splitting work across more tool calls.
+            // Remaining budget is computed from what the session already spent, so a model cannot
+            // widen its own capability budget by splitting work across more scripts.
             let remaining = limits
                 .max_capability_calls
                 .saturating_sub(capability_invocations);
-            // One span per unit of tool work. That unit is now a whole script rather than a single
-            // capability call, so the per-capability detail the old loop recorded here lives in
-            // the interpreter and is reported through the outcome attributes below.
             let span = tracing::info_span!(
                 "prompt.script",
                 model.turn = model_turns,
@@ -1065,9 +805,6 @@ where
                     },
                     "agent tool script"
                 );
-                // `run_script` returns no `Result`: a failed script is an outcome the model reads
-                // and recovers from, so the `prompt.script` span always closes normally and
-                // reports the script's own exit code rather than a host error.
                 check_cancelled(cancellation)?;
                 let outcome = runtime.run_script(&script, remaining);
                 check_cancelled(cancellation)?;
@@ -1103,25 +840,15 @@ fn check_cancelled(cancellation: Option<&dyn CancellationProbe>) -> Result<(), P
     }
 }
 
-/// What one model turn reported while it was still arriving.
-///
-/// Three things outlive the call. The cumulative text, because an interrupted turn returns no
-/// [`AssistantTurn`](dekopon_model::model::AssistantTurn) and this is then the only account of
-/// what the person read. The fragment count and the time to the first one, because they belong on
-/// the turn span. And the decision to stop: the cancellation probe is read between fragments here,
-/// which is what moves a Stop's effect from "after this turn" to "after this event".
 struct TurnStream<'a> {
     turn: u32,
     started: Instant,
     progress: Option<&'a dyn ProgressSink>,
     cancellation: Option<&'a dyn CancellationProbe>,
-    /// Everything the model has written this turn, in arrival order.
     text: ModelText,
-    /// Characters of that text, counted as it grows rather than recounted per fragment.
     chars: usize,
     deltas: u64,
     first_delta: Option<Duration>,
-    /// Whether the text passed the bound past which no further fragment is forwarded.
     bound_passed: bool,
 }
 
@@ -1145,12 +872,9 @@ impl<'a> TurnStream<'a> {
         }
     }
 
-    /// Takes one event and answers whether the session still wants the rest of the turn.
     fn observe(&mut self, event: TurnEvent) -> ControlFlow<()> {
         match event {
             TurnEvent::TextDelta(delta) => self.append(delta),
-            // Nothing to show: an index is not a name, and the arguments that would name it are
-            // model-authored and arrive with the completed turn, which is where they are read.
             TurnEvent::ToolCallStarted { .. } => {}
         }
         if self
@@ -1163,7 +887,6 @@ impl<'a> TurnStream<'a> {
         }
     }
 
-    /// Accumulates one fragment and forwards it while a surface can still use it.
     fn append(&mut self, delta: ModelText) {
         self.deltas = self.deltas.saturating_add(1);
         if self.first_delta.is_none() {
@@ -1175,8 +898,6 @@ impl<'a> TurnStream<'a> {
             return;
         }
         if self.text.len() > STREAMED_TEXT_BOUND_BYTES {
-            // Past the bound the surface stops growing and stays at what it had: it cannot show
-            // more than the answer will carry, and the whole answer still arrives with the turn.
             self.bound_passed = true;
             return;
         }
@@ -1190,17 +911,14 @@ impl<'a> TurnStream<'a> {
         );
     }
 
-    /// Everything the model wrote this turn, which is all an interrupted turn leaves behind.
     const fn text(&self) -> &ModelText {
         &self.text
     }
 
-    /// Time to the first fragment, absent when the response did not stream.
     const fn first_delta(&self) -> Option<Duration> {
         self.first_delta
     }
 
-    /// Puts the two stream counters on the turn span, leaving the absent one empty.
     fn record_on(&self, span: &tracing::Span) {
         span.record("stream.deltas", self.deltas);
         if let Some(first) = self.first_delta {
@@ -1209,10 +927,6 @@ impl<'a> TurnStream<'a> {
     }
 }
 
-/// Renders one script outcome the way a terminal would: output, then an exit-code trailer.
-///
-/// Embedders can print this exact shape to a human, and the prompt loop hands this exact
-/// shape to a model, so a script a model wrote behaves identically when an operator reruns it.
 #[must_use]
 pub fn format_script_outcome(outcome: &ScriptOutcome) -> String {
     let mut text = outcome.output.clone();
@@ -1223,11 +937,6 @@ pub fn format_script_outcome(outcome: &ScriptOutcome) -> String {
     text
 }
 
-/// Records one model-authored tool call the loop refused to run.
-///
-/// Every caller passes a fixed category rather than the model's own text: a rejection event is
-/// triggered by untrusted model output, and `docs/observability.md` keeps that output out of
-/// exported telemetry.
 pub(crate) fn reject_tool_call(model_turn: u32, tool_call_index: usize, error_type: &'static str) {
     tracing::error!(
         target: "dekopon_agent::audit",
@@ -1241,16 +950,9 @@ pub(crate) fn reject_tool_call(model_turn: u32, tool_call_index: usize, error_ty
     );
 }
 
-/// Builds the scripting tool every prompt session offers.
-///
-/// `command_words` are the words loaded providers contribute on top of the fixed builtins. They are
-/// appended rather than interpolated into the prose so the description stays one constant plus a
-/// list, and so a session with no providers reads exactly as it did before.
 fn script_tool(command_words: &[String]) -> ModelTool {
     let mut description = SCRIPT_TOOL_DESCRIPTION.to_owned();
     if !command_words.is_empty() {
-        // Sorted and deduplicated: the tool definition is part of the cached prompt prefix, and
-        // provider load order must not produce two definitions for one set of words.
         let mut words = command_words.to_vec();
         words.sort();
         words.dedup();
@@ -1316,21 +1018,11 @@ fn agent_config_tool() -> ModelTool {
     }
 }
 
-/// What a repeated `inspect_agent_config` call is answered with.
-///
-/// The configuration cannot change inside one session — it is built once, from one fresh broker
-/// answer — so a second copy would say exactly what the first said. It would also stay in the
-/// message vector and be re-sent to the provider on every remaining turn, which is why the
-/// repeat is a pointer rather than a bounded-but-large duplicate.
 const AGENT_CONFIG_ALREADY_SHOWN: &str = "This session's agent configuration is already in this \
                                           conversation, in the earlier inspect_agent_config \
                                           result. It cannot change within a session; read that \
                                           result again.";
 
-/// Answers one `inspect_agent_config` call without touching the capability budget or broker.
-///
-/// `already_shown` is the session's own record of whether a full copy is already in `messages`.
-/// Inspection stays repeatable under the loop's shared bounds; only the *bytes* are spent once.
 fn inspect_agent_config_into(
     messages: &mut Vec<ModelMessage>,
     config: &AgentConfigView,
@@ -1364,7 +1056,6 @@ fn inspect_agent_config_into(
     Ok(())
 }
 
-/// Requires the decline tool's argument object to be exactly empty.
 fn decline_reply_argument(tool: &str, arguments: &str) -> Result<(), PromptError> {
     let arguments = serde_json::from_str::<Value>(arguments).map_err(|source| {
         PromptError::InvalidArguments {
@@ -1385,7 +1076,6 @@ fn decline_reply_argument(tool: &str, arguments: &str) -> Result<(), PromptError
     Ok(())
 }
 
-/// Requires the meta tool's argument object to be exactly empty.
 fn agent_config_argument(tool: &str, arguments: &str) -> Result<(), PromptError> {
     let arguments = serde_json::from_str::<Value>(arguments).map_err(|source| {
         PromptError::InvalidArguments {
@@ -1406,11 +1096,6 @@ fn agent_config_argument(tool: &str, arguments: &str) -> Result<(), PromptError>
     Ok(())
 }
 
-/// Media types whose bytes are readable as a tool result rather than as an attachment.
-///
-/// A model reads these as text, so routing them through an attachment part would encode a file it
-/// could simply have been handed. Everything else — an image, a PDF, an office document — has to
-/// arrive as a content part instead.
 fn is_textual(mime: &str) -> bool {
     mime.starts_with("text/")
         || matches!(
@@ -1440,15 +1125,8 @@ fn asset_tool() -> ModelTool {
     }
 }
 
-/// Answers one `fetch_chat_asset` call by appending the tool result and, when the asset is not
-/// text, the message that actually carries it.
-///
-/// Two messages rather than one because **a tool result cannot carry an attachment**. Chat
-/// Completions types a `tool` message's content as a string, and the Responses API types
-/// `function_call_output.output` the same way; neither accepts an image part where a tool result
-/// goes. So the tool result says what happened and a following `user` message carries the bytes.
-/// This shape is the only one both wire formats accept — do not "simplify" it by attaching to the
-/// tool result.
+/// A tool result cannot carry an attachment on either wire format, so the asset always arrives as a
+/// following message; this shape must not be simplified.
 fn fetch_asset_into(
     messages: &mut Vec<ModelMessage>,
     source: &dyn AssetSource,
@@ -1470,8 +1148,6 @@ fn fetch_asset_into(
         asset.id = id,
     );
     let _entered = span.enter();
-    // A refusal is an outcome the model reads, not a failed session. Its text is gateway-authored
-    // rather than sender-supplied, so it is safe to record.
     let asset = match source.fetch(id) {
         Ok(asset) => asset,
         Err(reason) => {
@@ -1498,7 +1174,8 @@ fn fetch_asset_into(
     let truncated = text
         .as_ref()
         .is_some_and(|text| text.len() > MAX_TEXTUAL_ASSET_BYTES);
-    // Size and media type, never the bytes and never the sender's file name, which is untrusted.
+    // Only size and media type are logged, never the bytes or the sender's file name, since the
+    // file name is untrusted.
     tracing::info!(
         target: "dekopon_agent::audit",
         {
@@ -1540,12 +1217,6 @@ fn fetch_asset_into(
     Ok(())
 }
 
-/// Clamps one textual asset to what a prompt can carry, saying so in the text itself.
-///
-/// The trailer is part of the tool result rather than a separate signal because the model is the
-/// one that has to act on it: it can read what it got, and tell the person the rest was too large
-/// to look at. That is the asset contract — an unusable attachment is refused in words the model
-/// can pass on, never by failing the session.
 fn clamp_textual_asset(mut text: String) -> String {
     let total = text.len();
     if total <= MAX_TEXTUAL_ASSET_BYTES {
@@ -1560,7 +1231,6 @@ fn clamp_textual_asset(mut text: String) -> String {
     text
 }
 
-/// Extracts the `id` argument from one `fetch_chat_asset` call.
 fn asset_argument(tool: &str, arguments: &str) -> Result<u64, PromptError> {
     let arguments = serde_json::from_str::<Value>(arguments).map_err(|source| {
         PromptError::InvalidArguments {
@@ -1573,8 +1243,6 @@ fn asset_argument(tool: &str, arguments: &str) -> Result<u64, PromptError> {
             tool: tool.to_owned(),
         });
     };
-    // Models write `5` and `"5"` for the same intent, and refusing the second would spend a turn
-    // teaching one that the conversation already told it the number.
     let id = arguments.get("id").and_then(|id| match id {
         Value::Number(number) => number.as_u64(),
         Value::String(text) => text.trim().parse().ok(),
@@ -1585,7 +1253,6 @@ fn asset_argument(tool: &str, arguments: &str) -> Result<u64, PromptError> {
     })
 }
 
-/// Extracts the `script` argument from one model tool call.
 fn script_argument(tool: &str, arguments: &str) -> Result<String, PromptError> {
     let arguments = serde_json::from_str::<Value>(arguments).map_err(|source| {
         PromptError::InvalidArguments {
@@ -1606,14 +1273,6 @@ fn script_argument(tool: &str, arguments: &str) -> Result<String, PromptError> {
     }
 }
 
-/// The whole model-facing surface of a Dekopon session.
-///
-/// This replaces one JSON Schema per capability, so it is allowed to be long: it is paid once per
-/// request instead of once per capability, and it shrinks rather than grows as an operator grants
-/// more. What it must *not* do is describe anything the interpreter does not have. There is no
-/// `help` builtin — the runtime discovery surface is each provider word's own `--help` and
-/// `cap --list`, and pointing a model at anything else would spend a tool call on "command not
-/// found".
 const SCRIPT_TOOL_DESCRIPTION: &str = "\
 Run one script in Dekopon's sandboxed shell. This is the only way to invoke capabilities: use it \
 whenever the task needs data or an action the session's capabilities provide, and write the whole \
@@ -1697,115 +1356,55 @@ into it.
 There is no `help` builtin. Discover once, then prefer a single script that does the whole job \
 over many small ones — that is the entire point of this tool.";
 
-/// Failure to complete a prompt/tool session.
-///
-/// Every variant here is a broken *session*, not a failed script. A script that parses badly,
-/// trips a budget, or calls a capability policy refuses is reported to the model through
-/// [`format_script_outcome`] so it can recover.
 #[derive(Debug, Error)]
 pub enum PromptError {
-    /// The embedding caller stopped the session at a cooperative boundary.
     #[error("prompt session was cancelled")]
     Cancelled,
-    /// A zero-length loop was requested.
     #[error("prompt max steps must be greater than zero")]
     ZeroSteps,
-    /// A model request failed.
     #[error(transparent)]
     Model(#[from] InferenceError),
-    /// The model selected a tool that was not offered.
     #[error("model requested unknown or unavailable tool {0:?}")]
     UnknownTool(String),
-    /// A model requested more tool calls in one turn than a plan ever needs.
     #[error("model returned {actual} tool calls in one turn; the maximum is {maximum}")]
-    TooManyToolCalls {
-        /// Model-requested call count.
-        actual: usize,
-        /// Fixed per-turn bound.
-        maximum: usize,
-    },
-    /// A model supplied an empty tool-call correlation ID.
+    TooManyToolCalls { actual: usize, maximum: usize },
     #[error("model returned an empty tool-call ID")]
     EmptyToolCallId,
-    /// Tool arguments were malformed JSON.
     #[error("model returned invalid JSON arguments for tool {tool:?}")]
     InvalidArguments {
-        /// Prompt-visible tool name.
         tool: String,
-        /// JSON error.
         #[source]
         source: serde_json::Error,
     },
-    /// Tool arguments were valid JSON but not an object.
     #[error("model arguments for tool {tool:?} must be a JSON object")]
-    ArgumentsNotObject {
-        /// Prompt-visible tool name.
-        tool: String,
-    },
-    /// The agent-configuration tool received fields despite having no arguments.
+    ArgumentsNotObject { tool: String },
     #[error("model arguments for tool {tool:?} must be an empty object")]
-    AgentConfigArgumentsNotEmpty {
-        /// Prompt-visible tool name.
-        tool: String,
-    },
-    /// The optional-reply decline tool received fields despite having no arguments.
+    AgentConfigArgumentsNotEmpty { tool: String },
     #[error("model arguments for tool {tool:?} must be an empty object")]
-    DeclineReplyArgumentsNotEmpty {
-        /// Prompt-visible tool name.
-        tool: String,
-    },
-    /// Tool arguments carried no script to run.
+    DeclineReplyArgumentsNotEmpty { tool: String },
     #[error("model arguments for tool {tool:?} must include a string \"script\" field")]
-    MissingScript {
-        /// Prompt-visible tool name.
-        tool: String,
-    },
-    /// Tool arguments carried no asset to fetch.
+    MissingScript { tool: String },
     #[error("model arguments for tool {tool:?} must include an integer \"id\" field")]
-    MissingAssetId {
-        /// Prompt-visible tool name.
-        tool: String,
-    },
-    /// Skill-reading arguments carried no skill name.
+    MissingAssetId { tool: String },
     #[error("model arguments for tool {tool:?} must include a non-empty string \"name\" field")]
-    MissingSkillName {
-        /// Prompt-visible tool name.
-        tool: String,
-    },
-    /// Skill-reading arguments contained fields outside the strict name-and-resource schema.
+    MissingSkillName { tool: String },
     #[error("model arguments for tool {tool:?} contain unexpected or mistyped fields")]
-    UnexpectedSkillArguments {
-        /// Prompt-visible tool name.
-        tool: String,
-    },
-    /// Suggestion arguments were a JSON object but not the six-field shape the tool declares.
+    UnexpectedSkillArguments { tool: String },
     #[error("model arguments for tool {tool:?} do not match the suggestion schema")]
     InvalidSuggestion {
-        /// Prompt-visible tool name.
         tool: String,
-        /// Decoder diagnostic.
         #[source]
         source: serde_json::Error,
     },
-    /// Capability work ran, then the model tried to decline with no reporting turn left.
     #[error("model tried to suppress a reply after capability work with no reporting turn left")]
     UnreportedCapabilityWork,
-    /// The model ended without text or a tool call.
     #[error("model returned neither tool calls nor a final answer")]
     EmptyAnswer,
-    /// The model did not produce a final answer within the configured loop bound.
     #[error("model did not produce a final answer within {maximum} turns")]
-    MaxSteps {
-        /// Configured model-turn limit.
-        maximum: u32,
-    },
+    MaxSteps { maximum: u32 },
 }
 
 impl PromptError {
-    /// Stable, low-cardinality failure category for telemetry.
-    ///
-    /// Several variants carry model-chosen text; the category returned here never does. Embedding
-    /// binaries reuse it so a session failure is labeled identically wherever it is reported.
     #[must_use]
     pub fn telemetry_kind(&self) -> &'static str {
         match self {
@@ -1831,12 +1430,6 @@ impl PromptError {
     }
 }
 
-/// Renders the conversation so far for the transcript log.
-///
-/// Serialization failure is reported inline rather than propagated: telemetry must not be able to
-/// end a session that is otherwise working.
-/// Records reported token counts on the turn span, leaving unreported fields empty rather than
-/// writing zeros the provider never sent.
 fn record_usage(span: &tracing::Span, usage: &ModelUsage) {
     if let Some(tokens) = usage.input_tokens {
         span.record("usage.input_tokens", tokens);
@@ -1862,7 +1455,6 @@ fn transcript(messages: &[ModelMessage]) -> String {
     serde_json::to_string(messages).unwrap_or_else(|_| "<unserializable>".to_owned())
 }
 
-/// Renders requested tool calls for the transcript log.
 fn tool_calls_json(tool_calls: &[ModelToolCall]) -> String {
     serde_json::to_string(tool_calls).unwrap_or_else(|_| "<unserializable>".to_owned())
 }
@@ -1906,14 +1498,6 @@ mod tests {
         script_tool,
     };
 
-    /// A model whose turns are fixed in advance, recording what it was asked.
-    ///
-    /// `Mutex` rather than `RefCell`: the loop now runs on a blocking task, so every fixture it
-    /// touches has to cross a thread boundary.
-    ///
-    /// The whole `messages` slice is captured rather than a filtered projection of it. History
-    /// assertions are about ordering, role placement, and what is *absent* from a request, none of
-    /// which survive a filter applied before the test sees the request.
     struct ScriptedModel {
         turns: Mutex<VecDeque<AssistantTurn>>,
         observed_tools: Mutex<Vec<Vec<ModelTool>>>,
@@ -1929,7 +1513,6 @@ mod tests {
             }
         }
 
-        /// Messages the model saw on its first request of the session.
         fn first_request(&self) -> Vec<ModelMessage> {
             self.observed_messages
                 .lock()
@@ -1939,7 +1522,6 @@ mod tests {
                 .expect("the model was asked at least once")
         }
 
-        /// `(role, content)` pairs from the first request, the shape most assertions want.
         fn first_roles(&self) -> Vec<(&'static str, String)> {
             self.first_request()
                 .iter()
@@ -1952,7 +1534,6 @@ mod tests {
                 .collect()
         }
 
-        /// Every tool result the model was handed, across every request.
         fn tool_messages(&self) -> Vec<String> {
             self.observed_messages
                 .lock()
@@ -1966,8 +1547,6 @@ mod tests {
     }
 
     impl ChatModel for ScriptedModel {
-        /// Answers whole, calling `on_event` zero times, which is the contract for an
-        /// implementation that does not stream.
         fn complete(
             &self,
             messages: &[ModelMessage],
@@ -1993,7 +1572,6 @@ mod tests {
         }
     }
 
-    /// A runtime that records the scripts and ceilings it was handed.
     struct RecordingRuntime {
         scripts: Mutex<Vec<(String, u32)>>,
         capability_calls_per_script: u32,
@@ -2103,7 +1681,6 @@ mod tests {
         );
     }
 
-    /// Keeps what one session reported, in order.
     #[derive(Default)]
     struct RecordingSink {
         events: Mutex<Vec<ProgressEvent>>,
@@ -2115,7 +1692,6 @@ mod tests {
         }
     }
 
-    /// One recorder, twice: the handle the assertions read and the trait object a session takes.
     fn recording_sink() -> (Arc<RecordingSink>, Arc<dyn ProgressSink>) {
         let recorder = Arc::new(RecordingSink::default());
         let installed = Arc::clone(&recorder) as Arc<dyn ProgressSink>;
@@ -2132,7 +1708,6 @@ mod tests {
                 .collect()
         }
 
-        /// The running character count of each fragment that reached the surface.
         fn forwarded_chars(&self) -> Vec<usize> {
             self.events
                 .lock()
@@ -2148,10 +1723,6 @@ mod tests {
         }
     }
 
-    /// One line per event, carrying the fields these assertions are about and no clock.
-    ///
-    /// Every variant is named rather than swept up by a catch-all: a new one has to be given a
-    /// rendering here, which is the question "what would a person be told" asked at compile time.
     fn progress_label(event: &ProgressEvent) -> String {
         match event {
             ProgressEvent::Started { agent, max_steps } => {
@@ -2187,10 +1758,6 @@ mod tests {
         }
     }
 
-    /// A model that reports one event before it answers.
-    ///
-    /// The event carries no text, which is the point: what makes a turn interruptible is that the
-    /// callback runs between reads at all, not what any particular read contained.
     struct EventingModel {
         turns: Mutex<VecDeque<AssistantTurn>>,
     }
@@ -2204,8 +1771,6 @@ mod tests {
             on_event: &mut (dyn FnMut(TurnEvent) -> ControlFlow<()> + Send),
         ) -> Result<AssistantTurn, InferenceError> {
             if on_event(TurnEvent::ToolCallStarted { index: 0 }).is_break() {
-                // Real clients cancel the local exchange and drop its response, without
-                // promising pooled-connection closure, and report that no turn will arrive.
                 return Err(InferenceError::Cancelled);
             }
             self.turns
@@ -2218,11 +1783,6 @@ mod tests {
         }
     }
 
-    /// A model that replays the events of a recorded stream and then answers.
-    ///
-    /// The events come from the model client's own parser rather than from anything this module
-    /// builds: [`dekopon_model::ModelText`] is constructed from bytes only inside that crate, so a
-    /// fixture can neither invent visible text nor drift from what a backend really sends.
     struct TranscriptModel {
         events: Mutex<VecDeque<TurnEvent>>,
         turn: Mutex<Option<AssistantTurn>>,
@@ -2263,7 +1823,6 @@ mod tests {
         }
     }
 
-    /// A chat-completions stream body carrying one visible-text fragment per chunk.
     fn text_transcript(fragments: &[&str]) -> String {
         let mut body = String::new();
         for fragment in fragments {
@@ -2276,11 +1835,6 @@ mod tests {
         body
     }
 
-    /// A probe that reports a stop only once the turn it is watching is under way.
-    ///
-    /// `after` is how many reads pass before it answers `true`: the loop reads once at the top of
-    /// a turn, so `1` is a person pressing Stop while the answer is arriving rather than before
-    /// the request was built.
     struct StopsDuringTheTurn {
         reads: AtomicUsize,
         after: usize,
@@ -2328,8 +1882,6 @@ mod tests {
 
     #[test]
     fn a_session_without_a_sink_answers_exactly_as_one_with_it() {
-        // The no-op is the case every embedder that renders nothing takes, so it is the one that
-        // must not diverge: same turns, same answer, same counts.
         let watched = ScriptedModel::new([script_call("call-1", "echo one"), answer("done")]);
         let unwatched = ScriptedModel::new([script_call("call-1", "echo one"), answer("done")]);
         let runtime = RecordingRuntime::new(1);
@@ -2355,8 +1907,6 @@ mod tests {
 
     #[test]
     fn an_interrupted_turn_stops_the_session_and_names_who_asked() {
-        // The stop lands between two reads of one model request rather than between turns, which
-        // is the whole reason the callback exists; the loop reports it as the outcome it is.
         let model = EventingModel {
             turns: Mutex::new([answer("never delivered")].into_iter().collect()),
         };
@@ -2422,8 +1972,6 @@ mod tests {
 
     #[test]
     fn fragments_stop_at_the_outbound_bound_and_the_turn_still_answers() {
-        // A surface cannot show more than the answer will carry, so forwarding stops at the bound
-        // while the turn keeps arriving: the complete answer is delivered by the reply path.
         let half = STREAMED_TEXT_BOUND_BYTES / 2;
         let fragment = "x".repeat(half);
         let model = TranscriptModel::new(
@@ -2478,8 +2026,6 @@ mod tests {
 
     #[test]
     fn a_zero_step_session_still_tells_a_waiting_surface_that_it_ended() {
-        // Nothing reached a model, so there is nothing to report but the ending — and a surface
-        // that was never told would keep saying "working on it" forever.
         let model = ScriptedModel::new([answer("unreachable")]);
         let runtime = RecordingRuntime::new(0);
         let (sink, progress) = recording_sink();
@@ -2563,7 +2109,6 @@ mod tests {
         )
     }
 
-    /// A conversation of `count` answered exchanges, every turn the same size.
     fn conversation(count: usize) -> Vec<ConversationTurn> {
         (1..=count)
             .map(|index| {
@@ -2581,11 +2126,6 @@ mod tests {
         }
     }
 
-    /// Asserts a replayed window is a request both backends accept.
-    ///
-    /// The two 400s this feature could produce are a `tool` result whose call was trimmed away and
-    /// an assistant `tool_calls` nothing answered. Neither is checked by reading the loop: both are
-    /// checked on the serialized message, because the serialized message is what a backend sees.
     fn assert_window_is_well_formed(history: &History) {
         let mut messages = Vec::new();
         history.replay_into(&mut messages);
@@ -2613,10 +2153,8 @@ mod tests {
                 !fields.contains_key("tool_call_id"),
                 "message {index} replays an orphaned tool result"
             );
-            // A replayed message must carry its text on the wire. The ChatGPT backend emits an
-            // assistant message that carries provider replay items as *only* those items and
-            // discards its content, so a remembered answer reaching the request as anything other
-            // than plain content would disappear from it without an error.
+            // A replayed message must carry plain text content, or the ChatGPT backend silently
+            // drops it with no error.
             assert!(
                 fields.contains_key("content"),
                 "message {index} replays without content"
@@ -2705,10 +2243,6 @@ mod tests {
 
     #[test]
     fn the_instructions_are_prepended_once_per_call_and_never_remembered() {
-        // The failure this guards is silent rather than loud: the ChatGPT backend joins every
-        // `system` message it is handed into one `instructions` string, so a conversation that
-        // remembered the system prompt would send an agent its own instructions concatenated with
-        // themselves, one extra copy per exchange, with no error from anywhere.
         let system = "You are Dekopon.";
         let mut history = History::default();
 
@@ -2768,8 +2302,6 @@ mod tests {
         )
         .expect("prompt session succeeds");
 
-        // The session itself saw every tool result, and the conversation kept none of them: one
-        // script's output can be 256 KiB, which is what replaying transcripts would cost.
         assert!(!model.tool_messages().is_empty());
         assert_eq!(history.len(), 1);
         assert_eq!(history.turns()[0].user(), "do the work");
@@ -2814,7 +2346,6 @@ mod tests {
 
             assert_eq!(history.len(), max_turns);
             assert_window_is_well_formed(&history);
-            // Trimming is oldest-first in whole exchanges, so survivors are always a suffix.
             assert_eq!(history.turns(), &turns[turns.len() - max_turns..]);
         }
 
@@ -2944,7 +2475,6 @@ mod tests {
         assert!(!history.turns()[0].is_answered());
         assert_window_is_well_formed(&history);
 
-        // The retry knows what it is a retry of, and the abandoned attempt's tool traffic is gone.
         let retry = ScriptedModel::new([answer("sorry about that")]);
         run_prompt_with_history(
             &retry,
@@ -2990,8 +2520,6 @@ mod tests {
 
     #[test]
     fn a_zero_step_session_records_nothing() {
-        // A usage error, not a conversation event: no request was built, so nothing in the
-        // conversation may claim the model was asked.
         let model = ScriptedModel::new([]);
         let runtime = RecordingRuntime::new(0);
         let mut history = History::from_turns(HistoryLimits::default(), conversation(1));
@@ -3036,11 +2564,6 @@ mod tests {
         }
     }
 
-    /// A model that answers once per request and records the options each request carried.
-    ///
-    /// Separate from [`ScriptedModel`] because the question is different: that one is about what
-    /// the conversation looked like, this one is about the routing metadata riding beside it on
-    /// every turn of a session.
     struct OptionsObserver {
         turns: Mutex<VecDeque<AssistantTurn>>,
         observed: Mutex<Vec<Option<String>>>,
@@ -3070,9 +2593,6 @@ mod tests {
 
     #[test]
     fn every_turn_of_a_session_carries_the_same_routing_metadata() {
-        // The tool-calling turns within one session share the longest prefix in the whole feature —
-        // each one repeats every message before it — so a key that reached only the first request
-        // would miss the requests it helps most.
         let model = OptionsObserver {
             turns: Mutex::new(
                 [
@@ -3112,9 +2632,6 @@ mod tests {
 
     #[test]
     fn a_session_without_options_asks_exactly_what_it_always_asked() {
-        // The additive half of the contract: a caller that supplies nothing must be indistinguishable
-        // from the same caller before options existed, which is why the default carries no key
-        // rather than an empty one.
         let observer = OptionsObserver {
             turns: Mutex::new([answer("done")].into_iter().collect()),
             observed: Mutex::new(Vec::new()),
@@ -3135,21 +2652,14 @@ mod tests {
         assert_eq!(*observer.observed.lock().expect("options lock"), vec![None]);
     }
 
-    /// A provider's command words reach the model, or it has no way to know they exist.
-    ///
-    /// `cap --list` enumerates capabilities, not the ergonomic words a provider layers over them,
-    /// so a word absent from this description is a word the model will never type.
     #[test]
     fn provider_command_words_are_offered_to_the_model() {
-        // Load order and a repeated word must not change the definition the model is sent.
         let tool = script_tool(&["gh".to_owned(), "fly".to_owned(), "gh".to_owned()]);
         assert!(
             tool.description.contains("command words: fly, gh."),
             "{}",
             tool.description
         );
-        // A provider word is a program of its own, and its help page is the only place its
-        // subcommands and flags are described; the model has to be told where to look, once.
         assert_eq!(
             tool.description.matches("run `<word> --help`").count(),
             1,
@@ -3159,9 +2669,6 @@ mod tests {
         assert_no_doubled_spaces(&tool.description);
     }
 
-    /// This is the one string the project treats as engineered prompt text, and it ships verbatim
-    /// to the model on every request. A run of spaces is a collapsed line continuation: junk
-    /// tokens that read to a model as a typo, and which substring assertions cannot see.
     fn assert_no_doubled_spaces(description: &str) {
         assert!(
             !description.contains("  "),
@@ -3169,7 +2676,6 @@ mod tests {
         );
     }
 
-    /// A session holding nothing, for scripts that must be refused before a command ever runs.
     struct NoCapabilities;
 
     impl CapabilityInvoker for NoCapabilities {
@@ -3187,7 +2693,6 @@ mod tests {
         }
     }
 
-    /// Returns the constructs the description still calls errors, as it writes their names.
     fn refusal_list() -> Vec<&'static str> {
         let listed = SCRIPT_TOOL_DESCRIPTION
             .split_once("fails loudly and by name: ")
@@ -3202,17 +2707,8 @@ mod tests {
             .collect()
     }
 
-    /// The refusal list is the interpreter's API documentation, not a comment about it.
-    ///
-    /// No human writes these scripts, so a construct the description calls an error is one the
-    /// model will never type — which is how `[[ ]]` and `set -e` stayed unreachable after #165
-    /// implemented them. Pinning the list to the shell the way `dekopon-shell`'s builtin registry
-    /// is pinned to its documented builtin list is what makes that drift a test failure: the names
-    /// still listed must be exactly these, and each must be refused by the interpreter itself.
     #[test]
     fn every_construct_the_description_calls_an_error_is_refused_by_the_shell() {
-        // Name as the description writes it, a script that reaches the construct, and the word its
-        // refusal has to carry — a refusal naming the wrong feature sends a model to the wrong fix.
         let refused = [
             ("`eval`", "eval 'echo hi'", "eval"),
             ("backticks", "echo `echo hi`", "backtick"),
@@ -3241,10 +2737,6 @@ mod tests {
         }
     }
 
-    /// The other half of the same pin: what #165 built has to stay off the refusal list.
-    ///
-    /// Without this, dropping `[[ ]]` and `set -e` from the list could be undone — or the shell
-    /// could stop supporting them — and the test above would still pass on the shortened list.
     #[test]
     fn conditionals_and_errexit_are_supported_rather_than_refused() {
         let listed = refusal_list();
@@ -3267,11 +2759,6 @@ mod tests {
         assert!(!errexit.output.contains("after"), "{errexit:?}");
     }
 
-    /// A session whose capabilities cover every outcome the description explains.
-    ///
-    /// Reached the only way a script reaches a capability: through a provider command word.
-    /// `probe` renders its own help, declines an argv it does not know, and proposes one capability
-    /// per subcommand, including one this session was never granted.
     struct OutcomeCapabilities;
 
     impl CapabilityInvoker for OutcomeCapabilities {
@@ -3341,12 +2828,6 @@ mod tests {
         }
     }
 
-    /// The exit codes, messages, and argument rules the description promises are the shell's.
-    ///
-    /// The "Reading the result" paragraph and the provider-word item describe interpreter
-    /// behaviour that no prose can keep true on its own; this pins each promise to the shell the
-    /// way `refusal_list` pins the refused constructs, so a remapped code, a reworded message, or
-    /// a provider word the shell stopped running fails here rather than misleading a model.
     #[test]
     fn every_outcome_the_description_explains_is_what_the_shell_produces() {
         for (code, phrase) in [
@@ -3374,7 +2855,6 @@ mod tests {
             );
         }
 
-        // A capability-shaped word is an ordinary unknown command.
         let not_found = dekopon_shell::run("wikipedia_page --title x", &OutcomeCapabilities);
         assert_eq!(not_found.exit_code, ExitCode::NOT_FOUND, "{not_found:?}");
         assert!(
@@ -3382,7 +2862,6 @@ mod tests {
             "{not_found:?}"
         );
 
-        // A command that needs a capability this session was not granted says which one.
         let ungranted = dekopon_shell::run("probe vault", &OutcomeCapabilities);
         assert_eq!(ungranted.exit_code, ExitCode::NOT_FOUND, "{ungranted:?}");
         assert!(ungranted.output.contains("vault.open"), "{ungranted:?}");
@@ -3405,8 +2884,6 @@ mod tests {
         assert_eq!(declined.exit_code, ExitCode::SYNTAX, "{declined:?}");
         assert!(declined.output.contains("probe: usage:"), "{declined:?}");
 
-        // Item 2: a provider word documents itself, proposes what it parsed from its own argv,
-        // and `cap --list` shows the grants those proposals have to fall within.
         let help = dekopon_shell::run("probe --help", &OutcomeCapabilities);
         assert_eq!(help.exit_code, ExitCode::SUCCESS, "{help:?}");
         assert!(help.output.contains("Usage: probe"), "{help:?}");
@@ -3458,8 +2935,6 @@ mod tests {
         assert_eq!(tool.parameters["properties"]["script"]["type"], "string");
         assert_eq!(tool.parameters["required"], json!(["script"]));
         assert_eq!(tool.parameters["additionalProperties"], json!(false));
-        // The description has to point at the interpreter's own self-disclosure, or a model has no
-        // way to learn which capabilities this session holds or how to call a provider's word.
         assert!(tool.description.contains("cap --list"));
         assert_eq!(
             tool.description.matches("run `<word> --help`").count(),
@@ -3467,9 +2942,6 @@ mod tests {
             "{}",
             tool.description
         );
-        // A provider parses its own argv. Nothing may still describe the retired flag-to-JSON
-        // rewrite, capability identifiers typed as commands, schema discovery, or the `curl`
-        // builtin.
         for retired in [
             "kebab",
             "JSON object",
@@ -3483,14 +2955,11 @@ mod tests {
                 tool.description
             );
         }
-        // A session with no provider command words reads exactly as it always did.
         assert!(
             !tool
                 .description
                 .contains("providers add these command words")
         );
-        // ...and it must not invent a discovery command the interpreter does not implement. There
-        // is no `help` builtin, so advertising one would spend a tool call on "command not found".
         assert!(tool.description.contains("There is no `help`"));
         assert_no_doubled_spaces(&tool.description);
     }
@@ -3582,17 +3051,12 @@ mod tests {
         assert_eq!(outcome.capability_invocations, 0);
         assert!(runtime.scripts.lock().expect("script lock").is_empty());
 
-        // Repetition still succeeds — it is bounded by the loop's shared per-turn tool-call and
-        // model-step limits and by nothing of its own.
         let messages = model.tool_messages();
         assert_eq!(messages.len(), 2);
         let first: Value =
             serde_json::from_str(&messages[0]).expect("the first configuration is JSON");
         assert_eq!(first["agent"]["id"], "reviewer");
         assert!(first.get("error").is_none());
-        // What it does not do is append a second copy. Every tool result stays in the message
-        // vector and is re-sent to the provider on every later turn, so a 128 KiB view repeated
-        // ten times a turn is a session that pays for it twelve turns running.
         assert_eq!(messages[1], AGENT_CONFIG_ALREADY_SHOWN);
         assert!(messages[1].len() < messages[0].len() / 2);
     }
@@ -3636,7 +3100,6 @@ mod tests {
         );
     }
 
-    /// One conversation's attachments, fixed in advance and numbered from one.
     struct FixedAssets(Vec<FetchedAsset>);
 
     impl AssetSource for FixedAssets {
@@ -3702,11 +3165,6 @@ mod tests {
 
     #[test]
     fn an_oversized_textual_asset_is_clamped_rather_than_ending_the_session() {
-        // The gateway's asset budget is 8 MiB, sized for images on the wire. That much
-        // `text/plain` is roughly two million tokens, so unclamped it reaches the provider as a
-        // context-length rejection and kills a session over a file someone attached — exactly what
-        // the asset contract refuses to do. A three-byte character makes the clamp land mid
-        // character, which is the case a naive byte truncation panics on.
         let text = "☃".repeat(MAX_TEXTUAL_ASSET_BYTES);
         let model = ScriptedModel::new([asset_call(1), answer("The file was too large to read.")]);
         let runtime = RecordingRuntime::new(0);
@@ -3724,7 +3182,6 @@ mod tests {
         assert_eq!(outcome.answer, "The file was too large to read.");
         let messages = model.tool_messages();
         assert_eq!(messages.len(), 1);
-        // 262144 is not a multiple of three, so the clamp retains one byte less than the bound.
         let retained = MAX_TEXTUAL_ASSET_BYTES - MAX_TEXTUAL_ASSET_BYTES % 3;
         let trailer = format!("\n[truncated at {retained} bytes of {}]", text.len());
         assert!(messages[0].ends_with(&trailer), "no truncation trailer");
@@ -3982,8 +3439,6 @@ mod tests {
 
     #[test]
     fn spends_one_capability_budget_across_every_script_in_the_session() {
-        // The interpreter's own ceiling bounds one script. Without this, a model widens its budget
-        // simply by writing more scripts, and `max_steps` multiplies rather than bounds the work.
         let model = ScriptedModel::new([
             script_call("call-1", "one"),
             script_call("call-2", "two"),
@@ -4143,11 +3598,6 @@ mod tests {
         assert_eq!(format_script_outcome(&outcome), "[exit code: 127]");
     }
 
-    /// A runtime whose capability dispatch is genuinely asynchronous underneath.
-    ///
-    /// This is the shape embedding binaries use in production: a synchronous [`ScriptRuntime`]
-    /// bridging to an async broker round trip with `Handle::block_on`, which is correct only
-    /// because the whole loop runs on a blocking task rather than a runtime worker thread.
     struct BlockingBridgeRuntime {
         handle: tokio::runtime::Handle,
         dispatched: Arc<Mutex<Vec<String>>>,
@@ -4281,11 +3731,6 @@ mod tests {
         assert!(matches!(error, PromptError::ArgumentsNotObject { .. }));
     }
 
-    // -----------------------------------------------------------------------
-    // Skills
-    // -----------------------------------------------------------------------
-
-    /// One loaded skill with one resource file, held with the directory it was read from.
     fn mounted_skill() -> (tempfile::TempDir, dekopon_config::Skill) {
         let root = tempfile::tempdir().expect("temporary directory");
         let directory = root.path().join("pull-request-review");
@@ -4304,10 +3749,6 @@ mod tests {
         (root, skill)
     }
 
-    /// The tool results the model saw on its *last* request, in order.
-    ///
-    /// `tool_messages` flattens every request, so a result the loop appended on turn one is
-    /// observed again on every later request; the last request carries each exactly once.
     fn last_tool_results(model: &ScriptedModel) -> Vec<String> {
         model
             .observed_messages
@@ -4351,7 +3792,6 @@ mod tests {
                 SKILL_TOOL_NAME,
                 json!({"name": "pull-request-review", "resource": "references/checklist.md"}),
             ),
-            // A repeat costs a pointer rather than a second copy.
             tool_call(
                 "read-3",
                 SKILL_TOOL_NAME,
@@ -4373,7 +3813,6 @@ mod tests {
         .expect("skill reads are recoverable model turns");
 
         assert_eq!(outcome.answer, "Reviewed.");
-        // Instructions first, then the standing listing, then the prompt.
         let roles = model.first_roles();
         assert_eq!(roles[0], ("system", "Be concise.".to_owned()));
         assert_eq!(roles[1].0, "system");
@@ -4522,10 +3961,6 @@ mod tests {
         ));
     }
 
-    // -----------------------------------------------------------------------
-    // Improvement suggestions
-    // -----------------------------------------------------------------------
-
     fn suggestion(id: &str, target: &str) -> AssistantTurn {
         tool_call(
             id,
@@ -4547,7 +3982,6 @@ mod tests {
             suggestion("s-1", "gh.pull-request.read"),
             suggestion("s-2", "gh.pull-request.comment"),
             suggestion("s-3", "gh.issue.read"),
-            // One past the bound: refused in a sentence, never an error.
             suggestion("s-4", "gh.issue.comment"),
             answer("Done."),
         ]);

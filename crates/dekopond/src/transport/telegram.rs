@@ -1,9 +1,5 @@
-//! Telegram long polling, where the poll *is* the wakeup and the offset *is* the acknowledgment.
-//!
-//! `getUpdates` blocks server-side for up to fifty seconds and returns as soon as anything arrives,
-//! so waiting costs one idle connection rather than a poll loop. Advancing `offset` past an update
-//! is what tells Telegram it was handled; there is no separate ack and therefore no ack-before-work
-//! problem the way Socket Mode has one.
+//! The offset advance is the only acknowledgment Telegram has; polling blocks until something
+//! arrives, so there is no separate ack and no ack-before-work ordering problem.
 
 use std::{collections::VecDeque, sync::Arc, time::Duration};
 
@@ -29,106 +25,45 @@ use crate::{
     },
 };
 
-/// Ceiling on one attachment's file name.
 const MAX_ATTACHMENT_NAME_BYTES: usize = 128;
-/// Telegram's `sendMessage` text ceiling, which the Bot API counts in UTF-16 code units.
-///
-/// Below the gateway's own 8 KiB outbound bound, so a normal long answer is two or three posts
-/// rather than a rejected one. Splitting is shared with Discord's 2,000-unit ceiling through
-/// [`crate::transport::split_message`], newline preference and all.
 const MAX_MESSAGE_CHARS: usize = 4_096;
-/// Ceiling on one streamed render, in Unicode scalar values.
-///
-/// Not [`MAX_MESSAGE_CHARS`], because the two count different things: the policy spends
-/// [`StreamLimits::max_chars`] as a `char` count, while [`MAX_MESSAGE_CHARS`] is UTF-16 code
-/// units and a scalar outside the BMP costs two of them. The ninety-six units of headroom pay for
-/// that difference: a cut render is 4,000 scalars plus the one-scalar marker, which is inside
-/// Telegram's ceiling while at most ninety-five of those scalars are astral.
-///
-/// The worst case past that is worth naming rather than implying. A render the policy cut is
-/// still marked, because [`bounded`] brings it back under the ceiling and the marker is appended
-/// after that. A render the policy did *not* cut — 4,000 scalars or fewer, but more than 4,096
-/// units of them — is cut by [`bounded`] alone, and that cut goes out unmarked.
+/// This counts Unicode scalars while MAX_MESSAGE_CHARS counts UTF-16 units; an astral scalar costs
+/// two units, so the headroom between them covers the worst-case gap.
 const MAX_STREAM_CHARS: usize = 4_000;
-/// Telegram's `sendPhoto` caption ceiling.
 const MAX_PHOTO_CAPTION_CHARS: usize = 1_024;
 
-/// Server-side wait per poll, in seconds. Telegram's own ceiling is fifty.
 const POLL_SECONDS: u64 = 50;
-/// Client deadline, generously above the server wait so a normal empty poll is not an error.
 const POLL_TIMEOUT: Duration = Duration::from_secs(POLL_SECONDS + 20);
-/// Deadline on one cosmetic call. Liveness decorates an answer; it never delays one.
 const LIVENESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
-/// How often the `typing` action is re-sent. Telegram expires it after five seconds and offers no
-/// way to clear it early, so the lease is renewed under that and the final answer ends it.
+/// Telegram's typing indicator auto-expires after five seconds with no way to clear it early, so it
+/// must be renewed more often than that until the final answer.
 const TYPING_RENEW_INTERVAL: Duration = Duration::from_secs(4);
-/// Ceiling on a server-directed liveness cooldown.
 const MAX_LIVENESS_COOLDOWN: Duration = Duration::from_secs(300);
-/// Floor between two edits of one message.
-///
-/// The Bot API's per-chat flood limit tolerates roughly one message every three seconds
-/// indefinitely; the policy coalesces to this rather than learning it as a `retry_after`.
 const MIN_EDIT_INTERVAL: Duration = Duration::from_secs(3);
-/// The reaction that says an inbound message was seen.
-///
-/// Not the `:tangerine:` Slack wears: `setMessageReaction` accepts only emoji from the server's own
-/// available-reactions list for the chat, and the tangerine is not on it. A reaction Telegram
-/// refuses is cosmetic, and its refusal surfaces as the Bot API's own description.
 const WORKING_REACTION: &str = "👀";
-/// What a cancel button puts in `callback_data`, ahead of the conversation identifier.
 const CANCEL_CALLBACK_PREFIX: &str = "stop:";
-/// The Bot API description for an edit whose text and markup already match what is on screen.
 const NOT_MODIFIED: &str = "message is not modified";
-/// What a stream render ends in when the answer outgrew the message it is being written into.
-///
-/// Telegram has no "show more" and an edited message simply stops, so a cut is invisible without
-/// this. One scalar rather than a sentence because the room it needs is room the answer gives up:
-/// it is counted by [`MAX_STREAM_CHARS`] and, on a render already at the Bot API's ceiling, taken
-/// back out of the text.
 const TRUNCATION_MARKER: &str = "\u{2026}";
 
 pub(crate) struct TelegramTransport {
     name: String,
     http: reqwest::Client,
-    /// Also the reader's URL builder: the bot token lives in every Bot API path, and one place
-    /// that formats it is one place that calls [`Redacted::expose`].
     driver: Arc<TelegramDriver>,
     offset: i64,
     pending: VecDeque<TransportEvent>,
-    /// `liveness.mode: native` — an inbound message carries coordinates for transient signals.
-    ///
-    /// One decision rather than the whole block: what the Bot API can render is fixed, and
-    /// progress, stream, cancel button, keep-alive, and templates are read by the policy that
-    /// drives the driver. Withholding the coordinates is how `off` keeps this transport
-    /// reply-only.
     native: bool,
 }
 
-/// What one polled update turned into.
-///
-/// Both payloads are boxed for the same reason: an update is read one at a time and neither of
-/// these belongs on the stack of the poll loop.
 enum Routed {
-    /// Ordinary routable traffic.
     Message(Box<InboundMessage>),
-    /// A cancel button press.
     Cancel(Box<StopPress>),
 }
 
-/// One press, split in two because the halves go to different places: the acknowledgment Telegram
-/// is waiting for leaves from the reader, and the request the gateway acts on leaves through the
-/// channel after it.
 struct StopPress {
     press: CancelPress,
     request: CancelRequest,
 }
 
-/// The conversation one chat and optional forum topic belong to.
-///
-/// One definition because three callers have to agree or turns are misfiled: the inbound message,
-/// the cancel button's `callback_data`, and the press that checks that untrusted payload against
-/// the envelope it arrived in. It is [`Conversation::key`] for a Telegram conversation, and it is
-/// derived through one rather than spelled a second time here.
 fn conversation_id(chat_id: i64, message_thread_id: Option<i64>) -> String {
     Conversation {
         kind: if message_thread_id.is_some() {
@@ -144,7 +79,6 @@ fn conversation_id(chat_id: i64, message_thread_id: Option<i64>) -> String {
 }
 
 impl TelegramTransport {
-    /// Takes the bot token *value*; the caller resolves it from the named environment variable.
     pub(crate) fn new(
         name: String,
         endpoint: String,
@@ -169,11 +103,6 @@ impl TelegramTransport {
         })
     }
 
-    /// Runs one long-poll cycle and hands back what it failed with.
-    ///
-    /// Test-only: the daemon reaches [`Self::poll`] through [`Self::next`], which logs the
-    /// category and retries, so a poll failure is otherwise never returned to anything that
-    /// could render it.
     #[cfg(test)]
     pub(crate) async fn poll_once(&mut self) -> Result<(), TransportError> {
         self.poll().await
@@ -194,12 +123,8 @@ impl TelegramTransport {
             let Some(update_id) = update["update_id"].as_i64() else {
                 continue;
             };
-            // One span per poll item, opened before the update is read, so the offset advance that
-            // acknowledges it and the decision not to route it are both inside the item's trace.
             let received = receive_span(ChatTransportKind::Telegram);
             let routed = received.in_scope(|| {
-                // Advance first, unconditionally. An update this daemon chooses not to route still
-                // has to be acknowledged, or the next poll returns it forever.
                 self.offset = self.offset.max(update_id + 1);
                 if update["callback_query"].is_object() {
                     return Ok(self.pressed(&update["callback_query"], &received));
@@ -214,10 +139,8 @@ impl TelegramTransport {
                 }
                 Some(Routed::Cancel(pressed)) => {
                     let StopPress { press, request } = *pressed;
-                    // Answered here, inside the reader, before the request reaches the channel:
-                    // Telegram spins the button's progress circle on the presser's client until
-                    // this call lands, and the run being stopped takes as long as it takes to
-                    // notice. An acknowledgment that waited for either would be a stuck button.
+                    // Acknowledge inside the reader before the cancel request reaches the channel,
+                    // or the button spins until the run notices it stopped.
                     let driver = Arc::clone(&self.driver);
                     if let Err(error) = driver.ack(&press).instrument(received.clone()).await {
                         tracing::warn!(
@@ -247,8 +170,8 @@ impl TelegramTransport {
         ) else {
             return Ok(None);
         };
-        // A message carrying a photo or a document puts its words in `caption`; only a plain
-        // message has `text`. Reading just `text` is what made an upload invisible here.
+        // A photo or document's caption text lives in caption, not text; reading only text makes an
+        // upload with a caption disappear entirely.
         let text = message["text"]
             .as_str()
             .or_else(|| message["caption"].as_str())
@@ -257,7 +180,6 @@ impl TelegramTransport {
         if text.trim().is_empty() && assets.is_empty() {
             return Ok(None);
         }
-        // Loop prevention: a bot's own posts and every other bot's come back marked.
         if from.get("is_bot").and_then(Value::as_bool) == Some(true) {
             return Ok(None);
         }
@@ -267,24 +189,16 @@ impl TelegramTransport {
         let Some(chat_id) = chat.get("id").and_then(Value::as_i64) else {
             return Ok(None);
         };
-        // Only a forum topic is a thread. Telegram also sets `message_thread_id` on an ordinary
-        // reply in a non-forum supergroup and in a private chat, where it is the id of the message
-        // being replied to and names no topic at all — reading it as one files every reply in a
-        // conversation of its own, so history, admission, memory, and liveness all split apart.
-        // `is_topic_message` is the flag that says it really is a topic.
+        // message_thread_id is also set on an ordinary reply in a non-forum supergroup, naming the
+        // replied-to message rather than a topic; only is_topic_message confirms a real forum
+        // topic.
         let topic = message["message_thread_id"]
             .as_i64()
             .filter(|_| message["is_topic_message"].as_bool() == Some(true));
         if topic.is_some_and(|id| id <= 0) {
-            // One update, not the batch: `poll` has already advanced past this update, and
-            // returning an error here would abandon every update behind it in the same response.
             received.record("drop.reason", "malformed-envelope");
             return Ok(None);
         }
-        // Every private chat is a direct message however it threads; a group or supergroup is a
-        // channel, or a thread when the message is in a forum topic, and the daemon separately
-        // requires the bot to be addressed in both. A broadcast channel is not a conversation this
-        // gateway answers: nobody can reply in one, so a message there is dropped by name.
         let chat_type = chat.get("type").and_then(Value::as_str);
         let kind = match (chat_type, topic) {
             (Some("private"), _) => ConversationKind::DirectMessage,
@@ -301,7 +215,6 @@ impl TelegramTransport {
         };
         let conversation = Conversation {
             kind,
-            // Telegram has nothing above a chat: no workspace, no guild, no business account.
             container: None,
             id: chat_id.to_string(),
             thread: topic.map(|topic| topic.to_string()),
@@ -317,12 +230,8 @@ impl TelegramTransport {
             message_id: message_id.to_string(),
             text: bound_inbound(text),
             assets,
-            // Telegram's message text carries `@handle`, so the shared fallback checks it.
             addressed: None,
             thread_continuation: None,
-            // The topic and nothing else: `sendMessage` takes `message_thread_id` as the forum
-            // topic to post in, so passing an ordinary reply's thread id would answer into a
-            // topic the chat does not have.
             reply: ReplyTarget::Telegram {
                 chat_id,
                 reply_to,
@@ -345,13 +254,6 @@ impl TelegramTransport {
         }))
     }
 
-    /// Reads one `callback_query`, which is the only inline-keyboard press this bot draws.
-    ///
-    /// `callback_data` comes back verbatim from whoever pressed the button, so it is untrusted and
-    /// says only which conversation the press *claims*. The presser comes from the callback
-    /// envelope, which Telegram authenticated, and the claim is accepted only when it matches the
-    /// chat and topic that same envelope names. Whether that presser may stop this conversation's
-    /// run is the gateway's question rather than this reader's: it holds the subject that asked.
     fn pressed(&self, callback: &Value, received: &Span) -> Option<Routed> {
         let ignored = |reason: &'static str| -> Option<Routed> {
             tracing::debug!(
@@ -368,7 +270,6 @@ impl TelegramTransport {
         ) else {
             return ignored("malformed");
         };
-        // Loop prevention, as on the message path: a bot's own presses come back marked.
         if from.get("is_bot").and_then(Value::as_bool) == Some(true) {
             return ignored("bot");
         }
@@ -387,9 +288,6 @@ impl TelegramTransport {
         let Some(claimed) = data.strip_prefix(CANCEL_CALLBACK_PREFIX) else {
             return ignored("malformed");
         };
-        // Filtered exactly as the message path filters it, or the key this press is checked
-        // against would carry an ordinary reply's thread id that the session's own key does not,
-        // and every press in a non-forum supergroup would be ignored as a mismatch.
         let topic = message
             .get("message_thread_id")
             .and_then(Value::as_i64)
@@ -426,14 +324,6 @@ impl TelegramTransport {
         })))
     }
 
-    /// Describes the photo or document on one message so the session can number it.
-    ///
-    /// A photo arrives as an array of the same image at several sizes, smallest first. The largest is
-    /// the one worth showing a model — the small ones are thumbnails, and a model asked to read text in
-    /// a screenshot cannot read a 90-pixel-wide copy of it.
-    ///
-    /// Telegram reports no media type for a photo, so one is inferred: the Bot API re-encodes every
-    /// photo to JPEG, while a file sent as a *document* keeps its own bytes and its own declared type.
     fn pending_assets(message: &Value) -> Vec<PendingAsset> {
         if let Some(photo) = message["photo"].as_array()
             && let Some(largest) = photo
@@ -506,11 +396,6 @@ impl ChatTransport for TelegramTransport {
         })
     }
 
-    /// One handle for replying and for every liveness surface the Bot API has.
-    ///
-    /// What the capability objects advertise is what Telegram implements, not what this deployment
-    /// asked for: `liveness.mode: off` withholds the target on the inbound message instead, so the
-    /// policy has nothing to render against and the transport is reply-only exactly as before.
     fn driver(&self) -> Arc<dyn ChatDriver> {
         Arc::clone(&self.driver) as Arc<dyn ChatDriver>
     }
@@ -520,12 +405,6 @@ impl ChatTransport for TelegramTransport {
     }
 }
 
-/// Resolving a `file_id` and downloading the bytes, which the Bot API splits into two calls.
-///
-/// Telegram hands out a handle rather than a URL. `getFile` turns it into a path valid for roughly
-/// an hour, and the bytes live under a different prefix — `/file/bot<token>/<path>` rather than
-/// `/bot<token>/<method>`. Both carry the token in the URL, which is the Bot API's own design and
-/// the reason this transport never logs one.
 impl AssetFetcher for TelegramDriver {
     fn fetch(
         &self,
@@ -533,7 +412,6 @@ impl AssetFetcher for TelegramDriver {
         max_bytes: u64,
     ) -> BoxFuture<'_, Result<Vec<u8>, TransportError>> {
         let AssetSourceRef::Telegram { file_id } = source else {
-            // A reference belonging to another transport is a routing mistake, not a fetch failure.
             return Box::pin(async { Err(TransportError::Response) });
         };
         let file_id = file_id.clone();
@@ -565,9 +443,6 @@ impl AssetFetcher for TelegramDriver {
                     code: response.status().as_u16().to_string(),
                 });
             }
-            // Streamed against the ceiling rather than buffered and measured afterwards, for the
-            // same reason the Slack path is: a declared length is not a bound, only a clamped
-            // starting size for the buffer.
             let limit = usize::try_from(max_bytes).unwrap_or(usize::MAX);
             let mut body = asset_buffer(response.content_length(), limit);
             while let Some(chunk) = response.chunk().await.map_err(request_failed)? {
@@ -584,16 +459,10 @@ impl AssetFetcher for TelegramDriver {
     }
 }
 
-/// The answering and rendering half of the transport: replies, attachments, and every liveness
-/// surface the Bot API offers.
 pub(crate) struct TelegramDriver {
     endpoint: String,
     token: Redacted<String>,
     http: reqwest::Client,
-    /// Until when the Bot API's own `retry_after` says this transport must stop calling.
-    ///
-    /// Cosmetic calls only. A reply is the session's one visible outcome and is never withheld for
-    /// a rate limit a progress message earned.
     liveness_cooldown_until: std::sync::Mutex<Option<tokio::time::Instant>>,
 }
 
@@ -622,8 +491,6 @@ impl TypingLease for TelegramDriver {
 
 #[async_trait]
 impl InboundReaction for TelegramDriver {
-    /// Telegram replaces the bot's whole reaction set on each call, so an empty list is how one is
-    /// taken back.
     async fn set(&self, target: &LivenessTarget, present: bool) -> Result<(), TransportError> {
         let LivenessTarget::Telegram {
             chat_id,
@@ -707,15 +574,6 @@ impl TextStream for TelegramDriver {
         }
     }
 
-    /// Telegram has no append. A stream here is one message edited to the whole answer so far,
-    /// which is why the policy hands over cumulative text rather than a delta.
-    ///
-    /// The policy cuts that text to [`StreamLimits::max_chars`] — scalars, which is why the cap
-    /// advertised is [`MAX_STREAM_CHARS`] rather than the Bot API's own UTF-16 ceiling — and
-    /// reports the cut in [`StreamedText::truncated`] without marking it, because what marks it is
-    /// per surface. Here it is [`TRUNCATION_MARKER`] on the end. The headroom normally pays for
-    /// it; where a render arrives at the ceiling anyway, the tail of the text gives up the room,
-    /// because one unit past it is an edit the Bot API rejects whole.
     async fn show(
         &self,
         target: &LivenessTarget,
@@ -725,9 +583,6 @@ impl TextStream for TelegramDriver {
     ) -> Result<MessageRef, TransportError> {
         let mut rendered = bounded(text.text.as_str());
         if text.truncated {
-            // Terminates: the marker is one unit against a ceiling of four thousand and ninety-
-            // six, so the condition is false long before the text runs out. A popped scalar frees
-            // one unit, or two when it was an astral one.
             let marker = TRUNCATION_MARKER.encode_utf16().count();
             while rendered.encode_utf16().count() + marker > MAX_MESSAGE_CHARS {
                 rendered.pop();
@@ -765,21 +620,11 @@ impl CancelButton for TelegramDriver {
     }
 }
 
-/// The liveness half of the driver: the calls that decorate an answer rather than deliver one.
 impl TelegramDriver {
     fn url(&self, method: &str) -> String {
         format!("{}/bot{}/{method}", self.endpoint, self.token.expose())
     }
 
-    /// One Bot API call made for liveness rather than for an answer.
-    ///
-    /// Three things separate it from the reply path, and all three matter. A two-second deadline
-    /// instead of the poll client's seventy, because a progress edit that outlives the answer is
-    /// worse than no progress edit. A server-directed cooldown this transport refuses inside,
-    /// rather than re-earning a `retry_after` per call — and refuses *as a failure with a cause*,
-    /// so the policy counts it and drops the rung instead of believing a call it never made. And
-    /// the Bot API's own `description` on the error, which is how `message is not modified` reaches
-    /// the one caller that has to read it as success.
     async fn liveness_call(&self, method: &str, body: &Value) -> Result<Value, TransportError> {
         if self
             .liveness_cooldown_until
@@ -830,7 +675,6 @@ impl TelegramDriver {
         })
     }
 
-    /// Posts the message a progress or stream surface lives in.
     async fn post_text(
         &self,
         target: &LivenessTarget,
@@ -864,7 +708,6 @@ impl TelegramDriver {
         })
     }
 
-    /// One `editMessageText`, treating "message is not modified" as the success it describes.
     async fn edit_text(
         &self,
         message: &MessageRef,
@@ -880,19 +723,11 @@ impl TelegramDriver {
         });
         match self.liveness_call("editMessageText", &body).await {
             Ok(_) => Ok(()),
-            // Telegram answers `ok: false` when the text and the markup already match what is on
-            // screen. The caller asked for exactly that state and it holds; calling it a failure
-            // would trip the policy's breaker on a coalesced re-render of unchanged state.
             Err(TransportError::Service { ref code }) if code.contains(NOT_MODIFIED) => Ok(()),
             Err(error) => Err(error),
         }
     }
 
-    /// Turns the surface into the answer, where the answer fits inside it.
-    ///
-    /// `Err` is the policy's signal to delete this message and reply normally. That is the only
-    /// path for an answer carrying attachments, which an edit cannot add, and for one past
-    /// Telegram's single-message ceiling, which an edit cannot split.
     async fn finalize_in_place(
         &self,
         message: &MessageRef,
@@ -903,17 +738,10 @@ impl TelegramDriver {
                 code: "answer-does-not-fit".to_owned(),
             });
         }
-        // Through the same splitter `reply` uses, so an empty answer reads the same here as it
-        // would in a posted one rather than becoming a text the Bot API refuses.
         self.edit_text(message, bounded(&reply.text), false).await
     }
 }
 
-/// The chat, topic, and message one [`MessageRef`] names.
-///
-/// The one failure is a reference this transport did not mint, which is what
-/// [`TransportError::Response`] says: a surface belonging to another chat service reached a
-/// Telegram driver.
 fn addressed(message: &MessageRef) -> Result<(i64, Option<i64>, i64), TransportError> {
     let LivenessTarget::Telegram {
         chat_id,
@@ -932,22 +760,10 @@ fn addressed(message: &MessageRef) -> Result<(i64, Option<i64>, i64), TransportE
     Ok((*chat_id, *message_thread_id, id))
 }
 
-/// The inline keyboard one liveness post or edit carries.
-///
-/// `callback_data` names the conversation and nothing else: Telegram hands it back verbatim from
-/// whoever pressed the button, so it is untrusted, and the reader checks it against the envelope
-/// the press arrived in. An edit that omits `reply_markup` leaves the keyboard that is already
-/// there, so "no button" has to be said out loud — which is what the empty keyboard is for, on the
-/// finalize that turns a progress message into an answer as much as on a post that never had one.
-///
-/// The button's label is the gateway's own fixed word, never a template and never model text.
 fn reply_markup(chat_id: i64, message_thread_id: Option<i64>, cancel: bool) -> Value {
     if !cancel {
         return json!({ "inline_keyboard": [] });
     }
-    // The Bot API bounds `callback_data` at 64 bytes and rejects the whole post over it, but the
-    // widest identifier two `i64`s can spell is well inside that, so there is no branch here to
-    // reach: `the_cancel_payload_always_fits_the_bot_api_ceiling` pins the arithmetic instead.
     json!({
         "inline_keyboard": [[{
             "text": "Stop",
@@ -959,11 +775,6 @@ fn reply_markup(chat_id: i64, message_thread_id: Option<i64>, cancel: bool) -> V
     })
 }
 
-/// The head of one text at the Bot API's own ceiling, through the splitter the reply path uses so
-/// the two cannot disagree about what fits.
-///
-/// A liveness surface is one message: the rest of an over-long render is dropped rather than posted
-/// beside it.
 fn bounded(text: &str) -> String {
     split_message(text, MAX_MESSAGE_CHARS, TextUnit::Utf16)
         .into_iter()
@@ -991,9 +802,6 @@ impl ChatDriver for TelegramDriver {
         };
         let (chat_id, reply_to, message_thread_id) = (*chat_id, *reply_to, *message_thread_id);
         if !images.is_empty() {
-            // One `sendPhoto` per attachment; Telegram has no multi-attachment message that also
-            // carries a caption the way a person expects to read it. Each is read immediately
-            // before its own send and dropped after it.
             let caption_fits = text.encode_utf16().count() <= MAX_PHOTO_CAPTION_CHARS;
             let mut accepted = false;
             while let Some(read) = images.next().await {
@@ -1008,9 +816,6 @@ impl ChatDriver for TelegramDriver {
                     .await
                 {
                     Ok(()) => accepted = true,
-                    // One attachment already reached the chat, so this is a reply that arrived
-                    // in part rather than one that never arrived — the same distinction the text
-                    // chunk loop below makes.
                     Err(_) if accepted => return Err(TransportError::PartialDelivery),
                     Err(error) => return Err(error),
                 }
@@ -1056,8 +861,6 @@ impl TelegramDriver {
         text: &str,
         prior_accepted: bool,
     ) -> Result<(), TransportError> {
-        // `accepted` starts from the attachments this reply already posted and decides partial
-        // delivery; `delivered` is about this call alone and decides whether anything went out.
         let mut accepted = prior_accepted;
         let mut delivered = false;
         for (index, chunk) in split_message(text, MAX_MESSAGE_CHARS, TextUnit::Utf16)
@@ -1200,19 +1003,12 @@ impl TelegramDriver {
     }
 }
 
-/// Turns one Bot API failure into a transport error with the credential-bearing URL removed.
-///
-/// Every call in this transport puts the bot token in its path, and reqwest keeps the request URL
-/// on both send and body-read failures, rendering it in the `Display` *and* the `Debug` of its
-/// error. `TransportError` is public, `Debug`, and re-exported from a published crate, so an
-/// embedder that printed one would print the token. This is the only construction of
-/// [`TransportError::Request`] from a Bot API call for exactly that reason; the client-builder
-/// failure in [`TelegramTransport::new`] carries no URL and is built inline.
+/// reqwest's error embeds the request URL, which carries the bot token, in both its Display and
+/// Debug; this is the only Bot API failure built with that URL removed.
 fn request_failed(source: reqwest::Error) -> TransportError {
     TransportError::Request(Box::new(source.without_url()))
 }
 
-/// Decodes a Bot API response, turning `ok: false` into its stable description.
 async fn decode(response: reqwest::Response) -> Result<Value, TransportError> {
     let status = response.status();
     let bytes = response.bytes().await.map_err(request_failed)?;
@@ -1230,11 +1026,6 @@ async fn decode(response: reqwest::Response) -> Result<Value, TransportError> {
     })
 }
 
-/// The Bot API's own `description`, bounded, which is all it says about a rejection.
-///
-/// One definition because two callers act on it: the reply path turns it into a low-cardinality
-/// category, and the liveness path reads it for `message is not modified`, the one description
-/// whose meaning is success.
 fn described(body: &Value) -> String {
     body["description"]
         .as_str()
@@ -1252,24 +1043,14 @@ mod tests {
 
     use super::*;
 
-    /// Telegram's `callback_data` ceiling, in bytes, which it enforces by rejecting the whole post.
-    ///
-    /// Lives here rather than beside [`reply_markup`] because nothing at run time compares against
-    /// it: the widest conversation identifier this transport can spell is far inside it, and
-    /// [`the_cancel_payload_always_fits_the_bot_api_ceiling`] is what keeps that true.
     const MAX_CALLBACK_DATA_BYTES: usize = 64;
 
-    /// A loopback Bot API that records every call and answers each method from `handler`.
-    ///
-    /// Hand-rolled and local to this transport: what is under test is the exact request the Bot
-    /// API receives, and a real socket carrying real bytes is the only thing that proves one.
     struct BotApi {
         base: String,
         calls: Arc<std::sync::Mutex<Vec<(String, Value)>>>,
     }
 
     impl BotApi {
-        /// Bot API method names, in the order they were called.
         fn methods(&self) -> Vec<String> {
             self.calls
                 .lock()
@@ -1279,7 +1060,6 @@ mod tests {
                 .collect()
         }
 
-        /// Every body sent to one method, in order.
         fn bodies(&self, method: &str) -> Vec<Value> {
             self.calls
                 .lock()
@@ -1290,7 +1070,6 @@ mod tests {
                 .collect()
         }
 
-        /// The body of the one call to `method`.
         fn body(&self, method: &str) -> Value {
             let mut bodies = self.bodies(method);
             assert_eq!(bodies.len(), 1, "{method} was called exactly once");
@@ -1328,7 +1107,6 @@ mod tests {
                     let Some((path, body)) = read_request(&mut stream).await else {
                         return;
                     };
-                    // `/bot<token>/<method>`, with the long poll's query string on the end.
                     let method = path
                         .rsplit('/')
                         .next()
@@ -1361,7 +1139,6 @@ mod tests {
         }
     }
 
-    /// Reads one request, answering with its path and body once both have arrived.
     async fn read_request(stream: &mut tokio::net::TcpStream) -> Option<(String, String)> {
         use tokio::io::AsyncReadExt as _;
         let mut bytes = Vec::new();
@@ -1423,12 +1200,10 @@ mod tests {
         .expect("telegram transport builds")
     }
 
-    /// A Bot API success carrying `result`.
     fn accepted(result: Value) -> Value {
         json!({ "ok": true, "result": result })
     }
 
-    /// `sendMessage` answers a posted message; everything else answers a bare success.
     fn posting(method: &str, _: &Value) -> Value {
         if method == "sendMessage" {
             return accepted(json!({ "message_id": 9, "chat": { "id": 42 } }));
@@ -1459,11 +1234,6 @@ mod tests {
         }
     }
 
-    /// A recorded stream's cumulative text, repeated until it is longer than one Telegram message.
-    ///
-    /// Through the model crate's own parser because that parser is the only thing in the workspace
-    /// that builds [`ModelText`] from bytes, and repeated rather than handed a `String` of `x`s for
-    /// the same reason: a driver cannot be shown text no model wrote.
     fn longer_than_one_message() -> ModelText {
         let events = dekopon_model::events_from_transcript(
             dekopon_test_support::OPENAI_CHAT_COMPLETIONS_TWO_DELTAS,
@@ -1487,8 +1257,6 @@ mod tests {
         }
     }
 
-    /// The presence of a capability object is the whole advertisement; there is no descriptor
-    /// beside it that could disagree.
     #[tokio::test]
     async fn telegram_advertises_every_surface_the_bot_api_has() {
         let driver = driver("http://127.0.0.1:1");
@@ -1591,7 +1359,6 @@ mod tests {
         assert_eq!(deleted["message_id"], 9);
     }
 
-    /// The one Bot API rejection that means the caller got what it asked for.
     #[tokio::test]
     async fn an_edit_that_changes_nothing_is_the_success_it_describes() {
         let api = bot_api(|_, _| {
@@ -1626,8 +1393,6 @@ mod tests {
         );
     }
 
-    /// A flood limit is a refusal with a cause, so the policy can count it and drop the rung
-    /// rather than believe a call that was never sent.
     #[tokio::test]
     async fn a_flood_limit_refuses_every_later_liveness_call_without_sending_one() {
         let api = bot_api(|_, _| json!({ "ok": false, "parameters": { "retry_after": 30 } }));
@@ -1694,9 +1459,6 @@ mod tests {
     async fn a_cut_stream_render_says_so_and_still_fits_one_message() {
         let api = bot_api(posting);
         let driver = driver(&api.base);
-        // Exactly what the policy hands a driver once the answer outgrows the surface: the head
-        // that fits, cut to the ceiling this driver advertised, and the flag saying the rest of it
-        // was dropped.
         let whole = longer_than_one_message();
         let streamed = StreamedText {
             text: whole.truncated(MAX_STREAM_CHARS),
@@ -1746,10 +1508,6 @@ mod tests {
         );
     }
 
-    /// The policy counts its cut in scalars, the Bot API counts UTF-16 units, and ninety-six units
-    /// of headroom is not every text: a render can still arrive at the ceiling. The marker has to
-    /// come out of that text, because an edit one unit over is rejected whole and the reader would
-    /// be left with whatever the last accepted render said.
     #[tokio::test]
     async fn a_stream_render_at_the_bot_api_ceiling_takes_its_marker_out_of_the_text() {
         let api = bot_api(posting);
@@ -1808,11 +1566,6 @@ mod tests {
         );
     }
 
-    /// Only a forum topic is a thread; `message_thread_id` alone is not one.
-    ///
-    /// Telegram sets `message_thread_id` on an ordinary reply in a non-forum supergroup, where it
-    /// is the id of the message being replied to. Keying the conversation on it filed every reply
-    /// in a conversation of its own, so history, admission, memory, and liveness all split apart.
     #[tokio::test]
     async fn only_a_message_marked_as_a_topic_is_a_thread() {
         let in_chat = |extra: Value| {
@@ -1863,10 +1616,6 @@ mod tests {
         assert_eq!(topic.conversation.key(), "-1001:77");
     }
 
-    /// A topic id the Bot API would never mint costs that update and no other.
-    ///
-    /// The offset has already advanced past every update in the batch by the time one is read, so
-    /// failing the poll would abandon the ones behind it: they are acknowledged and never resent.
     #[tokio::test]
     async fn an_impossible_topic_id_drops_its_own_update_rather_than_the_batch() {
         let capture = CaptureLayer::workspace();
@@ -1971,8 +1720,6 @@ mod tests {
         assert_eq!(request.via, CancelVia::Button);
     }
 
-    /// `callback_data` is echoed from the presser's own client, so a crafted one must not name a
-    /// conversation the envelope does not.
     #[tokio::test]
     async fn a_press_claiming_another_conversation_is_neither_answered_nor_queued() {
         let api = bot_api(one_update(json!({
@@ -2040,7 +1787,6 @@ mod tests {
         );
     }
 
-    /// A reference this transport did not mint names another service's surface.
     #[tokio::test]
     async fn a_surface_belonging_to_another_transport_is_refused() {
         let api = bot_api(posting);

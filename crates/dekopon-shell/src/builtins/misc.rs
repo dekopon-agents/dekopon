@@ -1,5 +1,3 @@
-//! `echo`, `printf`, `test`/`[`, `true`, `false`, `sleep`, and `cat`.
-
 use std::{thread, time::Duration};
 
 use serde_json::Value;
@@ -7,7 +5,6 @@ use serde_json::Value;
 use super::{Builtin, BuiltinContext, CommandFailure, CommandResult, unsupported_flag};
 use crate::{ExitCode, ast::DEV_NULL};
 
-/// `echo [-neE] ARGS...`.
 pub(crate) struct Echo;
 
 impl Builtin for Echo {
@@ -24,9 +21,8 @@ impl Builtin for Echo {
         let mut suppress_newline = false;
         let mut escapes = false;
         let mut words = arguments;
-        // `-n`, `-e`, `-E`, and bundles of them are consumed as flags, exactly as busybox echo
-        // does. Leaving `-e` unconsumed printed it as data, silently corrupting the value the
-        // script produced — and `echo -e` is how a bash-fluent model writes a multi-line string.
+        // -n, -e, -E and their bundles are consumed as flags, matching busybox echo; leaving -e
+        // unconsumed would print it as data, corrupting the value the script produced.
         while let Some(first) = words.first() {
             if !is_echo_flags(first) {
                 break;
@@ -55,7 +51,6 @@ impl Builtin for Echo {
     }
 }
 
-/// Reports whether one argument is an `echo` flag bundle such as `-n`, `-e`, or `-ne`.
 fn is_echo_flags(argument: &str) -> bool {
     argument.len() > 1
         && argument.starts_with('-')
@@ -65,10 +60,6 @@ fn is_echo_flags(argument: &str) -> bool {
             .all(|flag| matches!(flag, 'n' | 'e' | 'E'))
 }
 
-/// Expands the escape sequences `echo -e` interprets.
-///
-/// The set matches [`format_text`]: an unrecognized escape stays literal rather than being dropped,
-/// so nothing disappears from the text a script meant to emit.
 fn interpret_escapes(text: &str) -> String {
     let mut output = String::with_capacity(text.len());
     let mut characters = text.chars();
@@ -92,7 +83,6 @@ fn interpret_escapes(text: &str) -> String {
     output
 }
 
-/// `printf FORMAT [ARGS...]`.
 pub(crate) struct Printf;
 
 impl Builtin for Printf {
@@ -112,12 +102,10 @@ impl Builtin for Printf {
             ));
         };
         let rendered = format_text(format, values)?;
-        // printf never appends a newline of its own; `\n` in the format is the only source.
         Ok(CommandResult::value(Value::String(rendered)).without_newline())
     }
 }
 
-/// Renders a curated printf format: `%s`, `%d`, `%f`, `%%`, plus `\n`, `\t`, and `\\`.
 #[allow(
     clippy::map_err_ignore,
     reason = "both discarded values are ParseFloatError over a `%d` or `%f` argument the message \
@@ -172,7 +160,6 @@ fn format_text(format: &str, values: &[String]) -> Result<String, CommandFailure
     Ok(output)
 }
 
-/// `test EXPRESSION`.
 pub(crate) struct Test;
 
 impl Builtin for Test {
@@ -190,7 +177,6 @@ impl Builtin for Test {
     }
 }
 
-/// `[ EXPRESSION ]`.
 pub(crate) struct TestBracket;
 
 impl Builtin for TestBracket {
@@ -222,9 +208,8 @@ pub(crate) fn evaluate_test(
     command: &str,
     arguments: &[String],
 ) -> Result<CommandResult, CommandFailure> {
-    // Leading `!`s are counted in a loop rather than peeled off by recursion. argv length here is
-    // attacker-controlled — an unquoted expansion of a JSON array spreads element by element — so
-    // one frame per `!` let a three-line script build a 20,000-deep stack and abort the process.
+    // Leading !s are counted in a loop, not recursion: argv length is attacker-controlled via array
+    // expansion, and one stack frame per ! could build a 20,000-deep stack and abort the process.
     let mut negations = 0usize;
     let mut arguments = arguments;
     while arguments.first().is_some_and(|first| first == "!") {
@@ -298,7 +283,6 @@ fn parse_number(command: &str, text: &str) -> Result<f64, CommandFailure> {
         .map_err(|_| CommandFailure::usage(format!("{command}: {text:?} is not a number")))
 }
 
-/// `true`.
 pub(crate) struct True;
 
 impl Builtin for True {
@@ -316,7 +300,6 @@ impl Builtin for True {
     }
 }
 
-/// `false`.
 pub(crate) struct False;
 
 impl Builtin for False {
@@ -334,7 +317,6 @@ impl Builtin for False {
     }
 }
 
-/// `sleep SECONDS`.
 pub(crate) struct Sleep;
 
 impl Builtin for Sleep {
@@ -368,12 +350,9 @@ impl Builtin for Sleep {
             ));
         }
 
-        // Sleeping is capped by whatever remains of the script deadline, so `sleep 3600` cannot
-        // park the interpreter past its own wall clock. Overshooting the deadline then trips it.
-        //
-        // The conversion is fallible on purpose: `Duration::from_secs_f64` *panics* above roughly
-        // 1.8e19 seconds, so `sleep 1e30` would abort the whole process rather than being clamped
-        // to a deadline it was always going to exceed.
+        // Sleep is capped by the remaining deadline; the fallible duration conversion is deliberate
+        // since it panics above roughly 1.8e19 seconds, and an astronomical sleep must not abort
+        // the process.
         let requested = Duration::try_from_secs_f64(seconds).unwrap_or(Duration::MAX);
         let remaining = context.budget.remaining();
         thread::sleep(requested.min(remaining));
@@ -382,7 +361,6 @@ impl Builtin for Sleep {
     }
 }
 
-/// `cat BUFFER...`.
 pub(crate) struct Cat;
 
 impl Builtin for Cat {
@@ -402,17 +380,12 @@ impl Builtin for Cat {
             }
         }
 
-        // `cat` reads only the named in-memory buffer store written by `>` and `>>`. It resolves no
-        // path, touches no filesystem, and reaches nothing outside this one script execution.
         if arguments.is_empty() {
             return Ok(CommandResult::value(input.unwrap_or(Value::Null)));
         }
 
         let mut values = Vec::new();
         for name in arguments {
-            // `/dev/null` is the one name that never needs a prior write: it discards on the way in
-            // and reads empty on the way out, which is what makes `cmd > /dev/null` and
-            // `cat /dev/null` mean here what they mean everywhere else.
             if name == DEV_NULL {
                 values.push(Value::Null);
                 continue;
@@ -463,8 +436,6 @@ mod tests {
 
     #[test]
     fn echo_consumes_its_flag_bundles_instead_of_printing_them() {
-        // An unconsumed `-e` used to be printed as data, so the value the script produced silently
-        // gained a flag it never meant to emit.
         assert_eq!(
             run_builtin(&Echo, &["-e", "a\\nb"], None)
                 .expect("echo runs")
@@ -480,7 +451,6 @@ mod tests {
         let bundled = run_builtin(&Echo, &["-ne", "a\\tb"], None).expect("echo runs");
         assert_eq!(bundled.value, json!("a\tb"));
         assert!(bundled.suppress_newline);
-        // A word that merely starts with a dash is still ordinary text, as in real echo.
         assert_eq!(
             run_builtin(&Echo, &["-x", "a"], None)
                 .expect("echo runs")
@@ -538,8 +508,6 @@ mod tests {
         assert_eq!(status(&["!", "!", "-n", "x"]), ExitCode::SUCCESS);
         assert_eq!(status(&["!", "!", "!", "-n", "x"]), ExitCode::FAILURE);
 
-        // argv length is attacker-controlled: an unquoted expansion of a JSON array spreads one
-        // word per element, so a runtime-generated pile of `!`s must not build a stack frame each.
         let bangs = vec!["!"; 50_000];
         let mut arguments = bangs.clone();
         arguments.extend(["-n", "x"]);
@@ -604,8 +572,6 @@ mod tests {
 
     #[test]
     fn an_astronomical_sleep_is_clamped_rather_than_panicking() {
-        // `Duration::from_secs_f64` panics past its u64-second ceiling, so `sleep 1e30` used to
-        // abort the process instead of being capped by the deadline like any other long sleep.
         let limits = Limits {
             timeout: Duration::from_millis(20),
             ..Limits::default()

@@ -1,13 +1,3 @@
-//! Import-free fixture whose `probe` command word behaves like a small command-line program.
-//!
-//! It is the checked-in `run-command` guest built on the SDK's `clap` layer: `probe --help` and
-//! `probe --version` render on stdout at status 0, `probe bogus` and `probe count` (missing its
-//! argument) render clap's usage error on stderr at status 2, `probe upper --text hi` proposes
-//! `cli-probe.upper`, `probe upper -` reads the value piped into the word, and `probe upper -`
-//! with nothing piped is declined with a `usage` error. The command tree is declared once through
-//! `#[derive(Parser)]` against the clap the SDK re-exports; the hand-rolled baseline the SDK
-//! documents lives in `memory-reservation-probe`.
-
 use dekopon_provider_sdk::clap::{self, Args, CommandFactory, FromArgMatches, Parser, Subcommand};
 use dekopon_provider_sdk::{
     CapabilityId, CommandInvocation, CommandRun, EffectKind, Provider, ProviderApiVersion,
@@ -37,8 +27,6 @@ const REVERSE: &str = "cli-probe.reverse";
 /// The largest `text` the fixture transforms; anything longer is refused with its length.
 const MAX_TEXT_BYTES: usize = 16 * 1024;
 
-// The `probe` command tree, declared once and rendered by clap. A plain comment rather than a doc
-// comment: clap would render a doc comment as the `about` line above `Usage:`.
 #[derive(Parser)]
 #[command(name = "probe", version = "0.1.0")]
 struct Probe {
@@ -46,9 +34,6 @@ struct Probe {
     transform: Transform,
 }
 
-// Every subcommand; each proposes exactly one capability, named by the `const` `manifest()`
-// declares, so a renamed capability is a compile error rather than an exit code. A plain comment
-// for the same reason as on `Probe`: clap renders an enum's doc comment as the parent's `about`.
 #[derive(Subcommand)]
 enum Transform {
     /// Upper-case the text

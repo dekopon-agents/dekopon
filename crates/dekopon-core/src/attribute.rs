@@ -1,34 +1,17 @@
-//! The size bound on one span attribute value.
-//!
-//! A run's arguments, piped values, and outputs ride its trace, so the bound applies to each value
-//! rather than to the number of spans. The shell and the broker host cut through this one function,
-//! so the two processes cannot disagree about where a value ends.
-
 use std::{
     borrow::Cow,
     fmt::{self, Write as _},
 };
 
-/// Maximum bytes of one span attribute value [`bounded_attribute`] passes through uncut.
 pub const MAX_ATTRIBUTE_BYTES: usize = 4096;
 
-/// Appended to a value [`bounded_attribute`] cut.
 const TRUNCATION_MARKER: &str = "\u{2026}[truncated]";
 
-/// Returns `value` unchanged when it fits [`MAX_ATTRIBUTE_BYTES`], otherwise the longest prefix
-/// ending on a character boundary within the bound followed by `…[truncated]`.
-///
-/// The cut never splits a character, so the result is always valid text, and the marker is added
-/// past the bound rather than inside it. A caller records the full byte length beside the bounded
-/// value, so a reader can tell a cut value from one that happened to end there.
 #[must_use]
 pub fn bounded_attribute(value: &str) -> Cow<'_, str> {
     bounded_text(value, MAX_ATTRIBUTE_BYTES)
 }
 
-/// One value rendered under [`MAX_ATTRIBUTE_BYTES`], beside the byte length of the whole.
-///
-/// Returned by [`bounded_display`].
 #[derive(Debug)]
 pub struct BoundedDisplay {
     text: String,
@@ -36,27 +19,19 @@ pub struct BoundedDisplay {
 }
 
 impl BoundedDisplay {
-    /// The rendering, cut exactly where [`bounded_attribute`] cuts and marked the same way.
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
     }
 
-    /// The byte length of the whole rendering, whether or not it was cut.
     #[must_use]
     pub fn bytes(&self) -> usize {
         self.bytes
     }
 }
 
-/// Renders `value` the way [`bounded_attribute`] would cut it, without ever holding more than the
-/// bound.
-///
-/// [`bounded_attribute`] needs the value already in a `&str`, so a caller with a `Display` value
-/// pays a full copy of it before anything is cut — and a provider proposal carries whatever the
-/// model sent, which today includes base64 image bytes. This renders straight into a sink that
-/// stops copying at the bound and keeps counting past it, so recording a multi-megabyte proposal
-/// costs the bound rather than the proposal.
+/// Renders straight into a bounded sink instead of formatting to a String first, so recording a
+/// multi-megabyte proposal costs the bound, not the proposal.
 #[must_use]
 pub fn bounded_display(value: &impl fmt::Display) -> BoundedDisplay {
     let mut sink = BoundedSink {
@@ -64,9 +39,8 @@ pub fn bounded_display(value: &impl fmt::Display) -> BoundedDisplay {
         bytes: 0,
         cut: false,
     };
-    // The sink itself never fails, so an error is the value's own `Display` giving up part way
-    // through. What was written is then a prefix of the value, which is what the marker announces;
-    // `bytes` counts that prefix, because no more of the value exists to count.
+    // This assumes the sink itself never errors; if it ever could, a real sink failure would be
+    // miscounted as a truncated value.
     if write!(sink, "{value}").is_err() {
         sink.cut = true;
     }
@@ -81,11 +55,6 @@ pub fn bounded_display(value: &impl fmt::Display) -> BoundedDisplay {
     BoundedDisplay { text, bytes }
 }
 
-/// Keeps the first [`MAX_ATTRIBUTE_BYTES`] of everything written to it and counts the rest.
-///
-/// Once one fragment crosses the bound the sink stops appending for good, so the kept prefix is the
-/// same one [`bounded_attribute`] would take from the joined text rather than a later fragment's
-/// short characters slipping in behind a dropped long one.
 struct BoundedSink {
     text: String,
     bytes: usize,
@@ -110,11 +79,6 @@ impl fmt::Write for BoundedSink {
     }
 }
 
-/// Applies the same cut as [`bounded_attribute`] at a caller-chosen bound.
-///
-/// A provider-reported failure code and message are carried on the wire and in the audit record
-/// rather than only on a span, so they take tighter bounds than a span attribute. The truncation
-/// rule itself stays in one place so the two cannot disagree about where a value ends.
 pub(crate) fn bounded_text(value: &str, maximum: usize) -> Cow<'_, str> {
     if value.len() <= maximum {
         return Cow::Borrowed(value);
@@ -131,7 +95,6 @@ mod tests {
         BoundedSink, MAX_ATTRIBUTE_BYTES, TRUNCATION_MARKER, bounded_attribute, bounded_display,
     };
 
-    /// Writes `fragment` `times` over without ever holding the whole rendering itself.
     struct Repeated<'a> {
         fragment: &'a str,
         times: usize,
@@ -171,8 +134,6 @@ mod tests {
         );
     }
 
-    /// A four-byte character starting three bytes before the cap ends one byte past it: cutting
-    /// at the cap would split it, so the whole character goes.
     #[test]
     fn a_multibyte_character_straddling_the_cap_is_dropped_whole() {
         let value = format!("{}\u{1f980}", "x".repeat(MAX_ATTRIBUTE_BYTES - 3));
@@ -187,8 +148,6 @@ mod tests {
         );
     }
 
-    /// Rendering through the sink and cutting an already-built string must not disagree, whatever
-    /// the fragment lengths are, including a fragment whose character straddles the bound.
     #[test]
     fn a_rendered_value_is_cut_where_the_same_text_would_be() {
         for value in [
@@ -214,8 +173,6 @@ mod tests {
                 };
                 let mut rest = value.as_str();
                 while !rest.is_empty() {
-                    // A fragment is always whole characters, so a character longer than `chunk`
-                    // goes across on its own rather than stalling the loop.
                     let mut split = rest.floor_char_boundary(chunk.min(rest.len()));
                     if split == 0 {
                         split = rest
@@ -240,8 +197,6 @@ mod tests {
         }
     }
 
-    /// The point of rendering rather than cutting a built string: a value far past the bound is
-    /// counted in full while the buffer holding it never grows past the bound.
     #[test]
     fn a_value_far_past_the_bound_never_buffers_more_than_the_bound() {
         let fragment = "x".repeat(64 * 1024);

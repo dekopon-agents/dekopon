@@ -1,5 +1,3 @@
-//! `wc [-l] [-w] [-c]`.
-
 use serde_json::{Value, json};
 
 use crate::{
@@ -7,11 +5,8 @@ use crate::{
     value::{to_lines, to_text},
 };
 
-/// Counts lines, words, or bytes.
-///
-/// With exactly one flag the result is a bare number so `| wc -l` composes with arithmetic and
-/// `test`. With no flag it is an object carrying all three counts, which stays JSON-native instead
-/// of forcing a script to parse columns.
+/// With exactly one flag the result is a bare number so it composes with arithmetic and test; with
+/// no flag it returns an object holding all three counts instead of requiring column parsing.
 pub(crate) struct Wc;
 
 impl Builtin for Wc {

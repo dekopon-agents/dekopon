@@ -1,5 +1,3 @@
-//! `grep [-v] [-i] [-c] [-n] [-E] PATTERN`.
-
 use serde_json::Value;
 
 use crate::{
@@ -10,8 +8,6 @@ use crate::{
 
 use super::Pattern;
 
-/// Selects lines matching a literal, optionally anchored pattern — or, under `-E`, a regular
-/// expression compiled by the engine `jq` already links.
 pub(crate) struct Grep;
 
 impl Builtin for Grep {
@@ -75,7 +71,6 @@ impl Builtin for Grep {
             });
         }
 
-        // Real grep exits 1 when nothing matched; `grep x && ...` depends on that.
         let status = if matched.is_empty() {
             ExitCode::FAILURE
         } else {
@@ -126,8 +121,6 @@ mod tests {
     fn no_match_exits_one_and_emits_nothing_like_real_grep() {
         let result = grep(&["zzz"], json!("hello"));
         assert_eq!(result.status, ExitCode::FAILURE);
-        // Null, not an empty string: real grep prints nothing when nothing matched, and an empty
-        // string would emit a phantom blank line into the script's output.
         assert_eq!(result.value, Value::Null);
     }
 
@@ -151,8 +144,6 @@ mod tests {
 
     #[test]
     fn the_e_flag_matches_with_the_regex_engine() {
-        // `grep "[0-9]"` is the single most common thing a model writes, and without `-E` it is a
-        // usage error naming the character class. With it, the engine answers.
         assert_eq!(
             grep(&["-E", "[0-9]"], json!("port 8080\nno digits")).value,
             json!("port 8080")
@@ -161,7 +152,6 @@ mod tests {
             grep(&["-E", "^ba(r|z)$"], json!(["bar", "baz", "barn"])).value,
             json!(["bar", "baz"])
         );
-        // The other flags keep working against a regex.
         assert_eq!(
             grep(&["-c", "-E", r"\d"], json!("a1\nb2\ncc")).value,
             json!(2)

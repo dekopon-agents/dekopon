@@ -70,7 +70,6 @@ struct State {
     ending: Ending,
 }
 
-/// A missing old interval is a refusal, not evidence that this receipt arrived while idle.
 #[derive(Clone, Debug)]
 pub(crate) enum LatePhotoReceipt {
     Run(LatePhotos),
@@ -135,7 +134,6 @@ impl LatePhotoReceipt {
     }
 }
 
-/// One entry per admitted metadata operation; permits bound both entries and broker connections.
 #[derive(Clone, Default)]
 pub(super) struct LateIntakes {
     entries: Arc<Mutex<Vec<Arc<IntakeControl>>>>,
@@ -203,7 +201,6 @@ impl LateIntakes {
                 && control.key.1 == request.conversation_id
                 && control.subject.canonical() == request.subject
         }) {
-            // Publication, terminal arbitration and Stop share one linearization boundary.
             let _gate = control.gate.lock().expect("late intake cancellation gate");
             if control
                 .cancellation
@@ -326,8 +323,8 @@ impl ActiveSessions {
             return None;
         }
         let key = (message.transport.clone(), message.conversation.key());
-        // Registration/removal and recent insertion share this lock. Receipt-time association
-        // cannot observe the gap between an active entry and its completed interval.
+        // Registration, removal, and recent-session insertion all take this same lock, so no reader
+        // can observe the gap between active and completed.
         let entries = self.entries.lock().expect("active session registry");
         if let Some(active) = entries.get(&key)
             && message.received_at >= active.started_at
@@ -529,7 +526,6 @@ impl LatePhotos {
         if matches!(state.ending, Ending::Running) {
             state.pending_notice = true;
             state.ids.extend(ids);
-            // Inventory eviction also removes old notice IDs; tracking never exceeds that table.
             state.ids.retain(|id| {
                 runner
                     .assets
@@ -588,7 +584,6 @@ pub(super) fn append_notice(text: &str, notice: Option<&str>) -> String {
     let Some(notice) = notice else {
         return bound_outbound(text);
     };
-    // The shared truncator retains both ends; the fixed notice fits wholly in its tail budget.
     bound_outbound(&format!("{text}\n\n{notice}"))
 }
 
@@ -691,7 +686,6 @@ mod tests {
             if completion_wins {
                 assert!(intake.claim_completion());
             }
-            // Keep the finalized control registered to expose the original check-before-Drop gap.
             let stop = CancelRequest {
                 transport: "dev".into(),
                 conversation_id: native.key(),
@@ -706,7 +700,6 @@ mod tests {
                 assert_eq!(outcome, CancelOutcome::Completing);
                 assert!(!run.inner.lock().unwrap().intake_stopped);
                 assert!(!intake.control.announce_stop.load(Ordering::Acquire));
-                // Dispatch owns the removed batch's stopped ending when intake is completing.
                 assert!(answer(&courier, &message, STOPPED_REPLY).await);
                 assert!(intake.claim_completion());
             } else {

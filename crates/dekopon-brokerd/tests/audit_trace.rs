@@ -1,21 +1,3 @@
-//! The W3C trace identifier every audit record and every command run has to carry, on every
-//! entrance to the broker.
-//!
-//! Nothing puts that identifier into an audit record's own fields, and nothing should:
-//! `dekopon-broker` links no telemetry SDK. It carries the id because it is emitted *inside* the
-//! span that made the decision, which descends from the `broker.invocation` span that adopted the
-//! client's `traceparent` — so the console JSON formatter and the OTLP log bridge each stamp the
-//! live ids on it. These tests read the same native context those two read, from the same place.
-//!
-//! Both invocation entrances are covered because they build their span from different requests:
-//! `Invoke` from a proposal, the storage-routed `RecordDeliveredTurn` from a delivered turn.
-//! Storage withholds nothing from that span; the attested subject and agent ride both. A command
-//! run makes no audit record at all, so `broker.command_run` is read as it is entered instead: the
-//! word an agent ran belongs to the trace of the invocation its proposal becomes.
-//!
-//! Its own test binary, because `tracing` caches per-callsite interest against the global
-//! dispatcher for the whole process. Both tests share the one subscriber a process can install.
-
 #![allow(
     clippy::disallowed_methods,
     clippy::disallowed_types,
@@ -51,18 +33,13 @@ use opentelemetry_sdk::trace::SdkTracerProvider;
 use tokio::{net::UnixListener, sync::oneshot, task::JoinHandle};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
-/// The trace the client claims to be part of; every audit record and command run it causes must
-/// name it.
 const CLIENT_TRACE_ID: [u8; 16] = [
     0x4b, 0xf9, 0x2f, 0x35, 0x77, 0xb3, 0x4d, 0xa6, 0xa3, 0xce, 0x92, 0x9d, 0x0e, 0x0e, 0x47, 0x36,
 ];
 const CLIENT_SPAN_ID: [u8; 8] = [0x00, 0xf0, 0x67, 0xaa, 0x0b, 0xa9, 0x02, 0xb7];
-/// [`CLIENT_TRACE_ID`] as the native context renders it.
 const CLIENT_TRACE_HEX: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
-/// [`CLIENT_SPAN_ID`] as the SDK renders a span id: the parent a span joined to the client names.
 const CLIENT_SPAN_HEX: &str = "00f067aa0ba902b7";
 
-/// The subject and agent the chat claim speaks for.
 const SUBJECT: &str = "slack.t0123abc.u9xyz";
 const AGENT: &str = "chat-agent";
 
@@ -75,7 +52,6 @@ when { context has agent && context.agent == "brokerd-test" }
 unless { context has via };
 "#;
 
-/// One audit record, read exactly as the console formatter and the log bridge read it.
 #[derive(Clone, Debug)]
 struct Captured {
     fields: String,
@@ -83,22 +59,18 @@ struct Captured {
     scope: Vec<String>,
 }
 
-/// One span entry: the trace the native context held once the OTel layer beneath had entered it.
 #[derive(Clone, Debug)]
 struct Entered {
     name: &'static str,
     trace_id: String,
 }
 
-/// One span as the SDK ended it: the parent span id an exporter would send for it.
 #[derive(Clone, Debug)]
 struct Ended {
     name: String,
     parent_span_id: String,
 }
 
-/// What the one global subscriber saw of this workspace: audit records, span entries, every field
-/// rendered onto a span, and every span the SDK ended.
 #[derive(Clone, Debug, Default)]
 struct Probe {
     audits: Arc<Mutex<Vec<Captured>>>,
@@ -112,7 +84,6 @@ impl Probe {
         self.audits.lock().expect("probe sink").clone()
     }
 
-    /// The parent span id each span named `name` ended with, as the SDK hands it to an exporter.
     fn parents_ended(&self, name: &str) -> Vec<String> {
         self.ended
             .lock()
@@ -123,7 +94,6 @@ impl Probe {
             .collect()
     }
 
-    /// The trace the native context held each time a span named `name` was entered.
     fn traces_entered(&self, name: &str) -> Vec<String> {
         self.entered
             .lock()
@@ -134,7 +104,6 @@ impl Probe {
             .collect()
     }
 
-    /// Every field set rendered onto spans named `name`, at creation and at each later recording.
     fn span_fields(&self, name: &str) -> Vec<String> {
         self.fields
             .lock()
@@ -195,7 +164,6 @@ where
         if !span.metadata().target().starts_with("dekopon") {
             return;
         }
-        // The OTel layer sits beneath this one, so it has already made this span's context current.
         let trace_id = opentelemetry::Context::current()
             .span()
             .span_context()
@@ -217,7 +185,6 @@ where
         }
         let mut fields = String::new();
         event.record(&mut Visitor(&mut fields));
-        // The formatter's own source: the OTel layer activated this context on span entry.
         let native = opentelemetry::Context::current();
         let trace_id = native.span().span_context().trace_id().to_string();
         let scope = context
@@ -242,8 +209,6 @@ impl tracing::field::Visit for Visitor<'_> {
     }
 }
 
-/// The probe is also the SDK's span processor, so a span's parent is read from the `SpanData` an
-/// exporter would receive rather than inferred from the tracing side.
 impl opentelemetry_sdk::trace::SpanProcessor for Probe {
     fn on_start(&self, _span: &mut opentelemetry_sdk::trace::Span, _cx: &opentelemetry::Context) {}
 
@@ -263,15 +228,11 @@ impl opentelemetry_sdk::trace::SpanProcessor for Probe {
     }
 }
 
-/// Installs the one global subscriber this binary can have — the OTel layer with the probe above
-/// it — on first use, and hands every test the same probe.
 fn install() -> Probe {
     static INSTALLED: OnceLock<(Probe, SdkTracerProvider)> = OnceLock::new();
     INSTALLED
         .get_or_init(|| {
             let probe = Probe::default();
-            // A provider with no exporter still mints span contexts, which is all the formatter and
-            // the log bridge read; the probe ends each span itself, so nothing needs a receiver.
             let provider = SdkTracerProvider::builder()
                 .with_span_processor(probe.clone())
                 .build();
@@ -370,7 +331,6 @@ async fn broker() -> Arc<Broker<TraceOnlyAuditLog>> {
     )
 }
 
-/// A broker serving the current UID on a private socket, and a client connected to it.
 struct Served<E> {
     client: BrokerClient,
     shutdown: oneshot::Sender<()>,
@@ -458,8 +418,6 @@ async fn every_audit_record_carries_the_client_s_w3c_trace_id() {
         .expect("the authorized invocation completes");
     assert_eq!(invoked.result.outcome, InvocationOutcome::Succeeded);
 
-    // The storage-routed entrance. No chat memory is configured, so this is an audited refusal —
-    // which is the point: a refusal is a decision, and it has to land in the caller's trace too.
     let refused = served
         .client
         .record_delivered_turn(
@@ -506,7 +464,6 @@ async fn every_audit_record_carries_the_client_s_w3c_trace_id() {
             );
         }
     }
-    // Both entrances, not one twice.
     assert!(
         records
             .iter()
@@ -514,8 +471,6 @@ async fn every_audit_record_carries_the_client_s_w3c_trace_id() {
         "{records:?}"
     );
 
-    // The storage-routed span withholds nothing the attested direct one carries: the claim's
-    // subject and agent ride it too.
     let turn = probe
         .span_fields("broker.invocation")
         .into_iter()
@@ -525,13 +480,6 @@ async fn every_audit_record_carries_the_client_s_w3c_trace_id() {
     assert!(turn.contains(&format!("agent={AGENT}")), "{turn}");
 }
 
-/// A command run makes no audit record, so its trace is read where the run starts:
-/// `broker.command_run` adopts the client's `traceparent` exactly as `broker.invocation` does, and
-/// the host's `provider.run_command` inherits the same trace beneath it.
-///
-/// A shared trace id is not enough: the span must be the child of the exact span the client
-/// named, or the operator's trace shows the run beside the client's work rather than under it. Each
-/// of the four outcomes a run ends in is recorded under its exact name.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_command_run_carries_the_client_s_w3c_trace_id() {
     let probe = install();
@@ -571,7 +519,6 @@ async fn every_command_run_carries_the_client_s_w3c_trace_id() {
         matches!(help, CommandRunOutcome::Rendered { status: 0, .. }),
         "{help:?}"
     );
-    // The guest's own decline: `-` asks for piped text, and nothing was piped.
     let declined = served
         .client
         .run_command(
@@ -591,7 +538,6 @@ async fn every_command_run_carries_the_client_s_w3c_trace_id() {
         ),
         "{declined:?}"
     );
-    // No answer at all: no loaded provider declares the word.
     let refused = served
         .client
         .run_command(

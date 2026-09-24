@@ -27,8 +27,6 @@ use dekopon_test_support::{LoopbackServer, provider_fixture, snapshot_tree};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 
-/// An opt-in cross-repository compatibility smoke for the locally built OpenObserve component.
-/// CI can set OPENOBSERVE_COMPONENT_PATH to an independently built, immutable artifact.
 #[tokio::test]
 async fn owner_configured_openobserve_component_links_and_has_no_sql_command() {
     let Ok(component) = std::env::var("OPENOBSERVE_COMPONENT_PATH") else {
@@ -220,7 +218,6 @@ async fn loads_http_provider_and_executes_one_authorized_request() {
     assert_eq!(output.output["status"], 200);
     assert_eq!(output.output["bodyBytes"], 11);
     assert_eq!(output.output["headerCount"], 4);
-    // The probe returns the response body itself: base64 always, plus decoded text when it is UTF-8.
     assert_eq!(output.output["body"], "eyJvayI6dHJ1ZX0=");
     assert_eq!(output.output["bodyText"], r#"{"ok":true}"#);
     assert_eq!(output.output["bodyTruncated"], false);
@@ -631,11 +628,6 @@ fn broker_bindings_mirror_the_immutable_packages() {
     );
 }
 
-/// `run-command` is pure by contract. The clock import is linked into every store, but only an
-/// invocation's store may read it: the bare `date` word proposes without touching the clock, and a
-/// guest that reaches for the clock from a command run traps there, surfacing as the same
-/// `RunCommandUsedHostImport` refusal a denied HTTP or storage call produces. It is the one
-/// checked-in fixture that drives that tripwire.
 #[tokio::test(flavor = "multi_thread")]
 async fn run_command_reading_the_clock_traps() {
     let registry = BrokerProviderRegistry::load(
@@ -672,7 +664,6 @@ async fn run_command_reading_the_clock_traps() {
         "expected the host-import tripwire, got {error:?}"
     );
 
-    // The refusal belongs to that one run: the next bare word still proposes.
     let outcome = registry
         .run_command("date", &[], None)
         .await
@@ -700,7 +691,6 @@ async fn rejects_zero_wasm_resource_ceilings() {
     ));
 }
 
-/// The published artifact digest describes the exact buffer Cranelift compiled.
 #[tokio::test(flavor = "multi_thread")]
 async fn artifact_digest_describes_the_compiled_buffer() {
     let source = provider_fixture("cli-probe-provider.wasm");
@@ -723,7 +713,6 @@ async fn artifact_digest_describes_the_compiled_buffer() {
     assert_eq!(metadata.artifact_bytes, bytes.len() as u64);
 }
 
-/// A provider lock is compared with the same buffer Wasmtime would compile.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_locked_artifact_digest_is_enforced_at_the_compile_boundary() {
     let source = provider_fixture("cli-probe-provider.wasm");
@@ -751,7 +740,6 @@ async fn a_locked_artifact_digest_is_enforced_at_the_compile_boundary() {
     assert!(error.to_string().contains("provider lock expects"));
 }
 
-/// The locked descriptor length is enforced against that same compile buffer.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_locked_artifact_length_is_enforced_at_the_compile_boundary() {
     let source = provider_fixture("cli-probe-provider.wasm");
@@ -785,7 +773,6 @@ async fn a_locked_artifact_length_is_enforced_at_the_compile_boundary() {
     );
 }
 
-/// A replaced locked file is refused from descriptor metadata before its oversized body is read.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_physically_oversized_locked_artifact_is_bounded_before_read() {
     assert!(matches!(
@@ -833,7 +820,6 @@ async fn a_physically_oversized_locked_artifact_is_bounded_before_read() {
     );
 }
 
-/// The provider identity is lock input too, not metadata the component may replace.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_locked_provider_identity_is_enforced_after_describe() {
     let source = provider_fixture("cli-probe-provider.wasm");
@@ -867,9 +853,6 @@ async fn a_locked_provider_identity_is_enforced_after_describe() {
     assert!(error.to_string().contains("provider lock expects other"));
 }
 
-/// The checked-in `memory-reservation-probe` component is the hand-rolled `run-command` guest:
-/// no argument parser, values shifted out of argv by hand. Its help page, its proposal, and its
-/// decline prove the clap-free baseline at the current package against a real component.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_hand_rolled_run_command_guest_renders_help_and_proposes() {
     let registry = BrokerProviderRegistry::load(
@@ -921,10 +904,6 @@ async fn a_hand_rolled_run_command_guest_renders_help_and_proposes() {
     );
 }
 
-/// The checked-in `cli-probe` component exports `run-command` and renders through the SDK's
-/// `clap` layer: the load reads that export from the component type, the typed
-/// `(list<string>, option<string>)` call delivers the piped value, and clap's help page, clap's
-/// usage error, a proposal, and a decline each parse as the shared outcome.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
     let registry = BrokerProviderRegistry::load(
@@ -972,7 +951,6 @@ async fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
             input: json!({"text": "héllo"}),
         }
     );
-    // The proposal is authorized and executed as any other: the loop from word to output closes.
     let output = registry
         .invoke(
             authorized_for(
@@ -1029,8 +1007,6 @@ async fn a_run_command_provider_renders_help_reads_stdin_and_declines() {
     );
 }
 
-/// The default is a ceiling, not the absence of one: an embedder that never sets the field still
-/// gets a bounded aggregate, and it has to admit at least one store or nothing could ever run.
 #[test]
 fn the_default_aggregate_ceiling_is_256_mib_and_admits_a_store() {
     let options = BrokerHostOptions::default();
@@ -1049,7 +1025,6 @@ fn the_default_aggregate_ceiling_is_256_mib_and_admits_a_store() {
     );
 }
 
-/// An aggregate ceiling below one store could never admit an invocation.
 #[tokio::test(flavor = "multi_thread")]
 async fn rejects_an_aggregate_ceiling_smaller_than_one_store() {
     let limits = BrokerHostLimits::default();
@@ -1076,12 +1051,10 @@ async fn rejects_an_aggregate_ceiling_smaller_than_one_store() {
     );
 }
 
-/// A second store is refused rather than OOM-killed once the aggregate ceiling is reserved.
 #[tokio::test(flavor = "multi_thread")]
 async fn refuses_a_store_beyond_the_aggregate_memory_ceiling() {
     let limits = BrokerHostLimits::default();
     let options = BrokerHostOptions {
-        // Exactly one live store fits.
         max_total_memory_bytes: Some(limits.max_memory_bytes),
         ..BrokerHostOptions::default()
     };
@@ -1117,8 +1090,6 @@ async fn refuses_a_store_beyond_the_aggregate_memory_ceiling() {
                 .await
         }
     });
-    // The request bytes only arrive once the guest is inside its host call, which proves the first
-    // store is alive and holding the whole reservation.
     let first = stalled.request();
     assert!(
         first.starts_with(b"GET /stalled "),
@@ -1148,7 +1119,6 @@ async fn refuses_a_store_beyond_the_aggregate_memory_ceiling() {
 
     let held = holding.await.expect("held invocation joins");
     assert!(held.is_err(), "the stalled invocation must time out");
-    // The refused store released nothing it never took, and the held one released everything.
     registry
         .invoke(
             authorized(
@@ -1256,7 +1226,6 @@ fn json_http_response(body: &serde_json::Value) -> Vec<u8> {
     .into_bytes()
 }
 
-/// A response carrying the etag the conditional write pins itself to.
 fn etagged_response(etag: &str) -> Vec<u8> {
     let body = "{}";
     format!(
@@ -1289,11 +1258,6 @@ fn conditional_write_constraints(
     }
 }
 
-/// Two authorized calls in one invocation, which is the shape worth covering in tree.
-///
-/// `gh.pull-request.approve` used to be the only in-tree capability that did this, and it left with
-/// the GitHub provider. `http-probe.conditional-write` replaces it so host coverage of `maxRequests`,
-/// per-call evidence, and the host-call limit does not depend on a provider in another repository.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_two_request_capability_leaves_two_evidence_entries() {
     let registry = BrokerProviderRegistry::load(
@@ -1326,7 +1290,6 @@ async fn a_two_request_capability_leaves_two_evidence_entries() {
     assert_eq!(output.provider.as_str(), "http-probe");
     assert_eq!(output.output["observedEtag"], "\"v1\"");
 
-    // The trace of what actually happened: a pre-read, then a write pinned to what it observed.
     assert_eq!(output.http_calls.len(), 2);
     assert_eq!(output.http_calls[0].method, "GET");
     assert_eq!(output.http_calls[1].method, "POST");
@@ -1364,8 +1327,6 @@ async fn a_write_without_post_authority_is_a_terminal_policy_rejection() {
         .await
         .expect_err("a write without POST authority must fail");
 
-    // The denial is terminal even though the guest catches the HTTP error internally, and the
-    // evidence still shows exactly what ran: the pre-read happened, the write never did.
     assert!(matches!(
         failure.error.as_ref(),
         BrokerHostError::HostCallRejected {
@@ -1415,7 +1376,6 @@ async fn a_two_request_capability_over_its_call_budget_trips_the_host_call_limit
     server.join();
 }
 
-/// Two providers declaring one capability are reported together, not one restart apart.
 #[tokio::test(flavor = "multi_thread")]
 async fn conflicting_providers_are_all_reported_in_one_failure() {
     let error = BrokerProviderRegistry::load(
@@ -1431,9 +1391,6 @@ async fn conflicting_providers_are_all_reported_in_one_failure() {
     let BrokerHostError::ConflictingProviders { report } = error else {
         panic!("expected a conflict report, got {error:?}");
     };
-    // The same component twice is a duplicate provider, three duplicate capabilities, and its one
-    // command word claimed twice. A check that returned on the first would have named one of the
-    // five.
     assert_eq!(report.providers.len(), 1, "{report:?}");
     assert_eq!(report.capabilities.len(), 3, "{report:?}");
     assert_eq!(report.command_words.len(), 1, "{report:?}");
@@ -1468,7 +1425,6 @@ async fn a_waiting_namespace_lease_never_stalls_timers_or_a_distinct_namespace()
             "slack.t0123abc.uone",
         ))
     });
-    // This timer runs on the only runtime worker while the blocking lease wait continues elsewhere.
     tokio::time::timeout(
         std::time::Duration::from_millis(100),
         tokio::time::sleep(std::time::Duration::from_millis(20)),
@@ -1487,8 +1443,6 @@ async fn a_waiting_namespace_lease_never_stalls_timers_or_a_distinct_namespace()
         .expect("distinct grant");
     drop(distinct);
 
-    // Cancelling the waiter does not cancel a native syscall/job. The held grant is released only
-    // now; the blocking task then drains and drops whichever grant it obtained.
     competing.abort();
     drop(held);
     tokio::time::sleep(std::time::Duration::from_millis(30)).await;
@@ -1513,13 +1467,6 @@ fn probe_storage_grant(invocation: &str, subject: &str) -> StorageGrantRequest {
     )
 }
 
-/// The same storage-backed invocation as the raw-API tests above, driven through the testkit.
-///
-/// It is the one place in this suite that exercises the composition a provider author actually
-/// uses, and it keeps `dekopon-provider-sdk-testkit` honest against the host it wraps. Every other
-/// storage test here — the sticky-denial matrix below in particular — still drives
-/// `invoke_with_storage` directly, so the host's own behaviour is never observed only through a
-/// wrapper around it.
 #[tokio::test(flavor = "multi_thread")]
 async fn durable_storage_probe_runs_under_one_exact_consumed_grant() {
     let broker = dekopon_provider_sdk_testkit::FakeBroker::builder()
@@ -1671,7 +1618,6 @@ async fn generated_wasm_storage_denials_are_sticky_and_commit_nothing() {
     }
 }
 
-/// Every entry under `root` with the mode, length, and contents a mutation would change.
 fn snapshot_storage_tree(root: &Path) -> Vec<(PathBuf, u32, u64, Vec<u8>)> {
     snapshot_tree(root)
         .into_iter()
@@ -1679,8 +1625,6 @@ fn snapshot_storage_tree(root: &Path) -> Vec<(PathBuf, u32, u64, Vec<u8>)> {
         .collect()
 }
 
-// Keep the adversarial core cleanup separate from a real Rust guest's allocator. Each export
-// returns a valid string before post-return traps or spins; a successful lift is not success.
 fn post_return_component(cleanup: &str) -> tempfile::NamedTempFile {
     use std::io::Write as _;
 
@@ -1816,8 +1760,6 @@ async fn automatic_post_return_yields_to_the_deadline_and_releases_the_store() {
         matches!(error, BrokerHostError::Timeout { timeout_ms: 50, .. }),
         "{error:?}"
     );
-    // The aggregate ceiling admits exactly one store, so a second run that reaches the same
-    // deadline rather than memory exhaustion proves the first store was released.
     assert!(matches!(
         registry.run_command("cleanup", &[], None).await,
         Err(BrokerHostError::Timeout { .. })
@@ -1847,7 +1789,6 @@ async fn real_guest_streams_one_and_five_eight_mib_assets_and_attaches_a_read_on
     ));
     let input = tempfile::NamedTempFile::new().unwrap();
     input.as_file().set_len(8 * 1024 * 1024).unwrap();
-    // The full 40 MiB upload leaves no decoded budget for a response writer.
     for (count, response) in [(1, "done"), (5, "")] {
         let server = LoopbackServer::once(format!("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).as_bytes());
         let refs = (1..=count)
@@ -1969,7 +1910,6 @@ async fn real_guest_asset_effects_exist_only_on_success_and_caught_denials_stay_
             _ => unreachable!(),
         }
         assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
-        // Exact capacity is available again after every terminal path.
         directory
             .allocate()
             .await

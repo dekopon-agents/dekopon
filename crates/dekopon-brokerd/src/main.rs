@@ -170,7 +170,6 @@ async fn execute(cli: Cli) -> ExitCode {
             }
         },
         Some(Command::Provider(provider)) => {
-            // An offline operator mode with command output on stdout and diagnostics on stderr.
             let install = Install::new(Console {
                 format: ConsoleFormat::Text {
                     ansi: None,
@@ -191,19 +190,14 @@ async fn execute(cli: Cli) -> ExitCode {
                     .await
                     .ok()
                     .flatten();
-            // Telemetry must never keep the broker from starting. Authorization and audit are the
-            // service's contract; observability is not, and failing closed here would trade a
-            // working authority boundary for a missing dashboard.
+            // Telemetry setup must never block broker startup: authorization and audit are the
+            // service's contract, observability is not, so a telemetry failure costs a missing
+            // dashboard, not a working authority boundary.
             let exporter = settings.as_ref().map(|telemetry| &telemetry.settings);
             let tracer_provider =
                 dekopon_telemetry::optional_tracer_provider(exporter, "dekopon-brokerd");
-            // The audit record is a log record now, so the log signal is not optional decoration:
-            // without this bridge a configured receiver gets every decision span and none of the
-            // decisions.
             let logger_provider =
                 dekopon_telemetry::optional_logger_provider(exporter, "dekopon-brokerd");
-            // Structured JSON on stdout is the daemon log contract; a collector or shipper can
-            // pick it up without the broker holding a second credential.
             let mut install = Install::new(Console {
                 format: ConsoleFormat::Json,
                 writer: ConsoleWriter::Stdout,
@@ -237,8 +231,6 @@ async fn observed(install: Install, work: impl Future<Output = Result<(), AppErr
             ExitCode::FAILURE
         }
     };
-    // Flush failures are reported but do not change the exit code: serving has already ended, and
-    // a final batch the exporter could not deliver is the audit loss the constitution accepts.
     if let Err(error) = telemetry.shutdown() {
         tracing::error!(event = "broker_telemetry_shutdown_failed", error = %error);
     }

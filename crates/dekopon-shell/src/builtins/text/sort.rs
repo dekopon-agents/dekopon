@@ -1,5 +1,3 @@
-//! `sort [-r] [-n] [-u]`.
-
 use serde_json::Value;
 
 use crate::{
@@ -7,7 +5,6 @@ use crate::{
     value::{from_lines, to_lines},
 };
 
-/// Sorts lines lexicographically, or numerically with `-n`.
 pub(crate) struct Sort;
 
 impl Builtin for Sort {
@@ -43,11 +40,6 @@ impl Builtin for Sort {
 
         let mut lines = to_lines(&input.unwrap_or(Value::Null));
         if numeric {
-            // Non-numeric lines sort before numeric ones, matching coreutils closely enough that a
-            // mixed list stays stable and predictable. NaN counts as non-numeric on purpose: a
-            // comparator that calls NaN equal to every number is not a strict weak ordering, and a
-            // single `nan` line — ordinary content in real capability output — left the whole list
-            // in input order with no diagnostic.
             lines.sort_by(
                 |left, right| match (numeric_key(left), numeric_key(right)) {
                     (Some(left_number), Some(right_number)) => left_number.total_cmp(&right_number),
@@ -128,8 +120,6 @@ mod tests {
 
     #[test]
     fn a_nan_line_cannot_leave_the_list_unsorted() {
-        // `nan` parses as a float but compares equal to nothing, so treating it as a number made
-        // the comparator inconsistent and `sort -n` silently returned its input untouched.
         assert_eq!(
             sort(&["-n"], json!(["5", "nan", "3", "NaN", "1"])).value,
             json!(["NaN", "nan", "1", "3", "5"])

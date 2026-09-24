@@ -17,10 +17,6 @@ use dekopon_broker::{
     RouteConflict,
 };
 
-/// Capability identifiers the shipped `memory-chat` provider declares.
-///
-/// Fixtures only. The broker reserves the surface by the declared `route`, so these are the
-/// component's names rather than anything the broker compares against.
 const MEMORY_RECORD: &str = "memory.chat.record";
 const MEMORY_RECENT: &str = "memory.chat.recent";
 use dekopon_broker_host::{
@@ -39,10 +35,6 @@ use dekopon_test_support::{CaptureLayer, Record, provider_fixture};
 use serde_json::json;
 use tracing_subscriber::layer::SubscriberExt as _;
 
-/// One fixture trace context for every request these tests build.
-///
-/// The trace is mandatory on the wire now; these cases read invocation identifiers and audit
-/// fields rather than the trace itself, so one shared value keeps the fixtures about their subject.
 const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
 
 fn memory_config() -> ChatMemoryConfig {
@@ -373,14 +365,11 @@ fn claim() -> Attestation {
     claim_for("c0123abc:1712345678.000100")
 }
 
-/// Splits a `channel:thread` key back into the conversation a Slack transport would have minted.
 fn slack_conversation(key: &str) -> Conversation {
     let (id, thread) = key
         .split_once(':')
         .map_or((key, None), |(id, thread)| (id, Some(thread.to_owned())));
     Conversation {
-        // A Slack message with a root timestamp beside it is a thread under the channel; the whole
-        // fixture corpus is threaded, which is what every `channel:ts` key here means.
         kind: ConversationKind::Thread,
         container: Some("t0123abc".to_owned()),
         id: id.to_owned(),
@@ -406,11 +395,6 @@ fn grant() -> AttestorGrant {
     grant_for(&["c0123abc:1712345678.000100"])
 }
 
-/// One grant over the parent channel and the threads under it.
-///
-/// Grants never name a thread (S31), so the conversations these fixtures distinguish share one
-/// grant; what keeps them apart is the storage namespace, which is derived from the conversation
-/// key rather than from the grant.
 fn grant_for(conversations: &[&str]) -> AttestorGrant {
     let mut ids = conversations
         .iter()
@@ -535,8 +519,6 @@ async fn generic_storage_surfaces_require_an_effective_chat_scope() {
             .iter()
             .any(|word| word == storage_word)
     );
-    // One authorization pass, two derived listings: a combined view that disagreed with either
-    // listing would break the guarantee that what a session is shown is what it may invoke.
     assert_eq!(
         broker.capability_view(&direct),
         (broker.capabilities(&direct), broker.command_words(&direct))
@@ -574,13 +556,8 @@ async fn generic_storage_surfaces_require_an_effective_chat_scope() {
     );
     assert!(scoped_words.iter().any(|word| word == storage_word));
 }
-/// The reserved chat-memory surface is the operator's declaration, not a spelling.
-///
-/// The fixture is deliberately hostile in every way a name can be: its provider identity is
-/// `memory-chat` and one of its capabilities is `memory.chat.export`. With no `route` declared,
-/// both are ordinary capabilities on every path — which is the whole point of typing the route,
-/// because the reservation now follows what an operator wrote rather than what they happened to
-/// call something.
+/// The reserved chat-memory surface is determined by the declared route, not a provider's name or
+/// capability naming, so mimicking the shipped provider gains or loses nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabilities() {
     let registry = BrokerProviderRegistry::load(
@@ -772,9 +749,6 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
     );
     drop(broker);
 
-    // Declaring the three routes correctly is still not enough: the routed provider must own
-    // exactly those three capabilities, so a component with a fourth route can never be the one
-    // holding a conversation's storage authority.
     let temporary = tempfile::tempdir().expect("tempdir");
     let directory = temporary.path().canonicalize().expect("canonical tempdir");
     let root = directory.join("provider-storage");
@@ -850,12 +824,6 @@ async fn reserved_looking_names_without_a_declared_route_are_ordinary_capabiliti
     );
 }
 
-/// A reserved provider renders not even its help page for a caller without the surface.
-///
-/// The word gate runs before the guest does, so the `run-command` export of a provider a
-/// chat-memory `route:` names is never entered for a session the surface is not effective for —
-/// nothing it could have rendered exists to leak. The fixture is the hand-rolled `run-command`
-/// guest whose `recall --help` renders a page, routed as the recent half of the surface.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rendered_page_never_reaches_a_reserved_memory_route() {
     let temporary = tempfile::tempdir().expect("tempdir");
@@ -876,7 +844,6 @@ async fn a_rendered_page_never_reaches_a_reserved_memory_route() {
             .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
     )
     .expect("policy world");
-    // Policy permits the capability outright, so what reserves the word can only be the route.
     let policy = PolicyEngine::new(
         r#"
         permit(principal == Dekopon::Principal::"caller",
@@ -938,20 +905,12 @@ async fn a_rendered_page_never_reaches_a_reserved_memory_route() {
         .run_command(&caller, None, None, "recall", &["--help".to_owned()], None)
         .await
         .expect_err("a reserved word never reaches its guest");
-    // `UnknownCommandWord` is the reserved-word refusal itself: the broker never reached the host
-    // registry, so the guest never ran and rendered nothing.
     assert!(
         matches!(&refused, BrokerHostError::UnknownCommandWord { word } if word == "recall"),
         "{refused:?}"
     );
 }
 
-/// Renaming the shipped provider changes nothing the broker hides or denies.
-///
-/// `storage-probe` is named nothing like chat memory and declares `storage-probe.run`, but the
-/// deployment routes it as the record half of the surface — and that alone takes it off the
-/// generic listing, out of the vocabulary, and off every non-record invoke path, exactly as the
-/// shipped `memory-chat` provider is.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied() {
     let temporary = tempfile::tempdir().expect("tempdir");
@@ -976,7 +935,6 @@ async fn a_renamed_provider_carrying_a_declared_route_is_still_hidden_and_denied
             .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
     )
     .expect("policy world");
-    // Policy permits it on every path, so what hides it can only be the route.
     let policy = PolicyEngine::new(
         r#"
         permit(principal == Dekopon::Principal::"caller",
@@ -1245,8 +1203,6 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
             .is_err(),
         "legacy command resolution never enters the memory provider"
     );
-    // A routed capability on the two legacy paths: reserved, denied, and audited with the same
-    // identity every other record carries.
     for (index, attested) in [false, true].into_iter().enumerate() {
         let id = format!("reserved-route-{index}")
             .parse::<InvocationId>()
@@ -1287,8 +1243,6 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
     let mut swapped = claim.clone();
     swapped.scope.as_mut().expect("chat scope").conversation.id = "c999999".to_owned();
     swaps.push(swapped);
-    // The kind is part of the selector, and this grant lists `[channel, thread]`: the same channel
-    // claimed as a direct message is a claim the grant does not cover.
     let mut swapped = claim.clone();
     swapped
         .scope
@@ -1315,11 +1269,8 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
             "every independently swapped selector field denies"
         );
     }
-    // The thread is the one coordinate a grant deliberately does not name. A different thread under
-    // the same granted parent is the same claim as far as authority is concerned — that is what
-    // makes a grant on a channel cover the threads under it without a second line — while the
-    // storage namespace still keys on the whole conversation, so the two threads never share
-    // memory. Swapping it must therefore *not* deny.
+    // A grant on a channel implicitly authorizes every thread under it, but the storage namespace
+    // keys on the whole conversation, so different threads under the same grant never share memory.
     let mut sibling_thread = claim.clone();
     sibling_thread
         .scope
@@ -1448,8 +1399,6 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
         .expect("opaque UTF-8 token");
     let records = audit.records();
     assert_eq!(records.len(), 5);
-    // A storage-backed record carries every identity and policy field a non-storage record does:
-    // the storage boundary contains what was stored, not who asked for it or which policy let them.
     let encoded = serde_json::to_value(&records).expect("audit serializes");
     let attested = |event: &serde_json::Value| {
         assert_eq!(event["principal"], "maintainer", "{event}");
@@ -1644,11 +1593,6 @@ async fn generated_wasm_b1_original_loads_are_independent_of_write_growth() {
     assert_eq!(recent["turns"][0]["assistant"], assistant);
 }
 
-/// A corrupt memory namespace fails only the invocation that finds it, and inside that trace.
-///
-/// The model is told once, through the storage failure, and the retry runs on empty memory. The
-/// only test in this binary that installs a global subscriber, which the blocking materialization
-/// thread needs: the span has to travel onto it for the reset record to land in the trace.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_corrupt_memory_namespace_is_reset_by_the_invocation_that_finds_it() {
     let capture = CaptureLayer::workspace();
@@ -1722,8 +1666,6 @@ async fn a_corrupt_memory_namespace_is_reset_by_the_invocation_that_finds_it() {
         "{}",
         capture.spans_text()
     );
-    // The same span names the directory, which is how an operator gets from this trace to the
-    // bytes on disk.
     let token = base
         .file_name()
         .expect("base token")
@@ -1738,9 +1680,6 @@ async fn a_corrupt_memory_namespace_is_reset_by_the_invocation_that_finds_it() {
         "{}",
         capture.spans_text()
     );
-    // Beside those storage additions, the storage-backed invocation's spans record what every
-    // other invocation's do: the capability, the attested identity, and the input on
-    // `broker.authorize`, and the capability on `provider.invoke`.
     let spans = capture.spans();
     let recorded = |span: &str, fragment: &str| {
         spans
@@ -1767,9 +1706,6 @@ async fn a_corrupt_memory_namespace_is_reset_by_the_invocation_that_finds_it() {
             capture.spans_text()
         );
     }
-    // The invocation that finds the corrupt namespace resets it and never reaches the provider;
-    // the record call that follows does, and its storage-backed `provider.invoke` carries the
-    // capability and input like any other.
     for fragment in [
         " capability=memory.chat.record",
         r#" input={"operation":"record","#,
@@ -2018,8 +1954,6 @@ async fn selected_symbolic_credential_rotates_authority_without_hashing_its_valu
     );
     drop(broker);
 
-    // Secret values are deliberately not authority metadata. Replacing one behind the same
-    // selected symbolic reference keeps the current generation and its existing text.
     let broker = build_broker_with_principal(
         &root,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
@@ -2165,8 +2099,6 @@ async fn unreachable_memory_authority_never_rotates_generic_durable_storage() {
     drop(broker);
     assert_eq!(generation_count(&root), 1);
 
-    // Cedar still permits all three exact memory IDs, but chatMemory is not enabled for reviewer.
-    // Changing an unreachable memory ceiling must not enter this generic provider's authority.
     memory.max_recent_turns -= 1;
     let broker = build_broker_with_principal(
         &root,
@@ -2217,8 +2149,6 @@ async fn invoke_generic_storage_denial(broker: &Broker<InMemoryAuditLog>, invoca
 
 #[tokio::test(flavor = "multi_thread")]
 async fn authority_surface_ignores_order_and_denied_provider_but_rotates_every_semantic_ceiling() {
-    // One owner and sequential loaders: no parallel publishers or shared mutable broker state.
-    // Keep compiled artifacts outside the storage tree whose generations this test checks.
     let compiled = tempfile::tempdir().expect("compiled providers");
     let options = BrokerHostOptions {
         cwasm_dir: Some(compiled.path().to_owned()),
@@ -2270,9 +2200,6 @@ async fn authority_surface_ignores_order_and_denied_provider_but_rotates_every_s
         "the first registry compiles the three distinct provider fixtures"
     );
 
-    // Principal is an owner-controlled mapping for the canonical subject in the base namespace,
-    // not part of the resulting effective authority surface. Equivalent grants under a remap keep
-    // continuity exactly as provider order, policy formatting, and unrelated denied providers do.
     let broker = build_broker_with_options(
         &root,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
@@ -2346,8 +2273,6 @@ async fn authority_surface_ignores_order_and_denied_provider_but_rotates_every_s
     drop(broker);
     assert_eq!(generation_count(&root), 2);
 
-    // Returning B -> A still mints a third generation; an old authority generation is never
-    // reopened merely because its canonical bytes recur.
     let broker = build_broker_with_options(
         &root,
         Arc::new(InMemoryAuditLog::new(16).expect("audit")),
@@ -2409,7 +2334,6 @@ async fn authority_surface_ignores_order_and_denied_provider_but_rotates_every_s
         cold_artifacts,
         "authority changes and provider ordering must reuse immutable compiled artifacts"
     );
-    // All registries are dropped before the private mapped-artifact directory is removed.
     compiled.close().expect("compiled fixtures can be removed");
 }
 
@@ -2551,13 +2475,6 @@ fn walk(path: &Path) -> Vec<PathBuf> {
     paths
 }
 
-/// An upgrade that adds `chatMemory:` and forgets `route:` must be told which lines to write.
-///
-/// This is the shape of a real deployment mid-upgrade: the three `memory.chat.*` capabilities and
-/// the `chatMemory:` block were already there and composed by name, and nothing in the constraint
-/// sets was edited. `validate_routes` has nothing to say — there are no declared routes to
-/// conflict — so this refusal is the operator's only signal, and the composition message it used
-/// to be named neither `route:` nor any of the roles.
 #[tokio::test(flavor = "multi_thread")]
 async fn chat_memory_without_routes_names_every_missing_role() {
     let temporary = tempfile::tempdir().expect("tempdir");
@@ -2578,8 +2495,6 @@ async fn chat_memory_without_routes_names_every_missing_role() {
             .map(|(provider, capability)| (capability.id.clone(), provider.clone())),
     )
     .expect("world");
-    // Exactly the pre-upgrade catalog: the right three capabilities, the right storage authority,
-    // and no `route:` anywhere. `route` defaults to `generic`, so this is what omitting it means.
     let unrouted = |effect, risk, access| {
         let mut set = memory_constraint(CapabilityRoute::ChatMemoryRecord, effect, risk, access);
         set.route = CapabilityRoute::Generic;
@@ -2655,7 +2570,6 @@ async fn chat_memory_without_routes_names_every_missing_role() {
     }
 }
 
-/// Route mistakes are reported together, because a route file is edited as a whole.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_declared_route_conflict_is_reported_at_startup() {
     let registry = BrokerProviderRegistry::load(

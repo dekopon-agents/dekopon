@@ -1,5 +1,3 @@
-//! Pins vendored asset contracts to the canonical package, byte for byte.
-
 use dekopon_provider_sdk::ASSET_WIT;
 
 #[test]

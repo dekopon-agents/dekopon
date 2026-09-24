@@ -1,5 +1,3 @@
-//! Shared generation HTTP policy, cancellation and telemetry.
-
 use crate::{
     control::TurnControl,
     diagnostic::DiagnosticSecrets,
@@ -18,7 +16,6 @@ use std::{
 };
 use tracing::Instrument as _;
 
-// Preserve the synchronous client's former JSON-reader default, independently of SSE's ceiling.
 pub(crate) const MAX_BUFFERED_BYTES: usize = 10 * 1024 * 1024;
 
 pub(crate) fn record_phase(phase: FailurePhase) {

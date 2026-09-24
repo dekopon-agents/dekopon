@@ -1,98 +1,60 @@
-//! Credential-free, request-scoped agent configuration exposed to the model on demand.
-//!
-//! The gateway already owns the catalog agent and receives one subject-specific effective
-//! capability snapshot from the broker before a model is called. This module joins only those two
-//! safe views. It deliberately has no field for a principal, subject, policy source, policy ID,
-//! execution constraint, legacy credential/private-map inventory or value, model endpoint, chat
-//! token, or broker path, so an embedder cannot accidentally populate one. Exact standing
-//! instructions remain visible and may intentionally contain inert public DRNs.
+//! Deliberately has no field for a principal, subject, policy source or ID, execution constraint,
+//! legacy credential map, model endpoint, chat token, or broker path, so an embedder cannot
+//! accidentally populate one.
 
 use serde::Serialize;
 
-/// Maximum serialized size of one `inspect_agent_config` tool result.
-///
-/// Agent instructions are owner-authored but can be large. Repeating an unbounded system prompt as
-/// a tool result would turn one introspection request into an unbounded second copy in the model
-/// context. Oversized views return a fixed diagnostic containing none of the view.
+/// Bounds the tool result since agent instructions can be arbitrarily large; an oversized view
+/// returns a fixed diagnostic with none of the actual content, not a partial or unbounded copy.
 pub const MAX_AGENT_CONFIG_TOOL_BYTES: usize = 128 * 1024;
 
-/// Trusted effective metadata for one capability Cedar currently exposes to this session.
-///
-/// The broker overwrites effect and risk from the owner-authored constraint set
-/// before returning its capability snapshot. Provider input schemas are not part of it: a model
-/// learns how to call a provider from its command word's `--help`, never from a schema.
+/// Effect and risk are overwritten by the broker from the owner's constraint set, not the provider;
+/// there is no input schema, since a model learns a provider from its own --help.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EffectiveCapabilityView {
-    /// Canonical capability identifier.
     pub id: String,
-    /// Trusted selected provider identifier.
     pub provider: String,
-    /// Bounded provider-supplied model-facing description.
     pub description: String,
-    /// Trusted effect classification.
     pub effect: String,
-    /// Trusted risk classification.
     pub risk: String,
 }
 
-/// Effective audience of a persistent replay window.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum MemoryScopeView {
-    /// One authenticated transport subject sees only its own transcript.
     PrivateConversation,
-    /// Authenticated subjects in one exact routed conversation share a transcript.
     SharedConversation,
 }
 
-/// What the route serving this session remembers between messages.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(tag = "mode", rename_all = "camelCase")]
 pub enum MemoryConfigView {
-    /// Every message starts with no remembered conversation.
     OneShot,
-    /// A bounded private or intentionally shared history is replayed.
     Persistent {
-        /// Effective audience selected by trusted route configuration.
         scope: MemoryScopeView,
-        /// Milliseconds after which an idle conversation is no longer replayed.
         idle_timeout_ms: u64,
-        /// Maximum remembered exchanges.
         max_turns: usize,
-        /// Maximum replayed history bytes.
         max_bytes: usize,
     },
 }
 
-/// Session bounds safe to show to the model and the authorized chat sender.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionConfigView {
-    /// Maximum model turns for one message.
     pub max_steps: u32,
-    /// Maximum broker capability calls across all scripts for one message.
     pub max_capability_calls: u32,
-    /// What the route remembers between messages.
     pub memory: MemoryConfigView,
 }
 
-/// One mounted skill as the model may see it described: its name and trigger, never its text.
-///
-/// The text is reachable through `read_skill` on demand, so repeating it here would spend the
-/// introspection bound on material the session already discloses progressively.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillView {
-    /// The skill's name.
     pub name: String,
-    /// The one-line description the prompt lists it under.
     pub description: String,
-    /// Relative paths of the resource files it carries.
     pub resources: Vec<String>,
 }
 
-/// One credential-free snapshot returned by the `inspect_agent_config` meta tool.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentConfigView {
@@ -139,10 +101,6 @@ struct SecurityView {
 }
 
 impl AgentConfigView {
-    /// Builds the only shape the model-facing meta tool can return.
-    ///
-    /// Capability order is normalized here so two broker responses with the same effective set
-    /// produce byte-identical tool results.
     #[must_use]
     pub fn new(
         id: String,
@@ -186,9 +144,6 @@ impl AgentConfigView {
         }
     }
 
-    /// Lists the skills mounted for this agent, by name and description.
-    ///
-    /// Sorted by name so two sessions over one mounted set produce byte-identical results.
     #[must_use]
     pub fn with_skills(mut self, mut skills: Vec<SkillView>) -> Self {
         skills.sort_by(|left, right| left.name.cmp(&right.name));
@@ -196,7 +151,6 @@ impl AgentConfigView {
         self
     }
 
-    /// Serializes the bounded tool result, or a fixed content-free diagnostic when it is too large.
     #[must_use]
     pub fn tool_result(&self) -> String {
         let encoded = match serde_json::to_string(self) {
@@ -299,7 +253,6 @@ mod tests {
         );
     }
 
-    /// Skills are listed by name and trigger, sorted, and the key is absent when none is mounted.
     #[test]
     fn mounted_skills_are_listed_without_their_text() {
         let bare = view("Be concise.".to_owned()).tool_result();

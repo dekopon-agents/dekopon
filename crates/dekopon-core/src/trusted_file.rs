@@ -1,14 +1,3 @@
-//! One definition of what makes a local file trusted input.
-//!
-//! The same predicate was hand-written at every site that reads owner-authored state — open
-//! without following a symlink, refuse anything that is not a regular file, require this process's
-//! UID, refuse a permission bit outside the owner, require exactly one hard link, and bound the
-//! read — and the permission mask silently differed between copies with nothing naming the two
-//! tiers. Both tiers are here, named, with the reason they differ in [`FileTier`].
-//!
-//! This is Unix-only: every caller is a Unix-only process, and `O_NOFOLLOW`, an owning UID, and a
-//! permission mask have no portable equivalent worth pretending to.
-
 use std::{
     fmt,
     fs::{self, Metadata},
@@ -19,29 +8,13 @@ use std::{
 
 use thiserror::Error;
 
-/// How far outside its owner a trusted file may be reachable.
-///
-/// The two tiers exist because reading a file and trusting a file are different risks. Anything
-/// holding secret material must also be unreadable outside its owner, because disclosure alone is
-/// the loss; anything merely *authored* by the owner only has to be unwritable, because the risk is
-/// another user editing what this process will obey.
-///
-/// - [`Private`](Self::Private) — `mode & 0o077` must be zero: the broker credentials file, the
-///   secret map and the file sources it names, the provider store's
-///   operation lock, and every private file inside a storage root.
-/// - [`NotWorldWritable`](Self::NotWorldWritable) — `mode & 0o022` must be zero: `broker.yaml`,
-///   `dekopond.yaml`, the Cedar policy file, and managed provider state. These are readable
-///   configuration by design, and several deployments hand them to an operator group.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FileTier {
-    /// Owner-only. Nothing outside the owner may read or write it.
     Private,
-    /// Owner-writable. Group and world may read it but must not write it.
     NotWorldWritable,
 }
 
 impl FileTier {
-    /// Permission bits this tier refuses.
     #[must_use]
     pub const fn forbidden_bits(self) -> u32 {
         match self {
@@ -60,95 +33,56 @@ impl fmt::Display for FileTier {
     }
 }
 
-/// Why a path is not trusted input, and what was observed instead.
-///
-/// Callers map this into their own error types. Several of them deliberately collapse it — a
-/// secret-map source must not tell a caller which check refused it — so every variant carries
-/// enough for the collapsing site to log the reason it is dropping.
 #[derive(Debug, Error)]
 pub enum FileHygieneError {
-    /// The path resolved to something that is not a regular file.
     #[error("{} is a {observed}, not a regular file", path.display())]
     NotRegular {
-        /// The rejected path.
         path: PathBuf,
-        /// What the path actually is.
         observed: &'static str,
     },
-    /// A permission bit the tier forbids was set.
     #[error(
         "{} has mode {mode:04o}; a {tier} file must clear {forbidden:03o}",
         path.display()
     )]
     InsecureMode {
-        /// The rejected path.
         path: PathBuf,
-        /// Tier that was required.
         tier: FileTier,
-        /// Observed permission bits.
         mode: u32,
-        /// Bits the tier refuses.
         forbidden: u32,
     },
-    /// The file belongs to another user.
     #[error("{} is owned by uid {owner}, not uid {expected}", path.display())]
     WrongOwner {
-        /// The rejected path.
         path: PathBuf,
-        /// Observed owning UID.
         owner: u32,
-        /// UID the caller requires.
         expected: u32,
     },
-    /// The file has another name elsewhere, so another directory's permissions also govern it.
     #[error("{} has {links} hard links; a trusted file has exactly one", path.display())]
-    HardLinked {
-        /// The rejected path.
-        path: PathBuf,
-        /// Observed link count.
-        links: u64,
-    },
-    /// The file is larger than the caller agreed to read.
+    HardLinked { path: PathBuf, links: u64 },
     #[error("{} is {length} bytes; the maximum is {maximum}", path.display())]
     TooLarge {
-        /// The rejected path.
         path: PathBuf,
-        /// Observed length.
         length: u64,
-        /// Caller's bound.
         maximum: usize,
     },
-    /// A directory above the file is writable outside its owner, so the file carries no more
-    /// authority than that directory does.
     #[error(
         "{} is a {observed} with mode {mode:04o}; an ancestor must be a directory that is not \
          group- or world-writable unless it is sticky",
         path.display()
     )]
     UnsafeAncestor {
-        /// The rejected ancestor.
         path: PathBuf,
-        /// Observed permission bits, including the sticky bit.
         mode: u32,
-        /// What the ancestor actually is.
         observed: &'static str,
     },
-    /// Opening, inspecting, or reading the file failed.
     #[error("could not read {}", path.display())]
     Io {
-        /// The path being read.
         path: PathBuf,
-        /// Underlying failure.
         #[source]
         source: std::io::Error,
     },
 }
 
 impl FileHygieneError {
-    /// Stable, low-cardinality name for which check refused the file.
-    ///
-    /// A site that collapses several causes into one opaque error logs this instead of the
-    /// rendered message, which carries a path.
     #[must_use]
     pub const fn category(&self) -> &'static str {
         match self {
@@ -162,7 +96,6 @@ impl FileHygieneError {
         }
     }
 
-    /// The path that was refused.
     #[must_use]
     pub fn path(&self) -> &Path {
         match self {
@@ -177,16 +110,6 @@ impl FileHygieneError {
     }
 }
 
-/// Refuses metadata that is not a regular, single-link, `expected_uid`-owned file at `tier`.
-///
-/// Use this where the file is already open — a descriptor obtained relative to a validated parent,
-/// or a path being removed rather than read. [`read_trusted_file`] applies it to a file it opens.
-/// `path` names the file for the error only; nothing here touches the filesystem.
-///
-/// # Errors
-///
-/// Returns the first failing check as a [`FileHygieneError`]: not a regular file, wrong owner, a
-/// permission bit the tier forbids, or more than one hard link.
 pub fn check_trusted_metadata(
     path: &Path,
     metadata: &Metadata,
@@ -226,32 +149,12 @@ pub fn check_trusted_metadata(
     Ok(())
 }
 
-/// The two decisions an ancestor walk's callers legitimately differ on.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AncestorPolicy {
-    /// Resolve symlinks and `..` first, which requires `path` to exist. False refuses a symlinked
-    /// ancestor where it stands.
     pub canonicalize: bool,
-    /// Inspect `path` itself, not only the directories above it.
     pub include_self: bool,
 }
 
-/// Refuses a path whose ancestry would let another user substitute what sits under it.
-///
-/// One walk, three callers: a group- or world-writable ancestor is refused unless it is sticky, and
-/// one that is not a directory is refused outright — a symlink included, because
-/// `symlink_metadata` reports the link rather than its target. Only [`AncestorPolicy`] differs, and
-/// `canonicalize: false` is not a preference: the storage root and the broker socket authorize the
-/// operator's spelling, which `storage.rs`'s
-/// `a_configured_root_ancestor_symlink_is_rejected_before_canonicalization` and
-/// `configured_storage_ancestor_symlinks_are_not_canonicalized_away` (`brokerd/src/tests.rs:1082`)
-/// both pin.
-///
-/// # Errors
-///
-/// [`FileHygieneError::UnsafeAncestor`] naming the first ancestor that fails, or
-/// [`FileHygieneError::Io`] when one cannot be inspected or `path` cannot be resolved. Those are
-/// the only two produced, so a caller may map anything else as a refusal.
 pub fn check_trusted_ancestors(
     path: &Path,
     policy: AncestorPolicy,
@@ -281,21 +184,8 @@ pub fn check_trusted_ancestors(
     Ok(())
 }
 
-/// Opens `path` without following a symlink, applies [`check_trusted_metadata`], and reads it.
-///
-/// The length is checked twice on purpose: once against the metadata, so an oversized file is
-/// refused before any of it is read, and once against the bytes actually delivered, because a file
-/// can grow between the two.
-///
-/// This blocks. Every current caller is inside a Tokio runtime and wraps it in one
-/// `spawn_blocking`, which is both what `tokio::fs` does internally and one hop instead of the four
-/// an open, a stat, and a chunked read would each take.
-///
-/// # Errors
-///
-/// Returns [`FileHygieneError::Io`] when the file cannot be opened, inspected, or read,
-/// [`FileHygieneError::TooLarge`] when it exceeds `max_bytes`, and otherwise whatever
-/// [`check_trusted_metadata`] refused.
+/// This blocks and must be wrapped in spawn_blocking from async code; the length is checked twice
+/// because the file can grow between the metadata check and the read.
 pub fn read_trusted_file(
     path: &Path,
     expected_uid: u32,
@@ -368,17 +258,14 @@ mod tests {
         AncestorPolicy, FileHygieneError, FileTier, check_trusted_ancestors, read_trusted_file,
     };
 
-    /// The storage root's policy: the operator's spelling, and only what is above the root.
     const AS_WRITTEN_ABOVE: AncestorPolicy = AncestorPolicy {
         canonicalize: false,
         include_self: false,
     };
-    /// The broker socket's policy.
     const AS_WRITTEN_SELF: AncestorPolicy = AncestorPolicy {
         canonicalize: false,
         include_self: true,
     };
-    /// The provider store's policy.
     const CANONICAL_SELF: AncestorPolicy = AncestorPolicy {
         canonicalize: true,
         include_self: true,
@@ -390,10 +277,6 @@ mod tests {
         uid: u32,
     }
 
-    /// Creates one file and reads its owner back from the filesystem.
-    ///
-    /// This crate forbids unsafe, so there is no `getuid` call available; the UID of a file this
-    /// process just created is the same answer.
     fn fixture(mode: u32, contents: &[u8]) -> Fixture {
         let root = tempfile::tempdir().expect("temporary directory");
         let path = root.path().join("trusted");
@@ -404,7 +287,6 @@ mod tests {
         Fixture { root, path, uid }
     }
 
-    /// Every refusal reports which check failed, so a collapsing caller can still log the cause.
     #[test]
     fn each_refusal_names_the_check_that_failed() {
         let readable = fixture(0o644, b"contents");
@@ -450,8 +332,8 @@ mod tests {
 
         let error = read_trusted_file(private.root.path(), private.uid, FileTier::Private, 8)
             .expect_err("a directory is not a regular file");
-        // Opening a directory read-only succeeds on Linux and fails with EISDIR elsewhere; either
-        // way the caller must not be told it read a trusted file.
+        // Opening a directory read-only succeeds on Linux but fails with EISDIR elsewhere, so
+        // either way the caller must not be told it read a trusted file.
         assert!(
             matches!(
                 error,
@@ -469,7 +351,6 @@ mod tests {
         );
     }
 
-    /// A symlink to a perfectly good file is still refused: `O_NOFOLLOW` is the whole point.
     #[test]
     fn a_symlink_is_refused_without_being_followed() {
         let target = fixture(0o600, b"contents");
@@ -483,11 +364,8 @@ mod tests {
         assert_eq!(error.path(), link);
     }
 
-    /// A temporary root with no symlink left in it.
-    ///
-    /// `TMPDIR` is reached through `/var -> /private/var` on macOS, and an `AsWritten` walk
-    /// refuses a symlinked ancestor by design, so every fixture below starts from the resolved
-    /// spelling. That is the same thing the storage-host callers require of their operators.
+    /// TMPDIR resolves through /var to /private/var on macOS, so fixtures must start from the
+    /// already-resolved path since a symlinked ancestor is refused by design.
     fn resolved_root() -> (TempDir, PathBuf) {
         let root = tempfile::tempdir().expect("temporary directory");
         let resolved = root
@@ -497,10 +375,6 @@ mod tests {
         (root, resolved)
     }
 
-    /// `AsWritten` + `Above`, as the storage root walks it: the path itself is never inspected.
-    ///
-    /// The root may not exist yet — `Layout::open` creates it — and once it does it is held to
-    /// owner-only rules an ancestor is not held to.
     #[test]
     fn an_above_walk_refuses_the_parent_and_ignores_the_path_itself() {
         let (_root, resolved) = resolved_root();
@@ -508,11 +382,9 @@ mod tests {
         fs::create_dir(&parent).expect("parent");
         let target = parent.join("root");
 
-        // The target does not exist and is not consulted.
         check_trusted_ancestors(&target, AS_WRITTEN_ABOVE)
             .expect("a clean ancestry with no target yet");
 
-        // Neither is a world-writable target of the caller's own.
         fs::create_dir(&target).expect("target");
         fs::set_permissions(&target, Permissions::from_mode(0o777)).expect("target mode");
         check_trusted_ancestors(&target, AS_WRITTEN_ABOVE)
@@ -525,11 +397,6 @@ mod tests {
         assert_eq!(error.path(), parent);
     }
 
-    /// `AsWritten` + `PathAndAbove`, as the broker socket walks it.
-    ///
-    /// The socket's callers pass an already-canonicalized parent, which needs that directory
-    /// inspected, not just what is above it. A symlinked ancestor is refused where it stands
-    /// rather than resolved.
     #[test]
     fn a_path_and_above_walk_refuses_the_path_itself_and_any_symlinked_ancestor() {
         let (_root, resolved) = resolved_root();
@@ -546,9 +413,6 @@ mod tests {
         fs::set_permissions(&directory, Permissions::from_mode(0o700)).expect("holder mode");
         let alias = resolved.join("alias");
         std::os::unix::fs::symlink(&directory, &alias).expect("ancestor symlink");
-        // The socket's caller passes the parent itself, which is the alias here:
-        // `symlink_metadata` reports the link, a link is not a directory, and the walk stops
-        // there rather than authorizing a directory the operator never spelled.
         let error = check_trusted_ancestors(&alias, AS_WRITTEN_SELF)
             .expect_err("an alias is not the directory the operator named");
         assert_eq!(error.category(), "unsafe-ancestor");
@@ -556,11 +420,6 @@ mod tests {
         assert!(error.to_string().contains("symbolic link"), "{error}");
     }
 
-    /// `Canonical` + `PathAndAbove`, as the provider store walks it.
-    ///
-    /// The store is a directory the broker manages rather than a spelling it must preserve, so an
-    /// alias is resolved and the real directories are the ones inspected. Resolution needs the
-    /// path to exist, which is the one thing this combination refuses that the others do not.
     #[test]
     fn a_canonical_walk_resolves_an_alias_and_requires_the_path_to_exist() {
         let (_root, resolved) = resolved_root();
@@ -584,11 +443,6 @@ mod tests {
         assert_eq!(error.category(), "io");
     }
 
-    /// The sticky bit is tolerated, in every combination, on purpose.
-    ///
-    /// `/tmp` is world-writable and sticky, and so is the per-user directory `TMPDIR` names on
-    /// many systems. Refusing it would refuse the ordinary case; tolerating it is the reason the
-    /// rule says "non-sticky" rather than "not world-writable".
     #[test]
     fn a_sticky_world_writable_ancestor_is_tolerated() {
         let (_root, resolved) = resolved_root();
@@ -605,7 +459,6 @@ mod tests {
         check_trusted_ancestors(&owned, CANONICAL_SELF).expect("and after resolution");
     }
 
-    /// An ancestor that is not a directory is refused, and the message says what it is.
     #[test]
     fn a_non_directory_ancestor_is_refused_and_described() {
         let (_root, resolved) = resolved_root();

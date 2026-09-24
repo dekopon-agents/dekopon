@@ -1,17 +1,3 @@
-//! Test fixture for the broker host's HTTP and asset imports, reached through its
-//! `httpprobe` word.
-//!
-//! It is not a provider to deploy. Each capability is one `httpprobe` subcommand declared through
-//! the SDK's `clap` layer, each input field one kebab-case flag: `httpprobe fetch --uri <URI>`
-//! proposes `http-probe.fetch`, `httpprobe conditional-write --uri <URI> --expected-etag <ETAG>`
-//! proposes the two-call write, and `httpprobe purge --uri <URI>` proposes the delete. The dispatch
-//! assembles exactly the input object `invoke` reads, with an optional field present only when its
-//! flag was given.
-//!
-//! `fetch` also takes one of `--bearer <DRN>` or `--basic <USER> <DRN>`. Neither is an input field:
-//! each proposes secret use, so the public DRN leaves on the proposal's `secret_use` for the broker
-//! to authorize and never appears in the input `invoke` reads.
-
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use dekopon_provider_http::{Header, Request, method};
 use dekopon_provider_sdk::clap::{Arg, ArgAction, ArgMatches, Command};
@@ -22,19 +8,10 @@ use dekopon_provider_sdk::{
 };
 use serde_json::{Map, Value, json};
 
-/// Maximum response body this provider returns to its caller.
-///
-/// The broker host already bounds a provider's total serialized output, so an unbounded body field
-/// would simply fail the whole invocation on a large response instead of returning the useful
-/// prefix. Bounding it here keeps a big response readable and keeps base64 expansion (4 bytes out
-/// per 3 bytes in) comfortably inside that ceiling.
 const MAX_RETURNED_BODY_BYTES: usize = 64 * 1024;
 
-/// Fetches one broker-authorized URI.
 const FETCH: &str = "http-probe.fetch";
-/// Reads a resource, then writes only if its observed etag still matches.
 const CONDITIONAL_WRITE: &str = "http-probe.conditional-write";
-/// Deletes one broker-authorized resource.
 const PURGE: &str = "http-probe.purge";
 
 mod bindings {
@@ -52,7 +29,8 @@ fn asset_probe(mode: &str, input: &Value) -> Result<Value, ProviderError> {
     let asset_error =
         |error: asset::AssetError| ProviderError::new(error.code.as_str(), error.message);
     if mode == "direct-write" {
-        // Deliberately bypass the SDK chunking helper: adversarial direct WIT list lifting.
+        // Deliberately bypasses the SDK's chunking helper here to exercise the adversarial raw
+        // list-lifting path directly.
         use bindings::dekopon::asset::asset as raw;
         let bytes = input["bytes"].as_u64().unwrap() as usize;
         let writer = raw::allocate("application/octet-stream", raw::Encoding::Identity)
@@ -315,7 +293,6 @@ impl Provider for HttpProbe {
     }
 }
 
-/// The `httpprobe` command tree: one subcommand per capability, one flag per input field.
 fn tree() -> Command {
     Command::new("httpprobe")
         .version("0.1.0")
@@ -383,7 +360,6 @@ fn tree() -> Command {
         )
 }
 
-/// The `--uri` every subcommand requires.
 fn uri() -> Arg {
     Arg::new("uri")
         .long("uri")
@@ -392,10 +368,6 @@ fn uri() -> Arg {
         .help("The URI to request")
 }
 
-/// Turns clap's matches into the proposal for the selected subcommand.
-///
-/// Runs only after clap accepted the argv, so the subcommand and its `--uri` are present; the
-/// refusals below are unreachable from the tree and name what was missing rather than panic.
 fn dispatch(matches: ArgMatches, _stdin: Option<&str>) -> Result<CommandInvocation, ProviderError> {
     let (capability, input, secret_use) = match matches.subcommand() {
         Some(("fetch", fetch)) => (FETCH, fetch_input(fetch)?, fetch_secret_use(fetch)?),
@@ -421,19 +393,9 @@ fn dispatch(matches: ArgMatches, _stdin: Option<&str>) -> Result<CommandInvocati
     })
 }
 
-/// `--bearer` as a refusal names it.
 const BEARER_FLAG: &str = "--bearer <DRN>";
-/// `--basic` as a refusal names it.
 const BASIC_FLAG: &str = "--basic <USER> <DRN>";
 
-/// `fetch`'s secret use: the proposal `--bearer` or `--basic` asks for, and none without either.
-///
-/// Clap has already refused the two together and a `--basic` short of its pair; what it cannot
-/// judge is the values. The DRN parses as the core [`SecretDrn`], and the Basic username is judged
-/// by decoding the finished proposal through [`SecretUseProposal`]'s own deserializer, so the rule
-/// refusing a name here is the one the broker decodes with rather than a copy of it. A refusal is
-/// the guest's decline, which the shell reports as a usage error at exit 2. Only the message
-/// reaches the model, so it names the flag.
 fn fetch_secret_use(matches: &ArgMatches) -> Result<Option<SecretUseProposal>, ProviderError> {
     if let Some(drn) = matches.get_one::<String>("bearer") {
         let secret = secret_drn(BEARER_FLAG, drn)?;
@@ -456,19 +418,16 @@ fn fetch_secret_use(matches: &ArgMatches) -> Result<Option<SecretUseProposal>, P
     .map_err(|error| flag_usage(BASIC_FLAG, error))
 }
 
-/// Parses one flag's DRN, refusing a non-canonical one under that flag's name.
 fn secret_drn(flag: &str, value: &str) -> Result<SecretDrn, ProviderError> {
     value
         .parse::<SecretDrn>()
         .map_err(|error| flag_usage(flag, error))
 }
 
-/// A decline naming the `fetch` flag whose value caused it, and why.
 fn flag_usage(flag: &str, cause: impl core::fmt::Display) -> ProviderError {
     ProviderError::new("usage", format!("httpprobe fetch {flag}: {cause}"))
 }
 
-/// A subcommand's input object, starting from the `uri` every one of them requires.
 fn uri_input(matches: &ArgMatches) -> Result<Map<String, Value>, ProviderError> {
     let uri = matches
         .get_one::<String>("uri")
@@ -478,14 +437,12 @@ fn uri_input(matches: &ArgMatches) -> Result<Map<String, Value>, ProviderError> 
     Ok(input)
 }
 
-/// `fetch`'s input object: the `uri`, then each optional field only when its flag was given.
 fn fetch_input(matches: &ArgMatches) -> Result<Map<String, Value>, ProviderError> {
     let mut input = uri_input(matches)?;
     if let Some(selected) = matches.get_one::<String>("method") {
         input.insert("method".to_owned(), json!(selected));
     }
     if let Some(values) = matches.get_many::<String>("header") {
-        // `num_args(2)` makes clap hand back whole name/value pairs, in the order given.
         let values = values.collect::<Vec<_>>();
         let (pairs, _) = values.as_chunks::<2>();
         let headers = pairs
@@ -503,11 +460,6 @@ fn fetch_input(matches: &ArgMatches) -> Result<Map<String, Value>, ProviderError
     Ok(input)
 }
 
-/// Builds the probe's response summary, including a bounded copy of the body.
-///
-/// `body` is always base64, so any byte sequence round-trips. `bodyText` is added only when the
-/// returned bytes are valid UTF-8; an invalid encoding omits the field rather than failing the
-/// invocation, because a caller asking for a probe still wants the status and the raw bytes.
 fn describe_response(status: u16, body: &[u8], header_count: usize) -> Value {
     let returned = bounded_prefix(body);
     let mut fields = Map::new();
@@ -525,12 +477,6 @@ fn describe_response(status: u16, body: &[u8], header_count: usize) -> Value {
     Value::Object(fields)
 }
 
-/// Returns the returnable prefix of a body, never cutting a character in half.
-///
-/// Slicing at a raw byte offset made `bodyText` vanish from bodies that were perfectly valid
-/// UTF-8, purely because the 64 KiB mark landed mid-character — roughly three times in four for a
-/// multibyte character straddling the boundary. The consumer path is `jq -r .bodyText`, so the
-/// script saw a bare `null` and could not tell "this body was binary" from "I cut it badly".
 fn bounded_prefix(body: &[u8]) -> &[u8] {
     if body.len() <= MAX_RETURNED_BODY_BYTES {
         return body;
@@ -538,9 +484,8 @@ fn bounded_prefix(body: &[u8]) -> &[u8] {
     let candidate = &body[..MAX_RETURNED_BODY_BYTES];
     match core::str::from_utf8(candidate) {
         Ok(_) => candidate,
-        // An error with no length is an *incomplete* trailing sequence, meaning the cut split a
-        // character; backing up to the last complete one keeps the body readable as text.
-        // A genuinely invalid byte keeps the full prefix and omits `bodyText`, as before.
+        // Utf8Error's error_len is None only for an incomplete trailing sequence; treat that case
+        // differently from a genuinely invalid byte.
         Err(error) if error.error_len().is_none() => &candidate[..error.valid_up_to()],
         Err(_) => candidate,
     }
@@ -548,13 +493,6 @@ fn bounded_prefix(body: &[u8]) -> &[u8] {
 
 dekopon_provider_sdk::export_provider_with_cli!(HttpProbe, bindings);
 
-/// Reads a resource and writes only if what it observed is still current.
-///
-/// The pre-read is the point. It exists so the broker host has an in-tree capability that makes
-/// *two* authorized calls in one invocation and refuses between them, which is what exercises
-/// `maxRequests`, per-call evidence, and the host-call limit. Until the GitHub provider moved to
-/// its own repository, `gh.pull-request.approve` was the only capability shaped like this, and host
-/// coverage of that shape should not depend on a provider that is no longer in this tree.
 fn conditional_write(input: &Value) -> Result<Value, ProviderError> {
     let uri = input
         .get("uri")
@@ -574,8 +512,8 @@ fn conditional_write(input: &Value) -> Result<Value, ProviderError> {
         .map(|header| String::from_utf8_lossy(&header.value).into_owned())
         .unwrap_or_default();
 
-    // Refusing here is what makes the write conditional rather than unconditional, and it must
-    // happen before the write rather than being reported after it.
+    // The etag check must happen before the write, not after, since that ordering is what makes the
+    // write conditional rather than unconditional.
     if let Some(expected) = input.get("expectedEtag").and_then(Value::as_str)
         && expected != observed
     {
@@ -603,12 +541,6 @@ fn conditional_write(input: &Value) -> Result<Value, ProviderError> {
     }))
 }
 
-/// Deletes one resource.
-///
-/// Exists so the manifest exposes more than any one deployment grants, which is the realistic
-/// shape: `examples/conditional-write/` deliberately leaves this out of both its policy and its
-/// constraint sets, and the example tests assert that an ungranted capability is refused twice
-/// over — by Cedar, and by the missing constraint set before Cedar is consulted.
 fn purge(input: &Value) -> Result<Value, ProviderError> {
     let uri = input
         .get("uri")
@@ -640,7 +572,6 @@ mod tests {
         words.iter().map(|word| (*word).to_owned()).collect()
     }
 
-    /// The whole proposal a well-formed argv produces.
     fn invocation(words: &[&str]) -> CommandInvocation {
         let run = HttpProbe::run_command(&argv(words), None).expect("a well-formed argv proposes");
         let CommandRun::Proposal(proposed) = run else {
@@ -649,7 +580,6 @@ mod tests {
         proposed
     }
 
-    /// The capability and input an argv proposes when it names no secret.
     fn proposal(words: &[&str]) -> (String, Value) {
         let proposed = invocation(words);
         assert_eq!(proposed.secret_use, None, "{words:?}");
@@ -669,13 +599,10 @@ mod tests {
         (stdout, stderr, status)
     }
 
-    /// The guest's own decline of an argv clap accepted.
     fn declined(words: &[&str]) -> ProviderError {
         HttpProbe::run_command(&argv(words), None).expect_err("the guest declines")
     }
 
-    /// Each credential flag proposes its own secret use, and the input is exactly what `fetch`
-    /// sends without one: the DRN rides the proposal, never the object `invoke` reads.
     #[test]
     fn each_credential_flag_proposes_its_secret_use_beside_an_unchanged_input() {
         assert_eq!(
@@ -701,8 +628,6 @@ mod tests {
         );
     }
 
-    /// A proposal names at most one secret use, so both flags together is clap's usage error, as
-    /// is a `--basic` missing half its pair.
     #[test]
     fn both_credential_flags_or_half_a_basic_pair_is_a_usage_error() {
         let (stdout, stderr, status) = rendered(&[
@@ -719,9 +644,6 @@ mod tests {
         assert!(stderr.contains("--basic <USER> <DRN>"), "{stderr:?}");
     }
 
-    /// A value clap cannot judge is the guest's decline, which the shell reports as a usage error
-    /// at exit 2; the message names the flag and the rule the value broke. The retired curl
-    /// builtin's `${drn:…}` marker is not a DRN.
     #[test]
     fn a_non_canonical_drn_or_invalid_username_is_declined_naming_its_flag() {
         let cases: [(&[&str], &str, &str); 6] = [
@@ -797,7 +719,6 @@ mod tests {
             .map(|capability| capability.id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(declared, vec![FETCH, CONDITIONAL_WRITE, PURGE]);
-        // Every capability takes a `uri` and nothing else is required of any of them.
         for capability in &manifest.capabilities {
             assert_eq!(
                 capability.input_schema["required"],
@@ -806,8 +727,6 @@ mod tests {
                 capability.id
             );
         }
-        // The delete exists so a deployment can expose less than the manifest does; nothing in
-        // this repository grants it, which examples/conditional-write/ asserts from the other side.
         let purge = manifest
             .capabilities
             .iter()
@@ -816,8 +735,6 @@ mod tests {
         assert_eq!(purge.effect, EffectKind::ExternalWrite);
     }
 
-    /// Each subcommand proposes the capability of its name, and a flag that was not given leaves
-    /// its field out, so the input is exactly what a caller writing the object by hand would send.
     #[test]
     fn every_subcommand_proposes_its_capability_with_exactly_the_input_invoke_reads() {
         assert_eq!(
@@ -950,8 +867,6 @@ mod tests {
 
     #[test]
     fn truncation_never_cuts_a_character_in_half() {
-        // An all-ASCII body can never exercise this: the cut has to land inside a multibyte
-        // character, which is where a valid UTF-8 body used to lose `bodyText` entirely.
         let mut body = vec![b'x'; MAX_RETURNED_BODY_BYTES - 1];
         body.extend_from_slice("€tail".as_bytes());
         assert!(

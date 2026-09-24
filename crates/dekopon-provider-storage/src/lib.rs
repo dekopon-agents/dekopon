@@ -1,6 +1,4 @@
-//! Feature-gated guest facade for `dekopon:storage@0.1.0`.
-//!
-//! This crate contains component bindings only. It cannot select a host path, namespace,
+//! This crate contains component bindings only; it cannot select a host path, namespace,
 //! transaction, authority, or storage backend.
 
 #![forbid(unsafe_code)]
@@ -13,7 +11,6 @@
         reason = "tests spawn, join and drain freely; production sites carry their own expectation"
     )
 )]
-/// The imported storage WIT contract used by the generated guest bindings.
 pub const STORAGE_WIT: &str = include_str!("../wit/deps/storage.wit");
 
 #[cfg(feature = "jsonl")]
@@ -42,18 +39,13 @@ pub mod jsonl {
 
     use super::jsonl_bindings::dekopon::storage::jsonl as wit;
 
-    /// One bounded read result.
     #[derive(Clone, Debug, Eq, PartialEq)]
     pub struct Chunk {
-        /// Bytes beginning at the requested offset.
         pub bytes: Vec<u8>,
-        /// Offset at which the next read should begin.
         pub next_offset: u64,
-        /// Whether the complete current file was observed.
         pub eof: bool,
     }
 
-    /// Stable storage failure classes.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
     pub enum StorageError {
         NotFound,
@@ -93,12 +85,10 @@ pub mod jsonl {
 
     impl Error for StorageError {}
 
-    /// Returns the current logical file size.
     pub fn size(name: &str) -> Result<u64, StorageError> {
         wit::size(name).map_err(map_error)
     }
 
-    /// Reads at most `max_bytes` beginning at `offset`.
     pub fn read_chunk(name: &str, offset: u64, max_bytes: u32) -> Result<Chunk, StorageError> {
         wit::read_chunk(name, offset, max_bytes)
             .map(|chunk| Chunk {
@@ -109,12 +99,10 @@ pub mod jsonl {
             .map_err(map_error)
     }
 
-    /// Appends one record and exactly one host-supplied LF when `expected_size` still matches.
     pub fn append(name: &str, expected_size: u64, record: &[u8]) -> Result<u64, StorageError> {
         wit::append(name, expected_size, record).map_err(map_error)
     }
 
-    /// Replaces a file with empty or complete LF-terminated JSONL when its size still matches.
     pub fn replace(name: &str, expected_size: u64, contents: &[u8]) -> Result<(), StorageError> {
         wit::replace(name, expected_size, contents).map_err(map_error)
     }
@@ -139,12 +127,6 @@ pub mod jsonl {
     mod tests {
         use super::{StorageError, map_error, wit};
 
-        /// Eleven hand-written arms across two independently declared enums.
-        ///
-        /// Nothing else checks them: a transposed pair reports "busy" where the host said "quota
-        /// exceeded", and the variant is the guest's only signal about why a storage call failed.
-        /// A variant added to the WIT enum breaks `map_error`'s match, so this table only has to
-        /// pin the pairing.
         #[test]
         fn every_wit_error_maps_to_its_own_variant() {
             let table = [
@@ -182,7 +164,6 @@ pub mod jsonl {
 
 #[cfg(feature = "durable-files")]
 pub mod durable_files {
-    //! Namespace-bound durable-file operations for guest-owned storage engines.
 
     use std::{error::Error, fmt};
 
@@ -408,12 +389,6 @@ pub mod durable_files {
     mod tests {
         use super::{StorageError, map_error, wit};
 
-        /// Eleven hand-written arms across two independently declared enums.
-        ///
-        /// Nothing else checks them: a transposed pair reports "busy" where the host said "quota
-        /// exceeded", and the variant is the guest's only signal about why a storage call failed.
-        /// A variant added to the WIT enum breaks `map_error`'s match, so this table only has to
-        /// pin the pairing.
         #[test]
         fn every_wit_error_maps_to_its_own_variant() {
             let table = [

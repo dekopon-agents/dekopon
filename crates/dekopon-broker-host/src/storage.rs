@@ -1,5 +1,3 @@
-//! Wasmtime adapters for the two exact storage interfaces.
-
 use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -22,14 +20,12 @@ pub struct FileResource {
 
 #[derive(Debug)]
 pub(crate) struct ActiveStorage {
-    /// Every native storage effect runs holding this lock, so `finish` taking it is the drain: a
-    /// job orphaned by a cancelled host call either holds it (and `finish` waits for it, then
-    /// refuses to commit past its deadline) or has not started (and finds the transaction gone).
+    /// Every storage effect holds this lock; finish acquiring it drains a cancelled job, which
+    /// either still holds the lock and makes finish wait, or never started.
     transaction: Arc<Mutex<Option<StorageHandle>>>,
     finalization_budget: Duration,
 }
 
-/// Per-store storage context. A disabled context is still linked so imports can be diagnosed.
 #[derive(Debug)]
 pub(crate) enum StorageState {
     Disabled {
@@ -94,17 +90,14 @@ impl StorageState {
         .await
         {
             Ok(result) => result,
-            // A blocking worker panic/cancellation is an internal I/O-class failure, but it must
-            // still pass through the terminal-state path below. Returning early here would let a
-            // guest catch the mapped WIT error and report success despite the terminal host failure.
+            // A worker panic or cancellation must still pass through the terminal-state path below;
+            // returning early would let the guest report success despite the failure.
             Err(_) => Err(StorageHostError::Io),
         };
         if let Err(error) = &result
             && terminal(error)
             && let Self::Active { violation, .. } = self
         {
-            // The class lives on the error itself so the guest-visible reason and the cause an
-            // unaudited outcome records are drawn from one vocabulary rather than two copies.
             *violation = Some(error.class().label());
         }
         result

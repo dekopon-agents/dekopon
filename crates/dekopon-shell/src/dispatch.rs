@@ -1,20 +1,7 @@
-//! Command-word resolution.
-//!
-//! Resolution order is fixed:
-//!
-//! 1. words this shell refuses outright (`eval`, `exec`, `source`, job control, `declare`),
-//! 2. shell functions declared earlier in the same script,
-//! 3. the fixed builtin table,
-//! 4. command words declared by the session's loaded providers.
-//!
-//! Otherwise the word is "command not found", exit code 127. That includes a word shaped like a
-//! capability identifier (`wikipedia_page`, `cli-probe.upper`), granted or not: a capability is
-//! reached only through the provider command word that proposes it, never by typing its
-//! identifier, so a granted capability's name is as unknown here as a typo.
-//!
-//! Step 4 could collide with step 3, and would lose. A provider word matching a builtin or any
-//! other reserved word is refused at load by `dekopon_core::command_word_conflicts`, so a manifest
-//! that would be shadowed never reaches this table; the ordering here is the second line.
+//! A command word shaped like a capability identifier is never resolved directly, granted or not,
+//! since a capability is only reachable through the provider command word that proposes it, and a
+//! provider word colliding with a builtin is refused when the provider loads rather than silently
+//! shadowed here.
 
 use std::collections::BTreeSet;
 
@@ -24,21 +11,14 @@ use crate::{
     parser::REJECTED_COMMANDS,
 };
 
-/// How one command word resolves.
 pub(crate) enum Resolution {
-    /// A shell function declared earlier in this script.
     Function,
-    /// A builtin.
     Builtin(BuiltinKind),
-    /// A command word a loaded provider contributed, rewritten by that provider into a proposal.
     ProviderCommand,
-    /// A word this shell refuses, with the reason why.
     Rejected(&'static str),
-    /// Nothing matched.
     NotFound,
 }
 
-/// Resolves one command word.
 pub(crate) fn resolve(
     word: &str,
     functions: &BTreeSet<String>,
@@ -56,8 +36,6 @@ pub(crate) fn resolve(
     if let Some(builtin) = builtins::lookup(word) {
         return Resolution::Builtin(builtin);
     }
-    // After builtins, so a provider can never shadow one. A provider claiming a builtin name is
-    // refused at load rather than silently losing here; this ordering is the second line.
     if invoker.has_command_word(word) {
         return Resolution::ProviderCommand;
     }
@@ -78,10 +56,6 @@ mod tests {
 
     use super::{Resolution, resolve};
 
-    /// A session granted two capability-shaped identifiers and one provider word, `probe`.
-    ///
-    /// It answers membership directly, counts every list it is asked to build, and records every
-    /// capability it is asked to invoke.
     #[derive(Default)]
     struct Session {
         granted_lists: Cell<usize>,
@@ -122,7 +96,6 @@ mod tests {
         }
     }
 
-    /// A session that only lists its command words, so membership goes through the trait default.
     struct Words(&'static [&'static str]);
 
     impl CapabilityInvoker for Words {
@@ -211,9 +184,6 @@ mod tests {
 
     #[test]
     fn resolution_asks_membership_instead_of_materializing_a_list_per_command() {
-        // The query runs for every command word a script executes, so a loop of a thousand
-        // commands used to build, sort, and dedup the whole command-word list a thousand times
-        // over. An invoker that can answer directly must never be asked for it.
         let session = Session::default();
         let functions = BTreeSet::new();
         for word in ["probe", "wikipedia_page", "cli-probe.upper", "unknown"] {
@@ -225,8 +195,6 @@ mod tests {
 
     #[test]
     fn the_default_membership_query_answers_from_the_list() {
-        // `Words` does not override `has_command_word`, so it falls back to scanning. An embedder
-        // that has nothing cheaper must still resolve identically.
         let functions = BTreeSet::new();
         let words = Words(&["probe"]);
         assert!(matches!(
@@ -270,25 +238,15 @@ mod reserved {
         parser::{REJECTED_COMMANDS, RESERVED_WORDS},
     };
 
-    /// `dekopon_core::RESERVED_COMMAND_WORDS` and this crate's live tables must agree exactly.
-    ///
-    /// The list lives in `dekopon-core` so the broker can report command-word conflicts at its own
-    /// startup without linking an interpreter it never runs. That mirroring is only safe while it
-    /// is checked, and it has to be checked in **both** directions.
-    ///
-    /// Missing a word means a provider could claim something the shell would then shadow, and the
-    /// manifest would be a lie. Reserving a word no table owns is the opposite failure and the one
-    /// worth naming: `gh` was reserved until its builtin was deleted, and had the entry outlived
-    /// the builtin it would have kept the out-of-tree `gh` provider from claiming its own name.
+    /// This crate's word tables and the core crate's reserved command word list must agree in both
+    /// directions, or a provider could claim a name the shell secretly shadows, or an unused
+    /// reservation could block a provider's own name forever.
     #[test]
     fn the_reserved_list_matches_the_shells_own_tables() {
         let live = builtins::names()
             .into_iter()
             .chain(CONTROL_WORDS.iter().copied())
             .chain(REJECTED_COMMANDS.iter().map(|(word, _)| *word))
-            // Grammar keywords belong here for the same reason: the parser consumes them before
-            // dispatch ever runs, so a provider declaring `do` as a command word would load
-            // successfully and then never be reachable — a manifest that is a lie.
             .chain(RESERVED_WORDS.iter().copied())
             .collect::<BTreeSet<_>>();
         let declared = dekopon_core::RESERVED_COMMAND_WORDS

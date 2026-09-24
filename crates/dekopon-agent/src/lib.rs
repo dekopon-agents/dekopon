@@ -1,28 +1,3 @@
-//! The reusable agent session layer shared by Dekopon's embedding binaries.
-//!
-//! `dekopond` drives sessions from chat transports; external clients embed these same pieces. This crate is where they live so there is one
-//! authoritative copy:
-//!
-//! - [`prompt::run_prompt`] — the bounded model tool loop offering one sandboxed scripting tool,
-//!   with [`prompt::run_prompt_with_history`] running that same loop as the continuation of a
-//!   bounded [`prompt::History`], [`prompt::SessionInputs`] optionally carrying cooperative
-//!   cancellation for transport-owned Stop controls or a request-scoped no-reply decision, and
-//!   [`prompt::run_prompt_with_history_and_options`] adding the request-scoped routing metadata a
-//!   caller uses to point one conversation's turns at one provider cache lane;
-//! - [`ShellRuntime`] — the [`prompt::ScriptRuntime`] that runs each model-authored script on a
-//!   fresh `dekopon-shell` interpreter under a session-wide capability budget;
-//! - [`SessionInvoker`] — capability dispatch that prefers a local read-only leg and falls through
-//!   to a broker leg;
-//! - [`BrokerLeg`] — a synchronous [`CapabilityInvoker`] facade over the asynchronous
-//!   [`BrokerClient`], for sessions that run on a blocking task, carrying the typed
-//!   [`attachment`] handles that move bytes between a capability and a chat conversation
-//!   without putting them in the transcript.
-//!
-//! Nothing here holds authority. The broker leg submits identity-free proposals and reports back
-//! whatever the broker decided; this crate never interprets policy, resolves credentials, or
-//! constructs authorization state, and it deliberately depends only on the client half of the
-//! broker protocol.
-
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 #![cfg_attr(
@@ -83,28 +58,23 @@ pub use crate::progress::{
     SessionOutcome, ToolOutcome,
 };
 
-/// Runs each model-authored script on the interpreter under this session's dispatch.
 pub struct ShellRuntime<I> {
-    /// Capability dispatch for every command word a script runs.
     pub invoker: I,
-    /// Per-script interpreter bounds; the capability ceiling is narrowed per call.
     pub limits: ShellLimits,
 }
 
 impl<I: CapabilityInvoker> ScriptRuntime for ShellRuntime<I> {
     fn run_script(&self, script: &str, max_capability_calls: u32) -> ScriptOutcome {
-        // A fresh interpreter per script, but not a fresh budget: the prompt loop spends one
-        // capability allowance across the whole session, so this script gets whatever the earlier
-        // ones left. Exhausting it trips the interpreter's own ceiling, with the message and exit
-        // code the interpreter already established, rather than inventing a second way to say
-        // "no".
+        // Each script gets a fresh interpreter but not a fresh budget; capability allowance is
+        // spent across the whole session, and exhausting it trips the interpreter's own existing
+        // ceiling.
         let limits = ShellLimits {
             max_capability_calls: self.limits.max_capability_calls.min(max_capability_calls),
             ..self.limits
         };
         let outcome = Interpreter::new(limits).run(script, &self.invoker);
-        // Before the outcome goes back to the prompt loop, so a tool use the script left open
-        // finishes on a progress surface ahead of the next model turn rather than behind it.
+        // Call script_finished before returning the outcome, or the next turn's progress event
+        // reports out of order.
         self.invoker.script_finished();
         outcome
     }
@@ -114,16 +84,10 @@ impl<I: CapabilityInvoker> ScriptRuntime for ShellRuntime<I> {
     }
 }
 
-/// Dispatches a script's commands to direct-mode providers first and a broker second.
-///
-/// The order is not arbitrary. A direct component call is local, synchronous, and unauthorized by
-/// construction — the linker is import-free, so the component cannot reach anything. Preferring it
-/// keeps every capability that *can* run without a broker transition doing exactly that, and
-/// leaves the broker leg for what direct mode provably cannot reach: anything performing I/O.
+/// Direct leg runs first because it is unauthorized by construction (its linker is import-free, so
+/// it cannot reach anything); the broker leg is only for what direct mode provably cannot do: I/O.
 pub struct SessionInvoker<D> {
-    /// The local, read-only leg consulted first.
     pub direct: D,
-    /// The broker-backed leg consulted for everything direct mode cannot serve.
     pub broker: Option<Box<dyn CapabilityInvoker + Send>>,
 }
 
@@ -146,9 +110,6 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
                 .is_some_and(|broker| broker.is_granted(capability))
     }
 
-    // Asks each leg rather than merging the legs' lists and searching the merge. Dispatch asks it
-    // per command word, so building, extending, sorting, and deduping two `Vec<String>` here made
-    // a loop of a thousand commands do it a thousand times.
     fn has_command_word(&self, word: &str) -> bool {
         self.direct.has_command_word(word)
             || self
@@ -171,9 +132,8 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
         input: Value,
         secret_use: Option<dekopon_core::SecretUseProposal>,
     ) -> CapabilityCallResult {
-        // A DRN reaches only the broker leg, and only for a capability that leg already holds.
-        // The direct leg is read-only and import-free; it has no authorizer to prove the use
-        // against, so a proposal naming one is refused rather than run without it.
+        // A secret-use proposal must reach only the broker leg; the direct leg has no authorizer to
+        // check it.
         if secret_use.is_some() {
             return match &self.broker {
                 Some(broker) if broker.is_granted(capability) => {
@@ -202,16 +162,11 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
     }
 
     fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
-        // Same precedence as `invoke`: whichever leg owns the word runs it. A word both legs
-        // claim cannot happen — the broker refuses to start on a duplicate, and direct mode loads
-        // its own registry through the same check.
         self.direct
             .run_command(word, argv, stdin)
             .or_else(|| self.broker.as_ref()?.run_command(word, argv, stdin))
     }
 
-    // Both legs, not whichever ran the last word: the method defaults to doing nothing, so a leg
-    // this forgot would compile and leave the progress pair a proposal opened on it unfinished.
     fn script_finished(&self) {
         self.direct.script_finished();
         if let Some(broker) = &self.broker {
@@ -220,59 +175,20 @@ impl<D: CapabilityInvoker> CapabilityInvoker for SessionInvoker<D> {
     }
 }
 
-/// The live span's W3C context, when this process has one at all.
-///
-/// `None` is the ordinary state on a process that exports no traces, and it is not a near miss:
-/// `dekopon_telemetry::install` adds the `tracing-opentelemetry` layer only when an OTLP trace
-/// exporter is configured, so without one there is no OpenTelemetry context behind the current
-/// span to read — the identifiers are absent rather than invalid. Every caller that has to put a
-/// trace on the wire therefore goes through [`session_trace_parent`] instead.
 #[must_use]
 pub fn current_trace_parent() -> Option<TraceParent> {
     let parts = dekopon_telemetry::current_trace_context()?;
-    // A context the SDK considers valid can still be rejected here (all-zero identifiers), and a
-    // malformed parent is worse than none: it would attach broker spans to a trace that does not
-    // exist. Dropping it degrades correlation instead of corrupting it.
     TraceParent::new(parts.trace_id, parts.span_id, parts.flags).ok()
 }
 
-/// The W3C context one session's broker calls are correlated by, exporting or not.
-///
-/// A broker request must carry a trace: the audit record it produces is correlated by that
-/// identifier and nothing else, so a session without one would write records an operator cannot
-/// reassemble — the inverse of what the audit log exists for. When the process exports traces this
-/// adopts the live span, which is how the broker's spans join the caller's trace. When it does not,
-/// [`current_trace_parent`] has nothing to offer and this mints a trace of its own from the OS
-/// entropy source.
-///
-/// A minted trace reaches no collector and no third party from *this* process. It correlates one
-/// session's records with each other, which is the entire job of the identifier on a host that
-/// ships nothing, and it costs 24 bytes of entropy per session to keep the "every record carries a
-/// trace" invariant true everywhere rather than only where an exporter happens to be configured.
-///
-/// It is minted `sampled`, because the process on the other side of the socket may export even
-/// when this one does not, and an unsampled parent would silence it.
 #[must_use]
 pub fn session_trace_parent() -> TraceParent {
     current_trace_parent().unwrap_or_else(minted_trace_parent)
 }
 
-/// Mints a session-local W3C context for a process that exports nothing.
-///
-/// Drawn from the OS rather than from the clock or the process identifier, because the invocation
-/// identifiers derived from the trace bind attestations to their proposals and name calls in audit:
-/// a container runtime that starts two daemons in the same millisecond with the same PID must not
-/// hand them one identifier space. An OS that refuses entropy falls back to the hasher construction
-/// rather than failing the session — a degraded trace still correlates, and refusing to answer a
-/// chat message over the quality of a correlation identifier is the worse trade.
 fn minted_trace_parent() -> TraceParent {
     let mut bytes = [0_u8; 24];
     if let Err(error) = getrandom::fill(&mut bytes) {
-        // An OS that will not supply entropy still has to leave the session correlatable, so the
-        // draw degrades to the construction this crate used before: an OS-seeded `RandomState` key
-        // mixed with the process and a nanosecond reading. That is a weaker unguessability claim
-        // for the invocation identifiers derived from the trace, and it is said out loud once
-        // rather than passed off as a random draw.
         tracing::warn!(event = "session_trace_entropy_unavailable", error = %error);
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -291,28 +207,14 @@ fn minted_trace_parent() -> TraceParent {
     trace_id.copy_from_slice(&bytes[..16]);
     let mut parent_id = [0_u8; 8];
     parent_id.copy_from_slice(&bytes[16..]);
-    // All-zero is the one value W3C forbids for either identifier, and one draw in 2^128 does not
-    // justify a failure every caller would have to handle: setting the low bit makes the forbidden
-    // draw legal and changes nothing else.
+    // Setting the low bit avoids the one all-zero value W3C forbids for these identifiers, which a
+    // 1-in-2^128 draw does not justify making every caller handle as a failure.
     trace_id[15] |= 1;
     parent_id[7] |= 1;
-    // `sampled` is set, and it is not a claim that this process exports anything — it does not,
-    // which is why the trace was minted at all. The flag is an instruction to whoever receives it:
-    // `dekopon-brokerd` adopts this context as a remote parent, and the OpenTelemetry SDK's default
-    // `ParentBased(AlwaysOn)` sampler makes every span beneath an unsampled parent non-recording.
-    // A cleared bit would therefore silence an exporting broker behind a non-exporting gateway —
-    // exactly the deployment where the broker's trace is the only one anybody gets.
     TraceParent::new(trace_id, parent_id, 1)
         .expect("the low bit of each identifier is set, so neither is all zeroes")
 }
 
-/// Maps a provider's own command-run outcome onto the shell's seam type.
-///
-/// One definition for both legs: the direct host and the broker answer with the same
-/// [`CommandRunOutcome`], and the shell reads the same [`CommandRun`] from either. The provider's
-/// stable failure `code` stays with the operator; the model reads the message, as it always has.
-/// A proposal's secret use travels with it untouched: a provider command is the only way a script
-/// names a DRN, and only the broker may decide whether that use is allowed.
 #[must_use]
 pub fn command_run_from_outcome(outcome: CommandRunOutcome) -> CommandRun {
     match outcome {
@@ -340,101 +242,38 @@ pub fn command_run_from_outcome(outcome: CommandRunOutcome) -> CommandRun {
     }
 }
 
-/// Failure to open a session's broker leg.
 #[cfg(unix)]
 #[derive(Debug, Error)]
 pub enum BrokerLegError {
-    /// The broker could not be reached or refused the capability snapshot.
     #[error(transparent)]
     Client(#[from] ClientError),
-    /// The broker's capability snapshot named the same capability more than once.
     #[error("the broker answered with duplicate capability identifiers: {capabilities}")]
-    DuplicateCapabilities {
-        /// Every repeated identifier, in identifier order.
-        capabilities: String,
-    },
+    DuplicateCapabilities { capabilities: String },
 }
 
-/// The broker half of a session's capability dispatch.
-///
-/// This is a client of `dekopon-brokerd`'s authorization path, never a participant in it: it
-/// submits a proposal and reports back whatever the broker decided. Nothing here interprets policy,
-/// and nothing here can mint authorization. An attested leg additionally *claims* an external
-/// subject, which is still not authority: the broker honors the claim only under an owner-configured
-/// attestor grant, and it alone maps that subject to a principal.
+/// A client of brokerd's authorization path, never a participant: it only submits proposals and
+/// reports back the broker's decision; an attested leg's claimed subject is still not authority.
 #[cfg(unix)]
 pub struct BrokerLeg {
     client: BrokerClient,
     runtime: tokio::runtime::Handle,
     capabilities: BTreeMap<String, CapabilityDescription>,
-    /// Trusted, credential-free classification for this exact effective capability set.
     effective_capabilities: Vec<EffectiveCapabilityView>,
-    /// Command words loaded providers contribute, snapshotted with the capability set.
-    ///
-    /// Snapshotted for the same reason the capabilities are: dispatch consults this on every
-    /// command word a script runs, and a round trip per word would make the interpreter's cost
-    /// depend on the network rather than on the script. A set rather than a list for the same
-    /// reason again: that consultation is a membership test, and a script running thousands of
-    /// commands asks it thousands of times.
     command_words: BTreeSet<String>,
     identifiers: IdSequence,
-    /// `None` for a leg that speaks as its own connected peer, which is the original behavior.
     attestation: Option<Attestation>,
-    /// Broker-derived optional all-three durable-memory surface for this exact chat scope.
     chat_memory: Option<ChatMemorySurface>,
-    /// What cancels a command-word run in flight, and refuses a capability call proposed after it
-    /// fires: [`CancelSignal::never`] until an embedder ties it to its own session with
-    /// [`BrokerLeg::with_cancel_signal`].
     cancel: CancelSignal,
-    /// Gateway table intake and explicitly authorized sends for this turn.
     attachments: Option<Arc<ReplyAttachments>>,
-    /// Scoped descriptor resolution. Absent sources refuse references, never expand them.
     asset_inputs: Option<ChatAssetInputs>,
-    /// Where this leg reports the work a person is waiting on, when an embedder wants to show it.
-    ///
-    /// `None` for an embedder that renders nothing, which is every caller that has not asked: the
-    /// leg then builds no [`CommandWord`] and spends nothing on progress.
     progress: Option<Arc<dyn ProgressSink>>,
-    /// The session's capability-call ceiling, as the embedder's route configured it.
-    ///
-    /// The leg cannot derive it: the budget is spent across every script of the session and only
-    /// the caller of the prompt loop knows it. `0` until an embedder supplies both it and a sink.
     calls_max: u32,
-    /// Capability invocations this leg has proposed, which is what the ceiling above counts.
-    ///
-    /// A provider command word is not itself one of them — its *proposal* is, and arrives here as
-    /// an ordinary invocation — so a word that renders its own help spends nothing.
     calls_used: AtomicU32,
-    /// Attachments this session has accepted into the reply, which numbers each one for a surface.
-    /// The command word whose proposal is waiting on its capability call, and when its run began.
-    ///
-    /// Held so the pair [`ProgressEvent::ToolStarted`] opened under the word finishes with the
-    /// call's own outcome. The next [`CapabilityInvoker::invoke`] takes it; a proposal the
-    /// interpreter never invoked is finished as failed by the next command word or the end of the
-    /// script instead. A lock only because the leg must stay `Sync`: one script runs on one
-    /// thread, and nothing holds it across a broker round trip.
     pending_report: Mutex<Option<(CommandWord, Instant)>>,
 }
 
 #[cfg(unix)]
 impl BrokerLeg {
-    /// Connects one session's broker leg, snapshotting its capability set.
-    ///
-    /// The snapshot happens here, on the async side, for two reasons. It lets `cap --list` answer
-    /// without a round trip per script, and it turns "the daemon is not running" into one clear
-    /// startup failure instead of a capability that inexplicably reports "command not found"
-    /// halfway through a script a model already committed to.
-    ///
-    /// `attestation` is `None` for a leg that speaks as its own connected peer, which is the
-    /// original behavior. A chat gateway holds no broker authority of its own: it knows which
-    /// subject sent a message and which agent is answering, and the broker decides everything
-    /// else. So an attested leg's snapshot is what policy makes visible to the *attested* context
-    /// rather than to the daemon's own peer identity, and a claim carrying a chat scope is the
-    /// only leg that can see durable memory.
-    ///
-    /// An empty snapshot is a valid result rather than an error. It means "policy grants this
-    /// subject nothing through this agent", which a gateway answers very differently from "the
-    /// broker is unreachable"; deciding which of those to say is the caller's job.
     pub async fn connect(
         client: BrokerClient,
         attestation: Option<Attestation>,
@@ -477,44 +316,24 @@ impl BrokerLeg {
         })
     }
 
-    /// Ties every command-word run this leg makes to the embedder's cancellation.
-    ///
-    /// A run in flight when `signal` is requested is aborted at its next await and joined before
-    /// the leg answers the script with `session-cancelled`; the gateway fires it from a native
-    /// Stop. A capability call the script starts *after* that is refused with the same reason
-    /// before any proposal is built, so a stopped session cannot keep spending its budget on the
-    /// broker. Without it a run is cancellable in contract only, as in an embedder that supplies
-    /// no signal.
     #[must_use]
     pub fn with_cancel_signal(mut self, signal: CancelSignal) -> Self {
         self.cancel = signal;
         self
     }
 
-    /// Registers typed broker outputs and queues only explicitly authorized sends.
     #[must_use]
     pub fn with_provider_attachments(mut self, slot: Arc<ReplyAttachments>) -> Self {
         self.attachments = Some(slot);
         self
     }
 
-    /// Resolves every exact proposal marker to a scoped read-only descriptor.
     #[must_use]
     pub fn with_chat_asset_inputs(mut self, inputs: ChatAssetInputs) -> Self {
         self.asset_inputs = Some(inputs);
         self
     }
 
-    /// Reports every command word and capability call to `sink`.
-    ///
-    /// `max_capability_calls` is the session's ceiling, and it is required here rather than
-    /// optional because [`ProgressEvent::ToolStarted`] says "3 of 16 calls": a count with no
-    /// ceiling is not a thing to show a person. The leg cannot read it from anywhere else — the
-    /// budget is spent across every script of one session, and only the caller of the prompt loop
-    /// knows how much of it this session was given.
-    ///
-    /// Emission is synchronous on the session's own blocking thread, so `sink` must not block; it
-    /// is cosmetic, and no [`ProgressSink`] answer can fail a call.
     #[must_use]
     pub fn with_progress(mut self, sink: Arc<dyn ProgressSink>, max_capability_calls: u32) -> Self {
         self.progress = Some(sink);
@@ -522,26 +341,21 @@ impl BrokerLeg {
         self
     }
 
-    /// Reports one event, or does nothing for an embedder that renders no progress.
     fn emit(&self, event: ProgressEvent) {
         if let Some(sink) = &self.progress {
             sink.emit(event);
         }
     }
 
-    /// Takes the report a proposing command word left for its capability call, if one is held.
     fn take_pending_report(&self) -> Option<(CommandWord, Instant)> {
-        // Nothing panics while holding this lock, so even a poisoned one guards a whole report.
+        // Nothing inside this lock may panic, since even a poisoned mutex is recovered and trusted
+        // here.
         self.pending_report
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
     }
 
-    /// Finishes, as failed, a command word whose proposal no capability call consumed.
-    ///
-    /// The call never happened, and the interpreter already told the script why: the grant was
-    /// missing, or the budget or the deadline ran out before it.
     fn settle_pending_report(&self) {
         if let Some((word, started)) = self.take_pending_report() {
             self.emit(ProgressEvent::ToolFinished {
@@ -552,31 +366,21 @@ impl BrokerLeg {
         }
     }
 
-    /// Returns this session's trusted, subject-specific effective capability classification.
-    ///
-    /// This is the same fresh broker answer that backs `cap --list`. It contains no policy source,
-    /// policy identifier, subject, principal, constraint, or credential metadata.
     #[must_use]
     pub fn effective_capabilities(&self) -> Vec<EffectiveCapabilityView> {
         self.effective_capabilities.clone()
     }
 
-    /// Returns the broker-derived memory note and lookback only when all three grants are effective.
     #[must_use]
     pub fn chat_memory_surface(&self) -> Option<&ChatMemorySurface> {
         self.chat_memory.as_ref()
     }
 
-    /// This session's trace identifier, which every invocation it makes extends.
-    ///
-    /// It is the join key between an embedding surface's own telemetry and the broker's audit
-    /// records for the same session.
     #[must_use]
     pub const fn session_trace(&self) -> TraceId {
         self.identifiers.trace()
     }
 
-    /// Resolves every proposal reference without changing the proposal JSON.
     fn prepare_assets(
         &self,
         input: &Value,
@@ -611,16 +415,11 @@ impl BrokerLeg {
     }
 }
 
-/// Reports a count to a progress surface without letting a model-sized argv overflow the field.
 #[cfg(unix)]
 fn bounded_count(count: usize) -> u32 {
     u32::try_from(count).unwrap_or(u32::MAX)
 }
 
-/// How one capability call reads on a progress surface.
-///
-/// A capability nothing reaches is a failure rather than a refusal here: policy never saw it, so
-/// saying "denied" would credit a decision no one made.
 #[cfg(unix)]
 fn call_outcome(result: &CapabilityCallResult) -> ToolOutcome {
     match result {
@@ -630,13 +429,8 @@ fn call_outcome(result: &CapabilityCallResult) -> ToolOutcome {
     }
 }
 
-/// Indexes a capability snapshot for shell dispatch and its credential-free meta view.
-///
-/// A repeated identifier is a refusal rather than a last-wins overwrite, and every repeat is named
-/// at once. The two views are built from one list, so tolerating a duplicate would make `cap
-/// --list` and `inspect_agent_config` disagree about the same session — the broker refuses
-/// duplicate routes at startup, and the client half must not quietly accept the shape the rest of
-/// the system treats as fatal.
+/// A duplicate capability identifier is refused, naming every repeat at once, rather than silently
+/// kept as a last-wins entry, matching the broker's own refusal of duplicate routes at startup.
 #[cfg(unix)]
 fn snapshot(
     capabilities: Vec<dekopon_broker_protocol::AvailableCapability>,
@@ -702,41 +496,23 @@ impl CapabilityInvoker for BrokerLeg {
     }
 
     fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
-        // A proposal still held here was never invoked (the interpreter stops short of `invoke`
-        // for a capability this session lacks), and the script has moved on to its next command,
-        // so that tool use is over whatever this word turns out to be.
         self.settle_pending_report();
-        // Same visibility check the capability path makes, and for the same reason: the broker
-        // decides refusals, this only avoids spending a round trip on a word no provider owns.
         if !self.command_words.contains(word) {
             return None;
         }
-        // The word a person would have typed themselves, and the one moment it is known before
-        // the provider turns it into a capability identifier. The argument count travels; the
-        // arguments themselves are model-authored and stay on the trace.
         let reported = CommandWord::new(word);
         let started = Instant::now();
-        // Before the round trip, because a guest run is itself a wait a person sees. Whether the
-        // pair finishes here or with the capability call the run proposes is known only once it
-        // answers.
         self.emit(ProgressEvent::ToolStarted {
             word: reported.clone(),
             argument_count: bounded_count(argv.len()),
-            // Running a word is not itself a capability call: the proposal it returns is, and
-            // arrives at `invoke` as an ordinary invocation that spends one.
             calls_used: self.calls_used.load(Ordering::Relaxed),
             calls_max: self.calls_max,
         });
-        // The round trip is one cancellable process node: a gateway Stop aborts it at its next
-        // await and is still joined before this returns, so the leg never answers
-        // while the request could still be in flight. The node owns its inputs for the whole run,
-        // which is why the client (a path, a UID, and two bounds) is cloned into it.
+        // The round-trip task must be joined before returning, or the leg could answer while an
+        // aborted call is still in flight.
         let client = self.client.clone();
         let attestation = self.attestation.clone();
         let (owned_word, argv, stdin) = (word.to_owned(), argv.to_vec(), stdin.map(str::to_owned));
-        // Read here, on the blocking thread the script runs on, for the reason `invoke` reads it
-        // there: the broker parents its run on the script span that typed the word, which is the
-        // span current here and not necessarily the one current inside the process node.
         let trace_parent = self.identifiers.trace_parent();
         let operation = process_fn(
             ProcessMetadata::cancellable("broker-command", self.cancel.clone()),
@@ -747,14 +523,9 @@ impl CapabilityInvoker for BrokerLeg {
                     .map(command_run_from_outcome)
             },
         );
-        // Safe for the reason `invoke` documents: this runs on a `spawn_blocking` thread.
         let outcome = self.runtime.block_on(ProcessRun::execute(operation));
         let run = match outcome {
             ProcessOutcome::Completed(Ok(run)) => run,
-            // A transport failure is not the provider declining: the model reads it as the broker
-            // being unreachable rather than as a bad argv, and the cause travels with it; the
-            // interpreter prefixes the word, so the message must not. No `ClientError` names the
-            // socket path.
             ProcessOutcome::Completed(Err(error)) => CommandRun::Errored {
                 message: dekopon_core::error_chain(&error),
             },
@@ -766,11 +537,6 @@ impl CapabilityInvoker for BrokerLeg {
             },
         };
         let outcome = match &run {
-            // A proposal is not the end of this tool use: the interpreter hands it to `invoke`,
-            // which finishes the pair opened above with the call's own outcome, so finishing it
-            // here as well would show every provider command twice. Held rather than dropped,
-            // because the interpreter can stop short of `invoke` (a capability this session lacks,
-            // an exhausted budget, a passed deadline), and the pair must finish all the same.
             CommandRun::Proposed { .. } => {
                 *self
                     .pending_report
@@ -779,13 +545,9 @@ impl CapabilityInvoker for BrokerLeg {
                 return Some(run);
             }
             CommandRun::Rendered { status: 0, .. } => ToolOutcome::Succeeded,
-            // Rendered text at a non-zero status is the provider reporting a usage error, which is
-            // a failed run for the person watching even though the word answered.
             CommandRun::Rendered { .. }
             | CommandRun::Failed { .. }
             | CommandRun::Errored { .. } => ToolOutcome::Failed,
-            // The only refusal this leg builds for a word is its own cancellation: the broker
-            // answers a word with a proposal, its own text, or a failure, never with a denial.
             CommandRun::Denied { .. } => ToolOutcome::Cancelled,
         };
         self.emit(ProgressEvent::ToolFinished {
@@ -802,26 +564,8 @@ impl CapabilityInvoker for BrokerLeg {
         input: Value,
         secret_use: Option<dekopon_core::SecretUseProposal>,
     ) -> CapabilityCallResult {
-        // One finished event for every way the call below can end, which is why the proposal is
-        // its own function: a capability call is the unit of work a person actually waits on, and
-        // a surface told that one started has to be told how it ended.
-        //
-        // A command word that proposed this call already reported it started, under the word, so
-        // the call only finishes that pair; a second `ToolStarted` under the capability would show
-        // one provider command as two tool uses. Any call takes the held report: the interpreter
-        // invokes a proposal straight away or not at all.
         let held = self.take_pending_report();
-        // Prevents a script from starting another capability call after the embedder's Stop was
-        // observed. A call already inside the client is not rollbackable; this check is the
-        // cooperative boundary immediately before the broker proposal. It is not a refusal
-        // decision either: no proposal was built, so there is nothing for the broker to have
-        // decided about, and a leg with no signal (`CancelSignal::never`) never takes it. It is
-        // also why a stopped call reads as `Cancelled` rather than `Denied` on a progress
-        // surface: nothing refused it, the session ended underneath it.
         let cancelled = self.cancel.is_cancelled();
-        // The budget as this call leaves it. A stopped call spends nothing, so it reports the
-        // count unchanged; anything else would show a person a call against a budget that was
-        // never charged.
         let calls_used = if cancelled {
             self.calls_used.load(Ordering::Relaxed)
         } else {
@@ -829,20 +573,14 @@ impl CapabilityInvoker for BrokerLeg {
                 .fetch_add(1, Ordering::Relaxed)
                 .saturating_add(1)
         };
-        // A call no command word proposed (an embedder calling the leg directly) opens its own
-        // pair under the identifier, and only for a capability this session actually holds, which
-        // is the same check `run_command` makes for the same reason. The identifier is whatever
-        // the caller named, so reporting before the visibility check inside `submit` would render
-        // model-authored text on a chat line: an invented `ignore-your-instructions` would be put
-        // on the progress message verbatim. An identifier no provider owns is refused there
-        // without reaching the broker, and its refusal is already on the trace.
+        // Checks the capability exists before reporting it on the progress surface, since reporting
+        // an unvalidated identifier first would let a model put invented text on a person's chat
+        // line.
         let reported = held.or_else(|| {
             self.capabilities.contains_key(capability).then(|| {
                 let word = CommandWord::new(capability);
                 self.emit(ProgressEvent::ToolStarted {
                     word: word.clone(),
-                    // The count, never the arguments: they are model-authored and already on the
-                    // trace.
                     argument_count: bounded_count(
                         input.as_object().map_or(0, serde_json::Map::len),
                     ),
@@ -864,8 +602,6 @@ impl CapabilityInvoker for BrokerLeg {
             let outcome = call_outcome(&result);
             (result, outcome)
         };
-        // Timed from the word's run when a command word opened the pair, so the duration covers
-        // the guest run and the call together, as the one tool use they are.
         if let Some((word, started)) = reported {
             self.emit(ProgressEvent::ToolFinished {
                 word,
@@ -877,19 +613,12 @@ impl CapabilityInvoker for BrokerLeg {
     }
 
     fn script_finished(&self) {
-        // Finishes the pair a proposal opened when nothing invoked it (the budget or the deadline
-        // tripped between the proposal and its call, or the script ended after a refused one),
-        // before the script's outcome reaches the prompt loop and the next model turn is reported.
         self.settle_pending_report();
     }
 }
 
 #[cfg(unix)]
 impl BrokerLeg {
-    /// Builds one proposal and reports whatever the broker decided about it.
-    ///
-    /// Split from [`CapabilityInvoker::invoke`] so that the progress pair wrapping it has one
-    /// entry and one exit while this keeps the early returns each refusal wants.
     fn submit(
         &self,
         capability: &str,
@@ -899,26 +628,17 @@ impl BrokerLeg {
         let Ok(parsed) = capability.parse::<CapabilityId>() else {
             return CapabilityCallResult::NotFound;
         };
-        // A visibility check, deliberately not an authorization one. The interpreter already
-        // checks a command word's proposal against `is_granted`, but this leg is a public
-        // `CapabilityInvoker` an embedder may call directly, and without this a caller could spend
-        // a whole capability budget probing the broker with guessed identifiers. What this must
-        // never do is decide a *refusal*: anything policy makes visible goes to the broker and
-        // comes back with the broker's own answer, including the denials that only it can issue.
+        // This is a visibility check only, not an authorization decision; it just avoids spending
+        // capability-call budget on probes with guessed identifiers, and any real refusal still
+        // comes from the broker.
         if !self.capabilities.contains_key(capability) {
             return CapabilityCallResult::NotFound;
         }
-        // The last point at which the proposal's JSON is still this process's to edit: a command
-        // word's `run-command` proposal arrives here after the interpreter checked the grant.
         let (assets, asset_pins) = match self.prepare_assets(&input) {
             Ok(input) => input,
-            // A refusal here is permanent and the call never happened, which is the interpreter's
-            // `Denied` — exit 126, its one non-retryable status — rather than a `Failed` the model
-            // would retry. The interpreter renders it as `<capability>: denied: <reason>`, the same
-            // shape a *policy* denial takes, so the reason says outright that the gateway refused
-            // before the broker saw anything. There is deliberately no broker audit record: no
-            // proposal was submitted, and the gateway's own `agent.chat_asset_input.refused` above
-            // is the record of it.
+            // This refusal is permanent, the interpreter's non-retryable Denied rather than a
+            // retryable Failed, and produces no broker audit record since no proposal was ever
+            // submitted.
             Err(refusal) => {
                 return CapabilityCallResult::Denied {
                     reason: format!(
@@ -931,24 +651,19 @@ impl BrokerLeg {
         let request = InvocationRequest {
             id: self.identifiers.next_invocation(),
             capability: parsed,
-            // Read on the blocking thread the session entered, so the broker parents its spans to
-            // the script span that actually asked for this capability rather than to the session
-            // root.
             trace_parent: self.identifiers.trace_parent(),
             secret_use,
             input,
         };
 
-        // Safe specifically because this runs on a `spawn_blocking` thread rather than a runtime
-        // worker: `Handle::block_on` from a worker would deadlock the executor, and from the
-        // blocking pool it is the ordinary bridge back into async code.
+        // Safe only because this runs on a spawn_blocking thread; calling block_on here from an
+        // ordinary runtime worker would deadlock the executor.
         let invocation = request.id.to_string();
         let submitted = self.runtime.block_on(async {
             self.client
                 .invoke(self.attestation.clone(), request, assets)
                 .await
         });
-        // The provider request is over. Release its transient input pins before admitting outputs.
         drop(asset_pins);
         match submitted {
             Ok(outcome) => {
@@ -991,17 +706,11 @@ impl BrokerLeg {
                         }
                         CapabilityCallResult::Succeeded(output)
                     }
-                    // A refusal has to stay a refusal all the way to the script's exit code. The
-                    // interpreter maps `Denied` to 126 and `Failed` to 1, and a model that reads
-                    // "policy said no" as "the call errored" will retry something it must not retry.
                     InvocationOutcome::Denied => CapabilityCallResult::Denied {
                         reason: result
                             .error
                             .unwrap_or_else(|| "authorization refused this invocation".to_owned()),
                     },
-                    // The classification decides the exit status and what a model may retry; the
-                    // provider's own code and message travel beside it so the script output carries
-                    // the upstream refusal rather than only its class.
                     InvocationOutcome::Failed => CapabilityCallResult::Failed {
                         error: result.error.unwrap_or_else(|| {
                             "the broker reported a failed invocation".to_owned()
@@ -1010,31 +719,20 @@ impl BrokerLeg {
                     },
                 }
             }
-            // An unmapped peer — or, for an attested leg, a refused attestation — is an
-            // authorization refusal that never reached a decision record, so it arrives as a
-            // transport-level code rather than a `Denied` outcome. It is still a refusal, and
-            // collapsing it into a generic failure would tell a model to retry.
             Err(ClientError::Remote { code, message }) if code == ERROR_UNAUTHENTICATED => {
                 CapabilityCallResult::Denied { reason: message }
             }
-            // The proposal reached the broker and its outcome is unknown here: a client-side read
-            // timeout cannot distinguish a `gh.issue.comment` that ran 29s against a 30s deadline
-            // from one that never ran, and `outcome-unaudited` says outright that the effect may
-            // have happened. `Failed` exits 1, which a model reads as "the call errored, try
-            // again" — and the broker suppresses no duplicate, so a retry repeats the external
-            // effect. `Denied` (126) is the interpreter's only
-            // non-retryable status, so an unaudited outcome takes it and says why.
+            // A client-side timeout cannot tell whether the call ran, so it is treated as the one
+            // non-retryable Denied status with an explicit refusal to resubmit, rather than a
+            // Failed a model would retry.
             Err(error) if error.may_have_executed() => CapabilityCallResult::Denied {
                 reason: format!(
                     "the broker did not record an outcome for this invocation and it may already \
                      have taken effect; do not resubmit it ({error})"
                 ),
             },
-            // Every `ClientError` renders without the socket path, so a script cannot learn where
-            // the broker lives — the interpreter refuses to read the process environment, and this
-            // is the one path that could otherwise leak `DEKOPON_BROKER_SOCKET` back into it.
-            // A transport failure is the client's own account of what went wrong; no provider
-            // reported anything.
+            // Every ClientError renders without the socket path, since this is the one path that
+            // could otherwise leak DEKOPON_BROKER_SOCKET back into a script.
             Err(error) => CapabilityCallResult::Failed {
                 error: error.to_string(),
                 detail: None,
@@ -1043,18 +741,6 @@ impl BrokerLeg {
     }
 }
 
-/// One session's W3C trace and the invocation identifiers derived from it.
-///
-/// An invocation identifier binds an attestation to its proposal and names the call in the audit
-/// record, so two calls must never share one and a script that calls the same capability in a loop
-/// must not collide with itself. Both properties come from the trace: it is 128 bits an attacker
-/// cannot guess, drawn from the OS or adopted from the exporting span that opened the session, and a
-/// monotonic counter beneath it makes collisions *within* a session impossible rather than merely
-/// unlikely.
-///
-/// Every identifier here is one identifier: an invocation is `<trace>-<counter>`, so every call a
-/// session made is recoverable from the broker's audit log by trace prefix, and the audit records
-/// the broker writes carry the same trace the gateway's own spans do.
 #[cfg(unix)]
 pub struct IdSequence {
     parent: TraceParent,
@@ -1063,10 +749,6 @@ pub struct IdSequence {
 
 #[cfg(unix)]
 impl IdSequence {
-    /// Opens one session's identifier space on the current trace.
-    ///
-    /// Adopts the exporting span's trace when there is one and mints a session-local trace when
-    /// there is not; see [`session_trace_parent`] for why there is never a third answer.
     #[must_use]
     pub fn for_session() -> Self {
         Self {
@@ -1075,19 +757,11 @@ impl IdSequence {
         }
     }
 
-    /// The session's trace identifier, shared by every invocation it makes.
     #[must_use]
     pub const fn trace(&self) -> TraceId {
         self.parent.trace()
     }
 
-    /// The W3C context to send with the next call.
-    ///
-    /// The live span when it belongs to this session's trace, so the broker parents
-    /// `broker.invocation` and `broker.command_run` on the script span that actually asked rather
-    /// than on the session root, and the session's own context otherwise. The filter is what keeps
-    /// one promise true: the trace on the wire is always the trace the invocation identifier
-    /// extends, including for a leg built outside the span its calls run under.
     #[must_use]
     pub fn trace_parent(&self) -> TraceParent {
         current_trace_parent()
@@ -1095,12 +769,9 @@ impl IdSequence {
             .unwrap_or(self.parent)
     }
 
-    /// Derives the next invocation identifier in this session.
     #[must_use]
     pub fn next_invocation(&self) -> InvocationId {
         let counter = self.next.fetch_add(1, Ordering::Relaxed);
-        // 32 hexadecimal digits, a separator, and at most 10 decimal ones: lowercase, no adjacent
-        // separators, and 210 characters inside the identifier bound however the trace was drawn.
         format!("{}-{counter}", self.parent.trace())
             .parse()
             .expect("a trace and a counter are a valid invocation identifier")
@@ -1114,10 +785,8 @@ impl Default for IdSequence {
     }
 }
 
-// Whole milliseconds, not fractional. `duration_ms` is emitted by the broker
-// (`duration_millis`) and the model client (`elapsed_ms`) as an integer, and one attribute key
-// carries one type across every record: a backend that infers a column type from the first record
-// it sees rejects the second one otherwise.
+// Always emit duration as whole milliseconds; a mixed type here makes the telemetry backend reject
+// later records.
 pub(crate) fn milliseconds(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
@@ -1129,18 +798,15 @@ mod tests {
 
     use super::{SessionInvoker, current_trace_parent};
 
-    /// Outside an exporting span there is no context to send, and a session must not invent one.
     #[test]
     fn trace_parent_is_absent_without_an_active_exporting_span() {
         assert!(current_trace_parent().is_none());
     }
 
-    /// A leg that answers for a fixed capability set and records what it was asked to run.
     struct FakeLeg {
         capability: &'static str,
         marker: &'static str,
         invoked: std::sync::Mutex<Vec<String>>,
-        /// Every secret-use field this leg was handed, in call order.
         secret_uses: std::sync::Mutex<Vec<Option<dekopon_core::SecretUseProposal>>>,
     }
 
@@ -1190,9 +856,6 @@ mod tests {
 
     #[test]
     fn direct_capabilities_are_preferred_over_the_broker() {
-        // A capability reachable without a broker transition must never take one: the direct call
-        // is local and unauthorized by construction, so routing it through the broker would add an
-        // authorization decision, an audit record, and a round trip for no gain.
         let shared = Box::new(FakeLeg::new("shared.capability", "broker"));
         let invoker = SessionInvoker {
             direct: FakeLeg::new("shared.capability", "direct"),
@@ -1231,8 +894,6 @@ mod tests {
 
     #[test]
     fn a_session_without_a_broker_is_exactly_as_capable_as_direct_mode() {
-        // Omitting the broker leg has to leave a session behaving as direct mode always did, so a
-        // local demo or a CI run with no daemon is unaffected.
         let invoker = SessionInvoker {
             direct: FakeLeg::new("cli-probe.upper", "direct"),
             broker: None,
@@ -1246,12 +907,6 @@ mod tests {
         );
     }
 
-    /// A DRN reaches the broker and nothing else, through the one invocation method.
-    ///
-    /// The composite used to answer this on a separate defaulted method while every wrapper around
-    /// it forwarded the other one, so the secret use a script proposed was dropped between the
-    /// shell and this decision. There is one method now, and the deny for the direct leg is a
-    /// branch inside it rather than a default a wrapper can inherit by accident.
     #[test]
     fn a_secret_use_proposal_reaches_only_a_broker_backed_capability() {
         let proposal = dekopon_core::SecretUseProposal::HttpBearer {
@@ -1270,8 +925,6 @@ mod tests {
             CapabilityCallResult::Succeeded(json!({"leg": "broker"}))
         );
 
-        // Deny-by-default on the direct leg: immediate mode has no authorizer, so a capability it
-        // owns cannot carry a secret even though the call itself would succeed without one.
         assert_eq!(
             invoker.invoke("cli-probe.upper", json!({}), Some(proposal)),
             dekopon_shell::secret_use_unsupported()
@@ -1287,7 +940,6 @@ mod tests {
         );
     }
 
-    /// A leg whose command words and membership answers no trait default could produce.
     struct CommandLeg {
         word: &'static str,
         capability: &'static str,
@@ -1320,13 +972,6 @@ mod tests {
         }
     }
 
-    /// Command words and grants have to survive the composite, from either leg.
-    ///
-    /// `command_words` defaults to an empty list and `is_granted` to a scan of `granted`, so a
-    /// composite that forgets either answers "command not found" for a word a provider
-    /// contributed and refuses a capability a leg holds. Both legs here report a `granted` list
-    /// that is empty or silent about what they answer for, so every assertion below fails against
-    /// the defaults rather than coinciding with them.
     #[test]
     fn command_words_and_grants_survive_both_legs_rather_than_falling_back_to_the_defaults() {
         let invoker = SessionInvoker {
@@ -1399,11 +1044,6 @@ mod tests {
             rustix::process::geteuid().as_raw()
         }
 
-        /// A socket parent the broker would bind under, which is what the client now demands.
-        ///
-        /// `dekopon_broker_protocol::secure_socket_parent` is consulted for every socket rather
-        /// than only shared ones, and `tempfile::tempdir` honours the umask — a world-traversable
-        /// fixture parent describes a deployment the broker itself refuses.
         fn private_broker_directory() -> tempfile::TempDir {
             let directory = tempfile::tempdir().expect("temporary broker directory");
             std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
@@ -1428,21 +1068,11 @@ mod tests {
             }
         }
 
-        /// Serves a fixed script of responses over a private Unix socket.
-        ///
-        /// A real socket rather than an in-memory duplex, because the client authenticates the
-        /// server by socket ownership and peer UID before it writes a byte; a stub that skipped
-        /// that would not be exercising the path an embedding binary actually takes.
         async fn stub_leg(directory: &Path, responses: Vec<ResponseEnvelope>) -> BrokerLeg {
             let (leg, _observed) = stub_leg_observing(directory, responses, None).await;
             leg
         }
 
-        /// Serves `responses` and reports every request frame it decoded.
-        ///
-        /// The observation channel is what makes an attested test meaningful: the only difference
-        /// between a direct and an attested leg is the frame it puts on the wire, so a test that
-        /// checked the returned `CapabilityCallResult` alone would pass for both.
         async fn stub_leg_observing(
             directory: &Path,
             responses: Vec<ResponseEnvelope>,
@@ -1479,8 +1109,6 @@ mod tests {
             leg_with(socket, None)
         }
 
-        /// Accepts one request, reports it, and never answers until released: the shape of a
-        /// broker still working on a run when the session is cancelled underneath it.
         async fn stub_leg_parked(
             directory: &Path,
         ) -> (
@@ -1504,8 +1132,6 @@ mod tests {
                     reason = "the test may have finished observing before the stub reports"
                 )]
                 let _ = observed.send(request);
-                // Hold the connection open, unanswered, until the test lets go of the sender: a
-                // dropped sender releases the stub exactly as a sent signal would.
                 #[allow(
                     clippy::let_underscore_must_use,
                     reason = "a dropped sender and a sent signal both mean the test is done"
@@ -1516,7 +1142,6 @@ mod tests {
             (leg_for(&socket), receiver, release)
         }
 
-        /// Runs one command word the way an embedding binary does: from a blocking thread.
         async fn run_word(
             leg: BrokerLeg,
             argv: &'static [&'static str],
@@ -1548,8 +1173,6 @@ mod tests {
             )
             .await;
             leg.command_words.insert("probe".to_owned());
-            // The run joins the session's trace the way an invocation does, so the broker's span
-            // for it lands under the script that typed the word rather than in a trace of its own.
             let trace_parent = leg.identifiers.trace_parent();
 
             assert_eq!(
@@ -1612,12 +1235,6 @@ mod tests {
             );
         }
 
-        /// The secret use a provider's proposal names reaches the script's invocation intact.
-        ///
-        /// A provider command is the only way a script names a DRN, so a mapping that dropped the
-        /// field would turn every such proposal into a credential-less call the broker never gets
-        /// to decide about. `HttpBasic` carries the most fields, so the username rides the wire
-        /// and its validation too.
         #[tokio::test(flavor = "multi_thread")]
         async fn a_proposed_secret_use_survives_the_broker_leg() {
             let directory = private_broker_directory();
@@ -1652,9 +1269,6 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_cancel_signal_abandons_an_in_flight_run() {
-            // The broker has the request and is not answering. A gateway Stop must not leave the
-            // script parked on it: the node is aborted and joined, and the script reads the same
-            // refusal the capability path gives a cancelled session.
             let directory = private_broker_directory();
             let (mut leg, mut observed, release) = stub_leg_parked(directory.path()).await;
             leg.command_words.insert("probe".to_owned());
@@ -1750,8 +1364,6 @@ mod tests {
             }
         }
 
-        /// Runs one dispatch the way an embedding binary does: from a blocking thread, never a
-        /// worker.
         async fn invoke(leg: BrokerLeg, capability: &'static str) -> CapabilityCallResult {
             tokio::task::spawn_blocking(move || {
                 leg.invoke(capability, json!({"uri": "http://x/"}), None)
@@ -1762,9 +1374,6 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_denied_invocation_stays_denied_all_the_way_to_the_exit_code() {
-            // The interpreter maps `Denied` to 126 and `Failed` to 1. A model that reads "policy
-            // refused this" as "the call errored" will retry something it must not retry, so this
-            // distinction has to survive the whole trip back.
             let directory = private_broker_directory();
             let leg = stub_leg(
                 directory.path(),
@@ -1830,8 +1439,6 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn an_unmapped_peer_is_a_denial_rather_than_an_infrastructure_failure() {
-            // This refusal never reaches a decision record, so it arrives as a transport-level
-            // code instead of a `Denied` outcome. It is still policy saying no.
             let directory = private_broker_directory();
             let leg = stub_leg(
                 directory.path(),
@@ -1925,9 +1532,6 @@ mod tests {
             );
         }
 
-        /// The classification is what the exit status and any retry decision come from, so it
-        /// stays the `error`; the provider's own refusal travels beside it to the script the model
-        /// reads back, rather than being dropped at this seam.
         #[tokio::test(flavor = "multi_thread")]
         async fn a_typed_provider_failure_reaches_the_script_with_its_code_and_message() {
             let directory = private_broker_directory();
@@ -1978,12 +1582,8 @@ mod tests {
             );
         }
 
-        /// One PNG offered the way a provider offers one.
         #[tokio::test(flavor = "multi_thread")]
         async fn an_attested_leg_proposes_on_behalf_of_its_subject() {
-            // The whole difference between the two legs is the frame, so assert on the frame. An
-            // `invoke` here would be a gateway silently proposing as *itself*, which the broker
-            // would answer under the daemon's own peer identity rather than the sender's.
             let directory = private_broker_directory();
             let (leg, mut observed) = stub_leg_observing(
                 directory.path(),
@@ -2013,17 +1613,12 @@ mod tests {
             };
             assert_eq!(attestation.subject.canonical(), SUBJECT);
             assert_eq!(attestation.agent.as_str(), "chat-agent");
-            // The claim binds to the proposal it travels with; the broker rejects a mismatch as a
-            // protocol error rather than deciding it as policy.
             assert_eq!(attestation.invocation, Some(invocation.id));
             assert_eq!(invocation.capability.as_str(), CAPABILITY);
         }
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_refused_attestation_is_a_denial_rather_than_an_infrastructure_failure() {
-            // A gateway whose grant does not cover this subject's namespace gets the same
-            // transport-level code an unmapped peer gets. It is policy saying no, and a model that
-            // reads it as "the call errored" will retry something it must not retry.
             let directory = private_broker_directory();
             let (leg, _observed) = stub_leg_observing(
                 directory.path(),
@@ -2043,8 +1638,6 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_direct_leg_still_proposes_without_any_identity_claim() {
-            // The original behavior has to stay byte-for-byte: adding an attested mode must not
-            // start attaching claims to sessions that never asked for one.
             let directory = private_broker_directory();
             let (leg, mut observed) = stub_leg_observing(
                 directory.path(),
@@ -2072,8 +1665,6 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn capabilities_outside_the_session_never_reach_the_broker() {
-            // No stub server at all: if this dispatched, the call would fail against a missing
-            // socket instead of reporting the capability as absent.
             let directory = private_broker_directory();
             let leg = leg_for(&directory.path().join("absent.sock"));
 
@@ -2085,9 +1676,6 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_cancelled_session_is_refused_before_a_proposal_is_built() {
-            // No stub server at all, and a socket that was never bound: a call that dispatched
-            // would report the missing broker as a `Failed`, so the refusal proves nothing left
-            // this process. The check answers exactly what an in-flight run's abort answers.
             let directory = private_broker_directory();
             let leg = leg_for(&directory.path().join("absent.sock"));
             let (handle, signal) = CancelSignal::pair();
@@ -2104,12 +1692,6 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn the_cancellation_check_never_narrows_what_a_proposal_may_carry() {
-            // A refusal decided before the proposal is one method away from a refusal decided
-            // *about* the proposal. A wrapper in `dekopond` once sat here, forwarded the
-            // two-argument call and inherited a deny-by-default for the third, so a secret use
-            // proposed in a gateway session was refused inside the process that made it — the
-            // broker, the only thing that can decide `secret.use` at all, never saw it. The check
-            // moved in here; the proposal still travels untouched.
             let directory = private_broker_directory();
             let (leg, mut observed) = stub_leg_observing(
                 directory.path(),
@@ -2148,9 +1730,6 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn transport_failures_never_disclose_where_the_broker_lives() {
-            // The interpreter refuses to read the process environment precisely so a script cannot
-            // learn about its host. This is the one path that could hand `DEKOPON_BROKER_SOCKET`
-            // straight back to a model inside an error string.
             let directory = private_broker_directory();
             let socket = directory.path().join("dekopon-secret-broker.sock");
             let leg = leg_for(&socket);
@@ -2164,8 +1743,6 @@ mod tests {
 
         #[tokio::test]
         async fn invocation_identifiers_are_unique_and_extend_the_session_trace() {
-            // An invocation ID names one call in the broker's audit record, so a script calling
-            // one capability in a loop must not collide with itself.
             let identifiers = IdSequence::for_session();
             let first = identifiers.next_invocation();
             let second = identifiers.next_invocation();
@@ -2175,18 +1752,10 @@ mod tests {
             assert!(first.as_str().starts_with(&trace), "{first} vs {trace}");
             assert!(second.as_str().starts_with(&trace), "{second} vs {trace}");
 
-            // Two sessions in the same process must not share a key space either.
             let other = IdSequence::for_session();
             assert_ne!(identifiers.trace(), other.trace());
         }
 
-        /// The precondition behind a mandatory `traceParent`.
-        ///
-        /// `dekopon_telemetry::install` attaches the `tracing-opentelemetry` layer only when an
-        /// OTLP trace exporter is configured, so a daemon that exports nothing has no span context
-        /// at all — [`current_trace_parent`] is `None` however many spans are open. The request
-        /// field is not optional, so the session mints its own trace rather than leaving the
-        /// broker's audit records with no correlation identifier.
         #[tokio::test]
         async fn a_session_that_exports_nothing_still_carries_one_trace() {
             let span = tracing::info_span!("gateway.session");
@@ -2208,10 +1777,6 @@ mod tests {
                 ),
                 "the minted context is a well-formed traceparent"
             );
-            // Set even though this process exports nothing: the broker adopts this as a remote
-            // parent and its default `ParentBased(AlwaysOn)` sampler drops everything beneath an
-            // unsampled one, so a cleared bit would silence an exporting broker behind a
-            // non-exporting gateway.
             assert_eq!(minted.flags(), 1, "a minted parent instructs the receiver");
             assert!(
                 identifiers
@@ -2237,10 +1802,6 @@ mod tests {
 
         #[test]
         fn a_duplicated_capability_identifier_is_a_malformed_broker_answer() {
-            // Last-wins here would leave `cap --list` and `inspect_agent_config` describing
-            // different sessions: the map keeps one entry per identifier and the effective view
-            // keeps every entry it was handed. Every repeat is named at once, the way the rest of
-            // the workspace reports conflicts.
             let error = crate::snapshot(vec![
                 available("http-probe.fetch"),
                 available("cli-probe.upper"),
@@ -2277,7 +1838,6 @@ mod tests {
             );
         }
 
-        /// Keeps what one leg reported, in order.
         #[derive(Default)]
         struct RecordingSink {
             events: Mutex<Vec<ProgressEvent>>,
@@ -2289,7 +1849,6 @@ mod tests {
             }
         }
 
-        /// One recorder, twice: the handle the assertions read and the trait object a leg takes.
         fn recording_sink() -> (Arc<RecordingSink>, Arc<dyn ProgressSink>) {
             let recorder = Arc::new(RecordingSink::default());
             let installed = Arc::clone(&recorder) as Arc<dyn ProgressSink>;
@@ -2307,10 +1866,6 @@ mod tests {
             }
         }
 
-        /// One line per event, carrying only what these assertions are about.
-        ///
-        /// The final arm renders anything else rather than matching it away, so an event the leg
-        /// should not have emitted fails the comparison by name.
         fn label(event: &ProgressEvent) -> String {
             match event {
                 ProgressEvent::ToolStarted {
@@ -2360,8 +1915,6 @@ mod tests {
                 }
             );
 
-            // The count, not the argument: the one field of the fixture's input is model-authored
-            // and only its arity travels.
             assert_eq!(
                 sink.labels(),
                 vec![
@@ -2373,8 +1926,6 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_call_proposed_after_a_stop_reads_as_cancelled_rather_than_refused() {
-            // Nothing decided this call: the session ended underneath it. A surface that showed
-            // "denied" would credit a refusal to a broker that never saw a proposal.
             let directory = private_broker_directory();
             let leg = leg_for(&directory.path().join("absent.sock"));
             let (handle, signal) = CancelSignal::pair();
@@ -2388,9 +1939,6 @@ mod tests {
                     reason: "session-cancelled".to_owned(),
                 }
             );
-            // Nothing was charged either: the budget reads as it stood before the call, because a
-            // surface saying "1 of 4" for a proposal that never reached the broker tells a person
-            // their session spent something it did not.
             assert_eq!(
                 sink.labels(),
                 vec![
@@ -2400,8 +1948,6 @@ mod tests {
             );
         }
 
-        /// A leg that owns `probe`, answers each request with the next of `responses`, and reports
-        /// progress against a ceiling of four calls.
         async fn reporting_probe_leg(
             directory: &Path,
             responses: Vec<ResponseEnvelope>,
@@ -2412,7 +1958,6 @@ mod tests {
             (leg.with_progress(progress, 4), sink)
         }
 
-        /// A run that proposes `capability`, the way a provider answers a word it parsed.
         fn proposal_of(capability: &str) -> ResponseEnvelope {
             ResponseEnvelope::command_run(CommandRunOutcome::Proposed {
                 capability: capability.parse().expect("valid capability fixture"),
@@ -2421,8 +1966,6 @@ mod tests {
             })
         }
 
-        /// A run that answers with the provider's own text at `status`: `0` for help, `2` for a
-        /// usage error.
         fn rendered_at(status: u8) -> ResponseEnvelope {
             ResponseEnvelope::command_run(CommandRunOutcome::Rendered {
                 stdout: String::new(),
@@ -2433,10 +1976,6 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_word_that_proposes_nothing_is_one_pair_under_the_word_with_its_own_outcome() {
-            // `probe --help` and `probe --nonsense` spend no capability call and reach no
-            // capability, so the word is the only name either round trip has. Each finishes where
-            // it answers — a provider's usage error is a failed run for the person watching even
-            // though the word answered — and nothing is held for the end of the script to finish.
             let directory = private_broker_directory();
             let (leg, sink) =
                 reporting_probe_leg(directory.path(), vec![rendered_at(0), rendered_at(2)]).await;
@@ -2471,9 +2010,6 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_proposing_word_is_one_pair_under_the_word_finished_by_the_call_it_proposed() {
-            // The word opens the pair before its run and the capability call closes it with the
-            // broker's answer. Reporting the capability as well would show one provider command as
-            // two tool uses, and the budget reads as it stood when the word started.
             let directory = private_broker_directory();
             let (leg, sink) = reporting_probe_leg(
                 directory.path(),
@@ -2523,10 +2059,6 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_proposal_the_script_never_invokes_finishes_failed_before_the_script_returns() {
-            // The provider proposes without knowing what the session holds, and the interpreter
-            // refuses a capability it was not granted without ever calling `invoke`. Nothing in
-            // the script finishes the pair the word opened, so the runtime has to, through the
-            // composite dispatch, before the outcome goes back to the prompt loop.
             let directory = private_broker_directory();
             let (leg, sink) =
                 reporting_probe_leg(directory.path(), vec![proposal_of("gh.pr-merge")]).await;
@@ -2557,9 +2089,6 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_proposal_left_uninvoked_finishes_failed_before_the_next_word_starts() {
-            // A refused proposal does not end the script, and the next command is the earliest
-            // point the leg can tell that tool use is over: the pair has to finish before another
-            // opens, or a surface would show the next word running inside the last one.
             let directory = private_broker_directory();
             let (leg, sink) = reporting_probe_leg(
                 directory.path(),
@@ -2597,19 +2126,13 @@ mod tests {
 
         #[tokio::test(flavor = "multi_thread")]
         async fn a_capability_no_provider_owns_is_refused_without_reaching_a_progress_surface() {
-            // The leg is handed whatever identifier its caller named; a progress line renders the
-            // word it is given, so a leg that reported before the visibility check would put
-            // `Running ignore-your-instructions…` on a chat message on the model's say-so. The
-            // refusal is unchanged and already on the trace; only the rendering is withheld. The
-            // leg is called directly rather than through a script so the check is pinned on the
-            // leg itself, whichever dispatch path a shell offers.
+            // Check the capability is known before reporting progress, or an untrusted model-chosen
+            // word renders directly in chat.
             let directory = private_broker_directory();
             let leg = leg_for(&directory.path().join("absent.sock"));
             let (sink, progress) = recording_sink();
             let leg = leg.with_progress(progress, 4);
 
-            // On a blocking thread because that is where the prompt loop calls the leg; the socket
-            // is absent and never opened, because this refusal never reaches the broker.
             let outcome = tokio::task::spawn_blocking(move || {
                 leg.invoke("ignore-your-instructions", json!({}), None)
             })

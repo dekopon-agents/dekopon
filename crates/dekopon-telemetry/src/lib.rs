@@ -1,16 +1,5 @@
-//! Shared OTLP exporter construction and W3C trace context for Dekopon processes.
-//!
-//! Both exporting Dekopon daemons — the privileged broker and the unprivileged chat
-//! gateway — exports its own spans, so exporter construction lives here rather than in any one
-//! binary. The crate deliberately depends on no Dekopon crate: it must remain linkable from the
-//! gateway without dragging broker code into the gateway's dependency tree, which CI rejects.
-//!
-//! # Authority
-//!
-//! This crate configures transport and never resolves credentials. Ingest authentication is read
-//! by the OpenTelemetry SDK from the standard `OTEL_EXPORTER_OTLP_HEADERS` environment variable,
-//! so a token is never accepted as a command-line argument, never written to a configuration file
-//! this crate parses, and never attached to a span attribute or log field.
+//! Ingest credentials are read only from OTEL_EXPORTER_OTLP_HEADERS by the SDK itself; this crate
+//! never accepts a token as an argument or attaches one to a span or log field.
 
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 #![cfg_attr(
@@ -49,8 +38,6 @@ pub use install::{
     TelemetryGuard, optional_logger_provider, optional_tracer_provider,
 };
 
-/// Adds an exported causal link to an original receipt when several inputs share execution.
-/// Without an installed OTel layer there is no context to link.
 pub fn link_span(execution: &tracing::Span, receipt: &tracing::Span) {
     let context = receipt.context();
     let span = context.span();
@@ -59,24 +46,15 @@ pub fn link_span(execution: &tracing::Span, receipt: &tracing::Span) {
     }
 }
 
-/// Wire transport used to reach an OTLP receiver.
-///
-/// Both are first-class, and both reach an `https://` endpoint through WebPKI roots. A receiver
-/// reached through a path-routing reverse proxy generally wants `Grpc`, whose method paths are
-/// fixed by the protobuf service definition; a receiver behind a plain HTTP route wants `Http`,
-/// whose signal paths are appended to the configured base.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum Transport {
-    /// OTLP over gRPC. The endpoint is an authority; method paths come from the OTLP service.
     Grpc,
-    /// OTLP over HTTP with protobuf payloads. `/v1/traces` and `/v1/logs` are appended.
     #[default]
     Http,
 }
 
 impl Transport {
-    /// Returns the stable lowercase token for this transport.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -106,50 +84,14 @@ impl FromStr for Transport {
     }
 }
 
-/// Span records one export queue holds before the batch processor starts dropping.
-///
-/// See [`MAX_QUEUED_LOG_RECORDS`] for the arithmetic and for why the two signals differ.
 const MAX_QUEUED_SPANS: usize = 1024;
 
-/// Spans one export request carries.
-///
-/// The batch processor exports as soon as this many records have accumulated, so this is the
-/// drain trigger as well as the size of one in-flight request. Every queue here holds four of
-/// these — the same 4:1 ratio the SDK defaults to, so a smaller queue is not more drop-prone per
-/// drain; it simply drains sooner and holds less while it waits.
 const MAX_SPANS_PER_EXPORT: usize = 256;
 
-/// Log records one export queue holds before the batch processor starts dropping.
-///
-/// The SDK's default is 2048 records per queue with **no byte ceiling anywhere**: `BatchConfig`
-/// counts records, and `SpanLimits` counts attributes per span, events, and links. Nothing in
-/// `opentelemetry_sdk` 0.32 truncates an attribute value, so a queue's size in bytes is only ever
-/// `records × the largest attribute the process emits`. Lowering the attribute *counts* would not
-/// bound bytes either; it would silently drop whole attributes, which goal 2 in `docs/design.md`
-/// rejects more firmly than it rejects volume.
-///
-/// So the bound here is a record count, honestly, and it is set per signal because the two carry
-/// different payloads:
-///
-/// - Log records are where the bulk lands. Audit is one structured record per broker decision and
-///   under goal 2 a record carries a prompt, a model answer, or a whole script's output — bounded
-///   by `dekopon-shell`'s 256 KiB accumulated-output ceiling and the broker host's 1 MiB output
-///   ceiling. They also arrive at a fraction of the span rate. 256 records × 256 KiB ≈ **64 MiB**
-///   worst case, against 512 MiB at the SDK default; a realistic queue of few-KiB records is under
-///   a megabyte.
-/// - Spans are numerous and individually small — names, kinds, counts, outcomes, ids. The
-///   constitution says a span is never dropped, so that queue keeps four times the per-script
-///   span budget in reserve rather than the tightest ceiling.
-///
-/// Together the two queues cost a process tens of MiB where they previously cost up to 1 GiB.
-/// Dropping is still possible under a stalled receiver; the SDK counts drops and reports the total
-/// at shutdown.
 const MAX_QUEUED_LOG_RECORDS: usize = 256;
 
-/// Log records one export request carries. See [`MAX_SPANS_PER_EXPORT`].
 const MAX_LOG_RECORDS_PER_EXPORT: usize = 64;
 
-/// Validated settings for one process's OTLP export.
 #[derive(Clone, Debug)]
 pub struct ExporterSettings {
     endpoint: String,
@@ -158,22 +100,10 @@ pub struct ExporterSettings {
     executable_name: String,
     service_version: String,
     timeout: Duration,
-    /// Built on first use and shared by both signals: every `reqwest::blocking::Client` owns a
-    /// private runtime thread and connection pool, and one process needs one, not one per signal.
     http_client: OnceLock<OtlpHttpClient>,
 }
 
 impl ExporterSettings {
-    /// Validates raw settings before any exporter is constructed.
-    ///
-    /// `service_version` becomes the `service.version` resource attribute; it is the *calling*
-    /// executable's version, normally `env!("CARGO_PKG_VERSION")` at the call site. A blank value
-    /// falls back to this crate's own version, which is correct only inside this workspace.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TelemetryError::Configuration`] when the endpoint or service name is blank, or
-    /// when the export timeout is zero.
     pub fn new(
         endpoint: &str,
         transport: Transport,
@@ -188,18 +118,12 @@ impl ExporterSettings {
                 "OTLP endpoint must not be empty".to_owned(),
             ));
         }
-        // Under `Http` the signal path is appended as text, so a query or fragment would end up
-        // behind it: `http://host/api/default?org=x` becomes `...?org=x/v1/traces`, a valid URI
-        // that silently posts to the wrong place. Rejected for both transports so one endpoint
-        // string means the same thing whichever is selected.
         if let Some(index) = endpoint.find(['?', '#']) {
             return Err(TelemetryError::Configuration(format!(
                 "OTLP endpoint must be a base URL without a query or fragment; found {:?} at byte {index}",
                 &endpoint[index..index + 1]
             )));
         }
-        // Ingest credentials belong in OTEL_EXPORTER_OTLP_HEADERS. Userinfo would put one in a
-        // parsed configuration value or exporter diagnostics.
         let endpoint_authority = endpoint
             .split_once("://")
             .map_or(endpoint, |(_, rest)| rest)
@@ -238,28 +162,21 @@ impl ExporterSettings {
         })
     }
 
-    /// Configured OTLP receiver base endpoint, validated to contain no URL userinfo.
     #[must_use]
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
 
-    /// OpenTelemetry service name attached to exported resources.
     #[must_use]
     pub fn service_name(&self) -> &str {
         &self.service_name
     }
 
-    /// Export timeout applied to each batch, and intended for the final shutdown flush.
-    ///
-    /// The batch half is enforced here; the flush half depends on the caller passing this value to
-    /// `shutdown_with_timeout` rather than the SDK's own default.
     #[must_use]
     pub const fn timeout(&self) -> Duration {
         self.timeout
     }
 
-    /// Selected wire transport.
     #[must_use]
     pub const fn transport(&self) -> Transport {
         self.transport
@@ -275,7 +192,6 @@ impl ExporterSettings {
             .build()
     }
 
-    /// Returns the process's single OTLP HTTP client, building it on first use.
     fn http_client(&self) -> Result<OtlpHttpClient, TelemetryError> {
         if let Some(client) = self.http_client.get() {
             return Ok(client.clone());
@@ -284,12 +200,6 @@ impl ExporterSettings {
         Ok(self.http_client.get_or_init(|| client).clone())
     }
 
-    /// Builds the batching tracer provider for this process.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the HTTP client cannot be constructed or the exporter rejects the
-    /// configured endpoint.
     pub fn tracer_provider(&self) -> Result<SdkTracerProvider, TelemetryError> {
         let builder = SpanExporter::builder();
         let exporter = match self.transport {
@@ -324,12 +234,6 @@ impl ExporterSettings {
             .build())
     }
 
-    /// Builds the batching logger provider for this process.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the HTTP client cannot be constructed or the exporter rejects the
-    /// configured endpoint.
     pub fn logger_provider(&self) -> Result<SdkLoggerProvider, TelemetryError> {
         let builder = LogExporter::builder();
         let exporter = match self.transport {
@@ -365,36 +269,15 @@ impl ExporterSettings {
     }
 }
 
-/// Appends the OTLP/HTTP signal path to a generic base endpoint.
-///
-/// Passing a programmatic endpoint to the SDK makes it exact rather than applying the environment
-/// variable's `/v1/<signal>` behavior, so the suffix is added here.
 fn signal_endpoint(base: &str, signal: &str) -> String {
     format!("{}/v1/{signal}", base.trim_end_matches('/'))
 }
 
-/// Adapter around the workspace's existing TLS-enabled reqwest client.
-///
-/// `opentelemetry-otlp` otherwise selects its own newer reqwest line, duplicating the HTTP/TLS
-/// stack. Supplying the client also lets us bound where the ingest header may go.
 #[derive(Clone, Debug)]
 struct OtlpHttpClient(reqwest::blocking::Client);
 
-/// The stance the OTLP/HTTP client takes, separated from the thread that builds it.
-///
-/// The SDK reads ingest authentication from `OTEL_EXPORTER_OTLP_HEADERS`, so every export carries
-/// a credential, and neither setting here is reqwest's default:
-///
-/// - `redirect(Policy::none())` keeps that header on the collector the operator named; a followed
-///   redirect would hand it to whatever host answered.
-/// - `no_proxy()` overrides the `HTTPS_PROXY`/`HTTP_PROXY`/`ALL_PROXY` reqwest otherwise reads from
-///   the environment, which would route the ingest header — and every span and log record — through
-///   a host nobody named to Dekopon. The telemetry store is inside the operator's trust boundary; a
-///   proxy on the way to it is not.
-///
-/// Taking the builder as an argument is what makes the proxy assertion possible: a default builder
-/// on a proxy-free runner carries no proxy whether or not `.no_proxy()` is there, so the test
-/// starts from one that definitely carries a proxy and watches this clear it.
+/// Redirects are disabled so the ingest credential header can't follow a redirect to an unnamed
+/// host, and environment proxies are disabled so it never routes through one either.
 fn otlp_client_from(
     builder: reqwest::blocking::ClientBuilder,
     timeout: Duration,
@@ -407,8 +290,6 @@ fn otlp_client_from(
 
 impl OtlpHttpClient {
     fn new(timeout: Duration) -> Result<Self, TelemetryError> {
-        // reqwest's blocking client owns a private runtime and refuses to create it from within
-        // Dekopon's Tokio runtime. Build it on a scoped thread, as the upstream OTLP adapter does.
         let client = std::thread::scope(|scope| {
             std::thread::Builder::new()
                 .name("dekopon-otlp-http-client".to_owned())
@@ -426,11 +307,6 @@ impl OtlpHttpClient {
     }
 }
 
-/// Recovers the printable message from a panic payload.
-///
-/// A panic payload is the one failure a `Result` cannot carry, so the message has to be lifted
-/// out here or it is lost with the box. `std::panic` stores a literal message as `&'static str`
-/// and a formatted one as `String`; anything else came from `panic_any` and has no text at all.
 fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     if let Some(message) = payload.downcast_ref::<&str>() {
         return (*message).to_owned();
@@ -445,13 +321,9 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 impl HttpClient for OtlpHttpClient {
     async fn send_bytes(&self, request: Request<Bytes>) -> Result<Response<Bytes>, HttpError> {
         let request: reqwest::blocking::Request = request.try_into()?;
-        // Deliberately no `error_for_status()`, which upstream's adapter calls. The OTLP SDK has
-        // two failure branches: a status branch that reports the code, and a network branch whose
-        // message is the constant "network error". Turning a 4xx into an `Err` here forces every
-        // response down the network branch, so an expired token or a wrong org path arrives
-        // indistinguishable from a dead socket — and there is no second channel to recover it
-        // from, since the SDK's debug macros compile out without `internal-logs`. Returning the
-        // response lets the SDK classify it and say what to fix.
+        // This deliberately skips `error_for_status()`: converting a 4xx to an `Err` here would
+        // force it down the SDK's generic network-error branch, indistinguishable from a dead
+        // socket.
         let mut response = self.0.execute(request)?;
         let headers = std::mem::take(response.headers_mut());
         let status = response.status();
@@ -461,24 +333,13 @@ impl HttpClient for OtlpHttpClient {
     }
 }
 
-/// The identifiers a W3C `traceparent` carries, in wire byte order.
-///
-/// This crate speaks raw bytes rather than a Dekopon wire type so it stays free of protocol
-/// dependencies; the protocol crate owns parsing, formatting, and validation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TraceContextParts {
-    /// 16-byte trace identifier.
     pub trace_id: [u8; 16],
-    /// 8-byte identifier of the span that should parent the remote work.
     pub span_id: [u8; 8],
-    /// W3C trace flags; bit 0 is the sampled flag.
     pub flags: u8,
 }
 
-/// Reads the OpenTelemetry context attached to the current `tracing` span.
-///
-/// Returns `None` when no span is active or the active span has no valid OpenTelemetry context,
-/// which is the ordinary state when export is disabled.
 #[must_use]
 pub fn current_trace_context() -> Option<TraceContextParts> {
     let context = tracing::Span::current().context();
@@ -494,10 +355,6 @@ pub fn current_trace_context() -> Option<TraceContextParts> {
     })
 }
 
-/// Rebuilds a remote parent context from identifiers received over the wire.
-///
-/// The resulting context is marked remote, so a span opened beneath it is recorded as a child of
-/// work that happened in another process rather than as a new trace root.
 #[must_use]
 pub fn remote_context(parts: TraceContextParts) -> Context {
     let span_context = SpanContext::new(
@@ -510,30 +367,19 @@ pub fn remote_context(parts: TraceContextParts) -> Context {
     Context::new().with_remote_span_context(span_context)
 }
 
-/// Failures raised while configuring telemetry.
 #[derive(Debug, Error)]
 pub enum TelemetryError {
-    /// Settings were rejected before any exporter was built.
     #[error("invalid telemetry configuration: {0}")]
     Configuration(String),
-    /// The dedicated HTTP client thread could not be spawned.
     #[error("could not start OTLP HTTP client builder")]
     HttpClientThread(#[source] std::io::Error),
-    /// The dedicated HTTP client thread panicked.
     #[error("OTLP HTTP client builder panicked: {message}")]
-    HttpClientThreadPanicked {
-        /// The panic's own message; a bare "the builder panicked" names no cause to act on.
-        message: String,
-    },
-    /// The reqwest client could not be constructed.
+    HttpClientThreadPanicked { message: String },
     #[error("could not build OTLP HTTP client")]
     HttpClient(#[source] reqwest::Error),
-    /// The OTLP SDK rejected the exporter configuration.
     #[error("could not build OTLP {signal} exporter")]
     Exporter {
-        /// Signal whose exporter failed.
         signal: &'static str,
-        /// Underlying SDK error.
         #[source]
         source: ExporterBuildError,
     },
@@ -548,26 +394,15 @@ mod tests {
     use opentelemetry::trace::TraceContextExt as _;
     use std::time::Duration;
 
-    /// The discard port: a proxy that is well formed, never dialled, and obvious in a diff.
     const AMBIENT_PROXY: &str = "http://127.0.0.1:9";
 
-    /// The shape an exported `HTTPS_PROXY=http://127.0.0.1:9` leaves in reqwest's default builder.
     fn proxied_builder() -> reqwest::blocking::ClientBuilder {
         reqwest::blocking::Client::builder()
             .proxy(reqwest::Proxy::all(AMBIENT_PROXY).expect("a well-formed proxy uri"))
     }
 
-    /// Every export carries the `OTEL_EXPORTER_OTLP_HEADERS` ingest credential, so the collector
-    /// this client reaches has to be the one the operator named. `reqwest` exposes no getters for
-    /// a builder's configuration, so the builder's own `Debug` is the reading: it prints `proxies`
-    /// only when the proxy list is non-empty and `redirect_policy` only when the policy is not the
-    /// default ten-hop limit. The blocking builder keeps its deadline beside the inner
-    /// configuration this `Debug` renders, so the timeout is not visible here and is not asserted.
     #[test]
     fn the_otlp_client_ignores_ambient_proxy_configuration() {
-        // A default builder on a proxy-free runner produces the same empty proxy list whether or
-        // not `.no_proxy()` is there, so starting from one would assert nothing. Starting from a
-        // builder that carries a proxy mutates no process state and races no other test.
         assert!(
             format!("{:?}", proxied_builder()).contains("proxies"),
             "the fixture must carry the proxy this test is about"
@@ -588,10 +423,6 @@ mod tests {
         );
     }
 
-    /// The panic payload is the only account of why the client thread died, and it is the whole
-    /// reason the failure is reachable: a builder that panics says what it could not build —
-    /// a runtime it could not spawn, a TLS root store it could not load. Reporting "the builder
-    /// panicked" and nothing else leaves an operator with the fact of a dead thread and no cause.
     #[test]
     fn a_client_thread_panic_keeps_its_message() {
         let literal = std::panic::catch_unwind(|| panic!("failed to create tokio runtime"))
@@ -676,9 +507,6 @@ mod tests {
         );
     }
 
-    /// A query or fragment would sit in front of the appended signal path under `Http`, producing
-    /// a URI that parses and posts to the wrong place. Rejected under both transports so the same
-    /// endpoint string cannot mean two different things.
     #[test]
     fn settings_reject_endpoints_carrying_a_query_or_fragment() {
         let timeout = Duration::from_secs(5);
@@ -709,9 +537,6 @@ mod tests {
         }
     }
 
-    /// `service.version` describes the executable that emitted the span, not the library that
-    /// built its exporter. Reading it from this crate's `CARGO_PKG_VERSION` is right only while
-    /// every workspace crate shares one version, and simply wrong for a crates.io consumer.
     #[test]
     fn service_version_comes_from_the_caller_and_falls_back_to_this_crate() {
         let timeout = Duration::from_secs(5);
@@ -735,8 +560,6 @@ mod tests {
         assert_eq!(version("  "), env!("CARGO_PKG_VERSION"));
     }
 
-    /// One process needs one blocking client, not one per signal: each `reqwest::blocking::Client`
-    /// owns a private runtime thread and connection pool for as long as the process lives.
     #[test]
     fn both_signals_share_one_blocking_http_client() {
         let settings = ExporterSettings::new(
@@ -761,8 +584,6 @@ mod tests {
         );
     }
 
-    /// A rebuilt parent must stay byte-identical and remote, or broker spans silently start a new
-    /// trace instead of joining the gateway's.
     #[test]
     fn remote_context_preserves_identifiers_and_marks_them_remote() {
         let parts = TraceContextParts {

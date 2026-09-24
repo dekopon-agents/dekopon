@@ -1,7 +1,3 @@
-//! Real broker/client subprocesses. On Linux root runs the distinct-UID acceptance;
-//! ordinary unprivileged package tests exercise the owner-client subprocess path.
-//! DEKOPON_REQUIRE_CROSS_UID=1 makes missing UID-switch authority a hard failure.
-
 #![allow(clippy::unwrap_used)]
 
 use std::{
@@ -240,7 +236,6 @@ async fn ipc_process_boundary() {
     if root {
         assert_ne!(client_uid, server_uid);
         run_client("unmapped", 65530, server_uid, &socket);
-        // Root can forge filesystem ownership, but cannot forge the live peer credentials.
         let fake = ipc.join("counterfeit.sock");
         let listener = tokio::net::UnixListener::bind(&fake).unwrap();
         owned(&fake, server_uid, gid, 0o660, root);

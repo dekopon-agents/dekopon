@@ -1,13 +1,7 @@
-//! Rendering a failure so the reason survives the log line.
-
 use std::error::Error;
 
-/// Renders an error and its sources as one `a: b: c` line.
-///
-/// Every failure worth logging here is a wrapper whose own message names the layer rather than the
-/// cause: a connection error says "broker failed", and the errno that says why is two levels down.
-/// The chain is the diagnosable part, and dropping it is how a retrying loop ends up reporting
-/// that something failed without ever saying what.
+/// The top message only names the layer, not the cause; dropping the chain is how a retry loop logs
+/// a failure with no reason.
 pub fn error_chain(error: &dyn Error) -> String {
     let mut rendered = error.to_string();
     let mut source = error.source();

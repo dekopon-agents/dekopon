@@ -1,14 +1,6 @@
-//! What `broker.authorize` carries of the proposal it was handed.
-//!
-//! The proposal is the one payload this span exists to preserve, and it is also the one field a
-//! caller controls the size of: a chat attachment reaches the broker as base64 inside `input`. So
-//! `input` rides the same cap as every other attribute, with `input.bytes` beside it for the uncut
-//! length, and the value is rendered through the cap rather than built and then cut — a subscriber
-//! that received the whole proposal before cutting it would cost a copy of the image per layer.
-//!
-//! This lives in its own test binary because `tracing` resolves per-callsite interest against the
-//! global dispatcher, so a sibling test reaching this callsite with no subscriber installed can
-//! disable it for the whole process.
+//! Since a caller controls input size, the span renders input through the attribute cap directly
+//! rather than building the full value and cutting it, avoiding a copy of large attachments per
+//! layer.
 
 #![allow(clippy::unwrap_used)]
 
@@ -25,7 +17,6 @@ use dekopon_core::{Actor, CapabilityId, PrincipalId, ProviderId, RiskLevel};
 use dekopon_test_support::{CaptureLayer, provider_fixture};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
-/// One fixture trace context for the request this test builds.
 const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
 
 const POLICIES: &str = r#"
@@ -99,14 +90,11 @@ fn caller() -> AuthenticatedContext {
     .expect("caller context binds")
 }
 
-/// A proposal past the attribute cap is recorded as its first `MAX_ATTRIBUTE_BYTES` plus a marker,
-/// beside the byte length of the whole.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_proposal_past_the_cap_is_recorded_truncated_beside_its_full_length() {
     let captured = CaptureLayer::workspace();
     tracing_subscriber::registry().with(captured.clone()).init();
 
-    // Well past the attribute cap and inside the fixture's own 16 KiB text bound.
     let input = serde_json::json!({ "text": "x".repeat(16_000) });
     let input_bytes = input.to_string().len();
     let result = broker()
@@ -136,9 +124,6 @@ async fn a_proposal_past_the_cap_is_recorded_truncated_beside_its_full_length() 
         .map(|(_, fields)| fields)
         .collect::<Vec<_>>()
         .join("\n");
-    // `{"text":"` is the nine bytes of the cut prefix that are not the model's own text. The value
-    // is still recorded through `Display`, so a reader sees the proposal rather than an escaped
-    // rendering of it; what changed is only where it ends.
     assert!(
         authorize.contains(&format!(
             "input={{\"text\":\"{}…[truncated]",

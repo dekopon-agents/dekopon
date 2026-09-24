@@ -1,8 +1,3 @@
-//! Rust guest facade for the buffered and streamed `dekopon:http@1.1.0` component interface.
-//!
-//! This crate contains no HTTP transport. [`send`] calls a host import that only a separately
-//! authorized broker is expected to implement.
-
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 #![cfg_attr(
@@ -17,28 +12,17 @@ use std::{error::Error, fmt};
 
 use dekopon_provider_sdk::asset::{Encoding, Handle};
 
-/// The imported HTTP WIT contract used by the generated guest bindings.
 pub const HTTP_WIT: &str = include_str!("../wit/deps/http.wit");
 
-/// Common HTTP method tokens.
 pub mod method {
-    /// CONNECT.
     pub const CONNECT: &str = "CONNECT";
-    /// DELETE.
     pub const DELETE: &str = "DELETE";
-    /// GET.
     pub const GET: &str = "GET";
-    /// HEAD.
     pub const HEAD: &str = "HEAD";
-    /// OPTIONS.
     pub const OPTIONS: &str = "OPTIONS";
-    /// PATCH.
     pub const PATCH: &str = "PATCH";
-    /// POST.
     pub const POST: &str = "POST";
-    /// PUT.
     pub const PUT: &str = "PUT";
-    /// TRACE.
     pub const TRACE: &str = "TRACE";
 }
 
@@ -53,17 +37,13 @@ mod bindings {
     });
 }
 
-/// One ordered HTTP header with an opaque byte value.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Header {
-    /// Case-insensitive HTTP field name.
     pub name: String,
-    /// Field value bytes.
     pub value: Vec<u8>,
 }
 
 impl Header {
-    /// Creates and validates one header.
     pub fn new(name: impl Into<String>, value: impl Into<Vec<u8>>) -> Result<Self, BuildError> {
         let name = name.into();
         if !is_token(&name) {
@@ -76,27 +56,21 @@ impl Header {
         Ok(Self { name, value })
     }
 
-    /// Creates one header from a UTF-8 value.
     pub fn text(name: impl Into<String>, value: impl Into<String>) -> Result<Self, BuildError> {
         Self::new(name, value.into().into_bytes())
     }
 }
 
-/// A complete buffered HTTP request.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Request {
-    /// Any valid standard or extension HTTP method token.
     pub method: String,
     /// Absolute request URI. The broker performs authoritative URI and policy validation.
     pub uri: String,
-    /// Ordered headers; duplicate field names are preserved.
     pub headers: Vec<Header>,
-    /// Complete request body.
     pub body: Vec<u8>,
 }
 
 impl Request {
-    /// Creates a request without headers or a body.
     pub fn new(method: impl Into<String>, uri: impl Into<String>) -> Result<Self, BuildError> {
         let method = method.into();
         if !is_token(&method) {
@@ -114,14 +88,12 @@ impl Request {
         })
     }
 
-    /// Appends one header without coalescing duplicate names.
     #[must_use]
     pub fn with_header(mut self, header: Header) -> Self {
         self.headers.push(header);
         self
     }
 
-    /// Replaces the complete buffered request body.
     #[must_use]
     pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Self {
         self.body = body.into();
@@ -129,58 +101,41 @@ impl Request {
     }
 }
 
-/// A complete buffered HTTP response.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Response {
-    /// HTTP status code.
     pub status: u16,
-    /// Ordered response headers; duplicate field names are preserved.
     pub headers: Vec<Header>,
-    /// Complete response body.
     pub body: Vec<u8>,
 }
 
-/// One ordered segment of a host-composed request body.
 #[derive(Debug)]
 pub enum Part<'a> {
-    /// Literal bytes, counted against the HTTP request limit.
     Literal(Vec<u8>),
-    /// Asset bytes, re-encoded and streamed by the host without entering guest memory.
     Asset {
-        /// The asset to stream.
         handle: &'a Handle,
-        /// Encoding on the wire, independent of the stored encoding.
         encoding: Encoding,
     },
 }
 
 impl<'a> Part<'a> {
-    /// Creates a literal body segment.
     pub fn literal(bytes: impl Into<Vec<u8>>) -> Self {
         Self::Literal(bytes.into())
     }
 
-    /// Borrows an asset for one host-streamed segment.
     pub fn asset(handle: &'a Handle, encoding: Encoding) -> Self {
         Self::Asset { handle, encoding }
     }
 }
 
-/// A request whose body the host composes at exact length.
 #[derive(Debug)]
 pub struct StreamedRequest<'a> {
-    /// Any valid standard or extension HTTP method token.
     pub method: String,
-    /// Absolute request URI; authoritative validation remains host-owned.
     pub uri: String,
-    /// Ordered headers; duplicate names are preserved.
     pub headers: Vec<Header>,
-    /// Ordered literal and asset body segments.
     pub body: Vec<Part<'a>>,
 }
 
 impl<'a> StreamedRequest<'a> {
-    /// Creates a request without headers or body segments.
     pub fn new(method: impl Into<String>, uri: impl Into<String>) -> Result<Self, BuildError> {
         let request = Request::new(method, uri)?;
         Ok(Self {
@@ -191,14 +146,12 @@ impl<'a> StreamedRequest<'a> {
         })
     }
 
-    /// Appends one header without coalescing duplicate names.
     #[must_use]
     pub fn with_header(mut self, header: Header) -> Self {
         self.headers.push(header);
         self
     }
 
-    /// Replaces the ordered body segments.
     #[must_use]
     pub fn with_body(mut self, body: Vec<Part<'a>>) -> Self {
         self.body = body;
@@ -206,54 +159,33 @@ impl<'a> StreamedRequest<'a> {
     }
 }
 
-/// An echo-scanned HTTP response whose body is spooled on the broker.
 #[derive(Debug)]
 pub struct StreamedResponse {
-    /// HTTP status code.
     pub status: u16,
-    /// Ordered response headers; duplicate names are preserved.
     pub headers: Vec<Header>,
-    /// Response bytes, read through the asset host.
     pub body: Handle,
 }
 
-/// Stable failure classes returned by the broker HTTP host.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HttpErrorCode {
-    /// The method was not an HTTP token.
     InvalidMethod,
-    /// The URI was invalid or unsupported.
     InvalidUri,
-    /// A header was malformed or guest-controlled when broker ownership was required.
     InvalidHeader,
-    /// The encoded request exceeded an authorized bound.
     RequestTooLarge,
-    /// Policy denied the request.
     Denied,
-    /// The invocation exhausted its host-call budget.
     HostCallLimit,
-    /// Destination resolution failed or was rejected.
     Dns,
-    /// A connection could not be established.
     Connect,
-    /// TLS negotiation or validation failed.
     Tls,
-    /// The bounded operation timed out.
     Timeout,
-    /// The remote peer violated HTTP protocol expectations.
     Protocol,
-    /// The response exceeded an authorized bound.
     ResponseTooLarge,
-    /// The broker encountered an internal failure.
     Internal,
 }
 
 impl HttpErrorCode {
-    /// Returns the WIT enum name for this class.
-    ///
-    /// These are the stable machine-readable identifiers of the `dekopon:http@1.0.0` contract,
-    /// defined by its `error-code` enum. The Rust variant name is not part of that contract,
-    /// so anything a provider stringifies must use this instead.
+    /// Returns the WIT contract's stable error-code name rather than the Rust variant name, since a
+    /// provider's stringified error must match the wire contract, not this crate's naming.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -280,12 +212,9 @@ impl fmt::Display for HttpErrorCode {
     }
 }
 
-/// A bounded failure returned across the HTTP component boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HttpError {
-    /// Stable machine-readable class.
     pub code: HttpErrorCode,
-    /// Bounded provider-safe detail.
     pub message: String,
 }
 
@@ -297,16 +226,11 @@ impl fmt::Display for HttpError {
 
 impl Error for HttpError {}
 
-/// A request or header could not be represented as HTTP.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum BuildError {
-    /// Method was empty or contained a non-token byte.
     InvalidMethod(String),
-    /// URI was empty. Complete URI validation remains host-owned.
     EmptyUri,
-    /// Header name was empty or contained a non-token byte.
     InvalidHeaderName(String),
-    /// Header value contained a prohibited control byte.
     InvalidHeaderValue(String),
 }
 
@@ -325,10 +249,8 @@ impl fmt::Display for BuildError {
 
 impl Error for BuildError {}
 
-/// Sends one request through the broker-provided component import.
-///
-/// This function does not confer authority. The host validates the request against the current
-/// authorized invocation and may return [`HttpErrorCode::Denied`].
+/// Calling this confers no authority; the host validates the request against the current authorized
+/// invocation and may refuse it with Denied.
 pub fn send(request: Request) -> Result<Response, HttpError> {
     let request = bindings::dekopon::http::client::Request {
         method: request.method,
@@ -363,10 +285,8 @@ pub fn send(request: Request) -> Result<Response, HttpError> {
         })
 }
 
-/// Sends a host-composed request and returns an echo-scanned response handle.
-///
-/// This function grants no authority. The broker enforces HTTP and asset bounds, and requires
-/// its asset directory to be configured before spooling a response.
+/// Grants no authority; the broker enforces HTTP and asset bounds and must have its asset directory
+/// configured before it will spool a response.
 pub fn stream(request: StreamedRequest<'_>) -> Result<StreamedResponse, HttpError> {
     use bindings::dekopon::http::client as wit;
     let request = wit::StreamedRequest {
@@ -517,11 +437,6 @@ mod tests {
         assert!(Header::text("x-example", "safe\r\ninjected: value").is_err());
     }
 
-    /// The rendered code is the WIT enum name, read out of the contract itself.
-    ///
-    /// A provider that stringifies an error emits an identifier that flows into `ProviderError`
-    /// messages, `InvocationResult`, and payload-carrying telemetry. Rendering the Rust variant
-    /// spelling there would not match the contract's `error-code` enum.
     #[test]
     fn error_codes_render_the_wit_names() {
         let block = HTTP_WIT

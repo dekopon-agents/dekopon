@@ -78,12 +78,8 @@ pub use dekopon_storage_host::{
     ContinuityPolicy, StorageEvidence, StorageHost, StorageHostError, StorageLimits,
 };
 
-/// Re-exported so a test never mixes two semver-incompatible `dekopon-*` versions.
-///
-/// A provider repository pins its guest SDK exactly (`=0.10.0`, say) while taking this testkit as a
-/// development dependency at a different version. Both then exist in one dependency graph, and
-/// `CapabilityId` from one is not `CapabilityId` from the other. Importing the types above from
-/// here rather than from the guest SDK keeps a test on one side of that line.
+/// Re-exported here rather than from the guest SDK so a test does not accidentally mix two
+/// semver-incompatible dekopon-* versions of the same type.
 pub mod prelude {
     pub use super::{
         BrokerInvocationOutput, CapabilityId, CommandRunOutcome, FakeBroker, FakeBrokerError,
@@ -101,10 +97,8 @@ pub enum FakeBrokerError {
     /// [`FakeBrokerBuilder::provider`] was never called.
     #[error("no provider id was configured")]
     NoProvider,
-    /// The component path does not exist.
-    ///
-    /// Its own variant because it is overwhelmingly the first failure a new provider test hits:
-    /// the component is a build artifact, usually `.gitignore`d, and absent until `build.sh` runs.
+    /// The component path does not exist, usually because it is an untracked build artifact that
+    /// has not been built yet via build.sh.
     #[error("provider component {} does not exist; build it first", path.display())]
     ComponentMissing {
         /// The path that was configured.
@@ -151,11 +145,6 @@ impl FakeBrokerError {
     }
 }
 
-/// Chat-shaped scope material every storage grant is derived from.
-///
-/// [`StorageNamespace::Chat`] is the only namespace the storage host will grant — every other
-/// value is refused with `PermissionDenied` — so a provider with nothing to do with chat still
-/// needs a transport, channel, and conversation. These defaults are that ceremony, pre-filled.
 #[derive(Clone, Debug)]
 struct Scope {
     agent: String,
@@ -203,18 +192,13 @@ impl Default for FakeBrokerBuilder {
             storage_limits: StorageLimits::default(),
             host_limits: BrokerHostLimits::default(),
             host_options: BrokerHostOptions::default(),
-            // `ContinuityPolicy`'s own default is `AuthorityBound`, which mints a fresh
-            // non-reusing generation whenever the effective authority commitment changes. This
-            // harness holds the authority surface fixed, so today the two policies address the
-            // same namespace and nothing observable separates them. `Stable` is the default
-            // anyway: it is the policy that survives an authority change, so a harness that grows
-            // one later keeps addressing one namespace instead of silently starting over.
+            // Defaults to Stable, not the crate's own AuthorityBound default, because this harness
+            // holds authority fixed, so Stable is the policy that keeps addressing one namespace if
+            // that ever varies.
             continuity: ContinuityPolicy::Stable,
             scope: Scope::default(),
-            // Left unset so `build` can derive them from the host limits in force. An
-            // authorization may narrow a host ceiling but never widen one, so a hardcoded default
-            // here would be a second definition of a number this crate does not own — and one
-            // that fails every invocation the moment the two disagree.
+            // Left unset so build derives them from the host limits in force; a hardcoded default
+            // here would duplicate a number this crate does not own and could drift out of sync.
             timeout_ms: None,
             max_output_bytes: None,
         }
@@ -259,9 +243,9 @@ impl FakeBrokerBuilder {
         self
     }
 
-    /// Uses immutable, boot-verified, mmap-backed compiled components in a trusted directory.
-    ///
-    /// Do not modify mapped artifacts while a harness lives. Errors fail loading without fallback.
+    /// Uses immutable, boot-verified, mmap-backed compiled components from a trusted directory; do
+    /// not modify mapped artifacts while a harness is alive, since errors fail loading with no
+    /// fallback.
     #[must_use]
     pub fn compile_cache(mut self, directory: impl Into<PathBuf>) -> Self {
         self.host_options.cwasm_dir = Some(directory.into());
@@ -292,10 +276,8 @@ impl FakeBrokerBuilder {
         self
     }
 
-    /// Narrows the per-invocation wall-clock ceiling.
-    ///
-    /// Defaults to the host's own `max_timeout`. Raising it above that is refused at invocation
-    /// time, because an authorization may narrow a host ceiling but never widen one.
+    /// Narrows the per-invocation wall-clock ceiling below the host's own max_timeout; raising it
+    /// above that is refused, since an authorization may narrow a host ceiling but never widen it.
     #[must_use]
     pub const fn timeout_ms(mut self, timeout_ms: u64) -> Self {
         self.timeout_ms = Some(timeout_ms);
@@ -371,15 +353,13 @@ impl FakeBrokerBuilder {
     }
 }
 
-/// A loaded provider component with a real storage host behind it.
-///
-/// One `FakeBroker` is one durable namespace. Invocations made against it see each other's
-/// completed per-call writes, even if an invocation fails; there is no invocation-wide rollback.
+/// One FakeBroker is one durable namespace with a real storage host behind it; invocations see each
+/// other's completed per-call writes even after a failure, since there is no invocation-wide
+/// rollback.
 #[derive(Debug)]
 pub struct FakeBroker {
-    /// Owned so the storage root outlives every invocation; dropping this deletes the tree.
-    ///
-    /// Never read — the value exists for its `Drop`, which is what the leading underscore says.
+    /// Kept only for its Drop impl, which deletes the temporary storage root; the field itself is
+    /// never read.
     _temporary: TempDir,
     root: PathBuf,
     registry: BrokerProviderRegistry,
@@ -427,9 +407,8 @@ impl FakeBroker {
         input: Value,
     ) -> Result<BrokerInvocationOutput, FakeBrokerError> {
         let capability: CapabilityId = capability.parse()?;
-        // Grants are minted per invocation and consumed by it, so every call needs a fresh
-        // invocation id. The scope material around it stays fixed, which is what keeps successive
-        // calls addressing one namespace.
+        // Each invocation needs a fresh id since grants are minted and consumed per call; the scope
+        // material around it stays fixed, which is what keeps successive calls in one namespace.
         let sequence = self
             .invocations
             .fetch_add(1, Ordering::Relaxed)
@@ -464,8 +443,8 @@ impl FakeBroker {
             Actor::Agent {
                 agent: self.agent.clone(),
             },
-            // Sixteen ASCII bytes, so a trace that reaches a failure dump reads as the fixture it
-            // is rather than as a run somebody has to go looking for.
+            // Fixed sixteen-ASCII-byte trace ID so a failure dump reads as the fixture it is rather
+            // than as a real run someone has to hunt down.
             TraceId::new(*b"dekopon-testkit!").expect("the fixture bytes are not all zeroes"),
             input,
         );
@@ -484,19 +463,8 @@ impl FakeBroker {
             .map_err(|failure| FakeBrokerError::Invocation(Box::new(failure)))
     }
 
-    /// Runs one command word the component declared, as the sandboxed shell would.
-    ///
-    /// `argv` holds the arguments after the word and `stdin` the value piped into it. The answer
-    /// is what the broker host decodes from the guest: a page the provider rendered itself (help,
-    /// a version, a usage error) with its exit status, a capability proposal, or a decline.
-    /// Nothing is authorized or executed here — a proposal is the rewrite, not its result; run it
-    /// through [`FakeBroker::invoke`] to close the loop.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`FakeBrokerError::Host`] when the component declared no such word, `argv` plus
-    /// `stdin` exceed the host's input bound, the guest trapped, or its answer was not the wire
-    /// type.
+    /// Runs one command word as the sandboxed shell would, returning what the guest declared;
+    /// nothing is authorized here, so run the resulting proposal through invoke to execute it.
     pub async fn run_command(
         &self,
         word: &str,
@@ -506,12 +474,9 @@ impl FakeBroker {
         Ok(self.registry.run_command(word, argv, stdin).await?)
     }
 
-    /// Returns the storage root on disk.
-    ///
-    /// [`StorageEvidence`] counts the bytes an invocation read and wrote through storage, not what
-    /// the files hold afterwards, so a test asserting an on-disk size — that a write-ahead log was
-    /// truncated to zero, say — has to look at the tree. Note every path component is an opaque
-    /// SHA-256 token, so walk it rather than guessing names.
+    /// Returns the storage root on disk; StorageEvidence counts bytes moved, not final file sizes,
+    /// and every path component is an opaque SHA-256 token, so walk the tree rather than guessing
+    /// names.
     #[must_use]
     pub fn storage_root(&self) -> &Path {
         &self.root

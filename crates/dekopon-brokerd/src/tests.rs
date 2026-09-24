@@ -8,8 +8,6 @@ use sha2::{Digest as _, Sha256};
 
 use super::{config, current_uid, socket};
 
-/// The attested workflow policy: `cpetersen` may drive `chat-agent` and reach `cli-probe.upper`,
-/// but only through the gateway that vouched for them.
 const POLICIES: &str = r#"
 @id("chat-agent-session")
 permit(principal == Dekopon::Principal::"cpetersen",
@@ -52,13 +50,6 @@ fn write_config(path: &Path, document: &serde_json::Value) {
     );
 }
 
-/// A configuration whose attested path is complete end to end: a gateway peer holding an attestor
-/// grant, a mapping inside that grant, a policy file, and the constraint set the policy's
-/// capability needs.
-///
-/// The two peers under other UIDs are what `via` is for, and reaching them needs a group-traversable
-/// socket parent: under a private one `run` refuses both at startup, so a caller that runs this
-/// configuration chooses the parent's mode deliberately.
 fn attested_document(uid: u32) -> serde_json::Value {
     json!({
         "apiVersion": config::CONFIG_API_VERSION,
@@ -92,9 +83,6 @@ fn attested_document(uid: u32) -> serde_json::Value {
     })
 }
 
-/// The configuration layer owns two things the policy engine cannot see: that a deployment which
-/// declares executable capabilities also declares a policy, and that the policy file is owner-only
-/// trusted input read under the same rules as the configuration itself.
 #[tokio::test]
 async fn policy_and_constraint_configuration_is_resolved_and_owner_only() {
     let uid = current_uid();
@@ -133,7 +121,6 @@ async fn policy_and_constraint_configuration_is_resolved_and_owner_only() {
     assert!(resolved.policies.contains("agent.prompt"));
     assert_eq!(resolved.constraint_sets.len(), 1);
 
-    // Capabilities with no policy would refuse every request while looking configured.
     let mut orphaned = document.clone();
     orphaned
         .as_object_mut()
@@ -145,7 +132,6 @@ async fn policy_and_constraint_configuration_is_resolved_and_owner_only() {
         .expect_err("constraint sets without a policy file are a configuration mistake");
     assert!(matches!(error, config::ConfigError::MissingPoliciesPath));
 
-    // A world-readable policy file is authorization input anyone could rewrite.
     write_config(&path, &document);
     fs::set_permissions(&policies, fs::Permissions::from_mode(0o666))
         .expect("loosen policy fixture");
@@ -156,7 +142,6 @@ async fn policy_and_constraint_configuration_is_resolved_and_owner_only() {
     fs::set_permissions(&policies, fs::Permissions::from_mode(0o600))
         .expect("restore policy fixture");
 
-    // And a second hard link is a second writer nobody accounted for.
     let hard_link = directory.path().join("policies-hard-link.cedar");
     fs::hard_link(&policies, &hard_link).expect("create policy hard-link fixture");
     let error = config::load(&path, uid)
@@ -169,7 +154,6 @@ async fn policy_and_constraint_configuration_is_resolved_and_owner_only() {
         .expect("the restored policy file loads");
 }
 
-/// A managed lock resolves only local content-addressed paths, and legacy paths cannot be mixed in.
 #[tokio::test]
 async fn managed_provider_configuration_is_strict_and_network_free() {
     let uid = current_uid();
@@ -238,8 +222,6 @@ async fn managed_provider_configuration_is_strict_and_network_free() {
         Some(store.canonicalize().expect("canonical store").join("cwasm"))
     );
 
-    // This fixture directory is private, so the server's own UID is the only peer a socket bound
-    // under it could admit; `run` refuses the other two.
     let mut runnable = document.clone();
     runnable["identities"] = json!([document["identities"][0].clone()]);
     write_config(&path, &runnable);
@@ -285,10 +267,6 @@ async fn managed_provider_configuration_is_strict_and_network_free() {
     assert!(matches!(error, config::ConfigError::ProviderLock { .. }));
 }
 
-/// A peer that could never open the socket is the misconfiguration this refusal exists for: a
-/// private parent yields an owner-only socket, so a gateway under another UID loops on EACCES while
-/// the broker's own probe still reports healthy. Every offender is named at once, because an
-/// operator who corrects one at a time only reaches the next failed start.
 #[tokio::test]
 async fn every_peer_uid_a_private_socket_parent_excludes_is_named_at_startup() {
     let uid = current_uid();
@@ -307,8 +285,6 @@ async fn every_peer_uid_a_private_socket_parent_excludes_is_named_at_startup() {
     )
     .expect("checked cli-probe component");
     write_owner_only(&directory.path().join("cli-probe.wasm"), &component);
-    // The socket keeps its own parent: the audit log's parent must stay private whatever the
-    // socket's does, so one directory cannot express both deployments.
     let socket_parent = directory.path().join("run");
     fs::create_dir(&socket_parent).expect("create socket parent");
     fs::set_permissions(&socket_parent, fs::Permissions::from_mode(0o700))
@@ -333,8 +309,6 @@ async fn every_peer_uid_a_private_socket_parent_excludes_is_named_at_startup() {
         );
     }
 
-    // Group traversal on that parent is the deployment those peers need, and it is the only thing
-    // that changes here.
     fs::set_permissions(&socket_parent, fs::Permissions::from_mode(0o710))
         .expect("IPC socket parent");
     super::run(&path, async {})
@@ -342,9 +316,6 @@ async fn every_peer_uid_a_private_socket_parent_excludes_is_named_at_startup() {
         .expect("a group-traversable socket parent admits every configured peer");
 }
 
-/// Grants and mappings are owner-controlled identity machinery, so both fail closed on the shapes
-/// that would make attribution ambiguous: a namespace that is not a canonical subject prefix, and
-/// one subject naming two principals.
 #[tokio::test]
 async fn attestor_grants_and_subject_mappings_are_strictly_validated() {
     let uid = current_uid();
@@ -394,7 +365,6 @@ async fn attestor_grants_and_subject_mappings_are_strictly_validated() {
     }
 
     for scope in [
-        // The retired 0.13 tag: refused by name so the fix is one sentence.
         json!({
             "breadth": "exactChannel", "kind": "slack", "transport": "slack",
             "conversation": {"kind": "any"}
@@ -411,7 +381,6 @@ async fn attestor_grants_and_subject_mappings_are_strictly_validated() {
             "kind": "telegram", "transport": "telegram",
             "conversation": {"kind": ["channel"], "container": "t0123abc"}
         }),
-        // A bare kind word decodes to a narrower rule than it reads as, so it never decodes.
         json!({
             "kind": "slack", "transport": "slack", "conversation": {"kind": "channel"}
         }),
@@ -422,7 +391,6 @@ async fn attestor_grants_and_subject_mappings_are_strictly_validated() {
             "kind": "slack", "transport": "slack",
             "conversation": {"kind": ["channel"], "ids": [format!("c{}", "x".repeat(256))]}
         }),
-        // Grants never name a thread; `kind: [channel, thread]` is how threads are claimed.
         json!({
             "kind": "discord", "transport": "discord",
             "conversation": {"kind": ["thread"], "ids": ["123:456"]}
@@ -503,8 +471,6 @@ async fn strict_configuration_resolves_paths_and_rejects_unknown_fields() {
     assert!(config::load(&path, uid).await.is_err());
 }
 
-/// The plaintext opt-out is broker-level owner configuration, so it is validated at boot: an entry
-/// that could never match a host is a refusal here rather than a denied request weeks later.
 #[tokio::test]
 async fn plaintext_hosts_are_validated_at_startup() {
     let uid = current_uid();
@@ -534,7 +500,6 @@ async fn plaintext_hosts_are_validated_at_startup() {
         POLICIES.as_bytes(),
     );
 
-    // Absent section: the loopback-only default, and nothing for an operator to have written.
     write_config(&path, &document);
     let resolved = config::load(&path, uid)
         .await
@@ -552,7 +517,6 @@ async fn plaintext_hosts_are_validated_at_startup() {
         resolved.plaintext_hosts.iter().collect::<Vec<_>>(),
         ["openobserve.openobserve.svc", "rpi.lan"]
     );
-    // The host that enforces the rule gets the same list; nothing else has to agree with it.
     assert!(resolved.host_options.plaintext_hosts.contains("rpi.lan"));
 
     let ca_file = directory.path().join("root.pem");
@@ -613,7 +577,6 @@ async fn plaintext_hosts_are_validated_at_startup() {
         Err(config::ConfigError::InvalidHttpsConfiguration)
     ));
 
-    // Each of these is a refusal at boot, naming the entry the operator has to fix.
     for entry in [
         "http://rpi.lan",
         "rpi.lan:5080",
@@ -637,7 +600,6 @@ async fn plaintext_hosts_are_validated_at_startup() {
         );
     }
 
-    // `deny_unknown_fields` still holds inside the new section: a typo is not a silent empty list.
     let mut typo = document;
     typo["http"] = json!({"plainTextHosts": ["rpi.lan"]});
     write_config(&path, &typo);
@@ -652,7 +614,6 @@ async fn plaintext_hosts_are_validated_at_startup() {
     );
 }
 
-/// There is no on-disk audit sink, so its two fields refuse startup and the refusal names each one.
 #[tokio::test]
 async fn an_audit_path_in_config_is_refused() {
     let uid = current_uid();
@@ -690,7 +651,6 @@ async fn an_audit_path_in_config_is_refused() {
     }
 }
 
-/// Telemetry is optional, strict when present, and never a place to put a credential.
 #[tokio::test]
 async fn telemetry_section_is_optional_and_strict() {
     let uid = current_uid();
@@ -751,9 +711,6 @@ async fn telemetry_section_is_optional_and_strict() {
         settings.settings.timeout(),
         std::time::Duration::from_millis(5_000)
     );
-    // A partial section, an unknown transport, a zero timeout, and a retired key are all rejected
-    // rather than quietly defaulted; the section follows the same all-fields-required rule as every
-    // other one.
     for broken in [
         json!({"endpoint": "http://rpi.localdomain", "transport": "grpc"}),
         json!({
@@ -774,9 +731,6 @@ async fn telemetry_section_is_optional_and_strict() {
             "serviceName": "dekopon-brokerd",
             "exportTimeoutMs": 5000
         }),
-        // `telemetryPayloads` is gone rather than ignored. A config that still carries it is
-        // refused at startup, so an operator upgrading finds out at once instead of discovering
-        // months later that the key stopped meaning anything.
         json!({
             "endpoint": "http://rpi.localdomain",
             "transport": "grpc",
@@ -784,8 +738,6 @@ async fn telemetry_section_is_optional_and_strict() {
             "exportTimeoutMs": 5000,
             "telemetryPayloads": false
         }),
-        // A credential has no slot here. It belongs in `OTEL_EXPORTER_OTLP_HEADERS`, which the
-        // SDK reads directly, so an unknown field is the correct answer rather than a warning.
         json!({
             "endpoint": "http://rpi.localdomain",
             "transport": "http",
@@ -863,7 +815,6 @@ async fn stale_socket_is_replaced_but_guard_never_removes_a_new_inode() {
     fs::remove_file(path).expect("remove replacement fixture");
 }
 
-/// Builds a minimal valid configuration document whose `providers` list is caller-supplied.
 fn provider_config(uid: u32, providers: serde_json::Value) -> serde_json::Value {
     json!({
         "apiVersion": config::CONFIG_API_VERSION,
@@ -879,11 +830,6 @@ fn provider_config(uid: u32, providers: serde_json::Value) -> serde_json::Value 
     })
 }
 
-/// A directory entry loads every `*.wasm` directly inside it, in filename order.
-///
-/// The sort is the point. The registry builds its capability route table in load order, so
-/// readdir order would make two runs over one directory disagree about which provider claimed a
-/// duplicate capability.
 #[tokio::test]
 async fn a_provider_directory_expands_in_filename_order() {
     let uid = current_uid();
@@ -894,11 +840,9 @@ async fn a_provider_directory_expands_in_filename_order() {
     fs::set_permissions(&providers, fs::Permissions::from_mode(0o755))
         .expect("secure provider directory");
 
-    // Written in an order that is neither sorted nor reverse-sorted.
     for name in ["middle.wasm", "alpha.wasm", "zulu.wasm"] {
         fs::write(providers.join(name), b"component fixture").expect("write component fixture");
     }
-    // Neither of these is a component: one has the wrong extension, one is a directory.
     fs::write(providers.join("notes.txt"), b"not a component").expect("write decoy");
     fs::create_dir(providers.join("nested.wasm")).expect("create decoy directory");
 
@@ -917,11 +861,6 @@ async fn a_provider_directory_expands_in_filename_order() {
     );
 }
 
-/// A directory anyone can write to is a directory anyone can add a provider to, and a provider is
-/// code the broker compiles and runs.
-///
-/// The ownership half of the same check cannot be exercised without a second UID, and it is the
-/// adjacent condition in the same expression as the mode check this proves.
 #[tokio::test]
 async fn a_group_writable_provider_directory_refuses_to_load() {
     let uid = current_uid();
@@ -943,7 +882,6 @@ async fn a_group_writable_provider_directory_refuses_to_load() {
         "{error:?}"
     );
 
-    // The same directory, tightened, loads. This is what proves the refusal was about the mode.
     fs::set_permissions(&providers, fs::Permissions::from_mode(0o755))
         .expect("secure provider directory");
     config::load(&path, uid)
@@ -975,9 +913,6 @@ fn host_limits_document(max_total_memory_bytes: Option<u64>) -> serde_json::Valu
     limits
 }
 
-/// The aggregate ceiling used to be the one bound that only existed if an operator remembered to
-/// write it, which is why the worst case was 4 GiB. It now defaults, and an omitted `hostLimits`
-/// block, a partial one, and an explicit `null` are three different answers rather than one.
 #[tokio::test]
 async fn the_aggregate_memory_ceiling_defaults_to_256_mib() {
     let uid = current_uid();
@@ -991,7 +926,6 @@ async fn the_aggregate_memory_ceiling_defaults_to_256_mib() {
     .expect("write provider path fixture");
     write_owner_only(&policies, POLICIES.as_bytes());
 
-    // An absent block.
     let mut document = attested_document(uid);
     write_config(&path, &document);
     let resolved = config::load(&path, uid)
@@ -1007,7 +941,6 @@ async fn the_aggregate_memory_ceiling_defaults_to_256_mib() {
         "the documented default and the constant are one fact"
     );
 
-    // A complete block that names every other field still defaults this one.
     document["hostLimits"] = host_limits_document(None);
     write_config(&path, &document);
     let resolved = config::load(&path, uid)
@@ -1018,7 +951,6 @@ async fn the_aggregate_memory_ceiling_defaults_to_256_mib() {
         Some(dekopon_broker_host::DEFAULT_MAX_TOTAL_MEMORY_BYTES)
     );
 
-    // Only an explicit null asks for the old unbounded behavior.
     document["hostLimits"] = json!({ "maxTotalMemoryBytes": serde_json::Value::Null });
     write_config(&path, &document);
     let resolved = config::load(&path, uid)
@@ -1027,8 +959,6 @@ async fn the_aggregate_memory_ceiling_defaults_to_256_mib() {
     assert_eq!(resolved.host_options.max_total_memory_bytes, None);
 }
 
-/// Per-store limits bound one invocation; the connection ceiling decides how many exist at once.
-/// Configuration is where that product becomes a stated number rather than an OOM kill.
 #[tokio::test]
 async fn concurrent_guest_memory_budget_is_resolved_and_validated() {
     let uid = current_uid();
@@ -1059,7 +989,6 @@ async fn concurrent_guest_memory_budget_is_resolved_and_validated() {
         resolved.server_limits.max_connections * resolved.host_limits.max_memory_bytes
     );
 
-    // A ceiling below one store could never admit a single invocation.
     document["hostLimits"] = host_limits_document(Some(
         u64::try_from(dekopon_broker_host::BrokerHostLimits::default().max_memory_bytes)
             .expect("default fits u64")
@@ -1075,10 +1004,6 @@ async fn concurrent_guest_memory_budget_is_resolved_and_validated() {
     );
 }
 
-/// An all-or-nothing limits block is a bound nobody sets: `hostLimits` alone is fifteen fields to
-/// restate before the aggregate memory budget can be raised. Each field now defaults on its own to
-/// exactly the value the absent block produces — and a partial block still meets every cross-field
-/// check, because merging defaults happens before validation rather than instead of it.
 #[tokio::test]
 async fn a_partial_limits_block_takes_the_absent_block_defaults_and_is_still_validated() {
     let uid = current_uid();
@@ -1107,8 +1032,6 @@ async fn a_partial_limits_block_takes_the_absent_block_defaults_and_is_still_val
     );
     assert_eq!(resolved.broker_limits.max_constraint_sets, 2_048);
 
-    // Defaulting the omitted fields must not defeat the checks that read them together: an
-    // aggregate ceiling below the defaulted per-store ceiling still refuses.
     document["hostLimits"] = json!({"maxTotalMemoryBytes": defaults.max_memory_bytes - 1});
     write_config(&path, &document);
     let error = config::load(&path, uid)
@@ -1119,7 +1042,6 @@ async fn a_partial_limits_block_takes_the_absent_block_defaults_and_is_still_val
         "{error:?}"
     );
 
-    // An unknown field inside a partial block is still rejected.
     document["hostLimits"] = json!({"maxTotalMemoryBytes": 256 * 1024 * 1024, "typo": 1});
     write_config(&path, &document);
     let error = config::load(&path, uid)
@@ -1131,8 +1053,6 @@ async fn a_partial_limits_block_takes_the_absent_block_defaults_and_is_still_val
     );
 }
 
-/// An empty directory is almost certainly a mount that did not happen or a build that did not run,
-/// so it gets its own error rather than the generic "no providers".
 #[tokio::test]
 async fn an_empty_provider_directory_is_named_in_its_own_error() {
     let uid = current_uid();
@@ -1153,7 +1073,6 @@ async fn an_empty_provider_directory_is_named_in_its_own_error() {
     );
 }
 
-/// Files and directories mix in one list, and a component reachable two ways is still one provider.
 #[tokio::test]
 async fn file_and_directory_entries_mix_and_still_deduplicate() {
     let uid = current_uid();
@@ -1174,8 +1093,6 @@ async fn file_and_directory_entries_mix_and_still_deduplicate() {
     let resolved = config::load(&path, uid).await.expect("mixed config loads");
     assert_eq!(resolved.providers.len(), 2);
 
-    // The same component named directly and reached through the directory is one provider, and
-    // naming it twice is the configuration mistake `DuplicateProviderPath` exists for.
     write_config(
         &path,
         &provider_config(uid, json!(["providers/cli-probe.wasm", "providers"])),
@@ -1189,7 +1106,6 @@ async fn file_and_directory_entries_mix_and_still_deduplicate() {
     );
 }
 
-/// The pre-expansion bound limits what the file may say; this one limits what it resolves to.
 #[tokio::test]
 async fn a_directory_expanding_past_the_provider_ceiling_refuses_to_load() {
     let uid = current_uid();
@@ -1207,8 +1123,6 @@ async fn a_directory_expanding_past_the_provider_ceiling_refuses_to_load() {
         .expect("write component fixture");
     }
 
-    // One entry in the file, so the pre-expansion check passes and only the post-expansion one
-    // can catch this.
     write_config(&path, &provider_config(uid, json!(["providers"])));
     let error = config::load(&path, uid)
         .await
@@ -1304,9 +1218,6 @@ async fn configured_storage_ancestor_symlinks_are_not_canonicalized_away() {
     assert!(!actual.join("provider-storage").exists());
 }
 
-/// A refused deployment has to name the bound it broke. Both of these sections are validated by
-/// another crate that already says which field and which ceiling, and the operator reading a
-/// failed start is the only audience for that.
 #[tokio::test]
 async fn refused_storage_and_frame_bounds_keep_the_field_that_refused_them() {
     let uid = current_uid();
@@ -1463,8 +1374,6 @@ fn storage_section_is_optional_all_or_nothing_and_strict() {
     );
 }
 
-/// The namespace key is gone. A configuration still naming it is refused, and the error says which
-/// field, rather than the key quietly going unread while the operator believes it protects names.
 #[test]
 fn an_old_config_naming_namespace_key_path_is_refused() {
     let mut document = attested_document(current_uid());
@@ -1489,12 +1398,6 @@ fn an_old_config_naming_namespace_key_path_is_refused() {
     );
 }
 
-/// The startup frame check exists so an oversized capability response fails here rather than on
-/// the first session. It used to measure only the direct peers, and in the deployment it is written
-/// for the direct peer is the gateway — granted almost nothing. The capability sets that actually
-/// reach the wire belong to the attested principals the identity mappings name, on the attested
-/// `capabilities` path the check skipped, so the oversized response passed startup and then
-/// failed `write_frame` on every session open.
 #[tokio::test]
 async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
     use std::sync::Arc;
@@ -1547,8 +1450,6 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
     )
     .expect("broker starts");
 
-    // The gateway peer itself: it may attest for others and holds no capability of its own, so its
-    // own answer is empty and fits anything.
     let gateway = AuthenticatedContext::new(
         "gateway".parse().expect("valid principal"),
         Actor::Service {
@@ -1571,7 +1472,6 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
     .expect("peer response encodes")
     .len();
 
-    // A session's answer under `chat-agent` carries the real capability, so it is strictly larger.
     let (capabilities, words) = broker.capability_ceiling();
     assert!(
         !capabilities.is_empty(),
@@ -1606,7 +1506,6 @@ async fn the_startup_frame_check_covers_more_than_the_direct_peers() {
     .len();
     assert!(ceiling_bytes > peer_bytes);
 
-    // A frame that fits every direct peer and nothing else used to pass startup.
     let error = validate_capability_responses(&broker, &identities, peer_bytes)
         .expect_err("a frame that cannot carry a session's answer must refuse to start");
     assert!(
@@ -1650,7 +1549,6 @@ async fn ipc_group_socket_keeps_private_paths_private_and_replaces_only_safe_sta
             Err(super::SocketError::AlreadyRunning { .. })
         ));
         drop(listener);
-        // Keep the inode at the original path while relinquishing the first guard.
         let parked = directory.path().join("parked.sock");
         fs::rename(&path, &parked).unwrap();
         guard.cleanup().unwrap();
@@ -1698,10 +1596,6 @@ async fn ipc_group_socket_keeps_private_paths_private_and_replaces_only_safe_sta
         ));
     }
 
-    // Parent modes are half of the same rule, so both sides are pinned against the same directory.
-    // A shared-IPC socket belongs to the `0700` refusals as well: the broker binds under a private
-    // parent, but never this socket, and a client that trusted it would be trusting one the broker
-    // would refuse to reopen.
     fs::set_permissions(&path, fs::Permissions::from_mode(0o660)).unwrap();
     let limits = FrameLimits {
         max_frame_bytes: 64 * 1024,
@@ -1719,8 +1613,6 @@ async fn ipc_group_socket_keeps_private_paths_private_and_replaces_only_safe_sta
             "the client trusted parent {mode:o}"
         );
     }
-    // The parents the broker does bind a shared socket under are the parents its clients reach it
-    // through: nothing here answers, so the exchange fails on the read deadline instead.
     for mode in [0o710, 0o750, 0o2710] {
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(mode)).unwrap();
         let client = BrokerClient::new(&path, uid, limits).unwrap();

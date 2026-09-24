@@ -1,14 +1,3 @@
-//! What an operator can read after a connection fails.
-//!
-//! Every failure below answers the client with a deliberately generic wire code, so the log line is
-//! the only place the cause exists. The named risk this exists for is a full or failing audit
-//! filesystem: before, that produced a stream of `broker_connection_failed category=broker` with no
-//! io error, no bound, and no invocation to reconcile.
-//!
-//! This lives in its own test binary because `tracing` resolves per-callsite interest against the
-//! global dispatcher, so a sibling test reaching these callsites with no subscriber installed can
-//! disable them for the whole process.
-
 #![allow(
     clippy::disallowed_methods,
     clippy::disallowed_types,
@@ -45,10 +34,6 @@ use tokio::{
 };
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
-/// One fixture trace context for every request these tests build.
-///
-/// The trace is mandatory on the wire now; these cases read invocation identifiers and audit
-/// fields rather than the trace itself, so one shared value keeps the fixtures about their subject.
 const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
 
 const POLICY: &str = r#"
@@ -60,10 +45,6 @@ when { context has agent && context.agent == "brokerd-test" }
 unless { context has via };
 "#;
 
-/// Drains the capture once `marker` has arrived.
-///
-/// The events under test are emitted by a connection task the client never waits for, so a fixed
-/// sleep would only decide how flaky this is on a loaded machine.
 async fn take_after(captured: &CaptureLayer, marker: &str) -> String {
     for _ in 0..200 {
         if captured.saw(marker) {
@@ -84,11 +65,6 @@ fn context() -> AuthenticatedContext {
     .expect("trusted context binds")
 }
 
-/// A fixture directory the broker binds under and its client connects through.
-///
-/// `tempfile::tempdir` applies the process umask, which normally leaves the directory
-/// world-traversable — a parent both sides of the socket rule refuse, so a client under one never
-/// reaches the audit failure this file is about.
 fn private_directory() -> tempfile::TempDir {
     let directory = tempfile::tempdir().expect("create fixture directory");
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700))
@@ -113,8 +89,6 @@ fn limits() -> ServerLimits {
     }
 }
 
-/// One audit slot: an allowed invocation spends it on its decision, so its terminal append is
-/// already doomed when the provider runs.
 async fn broker(audit_bound: usize) -> Arc<Broker<InMemoryAuditLog>> {
     let registry = BrokerProviderRegistry::load(
         [provider_fixture("cli-probe-provider.wasm")],
@@ -175,8 +149,6 @@ fn identities(uid: u32) -> BTreeMap<u32, MappedPeer> {
     identities
 }
 
-/// Writes one raw length-prefixed frame, bypassing the client that would refuse to build it, and
-/// returns the wire code the server answers with.
 async fn write_raw(socket: &Path, prefix: u32, body: &[u8], limits: FrameLimits) -> String {
     let mut stream = UnixStream::connect(socket).await.expect("connect fixture");
     stream
@@ -194,9 +166,6 @@ async fn write_raw(socket: &Path, prefix: u32, body: &[u8], limits: FrameLimits)
     code
 }
 
-/// A timeout, an oversized frame, and unreadable JSON all answer `invalid-request`. The kind is
-/// what separates "a client is misbehaving" from "the frame ceiling is too small for this input".
-/// An unmapped peer answers `unauthenticated` and is named nowhere else at all.
 #[tokio::test(flavor = "multi_thread")]
 async fn framing_audit_and_unmapped_peer_failures_name_their_cause() {
     let captured = CaptureLayer::workspace();
@@ -223,7 +192,6 @@ async fn framing_audit_and_unmapped_peer_failures_name_their_cause() {
     assert_eq!(code, ERROR_INVALID_REQUEST);
     let unreadable = take_after(&captured, "broker_request_frame_invalid").await;
     assert!(unreadable.contains("deserialize"), "{unreadable}");
-    // The frame's own bytes are not diagnostics: an untrusted payload must not become a log field.
     assert!(
         !unreadable.contains("this is not protocol json"),
         "{unreadable}"
@@ -233,14 +201,8 @@ async fn framing_audit_and_unmapped_peer_failures_name_their_cause() {
     assert_eq!(oversized_code, ERROR_INVALID_REQUEST);
     let oversized = take_after(&captured, "broker_request_frame_invalid").await;
     assert!(oversized.contains("frame-too-large"), "{oversized}");
-    // The bound and the attempted size are the whole answer to "why did that call fail".
     assert!(oversized.contains("65536"), "{oversized}");
 
-    // A piped value rides a `runCommand` frame under the same ceiling: a real frame carrying a
-    // value twice the bound is refused from its length prefix before a byte of it is read.
-    // Send only that real frame's length: write_all may perform partial stream writes, so
-    // sending the body would race the server's refusal and close. Withholding it also proves
-    // that rejection does not wait for (or drain) an oversized body.
     let oversized_run = serde_json::to_vec(&RequestEnvelope::run_command(
         None,
         "probe".to_owned(),
@@ -265,8 +227,6 @@ async fn framing_audit_and_unmapped_peer_failures_name_their_cause() {
     );
     assert!(oversized_stdin.contains("65536"), "{oversized_stdin}");
 
-    // The consequential one: the decision landed, the provider ran, and nothing recorded the
-    // outcome. The invocation identifier and the audit cause both have to survive to the log.
     let client = BrokerClient::new(&socket_path, uid, limits().frame).expect("client starts");
     let request = InvocationRequest {
         id: "invoke-unaudited"
@@ -283,10 +243,6 @@ async fn framing_audit_and_unmapped_peer_failures_name_their_cause() {
         .invoke(None, request, Default::default())
         .await
         .expect_err("a terminal audit failure is not a successful invocation");
-    // The connection's own verdict is observed the moment its task finishes, with the server still
-    // accepting and no second client on the way. It used to wait inside the `JoinSet` for the next
-    // accept or for shutdown, so on a quiet broker the one failure an operator must act on was
-    // reported whenever the next connection happened to arrive.
     let unaudited = take_after(&captured, "broker_outcome_unaudited").await;
     assert!(
         unaudited.contains("broker_audit_append_failed"),
@@ -295,22 +251,11 @@ async fn framing_audit_and_unmapped_peer_failures_name_their_cause() {
     assert!(unaudited.contains("\"full\""), "{unaudited}");
     assert!(unaudited.contains("\"outcome\""), "{unaudited}");
     assert!(unaudited.contains("invoke-unaudited"), "{unaudited}");
-    // The chain, not just the category: the bound the log used to omit entirely.
     assert!(
         unaudited.contains("audit log reached its 1-record bound"),
         "{unaudited}"
     );
 
-    // The refusal that names its peer nowhere on the wire. A broker whose `identities` omit its
-    // own UID refuses its own readiness probe exactly like a stranger, so a pod that starts and
-    // never becomes ready has this line and nothing else to explain itself.
-    //
-    // A bare connection rather than a `BrokerClient`: this is the one refusal the broker writes
-    // before reading anything, and it closes the socket with it. A client reads its peer's
-    // credentials just after connecting, and macOS reports none for a socket already
-    // disconnected, so which failure a client surfaces here is a matter of timing. This event is
-    // not. What the peer is told is `server.rs`'s half; the connection stays open so the
-    // broker's write of it has somewhere to land.
     let unmapped_path = directory.path().join("unmapped.sock");
     let unmapped_listener = bind_fixture(&unmapped_path);
     let unmapped_server =

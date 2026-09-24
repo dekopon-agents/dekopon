@@ -1,74 +1,3 @@
-//! The `jq` builtin, backed by the real jaq interpreter.
-//!
-//! This wraps `jaq-core`, `jaq-std`, and `jaq-json` as a library rather than hand-rolling a jq
-//! subset. A model that knows jq gets jq, not an approximation of it that quietly differs.
-//!
-//! Embedding a complete, Turing-complete language inside a sandbox needs two things the rest of
-//! this crate does not, and [`evaluate`] handles both:
-//!
-//! - jq's standard library reaches the host. `jaq_std::funs()` exports `env`, which returns
-//!   [`std::env::vars`] — a script could dump the host process environment and pipe it into any
-//!   provider command word, defeating this crate's "never reads the host process environment"
-//!   guarantee outright.
-//!   The function set is therefore filtered by name rather than taken wholesale.
-//! - jaq has no fuel meter and offers no safe point to interrupt from outside, so nothing in a
-//!   tree-walking evaluator can stop `jq 'def f: f; f'`. Every other builtin returns to the
-//!   evaluator often enough for the budget to bite; this one need not return at all.
-//!
-//! The filter therefore runs on a worker thread and the outputs come back over a rendezvous
-//! channel. The evaluator charges each output against the step and value-byte budgets, and waits
-//! for the next one only until the script's deadline. The cost is stated plainly: a filter that is
-//! still running when the deadline passes is *abandoned*, not stopped. That is a worse outcome than
-//! a fuel meter and a better one than a runner that hangs forever, and it makes the wall-clock
-//! bound this crate advertises true for `jq` as well.
-//!
-//! # The worker is per thread, not per filter
-//!
-//! `jq` is the hottest builtin in model-written scripts — `gh ... | jq ...` is the shape of most
-//! of them — and each call is one step of a script's budget. Spawning and joining an operating-
-//! system thread for every one of those was the largest fixed cost in the builtin, so a thread that
-//! has run a filter keeps its worker parked on the job channel and hands it the next one.
-//!
-//! [`retire`] is what keeps that safe. A worker inside a filter nobody can stop must never be
-//! offered another, so the same act that charges an abandonment also drops this thread's handle:
-//! the next filter gets a freshly spawned worker, and the abandoned one exits by itself if its
-//! filter ever returns and finds nobody left to serve. A worker that died with a panicking filter
-//! is answered identically, one send failure later.
-//!
-//! # Values cross as values
-//!
-//! Both sides of the boundary speak [`serde_json::Value`], and jaq's [`Val`] implements
-//! `Deserialize`, so the input is deserialized straight into a `Val` — moving each string's buffer
-//! rather than copying it — and each output is converted back structurally. Rendering the input to
-//! JSON text, re-parsing it, rendering every output to text, and re-parsing *that* was four full
-//! passes over a payload that is routinely multiple kilobytes.
-//!
-//! One thing is lost with the text and restored deliberately: `serde_json` refuses to parse more
-//! than [`MAX_OUTPUT_DEPTH`] nested containers, and that ceiling was the only thing standing
-//! between a filter like `reduce range(100000) as $i (.; [.])` and a recursive conversion deep
-//! enough to abort the host process. [`convert`] applies it itself.
-//!
-//! # What an abandoned worker costs, and what bounds it
-//!
-//! Abandonment is not uniformly expensive. Dropping the receiver disconnects the channel, so a
-//! filter that produces *any* output fails its next `send` and returns — which is the cooperative
-//! cancellation check, sited at the only place jaq hands control back. A wrapping iterator over
-//! `compiled.id.run()` would stop such a filter one output earlier and nothing more.
-//!
-//! The residual is the filter that never yields at all: `jq 'def f: f; f'`, `jq 'last(repeat(0))'`.
-//! jaq offers no interruption point inside it, so its thread spins at 100% of a core until the
-//! process exits. In a long-lived host with a one-core limit that is not a leak to discover from a
-//! flame graph, so two things bound it here:
-//!
-//! - every abandonment logs a `tracing::warn!` carrying the elapsed time and this process's running
-//!   total, and [`crate::abandoned_filter_workers`] exposes how many are still going, and
-//! - once [`MAX_ABANDONED_WORKERS`] of them are outstanding, `jq` refuses to start another filter
-//!   rather than adding one more spinning thread to a host that is already saturated.
-//!
-//! The count is of *live* abandoned workers, not of abandonments: one that notices the closed
-//! channel decrements it immediately, so a script that merely exhausted its value budget does not
-//! spend the process's allowance.
-
 use std::{
     cell::{Cell, RefCell},
     io,
@@ -90,14 +19,10 @@ use serde_json::Value;
 use super::{Builtin, BuiltinContext, CommandFailure, CommandResult, unsupported_flag};
 use crate::limits::Budget;
 
-/// jq standard-library filters that reach outside this interpreter's value space.
-///
-/// `env` reads the host process environment; `now` reads the host wall clock. Neither is
-/// reachable through any other path in this crate, and a script that names one gets jaq's ordinary
-/// "undefined filter" error rather than a silent answer.
+/// env reads the host process environment and now reads the host wall clock; neither is reachable
+/// any other way in this crate, so both are excluded from the filter set.
 const HOST_REACHING_FILTERS: &[&str] = &["env", "now"];
 
-/// `jq [-r|--raw-output] FILTER`.
 pub(crate) struct Jq;
 
 impl Builtin for Jq {
@@ -114,10 +39,6 @@ impl Builtin for Jq {
         let mut filter = None;
         for argument in arguments {
             match argument.as_str() {
-                // `-r` and `-c` are accepted and documented as no-ops rather than rejected: the
-                // value model already emits string results verbatim and renders structures
-                // compactly, so raw compact output is this shell's only output mode. Nothing is
-                // silently different from what these flags request.
                 "-r" | "--raw-output" | "-c" | "--compact-output" => {}
                 flag if flag.starts_with('-') && flag.len() > 1 => {
                     return Err(unsupported_flag("jq", flag));
@@ -140,40 +61,18 @@ impl Builtin for Jq {
     }
 }
 
-/// How many abandoned filter workers this process tolerates before refusing to start another.
-///
-/// A soft threshold, not a reservation: admission reads the count without claiming a slot, so
-/// filters admitted together can all be abandoned past it. The worst case is this ceiling minus one
-/// plus every filter the gateway runs at once.
-///
-/// Only workers that never yield can accumulate here, and each one is a core spinning until the
-/// process exits. On the one-core deployment this crate is embedded in, four is already most of the
-/// machine — past that, the honest answer to a new filter is that there is nothing left to run it
-/// with, rather than one more thread nobody can stop.
+/// A soft threshold, not a reservation, so admitted filters can overshoot it; on this crate's
+/// one-core deployment, four already-spinning cores is most of the machine.
 const MAX_ABANDONED_WORKERS: usize = 4;
 
-/// Abandoned filter workers that have not yet noticed nobody is listening.
 static ABANDONED_WORKERS: AtomicUsize = AtomicUsize::new(0);
 
-/// Every abandonment this process has seen, for the warning's running total.
 static TOTAL_ABANDONMENTS: AtomicU64 = AtomicU64::new(0);
 
-/// Returns how many abandoned `jq` filter workers are still running in this process.
-///
-/// See [`crate::abandoned_filter_workers`], which is this counter's public face.
 pub(crate) fn abandoned_workers() -> usize {
     ABANDONED_WORKERS.load(Ordering::SeqCst)
 }
 
-/// One *filter's* liveness, shared with the evaluator paying for it.
-///
-/// Scoped to a job rather than to the thread serving it: a worker outlives the filters it runs, and
-/// what is charged, released, and counted is a filter nobody could stop.
-///
-/// Whichever side reaches the end first wins the exchange: the evaluator charges an abandonment
-/// only when the filter had not already returned, and the worker releases that charge only when its
-/// filter was in fact the one abandoned. Without the exchange, a filter that finishes in the same
-/// instant the deadline trips would be counted as spinning forever.
 struct Worker(AtomicU8);
 
 impl Worker {
@@ -185,9 +84,6 @@ impl Worker {
         Self(AtomicU8::new(Self::RUNNING))
     }
 
-    /// Called from the worker thread when its filter is done, however it ended.
-    ///
-    /// Returns whether this released an abandonment charged against the process.
     fn finish(&self) -> bool {
         if self
             .0
@@ -205,10 +101,6 @@ impl Worker {
         true
     }
 
-    /// Called from the evaluator when it stops waiting.
-    ///
-    /// Returns this process's running abandonment total when the worker really was still going, and
-    /// `None` when it had already returned and nothing outlives the command.
     fn abandon(&self) -> Option<u64> {
         // Charge before publishing `ABANDONED`: `finish` releases the charge as soon as it sees that
         // state, and releasing first would wrap the count below zero. A lost exchange undoes the
@@ -235,11 +127,6 @@ impl Worker {
     }
 }
 
-/// Refuses a new filter once too many abandoned workers are still burning CPU.
-///
-/// A recoverable failure rather than a fatal one: the script sees `jq` fail, writes the reason, and
-/// carries on with whatever it can still do. Ending the whole script would punish it for a filter
-/// an earlier one wrote.
 fn admit(outstanding: usize) -> Result<(), CommandFailure> {
     if outstanding < MAX_ABANDONED_WORKERS {
         return Ok(());
@@ -250,7 +137,6 @@ fn admit(outstanding: usize) -> Result<(), CommandFailure> {
     )))
 }
 
-/// Marks the worker finished when its thread returns, including through a panic.
 struct FinishOnDrop(Arc<Worker>);
 
 impl Drop for FinishOnDrop {
@@ -259,65 +145,35 @@ impl Drop for FinishOnDrop {
     }
 }
 
-/// One message from the filter worker to the evaluator.
 enum Produced {
-    /// One output value, and the size of the JSON text it stands for.
-    Output {
-        /// The output, converted into this shell's value model.
-        value: Value,
-        /// What that value's JSON encoding weighs, for the value-byte budget.
-        bytes: u64,
-    },
-    /// The filter could not be compiled, failed while running, or produced a value JSON has no
-    /// form for.
+    Output { value: Value, bytes: u64 },
     Failed(String),
-    /// The filter's stream ended normally.
     Done,
 }
 
-/// Why the evaluator stopped collecting outputs.
 enum Stopped {
-    /// The worker reported the failure itself and is on its way out.
     Worker(CommandFailure),
-    /// The evaluator gave up first, so the filter is still running.
     Evaluator(CommandFailure),
 }
 
-/// One filter to run, handed to a worker over its job channel.
 struct Job {
     filter: String,
     input: Value,
-    /// This filter's liveness, shared with the evaluator paying for it.
     worker: Arc<Worker>,
-    /// Where this filter's outputs go. Dropping the far end is what tells it to stop.
     outputs: SyncSender<Produced>,
 }
 
 thread_local! {
-    /// This thread's parked filter worker, if it has one.
-    ///
-    /// Per thread rather than per process: scripts run concurrently on separate threads, and one
-    /// shared worker would serialize every `jq` in the host behind whichever script got there
-    /// first. Nothing here is `Sync`, which is the type system agreeing.
     static WORKER: RefCell<Option<SyncSender<Job>>> = const { RefCell::new(None) };
 
-    /// How many workers this thread has had to spawn, which is what reuse is measured against.
     static SPAWNED: Cell<u64> = const { Cell::new(0) };
 }
 
-/// Returns how many filter workers the calling thread has spawned.
 #[cfg(test)]
 fn workers_spawned() -> u64 {
     SPAWNED.get()
 }
 
-/// Hands one job to this thread's worker, spawning one when there is none to hand it to.
-///
-/// The handle is dropped rather than repaired whenever its worker becomes unusable — abandoned in
-/// [`evaluate`], or dead with a panicking filter here — so a send that fails means the worker is
-/// gone and a replacement is owed. Capacity one rather than a rendezvous: a worker that has just
-/// sent its last output is on its way back to the job channel but need not have arrived, and the
-/// caller has no reason to wait for that.
 fn submit(job: Job) -> Result<(), CommandFailure> {
     let job = WORKER.with_borrow(|worker| match worker {
         Some(jobs) => jobs.send(job).err().map(|returned| returned.0),
@@ -340,8 +196,6 @@ fn submit(job: Job) -> Result<(), CommandFailure> {
             CommandFailure::failed(format!("jq: could not start the filter evaluator: {error}"))
         })?;
     SPAWNED.set(SPAWNED.get().saturating_add(1));
-    // A fresh worker is parked on an empty channel of capacity one, so this cannot block and
-    // cannot fail.
     let sent = jobs.send(job);
     WORKER.replace(Some(jobs));
     #[allow(
@@ -352,12 +206,10 @@ fn submit(job: Job) -> Result<(), CommandFailure> {
     sent.map_err(|_| CommandFailure::failed("jq: the filter evaluator stopped before it started"))
 }
 
-/// Gives up this thread's worker, so the next filter is served by a new one.
 fn retire() {
     WORKER.replace(None);
 }
 
-/// Runs whatever filters this worker's thread is given, until nobody is left to give it any.
 fn serve(queue: &Receiver<Job>) {
     while let Ok(Job {
         filter,
@@ -366,14 +218,11 @@ fn serve(queue: &Receiver<Job>) {
         outputs,
     }) = queue.recv()
     {
-        // Scoped to one job: however this filter ends, an abandonment charged against it is
-        // released here, and the next job starts with its own liveness.
         let _finish = FinishOnDrop(worker);
         let message = match run_filter(&filter, input, &outputs) {
             Ok(()) => Produced::Done,
             Err(message) => Produced::Failed(message),
         };
-        // A closed receiver means the evaluator already gave up on this filter.
         #[allow(
             clippy::let_underscore_must_use,
             reason = "a closed receiver is the normal end of a filter the budget cut short, \
@@ -384,10 +233,6 @@ fn serve(queue: &Receiver<Job>) {
     }
 }
 
-/// Compiles and runs one jq filter over one value under the script's budget.
-///
-/// See the module documentation for why this crosses a thread boundary, and why it refuses to cross
-/// it at all once this process is carrying too many workers it can no longer stop.
 pub(crate) fn evaluate(
     filter: &str,
     input: Value,
@@ -412,9 +257,6 @@ pub(crate) fn evaluate(
         Err(Stopped::Worker(failure)) => Err(failure),
         Err(Stopped::Evaluator(failure)) => {
             if let Some(total) = worker.abandon() {
-                // This worker is inside a filter it may never leave, so it stops being this
-                // thread's worker. It exits by itself if the filter does return, and the next
-                // `jq` on this thread starts from a new one either way.
                 retire();
                 tracing::warn!(
                     event = "shell_jq_filter_abandoned",
@@ -430,7 +272,6 @@ pub(crate) fn evaluate(
     }
 }
 
-/// Pulls outputs off the channel, charging each one, until the filter or the budget ends.
 fn collect(receiver: &Receiver<Produced>, budget: &mut Budget) -> Result<Vec<Value>, Stopped> {
     let mut outputs = Vec::new();
     loop {
@@ -439,8 +280,8 @@ fn collect(receiver: &Receiver<Produced>, budget: &mut Budget) -> Result<Vec<Val
         let wait = budget.remaining().max(Duration::from_millis(1));
         match receiver.recv_timeout(wait) {
             Ok(Produced::Output { value, bytes }) => {
-                // Pulling one value is where a filter's work happens, so each pull is a step and
-                // re-reads the deadline. Without this a whole `jq` command cost exactly one step.
+                // Each pulled value is charged as its own step and re-reads the deadline; otherwise
+                // a whole jq command would cost exactly one step regardless of output count.
                 budget
                     .charge_step()
                     .map_err(|limit| Stopped::Evaluator(limit.into()))?;
@@ -457,7 +298,6 @@ fn collect(receiver: &Receiver<Produced>, budget: &mut Budget) -> Result<Vec<Val
                 budget
                     .check_deadline()
                     .map_err(|limit| Stopped::Evaluator(limit.into()))?;
-                // The clock has not actually passed the deadline, so keep waiting for the filter.
             }
             Err(RecvTimeoutError::Disconnected) => {
                 return Err(Stopped::Worker(CommandFailure::failed(
@@ -468,10 +308,6 @@ fn collect(receiver: &Receiver<Produced>, budget: &mut Budget) -> Result<Vec<Val
     }
 }
 
-/// Reduces a filter's output stream to one value.
-///
-/// A jq filter is a stream. One output stays scalar so `| jq .field | grep x` reads naturally;
-/// several outputs become a JSON array so nothing is silently discarded.
 fn reduce(outputs: Vec<Value>) -> Value {
     match outputs.len() {
         0 => Value::Null,
@@ -480,7 +316,6 @@ fn reduce(outputs: Vec<Value>) -> Value {
     }
 }
 
-/// Compiles one filter and streams its outputs, on the worker thread.
 fn run_filter(filter: &str, input: Value, sender: &SyncSender<Produced>) -> Result<(), String> {
     let definitions = jaq_core::defs()
         .chain(jaq_std::defs())
@@ -505,9 +340,6 @@ fn run_filter(filter: &str, input: Value, sender: &SyncSender<Produced>) -> Resu
         .compile(modules)
         .map_err(|errors| format!("jq: invalid filter: {}", describe_compile_errors(&errors)))?;
 
-    // Consuming rather than borrowing: `serde_json`'s owning deserializer moves each string's
-    // buffer into the `Val` that replaces it, so a multi-kilobyte payload changes hands without
-    // being copied, and the original is gone before the filter starts.
     let value = serde_json::from_value::<Val>(input)
         .map_err(|error| format!("jq: invalid input: {error}"))?;
 
@@ -516,8 +348,6 @@ fn run_filter(filter: &str, input: Value, sender: &SyncSender<Produced>) -> Resu
         let produced = result.map_err(describe_exception)?;
         let value = convert(&produced, 0)?;
         let bytes = weigh(&value);
-        // A closed receiver means the evaluator abandoned this filter, so there is nothing left
-        // to compute for.
         if sender.send(Produced::Output { value, bytes }).is_err() {
             return Ok(());
         }
@@ -525,11 +355,8 @@ fn run_filter(filter: &str, input: Value, sender: &SyncSender<Produced>) -> Resu
     Ok(())
 }
 
-/// Turns a filter's exception into this command's failure.
-///
-/// Stands in for `jaq_core::unwrap_valr`, which calls `std::process::exit` when a filter runs
-/// `halt`, `halt(n)` or `halt_error`. Here that would end the whole gateway, so a halt is an
-/// ordinary `jq` failure like any other.
+/// Stands in for jaq_core::unwrap_valr, which calls process::exit on halt; here that would kill the
+/// whole gateway, so a halt becomes an ordinary jq failure instead.
 fn describe_exception(exception: Exn<'_, Val>) -> String {
     match exception.get_err() {
         Ok(error) => format!("jq: {error}"),
@@ -540,20 +367,13 @@ fn describe_exception(exception: Exn<'_, Val>) -> String {
     }
 }
 
-/// How deeply a filter's output may nest before `jq` refuses it.
-///
-/// `serde_json` applies exactly this ceiling when parsing, so it is what bounded this conversion
-/// while every output crossed the boundary as JSON text. It has to be kept: without it a filter
-/// like `reduce range(100000) as $i (.; [.])` recurses once per level through [`convert`] on the
-/// native stack, and aborting the host process is not one of the outcomes this crate may produce.
+/// Matches serde_json's own nesting ceiling; without it a filter like
+/// `reduce range(100000) as $i (.;[.])` recurses once per level in convert and can abort the
+/// host process.
 const MAX_OUTPUT_DEPTH: usize = 128;
 
-/// Converts one filter output into this shell's value model.
-///
-/// jaq's value type is a JSON *superset* — byte strings, non-string object keys, `NaN` — and its
-/// own writer documents that printing such a value deliberately yields text that is not valid
-/// JSON. Reading that text back is what used to refuse them, so this refuses them too rather than
-/// inventing a JSON meaning none of them has.
+/// jaq's value type is a JSON superset (byte strings, non-string keys, NaN) that its own writer
+/// says cannot round-trip through JSON text, so this refuses them rather than inventing a meaning.
 fn convert(value: &Val, depth: usize) -> Result<Value, String> {
     if depth > MAX_OUTPUT_DEPTH {
         return Err(format!(
@@ -564,8 +384,6 @@ fn convert(value: &Val, depth: usize) -> Result<Value, String> {
         Val::Null => Ok(Value::Null),
         Val::Bool(flag) => Ok(Value::Bool(*flag)),
         Val::Num(number) => convert_number(number),
-        // Lossy for the same reason jaq's own formatter is: a text string holds bytes that are
-        // only *interpreted* as UTF-8, and JSON has no way to carry the ones that are not.
         Val::TStr(text) => Ok(Value::String(String::from_utf8_lossy(text).into_owned())),
         Val::BStr(_) => Err(not_json("a byte string")),
         Val::Arr(items) => items
@@ -589,7 +407,6 @@ fn convert(value: &Val, depth: usize) -> Result<Value, String> {
     }
 }
 
-/// Converts one jaq number, which knows more shapes than a JSON number does.
 fn convert_number(number: &Num) -> Result<Value, String> {
     match number {
         Num::Int(int) => i64::try_from(*int)
@@ -598,9 +415,6 @@ fn convert_number(number: &Num) -> Result<Value, String> {
         Num::Float(float) => serde_json::Number::from_f64(*float)
             .map(Value::Number)
             .ok_or_else(|| not_json(&number.to_string())),
-        // A big integer and a decimal literal both keep the text jaq preserved for them, and
-        // reading that text is precisely what happened when every output crossed as JSON. `1e3`,
-        // an integer past `i64`, and `1.50` therefore land on the values they always did.
         Num::BigInt(_) | Num::Dec(_) => convert_written_number(number),
     }
 }
@@ -617,11 +431,6 @@ fn not_json(what: &str) -> String {
     format!("jq: a filter produced {what}, which has no JSON form")
 }
 
-/// Counts what one value's JSON encoding weighs without building it.
-///
-/// The value-byte budget charges a `jq` output for the JSON it stands for, which is what the
-/// rendered text used to supply for free. Serializing into a counter keeps that meaning and keeps
-/// the allocation this whole path exists to avoid.
 fn weigh(value: &Value) -> u64 {
     struct Meter(u64);
 
@@ -637,7 +446,6 @@ fn weigh(value: &Value) -> u64 {
     }
 
     let mut meter = Meter(0);
-    // Infallible: `Meter` never fails, and a `Value` is always serializable.
     #[allow(
         clippy::let_underscore_must_use,
         reason = "Meter::write and flush both return Ok, and serde_json only fails here on a \
@@ -673,7 +481,6 @@ fn describe_load_errors<P>(errors: &[(File<&str, P>, jaq_core::load::Error<&str>
         .join("; ")
 }
 
-/// One file's compilation errors, as `jaq-core` reports them.
 type CompileErrors<'a, P> = (File<&'a str, P>, Vec<jaq_core::compile::Error<&'a str>>);
 
 fn describe_compile_errors<P>(errors: &[CompileErrors<'_, P>]) -> String {
@@ -731,9 +538,6 @@ mod tests {
 
     #[test]
     fn a_thread_reuses_its_filter_worker() {
-        // The point of the whole worker arrangement: `gh ... | jq ...` in a loop is the shape of
-        // most model-written scripts, and each iteration used to spawn and join an operating-system
-        // thread. libtest gives every test its own thread, so this count is this test's alone.
         for _ in 0..8 {
             assert_eq!(
                 filter(".a", json!({"a": 1})).expect("filter runs"),
@@ -745,10 +549,6 @@ mod tests {
 
     #[test]
     fn an_abandoned_worker_is_replaced_instead_of_being_handed_the_next_filter() {
-        // A worker the evaluator gave up on is inside a filter nothing can interrupt, so offering
-        // it another would queue behind a thread that may never come back. This one does come back
-        // — it notices the closed channel at its next output — but the decision cannot wait to find
-        // that out, so the handle goes either way and the next filter gets a fresh worker.
         assert_eq!(filter(".", json!(1)).expect("filter runs"), json!(1));
         assert_eq!(workers_spawned(), 1);
 
@@ -765,25 +565,18 @@ mod tests {
 
     #[test]
     fn numbers_keep_the_values_the_json_boundary_used_to_give_them() {
-        // Values now cross as values rather than as JSON text, and jaq knows number shapes JSON
-        // does not: machine and big integers, floats, and decimal literals kept as written.
         assert_eq!(filter(".a", json!({"a": 1})).expect("runs"), json!(1));
         assert_eq!(filter(".a", json!({"a": -7})).expect("runs"), json!(-7));
         assert_eq!(filter(".a", json!({"a": 1.5})).expect("runs"), json!(1.5));
         assert_eq!(filter(".a", json!({"a": 1.0})).expect("runs"), json!(1.0));
         assert_eq!(filter("1 + 1", Value::Null).expect("runs"), json!(2));
         assert_eq!(filter("3 / 2", Value::Null).expect("runs"), json!(1.5));
-        // A decimal literal is kept as text by jaq and read back as the number it spells.
         assert_eq!(filter("1.50", Value::Null).expect("runs"), json!(1.5));
         assert_eq!(filter("1e3", Value::Null).expect("runs"), json!(1000.0));
-        // Past `i64` jaq switches to a big integer; its written form is what JSON always saw.
         assert_eq!(
             filter("10000000000000000000 + 1", Value::Null).expect("runs"),
             json!(10_000_000_000_000_000_001_u64)
         );
-        // The round trip through JSON text used to cost a float this last bit: `serde_json` parses
-        // the shortest round-tripping form of 2^70 one ULP low. Handing the float over directly is
-        // exact instead.
         assert_eq!(
             filter("pow(2; 70)", Value::Null).expect("runs"),
             json!(2f64.powi(70))
@@ -802,10 +595,6 @@ mod tests {
 
     #[test]
     fn a_value_json_has_no_form_for_is_refused_rather_than_invented() {
-        // jaq's value type is a JSON superset and its own writer says so: printing one of these
-        // deliberately produces text that is not JSON. Reading that text back is what used to
-        // refuse them, so converting structurally has to refuse them too — giving `NaN` the `null`
-        // jq would is a different answer, not a faster one.
         for (source, expected) in [
             ("nan", "NaN"),
             ("infinite", "Infinity"),
@@ -821,14 +610,10 @@ mod tests {
 
     #[test]
     fn output_nesting_is_bounded_the_way_parsing_it_used_to_be() {
-        // `serde_json` refuses more than 128 nested containers, and that ceiling was the only thing
-        // keeping a filter like this from recursing once per level on the native stack. Converting
-        // without a parser means applying it here instead of inheriting it.
         let deep = format!("reduce range({}) as $i (.; [.])", MAX_OUTPUT_DEPTH + 10);
         let failure = filter(&deep, Value::Null).expect_err("an over-nested output is refused");
         let message = message(failure);
         assert!(message.contains("nested deeper"), "{message}");
-        // One level inside the ceiling still converts.
         let allowed = format!(
             "reduce range({}) as $i (.; [.]) | flatten | length",
             MAX_OUTPUT_DEPTH - 1
@@ -843,9 +628,6 @@ mod tests {
                 .expect("filter runs"),
             json!([3, 2])
         );
-        // Sorted explicitly: `to_entries` preserves object order, and whether a `serde_json::Map`
-        // is sorted or insertion-ordered is a workspace-wide feature decision rather than
-        // something this filter promises.
         assert_eq!(
             filter("to_entries | map(.key) | sort", json!({"b": 2, "a": 1})).expect("filter runs"),
             json!(["a", "b"])
@@ -854,16 +636,12 @@ mod tests {
 
     #[test]
     fn host_reaching_standard_library_filters_are_not_linked() {
-        // `jaq_std::funs()` exports `env`, which reads the real process environment. Linking it
-        // would let `jq -r env.OPENAI_API_KEY | gh issue create -` walk straight past this crate's
-        // namespace isolation, so the filter must not exist at all.
         assert!(std::env::var_os("PATH").is_some(), "PATH must be set here");
         for source in ["env", "env.PATH", "env|keys", "now"] {
             let failure = filter(source, json!({})).expect_err(source);
             let message = message(failure);
             assert!(message.contains("undefined"), "{source}: {message}");
         }
-        // The rest of the standard library is untouched by the filtering.
         assert_eq!(
             filter("ltrimstr(\"a\")", json!("abc")).expect("filter runs"),
             json!("bc")
@@ -893,8 +671,6 @@ mod tests {
 
     #[test]
     fn a_streaming_filter_is_charged_against_the_step_budget() {
-        // Each pulled output costs a step, so an unbounded stream is bounded by the same budget
-        // every other looping construct answers to instead of running to completion for free.
         let mut budget = Budget::start(Limits {
             max_steps: 16,
             ..Limits::default()
@@ -907,12 +683,6 @@ mod tests {
 
     #[test]
     fn a_filter_that_never_yields_is_stopped_by_the_deadline_and_counted() {
-        // `def f: f; f` recurses forever inside jaq without ever producing an output, so nothing
-        // cooperative can reach it — not even the closed channel, which a filter only notices at a
-        // `send` it never reaches. The wall-clock bound this crate advertises has to hold anyway,
-        // and the thread it leaves behind has to be visible rather than inferred from a flame
-        // graph: this test really does leak one spinning worker for the rest of the binary's life,
-        // which is exactly the cost the counters exist to report.
         let abandonments = TOTAL_ABANDONMENTS.load(Ordering::SeqCst);
         let mut budget = Budget::start(Limits {
             timeout: std::time::Duration::from_millis(50),
@@ -925,19 +695,12 @@ mod tests {
         assert!(matches!(failure, CommandFailure::Fatal(_)), "{failure:?}");
         assert!(message(failure).contains("Deadline"));
 
-        // Strictly greater rather than exactly one more: an abandonment is process-wide, and the
-        // other tests in this binary produce their own.
         assert!(TOTAL_ABANDONMENTS.load(Ordering::SeqCst) > abandonments);
-        // This one can never come back, so it stays counted against the process.
         assert!(abandoned_workers() >= 1);
     }
 
     #[test]
     fn a_saturated_process_refuses_to_start_another_filter() {
-        // Every abandoned worker that cannot come back is a core spinning until the process exits,
-        // so past the ceiling the honest answer is that there is nothing left to run a filter with.
-        // Driven through `admit` rather than by leaking four real workers: this test suite would
-        // then refuse every later `jq` in it, which is the failure being guarded against.
         assert!(admit(MAX_ABANDONED_WORKERS - 1).is_ok());
         let failure = admit(MAX_ABANDONED_WORKERS).expect_err("a saturated process refuses");
         assert!(
@@ -953,9 +716,6 @@ mod tests {
 
     #[test]
     fn an_abandoned_worker_stops_counting_once_it_finally_returns() {
-        // The common abandonment is benign: a filter that produced output fails its next `send` and
-        // returns within microseconds. Charging that permanently against the process would let a
-        // script that merely exhausted its value budget disable `jq` for every later session.
         let worker = Worker::new();
         assert!(worker.abandon().is_some());
         assert!(
@@ -966,9 +726,6 @@ mod tests {
 
     #[test]
     fn a_worker_that_finished_first_is_not_counted_as_abandoned() {
-        // The evaluator gives up and the worker returns in the same instant often enough to matter,
-        // and a filter that reported its own error is already on its way out. Whichever side wins
-        // the exchange, the count must end where it started.
         let worker = Worker::new();
         assert!(!worker.finish());
         assert!(worker.abandon().is_none());

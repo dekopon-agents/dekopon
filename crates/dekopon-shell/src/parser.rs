@@ -1,11 +1,3 @@
-//! Hand-written recursive-descent parser: [`crate::lexer`] tokens to [`crate::ast`].
-//!
-//! Every construct the sandbox drops is rejected here by name with an actionable message. Nothing
-//! is silently ignored: a script that asks for backgrounding, a subshell, process substitution, a
-//! here-string, or a brace group fails to parse rather than quietly doing something else. The same
-//! rule reaches inside constructs that are kept: a `case` pattern that would glob-match in bash is
-//! rejected by name here rather than matched literally behind the script's back.
-
 use thiserror::Error;
 
 use crate::{
@@ -20,28 +12,12 @@ use crate::{
     },
 };
 
-/// How deeply the grammar may nest before parsing stops.
-///
-/// Command substitution, `if`/`for`/`while` bodies, and parenthesized arithmetic are all
-/// recursive productions, and this parser runs on the native stack before any [`crate::limits`]
-/// budget exists. Without a ceiling a few kilobytes of nested `$( $( ... ) )` overflows the stack
-/// and aborts the host process with `SIGABRT`, which is not a `ScriptOutcome` any caller can
-/// report. The bound is fixed rather than configurable because it is a property of this parser's
-/// stack usage, not of the script's resource budget; 64 is far past any hand-written nesting and
-/// far short of the depth that threatens the smallest stack this runs on.
+/// Without this ceiling, deeply nested command substitution overflows the native stack and aborts
+/// the process with SIGABRT, which no script error can report.
 const MAX_NESTING_DEPTH: u32 = 64;
 
-/// How many tokens one `$(( ... ))` expansion may contain.
-///
-/// A flat `1 + 1 + 1 + ...` chain builds a left-leaning tree one node deep per term. Nothing walks
-/// it recursively at parse time, but evaluating *and dropping* it do, so the token count is what
-/// bounds that depth.
 const MAX_ARITHMETIC_TOKENS: usize = 4_096;
 
-/// Command words this shell refuses to let a script define or invoke.
-///
-/// Each one is excluded because it is sandbox-escape-shaped, ambient-authority-shaped, or would
-/// silently change the meaning of the surrounding script — not because it was left unfinished.
 pub(crate) const REJECTED_COMMANDS: &[(&str, &str)] = &[
     (
         "eval",
@@ -84,30 +60,17 @@ pub(crate) const REJECTED_COMMANDS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Words the grammar owns, which therefore cannot be a command word or a function name.
-///
-/// Mirrored into `dekopon_core::RESERVED_COMMAND_WORDS` and pinned in both directions by
-/// [`crate::dispatch::reserved`], so a provider can never declare one of these and then find that
-/// the parser consumed the word before dispatch ever saw it.
 pub(crate) const RESERVED_WORDS: &[&str] = &[
     "if", "then", "elif", "else", "fi", "for", "in", "do", "done", "while", "case", "esac",
     "until", "select", "function", "[[", "]]",
 ];
 
-/// A parse failure. These map to exit code `2`.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum ParseError {
-    /// Tokenization failed.
     #[error(transparent)]
     Lex(#[from] LexError),
-    /// A syntax rule was violated.
     #[error("line {line}: {message}")]
-    Syntax {
-        /// One-based source line.
-        line: usize,
-        /// Human-readable detail.
-        message: String,
-    },
+    Syntax { line: usize, message: String },
 }
 
 impl ParseError {
@@ -119,12 +82,10 @@ impl ParseError {
     }
 }
 
-/// Parses one complete script.
 pub fn parse(source: &str) -> Result<Program, ParseError> {
     parse_nested(source, 0)
 }
 
-/// Parses one script body already `depth` productions deep, for `$( ... )` re-entry.
 fn parse_nested(source: &str, depth: u32) -> Result<Program, ParseError> {
     let tokens = tokenize(source)?;
     let mut parser = Parser::new(tokens, depth);
@@ -137,13 +98,6 @@ fn parse_nested(source: &str, depth: u32) -> Result<Program, ParseError> {
     Ok(program)
 }
 
-/// Refuses a duplication whose target stream is redirected after it.
-///
-/// `cmd > buf 2>&1` sends both streams to `buf`; `cmd 2>&1 > buf` does not, because bash copies the
-/// file *description* stdout held at that moment and a later `> buf` leaves that copy pointing at
-/// the terminal. This interpreter has destinations rather than descriptions, so it cannot represent
-/// the difference — and the reversed spelling is precisely the one a script writes when it believes
-/// it captured diagnostics that in fact went somewhere else. It is named instead.
 fn check_duplication_order(redirects: &[Redirect], line: usize) -> Result<(), ParseError> {
     for (index, redirect) in redirects.iter().enumerate() {
         let RedirectTarget::Stream(copied) = redirect.target else {
@@ -173,7 +127,6 @@ fn check_duplication_order(redirects: &[Redirect], line: usize) -> Result<(), Pa
     Ok(())
 }
 
-/// Reports the nesting ceiling as a syntax error a script can act on.
 fn too_deep(line: usize, construct: &str) -> ParseError {
     ParseError::syntax(
         line,
@@ -186,7 +139,6 @@ fn too_deep(line: usize, construct: &str) -> ParseError {
 struct Parser {
     tokens: Vec<Token>,
     position: usize,
-    /// Recursive productions entered so far, checked against [`MAX_NESTING_DEPTH`].
     depth: u32,
 }
 
@@ -199,7 +151,6 @@ impl Parser {
         }
     }
 
-    /// Enters one recursive production, refusing past the nesting ceiling.
     fn enter(&mut self, construct: &str) -> Result<(), ParseError> {
         if self.depth >= MAX_NESTING_DEPTH {
             return Err(too_deep(self.line(), construct));
@@ -286,8 +237,6 @@ impl Parser {
         loop {
             self.skip_separators();
             match self.peek_kind() {
-                // `;;` ends a `case` clause, so a clause body stops here rather than trying to
-                // read it as another command.
                 None | Some(TokenKind::RightBrace | TokenKind::DoubleSemicolon) => break,
                 Some(_) => {}
             }
@@ -322,8 +271,6 @@ impl Parser {
 
     fn parse_statement(&mut self) -> Result<Statement, ParseError> {
         match self.peek_reserved() {
-            // Compound commands are parsed as pipeline stages even at statement level, so
-            // `while ...; done | wc -l` and a bare `while` reach the same production.
             Some("if" | "for" | "while" | "until" | "case" | "[[") => {
                 return self.parse_and_or_list().map(Statement::List);
             }
@@ -459,7 +406,6 @@ impl Parser {
     fn parse_for(&mut self) -> Result<ForLoop, ParseError> {
         self.expect_reserved("for", "a `for` loop")?;
         let line = self.line();
-        // `for (( i=0; i<n; i++ ))` is a C-style loop, not a malformed loop variable.
         if matches!(self.peek_kind(), Some(TokenKind::LeftParen)) {
             return Err(ParseError::syntax(
                 line,
@@ -506,7 +452,6 @@ impl Parser {
         })
     }
 
-    /// Parses `case WORD in PATTERN) LIST ;; ... esac`.
     fn parse_case(&mut self) -> Result<CaseStatement, ParseError> {
         self.expect_reserved("case", "a `case` statement")?;
         let line = self.line();
@@ -542,10 +487,7 @@ impl Parser {
         Ok(CaseStatement { subject, clauses })
     }
 
-    /// Parses one `PATTERN|PATTERN) LIST ;;` clause.
     fn parse_case_clause(&mut self) -> Result<CaseClause, ParseError> {
-        // bash accepts a decorative `(` before the first pattern; accepting it costs nothing and
-        // rejecting it would blame subshells for a shape that is not one.
         if matches!(self.peek_kind(), Some(TokenKind::LeftParen)) {
             self.position += 1;
         }
@@ -578,7 +520,6 @@ impl Parser {
         Ok(CaseClause { patterns, body })
     }
 
-    /// Parses one `case` alternative, rejecting pattern syntax this shell cannot honor.
     fn parse_case_pattern(&mut self) -> Result<CasePattern, ParseError> {
         let line = self.line();
         let Some(TokenKind::Word(raw)) = self.peek_kind() else {
@@ -594,8 +535,6 @@ impl Parser {
         let depth = self.depth;
         self.position += 1;
 
-        // A bare `*` is kept because it is the default branch, not a wildcard: every subject
-        // reaches it, which is exactly what a literal matcher would also conclude.
         if raw.as_literal() == Some("*") {
             return Ok(CasePattern::Any);
         }
@@ -646,9 +585,6 @@ impl Parser {
     }
 
     fn parse_pipeline(&mut self) -> Result<Pipeline, ParseError> {
-        // A leading `!` is the reserved word that inverts a pipeline's status. Dispatching it as a
-        // command word instead would report "!: command not found" and silently invert every
-        // `if ! cmd` branch, so it is recognized here rather than left to the builtin table.
         let negated = self.eat_pipeline_negation();
         let mut commands = vec![self.parse_command()?];
         while matches!(self.peek_kind(), Some(TokenKind::Pipe)) {
@@ -659,10 +595,6 @@ impl Parser {
         Ok(Pipeline { commands, negated })
     }
 
-    /// Parses one pipeline stage: a compound command, or a simple one.
-    ///
-    /// A compound stage is what lets `cmd | while read line; do ...; done` parse at all, and it is
-    /// the same production a statement uses — so the two spellings cannot drift apart.
     fn parse_command(&mut self) -> Result<Command, ParseError> {
         let compound = match self.peek_reserved() {
             Some("if") => Some(Statement::If(self.parse_if()?)),
@@ -677,8 +609,6 @@ impl Parser {
             None if self.peek_literal_word("[[") => {
                 Some(Statement::Conditional(self.parse_conditional()?))
             }
-            // A `{` opens a group only where a command may start, so `a{b}` stays one literal word
-            // and a function body is still parsed by `try_parse_function`.
             None if matches!(self.peek_kind(), Some(TokenKind::LeftBrace)) => {
                 Some(Statement::Group(self.parse_group()?))
             }
@@ -694,12 +624,10 @@ impl Parser {
         })
     }
 
-    /// Reports whether the next token is exactly the given literal word.
     fn peek_literal_word(&self, expected: &str) -> bool {
         matches!(self.peek_kind(), Some(TokenKind::Word(word)) if word.as_literal() == Some(expected))
     }
 
-    /// Parses `[[ ... ]]`.
     fn parse_conditional(&mut self) -> Result<Conditional, ParseError> {
         let line = self.line();
         self.position += 1;
@@ -765,7 +693,6 @@ impl Parser {
         self.parse_conditional_test()
     }
 
-    /// Collects one primary's operands and validates its operator.
     fn parse_conditional_test(&mut self) -> Result<Conditional, ParseError> {
         let line = self.line();
         let depth = self.depth;
@@ -778,8 +705,6 @@ impl Parser {
                     self.position += 1;
                     raws.push(word);
                 }
-                // Inside `[[ ]]` these are comparison operators, not redirections. The lexer has
-                // no way to know that, so they are translated back into operand words here.
                 Some(TokenKind::Less) => {
                     self.position += 1;
                     raws.push(RawWord {
@@ -825,8 +750,6 @@ impl Parser {
                 ));
             }
             if matches!(operator.as_str(), "=" | "==" | "!=") {
-                // In bash this operand is a glob. Comparing it literally would answer
-                // `[[ $f == *.json ]]` wrongly and silently.
                 if word_is_constant(right) {
                     if let Some((character, meaning)) = literal_pattern_metacharacter(right) {
                         return Err(ParseError::syntax(
@@ -850,7 +773,6 @@ impl Parser {
         }))
     }
 
-    /// Parses `{ ...; }` as a group of statements run in the current scope.
     fn parse_group(&mut self) -> Result<Program, ParseError> {
         let line = self.line();
         self.position += 1;
@@ -873,7 +795,6 @@ impl Parser {
         Ok(body)
     }
 
-    /// Parses the redirections trailing a compound command.
     fn parse_redirects(&mut self) -> Result<Vec<Redirect>, ParseError> {
         let mut redirects = Vec::new();
         loop {
@@ -941,8 +862,6 @@ impl Parser {
         let mut words = Vec::new();
         let mut redirects: Vec<Redirect> = Vec::new();
         let mut here_doc: Option<Word> = None;
-        // `arr=(a b c)` lexes as an empty assignment followed by `(`; remembering that shape is
-        // what lets the paren below name array literals instead of blaming subshells.
         let mut after_empty_assignment = false;
 
         loop {
@@ -997,9 +916,6 @@ impl Parser {
                     let (source, target) = (*source, *target);
                     let line = self.line();
                     self.position += 1;
-                    // `>&1` and `2>&2` ask for the stream a command already writes to. Bash makes
-                    // them no-ops; here they are a parse error, because a redirection that changes
-                    // nothing is a script believing it moved output that never moved.
                     if source == target {
                         return Err(ParseError::syntax(
                             line,
@@ -1016,8 +932,9 @@ impl Parser {
                         target: RedirectTarget::Stream(target),
                     });
                 }
-                // Job control is dropped whole. A trailing `&` must never be silently discarded:
-                // a model reading its own script would otherwise believe work was backgrounded.
+                // A trailing `&` must never be silently discarded, since a model reading back its
+                // own script would otherwise believe backgrounded work happened that this shell
+                // cannot do.
                 Some(TokenKind::Ampersand) => {
                     let line = self.line();
                     return Err(ParseError::syntax(
@@ -1025,9 +942,6 @@ impl Parser {
                         "backgrounding with `&` is not supported: this shell has no job control, so `&` can only mean something it cannot do",
                     ));
                 }
-                // Every paren-shaped bash construct arrives here. They are different features with
-                // different answers, so each is named for what it actually is: calling an array
-                // literal a subshell sends a reader looking for a process that was never involved.
                 Some(TokenKind::LeftParen) => {
                     let line = self.line();
                     if after_empty_assignment {
@@ -1054,8 +968,6 @@ impl Parser {
                     let line = self.line();
                     return Err(ParseError::syntax(line, "unexpected `)`"));
                 }
-                // Brace command groups are dropped; only `name() { ... }` uses braces.
-                // A here-document arrives with its body already collected off the following lines.
                 Some(TokenKind::HereDoc(raw)) => {
                     let raw = raw.clone();
                     let line = self.line();
@@ -1109,20 +1021,14 @@ impl Parser {
     }
 }
 
-/// Pattern syntax bash would match as a glob, and what each piece would mean there.
-///
-/// A `case` pattern is matched as literal text here, so silently accepting these would answer a
-/// question the script never asked. The rule, and the shape of its rejection, follow `grep` and
-/// `sed`, whose patterns are literal for the same reason and reject metacharacters the same way.
-/// `]` is deliberately absent: only `[` opens a character class, so `[ab]` is still caught by its
-/// opening bracket while a lone `a]` — ordinary text in bash too — is left alone.
+/// `]` is deliberately absent from this table: only `[` opens a character class, so `[ab]` is still
+/// caught by its bracket while a lone `a]` is left alone.
 const CASE_METACHARACTERS: &[(char, &str)] = &[
     ('*', "any run of characters"),
     ('?', "any single character"),
     ('[', "a character class"),
 ];
 
-/// Returns the first pattern metacharacter in some text, with what it would have meant.
 pub(crate) fn pattern_metacharacter(text: &str) -> Option<(char, &'static str)> {
     text.chars().find_map(|character| {
         CASE_METACHARACTERS
@@ -1132,52 +1038,42 @@ pub(crate) fn pattern_metacharacter(text: &str) -> Option<(char, &'static str)> 
     })
 }
 
-/// Composes the rejection for a constant `case` pattern this shell cannot honor.
-///
-/// Quoting is offered here and *not* in [`expanded_case_pattern`], because it is only a way out
-/// while the parser can still see it: by the time a pattern has been expanded, its quoting is gone.
 pub(crate) fn unsupported_case_pattern(character: char, meaning: &str) -> String {
     format!(
         "a `case` pattern here is literal text, so `{character}` — which would match {meaning} in bash — is not supported; spell the value out, add another `PATTERN|PATTERN` alternative, quote it as `'{character}'` to match the character itself, or use `*)` for the default branch"
     )
 }
 
-/// Composes the rejection for a `${NAME#pattern}`-family pattern this shell cannot honor.
 pub(crate) fn unsupported_parameter_pattern(character: char, meaning: &str) -> String {
     format!(
         "a `${{NAME}}` expansion pattern here is literal text, so `{character}` — which would match {meaning} in bash — is not supported; spell the text out, or slice the value with `jq` instead"
     )
 }
 
-/// Composes the rejection for a `[[ x == PATTERN ]]` operand this shell cannot honor.
 pub(crate) fn unsupported_conditional_pattern(character: char, meaning: &str) -> String {
     format!(
         "the right operand of `==` inside `[[ ... ]]` is a glob in bash, and every pattern here is literal text, so `{character}` — which would match {meaning} — is not supported; quote it as `'{character}'` to compare the character itself, or match structurally with `jq`"
     )
 }
 
-/// Composes the rejection for a `[[ ]]` operand that only exists once a script has run.
 pub(crate) fn expanded_conditional_pattern(character: char, meaning: &str) -> String {
     format!(
         "this `[[ ... ]]` comparison expanded to text containing `{character}`, which bash would match as {meaning}; patterns here are literal text, and quoting cannot exempt an expanded one because its quotes are already gone — compare without `{character}`, or match structurally with `jq`"
     )
 }
 
-/// Composes the rejection for a `${NAME}` expansion pattern that only exists once a script has run.
 pub(crate) fn expanded_parameter_pattern(character: char, meaning: &str) -> String {
     format!(
         "this `${{NAME}}` expansion pattern expanded to text containing `{character}`, which would match {meaning} in bash; patterns here are literal text, and quoting cannot exempt an expanded one because its quotes are already gone — build the pattern without `{character}`, or slice the value with `jq` instead"
     )
 }
 
-/// Composes the rejection for a `case` pattern that only exists once the script has run.
 pub(crate) fn expanded_case_pattern(character: char, meaning: &str) -> String {
     format!(
         "this `case` pattern expanded to text containing `{character}`, which would match {meaning} in bash; patterns here are literal text, and quoting cannot exempt an expanded one because its quotes are already gone — build the pattern without `{character}`, or branch with `if` and `jq` instead"
     )
 }
 
-/// Reports whether a raw word's text is fully known before the script runs.
 fn word_is_constant(word: &RawWord) -> bool {
     fn parts_are_constant(parts: &[RawPart]) -> bool {
         parts.iter().all(|part| match part {
@@ -1191,10 +1087,6 @@ fn word_is_constant(word: &RawWord) -> bool {
     parts_are_constant(&word.parts)
 }
 
-/// Returns the first pattern metacharacter in a constant word's *unquoted* text.
-///
-/// Quoted text is exempt because quoting is how bash itself spells "this asterisk is an asterisk",
-/// so `'*'` stays available as the way to match a literal one.
 fn literal_pattern_metacharacter(word: &RawWord) -> Option<(char, &'static str)> {
     word.parts.iter().find_map(|part| match part {
         RawPart::Literal(text) => pattern_metacharacter(text),
@@ -1213,7 +1105,6 @@ fn is_valid_name(name: &str) -> bool {
     characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
-/// Splits `NAME=value` into its parts when the word begins with a valid assignment prefix.
 fn split_assignment(word: &RawWord) -> Option<(String, RawWord)> {
     let RawPart::Literal(first) = word.parts.first()? else {
         return None;
@@ -1252,8 +1143,6 @@ fn convert_part(raw: &RawPart, line: usize, depth: u32) -> Result<WordPart, Pars
         RawPart::Parameter(parameter) => {
             WordPart::Parameter(convert_parameter(parameter, line, depth)?)
         }
-        // Each `$( ... )` re-enters the parser, so it counts against the same nesting ceiling the
-        // statement productions do.
         RawPart::CommandSubstitution(body) => {
             if depth >= MAX_NESTING_DEPTH {
                 return Err(too_deep(line, "command substitution `$( ... )`"));
@@ -1288,10 +1177,6 @@ fn convert_parameter(raw: &RawParameter, line: usize, depth: u32) -> Result<Para
     })
 }
 
-/// Converts one `${NAME#pattern}`-family pattern, checking it here when it is constant.
-///
-/// Quoting is the escape hatch, and it only works while the parser can still see it: `${p#'*'}`
-/// strips a literal asterisk, while `${p#*}` names the metacharacter and what it would have meant.
 fn convert_pattern(raw: &RawWord, line: usize, depth: u32) -> Result<Pattern, ParseError> {
     let word = convert_word(raw, line, depth)?;
     if word_is_constant(raw) {
@@ -1354,10 +1239,6 @@ fn convert_modifier(raw: &RawModifier, line: usize, depth: u32) -> Result<Modifi
     })
 }
 
-// ---------------------------------------------------------------------------
-// Arithmetic expansion
-// ---------------------------------------------------------------------------
-
 #[derive(Clone, Debug, PartialEq)]
 enum ArithToken {
     Integer(i64),
@@ -1366,11 +1247,6 @@ enum ArithToken {
     Symbol(&'static str),
 }
 
-/// One arithmetic operator spelling and what this shell does with it.
-///
-/// Rejected spellings are listed alongside the kept ones so the tokenizer can name the operator a
-/// script actually wrote. Consuming `**` as two multiplications and then complaining about a stray
-/// `*` describes a script nobody wrote.
 enum ArithSymbol {
     Kept,
     Rejected(&'static str),
@@ -1455,8 +1331,6 @@ fn tokenize_arithmetic(source: &str, line: usize) -> Result<Vec<ArithToken>, Par
                 ),
             ));
         }
-        // Decoding a whole character rather than casting one byte keeps a non-ASCII diagnostic
-        // honest: `bytes[index] as char` reports 'Ã' for an 'é' the script never wrote.
         let character = source[index..].chars().next().unwrap_or('\0');
         if character.is_ascii_whitespace() {
             index += 1;
@@ -1531,7 +1405,6 @@ struct ArithParser {
     tokens: Vec<ArithToken>,
     position: usize,
     line: usize,
-    /// Parenthesis nesting, checked against [`MAX_NESTING_DEPTH`]; see [`ArithParser::parse_primary`].
     depth: u32,
 }
 
@@ -1672,8 +1545,6 @@ impl ArithParser {
                 self.position += 1;
                 Ok(ArithExpr::Variable(name))
             }
-            // Each `(` re-enters the top of the precedence chain, roughly eight stack frames per
-            // level, so it is bounded by the same nesting ceiling the statement grammar uses.
             Some(ArithToken::Symbol("(")) => {
                 if self.depth >= MAX_NESTING_DEPTH {
                     return Err(too_deep(line, "an arithmetic expansion"));
@@ -1732,7 +1603,6 @@ mod tests {
 
     #[test]
     fn a_compound_command_parses_the_same_alone_as_in_a_pipeline() {
-        // One production, so the two spellings cannot drift apart.
         let alone = compound_in(&parse("while true; do echo x; done").unwrap().statements[0]);
         let piped = {
             let program = parse("cat | while true; do echo x; done").expect("valid script");
@@ -1770,10 +1640,6 @@ mod tests {
         ));
     }
 
-    /// Unwraps one statement into the compound command it wraps.
-    ///
-    /// Every compound command is a pipeline stage now, including one written on its own line, so
-    /// `while ...; done` and `cmd | while ...; done` cannot drift into two different productions.
     fn compound_in(statement: &Statement) -> Statement {
         let Statement::List(list) = statement else {
             panic!("expected a list, found {statement:?}");
@@ -1784,7 +1650,6 @@ mod tests {
         (**statement).clone()
     }
 
-    /// Returns the only simple command of the only statement of `source`.
     fn simple_command_of(source: &str) -> SimpleCommand {
         let program = parse(source).expect("valid script");
         let Statement::List(list) = &program.statements[0] else {
@@ -1796,7 +1661,6 @@ mod tests {
         command.clone()
     }
 
-    /// Returns the redirections of the only command in the only statement of `source`.
     fn redirects_of(source: &str) -> Vec<Redirect> {
         simple_command_of(source).redirects
     }
@@ -1852,17 +1716,12 @@ mod tests {
 
     #[test]
     fn redirections_that_would_do_nothing_or_mislead_are_refused() {
-        // A stream redirected onto itself moves nothing.
         for source in ["cmd >&1", "cmd 2>&2"] {
             let error = parse(source).expect_err("self-duplication is refused");
             assert!(format!("{error}").contains("onto itself"), "{source}");
         }
-        // `2>&1 > buf` is the classic footgun: bash copies the *description*, so stderr keeps
-        // going to the terminal while stdout moves. Nothing here can represent that difference,
-        // so it is named rather than silently given the other meaning.
         let error = parse("cmd 2>&1 > buf").expect_err("reversed duplication is refused");
         assert!(format!("{error}").contains("before"), "{error}");
-        // The supported spelling still parses.
         assert_eq!(redirects_of("cmd > buf 2>&1").len(), 2);
     }
 
@@ -1927,8 +1786,6 @@ mod tests {
 
     #[test]
     fn case_patterns_that_would_glob_are_rejected_by_name() {
-        // A literal matcher would answer `*.json` wrongly and silently, which is the one thing
-        // this shell will not do. `grep` and `sed` reject their metacharacters for the same reason.
         for (source, expected) in [
             ("case $f in *.json) echo j ;; esac", "any run of characters"),
             ("case $f in a?c) echo q ;; esac", "any single character"),
@@ -1939,12 +1796,8 @@ mod tests {
             assert!(message.contains("literal text"), "{source}: {message}");
         }
 
-        // Quoting is how bash itself spells "this asterisk is an asterisk", so it stays available.
         assert!(parse("case $f in '*') echo star ;; esac").is_ok());
 
-        // A backslash is bash's one-character quote: `\*` is the same pattern as `'*'`. It must
-        // classify as a literal match, never as the bare `*)` default branch — that would
-        // silently route every subject through the escaped clause.
         let program = parse("case $f in \\*) echo star ;; esac").expect("valid script");
         let Statement::Case(statement) = &compound_in(&program.statements[0]) else {
             panic!("expected a case statement");

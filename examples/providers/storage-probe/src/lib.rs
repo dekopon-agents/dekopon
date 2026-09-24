@@ -218,14 +218,11 @@ fn catch_wrong_interface_denial() -> Result<Value, ProviderError> {
 }
 
 fn catch_quota_denial() -> Result<Value, ProviderError> {
-    // One byte above the storage host's default entropy-per-call ceiling.
     expect(storage::random_bytes(257), StorageError::QuotaExceeded)?;
     Ok(json!({"caught": "quota"}))
 }
 
 fn catch_budget_denial() -> Result<Value, ProviderError> {
-    // The integration host gives this mode a one-call budget. Not-found remains non-terminal;
-    // the second call is caught as quota and must still reject the whole invocation.
     if storage::stat("missing.db").map_err(map)?.is_some() {
         return Err(failure("unexpected-present-file"));
     }
@@ -244,8 +241,8 @@ fn drop_after_denial() -> Result<Value, ProviderError> {
     .map_err(map)?;
     deleting.write_at(0, b"provisional").map_err(map)?;
     expect(storage::random_bytes(257), StorageError::QuotaExceeded)?;
-    // Resource drop executes after the guest caught the terminal quota error. It may release native
-    // accounting but must never turn delete-on-close into an authorized committed mutation.
+    // Drop runs after the quota error is caught; it may free native accounting but must never
+    // authorize the denied delete.
     drop(deleting);
     Ok(json!({"caught": "drop-after-denial"}))
 }

@@ -1,11 +1,3 @@
-//! One `tracing` capture layer, in place of nine that agreed only on how they rendered a field.
-//!
-//! The nine copies differed on the two things that matter and on nothing else: whether they kept
-//! spans as well as events, and whether they refused callsites outside this workspace. The second
-//! is not cosmetic — a test binary that compiles a real Wasm component captures Cranelift's own
-//! instrumentation event by event, which both drowns the assertions and makes them depend on a
-//! dependency's logging.
-
 use std::sync::{Arc, Mutex};
 
 use tracing::{
@@ -15,40 +7,22 @@ use tracing::{
 };
 use tracing_subscriber::{layer::Context, registry::LookupSpan};
 
-/// One captured span or event, flattened to the strings a collector would receive.
 #[derive(Clone, Debug)]
 pub enum Record {
-    /// One event, with the span the subscriber attributed it to.
     Event {
-        /// The event's level, as `INFO`/`WARN`/…
         level: &'static str,
-        /// The emitting callsite's target.
         target: String,
-        /// Every field rendered as ` name=value`.
         fields: String,
-        /// The enclosing span's name, when there was one.
         parent: Option<String>,
-        /// Every enclosing span's name, outermost first.
-        ///
-        /// Separate from `parent` because "this record rides that trace" and "this record was
-        /// written inside that span" are different claims, and only the first one is stable: a
-        /// record the gateway writes from its prompt loop is nested two or three spans deep, and
-        /// an assertion that read only the immediate parent would be pinned to whichever span the
-        /// loop happened to be inside rather than to the session the trace belongs to.
         scope: Vec<&'static str>,
     },
-    /// One span, at creation or when a later field was recorded onto it.
     Span {
-        /// The span's name.
         name: &'static str,
-        /// Every field rendered as ` name=value`.
         fields: String,
-        /// The name of the span this one was created under, when it had a parent.
         parent: Option<String>,
     },
 }
 
-/// Captures every span and event a subscriber offers it, optionally filtered by target prefix.
 #[derive(Clone, Default)]
 pub struct CaptureLayer {
     records: Arc<Mutex<Vec<Record>>>,
@@ -56,19 +30,16 @@ pub struct CaptureLayer {
 }
 
 impl CaptureLayer {
-    /// Captures every callsite the subscriber offers.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Captures only this workspace's callsites.
     #[must_use]
     pub fn workspace() -> Self {
         Self::with_target_prefix("dekopon")
     }
 
-    /// Captures only callsites whose target begins with `prefix`.
     #[must_use]
     pub fn with_target_prefix(prefix: &'static str) -> Self {
         Self {
@@ -86,13 +57,11 @@ impl CaptureLayer {
         self.records.lock().expect("capture sink").push(record);
     }
 
-    /// Every record captured so far, in arrival order.
     #[must_use]
     pub fn records(&self) -> Vec<Record> {
         self.records.lock().expect("capture sink").clone()
     }
 
-    /// Every event's rendered fields paired with the span it was attributed to.
     #[must_use]
     pub fn events(&self) -> Vec<(String, Option<String>)> {
         self.records()
@@ -104,7 +73,6 @@ impl CaptureLayer {
             .collect()
     }
 
-    /// Every span's name paired with its rendered fields.
     #[must_use]
     pub fn spans(&self) -> Vec<(&'static str, String)> {
         self.records()
@@ -116,10 +84,6 @@ impl CaptureLayer {
             .collect()
     }
 
-    /// Every span's name paired with the name of the span it was created under.
-    ///
-    /// Separate from [`Self::spans`] because parenting is what a trace *is*: a test that only reads
-    /// names and fields cannot tell one complete trace from a pile of unrelated roots.
     #[must_use]
     pub fn span_parents(&self) -> Vec<(&'static str, Option<String>)> {
         self.records()
@@ -131,7 +95,6 @@ impl CaptureLayer {
             .collect()
     }
 
-    /// Every event as one `LEVEL target field=value…` line.
     #[must_use]
     pub fn events_text(&self) -> String {
         render(
@@ -141,7 +104,6 @@ impl CaptureLayer {
         )
     }
 
-    /// Every span as one `name field=value…` line.
     #[must_use]
     pub fn spans_text(&self) -> String {
         render(
@@ -151,13 +113,11 @@ impl CaptureLayer {
         )
     }
 
-    /// Every record, spans and events together, in arrival order.
     #[must_use]
     pub fn text(&self) -> String {
         render(self.records().iter())
     }
 
-    /// Drains the capture and returns what every event in it rendered to.
     #[must_use]
     pub fn take_events(&self) -> String {
         let drained = std::mem::take(&mut *self.records.lock().expect("capture sink"));
@@ -168,13 +128,11 @@ impl CaptureLayer {
         )
     }
 
-    /// Whether any event captured so far rendered `marker`.
     #[must_use]
     pub fn saw(&self, marker: &str) -> bool {
         self.events_text().contains(marker)
     }
 
-    /// Discards everything captured so far.
     pub fn clear(&self) {
         self.records.lock().expect("capture sink").clear();
     }
@@ -209,8 +167,6 @@ impl<S> tracing_subscriber::Layer<S> for CaptureLayer
 where
     S: tracing::Subscriber + for<'lookup> LookupSpan<'lookup>,
 {
-    /// A binary that compiles a real component would otherwise capture Wasmtime's own trace
-    /// instrumentation event by event. Interest is cached per callsite for the process.
     fn register_callsite(&self, metadata: &'static Metadata<'static>) -> Interest {
         if self.interested(metadata) {
             Interest::always()
@@ -219,8 +175,6 @@ where
         }
     }
 
-    /// `Layer::enabled` is what actually turns a callsite off when the inner subscriber is a
-    /// registry, so the filter has to live here rather than only in `register_callsite`.
     fn enabled(&self, metadata: &Metadata<'_>, _context: Context<'_, S>) -> bool {
         self.interested(metadata)
     }
@@ -236,8 +190,6 @@ where
         self.push(Record::Span {
             name: attributes.metadata().name(),
             fields,
-            // Read back from the registry rather than from `attributes`, so an explicit
-            // `parent:` and an inherited contextual parent are reported the same way.
             parent: context
                 .span(id)
                 .and_then(|span| span.parent())
@@ -286,12 +238,8 @@ where
     }
 }
 
-/// Renders every field, including ones recorded as `Debug`.
-///
-/// Rendering everything is the point: a redaction test that inspected only the fields it expected
-/// would not notice a new one carrying a secret. `record_str` is deliberately left to the default
-/// forward to `record_debug`, so a string field renders quoted and a test can tell `outcome="x"`
-/// from a field whose value merely contains `x`.
+/// This renders every field including Debug ones, since a redaction test checking only expected
+/// fields would miss a new one leaking a secret.
 struct Visitor<'a>(&'a mut String);
 
 impl Visit for Visitor<'_> {

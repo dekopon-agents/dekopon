@@ -1,8 +1,3 @@
-//! Tests for the harness itself, driven against the checked-in example components.
-//!
-//! Every test here is `multi_thread`: the storage path dispatches to `spawn_blocking`, and a
-//! current-thread runtime deadlocks waiting for a namespace lease.
-
 #![allow(clippy::unwrap_used)]
 
 use dekopon_provider_sdk_testkit::{
@@ -56,8 +51,6 @@ async fn runs_a_storage_backed_component_against_a_real_storage_host() {
     assert_eq!(output.output["clocksCalled"], true);
     assert_eq!(output.output["entropyBytes"], 32);
     assert_eq!(output.output["identityNonzero"], true);
-    // Storage evidence exists because real host calls ran, which is the part a hand-written
-    // fake would have had to invent.
     let evidence = output
         .storage
         .expect("a storage-backed invocation carries evidence");
@@ -65,12 +58,6 @@ async fn runs_a_storage_backed_component_against_a_real_storage_host() {
     assert_eq!(evidence.quota_denials, 0, "{evidence:?}");
 }
 
-/// The property the whole harness exists for: separate invocations reach one durable namespace.
-///
-/// Each invocation gets a fresh id and a freshly minted, separately consumed grant; only the scope
-/// material around them is held constant. That constancy is what makes the third call able to read
-/// what the first two wrote through completed host calls, and it is the part a caller would otherwise have to know to
-/// reproduce by hand.
 #[tokio::test(flavor = "multi_thread")]
 async fn successive_invocations_reach_one_durable_namespace() {
     let broker = memory_chat().await;
@@ -109,7 +96,6 @@ async fn successive_invocations_reach_one_durable_namespace() {
     assert_eq!(turns[0]["user"], "first question");
     assert_eq!(turns[1]["assistant"], "second answer");
 
-    // One namespace, one generation: no invocation minted a fresh one behind the test's back.
     assert_eq!(generations(broker.storage_root()), 1);
 }
 
@@ -130,8 +116,6 @@ async fn two_subjects_do_not_share_a_namespace() {
         .await
         .expect("memory-chat loads");
 
-    // A different subject is a different namespace even within one storage host; this one is also
-    // a different temporary root, so the read must simply find nothing rather than fail.
     let recent = second
         .invoke(
             "memory.chat.recent",
@@ -148,8 +132,6 @@ async fn two_subjects_do_not_share_a_namespace() {
     assert_eq!(recent["turns"].as_array().expect("turns array").len(), 0);
 }
 
-/// A command word runs through the same host the shell uses: the guest's clap help page comes
-/// back rendered, a piped value reaches the proposal, and the proposal runs through `invoke`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_word_renders_its_help_page_and_proposes() {
     let broker = FakeBroker::builder()
@@ -251,7 +233,6 @@ async fn a_provider_declared_failure_is_distinguishable_from_a_host_refusal() {
         "{error}"
     );
 
-    // A host refusal is a different shape, and reports no provider code.
     let refused = broker
         .invoke("memory.chat.nonexistent", json!({}))
         .await
@@ -291,10 +272,6 @@ async fn a_builder_missing_its_component_or_provider_says_which() {
     assert!(matches!(error, FakeBrokerError::NoProvider), "{error}");
 }
 
-/// The crate's strongest claim is that a quota tripped here is a quota production would have
-/// tripped, and `storage_limits` is the knob that makes that testable. A one-byte write budget is
-/// refused by the real storage host — a `StorageCallRejected` with the stable class `quota`, not a
-/// provider-declared error and not a fake. The control proves the refusal came from the narrowing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_narrowed_storage_quota_refuses_the_write_the_defaults_accept() {
     let narrowed = FakeBroker::builder()
@@ -324,11 +301,8 @@ async fn a_narrowed_storage_quota_refuses_the_write_the_defaults_accept() {
         ),
         "{error:?}"
     );
-    // The host refused the call; the provider never got to declare anything.
     assert_eq!(error.provider_failure(), None, "{error}");
 
-    // The same turn against the defaults records, which is what makes the refusal above the
-    // narrowing rather than the fixture.
     memory_chat()
         .await
         .invoke("memory.chat.record", record("turn-1", "question", "answer"))
@@ -336,16 +310,6 @@ async fn a_narrowed_storage_quota_refuses_the_write_the_defaults_accept() {
         .expect("the default storage limits accept the same turn");
 }
 
-/// `continuity` is the one builder default this crate deliberately overrides, so the override has
-/// to be reachable — and what it actually does here has to be stated rather than assumed.
-///
-/// `AuthorityBound` mints a fresh non-reusing generation whenever the *effective authority
-/// commitment* changes. This harness holds that commitment fixed across invocations, so it never
-/// changes and the policy addresses one generation exactly like `Stable`: successive calls still
-/// read each other's writes. That is the claim `FakeBrokerBuilder::default` makes in a comment and
-/// the README's continuity bullet makes in prose, and this is the test that keeps both honest: the
-/// authority surface is a literal in `FakeBroker::invoke` with no builder knob on it, so if the
-/// harness ever grows a varying one this assertion fails and all three need revisiting together.
 #[tokio::test(flavor = "multi_thread")]
 async fn authority_bound_continuity_is_selectable_and_holds_one_generation_here() {
     let broker = FakeBroker::builder()
@@ -385,12 +349,8 @@ async fn authority_bound_continuity_is_selectable_and_holds_one_generation_here(
     assert_eq!(generations(broker.storage_root()), 1);
 }
 
-/// `host_limits` narrows the Wasmtime ceilings the same way `storage_limits` narrows storage, and
-/// the fuel ceiling is real enough that one unit cannot load the component — the ceiling bites
-/// during instantiation or `describe`, before any invocation exists to refuse.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_narrowed_fuel_ceiling_stops_the_guest() {
-    // The control: the same component, the same builder, the default ceilings.
     FakeBroker::builder()
         .component(provider_fixture("cli-probe-provider.wasm"))
         .provider("cli-probe")
@@ -423,7 +383,6 @@ async fn a_narrowed_fuel_ceiling_stops_the_guest() {
     );
 }
 
-/// Counts namespace generations on disk: `<root>/namespaces/<namespace>/<generation>/`.
 fn generations(root: &std::path::Path) -> usize {
     let namespaces = root.join("namespaces");
     let Ok(entries) = std::fs::read_dir(&namespaces) else {

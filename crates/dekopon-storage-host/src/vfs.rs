@@ -1,5 +1,3 @@
-//! Engine-neutral private-file access and rollback-journal lock state.
-
 use dekopon_capability::StorageInterface;
 
 use crate::{
@@ -8,7 +6,6 @@ use crate::{
     key::random_bytes,
 };
 
-/// Guest open intent.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct OpenOptions {
     pub read: bool,
@@ -18,7 +15,6 @@ pub struct OpenOptions {
     pub delete_on_close: bool,
 }
 
-/// Durability requested by a guest storage engine.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Durability {
     Data,
@@ -26,7 +22,6 @@ pub enum Durability {
     Full,
 }
 
-/// Curated rollback-journal lock level.
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub enum LockLevel {
     #[default]
@@ -37,7 +32,6 @@ pub enum LockLevel {
     Exclusive,
 }
 
-/// Equality-only identity stable for one live logical file.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FileStat {
     pub size: u64,
@@ -107,9 +101,9 @@ impl StorageHandle {
         let call = self.note_call();
         let state = self.handles.remove(&handle);
         if state.is_some() {
-            // A resource drop always releases native accounting, including after the host-call
-            // budget becomes terminal. The budget error still wins over an invalid-handle result,
-            // so repeated bad drops cannot mask or bypass the sticky ceiling.
+            // A drop always releases native accounting even after the host-call budget is terminal,
+            // and the budget error wins over an invalid-handle result so repeated bad drops can't
+            // bypass the ceiling.
             self.ledger.release_handle();
         }
         call?;
@@ -198,8 +192,6 @@ impl StorageHandle {
         if !state.write {
             return Err(StorageHostError::PermissionDenied);
         }
-        // Stat-derived length: a positional write never reads, allocates, or rewrites the bytes it
-        // is not replacing, so the file's own size is the only thing this call needs to know.
         let current_length = self
             .entries
             .get(&state.token)
@@ -208,8 +200,6 @@ impl StorageHandle {
         let end = offset
             .checked_add(bytes.len() as u64)
             .ok_or(StorageHostError::Arithmetic)?;
-        // A sparse gap is logical growth the namespace pays for, and a rewrite in place still
-        // charges the bytes it supplied.
         let logical_write = end.saturating_sub(current_length).max(bytes.len() as u64);
         self.charge_write(logical_write)?;
         let resulting_length = current_length.max(end);
@@ -255,8 +245,6 @@ impl StorageHandle {
             .get(&state.token)
             .and_then(crate::handle::FileEntry::size)
             .ok_or(StorageHostError::NotFound)?;
-        // Growing truncate is logical growth; shrinking charges nothing but still reserves, so the
-        // released bytes reach the ledger.
         let growth = size.saturating_sub(current_length);
         self.charge_write(growth)?;
         let planned = self.reserve_candidate(&[(&state.token, Some(size))])?;
@@ -331,8 +319,6 @@ impl StorageHandle {
         {
             return Err(StorageHostError::Busy);
         }
-        // The directory entry moves, not the bytes: the source's stat-derived length is exactly
-        // what the target ends up holding.
         let length = self.entries[&from_token]
             .size()
             .ok_or(StorageHostError::NotFound)?;

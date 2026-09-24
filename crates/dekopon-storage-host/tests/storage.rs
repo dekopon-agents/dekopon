@@ -24,7 +24,6 @@ use dekopon_test_support::{CaptureLayer, snapshot_tree};
 use tempfile::TempDir;
 use tracing_subscriber::layer::SubscriberExt as _;
 
-/// Runs `body` with every storage log record on this thread captured.
 fn captured<T>(body: impl FnOnce() -> T) -> (T, CaptureLayer) {
     let capture = CaptureLayer::workspace();
     let value = tracing::subscriber::with_default(
@@ -34,7 +33,6 @@ fn captured<T>(body: impl FnOnce() -> T) -> (T, CaptureLayer) {
     (value, capture)
 }
 
-/// The only namespace base under `root`.
 fn only_base(root: &Path) -> std::path::PathBuf {
     let mut bases = fs::read_dir(root.join("namespaces"))
         .expect("namespace root")
@@ -44,7 +42,6 @@ fn only_base(root: &Path) -> std::path::PathBuf {
     bases.remove(0)
 }
 
-/// Every generation directory under one base, sorted.
 fn generations(base: &Path) -> Vec<String> {
     let mut names = fs::read_dir(base)
         .expect("base entries")
@@ -331,8 +328,6 @@ fn namespace_tokens_are_stable_across_processes() {
         token
     );
 
-    // A second process over the same root resolves the same scope to the same directory, and a
-    // second root derives the same name: nothing about a deployment enters the derivation.
     let second = StorageHost::open(&root, StorageLimits::default()).expect("second host");
     let preparation = second
         .prepare_grant(scope("stable-token-read", StorageAccess::ReadOnly))
@@ -361,7 +356,6 @@ fn a_root_from_the_keyed_layout_is_refused_at_open() {
         "\n"
     );
 
-    // Every root an earlier release initialized: a keyed layout and its `quarantine/` beside it.
     let (_temporary, root) = fixture();
     drop(StorageHost::open(&root, StorageLimits::default()).expect("host"));
     fs::write(root.join("layout"), keyed).expect("keyed layout");
@@ -380,7 +374,6 @@ fn a_root_from_the_keyed_layout_is_refused_at_open() {
         "a refused root keeps every byte"
     );
 
-    // The keyed document on its own is refused too, naming it: an unknown field is not ignored.
     fs::remove_dir(&retired).expect("remove quarantine");
     let refused = StorageHost::open(&root, StorageLimits::default());
     let Err(StorageHostError::CorruptLayout { path }) = &refused else {
@@ -641,7 +634,6 @@ fn root_initialization_quota_denial_creates_no_layout_entry() {
     let (_temporary, root) = fixture();
     let parent = root.parent().expect("root parent");
     let before = tree_snapshot(parent);
-    // The three root entries fit; the layout document's own bytes do not.
     let limits = StorageLimits {
         max_root_bytes: 3 * 4_096,
         max_namespace_bytes: 8 * 1024,
@@ -662,7 +654,6 @@ fn root_initialization_quota_denial_creates_no_layout_entry() {
 fn namespace_housekeeping_quota_denial_precedes_every_mutation() {
     let (_temporary, root) = fixture();
     let limits = StorageLimits {
-        // Generation directory, data directory and lease: one byte below their live peak.
         max_namespace_bytes: 3 * 4_096 - 1,
         max_file_bytes: 1,
         ..StorageLimits::default()
@@ -894,8 +885,6 @@ fn a_hard_linked_logical_file_fails_its_own_grant_and_not_the_broker() {
     assert!(logged.contains("private-file"), "{logged}");
     assert!(logged.contains(&*base.to_string_lossy()), "{logged}");
 
-    // A second link is outside the store's shape, and a fresh generation beside it would fail the
-    // same scan, so the grant is refused naming the file and nothing on disk changes.
     let before = tree_snapshot(&root);
     let refused = host.grant(request(
         b"authority",
@@ -986,8 +975,6 @@ fn metadata_calls_do_not_load_whole_files_or_bypass_native_read_memory_bounds() 
             },
         )
         .expect("open metadata only");
-    // A write reads nothing, so it is bounded by the write budgets, not by the read ceiling the
-    // file's own length would exhaust.
     mutation
         .vfs_write_at(handle, 0, b"x")
         .expect("a write charges the read budget nothing");
@@ -996,7 +983,6 @@ fn metadata_calls_do_not_load_whole_files_or_bypass_native_read_memory_bounds() 
         mutation.vfs_read_at(handle, 0, 4).expect("bounded read"),
         b"x234"
     );
-    // Four of the four budgeted bytes are spent; the next read of any length is refused.
     assert!(matches!(
         mutation.vfs_read_at(handle, 4, 1),
         Err(StorageHostError::QuotaExceeded)
@@ -1004,11 +990,6 @@ fn metadata_calls_do_not_load_whole_files_or_bypass_native_read_memory_bounds() 
     mutation.abort();
 }
 
-/// A SQLite database outlives the invocation that created it and is then extended page by page
-/// and read back in short positional reads. Only the bytes an invocation asks for may be charged
-/// to its read budget: the pages already on disk, and the pages a write is not supplying, are
-/// never pulled into memory, so a database far larger than that budget stays writable,
-/// truncatable, renameable, and removable under it.
 #[test]
 fn a_database_larger_than_the_read_budget_is_extended_and_read_back_in_short_reads() {
     const PAGE: u64 = 4_096;
@@ -1018,7 +999,6 @@ fn a_database_larger_than_the_read_budget_is_extended_and_read_back_in_short_rea
     const READ_BUDGET: u64 = 8 * 1_024;
 
     fn page_contents(page: u64) -> Vec<u8> {
-        // Never zero, so a sparse hole or a truncated tail cannot read back as valid page bytes.
         let byte = u8::try_from(page % 200 + 1).expect("page byte");
         vec![byte; usize::try_from(PAGE).expect("page size")]
     }
@@ -1071,7 +1051,6 @@ fn a_database_larger_than_the_read_budget_is_extended_and_read_back_in_short_rea
     creating.vfs_close(database).expect("close database");
     creating.commit().expect("commit");
 
-    // A fresh invocation reopens a database many times its read budget.
     let mut extending = host
         .begin(
             host.grant(vfs_request("sqlite-extend", StorageAccess::ReadWrite))
@@ -1118,14 +1097,11 @@ fn a_database_larger_than_the_read_budget_is_extended_and_read_back_in_short_rea
             .expect("last page"),
         page_contents(PAGES - 1)
     );
-    // Two pages spend the whole read budget: positional reads remain bounded by it.
     assert!(matches!(
         extending.vfs_read_at(database, PAGE, 1),
         Err(StorageHostError::QuotaExceeded)
     ));
     extending.vfs_close(database).expect("close database");
-    // With the read budget exhausted, entry operations on files far larger than it still apply:
-    // neither charges the bytes it moves or unlinks.
     extending
         .vfs_rename_atomic("main.db", "main.db.bak", false, Durability::Full)
         .expect("rename a file larger than the read budget");
@@ -1694,8 +1670,6 @@ fn a_corrupt_authority_pointer_resets_the_namespace_once() {
     second.commit().expect("second commit");
     drop(host);
 
-    // Still a private single-link JSON document naming a real epoch, so nothing but the pointer
-    // check itself can object to it.
     let pointer = first_base.join("current");
     let mut document: serde_json::Value =
         serde_json::from_slice(&fs::read(&pointer).expect("pointer")).expect("pointer document");
@@ -1741,12 +1715,10 @@ fn a_corrupt_authority_pointer_resets_the_namespace_once() {
     ] {
         assert!(logged.contains(field), "{field} missing from {logged}");
     }
-    // The operator reads one rendered chain, so the location has to survive Display.
     let rendered = error_chain(&error);
     assert!(rendered.contains(&token), "{rendered}");
     assert!(rendered.contains("authority-pointer"), "{rendered}");
 
-    // The next invocation lands on the fresh generation, and the corrupt one is still on disk.
     let (retried, log) = captured(|| {
         let mut retried = host
             .begin(
@@ -1767,7 +1739,6 @@ fn a_corrupt_authority_pointer_resets_the_namespace_once() {
     assert_eq!(kept.len(), 2, "{kept:?}");
     assert!(kept.contains(&previous) && kept.contains(fresh), "{kept:?}");
 
-    // The neighbour never noticed.
     let mut neighbour = host
         .begin(
             host.grant(second_scope("neighbour-read", StorageAccess::ReadOnly))
@@ -1803,7 +1774,6 @@ fn a_corrupt_stable_generation_is_moved_aside_and_reset() {
 
     let base = only_base(&root);
     let [stable] = <[String; 1]>::try_from(generations(&base)).expect("one generation");
-    // A private file, so the base scan accepts it; only the logical-name check refuses the name.
     let stray = base.join(&stable).join("data").join("not-a-token");
     fs::write(&stray, b"stray").expect("stray logical entry");
     fs::set_permissions(&stray, fs::Permissions::from_mode(0o600)).expect("stray mode");
@@ -1825,8 +1795,6 @@ fn a_corrupt_stable_generation_is_moved_aside_and_reset() {
     };
     assert!(error.namespace_reset());
     assert_eq!(site.generation.as_deref(), Some(stable.as_str()));
-    // Stable continuity keeps its deterministic name: the fresh generation takes it, and the
-    // corrupt one moved to a new token beside it.
     assert_eq!(site.reset.as_deref(), Some(stable.as_str()));
     let kept = generations(&base);
     assert_eq!(kept.len(), 2, "{kept:?}");
@@ -2001,7 +1969,6 @@ fn initialized_root_never_recreates_missing_layout_entries_or_accepts_unknown_on
     ));
 }
 
-/// Every path under `root` paired with its file contents, directories carrying empty contents.
 fn tree_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
     snapshot_tree(root)
         .into_iter()
@@ -2014,7 +1981,6 @@ fn tree_snapshot(root: &Path) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-/// The logical bytes and entries a namespace tree occupies, as the quota ledger counts them.
 fn logical_tree_usage(root: &Path) -> (u64, u64) {
     let entries = snapshot_tree(root);
     let bytes = entries
@@ -2214,8 +2180,6 @@ fn b1_original_load_budget_and_write_growth_are_independent() {
     handle.commit().expect("finish");
 }
 
-/// Contenders for one namespace queue on an in-process lock before the base lease. Each used to
-/// get its own `lockTimeoutMs` after the one ahead of it gave up, so the k-th waited k timeouts.
 #[test]
 fn every_contender_for_a_held_namespace_times_out_within_one_lock_timeout() {
     const TIMEOUT_MS: u64 = 200;

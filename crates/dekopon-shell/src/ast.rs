@@ -1,130 +1,76 @@
-//! Abstract syntax produced by [`crate::parser`] and walked by the evaluator.
-//!
-//! The shape covers exactly the grammar this sandbox keeps. Constructs that were deliberately
-//! dropped (backgrounding, subshells, process substitution, `eval`, brace groups) have no
-//! representation here at all, so no evaluator path can accidentally implement one.
+//! Constructs deliberately dropped, such as backgrounding, subshells, process substitution, and
+//! eval, have no representation here, so no evaluator path can accidentally implement one.
 
-/// A parsed script or block.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Program {
-    /// Statements in source order.
     pub statements: Vec<Statement>,
 }
 
-/// One top-level or block-level statement.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Statement {
-    /// An `&&`/`||` list of pipelines.
     List(AndOrList),
-    /// `if ...; then ...; elif ...; else ...; fi`.
     If(IfStatement),
-    /// `for NAME in WORDS...; do ...; done`.
     For(ForLoop),
-    /// `while LIST; do ...; done` or `until LIST; do ...; done`.
     While(WhileLoop),
-    /// `case WORD in PATTERN) ...;; esac`.
     Case(CaseStatement),
-    /// A `{ ...; }` group: several statements run as one command, in the current scope.
-    ///
-    /// Not a subshell — this shell forks nothing. The group exists so a list of statements can be
-    /// one pipeline stage, one redirection target, or one `||` branch.
     Group(Program),
-    /// `[[ ... ]]`.
     Conditional(Conditional),
-    /// `name() { ... }`.
     Function(FunctionDefinition),
 }
 
-/// A pipeline chain joined by short-circuiting `&&` and `||`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AndOrList {
-    /// The unconditional first pipeline.
     pub first: Pipeline,
-    /// Conditionally executed continuations.
     pub rest: Vec<(AndOr, Pipeline)>,
 }
 
-/// Short-circuit operator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AndOr {
-    /// `&&`: run when the previous status was zero.
     And,
-    /// `||`: run when the previous status was non-zero.
     Or,
 }
 
-/// One or more commands joined by `|`.
-///
-/// A pipe hands the single structured value produced by the left command to the right command as
-/// its implicit input. This is jq-style value piping, not byte-stream piping.
+/// A pipe hands the single structured value produced by the left command to the right as its
+/// implicit input; this is jq-style value piping, not byte-stream piping.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Pipeline {
-    /// Commands in left-to-right order; never empty.
     pub commands: Vec<Command>,
-    /// `true` when a leading `!` inverts the pipeline's exit status.
     pub negated: bool,
 }
 
-/// One stage of a pipeline.
-///
-/// A stage is a simple command or a compound one — `if`, `for`, `while`, `until`, `case`, or a
-/// `{ ...; }` group — which is what makes `cmd | while read line; do ...; done` and
-/// `cmd || { echo failed; exit 1; }` expressible. A compound stage runs in the *current* scope:
-/// there are no subshells here, so a variable a piped `while` loop assigns is still set afterwards,
-/// which is the opposite of bash and the thing that makes the idiom usable rather than a trap.
+/// A compound stage (if/for/while/case/group) runs in the current scope, not a subshell, so a
+/// variable a piped while loop assigns is still set afterward, the opposite of bash.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {
-    /// A command word with its arguments.
     Simple(SimpleCommand),
-    /// A compound statement, with any redirections written after it.
     Compound {
-        /// The statement to run.
         statement: Box<Statement>,
-        /// Redirections applied to the whole statement.
         redirects: Vec<Redirect>,
     },
 }
 
-/// One command: optional assignment prefixes, argv words, and its redirections.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SimpleCommand {
-    /// `NAME=value` prefixes. With no argv words these are plain assignments.
     pub assignments: Vec<Assignment>,
-    /// Command word followed by arguments.
     pub words: Vec<Word>,
-    /// Redirections in source order, applied left to right the way bash applies them.
     pub redirects: Vec<Redirect>,
-    /// `<<DELIM` body, supplying this command's input in place of anything piped into it.
     pub here_doc: Option<Word>,
 }
 
-/// A `NAME=value` assignment.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Assignment {
-    /// Variable name.
     pub name: String,
-    /// Right-hand side.
     pub value: Word,
 }
 
-/// One of the two streams a command writes to.
-///
-/// A command produces a *value* on stdout and *text* on stderr. That split already governed how
-/// this interpreter behaved — a command substitution captures the value and lets diagnostics
-/// through to the terminal, exactly as a real shell does — and these are the names a script uses to
-/// address the two halves.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Stream {
-    /// The value channel, written by `>`, `1>`, and read by `$( )`.
     Stdout,
-    /// The diagnostic channel, written by `2>`.
     Stderr,
-    /// Both at once, written by `&>`. Never a duplication *target*.
     Both,
 }
 
 impl Stream {
-    /// Renders the descriptor prefix a script would have typed.
     #[must_use]
     pub const fn descriptor(self) -> &'static str {
         match self {
@@ -135,127 +81,78 @@ impl Stream {
     }
 }
 
-/// Where a redirected stream goes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RedirectTarget {
-    /// A named in-memory buffer.
-    ///
-    /// These are not files. The buffer store lives for exactly one script execution and is
-    /// unreachable from any real path; `cat <name>` is the only reader. The one reserved name is
-    /// [`DEV_NULL`], which discards.
+    /// Not files: the buffer store lives for exactly one script execution and is unreachable from
+    /// any real path; the reserved name DEV_NULL discards.
     Buffer {
-        /// `true` for `>>` and `2>>`, `false` for `>` and `2>`.
         append: bool,
-        /// Buffer name word.
         target: Word,
     },
-    /// The other stream, as in `2>&1` and `>&2`. Never [`Stream::Both`].
     Stream(Stream),
 }
 
-/// The one buffer name that discards everything written to it.
-///
-/// There is no filesystem here, so this is a reserved name rather than a path. It exists because it
-/// is the one target a model will reach for to silence a command, and refusing the spelling every
-/// shell shares would be worse than admitting it.
 pub const DEV_NULL: &str = "/dev/null";
 
-/// One redirection: which stream, and where it goes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Redirect {
-    /// The stream being redirected.
     pub source: Stream,
-    /// Its destination.
     pub target: RedirectTarget,
 }
 
-/// `if`/`elif`/`else`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IfStatement {
-    /// `if` and each `elif` condition paired with its body.
     pub branches: Vec<(AndOrList, Program)>,
-    /// Optional `else` body.
     pub otherwise: Option<Program>,
 }
 
-/// `for NAME in WORDS...; do ...; done`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ForLoop {
-    /// Loop variable.
     pub variable: String,
-    /// Words expanded once before the loop begins.
     pub words: Vec<Word>,
-    /// Loop body.
     pub body: Program,
 }
 
-/// `while LIST; do ...; done` and its inverted `until` form.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WhileLoop {
-    /// Condition re-evaluated before each iteration.
     pub condition: AndOrList,
-    /// Loop body.
     pub body: Program,
-    /// `true` for `until`, which iterates while the condition's status is non-zero.
     pub until: bool,
 }
 
-/// `case WORD in PATTERN) ...;; esac`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaseStatement {
-    /// The word each clause's patterns are matched against.
     pub subject: Word,
-    /// Clauses in source order; the first whose pattern matches runs, and no other.
     pub clauses: Vec<CaseClause>,
 }
 
-/// One `PATTERN|PATTERN) LIST ;;` clause.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CaseClause {
-    /// Alternatives, any one of which selects this clause.
     pub patterns: Vec<CasePattern>,
-    /// Body run when a pattern matches.
     pub body: Program,
 }
 
-/// One `case` alternative.
-///
-/// Bash matches these as filename-style patterns. This shell matches literal text instead, for the
-/// same reason `builtins`' `grep` and `sed` take literal patterns: a partial wildcard is
-/// the pattern a literal matcher answers wrongly and silently, so it is rejected by name rather
-/// than quietly mismatched. A bare `*` is kept, because it is the default branch rather than a
-/// wildcard in any meaningful sense.
+/// Unlike bash's filename-style globs, this matches literal text, since a partial wildcard would
+/// otherwise mismatch silently; a bare * is kept only as the default branch.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CasePattern {
-    /// A bare `*`: the catch-all branch, which matches every subject.
     Any,
-    /// A constant pattern, already checked for pattern syntax when it was parsed.
     Literal(Word),
-    /// A pattern built from expansions, checked for pattern syntax when it is expanded.
-    ///
-    /// It cannot be checked earlier, because its text does not exist until the script runs — the
-    /// same reason `grep "$pattern"` is checked at run time rather than at parse time.
     Expanded(Word),
 }
 
-/// `name() { ... }`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FunctionDefinition {
-    /// Function name.
     pub name: String,
-    /// Function body.
     pub body: Program,
 }
 
-/// One argv word built from concatenated parts.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct Word {
-    /// Parts in source order.
     pub parts: Vec<WordPart>,
 }
 
 impl Word {
-    /// Returns the word's text when it is a single unquoted literal.
     #[must_use]
     #[cfg(test)]
     pub(crate) fn as_literal(&self) -> Option<&str> {
@@ -265,11 +162,6 @@ impl Word {
         }
     }
 
-    /// Reports whether the whole word is exactly one command substitution.
-    ///
-    /// `x=$(cmd)` preserves the command's structured value instead of coercing it to text. This is
-    /// a deliberate, documented deviation from bash, where `$()` is always textual; it is what lets
-    /// `issue=$(gh issue view 12)` be followed by `echo ${issue[title]}`.
     #[must_use]
     #[cfg(test)]
     pub(crate) fn is_bare_command_substitution(&self) -> bool {
@@ -277,216 +169,121 @@ impl Word {
     }
 }
 
-/// One component of a word.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WordPart {
     /// Unquoted literal text. `*`, `?`, `[`, `{`, and `~` are ordinary characters here.
     Literal(String),
-    /// Single-quoted text; fully literal, bash-exact.
     SingleQuoted(String),
-    /// Double-quoted text; interpolates parameters, `$(...)`, and `$(( ... ))`.
     DoubleQuoted(Vec<WordPart>),
-    /// An unquoted parameter reference. A JSON array expands element-by-element into argv words.
     Parameter(Parameter),
-    /// `$( ... )`.
     CommandSubstitution(Program),
-    /// `$(( ... ))`.
     Arithmetic(ArithExpr),
 }
 
-/// A parameter reference.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Parameter {
-    /// `$NAME`, `${NAME}`, `${NAME[index]}`, and the `${NAME...}` forms that transform it.
     Named {
-        /// Variable name.
         name: String,
-        /// Indices applied left to right; array offsets and object keys are backed by real JSON.
         indices: Vec<Index>,
-        /// The transformation applied to whatever the indices selected.
         modifier: Modifier,
-        /// `${#NAME}`: produce the length of the selection rather than the selection.
         length: bool,
     },
-    /// `$1` .. `${N}`.
     Positional(usize),
-    /// `$@`, which splits one word per parameter even inside double quotes.
     AllPositional,
-    /// `$*`, which is always exactly one space-joined word.
     AllPositionalJoined,
-    /// `$#`.
     PositionalCount,
-    /// `$?`.
     LastStatus,
 }
 
-/// What one `[...]` in a parameter reference selects.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Index {
-    /// `${NAME[expr]}` — one element or field.
     At(Word),
-    /// `${NAME[@]}` — every element, one word each even inside double quotes, like `"$@"`.
     All,
-    /// `${NAME[*]}` — every element joined by a space into one word, like `$*`.
     AllJoined,
 }
 
-/// The transformation a `${NAME...}` expansion applies to the value it selected.
-///
-/// Every pattern here is **literal text**, the same rule `grep`, `sed`, and `case` patterns follow.
-/// A literal pattern matches in exactly one way, which is why bash's shortest/longest pairs
-/// (`#`/`##`, `%`/`%%`) are accepted as spellings of the same thing rather than as two behaviors:
-/// there is only one prefix to strip. A metacharacter in one of these patterns is rejected by name,
-/// because a partial wildcard is exactly the pattern a literal matcher answers wrongly and
-/// silently.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Modifier {
-    /// No transformation.
     None,
-    /// `${NAME:-word}` and `${NAME-word}`.
     Default {
-        /// `true` for the `:` forms, which also treat an empty value as absent.
         colon: bool,
-        /// The substitute.
         word: Word,
     },
-    /// `${NAME:=word}` and `${NAME=word}`, which also bind the substitute to the name.
     Assign {
-        /// `true` for the `:` form.
         colon: bool,
-        /// The substitute, also assigned.
         word: Word,
     },
-    /// `${NAME:?word}` and `${NAME?word}`, which end the script when the value is absent.
     Require {
-        /// `true` for the `:` form.
         colon: bool,
-        /// The message, or `None` for the built-in one.
         word: Option<Word>,
     },
-    /// `${NAME:+word}` and `${NAME+word}`.
     Alternate {
-        /// `true` for the `:` form.
         colon: bool,
-        /// What to produce when the value is present.
         word: Word,
     },
-    /// `${NAME#pattern}` and `${NAME##pattern}`.
     StripPrefix(Pattern),
-    /// `${NAME%pattern}` and `${NAME%%pattern}`.
     StripSuffix(Pattern),
-    /// `${NAME/pattern/replacement}` and `${NAME//pattern/replacement}`.
     Replace {
-        /// `true` for the `//` form.
         all: bool,
-        /// The literal text to find.
         pattern: Pattern,
-        /// What to put in its place.
         replacement: Word,
     },
 }
 
-/// A `[[ ... ]]` expression.
-///
-/// The operand tests are evaluated by the same code `test` and `[` use, so the two spellings cannot
-/// disagree about what `-z` or `-lt` mean. What `[[ ]]` adds is the connective grammar bash gives
-/// it — `&&`, `||`, `!`, and parentheses inside the brackets — plus the promise that an unquoted
-/// expansion is one word, so `[[ -n $x ]]` holds for a value with spaces in it where `[ -n $x ]`
-/// would fall apart.
+/// Operand tests share code with test and [, so they cannot disagree on what -z or -lt means;
+/// unlike [, an unquoted expansion here is always one word even with embedded spaces.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Conditional {
-    /// One primary: `[[ WORD ]]`, `[[ -n WORD ]]`, or `[[ WORD op WORD ]]`.
     Test(ConditionalTest),
-    /// `! EXPR`.
     Not(Box<Conditional>),
-    /// `EXPR && EXPR`.
     And(Box<Conditional>, Box<Conditional>),
-    /// `EXPR || EXPR`.
     Or(Box<Conditional>, Box<Conditional>),
 }
 
-/// One `[[ ]]` primary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ConditionalTest {
-    /// Operand words in source order; one, two, or three of them.
     pub words: Vec<Word>,
-    /// Whether the right operand of `=`/`==`/`!=` still needs its metacharacter check.
-    ///
-    /// In bash that operand is a *glob*, not a string. Comparing it literally would answer
-    /// `[[ $f == *.json ]]` wrongly and silently, so a metacharacter is rejected by name — by the
-    /// parser when the operand is constant, where quoting is still the way out, and at expansion
-    /// otherwise. This flag says which of the two applies, so a quoted `'*'` is not re-checked
-    /// after its quotes are gone.
+    /// This operand is a bash glob; a metacharacter is rejected by name at parse time when
+    /// constant, or at expansion otherwise, and this flag tracks which applies.
     pub check_right_pattern: bool,
 }
 
-/// One literal pattern, split by when its metacharacters can be checked.
-///
-/// The same split [`CasePattern`] draws, for the same reason: a pattern the parser can read whole
-/// is checked there, where quoting is still visible and `'*'` is the way to mean an asterisk. One
-/// assembled at run time is checked when it is expanded, because that is the first moment its text
-/// exists — and quoting cannot exempt it, since its quotes are already gone.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Pattern {
-    /// Constant in the source; already checked by the parser.
     Literal(Word),
-    /// Contains an expansion; checked when it is expanded.
     Expanded(Word),
 }
 
-/// An arithmetic expression inside `$(( ... ))`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ArithExpr {
-    /// Integer literal.
     Integer(i64),
-    /// Floating-point literal.
     Float(f64),
-    /// A bare variable name; its value is coerced to a number.
     Variable(String),
-    /// Prefix `-` or `!`.
     Unary(ArithUnaryOp, Box<ArithExpr>),
-    /// An infix operator.
     Binary(ArithBinaryOp, Box<ArithExpr>, Box<ArithExpr>),
 }
 
 impl Eq for ArithExpr {}
 
-/// Prefix arithmetic operator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArithUnaryOp {
-    /// Arithmetic negation.
     Negate,
-    /// Logical negation, yielding `1` or `0`.
     Not,
 }
 
-/// Infix arithmetic operator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ArithBinaryOp {
-    /// `+`.
     Add,
-    /// `-`.
     Subtract,
-    /// `*`.
     Multiply,
-    /// `/`.
     Divide,
-    /// `%`.
     Remainder,
-    /// `<`.
     Less,
-    /// `<=`.
     LessOrEqual,
-    /// `>`.
     Greater,
-    /// `>=`.
     GreaterOrEqual,
-    /// `==`.
     Equal,
-    /// `!=`.
     NotEqual,
-    /// `&&`.
     And,
-    /// `||`.
     Or,
 }

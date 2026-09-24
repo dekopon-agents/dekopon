@@ -1,5 +1,3 @@
-//! Bridge from the blocking prompt session into its explicitly supplied runtime.
-
 use crate::{
     control::TurnControl,
     error::InferenceError,
@@ -10,7 +8,6 @@ use crate::{
 use std::{ops::ControlFlow, sync::Arc, time::Duration};
 use tokio::{runtime::Handle, sync::watch};
 
-/// Per-session bridge; the expensive configured client is shared, cancellation is not.
 pub struct BlockingModel {
     client: Arc<ModelClient>,
     runtime: Handle,

@@ -21,13 +21,8 @@ use dekopon_core::{
 use dekopon_test_support::{LoopbackServer, provider_fixture};
 use serde_json::{Value, json};
 
-/// One fixture trace context for every request these tests build.
-///
-/// The trace is mandatory on the wire now; these cases read invocation identifiers and audit
-/// fields rather than the trace itself, so one shared value keeps the fixtures about their subject.
 const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
 
-/// The canonical subject every attestation fixture stands for.
 const SLACK_SUBJECT: &str = "slack.t0123abc.u9xyz";
 
 fn principal(name: &str) -> PrincipalId {
@@ -49,7 +44,6 @@ fn context(principal: &str) -> AuthenticatedContext {
     agent_context(principal, "provider-test")
 }
 
-/// A directly connected agent context: no attestor peer, no external subject.
 fn agent_context(name: &str, agent_name: &str) -> AuthenticatedContext {
     AuthenticatedContext::new(
         principal(name),
@@ -60,11 +54,6 @@ fn agent_context(name: &str, agent_name: &str) -> AuthenticatedContext {
     .expect("trusted agent context is valid")
 }
 
-/// A gateway's own peer context.
-///
-/// A service actor must carry the principal the transport authenticated, so the two names a
-/// caller might expect to vary independently here cannot: `AuthenticatedContext::new` rejects the
-/// mismatch.
 fn service_context(name: &str) -> AuthenticatedContext {
     AuthenticatedContext::new(
         principal(name),
@@ -89,7 +78,6 @@ fn request(id: &str, capability: &str, input: serde_json::Value) -> InvocationRe
     }
 }
 
-/// One constraint set with the classification the cli-probe provider actually declares.
 fn set(provider: &str, constraints: ExecutionConstraints) -> ConstraintSet {
     set_with_metadata(provider, EffectKind::ReadOnly, RiskLevel::Low, constraints)
 }
@@ -125,10 +113,6 @@ fn catalog<'a>(entries: impl IntoIterator<Item = (&'a str, ConstraintSet)>) -> C
     .expect("distinct capability fixtures build a catalog")
 }
 
-/// A policy engine over exactly the entities a fixture names.
-///
-/// `principals` is the declared world: a policy naming anything outside it refuses construction,
-/// which is what replaced the old engine's reachability check.
 fn engine<'a>(
     policies: &str,
     principals: impl IntoIterator<Item = &'a str>,
@@ -151,7 +135,6 @@ fn engine<'a>(
     PolicyEngine::new(policies, &world).expect("fixture policy validates")
 }
 
-/// The cli-probe world every cli-probe fixture shares.
 fn probe_engine<'a>(policies: &str, principals: impl IntoIterator<Item = &'a str>) -> PolicyEngine {
     engine(
         policies,
@@ -164,7 +147,6 @@ fn probe_engine<'a>(policies: &str, principals: impl IntoIterator<Item = &'a str
     )
 }
 
-/// The HTTP probe world.
 fn http_probe_engine(policies: &str) -> PolicyEngine {
     engine(policies, ["caller"], [("http-probe.fetch", "http-probe")])
 }
@@ -210,8 +192,6 @@ impl SecretResolver for MissingSecretResolver {
     }
 }
 
-/// The JSONPlaceholder world, which is the only fixture with two differently classified
-/// capabilities on one provider.
 fn jsonplaceholder_engine(policies: &str) -> PolicyEngine {
     engine(
         policies,
@@ -223,7 +203,6 @@ fn jsonplaceholder_engine(policies: &str) -> PolicyEngine {
     )
 }
 
-/// [`direct_policy`] for a provider other than `cli-probe`.
 fn direct_provider_policy(
     name: &str,
     agent_name: &str,
@@ -243,14 +222,11 @@ fn direct_http_policy(name: &str, agent_name: &str, capability: &str) -> String 
     direct_provider_policy(name, agent_name, "http-probe", capability)
 }
 
-/// The same HTTP grant for a directly connected peer that is no agent at all — the shape
-/// a direct service peer arrives in, carrying `Actor::Service` and therefore no `context.agent`.
 const DIRECT_PEER_HTTP_POLICY: &str = r#"permit(principal == Dekopon::Principal::"direct-peer",
        action == Dekopon::Action::"http-probe.fetch",
        resource == Dekopon::Provider::"http-probe")
 unless { context has via };"#;
 
-/// One plaintext loopback GET against a fixture server.
 fn loopback_constraints(authority: &str) -> ExecutionConstraints {
     ExecutionConstraints {
         asset: None,
@@ -269,7 +245,6 @@ fn loopback_constraints(authority: &str) -> ExecutionConstraints {
     }
 }
 
-/// The Cedar spelling of "this exact principal, as this exact agent, connected directly".
 fn direct_policy(name: &str, agent_name: &str, capability: &str) -> String {
     format!(
         r#"permit(principal == Dekopon::Principal::"{name}",
@@ -280,7 +255,6 @@ fn direct_policy(name: &str, agent_name: &str, capability: &str) -> String {
     )
 }
 
-/// The session gate: this principal may drive this agent, but only through this gateway.
 fn agent_prompt_policy(name: &str, agent_name: &str, via: &str) -> String {
     format!(
         r#"permit(principal == Dekopon::Principal::"{name}",
@@ -290,7 +264,6 @@ fn agent_prompt_policy(name: &str, agent_name: &str, via: &str) -> String {
     )
 }
 
-/// The Cedar spelling of "…reached only through exactly this gateway".
 fn attested_policy(name: &str, agent_name: &str, via: &str, capability: &str) -> String {
     format!(
         r#"permit(principal == Dekopon::Principal::"{name}",
@@ -331,8 +304,6 @@ async fn probe_registry(limits: BrokerHostLimits) -> BrokerProviderRegistry {
         .expect("cli-probe provider fixture loads")
 }
 
-/// A broker whose only grant is attested: `cpetersen` may `cli-probe.upper`, but only through
-/// `gateway`.
 async fn attested_broker(
     identities: IdentityDirectory,
     audit: Arc<InMemoryAuditLog>,
@@ -346,8 +317,6 @@ async fn attested_broker(
                 "{}\n{}\n{}",
                 attested_policy("cpetersen", "some-agent", "gateway", "cli-probe.upper"),
                 agent_prompt_policy("cpetersen", "some-agent", "gateway"),
-                // `oncall` may drive the agent and holds no capability, which is what makes
-                // "allowed to ask, granted nothing" distinguishable from "may not ask".
                 agent_prompt_policy("oncall", "some-agent", "gateway"),
             ),
             ["cpetersen", "oncall", "gateway"],
@@ -727,8 +696,6 @@ async fn jsonplaceholder_write_requires_external_write_policy_and_redacts_conten
             "jsonplaceholder.posts.create",
         )),
         catalog([
-            // The read is deployable but ungranted, so its refusal is a policy decision rather
-            // than "nothing knows how to run this".
             (
                 "jsonplaceholder.posts.get",
                 set("jsonplaceholder", read_constraints),
@@ -835,8 +802,6 @@ async fn failed_execution_audits_the_external_write_that_already_landed() {
     )
     .await
     .expect("JSONPlaceholder provider fixture loads");
-    // The POST is accepted by the server — the non-idempotent effect happens — but the body is
-    // not a post, so the guest reports its own failure after the external write has landed.
     let server = LoopbackServer::once(
         b"HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnot-json",
     );
@@ -917,8 +882,6 @@ async fn failed_execution_audits_the_external_write_that_already_landed() {
         dekopon_capability::InvocationOutcome::Failed
     );
     assert_eq!(result.result.error.as_deref(), Some("provider-failure"));
-    // The class stays the class; the provider's own answer rides beside it, which is the only
-    // thing in the result that says what the endpoint actually did.
     assert_eq!(
         result.result.detail,
         Some(ProviderFailureDetail::new(
@@ -950,8 +913,6 @@ async fn failed_execution_audits_the_external_write_that_already_landed() {
     };
     assert_eq!(*outcome, dekopon_capability::InvocationOutcome::Failed);
     assert_eq!(error.as_deref(), Some("provider-failure"));
-    // An operator reconstructing this run from the trace alone reads the class and the provider's
-    // sentence in the same record, rather than the class and nothing.
     assert_eq!(
         error_detail
             .as_ref()
@@ -1043,7 +1004,6 @@ async fn credentialed_constraint_sets_inject_bound_secrets_and_never_audit_them(
         dekopon_capability::InvocationOutcome::Succeeded
     );
 
-    // The wire is the only place the secret may appear, exactly once, as the injected header.
     let wire = server.request_text();
     assert!(
         wire.contains(&format!("authorization: Bearer {SECRET}")),
@@ -1051,7 +1011,6 @@ async fn credentialed_constraint_sets_inject_bound_secrets_and_never_audit_them(
     );
     server.join();
 
-    // Presence is recorded; the value is not — not in audit, not in the public result.
     let records = audit.records();
     let serialized = serde_json::to_string(&records).expect("audit serializes");
     assert!(
@@ -1064,12 +1023,6 @@ async fn credentialed_constraint_sets_inject_bound_secrets_and_never_audit_them(
     assert!(!public.contains(SECRET), "result leaked the secret");
 }
 
-/// A credential the broker must resolve per invocation, with a counter instead of a token endpoint.
-///
-/// The real resolver is `dekopon-brokerd`'s, which runs `dekopon-model`'s OAuth refresh on the
-/// blocking pool; what this file has to pin is the broker's half of the seam — that the resolution
-/// happens exactly once per invocation, before the component runs, and outside everything the guest
-/// is accounted for.
 #[derive(Debug)]
 struct ScriptedRefreshingCredential {
     destinations: Vec<String>,
@@ -1119,12 +1072,6 @@ impl RefreshingCredential for ScriptedRefreshingCredential {
     }
 }
 
-/// A refresh is the broker's own call, not the guest's.
-///
-/// The constraint set grants exactly one HTTP request, so if the renewal were charged to the guest's
-/// budget the component's single call would be refused. The guest also never learns a renewal
-/// happened: evidence carries one call, the audit record carries the symbolic name, and neither
-/// carries the token or the account identifier.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refreshing_credential_resolves_once_per_invocation_outside_the_guest_budget() {
     const ACCESS: &str = "refreshed-access-token-audit-must-never-see";
@@ -1240,11 +1187,6 @@ async fn a_refreshing_credential_resolves_once_per_invocation_outside_the_guest_
     );
 }
 
-/// A credential that cannot be renewed fails its own invocation and nothing else.
-///
-/// The two classes are separate reasons on purpose: a revoked refresh-token family needs an operator
-/// at a browser, while a token endpoint that is down needs nobody. Both leave the broker serving,
-/// which the second invocation here demonstrates.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unrenewable_credential_fails_its_invocation_and_classifies_why() {
     let registry = BrokerProviderRegistry::load(
@@ -1253,8 +1195,6 @@ async fn an_unrenewable_credential_fails_its_invocation_and_classifies_why() {
     )
     .await
     .expect("HTTP provider fixture loads");
-    // Nothing listens here: a provider that ran at all would fail on connect instead, which is how
-    // this test proves the component was never reached.
     let authority = "127.0.0.1:9".to_owned();
     let source = ScriptedRefreshingCredential::new(
         vec![authority.clone()],
@@ -1528,7 +1468,6 @@ async fn capability_policy_alone_cannot_authorize_a_drn() {
 /// The secret [`basic_secret_broker`] resolves; at least the 16 bytes the native sink requires.
 const BASIC_SECRET: &[u8] = b"drn-secret-never-visible";
 
-/// `httpprobe fetch` asking for [`secret_drn`] as HTTP Basic under the username `user-a`.
 fn basic_fetch_argv(uri: &str) -> Vec<String> {
     let drn = secret_drn();
     ["fetch", "--uri", uri, "--basic", "user-a", drn.as_str()]
@@ -1536,11 +1475,8 @@ fn basic_fetch_argv(uri: &str) -> Vec<String> {
         .into()
 }
 
-/// A broker over the HTTP probe whose one private binding lets [`secret_drn`] reach
-/// `http-probe.fetch` as HTTP Basic for exactly `username`.
-///
-/// Its policy permits that `secret.use` whatever the username, because Cedar never sees one: which
-/// name may present the secret is the owner's binding alone.
+/// Cedar's policy permits secret.use regardless of username; the binding, not the policy, is what
+/// restricts which name may present the secret.
 fn basic_secret_broker(
     registry: BrokerProviderRegistry,
     authority: &str,
@@ -1596,12 +1532,6 @@ fn basic_secret_broker(
     .expect("binding fits capability")
 }
 
-/// A command word proposes secret use from its own argv.
-///
-/// No shell builtin produces a secret-use proposal any more; a provider's `run-command` guest does.
-/// `httpprobe fetch --basic` reads the username and DRN off its flag and returns them as the
-/// proposal's typed secret use, beside an input that names no secret. Running the word decides
-/// nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_word_proposes_basic_secret_use_from_its_argv() {
     let registry = BrokerProviderRegistry::load(
@@ -1639,12 +1569,6 @@ async fn a_command_word_proposes_basic_secret_use_from_its_argv() {
     assert!(audit.records().is_empty(), "running a word decides nothing");
 }
 
-/// A word's Basic proposal is authorized like any other secret use, and the binding fixes the
-/// username.
-///
-/// The `--basic user-a` proposal is refused `secret-denied` by a broker that binds the DRN for
-/// `user-b`, and rendered into the Authorization header by one that binds it for `user-a`. Policy
-/// permits the `secret.use` on both, so the refusal belongs to the binding alone.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_word_s_basic_proposal_needs_a_binding_for_its_exact_username() {
     let server = LoopbackServer::once(
@@ -1839,12 +1763,6 @@ async fn authorized_source_failure_is_a_terminal_audited_failure_not_an_ambiguou
     assert!(http_calls.is_empty());
 }
 
-/// The per-agent axis, end to end: one capability, one constraint set, two organizations' tokens.
-///
-/// Selection keys on the agent in the trusted context, so all three shapes a caller can arrive in
-/// are here — an agent the set names, an agent it does not, and a direct peer that is no agent at
-/// all. The wire is the only place a secret may appear; the audit log gets the symbolic name,
-/// which is what keeps the two writes from being indistinguishable after the fact.
 #[tokio::test(flavor = "multi_thread")]
 async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
     const DEFAULT_SECRET: &str = "dekopon-agents-token";
@@ -1948,7 +1866,6 @@ async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
         agent_context("caller", "dekoponville-github"),
     )
     .await;
-    // A direct peer is an `Actor::Service`: no agent, no override, default.
     fetch("invoke-direct", service_context("direct-peer")).await;
 
     let wire = || server.request_text();
@@ -1972,7 +1889,6 @@ async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
     }
     server.join();
 
-    // Which authority a write used is exactly what an auditor needs; the value still is not.
     let records = audit.records();
     let encoded = serde_json::to_value(&records).expect("audit serializes");
     let selected = encoded
@@ -1993,8 +1909,6 @@ async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
     assert!(!serialized.contains("Bearer"), "audit leaked the scheme");
 }
 
-/// A set may carry overrides and no default, and then "no credential" keeps its original meaning
-/// for every agent the overrides do not name: the capability transacts unauthenticated.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_agent_with_no_override_and_no_default_transacts_unauthenticated() {
     const SECRET: &str = "scientist-hq-token";
@@ -2181,7 +2095,6 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
         )
     };
 
-    // An unnamed credential must fail before any invocation can reference it.
     let error = build(
         "missing-token".to_owned(),
         http(vec!["api.example.test".to_owned()]),
@@ -2191,7 +2104,6 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
     .expect_err("unknown credential names are refused");
     assert!(matches!(error, BrokerBuildError::UnknownCredential { .. }));
 
-    // The same, for an override: a set is only as proven as the credential nobody validated.
     let error = build_override(
         "missing-token".to_owned(),
         http(vec!["api.example.test".to_owned()]),
@@ -2203,7 +2115,6 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
         BrokerBuildError::UnknownCredential { name, .. } if name == "missing-token"
     ));
 
-    // A credential with no HTTP authority to ride on is a configuration contradiction.
     let error = build(
         "fetch-token".to_owned(),
         ExecutionConstraints::default(),
@@ -2216,8 +2127,6 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
         BrokerBuildError::CredentialWithoutHttp { .. }
     ));
 
-    // Coverage is what makes the runtime destination mismatch unreachable: every allowed host
-    // must be a destination the credential is explicitly bound to.
     let error = build(
         "fetch-token".to_owned(),
         http(vec![
@@ -2233,8 +2142,6 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
         BrokerBuildError::CredentialDestinationMismatch { host, .. } if host == "other.example.test"
     ));
 
-    // An override is checked against this set's allowed hosts, not against the default's
-    // destinations: `other-token` reaches somewhere real, just not where this set may go.
     let error = build_override(
         "other-token".to_owned(),
         http(vec!["api.example.test".to_owned()]),
@@ -2248,10 +2155,8 @@ async fn credentialed_constraint_sets_fail_closed_at_construction() {
     ));
 }
 
-/// `via` is the entire reason adding a gateway cannot widen an existing grant, so it has to fail
-/// closed in both directions. An attested context must not reach a policy written for directly
-/// connected peers, and a direct context must not reach a policy written for an attested one —
-/// even when the principal and agent are otherwise identical.
+/// Via-isolation must fail closed both ways: an attested context must never match a policy written
+/// for direct peers, nor the reverse, even with identical principal and agent.
 #[tokio::test(flavor = "multi_thread")]
 async fn via_isolation_holds_in_both_directions() {
     let audit = Arc::new(InMemoryAuditLog::new(16).expect("valid audit bound"));
@@ -2312,8 +2217,6 @@ async fn via_isolation_holds_in_both_directions() {
         Some(json!({"text": "ON BEHALF OF"}))
     );
 
-    // The mapped principal arriving as itself, with the same agent actor, is a different context
-    // than the attested one and matches nothing.
     let direct = broker
         .invoke(
             &agent_context("cpetersen", "some-agent"),
@@ -2340,7 +2243,6 @@ async fn via_isolation_holds_in_both_directions() {
         "an attested rule must be invisible to the same principal connecting directly"
     );
 
-    // And the attested context cannot borrow authority granted to a direct peer.
     let crossed = broker
         .invoke(
             &gateway,
@@ -2361,7 +2263,6 @@ async fn via_isolation_holds_in_both_directions() {
     );
     assert_eq!(crossed.result.error.as_deref(), Some("policy-denied"));
 
-    // Capability listings agree with the invocation decisions on both sides of the boundary.
     let visible = broker
         .capability_surface(
             &gateway,
@@ -2390,11 +2291,6 @@ async fn via_isolation_holds_in_both_directions() {
     assert_eq!(records.len(), 4, "one allow plus execution, two denials");
 }
 
-/// A refused attestation is a decision, not an error, and it belongs to the peer that made the
-/// claim — no trusted mapping happened, so attributing it to the subject's principal would
-/// launder an unauthorized claim into that principal's record. The claimed subject is still
-/// recorded, because "which subject did this gateway try to speak for" is the question an
-/// operator will ask.
 #[tokio::test(flavor = "multi_thread")]
 async fn attestation_refusals_are_audited_denials_under_the_peer() {
     let gateway = service_context("gateway");
@@ -2407,7 +2303,6 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
     )
     .await;
 
-    // No attestor authority at all.
     let ungranted = broker
         .invoke(
             &gateway,
@@ -2431,7 +2326,6 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
         Some("attestation-denied")
     );
 
-    // Authority over a different workspace is not authority over this one.
     let out_of_scope = broker
         .invoke(
             &gateway,
@@ -2489,8 +2383,6 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
         assert_eq!(reason.as_deref(), Some("attestation-denied"));
     }
 
-    // A grant that covers the subject but a directory that does not name it is a distinct
-    // configuration mistake and gets a distinct reason.
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
     let broker = attested_broker(IdentityDirectory::empty(), Arc::clone(&audit)).await;
     let unmapped = broker
@@ -2531,9 +2423,6 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
     assert_eq!(reason.as_deref(), Some("unmapped-subject"));
 }
 
-/// An allowed attested invocation records who it ran as (`principal`), who vouched for it
-/// (`via`), and which external identity it stood for (`attestedSubject`) — and nothing about the
-/// message that prompted it.
 #[tokio::test(flavor = "multi_thread")]
 async fn attested_success_audits_via_and_subject() {
     let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
@@ -2568,8 +2457,6 @@ async fn attested_success_audits_via_and_subject() {
     let records = audit.records();
     assert_eq!(records.len(), 2);
     let encoded = serde_json::to_value(&records).expect("audit serializes");
-    // Event field names are the enum's own snake_case. Asserting the literal keys keeps them from
-    // drifting silently.
     for (index, kind) in [(0, "decision"), (1, "execution")] {
         let event = &encoded[index];
         assert_eq!(event["type"], kind);
@@ -2590,8 +2477,6 @@ async fn attested_success_audits_via_and_subject() {
     );
 }
 
-/// `None` and `Some(vec![])` answer different questions, and collapsing them would let a gateway
-/// probe the directory: "you may not ask" must not be reported as "this subject has nothing".
 #[tokio::test(flavor = "multi_thread")]
 async fn attested_capabilities_distinguishes_refusal_from_empty() {
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
@@ -2632,8 +2517,6 @@ async fn attested_capabilities_distinguishes_refusal_from_empty() {
     assert_eq!(granted.len(), 1);
     assert_eq!(granted[0].capability.id.as_str(), "cli-probe.upper");
 
-    // Attested successfully, mapped successfully, and granted nothing: an empty list is the
-    // honest answer and is not a refusal.
     let bare = broker
         .capability_surface(
             &gateway,
@@ -2648,8 +2531,6 @@ async fn attested_capabilities_distinguishes_refusal_from_empty() {
     assert!(bare.is_empty());
 }
 
-/// Namespace scoping is prefix matching, and prefix matching without segment boundaries is a
-/// tenant-confusion bug: `slack.t0123abc` must not reach into workspace `t0123abcx`.
 #[test]
 fn attestor_scopes_match_on_segment_boundaries() {
     let grant = attestor_grant(["slack.t0123abc"]);
@@ -2660,12 +2541,10 @@ fn attestor_scopes_match_on_segment_boundaries() {
     assert!(!grant.permits(&ExternalSubject::slack("T0123ABCX", "U9").expect("slack subject")));
 
     for invalid in [
-        // A grant that names nothing cannot be an authority over anything.
         vec![],
         vec!["sms".to_owned()],
         vec!["slack.T0123ABC".to_owned()],
         vec!["slack..u9xyz".to_owned()],
-        // Deeper than any canonical subject, so it could only ever match by accident.
         vec!["slack.t0123abc.u9xyz.extra".to_owned()],
     ] {
         let grant = AttestorGrant {
@@ -2679,8 +2558,6 @@ fn attestor_scopes_match_on_segment_boundaries() {
     }
 }
 
-/// The directory is the only place a subject becomes a principal, so it must be exact: no
-/// prefix or fallback resolution, and no subject naming two principals.
 #[test]
 fn identity_directory_rejects_duplicates_and_resolves_exactly() {
     let slack = subject(SLACK_SUBJECT);
@@ -2709,11 +2586,8 @@ fn identity_directory_rejects_duplicates_and_resolves_exactly() {
     ));
 }
 
-/// A capability nothing can execute is refused twice: at startup if any policy could ever permit
-/// it, and at decision time with its own reason if it somehow arrives anyway.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
-    // Startup: the policy names `cli-probe.reverse`, the catalog does not.
     let error = Broker::new(
         probe_registry(BrokerHostLimits::default()).await,
         principal("broker-test"),
@@ -2737,8 +2611,6 @@ async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
         BrokerBuildError::UnconstrainedCapability { capability } if capability.as_str() == "cli-probe.reverse"
     ));
 
-    // Decision time: a policy that constrains no action can permit anything, so the missing
-    // constraint set is the only thing standing between the caller and an unexecutable capability.
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
     let broker = Broker::new(
         probe_registry(BrokerHostLimits::default()).await,
@@ -2789,8 +2661,6 @@ async fn a_capability_without_a_constraint_set_fails_closed_at_both_layers() {
     );
 }
 
-/// A decision is only explainable if the record says which policy made it. The digest is the other
-/// half: it says which policy set that identifier belongs to.
 #[tokio::test(flavor = "multi_thread")]
 async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
     let audit = Arc::new(InMemoryAuditLog::new(8).expect("valid audit bound"));
@@ -2845,24 +2715,15 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
 
     let records = audit.records();
     let encoded = serde_json::to_value(&records).expect("audit serializes");
-    // Event fields keep the enum's own snake_case.
     for index in [0, 1] {
         assert_eq!(encoded[index]["policy_ids"], json!(["caller-upper"]));
         assert_eq!(encoded[index]["policy_digest"], json!(digest));
     }
-    // A deny-by-default refusal is reached by no policy, so the absent list is the explanation and
-    // the field stays off the wire entirely.
     assert_eq!(encoded[2]["reason"], "policy-denied");
     assert!(encoded[2].get("policy_ids").is_none());
     assert_eq!(encoded[2]["policy_digest"], json!(digest));
 }
 
-/// Leniency moves *when* the broker complains, never *whether* it enforces.
-///
-/// The configuration here is byte for byte what
-/// [`a_capability_without_a_constraint_set_fails_closed_at_both_layers`] proves refuses startup.
-/// Tolerating it must still deny the invocation with the same reason: the startup check is a
-/// tripwire, and the decision path is the enforcement.
 #[tokio::test(flavor = "multi_thread")]
 async fn tolerating_an_unconstrained_capability_warns_but_still_denies_it() {
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
@@ -2893,7 +2754,6 @@ async fn tolerating_an_unconstrained_capability_warns_but_still_denies_it() {
             if capability.as_str() == "cli-probe.reverse"
     ));
 
-    // The part that matters: enforcement is untouched.
     let result = broker
         .invoke(
             &context("caller"),
@@ -2925,8 +2785,6 @@ async fn tolerating_an_unconstrained_capability_warns_but_still_denies_it() {
     );
 }
 
-/// A constraint set for a provider that is not loaded is inert either way; tolerating it lets an
-/// operator keep configuration for a provider they have not dropped in yet.
 #[tokio::test(flavor = "multi_thread")]
 async fn tolerating_a_constraint_set_that_routes_nowhere_drops_it() {
     let unrouted = [
@@ -2986,7 +2844,6 @@ async fn tolerating_a_constraint_set_that_routes_nowhere_drops_it() {
     ));
     assert_eq!(warnings[0].reason(), "unrouted-constraint-set");
 
-    // The routed half of the same catalog still works.
     let result = broker
         .invoke(
             &context("caller"),
@@ -3003,10 +2860,6 @@ async fn tolerating_a_constraint_set_that_routes_nowhere_drops_it() {
     );
 }
 
-/// Command words are filtered by policy exactly as capabilities are.
-///
-/// A session is never told a word exists that it could not use, so a principal granted nothing
-/// receives an empty vocabulary rather than a map of the deployment's providers.
 #[tokio::test(flavor = "multi_thread")]
 async fn command_words_are_filtered_by_what_policy_allows() {
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
@@ -3030,9 +2883,6 @@ async fn command_words_are_filtered_by_what_policy_allows() {
     )
     .expect("broker starts");
 
-    // The granted context reaches the provider, so it is told the provider's word; the ungranted
-    // context is told nothing. The capability lists below establish that both answers are for the
-    // right reason.
     assert_eq!(broker.command_words(&context("caller")), ["probe"]);
     assert!(broker.command_words(&context("stranger")).is_empty());
     assert_eq!(broker.capabilities(&context("caller")).len(), 1);
@@ -3052,7 +2902,6 @@ async fn command_words_are_filtered_by_what_policy_allows() {
     }
 }
 
-/// A word no loaded provider declares is refused before any component runs.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unknown_command_word_is_refused_without_running_anything() {
     let audit = Arc::new(InMemoryAuditLog::new(4).expect("valid audit bound"));
@@ -3093,9 +2942,6 @@ async fn an_unknown_command_word_is_refused_without_running_anything() {
     );
 }
 
-/// A `run-command` guest answers as the command-line tool it fronts: a help page at status 0, a
-/// proposal built from the piped value, and a usage error at status 2, each travelling intact and
-/// none of them a decision.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_word_renders_help_and_reads_the_piped_value_through_the_broker() {
     let registry = BrokerProviderRegistry::load(

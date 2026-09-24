@@ -1,14 +1,6 @@
-//! Which spans a suspended authorization leaves entered on its worker thread.
-//!
-//! `broker.authorize` covers work that awaits: on every denial an asynchronous audit append. A span
-//! guard held across that await stays entered in the
-//! thread's context while the task is suspended, so whatever the runtime polls next on that thread
-//! — another connection, another session — is recorded as a child of this request's authorization.
-//! With OTLP export on, that is cross-request misattribution in production traces rather than a
-//! test-only nicety.
-//!
-//! This lives in its own test binary because `tracing` resolves per-callsite interest against the
-//! global dispatcher, and because the interleaving it depends on needs a single-threaded runtime.
+//! A span guard held across an await point stays entered on its worker thread while suspended, so
+//! whatever the runtime polls there next is misattributed as a child of this request, in production
+//! too.
 
 #![allow(
     clippy::disallowed_methods,
@@ -31,10 +23,6 @@ use dekopon_test_support::{CaptureLayer, provider_fixture};
 use tokio::sync::{Notify, mpsc};
 use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
-/// One fixture trace context for every request these tests build.
-///
-/// The trace is mandatory on the wire now; these cases read invocation identifiers and audit
-/// fields rather than the trace itself, so one shared value keeps the fixtures about their subject.
 const TRACE_PARENT: &str = "00-0000000000000000000000000000f1c7-00000000000000f1-00";
 
 const POLICIES: &str = r#"
@@ -44,10 +32,6 @@ permit(principal == Dekopon::Principal::"caller",
        resource == Dekopon::Provider::"cli-probe");
 "#;
 
-/// An audit log that parks inside `append` until the test lets it finish.
-///
-/// An asynchronous audit append can suspend. This gate holds the append pending until released,
-/// so the test deterministically exercises that interleaving on a single-threaded runtime.
 struct GatedAudit {
     inner: InMemoryAuditLog,
     entered: mpsc::UnboundedSender<()>,
@@ -131,7 +115,6 @@ fn caller() -> AuthenticatedContext {
     .expect("caller context binds")
 }
 
-/// A denial suspended mid-audit must not adopt whatever the runtime polls next.
 #[tokio::test]
 async fn a_suspended_authorization_does_not_parent_another_task_s_events() {
     let captured = CaptureLayer::workspace();
@@ -172,8 +155,6 @@ async fn a_suspended_authorization_does_not_parent_another_task_s_events() {
         }
     });
 
-    // The authorizing task is now parked inside the gated audit append. Anything else this thread
-    // polls belongs to itself, not to that request.
     entered_rx
         .recv()
         .await
@@ -199,8 +180,6 @@ async fn a_suspended_authorization_does_not_parent_another_task_s_events() {
         unrelated.1
     );
 
-    // The span's own fields still arrive: instrumenting the section must not cost the recorded
-    // outcome an entered guard used to sit next to.
     let authorize = captured
         .spans()
         .into_iter()

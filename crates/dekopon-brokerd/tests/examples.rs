@@ -1,20 +1,3 @@
-//! The `examples/conditional-write/` walkthrough, held against the real machinery it documents.
-//!
-//! The example is a configuration a reader copies and runs, and its claim is that one bounded read
-//! and one etag-pinned write are reachable by one person, through one gateway, driving one agent —
-//! and that the delete the same component exposes is not. Prose cannot keep that true. These tests
-//! load the checked-in `http-probe` component, build the same declared world `dekopon-brokerd`
-//! builds at startup, compile the example's Cedar file against it, and assert the decision table
-//! both directions.
-//!
-//! The configuration half is checked with the broker's own `BrokerdConfig` decoder rather than a
-//! hand-written struct, so a renamed or newly required field breaks here too. What is deliberately
-//! *not* done is running the loaded configuration through the full service: that would need a
-//! temporary directory, mode-0600 fixtures, a rewritten socket path, and a copy of the credentials
-//! file, which is a lot of scaffolding to prove something `tests/server.rs` already proves. The
-//! drift this file exists to catch is the example disagreeing with the manifest or the policy
-//! grammar, and that needs no filesystem at all.
-
 #![cfg(unix)]
 #![allow(clippy::unwrap_used)]
 
@@ -28,9 +11,7 @@ use dekopon_core::{AgentId, CapabilityId, PrincipalId, ProviderId, RiskLevel};
 use dekopon_policy::{PolicyContext, PolicyRequest, PolicyTarget};
 use serde::Deserialize;
 
-/// The two capabilities the example grants, in the order its files list them.
 const GRANTED: [&str; 2] = ["http-probe.conditional-write", "http-probe.fetch"];
-/// The destructive capability the `http-probe` manifest exposes and this example omits.
 const UNGRANTED: [&str; 1] = ["http-probe.purge"];
 const PRINCIPAL: &str = "cpetersen";
 const GATEWAY: &str = "dekopond-gateway";
@@ -66,8 +47,6 @@ async fn probe_registry() -> BrokerProviderRegistry {
     .expect("the checked-in http-probe component loads")
 }
 
-/// Builds the world exactly as `dekopon-brokerd::run` does: principals from the configuration's
-/// peer identities and subject mappings, capability routes from the loaded manifests.
 fn world(config: &BrokerdConfig, registry: &BrokerProviderRegistry) -> PolicyWorld {
     PolicyWorld::new(
         config
@@ -100,7 +79,6 @@ fn attested(via: Option<&str>, agent: Option<&str>) -> PolicyContext {
     }
 }
 
-/// One capability question, classified exactly as the example's constraint sets classify it.
 fn capability_request(
     sets: &BTreeMap<CapabilityId, dekopon_broker::ConstraintSet>,
     name: &str,
@@ -142,9 +120,6 @@ async fn the_example_policy_compiles_against_the_checked_in_probe_provider() {
         .expect("the example policy validates against the world its own configuration declares");
     assert_eq!(policy.policy_count(), 2, "two statements, two questions");
 
-    // The startup rule that makes an unreachable grant impossible: every capability the policy can
-    // permit has to be executable. The broker refuses to start otherwise, so an example that adds
-    // a capability to the policy and forgets its constraint set fails here first.
     for referenced in policy.referenced_capabilities() {
         assert!(
             config.constraint_sets.contains_key(referenced),
@@ -170,7 +145,6 @@ async fn the_sender_may_write_through_the_gateway_and_nothing_else_may() {
     let policy = PolicyEngine::new(&read("policies.cedar"), &world).expect("example policy loads");
     let sets = &config.constraint_sets;
 
-    // Allowed: the whole workflow, under the attested context the gateway actually renders.
     let session = policy.authorize(prompt_request(AGENT, attested(Some(GATEWAY), Some(AGENT))));
     assert!(session.allowed, "the mapped sender may drive the agent");
     assert_eq!(
@@ -194,11 +168,6 @@ async fn the_sender_may_write_through_the_gateway_and_nothing_else_may() {
         assert!(!decision.errors_present, "{name}");
     }
 
-    // Denied, one missing condition at a time.
-    //
-    // No `via` is the direct-peer case: a process connecting to the broker socket under the same
-    // UID, with no gateway vouching for anyone. It matches neither rule, which is the property
-    // that keeps adding a gateway from widening a grant that already existed.
     for (case, context) in [
         ("no via", attested(None, Some(AGENT))),
         (
@@ -232,8 +201,6 @@ async fn the_sender_may_write_through_the_gateway_and_nothing_else_may() {
         assert!(!decision.allowed, "agent.prompt must be denied with {case}");
     }
 
-    // The provider exposes this delete, but this workflow never grants or constrains it. Cedar denies each even with every context condition satisfied; the broker
-    // would deny it as `unconstrained-capability` before reaching Cedar at all.
     for name in UNGRANTED {
         let id = capability(name);
         assert!(
@@ -282,8 +249,6 @@ async fn every_example_constraint_set_matches_the_manifest_it_will_be_checked_ag
         let (provider, capability) = manifest
             .get(id)
             .unwrap_or_else(|| panic!("{id} exists in the loaded http-probe manifest"));
-        // These two are what `Broker::new` compares byte for byte against the manifest; a
-        // mismatch is a startup refusal, so an example carrying one would never run.
         assert_eq!(set.effect, capability.effect, "{id} effect");
         assert_eq!(set.risk, capability.risk, "{id} risk");
         assert_eq!(&set.provider, provider, "{id} provider route");
@@ -307,8 +272,6 @@ async fn every_example_constraint_set_matches_the_manifest_it_will_be_checked_ag
             Some("api-token"),
             "{id} presents the broker-held credential; the upstream needs it even to read"
         );
-        // The conditional write pre-reads the resource before the POST, which is the whole reason
-        // it gets two calls and two methods. The plain fetch is one GET.
         let (methods, requests) = if capability.effect == EffectKind::ExternalWrite {
             (vec!["GET".to_owned(), "POST".to_owned()], 2)
         } else {
@@ -319,13 +282,6 @@ async fn every_example_constraint_set_matches_the_manifest_it_will_be_checked_ag
     }
 }
 
-/// The destination coverage rule the broker enforces at startup, checked against the credentials
-/// file the walkthrough tells the reader to copy.
-///
-/// The real file is `broker-credentials.yaml`, which is deliberately absent from the repository —
-/// it is the one file holding a secret. The `.example` beside it is what a reader edits, so it is
-/// the one worth pinning: if it stops naming `api-token`, or stops binding `api.example.com`,
-/// following the walkthrough produces a broker that refuses to start.
 #[test]
 fn the_credentials_example_covers_every_host_the_constraint_sets_allow() {
     #[derive(Deserialize)]
@@ -367,19 +323,12 @@ fn the_credentials_example_covers_every_host_the_constraint_sets_allow() {
         }
     }
 
-    // A placeholder, and unmistakably one. A checked-in file that could be mistaken for a live
-    // token is a leak waiting for a copy-paste.
     assert!(
         entry.secret.starts_with("replace-me_X") && entry.secret.contains("XXXXXXXX"),
         "the checked-in secret must stay an obvious placeholder"
     );
 }
 
-/// The paths the walkthrough tells a reader not to edit.
-///
-/// `dekopon-brokerd` resolves every relative configured path against the configuration file's own
-/// canonicalized directory, which is what lets the example point at the checked-in component and
-/// its sibling policy and credentials files without a reader rewriting them first.
 #[test]
 fn the_relative_paths_in_the_example_resolve_from_its_own_directory() {
     let config = config();
@@ -409,8 +358,6 @@ fn the_relative_paths_in_the_example_resolve_from_its_own_directory() {
         );
     }
 
-    // The attested subject the identity mapping names must sit inside the attestor grant's
-    // namespace, or the gateway could name it and the broker would refuse the attestation.
     let identity = config.identities.first().expect("one peer identity");
     let grant = identity.attestor.as_ref().expect("the gateway may attest");
     let mapping = config.identity_mappings.first().expect("one mapping");

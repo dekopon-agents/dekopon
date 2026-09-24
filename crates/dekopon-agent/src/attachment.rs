@@ -1,5 +1,3 @@
-//! Reference-only proposals and descriptor-backed assets. The broker alone authorizes effects.
-
 use dekopon_broker_protocol::{
     AssetEncoding, AssetRow, InvokeAssets, MAX_DESCRIPTORS_PER_FRAME, NewAsset,
 };
@@ -18,17 +16,14 @@ use std::{
 use thiserror::Error;
 
 pub use dekopon_model::asset::MAX_ATTACHMENT_BYTES;
-/// Decoded bytes referenced by one invocation, independently of JSON frame size.
 pub const MAX_INVOCATION_ASSET_BYTES: usize = dekopon_core::asset::MAX_DECODED_INVOCATION_BYTES;
 
-/// One explicitly queued asset, pinned until the transport completes.
 pub struct GeneratedImage {
     data: DiskBlob,
     content_type: String,
     encoding: AssetEncoding,
 }
 impl GeneratedImage {
-    /// Creates an upload lease from authoritative table metadata.
     pub fn new(data: DiskBlob, content_type: String, encoding: AssetEncoding) -> Self {
         Self {
             data,
@@ -36,9 +31,6 @@ impl GeneratedImage {
             encoding,
         }
     }
-    /// Convenience constructor for native image producers.
-    /// # Errors
-    /// Refuses bytes exceeding the bounded scratch capacity.
     pub fn from_png(data: Vec<u8>) -> Result<Self, BlobError> {
         Ok(Self::new(
             DiskBlob::from_bytes(&data)?,
@@ -46,11 +38,9 @@ impl GeneratedImage {
             AssetEncoding::Identity,
         ))
     }
-    /// The declared label, not a type inferred from content.
     pub fn media_type(&self) -> &str {
         &self.content_type
     }
-    /// A gateway-generated filename; no provider path is used.
     pub fn filename(&self, index: usize) -> String {
         let extension = match self.content_type.as_str() {
             "image/png" => "png",
@@ -63,9 +53,6 @@ impl GeneratedImage {
         };
         format!("asset-{}.{extension}", index + 1)
     }
-    /// Reads and decodes one bounded upload buffer.
-    /// # Errors
-    /// Refuses changed/truncated descriptors or invalid encoded content.
     pub fn bytes(&self) -> Result<Vec<u8>, BlobError> {
         match self.encoding {
             AssetEncoding::Identity => self.data.read(),
@@ -93,10 +80,7 @@ impl GeneratedImage {
             }
         }
     }
-    /// Upload byte count from the validated representation, reading at most two stored bytes.
-    /// Call off the async worker, just like `bytes`.
-    /// # Errors
-    /// Refuses unavailable/changed descriptors and invalid base64 length.
+    /// This does blocking I/O and must be called off the async worker thread, the same as bytes().
     pub fn decoded_len(&self) -> Result<usize, BlobError> {
         match self.encoding {
             AssetEncoding::Identity => Ok(self.data.len()),
@@ -121,17 +105,12 @@ impl GeneratedImage {
             }
         }
     }
-    /// Stored byte count, without reading payloads.
     pub fn len(&self) -> usize {
         self.data.len()
     }
-    /// Whether the stored representation is empty.
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
-    /// Consumes this delivery pin into one upload buffer.
-    /// # Errors
-    /// Returns the same positional read/decoding errors as `bytes`.
     pub fn into_bytes(self) -> Result<Vec<u8>, BlobError> {
         self.bytes()
     }
@@ -159,11 +138,9 @@ impl Read for BlobReader<'_> {
     }
 }
 
-/// The embedding gateway's scoped table and registration seam.
 pub trait GeneratedAssetStore: Send + Sync {
-    /// Registers one received descriptor, reserving retention before publication.
-    /// # Errors
-    /// A failure is after the provider effect and must not authorize an automatic retry.
+    /// A failure here happens after the provider effect already occurred, so callers must not retry
+    /// automatically.
     fn register(
         &self,
         descriptor: OwnedFd,
@@ -171,26 +148,15 @@ pub trait GeneratedAssetStore: Send + Sync {
         capability: &str,
         invocation: &str,
     ) -> Result<u64, BlobError>;
-    /// Removes a broker-approved, unsent entry.
-    /// # Errors
-    /// Refuses stale references or storage reclamation failure.
     fn remove(&self, id: u64) -> Result<(), BlobError>;
-    /// Marks a broker-approved send once and pins its payload.
-    /// # Errors
-    /// Refuses stale/unavailable references. A previously sent entry returns no new pin.
     fn send(&self, id: u64) -> Result<Option<GeneratedImage>, BlobError>;
-    /// Records a bounded gateway notice for the next turn.
     fn delivery_failed(&self);
 }
 
-/// Terminal classification of a queued send, independent of broker authorization.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AssetDeliveryDisposition {
-    /// The turn ended without attempting its asset reply.
     Abandoned,
-    /// The reply was attempted but the transport did not accept it completely.
     Failed,
-    /// The transport accepted the reply.
     Delivered,
 }
 
@@ -200,7 +166,6 @@ struct Queued {
     spent: u8,
     finished: bool,
 }
-/// Request-local delivery pins and remaining-send accounting; attachment never implies send.
 pub struct ReplyAttachments {
     limit: u8,
     queued: Mutex<Queued>,
@@ -208,7 +173,6 @@ pub struct ReplyAttachments {
     transport: String,
 }
 impl ReplyAttachments {
-    /// Binds this turn to its scoped table and authenticated transport.
     pub fn new(limit: u8, registrar: Arc<dyn GeneratedAssetStore>, transport: String) -> Self {
         Self {
             limit,
@@ -222,7 +186,6 @@ impl ReplyAttachments {
             }),
         }
     }
-    /// Allowance is charged once per newly queued table entry, not per provider call.
     pub fn remaining(&self) -> u8 {
         self.limit.saturating_sub(
             self.queued
@@ -231,7 +194,6 @@ impl ReplyAttachments {
                 .spent,
         )
     }
-    /// Whether a final reply has authorized queued files, even if its text is empty.
     pub fn has_queued(&self) -> bool {
         !self
             .queued
@@ -240,7 +202,6 @@ impl ReplyAttachments {
             .images
             .is_empty()
     }
-    /// Transfers delivery pins only after a successful turn.
     pub fn take(&self) -> Vec<GeneratedImage> {
         std::mem::take(
             &mut self
@@ -250,7 +211,6 @@ impl ReplyAttachments {
                 .images,
         )
     }
-    /// Applies metadata only after a succeeded invocation, and returns a bounded model note.
     pub fn receive(
         &self,
         attached: Vec<NewAsset>,
@@ -312,7 +272,6 @@ impl ReplyAttachments {
         }
         note
     }
-    /// Logs dispatch separately from broker authority; no implicit retry follows failure.
     pub fn finish(&self, disposition: AssetDeliveryDisposition) {
         let mut queued = self
             .queued
@@ -341,10 +300,8 @@ impl Drop for ReplyAttachments {
     }
 }
 
-/// A permanent gateway refusal before broker submission.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ChatAssetRefusal {
-    /// Descriptor storage refusal, preserving its actionable category.
     #[error("{0}")]
     Storage(BlobError),
     #[error("the asset was released; ask the user to resend it or select another asset")]
@@ -365,7 +322,6 @@ pub enum ChatAssetRefusal {
     DataUrl,
 }
 impl ChatAssetRefusal {
-    /// Stable audit reason.
     pub const fn reason(&self) -> &'static str {
         match self {
             Self::Storage(_) => "storage",
@@ -379,32 +335,23 @@ impl ChatAssetRefusal {
             Self::DataUrl => "data-url",
         }
     }
-    /// Gateway-authored model explanation.
     pub fn note(&self) -> String {
         self.to_string()
     }
 }
-/// Scoped resolution for reference-only proposals.
 pub trait ChatAssetSource: Send + Sync {
-    /// Pins a reference after checking its conversation/generation audience.
-    /// # Errors
-    /// Returns a permanent refusal without redownloading released assets.
+    /// Fetching a released (reclaimed) asset refuses permanently rather than trying to redownload
+    /// it, since the underlying bytes are gone.
     fn fetch_for_capability(&self, id: u64) -> Result<(String, DiskBlob), ChatAssetRefusal>;
-    /// The complete bounded table, including non-referenced rows, without touching recency.
     fn rows(&self) -> Vec<AssetRow>;
 }
-/// A session's descriptor resolver. Every matching proposal leaf is resolved.
 pub struct ChatAssetInputs {
     source: Arc<dyn ChatAssetSource>,
 }
 impl ChatAssetInputs {
-    /// Binds a scoped source, never a capability allowlist.
     pub fn new(source: Arc<dyn ChatAssetSource>) -> Self {
         Self { source }
     }
-    /// Collects descriptors in first-occurrence order and pins until the invocation completes.
-    /// # Errors
-    /// Refuses the entire proposal on any unavailable reference or exceeded bound.
     pub fn prepare(
         &self,
         input: &Value,
@@ -448,9 +395,6 @@ fn input_total(total: usize, bytes: usize) -> Result<usize, ChatAssetRefusal> {
         .ok_or(ChatAssetRefusal::ByteBudget)
 }
 
-/// Finds distinct references without cloning or changing a proposal.
-/// # Errors
-/// Data URLs and more than five distinct references refuse before any file is fetched.
 pub fn references(input: &Value) -> Result<Vec<u64>, ChatAssetRefusal> {
     fn walk(input: &Value, ids: &mut Vec<u64>) -> Result<(), ChatAssetRefusal> {
         match input {

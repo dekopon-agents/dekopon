@@ -1,12 +1,5 @@
-//! Strict, versioned, owner-controlled gateway configuration.
-//!
-//! Every hygiene check `dekopon-brokerd` applies to its own configuration applies here for the
-//! same reason: this file names the agents a chat message may reach and the environment variables
-//! that hold chat and model credentials, so a world-writable or symlinked copy of it is a way to
-//! redirect the daemon rather than a cosmetic problem.
-//!
-//! Secrets themselves are deliberately absent. Transports and models name *environment variables*,
-//! never values, following the precedent `dekopon-telemetry` set for OTLP ingest credentials.
+//! This file is checked as strictly as the broker's own config, since it names agent-reachable
+//! models and credential env vars, so a writable or symlinked copy could redirect the daemon.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -33,48 +26,21 @@ use crate::{
     session::{FAILURE_REPLY, STOPPED_REPLY},
 };
 
-/// Exact configuration schema this daemon accepts.
 pub const CONFIG_API_VERSION: &str = "dekopon.dev/dekopond/v1alpha1";
-/// Hard ceiling on the configuration file, read before any allocation.
 pub const HARD_MAX_CONFIG_BYTES: usize = 1024 * 1024;
-/// Default concurrent sessions across every transport.
 pub const DEFAULT_MAX_CONCURRENT_SESSIONS: usize = 4;
-/// Default model turns one routed message may drive.
 pub const DEFAULT_MAX_STEPS: u32 = 8;
-/// Default capability invocations one routed message may drive.
 pub const DEFAULT_MAX_CAPABILITY_CALLS: u32 = 16;
-/// Default wall-clock deadline for one script a routed message's model runs.
-///
-/// `dekopon-shell`'s own default, restated here because this is now the value a route may replace
-/// and an operator reading the gateway's defaults should not have to open another crate to learn
-/// what the unwritten field means.
 pub const DEFAULT_SCRIPT_TIMEOUT_MS: u64 = 30_000;
-/// Default grace given to in-flight sessions at shutdown.
 pub const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(120);
-/// Default life of an untouched persistent conversation.
-///
-/// Fifteen minutes resolves toward the person rather than an undocumented provider-cache lifetime.
-/// A bot that forgot after a brief lull is the failure people report; the cost control is the
-/// window below, not a best-effort cache. See `docs/inference.md`.
 pub const DEFAULT_CONVERSATION_IDLE_TIMEOUT: Duration = Duration::from_secs(900);
-/// Default exchanges a persistent route replays into the next prompt.
 pub const DEFAULT_CONVERSATION_MAX_TURNS: usize = 12;
-/// Default bytes of replayed conversation a persistent route carries.
 pub const DEFAULT_CONVERSATION_MAX_BYTES: usize = 64 * 1024;
-/// Default conversations this process tracks at once.
 pub const DEFAULT_MAX_CONVERSATIONS: usize = 1024;
-/// What a person types to stop a running session when an operator names no list.
-///
-/// Two words rather than one because a person who wants a run to stop tries the obvious thing and
-/// then the other obvious thing, and neither should be answered by the agent instead.
 pub const DEFAULT_STOP_WORDS: [&str; 2] = ["stop", "cancel"];
-/// The only non-loopback Slack origin this daemon will talk to.
 pub const SLACK_ENDPOINT: &str = "https://slack.com";
-/// The only non-loopback Discord REST origin this daemon will talk to.
 pub const DISCORD_ENDPOINT: &str = "https://discord.com";
-/// The only non-loopback Telegram origin this daemon will talk to.
 pub const TELEGRAM_ENDPOINT: &str = "https://api.telegram.org";
-/// The only non-loopback Meta Graph API origin this daemon will send WhatsApp replies to.
 pub const WHATSAPP_GRAPH_ENDPOINT: &str = "https://graph.facebook.com";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -83,66 +49,46 @@ pub enum ConfigApiVersion {
     V1Alpha1,
 }
 
-/// Whether a transport publishes native in-flight liveness while an authorized session runs.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum LivenessMode {
-    /// Preserve the transport's reply-only behavior: nothing is typed, posted, edited, or reacted.
     #[default]
     Off,
-    /// Use whatever the service natively offers, with transport-specific fallback where configured.
     Native,
 }
 
-/// Which Slack conversation model the installed app exposes.
-///
-/// This is explicit because Agent mode changes DM threading and conversation identity. A failed
-/// cosmetic status call must never switch those semantics underneath a live conversation.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum SlackExperience {
-    /// Conventional App Home messages and channel mentions.
     #[default]
     Classic,
-    /// Slack's paid/admin-gated Agent messaging experience and thread-scoped sessions.
     Agent,
 }
 
-/// Visible fallback when Slack's Agent session status is unavailable.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum SlackLivenessFallback {
-    /// Degrade to the final reply only.
     #[default]
     None,
-    /// Add and later remove Dekopon's fixed `:tangerine:` reaction.
     Reaction,
 }
 
-/// Whether a transport posts one editable message saying what the session is doing.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum ProgressSurface {
-    /// Prefer native status or typing/reaction; post progress only without a working indicator.
     #[default]
     Auto,
-    /// No progress prose; native indicators and explicitly requested answer streaming remain.
     Off,
-    /// One message, posted late and edited in place, that becomes the answer at the end.
     Message,
 }
 
-/// When a running session says it is still alive.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct KeepAliveConfig {
-    /// Offsets from the moment the session started, in seconds.
     #[serde(default = "default_keep_alive_at")]
     pub at_seconds: Vec<u64>,
-    /// Period between ticks once those offsets are spent.
     #[serde(default = "default_keep_alive_every")]
     pub every_seconds: u64,
-    /// Ticks one session may write, because a run that never ends must not write forever.
     #[serde(default = "default_keep_alive_max")]
     pub max: u32,
 }
@@ -169,64 +115,36 @@ const fn default_keep_alive_max() -> u32 {
     crate::progress::DEFAULT_KEEP_ALIVE_MAX
 }
 
-/// What this daemon shows on one transport while a session runs.
-///
-/// One block for every transport, because the surfaces are one vocabulary and the differences
-/// between services are which of them a driver implements. A setting a transport cannot honor is a
-/// startup refusal naming it rather than a field that silently does nothing.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct LivenessConfig {
-    /// Whether anything at all is published while an authorized session runs.
     #[serde(default)]
     pub mode: LivenessMode,
-    /// Used by classic Slack apps and when Agent status is unavailable for that installation.
     #[serde(default)]
     pub classic_fallback: SlackLivenessFallback,
-    /// Whether one editable progress message is posted.
     #[serde(default)]
     pub progress: ProgressSurface,
-    /// Whether the model's answer is streamed into the surface as it is written.
     #[serde(default)]
     pub stream: bool,
-    /// Whether the surface carries the service's own stop control.
     #[serde(default)]
     pub cancel_button: bool,
     #[serde(default)]
     pub keep_alive: KeepAliveConfig,
-    /// Operator wording; an absent field keeps this daemon's own sentence.
     #[serde(default)]
     pub templates: TemplateOverrides,
-    /// Per-conversation-kind overlays on the block above.
-    ///
-    /// A direct message has one reader and a channel has a hundred, so what is worth streaming or
-    /// posting differs by *where*, not by which transport. Each key is optional and each field
-    /// inside one is optional; an absent key is the base block unchanged.
     #[serde(default)]
     pub conversations: BTreeMap<ConversationKind, LivenessOverride>,
 }
 
-/// What one conversation kind changes about a transport's liveness block.
-///
-/// Deliberately not the whole block. `mode`, `classicFallback`, and `templates` are transport
-/// facts and operator wording rather than budget knobs — what a service can render does not change
-/// because a message arrived in a thread — and `progressDetail` is the route's axis, so "detailed
-/// in DMs" is two routes rather than an override here.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct LivenessOverride {
-    /// Whether one editable progress message is posted.
     pub progress: Option<ProgressSurface>,
-    /// Whether the model's answer is streamed into the surface as it is written.
     pub stream: Option<bool>,
-    /// Whether the surface carries the service's own stop control.
     pub cancel_button: Option<bool>,
-    /// Replaces the base block whole rather than per field: three offsets, a period, and a ceiling
-    /// are one cadence, and merging them field by field yields a cadence nobody authored.
     pub keep_alive: Option<KeepAliveConfig>,
 }
 
-/// The authored `templates:` block.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct TemplateOverrides {
@@ -237,7 +155,6 @@ pub struct TemplateOverrides {
     pub failed: Option<String>,
 }
 
-/// The half of one transport's liveness block a driver needs, cheap enough to copy per session.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct LivenessSettings {
     pub mode: LivenessMode,
@@ -248,7 +165,6 @@ pub struct LivenessSettings {
 }
 
 impl LivenessConfig {
-    /// The driver-facing settings, without the policy's own timing and wording.
     #[must_use]
     pub const fn settings(&self) -> LivenessSettings {
         LivenessSettings {
@@ -261,18 +177,15 @@ impl LivenessConfig {
     }
 }
 
-/// One transport's liveness settings after validation.
 #[derive(Debug)]
 pub(crate) struct ResolvedLiveness {
     pub settings: LivenessSettings,
     pub keep_alive: KeepAlive,
     pub templates: Templates,
-    /// Per-kind overlays, already validated against what this transport can render.
     pub conversations: BTreeMap<ConversationKind, LivenessOverride>,
 }
 
 impl ResolvedLiveness {
-    /// The base block overlaid by this kind's override, or the base when there is none.
     pub(crate) fn for_kind(&self, kind: ConversationKind) -> (LivenessSettings, KeepAlive) {
         let Some(override_for_kind) = self.conversations.get(&kind) else {
             return (self.settings, self.keep_alive.clone());
@@ -293,7 +206,6 @@ impl ResolvedLiveness {
     }
 }
 
-/// Resolves one authored keep-alive block into the policy's own cadence.
 fn keep_alive_from(config: &KeepAliveConfig) -> KeepAlive {
     KeepAlive {
         at: config
@@ -307,15 +219,7 @@ fn keep_alive_from(config: &KeepAliveConfig) -> KeepAlive {
 }
 
 impl Default for ResolvedLiveness {
-    /// Reply-only, with this daemon's own sentences.
-    ///
-    /// Reached only by a session whose transport name is not in the resolved map, which startup
-    /// makes unreachable by building one entry per configured transport; it is the shape that
-    /// cannot show anything rather than a second set of defaults, so a future path that lost the
-    /// lookup degrades to today's behavior instead of inventing one.
     fn default() -> Self {
-        // The shipped templates carry only placeholders their own fields render, so the problem
-        // list is empty by construction; a configuration's overrides are what validation is for.
         let (templates, _) =
             Templates::resolve(&TemplateOverrides::default(), STOPPED_REPLY, FAILURE_REPLY);
         Self {
@@ -331,32 +235,22 @@ impl Default for ResolvedLiveness {
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct DekopondConfig {
     pub api_version: ConfigApiVersion,
-    /// The `dekopon-config` catalog whose agents routes may name.
     pub catalog_path: PathBuf,
     #[serde(default)]
     pub broker: BrokerConfig,
     pub transports: Vec<TransportConfig>,
     pub models: Vec<ModelConfig>,
     pub routes: Vec<RouteConfig>,
-    /// What a person types to stop the session running in their conversation.
-    ///
-    /// An operator list rather than a fixed one: the people talking to a deployment do not all
-    /// speak English, and a word that means "stop" to them is the one that has to work. Matched
-    /// exactly, case-insensitively, after the bot mention and trailing punctuation are stripped,
-    /// so a stop word never swallows a sentence that merely contains it.
     #[serde(default)]
     pub stop_words: Option<Vec<String>>,
     #[serde(default)]
     pub sessions: SessionsConfig,
-    /// Grace given to in-flight sessions before they are aborted at shutdown.
     #[serde(default)]
     pub shutdown_grace_ms: Option<u64>,
-    /// Optional OTLP export. Absent means the daemon exports no telemetry.
     #[serde(default)]
     pub telemetry: Option<TelemetryConfig>,
 }
 
-/// How to reach `dekopon-brokerd`. Every field defaults to the documented discovery behavior.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct BrokerConfig {
@@ -370,10 +264,6 @@ pub struct BrokerConfig {
     pub io_timeout_ms: Option<u64>,
 }
 
-/// One chat service this daemon waits on.
-///
-/// Internally tagged on `kind` so a transport reads as one flat block, and strict on both halves:
-/// an unknown `kind` and an unknown field inside a known one are both decode failures.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(
     tag = "kind",
@@ -382,78 +272,58 @@ pub struct BrokerConfig {
     rename_all_fields = "camelCase"
 )]
 pub enum TransportConfig {
-    /// Slack Socket Mode: an app-level token opens a WebSocket, a bot token answers.
     SlackSocketMode {
         name: String,
         app_token_env: String,
         bot_token_env: String,
-        /// Conversation and lifecycle model configured on the installed Slack app.
         #[serde(default)]
         experience: SlackExperience,
-        /// What a running session shows, and its explicit classic/free-workspace fallback.
         #[serde(default)]
         liveness: LivenessConfig,
-        /// Overridable only to `https://slack.com` or a literal loopback HTTP URL, for tests.
         #[serde(default)]
         endpoint: Option<String>,
     },
-    /// Discord Gateway: an outbound WebSocket carries messages and REST posts answers.
     DiscordGateway {
         name: String,
         bot_token_env: String,
-        /// What a running session shows on this transport.
         #[serde(default)]
         liveness: LivenessConfig,
-        /// Overridable only to `https://discord.com` or a literal loopback HTTP URL.
         #[serde(default)]
         endpoint: Option<String>,
     },
-    /// Meta WhatsApp Cloud API: a signed public webhook receives text and Graph API sends replies.
     WhatsappCloudApi {
         name: String,
         app_secret_env: String,
         verify_token_env: String,
         access_token_env: String,
-        /// Plain HTTP listener behind operator-owned TLS termination.
         bind: SocketAddr,
         callback_path: String,
         waba_id: String,
         phone_number_id: String,
         graph_api_version: String,
-        /// Media-first quiet interval; zero bypasses collection.
         #[serde(
             default = "default_whatsapp_debounce_ms",
             deserialize_with = "deserialize_collection_millis"
         )]
         debounce_ms: u32,
-        /// Maximum collection time from the first media receipt.
         #[serde(
             default = "default_whatsapp_debounce_max_wait_ms",
             deserialize_with = "deserialize_collection_millis"
         )]
         debounce_max_wait_ms: u32,
-        /// What a running session shows; WhatsApp has typing and nothing else.
         #[serde(default)]
         liveness: LivenessConfig,
-        /// Overridable only to the pinned production origin or literal loopback HTTP for tests.
         #[serde(default)]
         graph_endpoint: Option<String>,
     },
-    /// Telegram long polling: the poll is the wakeup and advancing the offset is the ack.
     TelegramLongPoll {
         name: String,
         bot_token_env: String,
-        /// What a running session shows on this transport.
         #[serde(default)]
         liveness: LivenessConfig,
-        /// Overridable only to `https://api.telegram.org` or a literal loopback HTTP URL.
         #[serde(default)]
         endpoint: Option<String>,
     },
-    /// A development transport on an owner-only Unix socket that trusts its local caller.
-    ///
-    /// The reference driver: it implements every surface, which is what lets the integration tests
-    /// read a whole session's progress off one line stream.
     Local {
         name: String,
         socket_path: PathBuf,
@@ -486,7 +356,6 @@ fn deserialize_collection_millis<'de, D: serde::Deserializer<'de>>(
 }
 
 impl TransportConfig {
-    /// The operator-chosen name routes refer to.
     #[must_use]
     pub fn name(&self) -> &str {
         match self {
@@ -498,7 +367,6 @@ impl TransportConfig {
         }
     }
 
-    /// The transport family the broker protocol names, which decides what conversations exist.
     #[must_use]
     pub const fn chat_kind(&self) -> ChatTransportKind {
         match self {
@@ -510,7 +378,6 @@ impl TransportConfig {
         }
     }
 
-    /// Stable low-cardinality label for lifecycle logs.
     #[must_use]
     pub const fn kind(&self) -> &'static str {
         match self {
@@ -523,7 +390,6 @@ impl TransportConfig {
     }
 }
 
-/// One model endpoint a route may select.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(
     tag = "kind",
@@ -532,7 +398,6 @@ impl TransportConfig {
     rename_all_fields = "camelCase"
 )]
 pub enum ModelConfig {
-    /// Any OpenAI-compatible chat-completions endpoint.
     OpenaiCompatible {
         name: String,
         endpoint: String,
@@ -540,29 +405,13 @@ pub enum ModelConfig {
         #[serde(default)]
         api_key_env: Option<String>,
         timeout_ms: u64,
-        /// Whether this endpoint is asked to stream its answer.
-        ///
-        /// On by default, because streaming is what puts the answer on screen while it is being
-        /// written and what lets a stop interrupt a turn instead of waiting out `timeoutMs`. The
-        /// field exists for the endpoint that claims chat-completions compatibility and gets
-        /// `stream: true` wrong — a proxy that buffers the whole SSE body, a server that drops
-        /// `usage` — where the repair is one line of configuration rather than a second client.
-        /// `kind: chatgptSubscription` has no such field: that backend streams and cannot be
-        /// asked not to, so writing one there is the unknown-field refusal every other typo gets.
         #[serde(default = "default_model_stream")]
         stream: bool,
-        /// Model classes this endpoint satisfies, matched against an agent's `modelClass`.
         #[serde(default)]
         classes: Vec<String>,
-        /// What this endpoint can be shown besides text.
-        ///
-        /// Defaults to nothing. An OpenAI-compatible endpoint is very often a small local model
-        /// that will either error or hallucinate when handed an image, and the default has to be
-        /// the one that is safe on the endpoint an operator did not think about.
         #[serde(default)]
         modalities: Vec<Modality>,
     },
-    /// OpenRouter chat completions with immutable authored controls.
     Openrouter {
         name: String,
         model: String,
@@ -577,7 +426,6 @@ pub enum ModelConfig {
         routing: Option<dekopon_model::openrouter::settings::Routing>,
         cache: Option<dekopon_model::openrouter::settings::Cache>,
     },
-    /// OpenAI's Codex Responses endpoint using Dekopon's own device-flow credential file.
     ChatgptSubscription {
         name: String,
         model: String,
@@ -586,31 +434,22 @@ pub enum ModelConfig {
         timeout_ms: u64,
         #[serde(default)]
         classes: Vec<String>,
-        /// What this endpoint can be shown besides text.
-        ///
-        /// Still opt-in rather than assumed. Every current Codex model reads images, but a
-        /// configuration that silently gained a capability when a default changed underneath it is
-        /// the thing this file's strict decoding exists to prevent.
         #[serde(default)]
         modalities: Vec<Modality>,
     },
 }
 
-/// Streaming is the default: an endpoint that cannot do it is the exception an operator names.
 const fn default_model_stream() -> bool {
     true
 }
 
-/// Something a model can be shown that is not text.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum Modality {
-    /// The model accepts images as message content.
     Image,
 }
 
 impl ModelConfig {
-    /// The operator-chosen name routes refer to.
     #[must_use]
     pub fn name(&self) -> &str {
         match self {
@@ -620,7 +459,6 @@ impl ModelConfig {
         }
     }
 
-    /// Whether this endpoint may be shown an image.
     #[must_use]
     pub fn accepts_images(&self) -> bool {
         match self {
@@ -630,7 +468,6 @@ impl ModelConfig {
         }
     }
 
-    /// The classes this endpoint declares it can serve.
     #[must_use]
     pub fn classes(&self) -> &[String] {
         match self {
@@ -649,21 +486,12 @@ impl ModelConfig {
     }
 }
 
-/// The authored `conversation:` block on a route.
-///
-/// The three [`ConversationMatch`] fields plus the five window keys that used to live under this
-/// name. An 0.13 file wrote `conversation: { mode: persistent, … }`, which is now the *match*
-/// block, so the retired keys are decoded and refused by name: serde's own "unknown field
-/// `mode`" says nothing about where the window went.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ConversationMatchConfig {
-    /// The word `any`, or a non-empty list of kinds.
     pub kind: ConversationKindMatch,
-    /// One container, or every container when absent.
     #[serde(default)]
     pub container: Option<String>,
-    /// These conversation ids only (the parent id for threads), or every id when absent.
     #[serde(default)]
     pub ids: Option<Vec<String>>,
     #[serde(default)]
@@ -679,7 +507,6 @@ pub struct ConversationMatchConfig {
 }
 
 impl ConversationMatchConfig {
-    /// Whether this block is an 0.13 memory window written under the match's name.
     const fn is_retired_memory_block(&self) -> bool {
         self.mode.is_some()
             || self.scope.is_some()
@@ -688,7 +515,6 @@ impl ConversationMatchConfig {
             || self.max_bytes.is_some()
     }
 
-    /// The selector itself, without the retired keys.
     fn selector(&self) -> ConversationMatch {
         ConversationMatch {
             kind: self.kind.clone(),
@@ -698,7 +524,6 @@ impl ConversationMatchConfig {
     }
 }
 
-/// Bounds one routed message's session.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RouteLimits {
@@ -706,21 +531,8 @@ pub struct RouteLimits {
     pub max_steps: u32,
     #[serde(default = "default_max_capability_calls")]
     pub max_capability_calls: u32,
-    /// Wall-clock bound on one session, counted from the moment the agent starts working.
-    ///
-    /// Optional because most deployments are bounded well enough by steps and calls; absent means
-    /// no wall-clock bound. It is counted from `Started` rather than from receipt, because waiting
-    /// for an admission slot is not the agent taking too long. Zero is refused: the way to run
-    /// nothing is to disable the route.
     #[serde(default)]
     pub max_duration_ms: Option<u64>,
-    /// Wall-clock deadline for one script the model runs, rather than for the whole session.
-    ///
-    /// Absent is [`DEFAULT_SCRIPT_TIMEOUT_MS`], which is what every route ran under before this
-    /// field existed. It bounds one `dekopon-shell` run: a capability call still in flight when it
-    /// fires is abandoned, so the number has to cover the slowest provider a script may drive.
-    /// Zero is refused, and so is a value above `maxDurationMs`, which the session bound would
-    /// always reach first.
     #[serde(default)]
     pub script_timeout_ms: Option<u64>,
 }
@@ -737,10 +549,6 @@ impl Default for RouteLimits {
 }
 
 impl RouteLimits {
-    /// The deadline one script on this route runs under, with the omitted default resolved.
-    ///
-    /// One definition of what an unwritten `scriptTimeoutMs` means, so the gateway cannot disagree
-    /// with the documentation about which number a route without the field gets.
     #[must_use]
     pub const fn script_timeout(self) -> Duration {
         Duration::from_millis(match self.script_timeout_ms {
@@ -758,27 +566,16 @@ const fn default_max_capability_calls() -> u32 {
     DEFAULT_MAX_CAPABILITY_CALLS
 }
 
-/// Who may share one persistent transcript replay window.
-///
-/// This value comes only from trusted route configuration. A transport kind, conversation kind,
+/// MemoryScope comes only from trusted route configuration; a transport kind, conversation kind,
 /// inbound message, or model response can never select it.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum MemoryScope {
-    /// Keep one history per authenticated transport subject.
     #[default]
     PrivateConversation,
-    /// Share one history among authenticated subjects in the exact routed conversation.
     SharedConversation,
 }
 
-/// What a route remembers between one message and the next.
-///
-/// Tagged on `mode` in the house style, and strict on both halves, because the failure worth
-/// preventing is a *silent* one: a persistent-only setting written next to `mode: oneShot` can
-/// never take effect, and a setting that can never take effect is far more likely a mode typo than
-/// an intention. Rejecting it at decode is what turns that into a startup failure with a field name
-/// in it rather than a bot that quietly forgets everything.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 #[serde(
     tag = "mode",
@@ -787,25 +584,14 @@ pub enum MemoryScope {
     rename_all_fields = "camelCase"
 )]
 pub enum MemoryConfig {
-    /// Every message is an independent session that starts from an empty prompt.
-    ///
-    /// A struct variant with no fields rather than a unit variant, deliberately. serde's internally
-    /// tagged *unit* variants accept and discard every key beside the tag, so `mode: oneShot` with
-    /// an `idleTimeoutMs` beside it would decode cleanly and do nothing — exactly the silence this
-    /// enum exists to prevent. An empty struct variant under `deny_unknown_fields` rejects it.
     OneShot {},
-    /// A bounded private or intentionally shared history is replayed ahead of each new message.
     Persistent {
-        /// Who shares the replay window; private per authenticated subject when omitted.
         #[serde(default)]
         scope: MemoryScope,
-        /// How long an untouched conversation survives.
         #[serde(default = "default_idle_timeout_ms")]
         idle_timeout_ms: u64,
-        /// Exchanges the replayed window holds, oldest dropped first.
         #[serde(default = "default_conversation_max_turns")]
         max_turns: usize,
-        /// Bytes the replayed window holds, oldest dropped first.
         #[serde(default = "default_conversation_max_bytes")]
         max_bytes: usize,
     },
@@ -829,25 +615,17 @@ const fn default_conversation_max_bytes() -> usize {
     DEFAULT_CONVERSATION_MAX_BYTES
 }
 
-/// One transport-and-conversation to agent binding.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct RouteConfig {
     pub transport: String,
-    /// Which conversations on that transport this route claims.
-    ///
-    /// Replaces `match:`. The memory window that used to sit under this name is `memory:`.
     pub conversation: ConversationMatchConfig,
-    /// Canonical subjects this route answers; every subject when absent.
-    ///
-    /// Accepted only on a `kind: [directMessage]` route. Routing only: it picks the agent that
-    /// hears the message, and authority stays the broker's subject mapping and Cedar. A per-person
-    /// *channel* route would read as an access-control list and be trusted as one, which is why it
-    /// is a startup refusal rather than a documented oddity.
+    /// Subjects only routes which agent hears a message; authority stays with Cedar and the
+    /// broker's subject mapping, and it is restricted to direct-message routes since a channel
+    /// version would read as an access list.
     #[serde(default)]
     pub subjects: Option<Vec<ExternalSubject>>,
     pub agent: AgentId,
-    /// Overrides model-class selection for this route.
     #[serde(default)]
     pub model: Option<String>,
     #[serde(
@@ -862,35 +640,19 @@ pub struct RouteConfig {
         deserialize_with = "refuse_chat_asset_inputs"
     )]
     _retired_chat_asset_inputs: (),
-    /// Offers the `suggest_improvement` tool on this route's sessions.
-    ///
-    /// Opt-in because the suggestion record carries model-authored text to the telemetry sink
-    /// whether or not payload telemetry is on; enabling it is that consent. It grants nothing: a
-    /// suggestion is a tagged log record an operator reads, never a change the daemon applies.
     #[serde(default)]
     pub improvement_suggestions: bool,
-    /// Offers the `inspect_agent_config` tool on this route's sessions.
-    ///
-    /// Default true keeps today's behavior. False removes the structured dump — description,
-    /// model class, limits, and the agent's standing orders verbatim — and nothing else: the
-    /// instructions are still the system prompt, so secrecy from a determined user is the model's
-    /// obedience rather than a gate.
+    /// Turning inspect_agent_config off only removes the structured config dump; the instructions
+    /// stay in the system prompt regardless, so this is never a real secrecy gate against a
+    /// determined user.
     #[serde(default = "default_true")]
     pub inspect_agent_config: bool,
     #[serde(default)]
     pub limits: RouteLimits,
-    /// How much this route's progress surface says.
-    ///
-    /// Per route because the same event stream serves a family Discord and an operations channel.
-    /// Crate-visible: it selects a rendering, and nothing outside this daemon renders.
     #[serde(default)]
     pub(crate) progress_detail: ProgressDetail,
-    /// What this route remembers between messages; `oneShot` unless an operator says otherwise.
-    ///
-    /// Was `conversation:`, which is now the match.
     #[serde(default)]
     pub memory: MemoryConfig,
-    /// Retired: decoded so the refusal names `conversation:` beside every other problem.
     #[serde(default, rename = "match", skip_serializing)]
     pub retired_match: Option<serde::de::IgnoredAny>,
 }
@@ -899,32 +661,20 @@ const fn default_true() -> bool {
     true
 }
 
-/// A persistent route's bounds, with `idleTimeoutMs` already resolved to a [`Duration`].
-///
-/// Both window bounds apply together, oldest exchanges dropping first until each holds. Two bounds
-/// because they fail differently: twelve one-line exchanges and twelve paragraph-length ones are the
-/// same number of turns and very different prompts.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct MemoryWindow {
-    /// Who shares the replay window, resolved from trusted route configuration.
     pub scope: MemoryScope,
-    /// How long an untouched conversation survives before a lookup drops it.
     pub idle_timeout: Duration,
-    /// What the replayed window holds.
     pub limits: HistoryLimits,
 }
 
-/// What a route remembers, after validation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemoryPolicy {
-    /// No history: every message is an independent session, which is every route's default.
     OneShot,
-    /// A bounded private or intentionally shared history, replayed ahead of each new message.
     Persistent(MemoryWindow),
 }
 
 impl MemoryPolicy {
-    /// The window this route replays, or `None` when it remembers nothing.
     #[must_use]
     pub const fn window(self) -> Option<MemoryWindow> {
         match self {
@@ -934,47 +684,29 @@ impl MemoryPolicy {
     }
 }
 
-/// One route after its agent, model, and conversation settings were validated.
 #[derive(Clone, Debug)]
 pub struct ResolvedRoute {
     pub transport: String,
-    /// Which conversations on that transport this route claims.
     pub conversation: ConversationMatch,
-    /// Canonical subjects this route answers; every subject when absent.
     pub subjects: Option<Vec<ExternalSubject>>,
     pub agent: AgentId,
-    /// Overrides model-class selection for this route.
     pub model: Option<String>,
-    /// Whether this route's sessions may record improvement suggestions.
     pub improvement_suggestions: bool,
-    /// Whether this route's sessions are offered `inspect_agent_config`.
     pub inspect_agent_config: bool,
     pub limits: RouteLimits,
-    /// How much this route's progress surface says.
     pub(crate) progress_detail: ProgressDetail,
-    /// What this route remembers between messages.
     pub memory: MemoryPolicy,
 }
 
-/// Process-wide session admission bounds.
 #[derive(Clone, Copy, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SessionsConfig {
-    /// Process-wide retained attachment bytes. Zero disables asset retention, not the bound.
     #[serde(default = "default_asset_retention_bytes")]
     pub asset_retention_bytes: usize,
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
-    /// Whether a rejected message gets a short "try again" reply instead of silence.
     #[serde(default = "default_reply_on_busy")]
     pub reply_on_busy: bool,
-    /// Conversations this process tracks at once, across every persistent route.
-    ///
-    /// A memory bound rather than an admission bound: reaching it evicts the least recently used
-    /// conversation rather than refusing a message, because a person talking now matters more than
-    /// one who stopped an hour ago. It lives here rather than in a route block because it is a
-    /// property of the process, and `sessions:` is already where what this daemon costs at once is
-    /// configured.
     #[serde(default = "default_max_conversations")]
     pub max_conversations: usize,
 }
@@ -1007,10 +739,6 @@ const fn default_reply_on_busy() -> bool {
     true
 }
 
-/// Gateway-owned OTLP export settings, identical in shape to the broker's.
-///
-/// The ingest credential is deliberately absent: the OpenTelemetry SDK reads it from
-/// `OTEL_EXPORTER_OTLP_HEADERS`, so no token enters this file, the command line, or a span.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct TelemetryConfig {
@@ -1020,13 +748,11 @@ pub struct TelemetryConfig {
     pub export_timeout_ms: u64,
 }
 
-/// Gateway telemetry after validation.
 #[derive(Clone, Debug)]
 pub struct ResolvedTelemetry {
     pub settings: ExporterSettings,
 }
 
-/// Where and how to reach the broker, after discovery defaults were applied.
 #[derive(Clone, Debug)]
 pub struct ResolvedBroker {
     pub socket_path: PathBuf,
@@ -1034,7 +760,6 @@ pub struct ResolvedBroker {
     pub frame: FrameLimits,
 }
 
-/// One validated configuration, before the catalog is consulted.
 #[derive(Debug)]
 pub struct ResolvedConfig {
     pub source: PathBuf,
@@ -1043,27 +768,20 @@ pub struct ResolvedConfig {
     pub transports: Vec<TransportConfig>,
     pub models: Vec<ModelConfig>,
     pub routes: Vec<ResolvedRoute>,
-    /// Each transport's validated liveness settings, by transport name.
-    ///
-    /// Resolved once here rather than re-derived per session: the templates are validated at
-    /// startup, so a placeholder nobody can render is a refusal instead of a line that reads wrong
-    /// in a chat window an hour later.
     pub(crate) liveness: BTreeMap<String, Arc<ResolvedLiveness>>,
-    /// The words that stop a running session, lowercased.
     pub(crate) stop_words: Vec<String>,
     pub sessions: SessionsConfig,
     pub shutdown_grace: Duration,
     pub telemetry: Option<ResolvedTelemetry>,
 }
 
-/// Reads, hygiene-checks, and strictly decodes one gateway configuration.
 pub async fn load(
     path: impl AsRef<Path>,
     expected_uid: u32,
 ) -> Result<ResolvedConfig, ConfigError> {
     let path = absolute(path.as_ref())?;
-    // Authored configuration, not a secret: the gateway's own credentials live in the environment
-    // and in transport credential files, so the bar here is that nobody else can rewrite it.
+    // This file isn't a secret, since credentials live in the environment and transport credential
+    // files, so the bar here is only that nobody else can rewrite it.
     let owned = path.clone();
     let bytes = tokio::task::spawn_blocking(move || {
         read_trusted_file(
@@ -1098,18 +816,8 @@ pub async fn load(
     )
 }
 
-/// What serde writes when strict decoding meets the block this release replaced.
-///
-/// The whole match: `deny_unknown_fields` has no case for a key that used to exist, so the name in
-/// the decoder's own refusal is the only trace a retired block leaves.
 const RETIRED_ACTIVITY_FIELD: &str = "unknown field `activity`";
 
-/// Strictly decodes one gateway configuration, naming the block this release replaced.
-///
-/// Nothing here reads what an `activity:` block contained, and no field accepts one: the decoder
-/// refuses the key, and this maps that refusal onto the sentence that says what to write instead.
-/// serde's own sentence lists the fields a transport does accept, which tells an operator that
-/// `activity` is not among them and nothing about where it went.
 fn decode(document: &[u8]) -> Result<DekopondConfig, ConfigError> {
     serde_yaml::from_slice::<DekopondConfig>(document).map_err(|source| {
         if source.to_string().contains(RETIRED_ACTIVITY_FIELD) {
@@ -1147,10 +855,6 @@ pub(crate) fn resolve(
         }
     };
 
-    // Every semantic problem in this file is collected before any of them is reported, the way
-    // `dekopon-config` scans a whole catalog: an operator with three mistakes in one file fixes
-    // three and restarts once, instead of rediscovering the next one after every restart. Only a
-    // failure that makes the rest unreadable — the file's hygiene, or its decode — stops earlier.
     let mut problems = Vec::new();
 
     if config.transports.is_empty() {
@@ -1163,14 +867,8 @@ pub(crate) fn resolve(
         problems.push(ConfigProblem::NoRoutes);
     }
 
-    // A transport that never reached the name set cannot be named by a route, so the reference
-    // checks below would blame the routes pointing at it on top of reporting the real failure.
-    // A *duplicate* name is not that case: the first declaration is still in the set and still
-    // resolves, which is exactly why `dekopon-config` leaves duplicates out of `drops_resource`.
     let mut transports_incomplete = config.transports.is_empty();
     let mut transport_names = BTreeSet::new();
-    // The family each configured transport belongs to, which is what a route's selector and a
-    // liveness override are validated against.
     let mut transport_kinds: BTreeMap<String, ChatTransportKind> = BTreeMap::new();
     let mut transports = Vec::with_capacity(config.transports.len());
     let mut liveness_settings = BTreeMap::new();
@@ -1368,8 +1066,6 @@ pub(crate) fn resolve(
                 transport: route.transport.clone(),
             });
         }
-        // Retired names first, because everything below reads the block they were written into and
-        // would otherwise blame a selector the operator never meant to write.
         if route.retired_match.is_some() {
             problems.push(ConfigProblem::RetiredRouteMatch { route: index });
         }
@@ -1377,8 +1073,6 @@ pub(crate) fn resolve(
             problems.push(ConfigProblem::RetiredMemoryBlock { route: index });
         }
         let conversation = route.conversation.selector();
-        // A selector is only meaningful against a transport family: `container` exists on Slack
-        // and not on Telegram, and `groupDirectMessage` is a shape Discord never produces.
         if let Some(chat_kind) = transport_kinds.get(&route.transport) {
             for problem in conversation.validate(*chat_kind) {
                 problems.push(ConfigProblem::InvalidRouteConversation {
@@ -1387,7 +1081,6 @@ pub(crate) fn resolve(
                 });
             }
         }
-        // Detail Off cannot silently hide an explicitly requested message-backed Stop control.
         if route.progress_detail == ProgressDetail::Off
             && let (Some(liveness), Some(chat_kind)) = (
                 liveness_settings.get(&route.transport),
@@ -1448,23 +1141,16 @@ pub(crate) fn resolve(
                 agent: route.agent.to_string(),
             });
         }
-        // A bound of zero cancels the session in the same instant it starts, which is a route that
-        // can only ever answer `Stopped.`; the way to run nothing is to remove the route.
         if route.limits.max_duration_ms == Some(0) {
             problems.push(ConfigProblem::InvalidRouteDuration {
                 agent: route.agent.to_string(),
             });
         }
-        // A script that must finish in no time is a route whose every script ends with the shell's
-        // deadline line; omitting the field is how an operator asks for the default.
         if route.limits.script_timeout_ms == Some(0) {
             problems.push(ConfigProblem::InvalidScriptTimeout {
                 agent: route.agent.to_string(),
             });
         }
-        // A script deadline above the session bound can never fire: the session is cancelled first,
-        // so the pair reads as a longer allowance than the route actually grants. Both numbers are
-        // named, because which one to move is the operator's choice rather than this daemon's.
         if let (Some(script_timeout_ms), Some(max_duration_ms)) =
             (route.limits.script_timeout_ms, route.limits.max_duration_ms)
             && script_timeout_ms > max_duration_ms
@@ -1475,9 +1161,6 @@ pub(crate) fn resolve(
                 max_duration_ms,
             });
         }
-        // A bound of zero is a bound nobody meant to write, exactly as a zero step budget already
-        // is. The other half of this check — a window setting on a `oneShot` route — is a decode
-        // failure rather than a check here, because there is no field it could have landed in.
         let memory = match route.memory {
             MemoryConfig::OneShot {} => MemoryPolicy::OneShot,
             MemoryConfig::Persistent {
@@ -1515,8 +1198,6 @@ pub(crate) fn resolve(
         });
     }
 
-    // Lowercased once here so the matcher in `dispatch` compares two values that were normalized
-    // the same way, rather than lowercasing the operator's list on every inbound message.
     let stop_words = match config.stop_words {
         Some(words) if words.is_empty() || words.iter().any(|word| word.trim().is_empty()) => {
             problems.push(ConfigProblem::InvalidStopWords);
@@ -1615,8 +1296,6 @@ pub(crate) fn resolve(
                 telemetry,
             })
         }
-        // Each of the three above pushed its own problem in place of a value, so every path that
-        // lands here carries at least one.
         _ => Err(ConfigError::Invalid {
             path: source,
             problems,
@@ -1624,10 +1303,6 @@ pub(crate) fn resolve(
     }
 }
 
-/// Validates one transport's `liveness:` block, recording every setting it cannot honor.
-///
-/// Every setting rather than the first, and a value comes back either way: the caller is
-/// collecting a whole file's problems and will refuse the configuration itself.
 fn resolve_liveness(
     transport: &TransportConfig,
     problems: &mut Vec<ConfigProblem>,
@@ -1645,8 +1320,6 @@ fn resolve_liveness(
         | TransportConfig::Local { liveness, .. } => (liveness, None),
     };
 
-    // A surface configured under `mode: off` is a setting that can never take effect, which is far
-    // more likely a forgotten `mode:` than an intention.
     if liveness.mode == LivenessMode::Off {
         for surface in [
             (liveness.progress == ProgressSurface::Message).then_some("progress"),
@@ -1663,11 +1336,8 @@ fn resolve_liveness(
         }
     }
 
-    // The same refusal wording for the base block and for every override, because a setting a
-    // transport cannot honor is the same mistake wherever it was written.
     let whatsapp = matches!(transport, TransportConfig::WhatsappCloudApi { .. });
     let slack_agent = experience == Some(SlackExperience::Agent);
-    /// Records every surface this transport cannot honor, for the base block or one override.
     fn unsupported_surfaces(
         problems: &mut Vec<ConfigProblem>,
         transport: &str,
@@ -1734,8 +1404,6 @@ fn resolve_liveness(
     }
 
     match experience {
-        // Carried over unchanged: the fallback is the classic app's only signal, and a native
-        // Agent installation that loses status falls back to it.
         Some(experience) => {
             let coherent = match (experience, liveness.mode) {
                 (_, LivenessMode::Off) => liveness.classic_fallback == SlackLivenessFallback::None,
@@ -1758,8 +1426,6 @@ fn resolve_liveness(
         None => {}
     }
 
-    // A zero period is a render loop rather than a keep-alive, and a tick at zero seconds is the
-    // post at `Started` this design deliberately does not make.
     if liveness.keep_alive.every_seconds == 0 || liveness.keep_alive.at_seconds.contains(&0) {
         problems.push(ConfigProblem::InvalidKeepAlive {
             transport: name.clone(),
@@ -1803,17 +1469,12 @@ fn resolve_liveness(
     resolved
 }
 
-/// Records an invalid environment variable name rather than abandoning the rest of the scan.
 fn check_env_name(name: &str, problems: &mut Vec<ConfigProblem>) {
     if let Err(problem) = validate_env_name(name) {
         problems.push(problem);
     }
 }
 
-/// Records an unsupported endpoint and keeps scanning under the pinned production origin.
-///
-/// The substituted value never reaches a socket: a recorded problem is a refusal, and the resolved
-/// configuration this would belong to is not returned at all.
 fn checked_endpoint(
     endpoint: Option<String>,
     production: &str,
@@ -1828,11 +1489,9 @@ fn checked_endpoint(
     }
 }
 
-/// Accepts an environment variable *name*, which is never a secret and is safe to echo.
-///
-/// The grammar is deliberately narrower than the operating system's: a name with `=` or a NUL is
-/// unreachable through `env::var_os` anyway, and one with a space is almost always a typo that
-/// would otherwise surface as "this token is missing" at connect time.
+/// Validates a variable name only, never a secret, so it is safe to echo in error messages; the
+/// grammar is narrower than the OS's, rejecting a stray space that would otherwise fail cryptically
+/// at connect time.
 fn validate_env_name(name: &str) -> Result<(), ConfigProblem> {
     let mut bytes = name.bytes();
     let valid = match bytes.next() {
@@ -1850,11 +1509,9 @@ fn validate_env_name(name: &str) -> Result<(), ConfigProblem> {
     }
 }
 
-/// Accepts the one production origin or a literal loopback HTTP URL.
-///
-/// Overridability exists so tests can point a transport at a mock, and the loopback restriction is
-/// what keeps that from doubling as a way to send a bot token to an arbitrary host. The host is
-/// compared after stripping userinfo, so `http://127.0.0.1@evil.test` does not read as loopback.
+/// The loopback-only override lets tests point a transport at a mock without letting the same
+/// override send a bot token to an arbitrary host, and the host is checked after stripping
+/// userinfo.
 fn validate_endpoint(endpoint: Option<String>, production: &str) -> Result<String, ConfigProblem> {
     let Some(endpoint) = endpoint else {
         return Ok(production.to_owned());
@@ -1910,8 +1567,8 @@ fn valid_graph_version(value: &str) -> bool {
 }
 
 fn is_loopback_authority(authority: &str) -> bool {
-    // Anything before `@` is userinfo and anything after `/` is a path; neither is the host the
-    // socket would connect to, and both are how a remote authority disguises itself as loopback.
+    // Userinfo before the @ and any path after the slash aren't the actual connection host; both
+    // are how a remote address can disguise itself as loopback.
     if authority.contains('@') || authority.contains('/') {
         return false;
     }
@@ -1927,13 +1584,6 @@ fn is_loopback_authority(authority: &str) -> bool {
     matches!(host.to_ascii_lowercase().as_str(), "127.0.0.1" | "::1")
 }
 
-/// Strict configuration failure.
-///
-/// Only the ways a file can be unusable before it is understood stop at the first error. Every
-/// semantic problem in a file that decoded is reported together through [`ConfigError::Invalid`],
-/// which is the shape `dekopon-config` already refuses a catalog with. A file that still carries
-/// the retired `activity:` block stops there too: strict decoding refuses the key, and the refusal
-/// names the replacement instead of listing the fields a transport does accept.
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("could not determine the current directory")]
@@ -1953,9 +1603,7 @@ pub enum ConfigError {
         "gateway configuration must be single-link, owned by the daemon UID, and not group/world writable: {path}"
     )]
     InsecureFile {
-        /// The refused path.
         path: PathBuf,
-        /// Which hygiene check refused it.
         #[source]
         source: FileHygieneError,
     },
@@ -1970,33 +1618,22 @@ pub enum ConfigError {
         "gateway configuration declares activity:, which this release replaced; write liveness: instead, with classicFallback where the old activity block had it"
     )]
     RetiredActivityBlock {
-        /// The decoder's own refusal, which carries where in the file the block was written.
         #[source]
         source: serde_yaml::Error,
     },
     #[error("configured path has no parent")]
     MissingParent,
-    /// The file decoded, and every semantic problem found in it is listed here.
     #[error("{path}: {}", render_problems(.problems))]
     Invalid {
-        /// The configuration file every problem below was found in.
         path: PathBuf,
-        /// Every problem found, in file order.
         problems: Vec<ConfigProblem>,
     },
 }
 
-/// One semantic problem in an otherwise decodable gateway configuration.
-///
-/// The file is scanned to the end before it is refused, so an operator fixing three mistakes
-/// restarts the daemon once rather than three times. Problems are reported through
-/// [`ConfigError::Invalid`], which owns the source path they all share.
 #[derive(Debug, Error)]
 pub enum ConfigProblem {
-    /// An OpenRouter model identifier is required, without a catalog restriction.
     #[error("model {name:?} requires a nonempty model identifier")]
     EmptyModelId { name: String },
-    /// One invalid authored OpenRouter control, collected with every other config problem.
     #[error("model {name:?}: {problem}")]
     OpenRouterSetting {
         name: String,
@@ -2098,52 +1735,33 @@ pub enum ConfigProblem {
     #[error(
         "routes[{route}]: `match` is no longer a route field; write `conversation: {{ kind: [channel, thread], ids: [...] }}`"
     )]
-    RetiredRouteMatch {
-        /// Position of the offending route in the file.
-        route: usize,
-    },
+    RetiredRouteMatch { route: usize },
     #[error(
         "routes[{route}]: `conversation:` is the match now; the memory window is `memory:` with the same fields"
     )]
-    RetiredMemoryBlock {
-        /// Position of the offending route in the file.
-        route: usize,
-    },
+    RetiredMemoryBlock { route: usize },
     #[error("routes[{route}]: conversation selector is invalid: {problem}")]
     InvalidRouteConversation {
-        /// Position of the offending route in the file.
         route: usize,
-        /// What is wrong with the selector.
         problem: ConversationMatchProblem,
     },
     #[error(
         "routes[{route}]: `subjects:` is accepted only beside `conversation: {{ kind: [directMessage] }}`; a per-person channel route is an access-control list by another name, and authority is the broker's subject mapping and policy"
     )]
-    SubjectsOnNonDmRoute {
-        /// Position of the offending route in the file.
-        route: usize,
-    },
+    SubjectsOnNonDmRoute { route: usize },
     #[error(
         "routes[{route}]: `subjects:` is empty, which answers nobody; omit it to answer every subject"
     )]
-    EmptyRouteSubjects {
-        /// Position of the offending route in the file.
-        route: usize,
-    },
+    EmptyRouteSubjects { route: usize },
     #[error(
         "routes[{route}]: `memory.scope: sharedConversation` on a `kind: [directMessage]` route shares nothing; the direct message already is the subject"
     )]
-    SharedMemoryOnDmRoute {
-        /// Position of the offending route in the file.
-        route: usize,
-    },
+    SharedMemoryOnDmRoute { route: usize },
     #[error(
         "transport {transport:?} overrides liveness for conversation kind {kind}, which it never produces"
     )]
     ImpossibleLivenessConversation {
-        /// The transport whose block carries the impossible key.
         transport: String,
-        /// The kind it named.
         kind: &'static str,
     },
     #[error(
@@ -2175,12 +1793,6 @@ pub enum ConfigProblem {
     },
 }
 
-/// Renders every problem in one refusal, each followed by its own cause chain.
-///
-/// The chain is walked here rather than inlined into each problem's message because a problem's
-/// real reason can sit two links down — a credential variable that is unset, under the transport
-/// that named it — and an aggregate printing only top lines would be a list of headlines with the
-/// reasons removed. Shared by the gateway's three aggregate refusals so they read alike.
 pub(crate) fn render_problems<P: std::error::Error>(problems: &[P]) -> String {
     let mut rendered = format!(
         "{} validation problem{} found:",
@@ -2223,7 +1835,6 @@ mod tests {
     };
     use crate::progress::{DEFAULT_KEEP_ALIVE_MAX, KeepAlive};
 
-    /// Everything a configuration needs before the field under test is added to it.
     const PREAMBLE: &str = "apiVersion: dekopon.dev/dekopond/v1alpha1\n\
          catalogPath: dekopon.yaml\n\
          broker: { socketPath: /run/dekopon/broker.sock, serverUid: 501 }\n\
@@ -2246,9 +1857,6 @@ mod tests {
         )
     }
 
-    /// An operator with nine mistakes in one file fixes nine and restarts once. Each of these is a
-    /// setting that decodes cleanly and could never take effect, which is exactly the class this
-    /// file's strict validation exists to refuse out loud rather than absorb.
     #[test]
     fn every_liveness_conflict_in_one_file_is_reported_together() {
         let error = resolved(
@@ -2406,12 +2014,6 @@ mod tests {
         );
     }
 
-    /// A file written for the previous release is told what replaced its block, not which keys a
-    /// transport happens to accept.
-    ///
-    /// Strict decoding is what refuses it — no field of any transport accepts `activity` — so this
-    /// is the one refusal that cannot be collected beside the file's other problems, and the
-    /// sentence carries the whole migration on its own.
     #[test]
     fn a_retired_activity_block_is_refused_by_name() {
         let document = format!(
@@ -2443,8 +2045,6 @@ mod tests {
         }
     }
 
-    /// The shipped shape, so a deployment that writes the block and nothing else gets the schedule
-    /// and the sentences this daemon documents rather than an empty one.
     #[test]
     fn a_liveness_block_resolves_to_the_documented_defaults() {
         let config = resolved(
@@ -2482,8 +2082,6 @@ mod tests {
         assert_eq!(liveness.templates.failed(), super::FAILURE_REPLY);
     }
 
-    /// Stop words are normalized once, where the list is read, rather than on every inbound
-    /// message: the matcher compares two values that were lowercased the same way.
     #[test]
     fn configured_stop_words_are_normalized_once() {
         let config = resolved(
@@ -2505,7 +2103,6 @@ mod tests {
         );
     }
 
-    /// Everything a two-model fixture needs around its `models:` block.
     const HEAD: &str = "apiVersion: dekopon.dev/dekopond/v1alpha1\n\
          catalogPath: dekopon.yaml\n\
          broker: { socketPath: /run/dekopon/broker.sock, serverUid: 501 }\n";
@@ -2667,13 +2264,6 @@ mod tests {
         }
     }
 
-    /// Only the kind that has a choice about streaming carries the switch, and its default is on.
-    ///
-    /// The default is the half worth pinning: a model block written before streaming existed
-    /// decodes into a streaming client, which is what makes `stream:` the repair for one endpoint
-    /// that gets `stream: true` wrong rather than a switch every deployment has to find.
-    /// `kind: chatgptSubscription` streams and cannot be asked not to, so the field written there
-    /// is refused by name instead of being accepted and ignored.
     #[test]
     fn only_an_openai_compatible_model_chooses_whether_it_streams() {
         let document = format!(
@@ -2727,11 +2317,6 @@ mod tests {
         );
     }
 
-    /// The route owns the script deadline, and a route that writes no number keeps the one every
-    /// route ran under before the field existed.
-    ///
-    /// Both halves matter: an image edit needs more than 30 seconds, and an operator who never
-    /// heard of the field must not discover that their scripts started ending somewhere new.
     #[test]
     fn a_route_script_deadline_is_read_and_otherwise_defaults() {
         let config = resolved(
@@ -2765,11 +2350,6 @@ mod tests {
         );
     }
 
-    /// Two script deadlines that decode cleanly and could never take effect, refused together.
-    ///
-    /// The second is the one worth naming both numbers for: a script deadline above the session
-    /// bound reads as the longer allowance an operator wrote, and is not, because the session is
-    /// cancelled first.
     #[test]
     fn script_deadlines_that_cannot_take_effect_are_reported_together() {
         let error = resolved(

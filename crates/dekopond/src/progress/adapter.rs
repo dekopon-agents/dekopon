@@ -1,10 +1,3 @@
-//! The gateway's [`ProgressSink`]: one trace record per event, then the two channels.
-//!
-//! The prompt loop is synchronous and runs on a blocking thread, so this implementation never
-//! blocks and never awaits. Discrete events go to a bounded queue with `try_send`; the cumulative
-//! answer text goes to a watch value, because text is a value the policy reads at its own cadence
-//! rather than an event it must not miss.
-
 use std::sync::{
     Arc,
     atomic::{AtomicU32, Ordering},
@@ -16,34 +9,22 @@ use tokio::sync::{mpsc, watch};
 
 use crate::session::SessionCancellation;
 
-/// Discrete events buffered between the blocking prompt loop and the policy task.
-///
-/// Bounded because everything that grows needs a bound and an owner. Discrete events are rare —
-/// a turn, a tool, an attachment — so overflow means the policy task is wedged behind a service
-/// call, and dropping the oldest news is better than blocking the model loop on presentation.
 pub(crate) const EVENT_QUEUE: usize = 64;
 
-/// The turn number no delta has carried yet, so the first one always starts a fresh accumulator.
 const NO_TURN: u32 = 0;
 
-/// What the adapter counted that the policy renders or records.
 #[derive(Debug, Default)]
 pub(crate) struct ProgressCounters {
-    /// Events the bounded queue could not take.
     pub dropped: AtomicU32,
-    /// Text deltas observed, which is what makes "the stream was alive" readable at cancel.
     pub deltas: AtomicU32,
 }
 
-/// The gateway's progress sink.
 pub(crate) struct ProgressAdapter {
     transport: String,
     events: mpsc::Sender<ProgressEvent>,
     text: watch::Sender<ModelText>,
-    /// The turn the watch value belongs to, because each turn's text starts again from nothing.
     turn: AtomicU32,
     counters: Arc<ProgressCounters>,
-    /// The race a finished loop closes; see [`ProgressSink::emit`].
     cancellation: SessionCancellation,
 }
 
@@ -68,15 +49,8 @@ impl ProgressAdapter {
 
 impl ProgressSink for ProgressAdapter {
     fn emit(&self, event: ProgressEvent) {
-        // A text delta is a value rather than an event: it is the newest rendering of one thing,
-        // it arrives hundreds of times per turn, and the count is what a trace needs. The loop
-        // sends fragments, so the cumulative text is accumulated here, once, rather than by every
-        // reader; `stream.deltas` on `prompt.model_turn` and the count on the policy's terminal
-        // record are where a reader finds how many there were.
         if let ProgressEvent::TextDelta { turn, text, .. } = &event {
             self.counters.deltas.fetch_add(1, Ordering::Relaxed);
-            // A new turn's text starts from nothing: the surface shows what is being written now,
-            // not the previous turn's answer with this one appended to it.
             let restart = self.turn.swap(*turn, Ordering::Relaxed) != *turn;
             self.text.send_modify(|cumulative| {
                 if restart {
@@ -86,10 +60,9 @@ impl ProgressSink for ProgressAdapter {
             });
             return;
         }
-        // The loop has the answer, so there is nothing left to stop: this claim is what makes a
-        // stop word that arrives while the session is still unwinding lose the race instead of
-        // replacing the answer on screen with `Stopped.`. It happens here, synchronously on the
-        // loop's own thread, because the session cannot claim it until a thread hand-off later.
+        // Claimed synchronously here, on the loop's own thread, so a stop word arriving while the
+        // session unwinds loses the race instead of overwriting the finished answer with the
+        // stopped reply.
         if matches!(event, ProgressEvent::Finished { .. }) {
             #[allow(
                 clippy::let_underscore_must_use,
@@ -115,11 +88,9 @@ impl ProgressSink for ProgressAdapter {
     }
 }
 
-/// Writes one event to the message's own trace.
-///
-/// Metadata only, by construction: every field below is a counter, a duration, an operator or
-/// provider word, or a fixed kind. There is no field a prompt, a capability argument, a provider
-/// result, or model text could be written into.
+/// Metadata only, by construction: every field here is a counter, duration, or fixed operator word,
+/// with none that a prompt, capability argument, provider result, or model text could be written
+/// into.
 pub(crate) fn record(event: &ProgressEvent) {
     match event {
         ProgressEvent::Started { agent, max_steps } => tracing::info!(
@@ -132,7 +103,6 @@ pub(crate) fn record(event: &ProgressEvent) {
             { audit.event = "gateway.progress", kind = "model_turn", turn = *turn, of = *of },
             "gateway progress"
         ),
-        // Counted rather than recorded; see `emit`.
         ProgressEvent::TextDelta { .. } => {}
         ProgressEvent::Answered {
             turn,

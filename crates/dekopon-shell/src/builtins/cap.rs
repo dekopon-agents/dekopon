@@ -1,19 +1,10 @@
-//! `cap`: what this session was granted.
-//!
-//! `cap --list` (`-l`) prints the granted capability identifiers, and `cap --describe <id>` (`-d`)
-//! prints one identifier with its description. Neither invokes anything. A capability is used
-//! through the provider command word that proposes it, and that word's `--help` is where its
-//! arguments are documented. Every other argument form is a usage error at exit `2`.
-
 use serde_json::{Value, json};
 
 use super::{Builtin, BuiltinContext, CommandFailure, CommandResult};
 
-/// The usage text every malformed `cap` reports.
 const USAGE: &str = "usage: cap --list | cap --describe <capability> (what this session was \
                      granted — run `<word> --help` to use it)";
 
-/// Lists and describes the session's granted capabilities.
 pub(crate) struct Cap;
 
 impl Builtin for Cap {
@@ -81,8 +72,6 @@ mod tests {
 
     use super::Cap;
 
-    /// A session granted two capabilities, one of them capability-shaped enough to tempt an
-    /// invocation, that records every call `cap` might wrongly make.
     #[derive(Default)]
     struct Fixture {
         invoked: RefCell<Vec<String>>,

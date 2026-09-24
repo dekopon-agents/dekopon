@@ -1,21 +1,3 @@
-//! Scaffolding every Dekopon test suite needs, defined once.
-//!
-//! Nine copies of the provider-fixture path, thirteen hand-rolled loopback HTTP servers, nine
-//! `tracing` capture layers, six directory walkers, and twelve identical `#[allow]` blocks had
-//! already drifted apart from each other: one loopback server truncated a request to its
-//! `content-length` and its twin did not, one capture layer filtered non-workspace callsites and
-//! its twin did not. A fixture that quietly differs between two suites is worse than a fixture
-//! that is merely duplicated, because the difference is what the two suites then disagree about.
-//!
-//! This crate is `publish = false` and is only ever a path `[dev-dependencies]` entry. It depends
-//! on nothing under the broker boundary, so adding it to `dekopond`'s dev-dependencies cannot put
-//! a broker crate in the gateway's dependency tree; the three workspace crates it does depend on
-//! — `dekopon-agent`, `dekopon-model`, `dekopon-shell` — are the boundaries the shared doubles
-//! implement, and all three are already normal dependencies of `dekopond` itself. Because this
-//! crate is a dev-dependency everywhere, none of them appears in any `cargo tree --edges normal`
-//! CI reads. The `agent-runtime` feature opts into `BlockedRuntime` and its agent dependency;
-//! generic socket, file, capture and transport fixtures do not compile the prompt loop.
-
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 #![allow(
     clippy::disallowed_methods,
@@ -52,20 +34,10 @@ pub use transcripts::{
     OPENAI_CHAT_COMPLETIONS_TWO_DELTAS,
 };
 
-/// How long a fixture waits on a peer before deciding the test, not the network, is stuck.
 const FIXTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How often [`LoopbackServer::pooled`] re-checks its two sources of a client's next move.
 const POOLED_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
-/// The path to one built provider component under `examples/providers/`.
-///
-/// Three of those components are fetched rather than built, so the failure worth naming is the
-/// precondition an operator forgot rather than `NotFound` on a path they have never seen.
-///
-/// # Panics
-///
-/// When the component is absent, naming the script that fetches it.
 #[must_use]
 pub fn provider_fixture(name: &str) -> PathBuf {
     let path = workspace_root().join("examples/providers").join(name);
@@ -78,7 +50,6 @@ pub fn provider_fixture(name: &str) -> PathBuf {
     path
 }
 
-/// The repository root, resolved from this crate's own manifest rather than the caller's.
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -86,11 +57,6 @@ fn workspace_root() -> PathBuf {
         .expect("the workspace root resolves from this crate's manifest directory")
 }
 
-/// Awaits a shutdown signal, treating a dropped sender as the signal.
-///
-/// Twelve server fixtures wrote this future inline with a byte-identical `#[allow]` and reason.
-/// The discard is correct exactly once — here — because a test body that panicked or returned
-/// early drops its sender, and "stop" is what both outcomes mean.
 pub async fn shutdown_on<T, E>(signal: impl Future<Output = Result<T, E>>) {
     #[allow(
         clippy::let_underscore_must_use,
@@ -100,7 +66,6 @@ pub async fn shutdown_on<T, E>(signal: impl Future<Output = Result<T, E>>) {
     let _ = signal.await;
 }
 
-/// The `content-length` a request or response header block declares, or zero when it declares none.
 #[must_use]
 pub fn content_length(headers: &[u8]) -> usize {
     String::from_utf8_lossy(headers)
@@ -114,30 +79,15 @@ pub fn content_length(headers: &[u8]) -> usize {
         .unwrap_or(0)
 }
 
-/// One entry of a directory tree, as [`snapshot_tree`] recorded it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TreeEntry {
-    /// Path relative to the snapshot root.
     pub relative: PathBuf,
-    /// Unix mode bits from `symlink_metadata`.
     pub mode: u32,
-    /// Length from `symlink_metadata`; for a directory this is the directory's own size.
     pub len: u64,
-    /// Whether the entry is a directory, without following a symlink to one.
     pub is_dir: bool,
-    /// File contents, empty for anything that is not a regular file.
     pub contents: Vec<u8>,
 }
 
-/// Every entry under `root`, depth first, each directory's children sorted by file name.
-///
-/// Symlinks are recorded and never followed: half the callers are proving that a substituted
-/// symlink was *not* traversed, and a walker that followed one would assert the opposite of what
-/// it was written for.
-///
-/// # Panics
-///
-/// When the tree cannot be read, which in a test is the fixture failing rather than the subject.
 #[must_use]
 pub fn snapshot_tree(root: &Path) -> Vec<TreeEntry> {
     fn visit(root: &Path, path: &Path, output: &mut Vec<TreeEntry>) {
@@ -177,12 +127,6 @@ pub fn snapshot_tree(root: &Path) -> Vec<TreeEntry> {
     output
 }
 
-/// A loopback HTTP server that records what it was asked and answers a scripted reply.
-///
-/// Every constructor records complete requests: headers plus exactly the `content-length` bytes
-/// the peer declared, truncated to it. That is the behavior the broker-host copy had and the
-/// broker copy did not, and it is the one worth keeping — a recorded request carrying whatever
-/// else happened to be in the socket buffer makes a body assertion depend on packet timing.
 pub struct LoopbackServer {
     authority: String,
     requests: Receiver<Vec<u8>>,
@@ -190,22 +134,16 @@ pub struct LoopbackServer {
 }
 
 impl LoopbackServer {
-    /// Answers `response` to exactly one request on one connection.
     #[must_use]
     pub fn once(response: &[u8]) -> Self {
         Self::serving(response, 1)
     }
 
-    /// Answers `response` to `calls` requests, one connection each.
-    ///
-    /// Requests arrive on the channel in the order they were served, which is the order the client
-    /// dispatched them.
     #[must_use]
     pub fn serving(response: &[u8], calls: usize) -> Self {
         Self::sequence(std::iter::repeat_n(response.to_vec(), calls))
     }
 
-    /// Answers each response in order, one connection each.
     #[must_use]
     pub fn sequence(responses: impl IntoIterator<Item = Vec<u8>>) -> Self {
         let responses = responses.into_iter().collect::<Vec<_>>();
@@ -227,7 +165,6 @@ impl LoopbackServer {
         .expect("bind loopback fixture")
     }
 
-    /// Accepts one request, records it, and never answers, so a call is dispatched but unresolved.
     #[must_use]
     pub fn stalled() -> Self {
         Self::bind_with("127.0.0.1:0", |listener, sender| {
@@ -244,21 +181,11 @@ impl LoopbackServer {
                           to fail"
             )]
             let _ = sender.send(read_request(&mut stream));
-            // Hold the connection open past the caller's deadline without ever responding.
             thread::sleep(FIXTURE_TIMEOUT);
         })
         .expect("bind loopback fixture")
     }
 
-    /// Answers `response` to `calls` requests across however many connections the client opens.
-    ///
-    /// A pooling client may or may not have checked its connection back in as idle by the time the
-    /// next request starts, which is a race decided by a background task rather than by anything
-    /// the caller controls. Both outcomes are served here and neither waits on the other: every
-    /// turn polls the connection already held and then the listener, so a second connection is
-    /// answered as soon as it arrives. Blocking on the held connection's read instead is what put
-    /// this fixture's deadline in a coin flip against the caller's own, which a loaded runner
-    /// loses.
     #[must_use]
     pub fn pooled(response: &[u8], calls: usize) -> Self {
         let response = response.to_vec();
@@ -268,8 +195,6 @@ impl LoopbackServer {
                 .expect("poll the fixture listener");
             let mut connection: Option<TcpStream> = None;
             let mut served = 0;
-            // Re-armed by every request served and every connection accepted, so the deadline
-            // bounds one wait on the client rather than the whole fixture.
             let mut deadline = Instant::now() + FIXTURE_TIMEOUT;
             while served < calls && Instant::now() < deadline {
                 if let Some(stream) = connection.as_mut() {
@@ -287,7 +212,6 @@ impl LoopbackServer {
                             deadline = Instant::now() + FIXTURE_TIMEOUT;
                             continue;
                         }
-                        // A client that closed this connection is about to open another one.
                         PeerState::Closed => {
                             connection = None;
                             continue;
@@ -300,7 +224,6 @@ impl LoopbackServer {
                         stream
                             .set_read_timeout(Some(FIXTURE_TIMEOUT))
                             .expect("set fixture timeout");
-                        // Any earlier connection is dropped: the client moved on from it.
                         connection = Some(stream);
                         deadline = Instant::now() + FIXTURE_TIMEOUT;
                     }
@@ -314,10 +237,6 @@ impl LoopbackServer {
         .expect("bind loopback fixture")
     }
 
-    /// Answers `response` once on an explicit bind address.
-    ///
-    /// `None` when that address family is unavailable on this host, which is the only reason
-    /// binding a loopback port fails and the only reason a caller needs to tell the two apart.
     #[must_use]
     pub fn bound(bind: &str, response: &[u8]) -> Option<Self> {
         let response = response.to_vec();
@@ -341,8 +260,6 @@ impl LoopbackServer {
         serve: impl FnOnce(TcpListener, &mpsc::Sender<Vec<u8>>) + Send + 'static,
     ) -> Option<Self> {
         let listener = TcpListener::bind(bind).ok()?;
-        // `SocketAddr`'s rendering is the authority grammar a host allowlist uses, brackets and
-        // all, so an IPv6 fixture agrees with the constraint that permits it.
         let authority = listener.local_addr().expect("fixture address").to_string();
         let (sender, requests) = mpsc::channel();
         let handle = thread::spawn(move || serve(listener, &sender));
@@ -353,23 +270,16 @@ impl LoopbackServer {
         })
     }
 
-    /// The `host:port` this fixture answers on.
     #[must_use]
     pub fn authority(&self) -> &str {
         &self.authority
     }
 
-    /// The plaintext base URL this fixture answers on.
     #[must_use]
     pub fn url(&self) -> String {
         format!("http://{}", self.authority)
     }
 
-    /// The next recorded request, waiting for it to arrive.
-    ///
-    /// # Panics
-    ///
-    /// When no request arrives before the fixture deadline.
     #[must_use]
     pub fn request(&self) -> Vec<u8> {
         self.requests
@@ -377,27 +287,16 @@ impl LoopbackServer {
             .expect("the fixture recorded a request")
     }
 
-    /// The next recorded request as text.
-    ///
-    /// # Panics
-    ///
-    /// When no request arrives before the fixture deadline.
     #[must_use]
     pub fn request_text(&self) -> String {
         String::from_utf8(self.request()).expect("the recorded request is UTF-8")
     }
 
-    /// Every request recorded so far, without waiting for more.
     #[must_use]
     pub fn recorded(&self) -> Vec<Vec<u8>> {
         self.requests.try_iter().collect()
     }
 
-    /// Waits for the serving thread to finish.
-    ///
-    /// # Panics
-    ///
-    /// When the fixture thread panicked, which is a fixture failure rather than a test result.
     pub fn join(mut self) {
         if let Some(handle) = self.handle.take() {
             handle.join().expect("fixture server exits");
@@ -405,17 +304,12 @@ impl LoopbackServer {
     }
 }
 
-/// What a client has done with a connection the fixture is holding open.
 enum PeerState {
-    /// A request has begun arriving on it.
     Request,
-    /// Nothing yet: the client is still deciding, or has gone to a new connection.
     Idle,
-    /// The client hung it up, or it is no longer usable, which for this fixture is the same thing.
     Closed,
 }
 
-/// Reports a connection's state without consuming anything or blocking on it.
 fn peer_state(stream: &mut TcpStream) -> PeerState {
     stream
         .set_nonblocking(true)
@@ -433,9 +327,6 @@ fn peer_state(stream: &mut TcpStream) -> PeerState {
     state
 }
 
-/// Reads one complete request: headers, then exactly the declared `content-length` bytes.
-///
-/// Returns what it has when the peer closes first, which is how a pooled connection ends.
 fn read_request(stream: &mut TcpStream) -> Vec<u8> {
     let mut request = Vec::new();
     let mut buffer = [0_u8; 1024];

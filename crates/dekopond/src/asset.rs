@@ -1,20 +1,6 @@
-//! The attachments a conversation carries, and the numbers a model refers to them by.
-//!
-//! An attachment is part of the message that carried it. Chat services deliver it by reference
-//! rather than by value, so hearing the whole request means being able to resolve that reference —
-//! which is why this lives in the gateway beside transport credentials rather than behind the
-//! broker. Nothing
-//! here decides *whether* an effect may happen; it reads what a sender already handed the bot on a
-//! transport the bot is already authenticated to.
-//!
-//! Inventories and model messages hold metadata/weak resolvers. One process-wide disk LRU owns
-//! residency; actual consumers acquire temporary pins. A released input never silently refetches.
-//!
-//! Numbering is per scope-aware conversation generation and monotonic within that generation.
-//! `Chat Asset #5` is short enough to replay inside the history byte budget, and stable enough that
-//! a follow-up three turns later still resolves. Persistent assets carry the exact transcript key
-//! and its live generation fence, so private/shared audiences and invalidation cannot drift from
-//! the reference notes that name them.
+//! This lives beside transport credentials in the gateway, not the broker, because resolving an
+//! attachment reference is reading already-authenticated data, not deciding whether an effect may
+//! happen.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -41,32 +27,16 @@ pub(crate) const MAX_SENDS_PER_TURN: u8 = 4;
 
 use crate::{conversation::ConversationKey, transport::AssetFetcher};
 
-/// Attachments one conversation may accumulate before the oldest are forgotten.
-///
-/// A ceiling rather than a timer, matching [`crate::conversation::ConversationStore`]: the insert
-/// that would exceed it is the one that evicts. Someone who pastes a long screenshot thread keeps
-/// the recent ones addressable, which is what a follow-up question is ever about.
 pub(crate) const MAX_ASSETS_PER_CONVERSATION: usize = dekopon_broker_protocol::MAX_ASSET_ROWS;
 
-/// One attachment, as the gateway knows it before anyone asks for the bytes.
-///
-/// `Debug` prints no source, because Slack private URLs and Discord signed CDN URLs are
-/// capabilities. They are metadata in the payload sense, not the span sense.
+/// Debug omits the source field because Slack private URLs and Discord signed CDN URLs function as
+/// bearer capabilities, not safe-to-log metadata.
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct AssetRef {
-    /// The number the conversation refers to this by.
     pub id: u64,
-    /// The name the sender gave it, which is untrusted text.
     pub name: String,
-    /// IANA media type as the transport reported it, also untrusted.
     pub mime: String,
-    /// Reported length when known, used to refuse an oversized fetch before making it.
     pub size: Option<u64>,
-    /// How the owning transport resolves this back to bytes, when it can.
-    ///
-    /// `None` for a file the app cannot see — Slack withholds the id and URL when the token lacks
-    /// access to it. Such a file is still named for the model, because "there is something here I
-    /// cannot open" is a better answer than pretending nothing arrived.
     pub source: Option<AssetSourceRef>,
     fetched: bool,
     encoding: AssetEncoding,
@@ -84,41 +54,27 @@ impl fmt::Debug for AssetRef {
     }
 }
 
-/// Where an attachment's bytes come from, in the terms its own transport understands.
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) enum AssetSourceRef {
-    /// Gateway provenance, not provider-supplied identity or a transport download source.
     Generated {
         capability: String,
         invocation: String,
     },
-    /// A Slack file, fetched from its private download URL with the bot token.
     Slack {
-        /// Slack's own file identifier, which is safe to log.
         file_id: String,
-        /// The private download URL, which is not.
         url: String,
     },
-    /// A Discord attachment, fetched from its signed CDN URL without the bot token.
     Discord {
-        /// Discord's snowflake attachment identifier, which is safe to log.
         attachment_id: String,
-        /// Channel containing the source message, used to refresh an expired signed URL.
         channel_id: String,
-        /// Source message containing the attachment, also used only for URL refresh.
         message_id: String,
-        /// The signed CDN URL, which is not logged and is fetched only from an allowed host.
         url: String,
     },
-    /// A WhatsApp image, resolved lazily under the owning phone number.
-    WhatsApp { media_id: String, mime: String },
-    /// A Telegram file, which is a handle rather than a URL.
-    ///
-    /// The Bot API hands out a `file_id` and nothing else; resolving it to a path takes a `getFile`
-    /// call, and the path is only valid for about an hour. So unlike Slack there is no URL to carry
-    /// here — the round trip happens at fetch time, which is also when the path is freshest.
+    WhatsApp {
+        media_id: String,
+        mime: String,
+    },
     Telegram {
-        /// The opaque handle Telegram gave this file.
         file_id: String,
     },
 }
@@ -147,17 +103,11 @@ impl fmt::Debug for AssetSourceRef {
     }
 }
 
-/// One persistent transcript generation's attachment-access fence.
-///
-/// Conversation invalidation closes the fence under `gate`. Asset publication and lookup hold the
-/// same gate through their store operation, which gives replacement a linear boundary: an asset
-/// operation either finishes before invalidation or observes the retired generation afterwards.
-/// Neither the fence nor the access token implements `Debug`, because its storage key contains the
-/// same sensitive identifiers as [`ConversationKey`].
+/// Asset publication and lookup share the same gate as invalidation, so an asset operation either
+/// finishes before invalidation or observes the retired generation afterward, never a mix.
 pub(crate) struct AssetFence {
     gate: Mutex<()>,
     active: AtomicBool,
-    /// Survives independent asset TTL/LRU removal while this transcript generation stays live.
     next_asset_id: AtomicU64,
 }
 
@@ -170,7 +120,6 @@ impl AssetFence {
         }
     }
 
-    /// Retires this generation and waits for an already-started asset operation to finish.
     pub fn deactivate(&self) {
         let _gate = self
             .gate
@@ -184,22 +133,14 @@ impl AssetFence {
     }
 }
 
-/// Complete key for one attachment inventory.
-///
-/// `None` preserves the independently bounded one-shot inventory. A persistent generation is
-/// globally non-reused for the life of the paired conversation and asset stores, so a number from
-/// a retired generation cannot alias the same number minted by its replacement.
+/// A generation number is never reused for the life of its conversation and asset stores, so an
+/// asset id from a retired generation can never alias one from its replacement.
 #[derive(Clone, Eq, Hash, PartialEq)]
 struct AssetStateKey {
     conversation: ConversationKey,
     generation: Option<u64>,
 }
 
-/// Request-local authority to publish and look up attachment metadata in one state generation.
-///
-/// This is not broker authority and carries no bytes. Persistent access is valid only while the
-/// conversation store keeps its generation live; one-shot access keeps the pre-existing TTL/LRU
-/// behavior because there is no transcript generation to follow.
 #[derive(Clone)]
 pub(crate) struct AssetAccess {
     key: AssetStateKey,
@@ -231,7 +172,6 @@ impl AssetAccess {
         }
     }
 
-    /// Runs one complete store operation while this generation is still current.
     fn with_active<T>(&self, operation: impl FnOnce(&AssetStateKey) -> T) -> Option<T> {
         let Some(fence) = self.fence.as_ref() else {
             return Some(operation(&self.key));
@@ -264,12 +204,6 @@ impl AssetAccess {
     }
 }
 
-/// The attachments of every live conversation, bounded and evicted without a timer.
-///
-/// Persistent entries share [`crate::conversation::ConversationStore`]'s complete non-debug key
-/// and generation fence, so agent, configured transport, conversation, private/shared audience,
-/// and invalidation boundaries apply identically to transcript and attachment state. One-shot
-/// entries retain the independent idle/LRU lifetime they had before persistent history existed.
 pub(crate) struct AssetStore {
     conversations: usize,
     idle_timeout: Duration,
@@ -278,19 +212,14 @@ pub(crate) struct AssetStore {
     next_one_shot_id: AtomicU64,
 }
 
-/// One conversation generation's attachments, and when it last saw one.
 struct ConversationAssets {
-    /// Oldest first, so eviction is a pop from the front.
     assets: Vec<AssetRef>,
     touched: Instant,
-    /// Absent for one-shot state; weak so this map cannot keep a retired generation live.
     fence: Option<Weak<AssetFence>>,
     delivery_failed: bool,
 }
 
 impl AssetStore {
-    /// Creates a store tracking at most `conversations` conversations, each idle-expiring after
-    /// `idle_timeout`.
     #[cfg(test)]
     pub fn new(conversations: usize, idle_timeout: Duration) -> Self {
         Self::with_retention(
@@ -320,10 +249,6 @@ impl AssetStore {
                 > 0
     }
 
-    /// Registers what one message carried and reports what a one-shot model may be shown.
-    ///
-    /// One-shot routes have no transcript generation. Their attachment state keeps its historical
-    /// private-keyed TTL/LRU behavior; persistent sessions must use [`Self::assets_for_access`].
     #[cfg(test)]
     pub fn assets_for(
         &self,
@@ -340,13 +265,6 @@ impl AssetStore {
         )
     }
 
-    /// Registers and inventories assets only if this conversation generation is still live.
-    ///
-    /// Registration and inventory share one fence hold. A grant/idle/capacity replacement cannot
-    /// land between them, and a stale session cannot publish into the replacement's independently
-    /// numbered inventory. Whether the tool is offered depends on the whole live generation: a
-    /// follow-up carries no attachment of its own, while its replayed history can still name an
-    /// earlier one.
     pub fn assets_for_access(
         &self,
         access: &AssetAccess,
@@ -413,13 +331,11 @@ impl AssetStore {
             .unwrap_or_else(Registered::empty)
     }
 
-    /// Looks one attachment up in independently bounded one-shot state.
     #[cfg(test)]
     pub fn get(&self, conversation: &ConversationKey, id: u64, now: Instant) -> Option<AssetRef> {
         self.get_access(&AssetAccess::one_shot(conversation.clone()), id, now)
     }
 
-    /// Looks one attachment up only while its exact conversation generation remains live.
     pub fn get_access(&self, access: &AssetAccess, id: u64, now: Instant) -> Option<AssetRef> {
         access
             .with_active(|state_key| {
@@ -435,7 +351,6 @@ impl AssetStore {
             .flatten()
     }
 
-    /// Drops idle and retired generations at the next attachment-store operation.
     fn expire(
         entries: &mut HashMap<AssetStateKey, ConversationAssets>,
         idle_timeout: Duration,
@@ -450,7 +365,6 @@ impl AssetStore {
         });
     }
 
-    /// Evicts least recently used attachment inventories down to the independent ceiling.
     fn enforce_ceiling(entries: &mut HashMap<AssetStateKey, ConversationAssets>, capacity: usize) {
         while entries.len() > capacity {
             let Some(oldest) = entries
@@ -466,7 +380,6 @@ impl AssetStore {
 }
 
 impl fmt::Debug for AssetStore {
-    /// Counts, never contents — the same rule [`AssetRef`] follows.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let entries = self
             .entries
@@ -487,31 +400,16 @@ impl fmt::Debug for AssetStore {
     }
 }
 
-/// One attachment as its transport found it, before the store assigns a number.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PendingAsset {
-    /// Sender-supplied file name.
     pub name: String,
-    /// Sender-supplied media type.
     pub mime: String,
-    /// Size the transport reported; `None` when absent.
     pub size: Option<u64>,
-    /// How to turn this back into bytes, when the transport could say.
     pub source: Option<AssetSourceRef>,
 }
 
-/// Media types a model can be shown as an image.
-///
-/// The intersection of what a chat service will deliver and what the model APIs accept. A chat
-/// service imposes no allowlist on uploads at all — a 700 MB screen recording is a legal
-/// attachment — so the narrow end of that intersection is the one worth enforcing.
 const READABLE_IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];
 
-/// Media types a model can be handed as a document.
-///
-/// The API's own `input_file` list. Spreadsheets and presentations are parsed server-side rather
-/// than rendered, and a spreadsheet is read only to its first thousand rows per sheet — worth
-/// knowing before concluding a model ignored the bottom of one.
 const READABLE_DOCUMENT_TYPES: [&str; 13] = [
     "application/pdf",
     "text/plain",
@@ -528,26 +426,14 @@ const READABLE_DOCUMENT_TYPES: [&str; 13] = [
     "application/rtf",
 ];
 
-/// Whether an attachment is one a model can be shown at all.
 pub(crate) fn is_readable(mime: &str) -> bool {
     is_image(mime) || READABLE_DOCUMENT_TYPES.contains(&mime)
 }
 
-/// Whether an attachment is an image, which is the half a model needs a vision modality for.
 pub(crate) fn is_image(mime: &str) -> bool {
     READABLE_IMAGE_TYPES.contains(&mime)
 }
 
-/// The lines appended to a prompt naming what this conversation carries.
-///
-/// The **whole inventory**, not just what this message brought. A reference line is the only way a
-/// model learns a number exists, and it used to live solely in the turn that introduced it — so
-/// once ordinary chatter pushed that turn out of the replayed history window, the file became
-/// unreachable while the store still held it for another hour. The model would answer that it had
-/// never been sent a PDF, which was true of the prompt it could see and false of the conversation.
-///
-/// Repeating the list costs one short line per attachment, bounded by the per-conversation
-/// ceiling, and it lands with the newest message rather than in the cached prefix.
 pub(crate) fn reference_note(registered: &Registered, images_supported: bool) -> Option<String> {
     if registered.inventory.is_empty() {
         return None;
@@ -560,8 +446,6 @@ pub(crate) fn reference_note(registered: &Registered, images_supported: bool) ->
             .map_or_else(|| "size unknown".to_owned(), kibibytes);
         let name = &asset.name;
         let mime = &asset.mime;
-        // Marked so a model asking "is this a good recipe?" reaches for the file that arrived with
-        // the question rather than one from twenty messages ago.
         let arrived = if registered.arrived.contains(&asset.id) {
             " — attached to this message"
         } else {
@@ -586,18 +470,12 @@ pub(crate) fn reference_note(registered: &Registered, images_supported: bool) ->
 }
 
 impl AssetRef {
-    /// Whether a model could actually be shown this one.
-    ///
-    /// Only an image needs the vision modality. A document is text or a parsed attachment to every
-    /// endpoint that accepts one at all, so gating it on the image modality would refuse a PDF to a
-    /// model perfectly able to read it.
     pub fn is_fetchable(&self, images_supported: bool) -> bool {
         self.source.is_some()
             && is_readable(&self.mime)
             && (images_supported || !is_image(&self.mime))
     }
 
-    /// Why this one cannot be shown, in words a model can repeat to the sender.
     pub fn unreadable_reason(&self, images_supported: bool) -> &'static str {
         if self.source.is_none() {
             "the gateway cannot see this file at all"
@@ -611,7 +489,6 @@ impl AssetRef {
     }
 }
 
-/// Renders a byte count the way a person reads one.
 fn kibibytes(size: u64) -> String {
     if size < 1024 {
         return format!("{size} B");
@@ -624,14 +501,9 @@ fn kibibytes(size: u64) -> String {
     }
 }
 
-/// What this conversation can offer a model, after one message's attachments joined it.
 pub(crate) struct Registered {
-    /// Every attachment the conversation still holds, oldest first.
     pub inventory: Vec<AssetRef>,
-    /// The identifiers that arrived on *this* message, so the note can say which are new.
     pub arrived: Vec<u64>,
-    /// Whether at least one of them could actually be fetched, which is what decides if the tool
-    /// is offered at all.
     pub fetchable: bool,
 }
 
@@ -645,31 +517,14 @@ impl Registered {
     }
 }
 
-/// Bytes one session may pull for a single attachment.
-///
-/// Well under the 50 MB the model APIs accept, because the binding constraint is the prompt rather
-/// than the wire: a screenshot near this size already costs more tokens than the conversation
-/// around it. A larger file is refused in words the model can pass on, not by failing the session.
 const MAX_ASSET_BYTES: u64 = dekopon_model::asset::MAX_ATTACHMENT_BYTES as u64;
 
-/// Attachments one session may pull, however many turns it takes.
-///
-/// A model that decides to look at everything should still be answering a question rather than
-/// touring the conversation's history, and each fetch is a round trip plus a re-encoded prompt.
 const MAX_FETCHES_PER_SESSION: u32 = 4;
 
-/// The longest one attachment download may take, end to end.
-///
-/// Transport clients time out per request, a fetch can be several requests, and Telegram's shares
-/// its long-poll client's 70 s timeout, so without this a stalled CDN holds the session's blocking
-/// thread for minutes.
 const ASSET_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// One session's view of the attachments it may show its model.
-///
-/// Implements [`dekopon_agent::prompt::AssetSource`], whose `fetch` is synchronous because the
-/// prompt loop is. The loop runs on a blocking task, so blocking on the download here parks a
-/// blocking thread rather than a runtime worker — the same reason the loop is on one at all.
+/// Fetch is synchronous because the prompt loop that calls it runs on a blocking task, so blocking
+/// here parks a blocking thread rather than a runtime worker.
 pub(crate) struct SessionAssets {
     store: Arc<AssetStore>,
     access: AssetAccess,
@@ -716,9 +571,6 @@ impl AssetSource for SessionAssets {
     }
 
     fn fetch(&self, id: u64) -> Result<FetchedAsset, String> {
-        // Every arm returns words rather than an error. A model that asked for the wrong number,
-        // or for something too large, can say so and carry on answering; ending the session would
-        // turn a recoverable turn into the fixed failure line.
         {
             let mut spent = self
                 .spent
@@ -756,15 +608,6 @@ impl AssetSource for SessionAssets {
     }
 }
 
-/// Pins the files referenced by a proposal in this conversation generation.
-///
-/// Deliberately a second entry point rather than a second caller of [`AssetSource::fetch`]. That
-/// budget is about how many files one *model* may look at; this one is about how much a single
-/// invocation may carry, which `dekopon-agent` counts per invocation. Spending one from the other
-/// would let a remix exhaust the model's ability to read its own conversation, or the reverse.
-///
-/// `images_supported` is deliberately not consulted: whether the route's chat model can be shown an
-/// image says nothing about whether a capability can be handed a referenced file.
 impl ChatAssetSource for SessionAssets {
     fn fetch_for_capability(
         &self,
@@ -773,8 +616,8 @@ impl ChatAssetSource for SessionAssets {
         let (asset, _resolution_pin) = self
             .load(id, AssetConsumer::Capability)
             .map_err(AssetFailure::for_capability)?;
-        // Capability resolution is actual use, not inventory replay. Keep the initial pin until
-        // the scoped recency update completes; never substitute bytes if that resolution fails.
+        // Capability resolution counts as actual use, not replay; the initial pin is kept until the
+        // recency update completes, and bytes are never substituted if that update fails.
         let data = self
             .store
             .pin(&self.access, id, true)
@@ -804,16 +647,10 @@ impl ChatAssetSource for SessionAssets {
 }
 
 impl SessionAssets {
-    /// Reads one attachment's bytes, or which check refused it.
-    ///
-    /// The one definition both entry points share, so the model-facing wording and the
-    /// capability-facing refusal reason can never disagree about what is readable.
     fn load(&self, id: u64, consumer: AssetConsumer) -> Result<(AssetRef, DiskBlob), AssetFailure> {
-        // No store-wide download lock: `SessionGate` admits one session per conversation and a
-        // session's reads are sequential, so one attachment is never fetched twice at once, and a
-        // stalled download elsewhere must not hold up this read. `admit` still keeps the first copy.
+        // There is no store-wide download lock because the session gate admits one session per
+        // conversation with sequential reads, so no attachment is ever fetched twice at once.
         let Some(asset) = self.store.get_access(&self.access, id, Instant::now()) else {
-            // Pin lookup emits the correlated unknown/reclaimed/unauthorized distinction.
             return match self.store.pin(&self.access, id, false) {
                 Err(BlobError::Unknown) => Err(AssetFailure::Unknown),
                 Err(error) => Err(AssetFailure::Storage(error)),
@@ -825,9 +662,6 @@ impl SessionAssets {
         {
             return Err(AssetFailure::Unreadable {
                 reason: asset.unreadable_reason(images_supported),
-                // A file the app cannot see at all and a file of the wrong type are one message to
-                // a model and two different answers to a capability, so the distinction is recorded
-                // here rather than re-derived from the prose above.
                 refusal: if asset.source.is_none() {
                     ChatAssetRefusal::Unavailable
                 } else {
@@ -840,8 +674,6 @@ impl SessionAssets {
             .pin(&self.access, id, false)
             .map_err(AssetFailure::Storage)?
         {
-            // Retained descriptors were checked at intake by decoded length. Their stored
-            // base64 size may exceed the raw download ceiling.
             return Ok((asset, data));
         }
         if let Some(size) = asset.size
@@ -849,7 +681,6 @@ impl SessionAssets {
         {
             return Err(AssetFailure::TooLarge { size });
         }
-        // Disabled retention and known impossible admissions do not spend transport IO.
         self.store
             .check_size(id, asset.size.unwrap_or_default() as usize)
             .map_err(AssetFailure::Storage)?;
@@ -866,12 +697,12 @@ impl SessionAssets {
                 category: "fetch-timeout",
             })?
             .map_err(|error| AssetFailure::Transport {
-                // The transport's own category, never its message: a transport error can carry
-                // service text, and this string goes into a prompt.
+                // Only the transport's error category goes into the prompt, never its message,
+                // since a transport error can carry arbitrary service text.
                 category: error.category(),
             })?;
-        // A generation can be retired while a transport read is in flight. The read cannot always
-        // be cancelled, but its bytes must not enter the model after the retirement became visible.
+        // A generation can retire while a transport read is in flight; the read may not always be
+        // cancellable, but its bytes must never reach the model once retirement is visible.
         if !self.access.is_active() {
             return Err(AssetFailure::Unknown);
         }
@@ -888,30 +719,23 @@ enum AssetConsumer {
     Capability,
 }
 
-/// Which check refused one attachment read, before it is rendered for its audience.
 enum AssetFailure {
     Storage(dekopon_model::asset::BlobError),
-    /// No such number in this conversation, or its generation was retired underneath the read.
     Unknown,
-    /// The gateway will not show this one: why, in words, and which refusal a capability reads.
     Unreadable {
         reason: &'static str,
         refusal: ChatAssetRefusal,
     },
-    /// Larger than the gateway reads.
     TooLarge {
         size: u64,
     },
-    /// Nothing can resolve it back to bytes.
     Unavailable,
-    /// The transport refused or failed the read.
     Transport {
         category: &'static str,
     },
 }
 
 impl AssetFailure {
-    /// Words a model can repeat to the sender.
     fn for_model(self, id: u64) -> String {
         match self {
             Self::Storage(error) => format!(
@@ -935,7 +759,6 @@ impl AssetFailure {
         }
     }
 
-    /// The stable reason `dekopon-agent` audits when a capability input reference cannot be resolved.
     const fn for_capability(self) -> ChatAssetRefusal {
         match self {
             Self::Unknown => ChatAssetRefusal::UnknownAsset,
@@ -951,8 +774,8 @@ impl AssetFailure {
     }
 }
 
-// Residency has exactly one owner: this process's AssetStore. Inventory entries and model
-// messages carry metadata/resolvers only. A consumer's DiskBlob clone is a temporary pin.
+// A consumer's DiskBlob clone is only a temporary pin; the AssetStore alone owns residency and its
+// actual cleanup.
 const MAX_RELEASE_TOMBSTONES: usize = 1024;
 type RetentionKey = (AssetStateKey, u64);
 struct Resident {
@@ -994,7 +817,6 @@ impl Retention {
     }
     fn evict(&mut self, key: &RetentionKey) {
         match self.remove(key) {
-            // Queued deliveries keep their pin and byte charge until later LRU reclamation.
             Ok(()) | Err(BlobError::Reclaimed | BlobError::Capacity) => (),
             Err(error) => {
                 tracing::warn!(asset.id = key.1, %error, "could not reclaim evicted asset")
@@ -1007,7 +829,7 @@ impl Retention {
         }
         if let Some(entry) = self.resident.remove(key) {
             self.bytes -= entry.data.len().max(1);
-            drop(entry); // descriptor cleanup occurs on the blocking consumer, never a listing
+            drop(entry);
             self.released.push_back(key.clone());
             while self.released.len() > MAX_RELEASE_TOMBSTONES {
                 self.released.pop_front();
@@ -1027,8 +849,8 @@ impl Retention {
         len: usize,
         create: impl FnOnce() -> Result<DiskBlob, BlobError>,
     ) -> Result<DiskBlob, BlobError> {
-        // Two reads of one attachment can finish their downloads back to back; the second keeps
-        // the first copy rather than charging the budget for it twice.
+        // If two reads of the same attachment finish downloading back to back, the second keeps the
+        // first copy instead of charging the byte budget twice.
         if let Some(entry) = self.resident.get_mut(&key) {
             self.clock += 1;
             entry.used = self.clock;
@@ -1054,8 +876,8 @@ impl Retention {
             }
             self.remove(&old)?;
         }
-        // Capacity is reserved by this mutex before the only file creation. No staging file
-        // escapes the configured budget, and failed construction never increments accounting.
+        // Capacity is reserved under this mutex before the one file creation, so no staging file
+        // can escape the configured budget, and a failed construction never increments accounting.
         let data = create().inspect_err(|_error| {
             self.miss(key.1, len, "storage");
         })?;
@@ -1149,8 +971,9 @@ impl AssetStore {
                     .retention
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                // Record the completed download before any fallible size, cleanup or admission
-                // check: successfully downloaded inputs must never silently fetch twice.
+                // The completed download is recorded before any fallible size, cleanup, or
+                // admission check, since a successfully downloaded input must never silently be
+                // fetched twice.
                 let asset = entries
                     .get_mut(key)
                     .and_then(|entry| entry.assets.iter_mut().find(|asset| asset.id == id))
@@ -1158,8 +981,6 @@ impl AssetStore {
                 asset.fetched = true;
                 asset.size = Some(bytes.len() as u64);
                 retention.check_size(id, bytes.len())?;
-                // Retired/expired inventories lose cache residency, but active pins stay charged until
-                // a later blocking admission can safely dispose their sole remaining cache owner.
                 Self::expire(&mut entries, self.idle_timeout, Instant::now());
                 let stale: Vec<_> = retention
                     .resident
@@ -1228,7 +1049,8 @@ impl dekopon_agent::attachment::GeneratedAssetStore for SessionAssets {
         if decoded > dekopon_model::asset::MAX_ATTACHMENT_BYTES {
             return Err(BlobError::TooLarge);
         }
-        // Sniff only a decoded prefix. The declared label remains authoritative even on mismatch.
+        // Only a decoded prefix is sniffed for the image signature; the declared media type stays
+        // authoritative even when it does not match what was sniffed.
         let detected = sniff(&data, metadata.encoding)?;
         self.access.with_active(|key| {
             let mut entries = self.store.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1298,7 +1120,8 @@ impl dekopon_agent::attachment::GeneratedAssetStore for SessionAssets {
                 if asset.sent {
                     return Ok(None);
                 }
-                // Mark once even when the retained file has become unavailable: never retry implicitly.
+                // Mark an asset sent once, even if its retained file becomes unavailable; never
+                // retry the send implicitly.
                 asset.sent = true;
                 let retention = self
                     .store
@@ -1343,7 +1166,6 @@ impl AssetStore {
     }
 }
 
-// Twelve decoded bytes identify supported image signatures; no whole-file decode at intake.
 fn sniff(blob: &DiskBlob, encoding: AssetEncoding) -> Result<Option<&'static str>, BlobError> {
     let mut stored = [0; 16];
     let count = blob.len().min(stored.len());
@@ -1741,7 +1563,6 @@ mod retention_tests {
             );
             assert_eq!(session.rows()[0].bytes, Some(3));
             assert_eq!(fetcher.0.load(Ordering::Relaxed), 1);
-            // An actually empty downloaded file is still a known zero, not an unknown or miss.
             let empty_id = registered.arrived[1];
             let empty = store.admit(&access, empty_id, b"").unwrap();
             assert_eq!(empty.len(), 0);
@@ -1825,7 +1646,7 @@ mod retention_tests {
     async fn metadata_oversize_refuses_before_transport_download() {
         let store = store(2);
         let access = access("one");
-        let id = register(&store, &access); // Reported three bytes cannot fit the two-byte budget.
+        let id = register(&store, &access);
         let fetcher = Arc::new(Fetcher(std::sync::atomic::AtomicUsize::new(0)));
         let session = SessionAssets::new(
             Arc::clone(&store),
@@ -1969,7 +1790,6 @@ mod retention_tests {
         .unwrap();
     }
 
-    /// A download that announces it has started, then never answers until released.
     struct Stalled {
         entered: Arc<tokio::sync::Notify>,
         release: Arc<tokio::sync::Semaphore>,

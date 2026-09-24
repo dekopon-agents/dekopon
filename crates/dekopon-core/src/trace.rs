@@ -1,32 +1,16 @@
-//! The one identifier a Dekopon run is correlated by.
-
 use std::{fmt, str::FromStr};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _};
 use thiserror::Error;
 
-/// Hexadecimal digits in the wire form of a trace identifier.
 const TRACE_ID_HEX_DIGITS: usize = 32;
 
-/// A W3C trace identifier: sixteen bytes written as thirty-two lowercase hexadecimal digits.
-///
-/// This is the only correlation identifier a run has. Everything one message produced — gateway
-/// spans, model turns, shell commands, broker decisions, audit records, provider invocations, HTTP
-/// egress — carries this value, so an operator reconstructs the run by asking the telemetry store
-/// for one identifier rather than joining two namespaces. Dekopon used to mint a second,
-/// free-form trace identifier of its own beside the W3C one; there is one now.
-///
-/// It is not an authorization or routing input, and it is chosen by whoever opened the
-/// trace. Two runs that share one are correlated, not related by authority.
+/// A trace ID carries no authority: two runs sharing one are correlated, not authorized to each
+/// other, and it is chosen by whoever opened the trace.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct TraceId([u8; 16]);
 
 impl TraceId {
-    /// Wraps sixteen identifier bytes.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`TraceIdError::Zero`] when every byte is zero, which W3C defines as invalid.
     pub const fn new(bytes: [u8; 16]) -> Result<Self, TraceIdError> {
         if u128::from_be_bytes(bytes) == 0 {
             return Err(TraceIdError::Zero);
@@ -34,7 +18,6 @@ impl TraceId {
         Ok(Self(bytes))
     }
 
-    /// The identifier's bytes, in wire order.
     #[must_use]
     pub const fn to_bytes(self) -> [u8; 16] {
         self.0
@@ -58,8 +41,8 @@ impl FromStr for TraceId {
     type Err = TraceIdError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        // Uppercase hexadecimal is rejected rather than folded: W3C specifies lowercase, and
-        // accepting both would let one trace serialize two ways and read as two traces.
+        // Uppercase hex is rejected rather than folded because W3C specifies lowercase, and
+        // accepting both would let one trace serialize two different ways.
         if value.len() != TRACE_ID_HEX_DIGITS
             || !value
                 .bytes()
@@ -99,13 +82,10 @@ impl<'de> Deserialize<'de> for TraceId {
     }
 }
 
-/// Failures raised while reading a trace identifier.
 #[derive(Clone, Copy, Debug, Error, Eq, PartialEq)]
 pub enum TraceIdError {
-    /// The value was not exactly thirty-two lowercase hexadecimal digits.
     #[error("trace identifier must be 32 lowercase hexadecimal digits")]
     Malformed,
-    /// Every byte was zero.
     #[error("trace identifier must not be all zeroes")]
     Zero,
 }
@@ -151,7 +131,6 @@ mod tests {
             "",
             "4bf92f3577b34da6a3ce929d0e0e473",
             "4bf92f3577b34da6a3ce929d0e0e47366",
-            // Uppercase is the same trace written a second way, so it is not a trace.
             "4BF92F3577B34DA6A3CE929D0E0E4736",
             "4bf92f3577b34da6a3ce929d0e0e473g",
             "dekopond-session-9f1c4a7b0e35d268",
@@ -164,9 +143,6 @@ mod tests {
         }
     }
 
-    /// Every identifier derived from a trace is `<trace>-<counter>`, which has to keep validating
-    /// as an invocation identifier: thirty-two hexadecimal digits are lowercase and start with a
-    /// legal edge character, so the derived name never depends on which trace was drawn.
     #[test]
     fn a_trace_identifier_is_a_legal_identifier_component() {
         let trace = TraceId::new([0xff; 16]).expect("non-zero identifier");

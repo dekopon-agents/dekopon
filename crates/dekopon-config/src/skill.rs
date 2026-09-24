@@ -1,18 +1,5 @@
-//! Skills: `SKILL.md` directories an agent mounts as on-demand reference material.
-//!
-//! The on-disk format is the open Agent Skills layout — a directory named after the skill, a
-//! `SKILL.md` whose YAML front matter carries the name and a one-line description, a Markdown body
-//! of instructions, and optional supporting files beside it — so a skill written for another
-//! client loads here unchanged. What this module adds is the reading discipline the rest of the
-//! catalog already has: every bound is fixed before a byte is read, every problem names the file,
-//! and a skill either loads whole or is refused.
-//!
-//! A skill is read once, at catalog load, into memory. The session layer that later shows it to a
-//! model never touches the filesystem: it holds the text, which is what keeps the sandboxed shell's
-//! "no filesystem" property true while a model can still read a reference document.
-//!
-//! Skill text is untrusted model text exactly as `instructions` is. It shapes answers and grants
-//! nothing; nothing in a skill can widen a capability or name a principal.
+//! Skill text is untrusted, like model instructions; it can shape answers but never widen a
+//! capability or name a principal.
 
 use std::{
     collections::BTreeMap,
@@ -24,28 +11,14 @@ use dekopon_core::{SkillId, SkillIdError};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// The file every skill directory must carry.
 pub const SKILL_FILE_NAME: &str = "SKILL.md";
-/// Maximum bytes of one `SKILL.md`, front matter included.
-///
-/// The format recommends keeping a body under a few hundred lines; a document past this bound is
-/// context a model pays for on every turn after it reads it, and belongs in a resource file.
 pub const MAX_SKILL_FILE_BYTES: usize = 64 * 1024;
-/// Maximum bytes in a skill description, fixed by the format.
 pub const MAX_SKILL_DESCRIPTION_BYTES: usize = 1024;
-/// Maximum bytes of one supporting file.
-///
-/// The same ceiling a script's output and a textual chat attachment already have on the way into a
-/// prompt, because a resource reaches the model by the same route.
 pub const MAX_SKILL_RESOURCE_BYTES: usize = 256 * 1024;
-/// Maximum supporting files one skill may carry.
 pub const MAX_SKILL_RESOURCES: usize = 64;
-/// Maximum bytes across every supporting file of one skill.
 pub const MAX_SKILL_TOTAL_BYTES: usize = 1024 * 1024;
-/// Maximum directory depth a resource may sit at beneath the skill directory.
 pub const MAX_SKILL_RESOURCE_DEPTH: usize = 4;
 
-/// One loaded skill: its front matter, its instructions, and every supporting file, in memory.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Skill {
@@ -64,69 +37,58 @@ pub struct Skill {
     source: PathBuf,
 }
 
-/// One supporting file inside a skill directory, read whole.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SkillResource {
-    /// Path relative to the skill directory, `/`-separated on every platform.
     pub path: String,
-    /// The file's UTF-8 text.
     pub text: String,
 }
 
 impl Skill {
-    /// The skill's name, equal to its directory name.
     #[must_use]
     pub fn name(&self) -> &SkillId {
         &self.name
     }
 
-    /// The one-line description a model reads to decide whether the skill applies.
     #[must_use]
     pub fn description(&self) -> &str {
         &self.description
     }
 
-    /// The Markdown instructions after the front matter.
     #[must_use]
     pub fn body(&self) -> &str {
         &self.body
     }
 
-    /// Declared license, if the front matter named one.
     #[must_use]
     pub fn license(&self) -> Option<&str> {
         self.license.as_deref()
     }
 
-    /// Declared environment requirements, if the front matter named any.
     #[must_use]
     pub fn compatibility(&self) -> Option<&str> {
         self.compatibility.as_deref()
     }
 
-    /// Free-form front-matter metadata, scalars rendered as text.
     #[must_use]
     pub fn metadata(&self) -> &BTreeMap<String, String> {
         &self.metadata
     }
 
-    /// The tools the author expected to be pre-approved.
-    ///
-    /// Recorded as metadata only. Dekopon's session has one scripting tool whatever a skill
-    /// says, and authority comes from broker policy rather than from a file a model reads.
+    /// Recorded as metadata only; real tool authority always comes from broker policy, never from
+    /// what a skill file declares.
     #[must_use]
     pub fn allowed_tools(&self) -> Option<&str> {
         self.allowed_tools.as_deref()
     }
 
-    /// Supporting files, sorted by relative path.
+    /// Sorted by relative path; resource() binary-searches this list and depends on that order
+    /// being maintained.
     #[must_use]
     pub fn resources(&self) -> &[SkillResource] {
         &self.resources
     }
 
-    /// Looks up one supporting file by its relative path.
     #[must_use]
     pub fn resource(&self, path: &str) -> Option<&SkillResource> {
         self.resources
@@ -135,17 +97,12 @@ impl Skill {
             .map(|index| &self.resources[index])
     }
 
-    /// The directory the skill was read from.
     #[must_use]
     pub fn source(&self) -> &Path {
         &self.source
     }
 }
 
-/// The front matter the Agent Skills format defines, and nothing else.
-///
-/// Strict, like every other authored document here: a misspelled key is a load failure naming it
-/// rather than a field silently ignored.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct FrontMatter {
@@ -161,13 +118,6 @@ struct FrontMatter {
     allowed_tools: Option<String>,
 }
 
-/// Reads and validates one skill directory.
-///
-/// # Errors
-///
-/// Returns the first thing wrong with the directory, naming the file it was found in. A skill is
-/// one authored unit, so unlike a catalog it is refused at the first problem rather than scanned
-/// for all of them.
 pub fn load_skill(directory: impl AsRef<Path>) -> Result<Skill, SkillError> {
     let directory = directory.as_ref();
     let metadata = fs::symlink_metadata(directory).map_err(|source| SkillError::Read {
@@ -272,11 +222,6 @@ pub fn load_skill(directory: impl AsRef<Path>) -> Result<Skill, SkillError> {
     })
 }
 
-/// Splits `---` front matter from the Markdown body.
-///
-/// The opening fence must be the first line and the closing fence a line of its own. CRLF endings
-/// are tolerated because a skill is frequently authored on another machine than the one that
-/// loads it.
 fn split_front_matter<'a>(text: &'a str, path: &Path) -> Result<(&'a str, &'a str), SkillError> {
     let mut lines = text.split_inclusive('\n');
     let Some(first) = lines.next() else {
@@ -303,11 +248,8 @@ fn split_front_matter<'a>(text: &'a str, path: &Path) -> Result<(&'a str, &'a st
     })
 }
 
-/// Walks the skill directory, reading every supporting file into memory.
-///
-/// Hidden entries are skipped because they are editor and version-control residue rather than
-/// authored material; a symbolic link is refused rather than followed, because a skill is
-/// authored content and a link is how one escapes the directory that was reviewed.
+/// Symlinks are refused rather than followed, since a link is how content would escape the
+/// directory that was reviewed.
 fn collect_resources(
     root: &Path,
     directory: &Path,
@@ -390,7 +332,6 @@ fn collect_resources(
     Ok(())
 }
 
-/// Reads one regular file as UTF-8 under a byte ceiling checked before the read.
 fn read_bounded_text(path: &Path, maximum: usize) -> Result<String, SkillError> {
     let metadata = fs::symlink_metadata(path).map_err(|source| SkillError::Read {
         path: path.to_path_buf(),
@@ -418,7 +359,8 @@ fn read_bounded_text(path: &Path, maximum: usize) -> Result<String, SkillError> 
         path: path.to_path_buf(),
         source,
     })?;
-    // The metadata length is a hint a concurrent writer can outrun; the read itself is the bound.
+    // The metadata length is only a hint a concurrent writer can outrun; the actual read length is
+    // what's enforced.
     if bytes.len() > maximum {
         return Err(SkillError::TooLarge {
             path: path.to_path_buf(),
@@ -432,158 +374,78 @@ fn read_bounded_text(path: &Path, maximum: usize) -> Result<String, SkillError> 
     })
 }
 
-/// Why one skill directory could not be loaded.
 #[derive(Debug, Error)]
 pub enum SkillError {
-    /// The path is not a directory.
     #[error("skill path is not a directory: {path}")]
-    NotADirectory {
-        /// The refused path.
-        path: PathBuf,
-    },
-    /// A file or directory could not be read.
+    NotADirectory { path: PathBuf },
     #[error("could not read skill file {path}")]
     Read {
-        /// The path that failed.
         path: PathBuf,
-        /// The underlying filesystem error.
         #[source]
         source: io::Error,
     },
-    /// A file exceeded its byte ceiling.
     #[error("skill file {path} is {length} bytes; the maximum is {maximum}")]
     TooLarge {
-        /// The oversized file.
         path: PathBuf,
-        /// Actual byte length.
         length: usize,
-        /// Maximum byte length.
         maximum: usize,
     },
-    /// A file was not UTF-8 text.
     #[error("skill file {path} is not UTF-8 text")]
     NotUtf8 {
-        /// The refused file.
         path: PathBuf,
-        /// Where in the file the text stopped being UTF-8.
         #[source]
         source: std::string::FromUtf8Error,
     },
-    /// A file name was not UTF-8, so the model could never name it in a `read_skill` call.
     #[error("skill file name {path} is not UTF-8")]
-    NameNotUtf8 {
-        /// The refused path.
-        path: PathBuf,
-    },
-    /// A resource path did not resolve under the skill directory it was found in.
+    NameNotUtf8 { path: PathBuf },
     #[error("skill file {path} is outside the skill directory it was read from")]
     OutsideRoot {
-        /// The refused path.
         path: PathBuf,
-        /// The prefix mismatch.
         #[source]
         source: std::path::StripPrefixError,
     },
-    /// A symbolic link was found where authored content was expected.
     #[error("skill path {path} is a symbolic link, which a skill directory may not contain")]
-    Symlink {
-        /// The refused path.
-        path: PathBuf,
-    },
-    /// Something that is neither a regular file nor a directory was found.
+    Symlink { path: PathBuf },
     #[error("skill path {path} is neither a regular file nor a directory")]
-    NotRegular {
-        /// The refused path.
-        path: PathBuf,
-    },
-    /// Resources were nested deeper than the format allows here.
+    NotRegular { path: PathBuf },
     #[error("skill directory {path} is nested deeper than {maximum} levels")]
-    TooDeep {
-        /// The directory past the limit.
-        path: PathBuf,
-        /// Maximum depth.
-        maximum: usize,
-    },
-    /// The skill carries more supporting files than the ceiling.
+    TooDeep { path: PathBuf, maximum: usize },
     #[error("skill {path} has more than {maximum} supporting files")]
-    TooManyResources {
-        /// The skill directory.
-        path: PathBuf,
-        /// Maximum file count.
-        maximum: usize,
-    },
-    /// The supporting files together exceed the ceiling.
+    TooManyResources { path: PathBuf, maximum: usize },
     #[error("skill {path} has more than {maximum} bytes of supporting files")]
-    ResourcesTooLarge {
-        /// The skill directory.
-        path: PathBuf,
-        /// Maximum total bytes.
-        maximum: usize,
-    },
-    /// `SKILL.md` does not open with a `---` front-matter fence.
+    ResourcesTooLarge { path: PathBuf, maximum: usize },
     #[error("{path} must begin with YAML front matter between `---` lines")]
-    MissingFrontMatter {
-        /// The skill file.
-        path: PathBuf,
-    },
-    /// The front matter never closed.
+    MissingFrontMatter { path: PathBuf },
     #[error("{path} opens YAML front matter with `---` but never closes it")]
-    UnterminatedFrontMatter {
-        /// The skill file.
-        path: PathBuf,
-    },
-    /// The front matter is not the strict shape the format defines.
+    UnterminatedFrontMatter { path: PathBuf },
     #[error("{path}: invalid skill front matter: {source}")]
     FrontMatter {
-        /// The skill file.
         path: PathBuf,
-        /// The decoder's diagnostic.
         #[source]
         source: serde_yaml::Error,
     },
-    /// The front-matter name is outside the skill grammar.
     #[error("{path}: invalid skill name: {source}")]
     InvalidName {
-        /// The skill file.
         path: PathBuf,
-        /// The grammar violation.
         #[source]
         source: SkillIdError,
     },
-    /// The front-matter name and the directory name disagree.
     #[error("{path}: skill name {name:?} must equal its directory name {directory:?}")]
     NameMismatch {
-        /// The skill file.
         path: PathBuf,
-        /// The authored name.
         name: String,
-        /// The directory the skill lives in.
         directory: String,
     },
-    /// The description is blank.
     #[error("{path}: skill description must not be empty")]
-    EmptyDescription {
-        /// The skill file.
-        path: PathBuf,
-    },
-    /// The description is longer than the format allows.
+    EmptyDescription { path: PathBuf },
     #[error("{path}: skill description is {length} bytes; the maximum is {maximum}")]
     DescriptionTooLong {
-        /// The skill file.
         path: PathBuf,
-        /// Actual byte length.
         length: usize,
-        /// Maximum byte length.
         maximum: usize,
     },
-    /// A metadata value is a list or a map rather than a scalar.
     #[error("{path}: skill metadata {key:?} must be a scalar value")]
-    MetadataValue {
-        /// The skill file.
-        path: PathBuf,
-        /// The offending key.
-        key: String,
-    },
+    MetadataValue { path: PathBuf, key: String },
 }
 
 #[cfg(test)]

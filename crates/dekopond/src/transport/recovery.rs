@@ -1,5 +1,3 @@
-//! Connection recovery only: never wraps a driver call or replays an outbound effect.
-
 use std::{sync::Arc, time::Duration};
 
 use futures_util::future::BoxFuture;
@@ -14,8 +12,6 @@ const MAX_FAILURES: u32 = 10;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const HEALTHY_RESET: Duration = Duration::from_secs(5 * 60);
 
-/// Composes with every adapter while leaving protocol recovery and capability objects with it.
-/// Dropping its owning reader cancels both connection attempts and backoff immediately.
 pub(crate) struct RecoveringTransport {
     inner: Box<dyn ChatTransport>,
     failures: u32,
@@ -34,7 +30,6 @@ impl RecoveringTransport {
     }
 
     async fn failed(&mut self, error: TransportError) -> Result<(), TransportError> {
-        // Idle time counts too; requiring messages here would penalize quiet workspaces.
         if self
             .connected_since
             .take()

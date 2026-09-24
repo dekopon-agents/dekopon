@@ -152,186 +152,87 @@ pub use limits::{
 
 use dekopon_core::{ProviderFailureDetail, SecretUseProposal};
 
-/// Model-facing metadata for one capability, used by `cap --describe`.
-///
-/// There is no input schema here: a capability is used through the provider command word that
-/// proposes it, and that word's `--help` is where its arguments are documented.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CapabilityDescription {
-    /// Canonical capability identifier.
     pub capability: String,
-    /// Human-readable operation description.
     pub description: String,
 }
 
-/// The outcome of one capability invocation.
-///
-/// The variants mirror the exit-code mapping in [`ExitCode`]: a capability that ran and failed is
-/// materially different from one that policy refused, which is different again from one that does
-/// not exist. Collapsing them would hide an authorization refusal behind a generic failure.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CapabilityCallResult {
-    /// The capability ran and produced output.
     Succeeded(Value),
-    /// Authorization refused the invocation. The capability was found but not permitted.
     Denied {
-        /// Why the invocation was refused.
         reason: String,
     },
-    /// The capability ran and failed.
     Failed {
-        /// The stable failure classification, such as `provider-failure` or `provider-timeout`.
         error: String,
-        /// The provider's own failure code and message, when the classification came from one.
-        ///
-        /// Rendered after the classification rather than in place of it. A class alone tells a
-        /// model only that the call failed; the provider's sentence is what says whether it should
-        /// change the request, wait, or stop — and for an upstream refusal it is the refusal
-        /// itself, which nothing else in the run holds.
+        /// The provider's own code and message are rendered after the classification, not instead
+        /// of it, since a class alone can't tell a model whether to retry, wait, or stop.
         detail: Option<ProviderFailureDetail>,
     },
-    /// No such capability is reachable from this session.
     NotFound,
 }
 
-/// What a provider did with one of its command words.
-///
-/// A provider command word behaves like its own command-line program: it can turn an argv into a
-/// capability proposal, print its own help or usage text, or refuse the argv outright. Those are
-/// kept apart because the interpreter charges and reports them differently, and apart again from
-/// a run that never reached the provider's answer, which is not a usage error however it failed.
 #[derive(Clone, Debug, PartialEq)]
 pub enum CommandRun {
-    /// The provider proposed a capability, authorized and charged like every capability call.
     Proposed {
-        /// The capability identifier the provider chose.
         capability: String,
-        /// The input it assembled from the argv and stdin.
         input: Value,
-        /// The public secret reference the provider's command asked this call to use, if any.
-        ///
-        /// Handed to [`CapabilityInvoker::invoke`] unchanged. It is intent, never authority: the
-        /// broker authorizes it separately from the capability, and an invoker with no broker
-        /// behind it refuses it with [`secret_use_unsupported`].
+        /// The secret reference is intent, never authority: the broker authorizes it separately
+        /// from the capability, and an invoker with no broker behind it must refuse it rather than
+        /// treat it as approved.
         secret_use: Option<SecretUseProposal>,
     },
-    /// The provider produced text of its own — help, a version, a usage error — and chose the
-    /// exit status; no capability call is charged.
     Rendered {
-        /// Text for the script's stdout, exactly as the provider wrote it.
         stdout: String,
-        /// Text for the script's diagnostic stream, exactly as the provider wrote it.
         stderr: String,
-        /// The exit status the provider chose, `0` for help and `2` for a usage error by
-        /// convention.
         status: u8,
     },
-    /// The provider declined the argv; reported as a usage error at exit `2`.
     Failed {
-        /// Why the provider declined.
         message: String,
     },
-    /// The run itself failed before the provider could answer — the broker was unreachable, the
-    /// host refused or trapped, the task did not complete — and is reported like a capability
-    /// that ran and errored, at exit `1`. Telling the model to fix its argv would be wrong.
+    /// A run that failed before the provider could answer is reported like an errored capability,
+    /// not a usage error, since telling the model to fix its argv would be wrong.
     Errored {
-        /// What failed, naming its cause; never a path.
+        /// This names the cause of failure and must never be a filesystem path.
         message: String,
     },
-    /// The run was refused before or during dispatch — the session was cancelled underneath it —
-    /// and is reported like a refused capability, at exit `126`.
     Denied {
-        /// Why the run was refused.
         reason: String,
     },
 }
 
-/// The boundary between this interpreter and the real world.
-///
-/// Implementations decide what a "capability" is: a direct Wasm component call, a broker proposal,
-/// or a test fixture. This crate never learns which.
 pub trait CapabilityInvoker {
-    /// Returns every capability identifier currently available to invoke.
     fn granted(&self) -> Vec<String>;
 
-    /// Reports whether one capability identifier is available, for dispatch-time lookup.
-    ///
-    /// The default scans [`CapabilityInvoker::granted`]; override it when a cheaper lookup exists.
     fn is_granted(&self, capability: &str) -> bool {
         self.granted().iter().any(|granted| granted == capability)
     }
 
-    /// Returns the command words loaded providers contribute, for dispatch and the prompt.
-    ///
-    /// Filtered by the embedder to providers this session already holds a grant on, so a principal
-    /// with no `gh.*` grant never sees the word and never reaches its rewrite.
     fn command_words(&self) -> Vec<String> {
         Vec::new()
     }
 
-    /// Reports whether one word is a command word a loaded provider contributed.
-    ///
-    /// This is the membership test [`CapabilityInvoker::is_granted`] already provides for
-    /// capabilities, and it is asked of *every* command word a script executes — a loop running
-    /// thousands of commands asks it thousands of times. The default builds and scans
-    /// [`CapabilityInvoker::command_words`]; override it when a cheaper lookup exists, because
-    /// materializing that list per command is what this exists to avoid.
     fn has_command_word(&self, word: &str) -> bool {
         self.command_words()
             .iter()
             .any(|candidate| candidate == word)
     }
 
-    /// Runs one provider command word against its argv and the text piped into it.
-    ///
-    /// `stdin` is what the script piped in, already rendered to text by the shell's display rule
-    /// (strings verbatim, other values as compact JSON); `None` when nothing was piped. `None`
-    /// coming back means no loaded provider owns the word; otherwise the [`CommandRun`] says
-    /// whether the provider proposed a capability, rendered text of its own, or declined.
-    ///
-    /// Running the word grants nothing: a proposal is invoked through the same budget, denial, and
-    /// telemetry path as every capability call, with its `secret_use` handed to
-    /// [`CapabilityInvoker::invoke`] unchanged, and rendered text is charged only against the
-    /// script's value and output ceilings.
+    /// Running a command word grants nothing: any proposal it makes is invoked through the same
+    /// budget, denial, and telemetry path as every other capability call.
     fn run_command(&self, word: &str, argv: &[String], stdin: Option<&str>) -> Option<CommandRun> {
         let _ = (word, argv, stdin);
         None
     }
 
-    /// Returns model-facing metadata for one capability, when the implementation has any.
     fn describe(&self, capability: &str) -> Option<CapabilityDescription> {
         let _ = capability;
         None
     }
 
-    /// Hears that one script has finished running against this invoker.
-    ///
-    /// The runtime that ran the script calls it once, after the interpreter returns and before the
-    /// outcome reaches whoever asked for the script. It is the only point at which an invoker
-    /// learns nothing more is coming from that script: the interpreter follows a
-    /// [`CommandRun::Proposed`] answer with [`CapabilityInvoker::invoke`] only when the capability
-    /// is granted, the budget has a call left, and the deadline has not passed. An invoker that
-    /// reports each tool use as a started/finished pair finishes here whatever a proposal left
-    /// open. The default does nothing, which suits an invoker that keeps nothing per script; a
-    /// wrapper forwards it, or the invoker behind the wrapper never hears the script end.
     fn script_finished(&self) {}
 
-    /// Invokes one capability synchronously, carrying the optional typed secret-use intent.
-    ///
-    /// One method rather than two. A defaulted `invoke_with_secret_use` used to sit beside a
-    /// two-argument `invoke`, and every wrapper forwarded the argument it could see: three of them
-    /// forwarded `invoke` and inherited the other's deny-by-default, so a DRN proposal a
-    /// broker-backed console or gateway session made was refused inside the process that made it
-    /// and never reached the broker. There is now one method to forward, and forgetting it is a
-    /// compile error rather than a refusal nobody asked for.
-    ///
-    /// An invoker with no authorizer behind it answers a `Some` proposal with
-    /// [`secret_use_unsupported`]. Dropping the field and running the call anyway is the one thing
-    /// it must not do: the caller asked for a credential the callee cannot prove it may use.
-    ///
-    /// This is deliberately synchronous: this crate carries no async runtime dependency, and the
-    /// calling binary's model tool loop is untouched. An implementation that is asynchronous
-    /// underneath bridges here itself, as a synchronous embedding can do from its blocking task.
     fn invoke(
         &self,
         capability: &str,
@@ -340,11 +241,6 @@ pub trait CapabilityInvoker {
     ) -> CapabilityCallResult;
 }
 
-/// The refusal an invoker with no authorizer behind it owes a secret-use proposal.
-///
-/// A public DRN names a secret only the broker may resolve. An invoker that cannot reach one — a
-/// direct Wasm registry, an empty local leg, a test fixture — refuses rather than dropping the
-/// field and running the call as though it had never been asked for.
 #[must_use]
 pub fn secret_use_unsupported() -> CapabilityCallResult {
     CapabilityCallResult::Denied {
@@ -352,11 +248,6 @@ pub fn secret_use_unsupported() -> CapabilityCallResult {
     }
 }
 
-/// Forwards every method to the shared invoker behind the pointer.
-///
-/// This is what lets one broker leg be held by a console's shell pane and handed to that session's
-/// dispatch at the same time. It replaced a hand-written forwarder that had to be kept in step with
-/// the trait by hand and was not.
 impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
     fn granted(&self) -> Vec<String> {
         self.as_ref().granted()
@@ -396,39 +287,27 @@ impl<T: CapabilityInvoker + ?Sized> CapabilityInvoker for Arc<T> {
     }
 }
 
-/// A script exit code.
-///
-/// The mapping is fixed and mirrors the conventions a model already knows from bash and coreutils.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ExitCode(u8);
 
 impl ExitCode {
-    /// A capability call, builtin, or script completed successfully.
     pub const SUCCESS: Self = Self(0);
-    /// A capability call ran and errored, or a builtin reported a runtime failure.
     pub const FAILURE: Self = Self(1);
-    /// A shell parse error or an exhausted resource limit.
     pub const SYNTAX: Self = Self(2);
-    /// The script exceeded its wall-clock deadline, matching coreutils `timeout(1)`.
     pub const TIMEOUT: Self = Self(124);
-    /// A capability was found but authorization refused it, matching bash's "cannot execute".
     pub const DENIED: Self = Self(126);
-    /// An unknown command word, or a proposed capability not granted to this session.
     pub const NOT_FOUND: Self = Self(127);
 
-    /// Wraps a raw status, mirroring bash's `N mod 256` wraparound for `exit N`.
     #[must_use]
     pub fn from_script_exit(status: i64) -> Self {
         Self(u8::try_from(status.rem_euclid(256)).unwrap_or(0))
     }
 
-    /// Returns the numeric exit code.
     #[must_use]
     pub const fn get(self) -> u8 {
         self.0
     }
 
-    /// Maps one capability call outcome onto its exit code.
     #[must_use]
     pub const fn from_capability_result(result: &CapabilityCallResult) -> Self {
         match result {
@@ -458,69 +337,42 @@ impl std::fmt::Display for ExitCode {
     }
 }
 
-/// Everything one script execution produced.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScriptOutcome {
-    /// Combined stdout and stderr, already truncated to the configured ceilings.
     pub output: String,
-    /// The script's exit code.
     pub exit_code: ExitCode,
-    /// Whether output was dropped to stay under the ceilings.
     pub truncated: bool,
-    /// Capability invocations this script drove.
     pub capability_calls: u32,
-    /// Evaluation steps this script charged.
     pub steps: u64,
 }
 
-/// A configured script interpreter.
 #[derive(Clone, Debug, Default)]
 pub struct Interpreter {
     limits: Limits,
 }
 
 impl Interpreter {
-    /// Creates an interpreter under the given bounds.
     #[must_use]
     pub fn new(limits: Limits) -> Self {
         Self { limits }
     }
 
-    /// Returns the configured bounds.
     #[must_use]
     pub fn limits(&self) -> Limits {
         self.limits
     }
 
-    /// Parses and evaluates one script.
-    ///
-    /// This never returns an error: a script failure is a script outcome. Parse errors and limit
-    /// trips are reported through [`ScriptOutcome::output`] and [`ScriptOutcome::exit_code`].
     pub fn run(&self, script: &str, invoker: &dyn CapabilityInvoker) -> ScriptOutcome {
         interp::run(script, invoker, self.limits)
     }
 }
 
-/// Parses and evaluates one script under default bounds.
 pub fn run(script: &str, invoker: &dyn CapabilityInvoker) -> ScriptOutcome {
     Interpreter::new(Limits::default()).run(script, invoker)
 }
 
-/// Returns how many abandoned `jq` filter workers are still running in this process.
-///
-/// jaq offers no interruption point, so a filter that produces no output at all — `jq 'def f: f;
-/// f'` — cannot be stopped when its script's deadline passes. Its worker is abandoned and spins
-/// until the process exits. A filter that produces output stops at its next one, so this counter
-/// falls back to zero on its own; what stays is the non-terminating kind, and each one is a core
-/// this process will never get back. `jq` refuses to start new filters once too many have
-/// accumulated.
-///
-/// Only abandoned workers are counted, and only they are threads this process cannot reclaim. An
-/// ordinary filter is served by the worker its thread already has, which is reused for the next
-/// one and released when that thread exits.
-///
-/// A long-lived embedder should surface this as a gauge. A one-shot runner can ignore it: the
-/// process is about to exit anyway.
+/// A non-terminating jq filter has no interruption point, so its worker thread is abandoned and
+/// spins forever after the deadline, permanently costing this process a CPU core.
 #[must_use]
 pub fn abandoned_filter_workers() -> usize {
     builtins::jq::abandoned_workers()
@@ -541,15 +393,9 @@ mod tests {
         Interpreter, Limits,
     };
 
-    /// An invoker that overrides every defaulted method with an answer the default cannot give.
-    ///
-    /// Each override answers for something absent from `granted` or `command_words`, so a caller
-    /// that reached the trait default instead of this implementation answers `false`, `None`, or
-    /// an empty list — which is exactly the shape of the defect this fixture exists to catch.
     #[derive(Default)]
     struct RecordingInvoker {
         secret_uses: Mutex<Vec<Option<SecretUseProposal>>>,
-        /// How many script ends reached this invoker, which the do-nothing default cannot count.
         scripts_finished: AtomicU32,
     }
 
@@ -616,13 +462,6 @@ mod tests {
         }
     }
 
-    /// The pointer is what lets one broker leg be held by a shell pane and by that session's
-    /// dispatch at once, so a proposal crossing it has to arrive whole.
-    ///
-    /// A hand-written forwarder here once dropped the secret-use argument it could not see, and a
-    /// DRN proposal a broker-backed session made was refused inside the process that made it.
-    /// The `Arc` blanket replaced that forwarder; nothing but this test now holds it to the same
-    /// standard, its last other consumer having left with `dekopon-tui`.
     #[test]
     fn an_arc_hands_a_secret_use_proposal_to_the_invoker_behind_it_unchanged() {
         let inner = Arc::new(RecordingInvoker::default());
@@ -644,27 +483,18 @@ mod tests {
         );
     }
 
-    /// Six of this trait's methods have defaults, and a forwarder that omits one silently answers
-    /// with the default instead of the invoker's own answer.
-    ///
-    /// Every override here answers for something the default would have to say `false`, `None`, or
-    /// "nothing" about, so an omission fails rather than coinciding.
     #[test]
     fn an_arc_forwards_the_defaulted_methods_instead_of_inheriting_their_defaults() {
         let inner = Arc::new(RecordingInvoker::default());
         let shared: Arc<dyn CapabilityInvoker> = Arc::clone(&inner) as Arc<dyn CapabilityInvoker>;
 
-        // The default does nothing, so only the invoker behind the pointer can have counted it.
         shared.script_finished();
         assert_eq!(inner.scripts_finished.load(Ordering::Relaxed), 1);
 
         assert_eq!(shared.granted(), vec!["cli-probe.upper".to_owned()]);
-        // Not in `granted`: the default scan would refuse it.
         assert!(shared.is_granted("gh.pr-view"));
-        // The default is an empty list and, through it, an empty membership test.
         assert_eq!(shared.command_words(), vec!["gh".to_owned()]);
         assert!(shared.has_command_word("gh-extra"));
-        // Both default to `None`.
         assert_eq!(
             shared.run_command("gh", &["pr".to_owned()], Some("piped")),
             Some(CommandRun::Proposed {
@@ -679,7 +509,6 @@ mod tests {
         );
     }
 
-    /// One provider word, `httpprobe`, whose proposal names the secret use it was built with.
     struct ProposingInvoker {
         secret_use: Option<SecretUseProposal>,
         invocations: Mutex<Vec<(String, Value, Option<SecretUseProposal>)>>,
@@ -730,8 +559,6 @@ mod tests {
         }
     }
 
-    /// A provider command is the only way a script names a secret, so the funnel that turns its
-    /// proposal into an invocation must hand the reference on rather than drop it.
     #[test]
     fn a_provider_proposal_hands_its_secret_use_to_invoke() {
         for secret_use in [Some(proposal()), None] {

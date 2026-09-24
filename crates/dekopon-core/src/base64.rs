@@ -1,38 +1,28 @@
-//! Canonical standard base64, with bounded streaming validation and checked offset arithmetic.
-
 pub use ::base64::{
     DecodeError, Engine, display::Base64Display, engine::general_purpose::STANDARD,
     read::DecoderReader, write::EncoderWriter,
 };
 use thiserror::Error;
 
-/// A codec failure whose category survives the host boundary.
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
 pub enum CodecError {
-    /// A byte length or offset cannot be represented.
     #[error("asset length exceeds the codec range")]
     TooLarge,
-    /// Content is not padded, whitespace-free standard base64.
     #[error("asset is not canonical standard base64")]
     InvalidEncoding,
 }
 
-/// Exact padded encoded length without allocating or narrowing to usize.
 pub fn encoded_len(bytes: u64) -> Result<u64, CodecError> {
     let groups = bytes / 3 + u64::from(!bytes.is_multiple_of(3));
     groups.checked_mul(4).ok_or(CodecError::TooLarge)
 }
 
-/// An aligned encoded offset and decoded bytes to skip within its first quantum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ReadOffset {
-    /// Start of the containing four-byte encoded quantum.
     pub encoded: u64,
-    /// Number of decoded bytes before the requested offset, at most two.
     pub skip: u8,
 }
 
-/// Maps a decoded offset without decoding the preceding file.
 pub fn read_offset(decoded: u64) -> Result<ReadOffset, CodecError> {
     Ok(ReadOffset {
         encoded: (decoded / 3).checked_mul(4).ok_or(CodecError::TooLarge)?,
@@ -40,7 +30,6 @@ pub fn read_offset(decoded: u64) -> Result<ReadOffset, CodecError> {
     })
 }
 
-/// Decoded length of already-validated content from its stored length and last two bytes.
 pub fn decoded_len(stored: u64, tail: &[u8]) -> Result<u64, CodecError> {
     if stored == 0 {
         return Ok(0);
@@ -55,7 +44,6 @@ pub fn decoded_len(stored: u64, tail: &[u8]) -> Result<u64, CodecError> {
         .ok_or(CodecError::InvalidEncoding)
 }
 
-/// Validates arbitrary write boundaries while retaining only one four-byte quantum.
 #[derive(Debug, Default)]
 pub struct Validator {
     quantum: [u8; 4],
@@ -66,7 +54,6 @@ pub struct Validator {
 }
 
 impl Validator {
-    /// Accepts another stored-byte chunk; invalid input permanently poisons the writer.
     pub fn write(&mut self, bytes: &[u8]) -> Result<(), CodecError> {
         if self.invalid {
             return Err(CodecError::InvalidEncoding);
@@ -98,12 +85,10 @@ impl Validator {
         Ok(())
     }
 
-    /// Decoded bytes in complete validated quanta. An incomplete quantum is charged when completed.
     pub fn decoded_len(&self) -> u64 {
         self.decoded
     }
 
-    /// Refuses an incomplete final quantum or any earlier invalid write.
     pub fn finish(&self) -> Result<(), CodecError> {
         if self.invalid || self.filled != 0 {
             Err(CodecError::InvalidEncoding)

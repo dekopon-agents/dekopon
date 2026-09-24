@@ -51,66 +51,31 @@ pub struct BrokerdConfig {
     pub socket_path: PathBuf,
     pub broker_principal: PrincipalId,
     pub policy_revision: String,
-    /// Optional owner-only credentials file resolved into the broker's credential store.
-    ///
-    /// Absent means the broker holds no provider credentials, and any rule naming one fails
-    /// construction. The secret values live only in that file — never here.
     #[serde(default)]
     pub credentials_path: Option<PathBuf>,
-    /// Optional owner-only public-DRN to private-source map.
-    ///
-    /// It coexists with legacy implicit credentials. Loading validates descriptors without network
-    /// access; one selected source is resolved only after both capability and `secret.use` policy
-    /// decisions allow an invocation.
+    /// Loading validates descriptors without network access; an actual secret source is resolved
+    /// only after both capability and secret.use policy decisions permit the invocation.
     #[serde(default)]
     pub secret_map_path: Option<PathBuf>,
-    /// Legacy directly named component files or directories.
     #[serde(default)]
     pub providers: Vec<PathBuf>,
-    /// Managed provider activation lock and content-addressed store.
-    ///
-    /// Mutually exclusive with `providers`. Registry access is never attempted while this
-    /// configuration is loaded; an offline `dekopon-brokerd provider` command materializes it.
     #[serde(default)]
     pub provider_set: Option<ManagedProviderSetConfig>,
-    /// Bypass persistent cwasm and compile source Wasm at every startup.
-    ///
-    /// Defaults to false: managed providers use immutable, boot-verified mapped artifacts under
-    /// `providerSet.storePath/cwasm`. Legacy `providers` paths always compile without a cache.
-    /// Cache errors are fatal; this switch is the operator's explicit escape hatch.
     #[serde(default)]
     pub compile_on_load: bool,
-    /// Whether configuration naming something no loaded provider offers refuses startup.
-    ///
-    /// Defaults to `false`, which warns and continues so a deployment can ship policy and
-    /// constraint sets that anticipate a provider it has not dropped in yet. Set it for a
-    /// deployment whose provider set is fixed, where a mismatch means someone made a mistake.
-    ///
-    /// Tolerating grants nothing either way: a capability nothing routes is denied
-    /// `unconstrained-capability` at invocation regardless of this setting.
+    /// Tolerating a startup mismatch never grants anything at runtime: a capability nothing routes
+    /// is still denied unconstrained-capability at invocation regardless of this setting.
     #[serde(default)]
     pub strict: bool,
     pub identities: Vec<PeerIdentity>,
-    /// Owner-controlled subject-to-principal mappings consulted for attested proposals.
     #[serde(default)]
     pub identity_mappings: Vec<IdentityMapping>,
-    /// Owner-only Cedar policy file evaluated for every authorization decision.
-    ///
-    /// Absent means an empty policy set, which permits nothing. Required once any constraint set
-    /// exists, because a deployment that declares executable capabilities and no policy is a
-    /// configuration mistake rather than a deliberate deny-everything.
     #[serde(default)]
     pub policies_path: Option<PathBuf>,
-    /// Execution constraints per capability, keyed by capability identifier.
-    ///
-    /// A capability with no entry is not deployable: the broker refuses it before consulting
-    /// policy, and refuses to start if policy could ever permit it.
     #[serde(default)]
     pub constraint_sets: BTreeMap<CapabilityId, ConstraintSet>,
-    /// Nonsecret owner settings given only to the named provider during invoke, never to the agent.
     #[serde(default)]
     pub provider_settings: BTreeMap<ProviderId, serde_json::Value>,
-    /// Broker-owner decisions about the native HTTP host's transport rules.
     #[serde(default)]
     pub http: HttpConfig,
     #[serde(default)]
@@ -119,64 +84,42 @@ pub struct BrokerdConfig {
     pub broker_limits: BrokerLimits,
     #[serde(default)]
     pub server_limits: ServerLimitsConfig,
-    /// Optional ephemeral broker asset directory. Presence requires both fields.
     #[serde(default)]
     pub assets: Option<AssetsConfig>,
-    /// Optional broker-owned provider storage. Presence requires every field.
     #[serde(default)]
     pub storage: Option<StorageConfig>,
-    /// Optional all-or-nothing durable chat-memory surface.
     #[serde(default)]
     pub chat_memory: Option<ChatMemoryConfig>,
-    /// Optional OTLP export. Absent means the broker exports no telemetry.
     #[serde(default)]
     pub telemetry: Option<TelemetryConfig>,
 }
 
-/// Broker-level HTTP transport settings the native host enforces for every provider.
-///
-/// Separate from a constraint set on purpose: "this hostname may be spoken to in the clear" is a
-/// fact about the network the broker runs on, not about one capability, and an owner who had to
-/// repeat it per constraint set would eventually forget one and widen the wrong thing.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct HttpConfig {
-    /// Exact hostnames plaintext `http://` is permitted to, besides loopback.
-    ///
-    /// Empty — the default — keeps the loopback-only rule. Entries are exact hostnames matched
-    /// case-insensitively: no wildcards, no ports, no schemes, no paths. A listed host still has
-    /// to be named by the constraint set's `allowedHosts` and still needs its
-    /// `allowPlaintextLoopback`; this only decides whether the native host will speak plaintext
-    /// to it once the authorization already allows the destination.
+    /// Listing a host here doesn't grant access by itself: it must still be named in a constraint
+    /// set's allowedHosts with allowPlaintextLoopback set; this only permits plaintext once already
+    /// authorized.
     pub plaintext_hosts: Vec<String>,
-    /// Additional root bundles for HTTPS, not tied to or granting any destination.
     #[serde(rename = "extraCABundles")]
     pub extra_ca_bundles: Vec<PathBuf>,
-    /// Exact authorities allowed to resolve to private unicast IPs (separate from TLS trust).
     pub non_public_https: Vec<String>,
 }
 
-/// Paths for one generated provider lock and its immutable blob store.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ManagedProviderSetConfig {
-    /// Generated lock consumed as trusted startup input.
     pub lock_path: PathBuf,
-    /// Store containing `blobs/sha256/<component-digest>.wasm`.
     pub store_path: PathBuf,
 }
 
-/// Ephemeral broker asset storage, emptied on every startup.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AssetsConfig {
-    /// Private broker-owned directory; never mounted in the gateway.
     pub root_path: PathBuf,
-    /// Shared byte budget for active response spools and provider outputs.
     pub max_in_flight_bytes: u64,
 }
 
-/// Strict broker-owned provider-storage paths and ceilings.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct StorageConfig {
@@ -185,28 +128,17 @@ pub struct StorageConfig {
     pub limits: StorageLimits,
 }
 
-/// Broker-owned OTLP export settings.
-///
-/// The credential is deliberately absent. Ingest authentication is read by the OpenTelemetry SDK
-/// from `OTEL_EXPORTER_OTLP_HEADERS`, so a token never enters this owner-readable configuration
-/// file, the process command line, or any span attribute.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct TelemetryConfig {
-    /// OTLP receiver endpoint.
     pub endpoint: String,
-    /// Wire transport: `grpc` or `http`.
     pub transport: Transport,
-    /// OpenTelemetry service name attached to broker spans.
     pub service_name: String,
-    /// Timeout for each OTLP export and the final shutdown flush.
     pub export_timeout_ms: u64,
 }
 
-/// Broker telemetry after validation.
 #[derive(Clone, Debug)]
 pub struct ResolvedTelemetry {
-    /// Exporter transport and endpoint.
     pub settings: ExporterSettings,
 }
 
@@ -230,7 +162,6 @@ pub struct PeerIdentity {
     pub uid: u32,
     pub principal: PrincipalId,
     pub actor: Actor,
-    /// Optional authority to attest external subjects inside canonical namespaces.
     #[serde(default)]
     pub attestor: Option<AttestorGrant>,
 }
@@ -241,22 +172,13 @@ impl PeerIdentity {
     }
 }
 
-/// One owner-controlled mapping from a canonical external subject to a stable principal.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct IdentityMapping {
-    /// Canonical subject, e.g. `slack.t0123abc.u9xyz` or `tel.16034700182`.
     pub subject: ExternalSubject,
-    /// The stable principal that subject resolves to.
     pub principal: PrincipalId,
 }
 
-/// Per-invocation Wasmtime ceilings and the optional aggregate memory budget.
-///
-/// Every field defaults independently to the value [`HostLimitsConfig::default`] gives it — the
-/// same value an entirely absent `hostLimits` block produces. Setting `maxTotalMemoryBytes` alone
-/// is therefore one line rather than fifteen, which is what makes the aggregate budget something a
-/// deployment actually sets. The cross-field checks in `resolve` still run on the merged result.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct HostLimitsConfig {
@@ -274,17 +196,8 @@ pub struct HostLimitsConfig {
     pub max_http_header_bytes: usize,
     pub fuel: u64,
     pub max_timeout_ms: u64,
-    /// Aggregate guest linear memory reservable across concurrently live provider stores.
-    ///
-    /// `maxMemoryBytes` bounds one invocation. This bounds all of them at once, turning an OOM kill
-    /// into a refusal: without it the worst case is `serverLimits.maxConnections` times
-    /// `maxMemoryBytes`, which is 4 GiB at the defaults and well past a small container's limit.
-    /// Defaults to [`dekopon_broker_host::DEFAULT_MAX_TOTAL_MEMORY_BYTES`]; an explicit
-    /// `maxTotalMemoryBytes: null` restores the unbounded behavior for a deployment that has
-    /// budgeted the product itself.
-    ///
-    /// Deliberately absent from the authority commitment: it is a concurrency budget, not a
-    /// ceiling an authorization could narrow, and changing it must not rotate stored authority.
+    /// This memory ceiling is deliberately left out of the authority commitment; including it would
+    /// rotate stored authority whenever the concurrency budget changes.
     pub max_total_memory_bytes: Option<usize>,
 }
 
@@ -377,7 +290,6 @@ pub struct ResolvedConfig {
     pub credentials_path: Option<PathBuf>,
     pub secret_map_path: Option<PathBuf>,
     pub providers: Vec<PathBuf>,
-    /// Expected component identities when providers came from a generated lock.
     pub locked_providers: Option<Vec<LockedProviderSource>>,
     pub strict: bool,
     pub identities: Vec<PeerIdentity>,
@@ -387,9 +299,7 @@ pub struct ResolvedConfig {
     pub constraint_sets: BTreeMap<CapabilityId, ConstraintSet>,
     pub host_limits: BrokerHostLimits,
     pub host_options: BrokerHostOptions,
-    /// Hostnames the owner opted out of the loopback-only plaintext rule, logged once at startup.
     pub plaintext_hosts: PlaintextHosts,
-    /// Worst-case concurrent guest memory: `maxConnections` times `maxMemoryBytes`.
     pub worst_case_guest_memory_bytes: usize,
     pub broker_limits: BrokerLimits,
     pub server_limits: ServerLimitsConfig,
@@ -412,9 +322,6 @@ pub async fn load(
     let config = serde_yaml::from_slice::<BrokerdConfig>(&bytes)
         .map_err(|source| ConfigError::Decode { source })?;
     let mut resolved = resolve(config, path, expected_uid).await?;
-    // The policy file gets the configuration's own hygiene: owner-owned, single-link, not
-    // group/world writable, no symlink following, byte-capped. It is trusted input in exactly the
-    // same sense the configuration is, so it is read under exactly the same rules.
     if let Some(policies_path) = resolved.policies_path.clone() {
         let bytes = read_owner_only(&policies_path, expected_uid, HARD_MAX_POLICY_BYTES).await?;
         resolved.policies = String::from_utf8(bytes).map_err(|_| ConfigError::PolicyNotUtf8 {
@@ -424,10 +331,6 @@ pub async fn load(
     Ok(resolved)
 }
 
-/// Reads one owner-only, single-link, byte-capped regular file without following symlinks.
-///
-/// `broker.yaml` and the policy file are authored configuration: an operator group may read them,
-/// so the tier is not-world-writable rather than private.
 async fn read_owner_only(
     path: &Path,
     expected_uid: u32,
@@ -445,11 +348,6 @@ async fn read_owner_only(
     .map_err(|error| trusted_read_error(path, error))
 }
 
-/// Maps one file-hygiene refusal onto this crate's configuration errors.
-///
-/// The three-way split an operator acts on — wrong kind of file, wrong permissions or owner, too
-/// big — is preserved; the specific check that failed rides along as the source rather than being
-/// dropped into one opaque message.
 fn trusted_read_error(path: &Path, error: FileHygieneError) -> ConfigError {
     match error {
         FileHygieneError::NotRegular { path, .. } => ConfigError::NotRegular { path },
@@ -483,19 +381,9 @@ fn resolve_future_path(path: PathBuf) -> Result<PathBuf, ConfigError> {
     Ok(parent.join(name))
 }
 
-/// Expands one configured provider entry into the component files it names.
-///
-/// A regular file is itself. A directory is every `*.wasm` directly inside it — not recursively, so
-/// a nested directory is a place to park something, not a place it loads from — **in filename
-/// order**. That sort is load-bearing rather than tidiness: the registry builds its capability
-/// route table in load order, so readdir order would make two runs over an identical directory
-/// disagree about which provider claimed a duplicate capability.
-///
-/// A directory is held to the same standard as every other trusted input this file reads: owned by
-/// the expected UID and not group- or world-writable. A directory anyone can write to is a
-/// directory anyone can add a provider to, and a provider is code this broker compiles and runs.
-/// Each file the scan yields is checked again on its own by `socket::validate_owned_file` before
-/// anything is loaded.
+/// Entries are scanned in filename order deliberately: the registry builds its capability route
+/// table in load order, so an unsorted scan would make identical directories disagree about which
+/// provider claims a duplicate capability.
 fn expand_provider_entry(path: &Path, expected_uid: u32) -> Result<Vec<PathBuf>, ConfigError> {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
@@ -592,8 +480,9 @@ async fn resolve(
         .transpose()
     };
     let credentials_path = canonical(config.credentials_path)?;
-    // Preserve the configured final component so the secret-map loader's O_NOFOLLOW check can
-    // actually reject a symlink rather than receiving the target canonicalization erased it into.
+    // The final path component is left uncanonicalized so the secret-map loader's O_NOFOLLOW check
+    // can actually reject a symlink, rather than being handed a target canonicalization already
+    // resolved away.
     let secret_map_path = config
         .secret_map_path
         .map(|path| resolve_future_path(resolve_path(path)))
@@ -602,9 +491,6 @@ async fn resolve(
     let storage = config
         .storage
         .map(|mut storage| {
-            // Storage paths preserve their configured spelling until every original ancestor has
-            // been walked through retained `openat(...NOFOLLOW...)` descriptors. Canonicalizing a
-            // parent here would erase precisely the symlink the storage boundary must reject.
             storage.root_path =
                 dekopon_storage_host::resolve_storage_root_path(&resolve_path(storage.root_path))
                     .map_err(|source| ConfigError::StoragePath { source })?;
@@ -689,8 +575,6 @@ async fn resolve(
             providers.push(provider);
         }
     }
-    // The pre-expansion bound above limits what this file may say; this one limits what it
-    // actually resolves to, which is what the component host will be asked to compile.
     if providers.len() > HARD_MAX_PROVIDERS {
         return Err(ConfigError::TooManyProviders {
             maximum: HARD_MAX_PROVIDERS,
@@ -732,9 +616,6 @@ async fn resolve(
                         || storage.root_path.starts_with(store_path)
                 }))
     {
-        // Initialization owns every entry under the root and rejects unknown ones. Refuse this at
-        // config resolution rather than letting a future socket poison the storage layout after
-        // the first successful start.
         return Err(ConfigError::StorageStateCollision);
     }
     if let Some(assets) = &assets {
@@ -782,10 +663,6 @@ async fn resolve(
             });
         }
     }
-    // A deployment that declares executable capabilities and no policy file would start and refuse
-    // everything, which is a configuration mistake dressed as deny-by-default. Every other check
-    // the old reachability validation performed now happens in policy-world construction: an
-    // undeclared principal, provider, or capability refuses `PolicyEngine::new` outright.
     if !config.constraint_sets.is_empty() && policies_path.is_none() {
         return Err(ConfigError::MissingPoliciesPath);
     }
@@ -796,9 +673,6 @@ async fn resolve(
         return Err(ConfigError::InvalidServerLimits);
     }
     let frame_limits = config.server_limits.frame_limits()?;
-    // Validated here rather than at the first refused request: an entry with a port or a scheme in
-    // it is a host the operator believes they allowed, and a broker that starts with one is a
-    // broker that will deny a request the operator is sure they permitted.
     let plaintext_hosts = PlaintextHosts::new(&config.http.plaintext_hosts)
         .map_err(|source| ConfigError::InvalidPlaintextHost { source })?;
     if config.http.extra_ca_bundles.len() > 8 || config.http.non_public_https.len() > 8 {
@@ -851,9 +725,6 @@ async fn resolve(
     if host_limits.max_timeout.is_zero() {
         return Err(ConfigError::InvalidHostLimits);
     }
-    // Per-store limits bound one invocation; the connection ceiling decides how many of those can
-    // exist at once. Naming the product here is what makes an operator budget it against the
-    // container limit instead of discovering it as an OOM kill.
     let worst_case_guest_memory_bytes = config
         .server_limits
         .max_connections
@@ -980,9 +851,7 @@ pub enum ConfigError {
         "broker configuration must be single-link, owned by the server UID, and not group/world writable: {path}"
     )]
     InsecureFile {
-        /// The refused path.
         path: PathBuf,
-        /// Which hygiene check refused it.
         #[source]
         source: FileHygieneError,
     },
@@ -1009,27 +878,18 @@ pub enum ConfigError {
     MixedProviderSources,
     #[error("managed provider lock or store is invalid")]
     ProviderLock {
-        /// Strict lock, store, or blob hygiene failure.
         #[source]
         source: provider_manager::ProviderManagerError,
     },
     #[error("managed provider store must be disjoint from broker-owned state paths")]
     ProviderStateCollision,
-    /// A provider directory was group- or world-writable, or owned by another user.
     #[error(
         "provider directory {path} is not owned by this user or is group/world writable; anyone \
          who can write it can add a provider this broker would execute"
     )]
-    InsecureProviderDirectory {
-        /// The offending directory.
-        path: PathBuf,
-    },
-    /// A configured provider directory held no `*.wasm` component.
+    InsecureProviderDirectory { path: PathBuf },
     #[error("provider directory {path} contains no *.wasm component")]
-    EmptyProviderDirectory {
-        /// The empty directory.
-        path: PathBuf,
-    },
+    EmptyProviderDirectory { path: PathBuf },
     #[error("broker configuration has too many providers; maximum is {maximum}")]
     TooManyProviders { maximum: usize },
     #[error("broker configuration must map at least one peer identity")]
@@ -1063,16 +923,13 @@ pub enum ConfigError {
     InvalidServerLimits,
     #[error("invalid broker frame limits")]
     InvalidFrameLimits {
-        /// Which frame bound was rejected: a zero or over-ceiling maximum, or a zero I/O timeout.
         #[source]
         source: ProtocolError,
     },
     #[error("host timeout must be positive")]
     InvalidHostLimits,
-    /// An `http.plaintextHosts` entry was not a bare hostname.
     #[error("http.plaintextHosts is invalid: {source}")]
     InvalidPlaintextHost {
-        /// Which entry was refused and why.
         #[source]
         source: PlaintextHostError,
     },
@@ -1093,13 +950,11 @@ pub enum ConfigError {
     AssetsStateCollision,
     #[error("could not safely resolve a configured provider storage path")]
     StoragePath {
-        /// The offending path and the reason it was refused.
         #[source]
         source: dekopon_storage_host::StorageHostError,
     },
     #[error("invalid provider storage limits")]
     InvalidStorage {
-        /// Which storage field, value, or relationship was rejected.
         #[source]
         source: dekopon_storage_host::StorageConfigError,
     },

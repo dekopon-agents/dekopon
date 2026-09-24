@@ -1,7 +1,5 @@
-//! Offline provider resolution, content storage, and lock verification.
-//!
-//! Network access exists only behind explicit provider-manager commands. Daemon startup consumes a
-//! generated lock and local content-addressed blobs without constructing a registry client.
+//! Network access happens only behind explicit provider-manager commands; daemon startup never
+//! constructs a registry client.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -39,17 +37,11 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 use crate::{HARD_MAX_PROVIDERS, socket};
 
-/// Expected OCI artifact type for a Dekopon provider.
 pub const PROVIDER_ARTIFACT_TYPE: &str = "application/vnd.dekopon.provider.v1+wasm";
-/// Expected media type for the single provider component layer.
 pub const PROVIDER_LAYER_MEDIA_TYPE: &str = "application/wasm";
-/// Maximum desired-set or lockfile bytes.
 pub const HARD_MAX_PROVIDER_STATE_BYTES: usize = 1024 * 1024;
-/// Maximum raw OCI manifest bytes.
 pub const HARD_MAX_PROVIDER_MANIFEST_BYTES: usize = 1024 * 1024;
-/// Maximum logical bytes retained across installed and orphan provider blobs (4 GiB).
 pub const HARD_MAX_PROVIDER_STORE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-/// Maximum files retained in the component-blob directory, including stale temporaries.
 pub const HARD_MAX_PROVIDER_STORE_BLOBS: usize = 1024;
 
 const HARD_MAX_TOKEN_BYTES: usize = 64 * 1024;
@@ -63,66 +55,47 @@ const OCI_EMPTY_CONFIG_DIGEST: &str =
 const OCI_EMPTY_CONFIG_DATA: &str = "e30=";
 const DOCKER_CONTENT_DIGEST: &str = "docker-content-digest";
 
-/// Operator-authored exact provider references.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProviderSet {
-    /// Versioned provider-set schema.
     pub api_version: ProviderSetApiVersion,
-    /// Exact tagged or manifest-digest references.
     pub providers: Vec<DesiredProvider>,
 }
 
-/// Supported provider-set API versions.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ProviderSetApiVersion {
-    /// Initial exact-reference format.
     #[serde(rename = "dekopon.dev/provider-set/v1alpha1")]
     V1Alpha1,
 }
 
-/// One exact operator-authored OCI source.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct DesiredProvider {
-    /// Fully qualified OCI reference carrying an explicit tag or SHA-256 manifest digest.
     pub source: String,
 }
 
-/// Generated immutable provider resolution.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProviderLock {
-    /// Versioned lock schema.
     pub api_version: ProviderLockApiVersion,
-    /// Deterministically source-sorted resolutions.
     pub providers: Vec<LockedProvider>,
 }
 
-/// Supported provider-lock API versions.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub enum ProviderLockApiVersion {
-    /// Initial exact-reference format.
     #[serde(rename = "dekopon.dev/provider-lock/v1alpha1")]
     V1Alpha1,
 }
 
-/// One immutable OCI manifest and component resolution.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct LockedProvider {
-    /// Exact desired reference that produced this resolution.
     pub source: String,
-    /// Semantic version when the exact tag itself parses as strict SemVer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resolved_version: Option<Version>,
-    /// Immutable SHA-256 digest of the OCI manifest.
     pub manifest_digest: String,
-    /// Immutable SHA-256 digest of the single component layer.
     pub component_digest: String,
-    /// Descriptor and verified component byte length.
     pub component_bytes: u64,
-    /// Provider identity returned by bounded, import-disabled `describe`.
     pub provider_id: ProviderId,
 }
 
@@ -147,82 +120,53 @@ impl ProviderLock {
     }
 }
 
-/// Files used by one provider-manager invocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderManagerPaths {
-    /// Operator-authored desired provider set.
     pub provider_set: Option<PathBuf>,
-    /// Generated activation lock.
     pub lock_file: PathBuf,
-    /// Content-addressed provider store.
     pub store: PathBuf,
 }
 
-/// Offline provider-manager operation settings.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProviderManagerOptions {
-    /// Desired, locked, and installed state locations.
     pub paths: ProviderManagerPaths,
-    /// Exact loopback registries for which plain HTTP is explicitly permitted.
     pub plaintext_loopback_registries: Vec<String>,
 }
 
-/// Result of resolving or materializing one desired set.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderSyncReport {
-    /// Number of activated providers.
     pub providers: usize,
-    /// Number of blobs fetched in this operation.
     pub fetched: usize,
-    /// Whether the generated lock bytes changed.
     pub lock_changed: bool,
-    /// Reminder that daemon state is startup-fixed.
     pub restart_required: bool,
 }
 
-/// Offline status for one locked provider.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderStatus {
-    /// Desired exact source reference.
     pub source: String,
-    /// Immutable OCI manifest digest.
     pub manifest_digest: String,
-    /// Immutable component digest.
     pub component_digest: String,
-    /// Locked provider identity.
     pub provider_id: ProviderId,
-    /// Local content-addressed component path.
     pub path: PathBuf,
-    /// Byte-verification state: `verified`, `missing`, or `invalid`.
     pub local_status: String,
-    /// Bounded actionable category when local verification did not succeed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_reason: Option<String>,
 }
 
-/// Complete offline validation result.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderVerifyReport {
-    /// Number of components checked and described as one complete set.
     pub providers: usize,
 }
 
-/// Provider-manager entry point embedded in `dekopon-brokerd`.
 pub struct ProviderManager {
     paths: ProviderManagerPaths,
     registry: RegistryClient,
 }
 
 impl ProviderManager {
-    /// Creates a manager without touching the network or filesystem.
-    ///
-    /// # Errors
-    ///
-    /// Refuses a plaintext registry unless it is an exact literal loopback host (with an optional
-    /// port). TLS certificate verification can never be disabled.
     pub fn new(options: ProviderManagerOptions) -> Result<Self, ProviderManagerError> {
         let registry = RegistryClient::new(options.plaintext_loopback_registries)?;
         Ok(Self {
@@ -231,11 +175,6 @@ impl ProviderManager {
         })
     }
 
-    /// Resolves changed exact references, materializes missing blobs, validates the complete set,
-    /// and atomically activates the generated lock.
-    ///
-    /// An unchanged tag keeps its previous immutable manifest resolution. Changing the authored
-    /// reference is the only way this exact-reference format asks for a new resolution.
     pub async fn sync(&self) -> Result<ProviderSyncReport, ProviderManagerError> {
         let uid = socket::current_uid();
         let _activation_operation = lock_activation(&self.paths.lock_file, uid)?;
@@ -291,7 +230,6 @@ impl ProviderManager {
         })
     }
 
-    /// Materializes an existing lock without resolving any desired tag.
     pub async fn sync_locked(&self) -> Result<ProviderSyncReport, ProviderManagerError> {
         let uid = socket::current_uid();
         let _activation_operation = lock_activation(&self.paths.lock_file, uid)?;
@@ -321,7 +259,6 @@ impl ProviderManager {
         })
     }
 
-    /// Reports lock and local-byte state without constructing a network client request.
     pub async fn list(&self) -> Result<Vec<ProviderStatus>, ProviderManagerError> {
         let uid = socket::current_uid();
         let lock = load_lock(&self.paths.lock_file, uid).await?;
@@ -329,9 +266,6 @@ impl ProviderManager {
         let mut statuses = Vec::with_capacity(lock.providers.len());
         for provider in lock.providers {
             let path = store.blob_path(&provider.component_digest)?;
-            // `list` remains a status command rather than failing the whole set, but it must not
-            // collapse distinct remedies into one boolean. Categories are bounded and contain no
-            // filesystem or registry text; `verify` retains the full error chain when requested.
             let (local_status, local_reason) = match verify_blob(&path, &provider, uid).await {
                 Ok(()) => ("verified", None),
                 Err(ProviderManagerError::Io { reason, source, .. })
@@ -369,7 +303,6 @@ impl ProviderManager {
         Ok(statuses)
     }
 
-    /// Verifies local bytes and validates the complete locked provider set without network access.
     pub async fn verify(&self) -> Result<ProviderVerifyReport, ProviderManagerError> {
         let uid = socket::current_uid();
         let lock = load_lock(&self.paths.lock_file, uid).await?;
@@ -381,10 +314,6 @@ impl ProviderManager {
     }
 }
 
-/// Loads a generated lock into exact broker-host sources without performing network access.
-///
-/// The daemon still validates each blob path's ownership and link count separately. The host then
-/// compares digest, length, and provider identity against the exact buffer it passes to Wasmtime.
 pub(crate) async fn load_locked_sources(
     lock_path: &Path,
     store_path: &Path,
@@ -1194,8 +1123,8 @@ impl RegistryClient {
                     )
                 })?
                 .to_owned();
-            // Bound and discard the unauthenticated response before retrying. Registry text is
-            // untrusted and never enters the surfaced error or ordinary logs.
+            // Registry response text is untrusted and must never reach the surfaced error or
+            // ordinary logs.
             bounded_response_bytes(response, HARD_MAX_REGISTRY_ERROR_BYTES, operation).await?;
             let token = self.fetch_token(reference, &challenge).await?;
             self.tokens
@@ -1438,8 +1367,8 @@ fn validate_manifest(
         ));
     }
     validate_digest(&layer.digest)?;
-    // A negative `size` reaches this arm, and reporting it as "0 bytes" hid what the registry
-    // actually sent. Report `layer.size` itself.
+    // Report the raw layer size on overflow instead of a hardcoded zero, so the value the registry
+    // actually sent isn't hidden.
     let Ok(size) = u64::try_from(layer.size) else {
         return Err(ProviderManagerError::registry_detail(
             COMPONENT_SIZE,
@@ -1457,8 +1386,8 @@ fn validate_manifest(
             ),
         ));
     }
-    // OCI annotations are accepted by the strict decoder but remain bounded incidental metadata;
-    // they are never trusted for filenames, identity, authorization, or I/O.
+    // OCI manifest annotations are accepted but never trusted for filenames, identity,
+    // authorization, or I/O.
     Ok(LayerDescriptor {
         digest: layer.digest.clone(),
         size,
@@ -1747,10 +1676,8 @@ async fn verify_component_file(
     Ok(())
 }
 
-/// Reads one owner-authored provider-state file: the operator-authored set or the generated lock.
-///
-/// Not private: an operator group reads these the same way it reads `broker.yaml`. They name
-/// providers this broker will compile, so the bar is that nobody else can rewrite them.
+/// These provider-state files are group-readable like broker.yaml; the real bar is that nobody else
+/// can rewrite them.
 async fn read_secure_file(
     path: &Path,
     expected_uid: u32,
@@ -1767,7 +1694,6 @@ async fn read_secure_file(
         ProviderManagerError::io_at(READ_PROVIDER_STATE, path.clone(), io::Error::other(join))
     })?
     .map_err(|error| match error {
-        // The absent-state case is matched on by `kind()` upstream, so the original error travels.
         FileHygieneError::Io { path, source } => {
             ProviderManagerError::io_at(READ_PROVIDER_STATE, path, source)
         }
@@ -1826,8 +1752,8 @@ fn validate_directory(
     Ok(())
 }
 
-/// Walks canonically from `path` inclusive, so aliases such as macOS's `/var -> /private/var`
-/// resolve first; the final entry is still inspected with `symlink_metadata` by the caller.
+/// Canonicalizes from path inclusive so aliases like macOS's /var -> /private/var resolve before
+/// the caller's own symlink check.
 fn validate_ancestors(path: &Path) -> Result<(), ProviderManagerError> {
     let policy = AncestorPolicy {
         canonicalize: true,
@@ -2036,7 +1962,6 @@ fn redirect_target_allowed(target: &Url, plaintext: &BTreeSet<String>) -> bool {
 }
 
 fn is_literal_loopback_registry(registry: &str) -> bool {
-    // The strict OCI source grammar in this slice accepts DNS names and IPv4 host[:port].
     if registry.starts_with('[') {
         return false;
     }
@@ -2058,180 +1983,108 @@ fn url_authority(url: &Url) -> Result<String, ProviderManagerError> {
     })
 }
 
-/// Reason recorded when reading trusted provider state from disk fails.
-///
-/// `list`, `load_optional_lock`, and `ensure_locked_blob` treat an absent state file differently
-/// from every other filesystem failure, so this one check stays identifiable by name.
+/// list, load_optional_lock, and ensure_locked_blob match on this exact reason string to treat
+/// missing state differently from other I/O failures.
 const READ_PROVIDER_STATE: &str = "could not read provider state";
-/// Reason recorded when a store path cannot be resolved or inspected.
 const INSPECT_STORE_PATH: &str = "could not inspect provider store path";
-/// Reason recorded when the blob directory cannot be scanned under the store lock.
 const SCAN_STORE_DIRECTORY: &str = "could not inspect provider store directory";
-/// Reason recorded when the manager operation lock cannot be opened or acquired.
 const LOCK_STORE_OPERATION: &str = "could not lock provider store operation";
-/// Reason recorded when the provider-lock temporary file cannot be written.
 const WRITE_LOCK_TEMPORARY: &str = "could not write provider-lock temporary file";
-/// Reason recorded when a state file exceeds its hard byte ceiling.
 const STATE_TOO_LARGE: &str = "provider state exceeds its hard byte ceiling";
-/// Reason recorded when a component length is zero or over its hard ceiling.
 const COMPONENT_SIZE: &str = "provider component size is outside its hard bounds";
-/// Reason recorded when a digest is not canonical SHA-256.
 const INVALID_DIGEST: &str =
     "provider digest must be sha256 followed by sixty-four lowercase hexadecimal characters";
-/// Reason recorded when a source omits its explicit registry.
 const UNQUALIFIED_SOURCE: &str =
     "provider source must be fully qualified with an explicit registry";
-/// Reason recorded when a source omits both an explicit tag and a manifest digest.
 const MISSING_SELECTOR: &str = "provider source must name an explicit tag or manifest digest";
-/// Reason recorded when a path used for trusted state has no parent directory.
 const PATH_HAS_NO_PARENT: &str = "path has no parent";
-/// Reason recorded when installed bytes do not match the descriptor length.
-///
-/// `list` reports length and content mismatches as different remedies, so both stay named.
 const BLOB_SIZE_MISMATCH: &str = "provider blob length does not match its descriptor";
-/// Reason recorded when installed bytes do not hash to the descriptor digest.
 const BLOB_DIGEST_MISMATCH: &str = "provider blob digest does not match its descriptor";
-/// Reason recorded when raw manifest bytes do not match the selected or returned digest.
 const MANIFEST_DIGEST_MISMATCH: &str = "OCI manifest digest does not match the selected digest";
-/// Reason recorded when a lock's informational SemVer disagrees with its exact tag.
 const RESOLVED_VERSION_MISMATCH: &str =
     "provider lock resolvedVersion does not match its exact tag";
-/// Reason recorded when a registry request fails before a response.
 const REGISTRY_REQUEST_FAILED: &str = "OCI registry request failed";
-/// Reason recorded when a registry response fails while streaming.
 const REGISTRY_STREAM_FAILED: &str = "OCI registry response failed while streaming";
-/// Reason recorded when a registry returns a non-success status.
 const REGISTRY_STATUS: &str = "OCI registry returned an unsuccessful HTTP status";
-/// Reason recorded when a registry response exceeds its independent byte bound.
 const RESPONSE_TOO_LARGE: &str = "OCI registry response exceeds its byte ceiling";
-/// Reason recorded when an authentication challenge header is absent.
 const MISSING_CHALLENGE: &str =
     "OCI registry required authentication without a WWW-Authenticate challenge";
 
-/// Renders the optional bounded detail a refusal carries after its fixed reason.
 fn detail_suffix(detail: &Option<String>) -> String {
     detail
         .as_ref()
         .map_or_else(String::new, |detail| format!(": {detail}"))
 }
 
-/// Renders the optional path a filesystem failure names after its fixed reason.
 fn path_suffix(path: &Option<PathBuf>) -> String {
     path.as_ref()
         .map_or_else(String::new, |path| format!(" at {}", path.display()))
 }
 
-/// Provider resolution, store, lock, or validation failure.
-///
-/// Variants classify a refusal on the axis a caller acts on; `reason` names the exact check that
-/// refused and is drawn from a fixed vocabulary rather than composed at runtime. Registry URLs,
-/// authentication challenges, tokens, and credential bytes never reach `Display` or `Debug`
-/// through any variant: transport failures are recorded with their URL already stripped, and
-/// registry-controlled text is admitted only as a bounded media or artifact type.
 #[derive(Debug, Error)]
 pub enum ProviderManagerError {
-    /// Operator-authored provider state, manager arguments, or exact source references were
-    /// rejected before any registry was contacted.
     #[error("{reason}{}", detail_suffix(detail))]
     Configuration {
-        /// Fixed description of the check that refused.
         reason: &'static str,
-        /// Bounded operator-authored context, such as the offending reference.
         detail: Option<String>,
-        /// Strict decode or encode failure when the refusal came from serialization.
         #[source]
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
-    /// Desired or locked state contained one or more ambiguous duplicate identities.
     #[error(
         "provider state has {} conflict(s): {}",
         problems.len(),
         problems.join("; ")
     )]
-    StateConflicts {
-        /// Deterministically sorted bounded conflict descriptions.
-        problems: Vec<String>,
-    },
-    /// Trusted file, directory, or ancestor hygiene failed.
+    StateConflicts { problems: Vec<String> },
     #[error("{reason}: {}", path.display())]
     FileSecurity {
-        /// Fixed description of the hygiene rule that refused.
         reason: &'static str,
-        /// Offending path.
         path: PathBuf,
-        /// Shared broker file-security failure when the refusal came from `socket`.
         #[source]
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
-    /// Registry transport, authentication, manifest, or descriptor validation failed.
     #[error("{reason}{}", detail_suffix(detail))]
     Registry {
-        /// Fixed description of the check that refused.
         reason: &'static str,
-        /// Low-cardinality operation, status, or bounded media type; never a URL or token.
         detail: Option<String>,
-        /// Transport, header, or decode failure carrying no registry URL.
         #[source]
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
-    /// Content-addressed bytes did not match the length or digest that selected them.
     #[error("{reason}: expected {expected}, got {actual}")]
     DigestMismatch {
-        /// Fixed description of the comparison that failed.
         reason: &'static str,
-        /// Selected, locked, or descriptor value.
         expected: String,
-        /// Value observed in the bytes actually read.
         actual: String,
     },
-    /// The generated lock disagreed with the desired set, the component, or its own grammar.
     #[error("{reason}{}", detail_suffix(detail))]
     LockMismatch {
-        /// Fixed description of the comparison that failed.
         reason: &'static str,
-        /// Bounded locked reference and the expectation it violated.
         detail: Option<String>,
     },
-    /// Retained blobs and stale temporaries reached the hard lifetime ceiling.
     #[error(
         "provider store holds {blobs} file(s) and {bytes} bytes; adding {requested} bytes would exceed {maximum_blobs} files or {maximum_bytes} bytes"
     )]
     StoreFull {
-        /// Current file count.
         blobs: usize,
-        /// Current logical bytes.
         bytes: u64,
-        /// Proposed component bytes.
         requested: u64,
-        /// Hard file-count ceiling.
         maximum_blobs: usize,
-        /// Hard logical-byte ceiling.
         maximum_bytes: u64,
     },
-    /// Another manager currently owns the operation lock.
     #[error("another provider-manager operation is in progress at {}", path.display())]
-    OperationInProgress {
-        /// Lock path.
-        path: PathBuf,
-    },
-    /// Complete provider-host validation failed.
+    OperationInProgress { path: PathBuf },
     #[error("provider set failed broker-host validation")]
     Host(#[source] BrokerHostError),
-    /// A filesystem operation on trusted state or the content store failed.
     #[error("{reason}{}", path_suffix(path))]
     Io {
-        /// Fixed description of the operation that failed.
         reason: &'static str,
-        /// Path the operation named, when it had one.
         path: Option<PathBuf>,
-        /// Filesystem failure.
         #[source]
         source: io::Error,
     },
 }
 
 impl ProviderManagerError {
-    /// Refuses authored state or arguments without further context.
     fn config(reason: &'static str) -> Self {
         Self::Configuration {
             reason,
@@ -2240,7 +2093,6 @@ impl ProviderManagerError {
         }
     }
 
-    /// Refuses authored state or arguments, naming the bounded offending value.
     fn config_detail(reason: &'static str, detail: impl Into<String>) -> Self {
         Self::Configuration {
             reason,
@@ -2249,7 +2101,6 @@ impl ProviderManagerError {
         }
     }
 
-    /// Refuses authored state, retaining the strict serialization failure that reported it.
     fn config_source(
         reason: &'static str,
         source: impl std::error::Error + Send + Sync + 'static,
@@ -2261,7 +2112,6 @@ impl ProviderManagerError {
         }
     }
 
-    /// Refuses a registry interaction without further context.
     fn registry(reason: &'static str) -> Self {
         Self::Registry {
             reason,
@@ -2270,7 +2120,6 @@ impl ProviderManagerError {
         }
     }
 
-    /// Refuses a registry interaction, naming bounded non-secret context.
     fn registry_detail(reason: &'static str, detail: impl Into<String>) -> Self {
         Self::Registry {
             reason,
@@ -2279,7 +2128,6 @@ impl ProviderManagerError {
         }
     }
 
-    /// Refuses a registry interaction, retaining the underlying failure.
     fn registry_source(
         reason: &'static str,
         source: impl std::error::Error + Send + Sync + 'static,
@@ -2291,7 +2139,6 @@ impl ProviderManagerError {
         }
     }
 
-    /// Refuses a registry transport failure, naming the low-cardinality operation.
     fn registry_transport(
         reason: &'static str,
         operation: &'static str,
@@ -2304,7 +2151,6 @@ impl ProviderManagerError {
         }
     }
 
-    /// Refuses a lock that disagrees with the desired set or the component it names.
     fn lock(reason: &'static str) -> Self {
         Self::LockMismatch {
             reason,
@@ -2312,7 +2158,6 @@ impl ProviderManagerError {
         }
     }
 
-    /// Refuses a lock disagreement, naming the bounded locked reference.
     fn lock_detail(reason: &'static str, detail: impl Into<String>) -> Self {
         Self::LockMismatch {
             reason,
@@ -2320,7 +2165,6 @@ impl ProviderManagerError {
         }
     }
 
-    /// Refuses a path whose own metadata failed a hygiene rule.
     fn insecure(reason: &'static str, path: impl Into<PathBuf>) -> Self {
         Self::FileSecurity {
             reason,
@@ -2329,7 +2173,6 @@ impl ProviderManagerError {
         }
     }
 
-    /// Refuses provider state the shared trusted-file predicate rejected, naming which check.
     fn file_hygiene(path: impl Into<PathBuf>, source: FileHygieneError) -> Self {
         Self::FileSecurity {
             reason: "provider state must be regular, single-link, owned by this UID, and not group/world writable",
@@ -2338,7 +2181,6 @@ impl ProviderManagerError {
         }
     }
 
-    /// Refuses a path the shared broker file-security check rejected.
     fn file_security(path: impl Into<PathBuf>, source: socket::SocketError) -> Self {
         Self::FileSecurity {
             reason: "provider blob failed broker file-security validation",
@@ -2347,7 +2189,6 @@ impl ProviderManagerError {
         }
     }
 
-    /// Refuses bytes that do not match the length or digest that selected them.
     fn digest_mismatch(
         reason: &'static str,
         expected: impl Into<String>,
@@ -2360,7 +2201,6 @@ impl ProviderManagerError {
         }
     }
 
-    /// Reports a filesystem failure that named no path.
     fn io(reason: &'static str, source: io::Error) -> Self {
         Self::Io {
             reason,
@@ -2369,7 +2209,6 @@ impl ProviderManagerError {
         }
     }
 
-    /// Reports a filesystem failure on a named path.
     fn io_at(reason: &'static str, path: impl Into<PathBuf>, source: io::Error) -> Self {
         Self::Io {
             reason,
@@ -2597,9 +2436,6 @@ mod tests {
         );
     }
 
-    /// A registry that answers with a negative layer `size` fails `u64::try_from`, and the arm
-    /// that catches it used to print a hardcoded "0 bytes" — the one number the descriptor did not
-    /// contain. The refusal has to name what actually arrived or it points at the wrong defect.
     #[test]
     fn a_negative_layer_size_is_reported_as_itself() {
         let manifest: OciProviderManifest = serde_json::from_value(serde_json::json!({

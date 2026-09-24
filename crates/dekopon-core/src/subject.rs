@@ -1,21 +1,5 @@
-//! External chat-transport subjects and their canonical, identifier-safe form.
-//!
-//! A subject names *who a message came from* on an external service — a Slack user inside a Slack
-//! workspace, a Discord or Telegram account, a WhatsApp account, or a telephone number. Raw
-//! external identifiers do not fit the workspace identifier grammar (Slack IDs are uppercase,
-//! E.164 numbers start with `+`), so this type owns one canonical normalization: dotted lowercase
-//! segments such as `slack.t0123abc.u9xyz`, `discord.123456789`, `telegram.5551234`,
-//! `whatsapp.16034700182`, or `tel.16034700182`.
-//!
-//! The canonical form is deliberately restrictive — each segment is `[a-z0-9]+` with no separator
-//! characters inside it — so the dotted string parses back unambiguously and the whole value
-//! satisfies [`validate_identifier`](crate::IdentifierError)'s grammar. That makes a canonical
-//! subject safe everywhere an identifier is safe: configuration keys, audit fields, and prefix
-//! scopes.
-//!
-//! A subject is *routing metadata*, not authority. Trust in a subject comes entirely from the
-//! transport that authenticated it and the broker-side owner-controlled mapping that resolves it
-//! to a principal; nothing about the value itself is credible.
+//! A subject is routing metadata, not authority; trust comes only from the transport that
+//! authenticated it and the broker's owner-controlled mapping to a principal.
 
 use std::{fmt, str::FromStr};
 
@@ -24,24 +8,17 @@ use thiserror::Error;
 
 use crate::MAX_IDENTIFIER_LENGTH;
 
-/// The external service a subject was authenticated by.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[non_exhaustive]
 pub enum SubjectService {
-    /// A Slack workspace member; the tenant segment is the Slack team identifier.
     Slack,
-    /// A Discord account, identified globally by its numeric user identifier.
     Discord,
-    /// A Telegram account, identified by its numeric user identifier.
     Telegram,
-    /// A WhatsApp account, identified by the signed webhook `wa_id`.
     Whatsapp,
-    /// A telephone number in digits-only E.164 form (the `+` is stripped).
     Tel,
 }
 
 impl SubjectService {
-    /// The canonical leading segment for this service.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -75,11 +52,6 @@ impl FromStr for SubjectService {
     }
 }
 
-/// One authenticated external identity in canonical form.
-///
-/// Constructed through the per-service constructors (which normalize raw transport identifiers)
-/// or parsed from the canonical dotted string. Serde delegates to [`FromStr`], so deserialization
-/// cannot produce a non-canonical value.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ExternalSubject {
     service: SubjectService,
@@ -88,29 +60,24 @@ pub struct ExternalSubject {
 }
 
 impl ExternalSubject {
-    /// A Slack workspace member: `slack.<team>.<user>`, both segments lowercased.
     pub fn slack(team: &str, user: &str) -> Result<Self, SubjectError> {
         let tenant = normalize_segment(team, "tenant")?;
         let subject = normalize_segment(user, "subject")?;
         Self::build(SubjectService::Slack, Some(tenant), subject)
     }
 
-    /// A Discord account: `discord.<user id>`.
-    ///
-    /// Discord user identifiers are global rather than server-scoped, so the guild is routing
-    /// context and not part of the authenticated subject.
+    /// Discord user identifiers are global, not server-scoped, so unlike Slack there's no tenant
+    /// segment; the guild is just routing context.
     pub fn discord(user: &str) -> Result<Self, SubjectError> {
         let subject = numeric_segment(user, "subject")?;
         Self::build(SubjectService::Discord, None, subject)
     }
 
-    /// A Telegram account: `telegram.<user id>`, all digits.
     pub fn telegram(user: &str) -> Result<Self, SubjectError> {
         let subject = digits_segment(user, "subject")?;
         Self::build(SubjectService::Telegram, None, subject)
     }
 
-    /// A WhatsApp account: `whatsapp.<wa_id>`, using the signed digits-only sender identifier.
     pub fn whatsapp(wa_id: &str) -> Result<Self, SubjectError> {
         if wa_id.is_empty()
             || wa_id.starts_with('0')
@@ -124,7 +91,6 @@ impl ExternalSubject {
         Self::build(SubjectService::Whatsapp, None, wa_id.to_owned())
     }
 
-    /// A telephone number: `tel.<digits>`, with one leading `+` stripped.
     pub fn telephone(number: &str) -> Result<Self, SubjectError> {
         let digits = number.strip_prefix('+').unwrap_or(number);
         let subject = digits_segment(digits, "subject")?;
@@ -149,25 +115,21 @@ impl ExternalSubject {
         Ok(candidate)
     }
 
-    /// The authenticated transport service.
     #[must_use]
     pub fn service(&self) -> SubjectService {
         self.service
     }
 
-    /// The service-scoped tenant segment, when the service has one (Slack's team).
     #[must_use]
     pub fn tenant(&self) -> Option<&str> {
         self.tenant.as_deref()
     }
 
-    /// The service-native subject segment (per-tenant only for services that require one).
     #[must_use]
     pub fn subject(&self) -> &str {
         &self.subject
     }
 
-    /// Renders the canonical dotted form.
     #[must_use]
     pub fn canonical(&self) -> String {
         match &self.tenant {
@@ -176,20 +138,13 @@ impl ExternalSubject {
         }
     }
 
-    /// Whether this subject falls inside a canonical-prefix namespace scope.
-    ///
-    /// Matching is segment-boundary exact: `slack.t0123abc` covers `slack.t0123abc.u9xyz` but not
-    /// `slack.t0123abcx.u9`. A scope equal to the whole canonical form also matches.
-    ///
-    /// Compared segment by segment rather than against a rendered canonical string: an attestor
-    /// grant asks this once per configured namespace on every attested request, and the answer
-    /// never needs the joined form.
+    /// Matching is segment-boundary exact: a scope covers its own subtree but never a sibling with
+    /// a longer shared prefix, unlike a naive string check.
     #[must_use]
     pub fn in_namespace(&self, scope: &str) -> bool {
         let mut wanted = scope.split('.');
         for segment in self.segments() {
             match wanted.next() {
-                // The scope ran out exactly on a segment boundary, so it is a covering prefix.
                 None => return true,
                 Some(value) if value == segment => {}
                 Some(_) => return false,
@@ -198,7 +153,6 @@ impl ExternalSubject {
         wanted.next().is_none()
     }
 
-    /// The canonical segments in order, without joining them.
     fn segments(&self) -> impl Iterator<Item = &str> {
         [
             Some(self.service.as_str()),
@@ -280,7 +234,6 @@ impl<'de> Deserialize<'de> for ExternalSubject {
     }
 }
 
-/// Lowercases a raw transport identifier and requires the canonical segment alphabet.
 fn normalize_segment(value: &str, segment: &'static str) -> Result<String, SubjectError> {
     let normalized = value.to_ascii_lowercase();
     require_canonical_segment(&normalized, segment)
@@ -327,44 +280,23 @@ fn require_canonical_segment(
     Ok(value)
 }
 
-/// A raw or canonical subject that could not be represented.
-///
-/// Variants echo segment *values* only for segments that are routing metadata by definition;
-/// nothing here is secret.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum SubjectError {
-    /// The canonical form was empty.
     #[error("external subject must not be empty")]
     Empty,
-    /// The leading segment named no known service.
     #[error("unknown external subject service {service:?}")]
-    UnknownService {
-        /// The unrecognized service segment.
-        service: String,
-    },
-    /// A required segment was absent.
+    UnknownService { service: String },
     #[error("external subject is missing its {segment} segment")]
-    MissingSegment {
-        /// Which segment was missing.
-        segment: &'static str,
-    },
-    /// More segments than the service's canonical form defines.
+    MissingSegment { segment: &'static str },
     #[error("external subject has more segments than its service defines")]
     TooManySegments,
-    /// A segment failed the canonical alphabet or a service-specific numeric identifier rule.
     #[error("external subject {segment} segment {value:?} is not canonical")]
     InvalidSegment {
-        /// Which segment was invalid.
         segment: &'static str,
-        /// The offending value.
         value: String,
     },
-    /// The canonical form exceeded the identifier length bound.
     #[error("external subject exceeds {maximum} bytes")]
-    TooLong {
-        /// Maximum canonical length.
-        maximum: usize,
-    },
+    TooLong { maximum: usize },
 }
 
 #[cfg(test)]
@@ -417,7 +349,6 @@ mod tests {
 
     #[test]
     fn canonical_subjects_satisfy_the_identifier_grammar() {
-        // The whole point of the canonical form: a subject is safe anywhere an identifier is.
         for canonical in [
             "slack.t0123abc.u9xyz",
             "discord.123456789012345678",
@@ -444,8 +375,6 @@ mod tests {
             "discord.18446744073709551616",
             "discord.123.extra",
             "telegram.5551234.extra",
-            // An identityMappings typo, refused at broker startup rather than accepted as a
-            // canonical subject no transport can ever produce.
             "telegram.alice",
             "telegram.abc123",
             "whatsapp.not-digits",
@@ -480,7 +409,6 @@ mod tests {
         assert!(!subject.in_namespace("slack.t0123abcx"));
         assert!(!subject.in_namespace("slack.t0123ab"));
         assert!(!subject.in_namespace("tel"));
-        // A scope is never a partial segment, an empty string, or longer than the subject itself.
         assert!(!subject.in_namespace(""));
         assert!(!subject.in_namespace("slack."));
         assert!(!subject.in_namespace("slack.t0123abc."));
@@ -498,9 +426,6 @@ mod tests {
 
     #[test]
     fn a_service_with_no_authenticator_behind_it_is_not_a_service_here() {
-        // `dev.<surface>.<name>` existed for the in-tree operator console, which moved out of this
-        // repository. Nothing else ever minted one, so the service is gone rather than kept as an
-        // unauthenticated namespace a broker would have to keep refusing.
         assert!(matches!(
             "dev.console.xavier".parse::<ExternalSubject>(),
             Err(SubjectError::UnknownService { .. })

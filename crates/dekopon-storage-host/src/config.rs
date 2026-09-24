@@ -1,5 +1,3 @@
-//! Strict storage ceilings and relationship validation.
-
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -7,7 +5,6 @@ const TIB: u64 = 1024 * 1024 * 1024 * 1024;
 const GIB: u64 = 1024 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
 
-/// Broker-owned process and invocation storage ceilings.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct StorageLimits {
@@ -27,7 +24,7 @@ pub struct StorageLimits {
     pub max_entropy_bytes_per_invocation: u64,
     pub lock_timeout_ms: u64,
     pub finalization_budget_ms: u64,
-    /// Compatibility spelling: bounds concurrently active invocation handles.
+    /// Despite its name, this bounds concurrently active invocation handles, not transactions.
     pub max_pending_transactions: u64,
     pub startup_max_entries: u64,
 }
@@ -45,9 +42,6 @@ impl Default for StorageLimits {
             max_host_calls_per_invocation: 4_096,
             max_read_bytes_per_call: 256 * 1024,
             max_read_bytes_per_invocation: 16 * MIB,
-            // JSONL replacement is one host call. The default memory compaction target is
-            // 8 MiB, so the host-call ceiling must admit that complete replacement rather than
-            // letting a valid store become permanently unable to compact.
             max_write_bytes_per_call: 16 * MIB,
             max_write_bytes_per_invocation: 16 * MIB,
             max_entropy_bytes_per_call: 256,
@@ -61,7 +55,6 @@ impl Default for StorageLimits {
 }
 
 impl StorageLimits {
-    /// Validates compile-time ceilings, checked relationships, and restart admissibility.
     pub fn validate(&self) -> Result<(), StorageConfigError> {
         let positive = [
             ("maxRootBytes", self.max_root_bytes),
@@ -196,11 +189,9 @@ impl StorageLimits {
             return Err(StorageConfigError::Relationship { relationship });
         }
 
-        // `startupMaxEntries` is also enforced as the live root-wide entry cap. It may therefore
-        // be lower than the product of independent namespace/file ceilings without admitting a
-        // store that cannot restart. One namespace must still be representable in full: the three
-        // root entries, then the base, its lease, one generation and that generation's data
-        // directory, before any of the namespace's own files.
+        // startupMaxEntries also caps live root-wide entries; the +7 covers the three root entries,
+        // the base, its lease, one generation, and that generation's data directory before any
+        // namespace file.
         let one_namespace = self
             .max_files_per_namespace
             .checked_add(7)
@@ -215,7 +206,6 @@ impl StorageLimits {
     }
 }
 
-/// Invalid storage configuration.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum StorageConfigError {
     #[error("storage field {field} must be greater than zero")]

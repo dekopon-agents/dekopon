@@ -1,5 +1,3 @@
-//! `sed [-E] s/pattern/replacement/[flags]` — substitution only.
-
 use regex_bites::{NoExpand, Regex};
 use serde_json::Value;
 
@@ -8,10 +6,6 @@ use crate::{
     value::{from_lines, to_lines},
 };
 
-/// Substitutes text line by line — literal by default, a regular expression under `-E`.
-///
-/// Only the `s` command is implemented. Addresses, `d`, `p`, `-n`, and script files are absent
-/// rather than approximated, and any other command is rejected by name.
 pub(crate) struct Sed;
 
 impl Builtin for Sed {
@@ -29,7 +23,6 @@ impl Builtin for Sed {
         let mut extended = false;
         for argument in arguments {
             match argument.as_str() {
-                // `-e` simply introduces the script, which is the only form supported anyway.
                 "-e" | "--expression" => {}
                 "-E" | "--regexp-extended" => extended = true,
                 flag if flag.starts_with('-') && flag.len() > 1 => {
@@ -60,7 +53,6 @@ impl Builtin for Sed {
     }
 }
 
-/// One parsed `s/pattern/replacement/flags` command.
 #[derive(Clone, Debug)]
 pub(crate) struct Substitution {
     matcher: Matcher,
@@ -68,17 +60,13 @@ pub(crate) struct Substitution {
     global: bool,
 }
 
-/// What the substitution's left-hand side matches with.
 #[derive(Clone, Debug)]
 enum Matcher {
-    /// Literal text, with `-i` folding case through [`str::to_lowercase`].
     Literal { needle: String, ignore_case: bool },
-    /// An `-E` regular expression. Each line is its own haystack, so `^` and `$` anchor the line.
     Extended(Regex),
 }
 
 impl Substitution {
-    /// Parses a substitution script, accepting any single-character delimiter after `s`.
     pub(crate) fn parse(script: &str, extended: bool) -> Result<Self, CommandFailure> {
         let mut characters = script.chars();
         if characters.next() != Some('s') {
@@ -124,11 +112,9 @@ impl Substitution {
             ));
         }
 
-        // Without `-E` this `s` command has no anchors at all, so a leading `^` or trailing `$`
-        // would be matched as that character. `sed "s/^ *//"` silently returning its input
-        // unchanged is precisely the failure this module claims cannot happen. An *escaped* `\$` is
-        // a literal dollar sign rather than an anchor, so it passes through to `literal_pattern`.
-        // Under `-E` both are the anchors they look like and the engine reads them.
+        // Without the extended flag, a bare caret or dollar sign in the pattern is rejected as an
+        // error instead of matched literally, because real sed reads them as anchors and a silent
+        // literal match would leave input unchanged with no warning.
         let matcher = if extended {
             Matcher::Extended(super::extended_pattern("sed", &fields[0], ignore_case)?)
         } else {
@@ -143,16 +129,14 @@ impl Substitution {
                 ignore_case,
             }
         };
-        // `&` in a real sed replacement inserts the matched text. Treating it as a literal
-        // ampersand would rewrite the line into something the script never asked for.
+        // An ampersand in the replacement text is rejected rather than treated as a literal
+        // character, because real sed uses it to mean the matched text, and treating it as literal
+        // would silently rewrite lines the script never intended.
         if has_unescaped_ampersand(&fields[1]) {
             return Err(CommandFailure::usage(
                 "sed: `&` in a replacement means the matched text in real sed and is not supported here; write `\\&` for a literal ampersand",
             ));
         }
-        // Same rule one step further. `\1` is a capture-group reference in real sed — a BRE group
-        // without `-E`, an ERE group with it — and the replacement here is inserted verbatim, so
-        // emitting a literal backslash-one is exactly the silent mismatch this module refuses.
         if let Some(digit) = group_reference(&fields[1]) {
             return Err(CommandFailure::usage(format!(
                 "sed: `\\{digit}` in a replacement is a capture-group reference in real sed and is not supported here; write `\\\\{digit}` for a literal backslash"
@@ -167,11 +151,11 @@ impl Substitution {
         })
     }
 
-    /// Applies the substitution to one line.
     pub(crate) fn apply(&self, line: &str) -> String {
         let (needle, ignore_case) = match &self.matcher {
-            // `NoExpand`, not the engine's `$1` interpolation: a replacement is literal text in
-            // both modes, so a `$` a script wrote stays the dollar sign it wrote.
+            // The replacement text is inserted without the regex engine's own dollar-number
+            // interpolation, so a literal dollar sign the script wrote stays a dollar sign in both
+            // the literal and extended modes.
             Matcher::Extended(regex) => {
                 let replaced = if self.global {
                     regex.replace_all(line, NoExpand(&self.replacement))
@@ -220,9 +204,6 @@ impl Substitution {
     }
 }
 
-/// Returns the digit of the first capture-group reference in a replacement, if there is one.
-///
-/// `\1` is a group reference; `\\1` is an escaped backslash followed by a digit and is not.
 fn group_reference(replacement: &str) -> Option<char> {
     let mut characters = replacement.chars();
     while let Some(character) = characters.next() {
@@ -238,7 +219,6 @@ fn group_reference(replacement: &str) -> Option<char> {
     None
 }
 
-/// Reports whether a replacement contains a `&` that is not written as `\&`.
 fn has_unescaped_ampersand(replacement: &str) -> bool {
     let mut characters = replacement.chars();
     while let Some(character) = characters.next() {
@@ -253,7 +233,6 @@ fn has_unescaped_ampersand(replacement: &str) -> bool {
     false
 }
 
-/// Splits on an unescaped delimiter, honoring `\<delimiter>`.
 fn split_unescaped(body: &str, delimiter: char) -> Vec<String> {
     let mut fields = vec![String::new()];
     let mut characters = body.chars();
@@ -360,8 +339,6 @@ mod tests {
 
     #[test]
     fn regex_syntax_and_anchors_are_rejected_rather_than_silently_literal() {
-        // `s/^ *//` returning its input unchanged, and `s/x/[&]/` inserting a literal ampersand,
-        // are the two ways this substitution could quietly answer a question it was not asked.
         for script in [
             "s/^ *//",
             "s/[0-9]*//g",
@@ -379,7 +356,6 @@ mod tests {
                 "{script}: {message}"
             );
         }
-        // Escaped forms recover the literal characters.
         assert_eq!(
             sed(&[r"s/\[x\]/y/"], json!("a [x] b")).value,
             json!("a y b")
@@ -389,8 +365,6 @@ mod tests {
 
     #[test]
     fn an_escaped_dollar_is_substituted_rather_than_rejected_as_an_anchor() {
-        // `s/price\$/x/` names a literal dollar sign, not an anchor, and rejecting it sent a script
-        // looking for a workaround that does not exist. An even backslash run is still an anchor.
         assert_eq!(
             sed(&[r"s/price\$/cost/"], json!("the price$ line")).value,
             json!("the cost line")
@@ -407,8 +381,6 @@ mod tests {
 
     #[test]
     fn the_e_flag_substitutes_with_the_regex_engine() {
-        // `sed "s/^ *//"` is the other idiom a model reaches for first. Unflagged it is a usage
-        // error naming the anchor; with `-E` the anchor is the anchor.
         assert_eq!(
             sed(&["-E", "s/^ *//"], json!("   indented")).value,
             json!("indented")
@@ -417,7 +389,6 @@ mod tests {
             sed(&["-E", "s/[0-9]+/N/g"], json!("a1b22c333")).value,
             json!("aNbNcN")
         );
-        // The `g` and `i` flags still mean what they meant.
         assert_eq!(
             sed(&["-E", "s/a+/X/"], json!("aaa aaa")).value,
             json!("X aaa")
@@ -434,11 +405,7 @@ mod tests {
 
     #[test]
     fn an_e_replacement_stays_literal_text() {
-        // The engine's own `$1` interpolation is off: a `$` a script wrote is a dollar sign, the
-        // same as it is on the literal path.
         assert_eq!(sed(&["-E", "s/(a)(b)/$2/"], json!("ab")).value, json!("$2"));
-        // ...which is exactly why a real-sed group reference has to be refused rather than emitted
-        // verbatim. Both modes refuse it, because both have group syntax in real sed.
         for script in [r"s/(a)/\1/", r"s/a/\1/"] {
             let failure = Substitution::parse(script, true).expect_err(script);
             assert!(
@@ -446,8 +413,6 @@ mod tests {
                 "{script}: {failure:?}"
             );
         }
-        // An escaped backslash is a backslash, not a reference, so it parses rather than being
-        // refused.
         assert!(Substitution::parse(r"s/a/\\1/", true).is_ok());
     }
 

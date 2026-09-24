@@ -1,9 +1,3 @@
-//! Model-account authentication command execution.
-//!
-//! `login`, `status`, and `logout` keep credential material inside the model crate. `export` is the
-//! one command in this binary whose entire job is to print credential material, so both of its
-//! gates live here, in front of the read, rather than being left to a caller to remember.
-
 use std::{
     collections::BTreeMap,
     io::{self, IsTerminal as _},
@@ -21,13 +15,8 @@ use crate::{
     cli::{AuthCommand, ChatGptAuthCommand, ExportFormat},
 };
 
-/// Key the exported credential is stored under.
-///
-/// It matches Dekopon's own credential file name so a projected volume presents it at a path
-/// `authFile` can name directly.
 const SECRET_KEY: &str = "chatgpt-auth.json";
 
-/// Header carried by the Secret manifest, because the manifest outlives the terminal that warned.
 const MANIFEST_HEADER: &str = "\
 # Exported by `dekopond auth chatgpt export`. This manifest carries a live ChatGPT access token and
 # a rotating refresh token; base64 here is Kubernetes' encoding for `data`, not encryption.
@@ -37,15 +26,10 @@ const MANIFEST_HEADER: &str = "\
 # a deliberate rotation.
 ";
 
-/// Failure while running an `auth` command.
 #[derive(Debug, Error)]
 pub enum AuthError {
-    /// The model crate refused.
     #[error(transparent)]
     ChatGpt(#[from] ChatGptError),
-    /// The caller did not acknowledge that the command prints credential material.
-    ///
-    /// Clap enforces this on the command line; constructed commands must pass the same gate.
     #[error("refusing to print ChatGPT credentials without --expose-credential")]
     ExposeNotAcknowledged,
     /// Standard output is a terminal, which keeps the credential after the command exits.
@@ -53,7 +37,6 @@ pub enum AuthError {
         "refusing to print ChatGPT credentials to a terminal; redirect or pipe the output (for example `| kubectl apply -f -`), or pass --allow-terminal to accept a live refresh token in your scrollback"
     )]
     TerminalDestination,
-    /// Rendering the Secret manifest failed.
     #[error("could not render the ChatGPT credential Secret manifest")]
     Manifest(#[source] serde_yaml::Error),
 }
@@ -99,10 +82,8 @@ fn execute_chatgpt(command: &ChatGptAuthCommand) -> Result<CommandResult, AuthEr
     Ok(CommandResult::Auth(ModelAuthStatus::chatgpt(status)))
 }
 
-/// Prints an existing local credential so it can be seeded into a secret store.
-///
-/// Both gates are checked before the credential file is opened, so a refused export never reads
-/// the secret at all.
+/// Both gates are checked before the credential file is opened, so a refused export never even
+/// reads the secret.
 fn export(
     auth_file: Option<&Path>,
     format: ExportFormat,
@@ -120,7 +101,6 @@ fn export(
     warn_about_the_exported_copy(export.path());
 
     let document = match format {
-        // The credential document itself, unchanged, for a password-manager field.
         ExportFormat::Raw => export.expose_document().to_owned(),
         ExportFormat::Secret => secret_manifest(&export, secret_name, namespace)?,
     };
@@ -128,12 +108,8 @@ fn export(
     Ok(CommandResult::CredentialExport(Redacted::new(document)))
 }
 
-/// Refuses a destination that keeps the credential after the command exits.
-///
-/// The required `--expose-credential` covers intent; this covers destination, which intent cannot.
-/// An operator who genuinely means to export still should not leave a live refresh token in
-/// terminal scrollback, a `tmux` capture, or a screen share, and every intended consumer —
-/// `kubectl apply -f -`, `pbcopy`, `op item edit` — is a pipe.
+/// The required flag covers intent; this gate covers destination, since even a genuine export
+/// should not leave a live token in terminal scrollback, a tmux capture, or a screen share.
 fn guard_destination(is_terminal: bool, allow_terminal: bool) -> Result<(), AuthError> {
     if is_terminal && !allow_terminal {
         return Err(AuthError::TerminalDestination);
@@ -141,10 +117,6 @@ fn guard_destination(is_terminal: bool, allow_terminal: bool) -> Result<(), Auth
     Ok(())
 }
 
-/// Says out loud what the exported copy is and how long it stays valid.
-///
-/// This goes to standard error so standard output stays a clean document, matching how device
-/// login writes its instructions.
 fn warn_about_the_exported_copy(path: &Path) {
     tracing::warn!(
         credential_file = %path.display(),
@@ -155,7 +127,6 @@ fn warn_about_the_exported_copy(path: &Path) {
     );
 }
 
-/// Kubernetes `v1` `Secret`, in the field order a reader expects.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SecretManifest<'a> {
@@ -167,7 +138,6 @@ struct SecretManifest<'a> {
     data: BTreeMap<&'static str, String>,
 }
 
-/// Object metadata for the emitted Secret.
 #[derive(Serialize)]
 struct SecretMetadata<'a> {
     name: &'a str,
@@ -176,7 +146,6 @@ struct SecretMetadata<'a> {
     labels: BTreeMap<&'static str, &'static str>,
 }
 
-/// Renders the credential as a manifest `kubectl apply -f -` accepts.
 fn secret_manifest(
     export: &ChatGptCredentialExport,
     name: &str,
@@ -207,13 +176,11 @@ fn secret_manifest(
 mod tests {
     use super::{AuthError, guard_destination};
 
-    /// A pipe or a file is the intended destination and must not need a second flag.
     #[test]
     fn a_redirected_destination_is_accepted() {
         assert!(guard_destination(false, false).is_ok());
     }
 
-    /// A terminal keeps the credential in scrollback long after the command exits.
     #[test]
     fn a_terminal_destination_is_refused_by_default() {
         let error = guard_destination(true, false).expect_err("a terminal must be refused");
@@ -222,7 +189,6 @@ mod tests {
         assert!(error.to_string().contains("--allow-terminal"));
     }
 
-    /// The refusal is a default, not a prohibition: an operator may still look at it.
     #[test]
     fn a_terminal_destination_is_allowed_explicitly() {
         assert!(guard_destination(true, true).is_ok());

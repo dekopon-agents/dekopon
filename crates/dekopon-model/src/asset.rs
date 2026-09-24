@@ -1,5 +1,3 @@
-//! Owned, bounded scratch files for chat payloads. No path is accepted from a model or provider.
-
 use std::{
     fmt,
     fs::File,
@@ -12,36 +10,25 @@ use std::{
 use tempfile::{NamedTempFile, TempDir};
 use thiserror::Error;
 
-/// Decoded per-attachment ceiling shared by inbound assets and provider results.
 pub const MAX_ATTACHMENT_BYTES: usize = dekopon_core::asset::MAX_DECODED_ASSET_BYTES;
-/// Largest stored representation: padded base64 of an eight-MiB decoded asset.
 pub const MAX_STORED_ATTACHMENT_BYTES: usize = MAX_ATTACHMENT_BYTES.div_ceil(3) * 4;
 
-/// A sanitized scratch-storage failure, never a filename or payload.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
 pub enum BlobError {
-    /// The attachment exceeds the supported per-file size.
     #[error("attachment exceeds the byte limit")]
     TooLarge,
-    /// The owner explicitly disabled gateway attachment retention.
     #[error("asset retention is disabled (assetRetentionBytes is zero); answer in text")]
     Disabled,
-    /// Active request pins prevent admission within the gateway retention budget.
     #[error("attachment scratch capacity exhausted")]
     Capacity,
-    /// No retained or released entry recognizes this scoped ID.
     #[error("unknown asset in this conversation; choose an ID from the current inventory")]
     Unknown,
-    /// The gateway has reclaimed this asset; callers must not redownload it.
     #[error("asset was released; ask the user to resend it or choose another asset")]
     Reclaimed,
-    /// The reference is no longer authorized in its original generation.
     #[error("asset is unavailable in this conversation generation")]
     Unauthorized,
-    /// An operating-system failure. Only its category is retained.
     #[error("attachment scratch IO failed ({0:?})")]
     Io(io::ErrorKind),
-    /// The descriptor no longer contains exactly the bytes published by its owner.
     #[error("attachment scratch length changed")]
     LengthChanged,
 }
@@ -82,11 +69,8 @@ struct Owner {
     origin: tracing::Span,
 }
 
-/// A lightweight shared lease on a private temporary file, not a filesystem capability.
-///
-/// Cloning copies only the lease. The final drop unlinks the file and directory. Reads use the
-/// original descriptor, never a path lookup. Equality means the same lease, not equal file contents.
-/// Configure the process temporary directory on disk, not tmpfs; no crash durability is promised.
+/// Equality here means the same lease, not equal file contents, and reads always use the original
+/// descriptor rather than a path lookup.
 #[derive(Clone)]
 pub struct DiskBlob(Arc<Owner>);
 
@@ -105,11 +89,6 @@ impl PartialEq for DiskBlob {
 impl Eq for DiskBlob {}
 
 impl DiskBlob {
-    /// Spools already downloaded/decoded bytes before publishing a lease.
-    ///
-    /// # Errors
-    /// Refuses oversized payloads or scratch IO failure. The gateway reserves capacity before calling. Failed
-    /// writes release their reservation and temporary files; no partially written lease escapes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, BlobError> {
         Self::write_with(bytes, |file, bytes| {
             file.write_all(bytes)?;
@@ -117,7 +96,6 @@ impl DiskBlob {
         })
     }
 
-    // The same ownership/unwind path serves real writes and deterministic IO-failure tests.
     fn write_with(
         bytes: &[u8],
         write: impl FnOnce(&mut NamedTempFile, &[u8]) -> io::Result<()>,
@@ -127,8 +105,8 @@ impl DiskBlob {
             if bytes.len() > MAX_ATTACHMENT_BYTES {
                 return Err(BlobError::TooLarge);
             }
-            // tempfile creates the directory exclusively with 0700 and the file with 0600 on
-            // Unix. A random name in this private directory cannot follow a supplied symlink.
+            // tempfile creates the directory 0700 and the file 0600 with an exclusive random name,
+            // so it cannot be made to follow a supplied symlink.
             let mut builder = tempfile::Builder::new();
             builder.prefix("dekopon-assets-");
             #[cfg(unix)]
@@ -161,11 +139,8 @@ impl DiskBlob {
         })
     }
 
-    /// Admits a read-only broker descriptor without copying its contents.
-    ///
-    /// # Errors
-    /// Refuses a changed fstat length or a stored payload over the representation ceiling.
-    /// The encoding-aware caller must also check the decoded per-asset ceiling before admission.
+    /// Callers must separately enforce the decoded per-asset byte ceiling; this only checks the
+    /// stored representation length.
     pub fn from_descriptor(descriptor: OwnedFd, len: usize) -> Result<Self, BlobError> {
         if len > MAX_STORED_ATTACHMENT_BYTES {
             return Err(BlobError::TooLarge);
@@ -182,12 +157,8 @@ impl DiskBlob {
         })))
     }
 
-    /// Obtains a read-only, close-on-exec descriptor for one invocation.
-    ///
-    /// Path-backed scratch has a writable owner, so it is opened afresh; a broker output is
-    /// read-only by construction and can be duplicated because all readers are positional.
-    /// # Errors
-    /// Refuses reclaimed files, changed lengths or descriptor IO failure.
+    /// The returned descriptor may be duplicated only because every consumer reads positionally; a
+    /// seek-based reader would race the shared file offset.
     pub fn descriptor(&self) -> Result<OwnedFd, BlobError> {
         let guard = self
             .0
@@ -205,9 +176,6 @@ impl DiskBlob {
         Ok(descriptor.into())
     }
 
-    /// Reads a bounded range without observing or changing a shared file offset.
-    /// # Errors
-    /// Refuses reclaimed, truncated or otherwise unreadable files.
     pub fn read_exact_at(&self, bytes: &mut [u8], offset: u64) -> Result<(), BlobError> {
         let guard = self
             .0
@@ -222,17 +190,11 @@ impl DiskBlob {
         Ok(())
     }
 
-    /// Whether an active consumer holds a pin in addition to the cache owner.
     #[must_use]
     pub fn is_pinned(&self) -> bool {
         Arc::strong_count(&self.0) > 1
     }
 
-    /// Unlinks an unpinned cache entry before the gateway releases its byte accounting.
-    ///
-    /// # Errors
-    /// A live consumer pin refuses reclamation. Unlink failure preserves the descriptor and
-    /// accounting owner so another admission cannot pretend unreclaimed disk is free.
     pub fn reclaim(&self) -> Result<(), BlobError> {
         if self.is_pinned() {
             return Err(BlobError::Capacity);
@@ -256,22 +218,16 @@ impl DiskBlob {
         })
     }
 
-    /// Metadata only; does not read the file.
     #[must_use]
     pub fn len(&self) -> usize {
         self.0.len
     }
 
-    /// Whether this lease represents an empty payload.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Materializes one bounded consumption buffer using positional reads only.
-    ///
-    /// # Errors
-    /// Returns a sanitized IO or length failure; never substitutes empty bytes or retries a call.
     pub fn read(&self) -> Result<Vec<u8>, BlobError> {
         let current = tracing::Span::current();
         let parent = if current.is_none() {
@@ -289,22 +245,15 @@ impl DiskBlob {
     }
 }
 
-/// A gateway-owned resolver. Resolution must authorize before pinning or touching retention.
+/// Implementors must authorize the resolution before pin() or touching retention; nothing in the
+/// trait itself enforces that order.
 pub trait BlobSource: Send + Sync {
-    /// Pins an existing asset for actual consumption, never by redownloading a reclaimed asset.
-    ///
-    /// # Errors
-    /// Returns a sanitized retention or IO failure.
     fn pin(&self) -> Result<DiskBlob, BlobError>;
-    /// Reads the consumer representation, decoding retained encodings when necessary.
-    /// # Errors
-    /// Returns the same scoped retention and IO failures as pinning.
     fn read(&self) -> Result<Vec<u8>, BlobError> {
         self.pin()?.read()
     }
 }
 
-/// Byte-free model reference. Clones do not acquire a disk pin.
 #[derive(Clone)]
 pub struct BlobReference {
     source: Arc<dyn BlobSource>,
@@ -312,28 +261,20 @@ pub struct BlobReference {
     id: u64,
 }
 impl BlobReference {
-    /// Binds a scoped resolver and gateway metadata, never a path.
     pub fn new(source: Arc<dyn BlobSource>, bytes: usize, id: u64) -> Self {
         Self { source, bytes, id }
     }
-    /// Metadata only; never updates recency.
     #[must_use]
     pub fn len(&self) -> usize {
         self.bytes
     }
-    /// Whether the payload is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.bytes == 0
     }
-    /// Resolves and reads a transient pin for model inclusion.
-    ///
-    /// # Errors
-    /// Returns the resolver's retention failure or the descriptor's IO failure.
     pub fn read(&self) -> Result<Vec<u8>, BlobError> {
         self.source.read()
     }
-    /// Explicit gateway notice substituted for a released historical attachment.
     #[must_use]
     pub fn release_notice(&self) -> String {
         format!(
@@ -383,7 +324,7 @@ impl Drop for Owner {
                 Ok(())
             })
             .unwrap_or(())
-        }); // operation records the sanitized cause once.
+        });
     }
 }
 

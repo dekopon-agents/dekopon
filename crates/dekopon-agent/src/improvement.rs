@@ -1,15 +1,5 @@
-//! Tapping the glass: a bounded channel for an agent to tell its operator how to improve it.
-//!
-//! An agent that hit a limit, reached for a capability it was never granted, or found its standing
-//! instructions wrong has learned something its operator would pay to know, and today it can say
-//! so only in chat, to a person who may not be the operator. This tool gives that observation a
-//! typed shape and a tagged telemetry record, so an operator can aggregate a month of sessions by
-//! category and target rather than reading transcripts.
-//!
-//! It is advisory by construction. A suggestion changes nothing: no instruction, skill, limit, or
-//! grant moves because a model asked. It is recorded, and a person decides. The channel is also
-//! opt-in per session, because the record carries model-authored text and enabling it is what
-//! declares the log sink in scope for that text.
+//! Purely advisory: nothing changes because a model asked, and it is opt-in per session since
+//! enabling it puts model-authored text in scope for the log sink.
 
 use std::fmt;
 
@@ -19,41 +9,27 @@ use serde_json::{Value, json};
 
 use crate::prompt::{PromptError, reject_tool_call};
 
-/// The tool a model calls to record one improvement suggestion.
 pub const IMPROVEMENT_TOOL_NAME: &str = "suggest_improvement";
 
-/// Suggestions one session may record.
-///
-/// Three is enough to name the instruction that was wrong, the capability that was missing, and
-/// the limit that bit; more than that is a model narrating rather than reporting.
+/// Three is enough to name the wrong instruction, the missing capability, and the limit that bit;
+/// more would be a model narrating, not reporting.
 pub const MAX_SUGGESTIONS_PER_SESSION: usize = 3;
-/// Bytes one `target` may carry: a skill name, a capability identifier, a limit name.
 pub const MAX_SUGGESTION_TARGET_BYTES: usize = 128;
-/// Bytes one `summary` may carry: a sentence.
 pub const MAX_SUGGESTION_SUMMARY_BYTES: usize = 512;
-/// Bytes `evidence` and `proposal` may each carry.
 pub const MAX_SUGGESTION_DETAIL_BYTES: usize = 2048;
 
-/// What kind of operator-owned thing a suggestion is about.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ImprovementCategory {
-    /// The agent's standing instructions.
     Instructions,
-    /// A mounted skill, or one that should exist.
     Skill,
-    /// A capability the agent holds, or one it needed and lacked.
     Capability,
-    /// The scripting tool, a builtin, or another tool's behavior.
     Tool,
-    /// A step, capability, output, or time bound.
     Limits,
-    /// Anything else.
     Other,
 }
 
 impl ImprovementCategory {
-    /// The stable wire and telemetry token.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -73,20 +49,15 @@ impl fmt::Display for ImprovementCategory {
     }
 }
 
-/// How sure the model is that the change would help.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SuggestionConfidence {
-    /// A hunch.
     Low,
-    /// Likely, from one session's evidence.
     Medium,
-    /// The session demonstrated it.
     High,
 }
 
 impl SuggestionConfidence {
-    /// The stable wire and telemetry token.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -103,29 +74,19 @@ impl fmt::Display for SuggestionConfidence {
     }
 }
 
-/// One recorded suggestion: bounded, sanitized, and typed.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImprovementSuggestion {
-    /// What kind of thing the operator would change.
     pub category: ImprovementCategory,
-    /// The specific thing: a skill name, a capability identifier, `instructions`, a limit.
     pub target: String,
-    /// One sentence: what was wrong or could be better.
     pub summary: String,
-    /// What the session observed that supports it.
     pub evidence: String,
-    /// The concrete change proposed.
     pub proposal: String,
-    /// How sure the model is.
     pub confidence: SuggestionConfidence,
 }
 
-/// The shape the model sends, before any bound is checked.
-///
-/// Every field is a plain string here so that a wrong enum token or an oversized value becomes a
-/// refusal the model reads rather than a decode failure that ends the session: a suggestion is
-/// advisory, and the task it was about must not fail because the note was formatted badly.
+/// Fields are plain strings, not typed enums, so a bad token or oversized value becomes a refusal
+/// the model can fix, not a decode failure that ends the session.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawSuggestion {
@@ -137,7 +98,6 @@ struct RawSuggestion {
     confidence: String,
 }
 
-/// Builds the suggestion tool.
 pub(crate) fn improvement_tool() -> ModelTool {
     ModelTool {
         name: IMPROVEMENT_TOOL_NAME.to_owned(),
@@ -201,10 +161,6 @@ pub(crate) fn improvement_tool() -> ModelTool {
     }
 }
 
-/// Answers one `suggest_improvement` call, recording the suggestion when it is well formed.
-///
-/// Malformed JSON or a non-object ends the session as it does for every tool. A well-formed object
-/// that fails a bound is answered with the bound, so the model can shorten and resubmit or move on.
 pub(crate) fn suggest_improvement_into(
     messages: &mut Vec<ModelMessage>,
     suggestions: &mut Vec<ImprovementSuggestion>,
@@ -242,10 +198,8 @@ pub(crate) fn suggest_improvement_into(
         }
     };
     let index = suggestions.len() + 1;
-    // The text fields are model-authored, and they are recorded whether or not payload telemetry
-    // is on: offering this tool is the operator's opt-in, and a suggestion nobody can read is not
-    // a suggestion. What the record never carries is chat text the gateway holds or a subject —
-    // only what the model chose to write into these six bounded fields.
+    // This record always includes the model-authored text regardless of the telemetry setting,
+    // since offering the tool is itself the opt-in, but never the chat text or the subject.
     tracing::info!(
         target: "dekopon_agent::audit",
         {
@@ -306,7 +260,6 @@ fn raw_suggestion(tool: &str, arguments: &str) -> Result<RawSuggestion, PromptEr
     })
 }
 
-/// Checks every bound, returning the telemetry reason and the sentence the model reads.
 fn validate(raw: RawSuggestion) -> Result<ImprovementSuggestion, (&'static str, String)> {
     let category = match raw.category.trim() {
         "instructions" => ImprovementCategory::Instructions,
@@ -401,7 +354,6 @@ mod tests {
         assert_eq!(suggestion.target, "gh.pull-request.read");
     }
 
-    /// Every refusal names its reason, because the model has to be able to fix what it sent.
     #[test]
     fn bounds_and_tokens_are_refused_by_reason() {
         assert_eq!(

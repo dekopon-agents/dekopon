@@ -1,12 +1,5 @@
-//! Tokenizer for the sandboxed shell grammar.
-//!
-//! The scanner is a quote state machine over `char`s. It produces operator tokens and structured
-//! words; nested `$( ... )` and `$(( ... ))` bodies are captured as raw source and handed back to
-//! [`crate::parser`], which re-enters itself on them.
-//!
-//! Constructs the sandbox drops are tokenized rather than skipped so the parser can reject them
-//! with an exact message. Silently discarding a trailing `&`, for example, would let a model
-//! believe backgrounding happened when nothing was backgrounded.
+//! Constructs the sandbox drops are tokenized rather than skipped, so the parser can reject them by
+//! name instead of silently discarding them, as it would a trailing ampersand.
 
 use std::{fmt, iter::Peekable, str::CharIndices};
 
@@ -14,61 +7,30 @@ use thiserror::Error;
 
 use crate::ast::Stream;
 
-/// One lexed token with the source line it started on.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Token {
-    /// What was matched.
     pub kind: TokenKind,
-    /// One-based source line.
     pub line: usize,
 }
 
-/// Token classes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TokenKind {
-    /// A structured word.
     Word(RawWord),
-    /// `|`.
     Pipe,
-    /// `;`.
     Semicolon,
-    /// `;;`, which ends one `case` clause.
     DoubleSemicolon,
-    /// A line break.
     Newline,
-    /// `&&`.
     AndAnd,
-    /// `||`.
     OrOr,
-    /// `&`. Kept as a token so the parser can hard-fail on backgrounding.
     Ampersand,
-    /// `(`.
     LeftParen,
-    /// `)`.
     RightParen,
-    /// `{` used as a reserved word.
     LeftBrace,
-    /// `}` used as a reserved word.
     RightBrace,
-    /// `>`, `>>`, `1>`, `1>>`, `2>`, `2>>`, `&>`, `&>>` — a stream into a named buffer.
-    Redirect {
-        /// The stream being redirected.
-        source: Stream,
-        /// `true` for the doubled `>>` forms.
-        append: bool,
-    },
-    /// `>&1`, `>&2`, `1>&2`, `2>&1` — one stream cross-wired onto the other.
-    Duplicate {
-        /// The stream being redirected.
-        source: Stream,
-        /// The stream it is redirected onto; never [`Stream::Both`].
-        target: Stream,
-    },
-    /// `<`. Kept so the parser can explain that there are no files to read.
+    Redirect { source: Stream, append: bool },
+    Duplicate { source: Stream, target: Stream },
     Less,
-    /// A `<<DELIM` here-document, with its body already collected off the following lines.
     HereDoc(RawWord),
-    /// `<(`. Kept so the parser can reject process substitution by name.
     LessParen,
 }
 
@@ -111,15 +73,12 @@ impl fmt::Display for TokenKind {
     }
 }
 
-/// A word before command substitutions and arithmetic have been parsed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RawWord {
-    /// Parts in source order.
     pub parts: Vec<RawPart>,
 }
 
 impl RawWord {
-    /// Returns the text when the word is a single unquoted literal.
     #[must_use]
     pub fn as_literal(&self) -> Option<&str> {
         match self.parts.as_slice() {
@@ -128,7 +87,6 @@ impl RawWord {
         }
     }
 
-    /// Renders a short description for parser diagnostics.
     #[must_use]
     pub fn describe(&self) -> String {
         self.as_literal().map_or_else(
@@ -138,160 +96,94 @@ impl RawWord {
     }
 }
 
-/// One component of a raw word.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RawPart {
-    /// Unquoted literal text.
     Literal(String),
-    /// Single-quoted text.
     SingleQuoted(String),
-    /// Double-quoted parts.
     DoubleQuoted(Vec<RawPart>),
-    /// A parameter reference.
     Parameter(RawParameter),
-    /// Raw `$( ... )` body.
     CommandSubstitution(String),
-    /// Raw `$(( ... ))` body.
     Arithmetic(String),
 }
 
-/// A parameter reference before index words are parsed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RawParameter {
-    /// `$NAME`, `${NAME}`, `${NAME[index]...}`, and the transforming `${NAME...}` forms.
     Named {
-        /// Variable name.
         name: String,
-        /// Zero or more indices, applied left to right.
         indices: Vec<RawIndex>,
-        /// The transformation to apply.
         modifier: RawModifier,
-        /// `${#NAME}`.
         length: bool,
     },
-    /// `$1` .. `${N}`.
     Positional(usize),
-    /// `$@`.
     AllPositional,
-    /// `$*`.
     AllPositionalJoined,
-    /// `$#`.
     PositionalCount,
-    /// `$?`.
     LastStatus,
 }
 
-/// One `[...]` selector, before words have been parsed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RawIndex {
-    /// `[expr]`.
     At(RawWord),
-    /// `[@]`.
     All,
-    /// `[*]`.
     AllJoined,
 }
 
-/// One `${NAME...}` transformation, before words have been parsed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RawModifier {
-    /// None.
     None,
-    /// `:-` / `-`.
     Default {
-        /// `true` for the `:` form.
         colon: bool,
-        /// The substitute.
         word: RawWord,
     },
-    /// `:=` / `=`.
     Assign {
-        /// `true` for the `:` form.
         colon: bool,
-        /// The substitute.
         word: RawWord,
     },
-    /// `:?` / `?`.
     Require {
-        /// `true` for the `:` form.
         colon: bool,
-        /// The message, if the script gave one.
         word: Option<RawWord>,
     },
-    /// `:+` / `+`.
     Alternate {
-        /// `true` for the `:` form.
         colon: bool,
-        /// What to produce instead.
         word: RawWord,
     },
-    /// `#` / `##`.
     StripPrefix(RawWord),
-    /// `%` / `%%`.
     StripSuffix(RawWord),
-    /// `/` / `//`.
     Replace {
-        /// `true` for `//`.
         all: bool,
-        /// The literal text to find.
         pattern: RawWord,
-        /// What to put in its place.
         replacement: RawWord,
     },
 }
 
-/// A tokenizer failure.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 #[error("line {line}: {message}")]
 pub struct LexError {
-    /// One-based source line.
     pub line: usize,
-    /// Human-readable detail.
     pub message: String,
 }
 
-/// Why backtick command substitution is refused, in both quoting contexts.
 const BACKTICK_REJECTION: &str = "backtick command substitution is not supported; use `$( ... )`, which nests and quotes cleanly";
 
-/// Why descriptors other than 1 and 2 are refused.
-///
-/// There are no numbered descriptors here to open; there are exactly two streams, and naming a
-/// third would be naming something that does not exist.
 const UNKNOWN_DESCRIPTOR_REJECTION: &str = "only descriptors 1 (the value stream) and 2 (the diagnostic stream) exist in this shell; there is nothing else to redirect";
 
-/// Why input duplication is refused.
 const INPUT_DUPLICATION_REJECTION: &str = "input duplication (`<&`) is not supported: there is no input descriptor to duplicate; pipe a value or `cat` a named buffer instead";
 
-/// Why `&>&` is refused.
 const BOTH_DUPLICATION_REJECTION: &str = "`&>&` is not a redirection: `&>` already sends both streams to one buffer, so there is no second stream left to duplicate";
 
-/// Why a duplication must name a stream rather than a buffer.
 const DUPLICATION_TARGET_REJECTION: &str = "a duplication must name a stream: write `>&1` or `>&2`; to write a buffer use `> name`, `2> name`, or `&> name`";
 
-/// Why the here-string `<<<` is refused.
-///
-/// It is one character away from a here-document and means something else entirely, so it is named
-/// rather than left to fail as a malformed delimiter.
 const HERE_STRING_REJECTION: &str = "the here-string `<<<` is not supported; pipe the value instead, as in `echo \"$x\" | cmd`, or use a here-document `<<EOF ... EOF`";
 
-/// Why bash's fall-through `case` terminators are refused.
 const CASE_FALLTHROUGH_REJECTION: &str = "`;&` and `;;&` are not supported: a `case` clause here runs alone and never falls through to the next; end every clause with `;;`";
 
-/// A `<<DELIM` whose body has not been read yet.
-///
-/// The body of a here-document begins on the line *after* the operator, so the token is pushed
-/// where it appears and filled in when the scanner reaches that newline. `cat <<EOF | jq .` depends
-/// on that: the rest of the line is ordinary shell, and only then does the body start.
+/// A here-document's body begins on the line after its operator, so the token is left as a
+/// placeholder filled in once the scanner reaches that line.
 struct PendingHereDoc {
-    /// Terminator line, already unquoted.
     delimiter: String,
-    /// `<<-`: strip leading tabs from body lines and from the terminator.
     strip_tabs: bool,
-    /// Whether the body interpolates `$NAME` and `$( )`; false when the delimiter was quoted.
     expand: bool,
-    /// Line the operator appeared on, for diagnostics.
     line: usize,
-    /// Index in `tokens` of the placeholder to fill in.
     token: usize,
 }
 
@@ -304,19 +196,14 @@ impl LexError {
     }
 }
 
-/// How deeply a `${NAME[...]}` index or a `${NAME:-word}` substitute may nest.
-///
-/// Reading one re-enters the tokenizer on the native stack, so without this a few kilobytes of
-/// `${a:-${a:-${a:- ... }}}` would abort the host process instead of returning a lex error. The
-/// parser applies its own ceiling to `$( $( ... ) )` for exactly the same reason.
+/// Nesting parameter expansions re-enters the tokenizer on the native stack, so without this
+/// ceiling, deeply nested expansions would abort the process instead of returning a lex error.
 const MAX_PARAMETER_NESTING: u32 = 32;
 
-/// Tokenizes one script.
 pub fn tokenize(source: &str) -> Result<Vec<Token>, LexError> {
     Lexer::new(source, 0).run()
 }
 
-/// Tokenizes one embedded fragment already `depth` parameter expansions deep.
 fn tokenize_nested(source: &str, depth: u32, line: usize) -> Result<Vec<Token>, LexError> {
     if depth >= MAX_PARAMETER_NESTING {
         return Err(LexError::new(
@@ -336,9 +223,7 @@ struct Lexer<'a> {
     literal: String,
     word_started: bool,
     word_line: usize,
-    /// Here-documents whose operator has been seen but whose body has not started yet.
     pending_here_docs: Vec<PendingHereDoc>,
-    /// How many parameter expansions this tokenizer is already nested inside.
     depth: u32,
 }
 
@@ -365,7 +250,6 @@ impl<'a> Lexer<'a> {
                     self.finish_word();
                     self.push(TokenKind::Newline);
                     self.line += 1;
-                    // The body of every here-document opened on the line just ended starts here.
                     self.read_pending_here_doc_bodies()?;
                 }
                 ' ' | '\t' | '\r' => self.finish_word(),
@@ -374,9 +258,8 @@ impl<'a> Lexer<'a> {
                 '\'' => self.read_single_quoted()?,
                 '"' => self.read_double_quoted()?,
                 '$' => self.read_dollar(index)?,
-                // Backticks are the one dropped construct a model reaches for by reflex, so they
-                // are rejected by name rather than falling through to the literal arm below. A
-                // silent literal would hand back the source text as if the command had run.
+                // Backticks are rejected by name rather than falling through as literal text, since
+                // silently treating them as text would make a script look like its command had run.
                 '`' => return Err(LexError::new(self.line, BACKTICK_REJECTION)),
                 '|' | '&' | ';' | '<' | '>' | '(' | ')' => self.read_operator(character)?,
                 '{' | '}' if self.brace_is_reserved_word() => {
@@ -447,9 +330,6 @@ impl<'a> Lexer<'a> {
         });
     }
 
-    /// `{` and `}` are reserved words only as complete words, so `a{b}` stays one literal word.
-    ///
-    /// Brace expansion (`{a,b,c}`) is dropped: braces inside a word are ordinary characters.
     fn brace_is_reserved_word(&mut self) -> bool {
         if self.word_started {
             return false;
@@ -476,11 +356,9 @@ impl<'a> Lexer<'a> {
                 Ok(())
             }
             Some((_, character)) => {
-                // An escaped character is bash's one-character quote: `\*` and `'*'` are the same
-                // word. Recording it as a single-quoted part instead of erasing the backslash into
-                // plain literal text is what lets a `case` pattern tell `\*)` — match one literal
-                // asterisk — apart from the bare `*)` default branch, which would otherwise
-                // silently capture every subject.
+                // An escaped character is recorded as a single-quoted part, not merged into literal
+                // text, so a case pattern can tell an escaped asterisk from the bare wildcard
+                // default, which would otherwise capture everything.
                 self.push_part(RawPart::SingleQuoted(character.to_string()));
                 Ok(())
             }
@@ -518,12 +396,9 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
-    /// Scans interpolated text: literals, `$NAME`, `$( )`, and `$(( ))`.
-    ///
-    /// Shared by double-quoted strings and by the body of an unquoted here-document, because bash
-    /// interpolates both by the same rules. The one difference is which characters a backslash may
-    /// escape: `\"` is an escaped quote inside quotes and ordinary text inside a here-document,
-    /// where collapsing it would silently corrupt embedded JSON such as `{"a": "\"x\""}`.
+    /// Double-quoted strings and unquoted here-document bodies share this scanner since bash
+    /// interpolates both alike, except a backslash-quote is an escape in quotes but ordinary text
+    /// in a here-document, where collapsing it would corrupt embedded JSON.
     fn read_interpolated(
         &mut self,
         terminator: Option<char>,
@@ -590,7 +465,6 @@ impl<'a> Lexer<'a> {
         Ok(parts)
     }
 
-    /// Records a `<<DELIM` operator, leaving a placeholder token for its body.
     fn read_here_doc_header(&mut self) -> Result<(), LexError> {
         if self.chars.peek().map(|(_, character)| *character) == Some('<') {
             return Err(LexError::new(self.line, HERE_STRING_REJECTION));
@@ -623,10 +497,6 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
-    /// Reads the terminator word after `<<`, reporting whether the body interpolates.
-    ///
-    /// Any quoting anywhere in the delimiter turns interpolation off, exactly as in bash: `<<'EOF'`,
-    /// `<<"EOF"`, and `<<\EOF` all mean "this body is literal text".
     fn read_here_doc_delimiter(&mut self) -> Result<(String, bool), LexError> {
         let line = self.line;
         let mut delimiter = String::new();
@@ -653,9 +523,9 @@ impl<'a> Lexer<'a> {
                     self.chars.next();
                     quoted = true;
                     match self.chars.next() {
-                        // A line continuation here is bash's `<<\` + newline. Folding the newline
-                        // into the delimiter would make a terminator no body line can ever equal,
-                        // swallowing the rest of the script and skewing every later line number.
+                        // Folding a line continuation's newline into the here-document delimiter
+                        // would create a terminator no body line could match, swallowing the rest
+                        // of the script and skewing later line numbers.
                         Some((_, '\n')) => {
                             return Err(LexError::new(
                                 line,
@@ -687,17 +557,13 @@ impl<'a> Lexer<'a> {
         Ok((delimiter, !quoted))
     }
 
-    /// Consumes the body of every here-document opened on the line that just ended.
     fn read_pending_here_doc_bodies(&mut self) -> Result<(), LexError> {
-        // Several here-documents may open on one line (`cmd <<A <<B`); bash reads their bodies in
-        // the order the operators appeared, and so does this.
         let pending = std::mem::take(&mut self.pending_here_docs);
         for specification in pending {
             let mut body = self.read_here_doc_body(&specification)?;
-            // Drop the newline that ended the last body line. Values in this shell are not
-            // newline-terminated — `echo hi` produces `"hi"`, and emitting a value adds the line
-            // ending — so keeping it would make `cat <<EOF` print a trailing blank line that the
-            // same here-document does not produce in bash.
+            // Values in this shell are not newline-terminated, so the last body line's newline is
+            // dropped; keeping it would print an extra trailing blank line bash's heredoc does not
+            // produce.
             body.pop();
             let parts = if specification.expand {
                 Self::interpolate_here_doc_body(&body, specification.line)?
@@ -714,7 +580,6 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
-    /// Reads raw body lines up to the terminator line.
     fn read_here_doc_body(&mut self, specification: &PendingHereDoc) -> Result<String, LexError> {
         let mut body = String::new();
         loop {
@@ -731,9 +596,8 @@ impl<'a> Lexer<'a> {
                 self.line += 1;
             }
 
-            // `<<-` strips leading tabs — and only tabs, never spaces — from both the body lines
-            // and the terminator, which is what lets a here-document sit at the indentation of the
-            // block around it.
+            // The <<- form strips leading tabs only, never spaces, from both body lines and the
+            // terminator, letting a here-document be indented with its surrounding block.
             let content = if specification.strip_tabs {
                 line.trim_start_matches('\t')
             } else {
@@ -756,11 +620,8 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Interpolates an unquoted here-document body by re-scanning it as quoted-style text.
     fn interpolate_here_doc_body(body: &str, line: usize) -> Result<Vec<RawPart>, LexError> {
         let mut lexer = Lexer::new(body, 0);
-        // The body starts on the line *after* the operator, so a diagnostic from inside it counts
-        // from there. Seeding this with the operator's own line put every such error one line early.
         lexer.line = line + 1;
         lexer
             .read_interpolated(None, "unterminated here-document")
@@ -770,7 +631,6 @@ impl<'a> Lexer<'a> {
     fn read_dollar(&mut self, index: usize) -> Result<(), LexError> {
         match self.read_dollar_part(index)? {
             Some(part) => self.push_part(part),
-            // A `$` that introduces nothing recognizable is an ordinary character, as in bash.
             None => self.push_literal('$'),
         }
         Ok(())
@@ -903,7 +763,6 @@ impl<'a> Lexer<'a> {
         self.read_named_parameter(line, false)
     }
 
-    /// Reads `${NAME…}` after any leading `#`, up to and including the closing brace.
     fn read_named_parameter(&mut self, line: usize, length: bool) -> Result<RawPart, LexError> {
         let name = self.read_name();
         if name.is_empty() {
@@ -912,8 +771,6 @@ impl<'a> Lexer<'a> {
 
         let mut indices = Vec::new();
         while self.chars.peek().map(|(_, character)| *character) == Some('[') {
-            // `[@]` and `[*]` select everything, so there is nothing left for a further subscript
-            // to index into. Bash refuses the same shape.
             if matches!(indices.last(), Some(RawIndex::All | RawIndex::AllJoined)) {
                 return Err(LexError::new(
                     line,
@@ -935,7 +792,6 @@ impl<'a> Lexer<'a> {
         }))
     }
 
-    /// Reads the `${NAME<op>word}` operator, consuming the closing brace.
     fn read_modifier(
         &mut self,
         line: usize,
@@ -950,8 +806,6 @@ impl<'a> Lexer<'a> {
             Some(character) => character,
             None => return Err(LexError::new(line, "unterminated ${} parameter reference")),
         };
-        // `${#NAME}` asks for a length; there is nothing left for an operator to transform, and
-        // bash agrees. Naming it beats producing the length of a substituted default.
         if length {
             return Err(LexError::new(
                 line,
@@ -992,8 +846,6 @@ impl<'a> Lexer<'a> {
                 colon,
                 word: self.read_modifier_word(line, &['}'])?.0,
             },
-            // The doubled forms mean "longest match" in bash. A literal pattern has exactly one
-            // match, so they are the same request spelled twice and are accepted as such.
             '#' | '%' | '/' if colon => {
                 return Err(LexError::new(
                     line,
@@ -1046,10 +898,6 @@ impl<'a> Lexer<'a> {
         Ok(modifier)
     }
 
-    /// Reads the word after a `${NAME<op>` operator, stopping at one of `terminators`.
-    ///
-    /// Returns the word and the terminator that ended it. Nesting is tracked so
-    /// `${a:-${b:-c}}` and `${a:-$(cmd)}` reach their own closing brace rather than the outer one.
     fn read_modifier_word(
         &mut self,
         line: usize,
@@ -1091,14 +939,11 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Tokenizes one embedded word, for the right-hand side of a `${NAME<op>word}` expansion.
     fn sub_word(&mut self, line: usize, text: &str) -> Result<RawWord, LexError> {
         let tokens = tokenize_nested(text, self.depth + 1, line)?;
         let mut parts = Vec::new();
         for (index, token) in tokens.into_iter().enumerate() {
             match token.kind {
-                // Several words means the text held a separator; the expansion produces one value,
-                // so they are rejoined with the space that separated them.
                 TokenKind::Word(word) => {
                     if index > 0 {
                         parts.push(RawPart::SingleQuoted(" ".to_owned()));
@@ -1123,10 +968,6 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Reads one selector inside `${NAME[...]}`.
-    ///
-    /// Indexing here is backed by real JSON arrays and objects, so `[expr]` is an array offset or
-    /// an object key, `[@]` is every element, and `[*]` is every element joined.
     fn read_index(&mut self, line: usize) -> Result<RawIndex, LexError> {
         let mut text = String::new();
         let mut depth = 0_usize;
@@ -1169,7 +1010,6 @@ impl<'a> Lexer<'a> {
         Ok(RawIndex::At(word))
     }
 
-    /// Captures a balanced `$( ... )` or `$(( ... ))` body as raw source.
     fn read_balanced(
         &mut self,
         dollar_index: usize,
@@ -1181,8 +1021,6 @@ impl<'a> Lexer<'a> {
         let opened = self.line;
         let initial = depth;
         let start = dollar_index + '$'.len_utf8() + open.len_utf8() * depth;
-        // `$(( ... ))` closes two levels, so the body ends at the *first* closing parenthesis while
-        // scanning continues to the second. Recording that position keeps the captured body exact.
         let mut body_end = None;
         loop {
             let Some((index, character)) = self.chars.next() else {
@@ -1245,7 +1083,6 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// Reads the stream name after a `>&`, having already consumed the `&`.
     fn read_duplication(&mut self, source: Stream) -> Result<(), LexError> {
         let target = match self.chars.peek().map(|(_, character)| *character) {
             Some('1') => Stream::Stdout,
@@ -1253,8 +1090,6 @@ impl<'a> Lexer<'a> {
             _ => return Err(LexError::new(self.line, DUPLICATION_TARGET_REJECTION)),
         };
         self.chars.next();
-        // `>&12` would otherwise read as `>&1` followed by the argument `2`, quietly redirecting
-        // somewhere the script did not ask for.
         if self
             .chars
             .peek()
@@ -1267,9 +1102,9 @@ impl<'a> Lexer<'a> {
     }
 
     fn read_operator(&mut self, character: char) -> Result<(), LexError> {
-        // `2>`, `2>>`, and `2>&1` are a bare descriptor glued to a redirection operator. The digit
-        // belongs to the operator, not to argv: letting it finish as an ordinary word would send
-        // `echo hi 2> log` the argument `2` and redirect its *value* into `log`.
+        // A leading descriptor digit, as in 2>, belongs to the redirection operator, not to argv;
+        // treating it as an ordinary word would redirect the command's own output where the script
+        // never asked.
         let mut source = Stream::Stdout;
         if character == '>'
             && self.word_started
@@ -1282,8 +1117,6 @@ impl<'a> Lexer<'a> {
                 "2" => Stream::Stderr,
                 _ => return Err(LexError::new(self.line, UNKNOWN_DESCRIPTOR_REJECTION)),
             };
-            // Consumed as the operator's prefix, so it must not also become a word. Clearing the
-            // literal alone would leave `finish_word` pushing an empty word onto argv.
             self.literal.clear();
             self.word_started = false;
         } else if character == '<'
@@ -1313,8 +1146,6 @@ impl<'a> Lexer<'a> {
                 self.chars.next();
                 TokenKind::AndAnd
             }
-            // `&>` and `&>>` send both streams to one buffer. Checked after `&&` so that a
-            // conjunction is never read as a redirection.
             ('&', Some('>')) => {
                 self.chars.next();
                 if self.chars.peek().map(|(_, character)| *character) == Some('&') {
@@ -1332,8 +1163,6 @@ impl<'a> Lexer<'a> {
             ('&', _) => TokenKind::Ampersand,
             (';', Some(';')) => {
                 self.chars.next();
-                // `;;&` and `;&` are bash's two fall-through terminators. Reading either as a
-                // plain `;;` would run one clause where the script asked for several.
                 if self.chars.peek().map(|(_, character)| *character) == Some('&') {
                     return Err(LexError::new(self.line, CASE_FALLTHROUGH_REJECTION));
                 }
@@ -1511,8 +1340,6 @@ mod tests {
 
     #[test]
     fn every_dropped_parameter_expansion_is_rejected_by_name() {
-        // One case per rejection branch, so a branch that regresses to falling through to
-        // `read_name` (where `${#x}` would quietly become the positional count `$#`) fails here.
         for (source, expected) in [
             ("echo ${arr[@][0]}", "cannot be indexed further"),
             (
@@ -1560,8 +1387,6 @@ mod tests {
             assert!(error.message.contains("backtick"), "{source}: {error}");
             assert!(error.message.contains("$( ... )"), "{source}: {error}");
         }
-        // An escaped backtick is ordinary text in both bash and here; escapes lex as
-        // single-quoted parts so words remember which characters were quoted.
         assert_eq!(
             single_word(r"\`"),
             vec![RawPart::SingleQuoted("`".to_owned())]
@@ -1603,8 +1428,6 @@ mod tests {
             target: Stream::Stderr
         }));
 
-        // A digit that is a plain argument, separated from the operator, still redirects the value
-        // stream and stays on argv.
         let separated = kinds("echo 2 > buf");
         assert!(separated.contains(&TokenKind::Redirect {
             source: Stream::Stdout,
@@ -1615,7 +1438,6 @@ mod tests {
             TokenKind::Word(word) if word.parts == vec![RawPart::Literal("2".to_owned())]
         )));
 
-        // A glued descriptor is consumed by the operator and must not also reach argv.
         assert!(!kinds("echo hi 2> buf").iter().any(|kind| matches!(
             kind,
             TokenKind::Word(word) if word.parts == vec![RawPart::Literal("2".to_owned())]
@@ -1676,7 +1498,6 @@ mod tests {
             ]
         );
 
-        // Any quoting of the delimiter turns the whole body literal, as in bash.
         for source in [
             "cat <<'EOF'\nid=$id\nEOF\n",
             "cat <<\"EOF\"\nid=$id\nEOF\n",
@@ -1695,8 +1516,6 @@ mod tests {
 
     #[test]
     fn a_here_document_body_keeps_backslashes_that_json_depends_on() {
-        // `\"` is an escaped quote inside double quotes and ordinary text in a here-document.
-        // Collapsing it here would silently rewrite embedded JSON.
         let TokenKind::HereDoc(body) = &kinds("cat <<EOF\n{\"a\": \"\\\"x\\\"\"}\nEOF\n")[1] else {
             panic!("expected a here-document token");
         };
@@ -1713,13 +1532,11 @@ mod tests {
         };
         assert_eq!(body.parts, vec![RawPart::Literal("indented".to_owned())]);
 
-        // Only tabs, never spaces: a space-indented terminator does not close the document.
         assert!(tokenize("cat <<-EOF\nbody\n    EOF\n").is_err());
     }
 
     #[test]
     fn the_rest_of_the_operator_line_is_ordinary_shell() {
-        // `cat <<EOF | jq .` must keep working: the body starts on the next line, not immediately.
         let tokens = kinds("cat <<EOF | jq .\n{\"a\":1}\nEOF\n");
         assert!(matches!(tokens[1], TokenKind::HereDoc(_)));
         assert!(tokens.contains(&TokenKind::Pipe));
@@ -1746,16 +1563,12 @@ mod tests {
 
     #[test]
     fn a_diagnostic_inside_a_here_document_body_counts_from_the_body() {
-        // The body starts on the line after the operator. Seeding the sub-scanner with the
-        // operator's own line reported every error inside a body one line early.
         let error = tokenize("echo one\ncat <<EOF\nbad `sub`\nEOF\n").expect_err("backticks");
         assert_eq!(error.line, 3, "{error}");
     }
 
     #[test]
     fn a_here_document_delimiter_cannot_be_split_across_lines() {
-        // `<<\` + newline is a line continuation in bash. Folding the newline into the delimiter
-        // produced a terminator no line could match, swallowing the rest of the script.
         let error = tokenize("cat <<\\\nEOF\nbody\nEOF\n").expect_err("a split delimiter");
         assert!(error.message.contains("cannot be split"), "{error}");
     }
@@ -1794,7 +1607,6 @@ mod tests {
                 TokenKind::RightBrace,
             ]
         );
-        // Brace expansion is dropped, so `{a,b}` stays one literal word.
         assert_eq!(
             single_word("{a,b}"),
             vec![RawPart::Literal("{a,b}".to_owned())]

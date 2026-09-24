@@ -68,15 +68,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
-/// Whether invoking a capability can cause an externally observable effect.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum EffectKind {
-    /// Reads data without intentionally mutating local or external state.
     ReadOnly,
-    /// Mutates only broker-controlled local state.
     LocalWrite,
-    /// Mutates a system outside the Dekopon trust boundary.
     ExternalWrite,
 }
 
@@ -91,48 +87,29 @@ impl fmt::Display for EffectKind {
     }
 }
 
-/// A provider permission needed to execute a capability.
 #[derive(Clone, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Permission {
-    /// Provider-specific operation, such as `pull_requests:read`.
     pub operation: String,
-    /// Optional provider-specific resource scope.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource: Option<String>,
 }
 
-/// An invocation proposed by a model, agent, or human.
-///
-/// This type carries intent but no authority to execute an external effect.
-///
-/// Deliberately not [`Deserialize`]: the wire type a broker decodes is
-/// `dekopon_broker_protocol::InvocationRequest`, which the broker converts here after
-/// authenticating the envelope. Deriving `Deserialize` would offer a decoding path that no caller
-/// should take.
+/// Not Deserialize: the broker converts this from a separate wire type only after authenticating
+/// the envelope, so no caller can decode one directly.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ProposedInvocation {
-    /// Unique invocation identifier.
     pub id: InvocationId,
-    /// Requested capability.
     pub capability: CapabilityId,
-    /// Authenticated actor attributed by the trusted message envelope.
     pub actor: Actor,
-    /// End-to-end trace identifier.
     pub trace: TraceId,
-    /// Optional typed intent to use one public secret reference in a broker-native sink.
-    ///
-    /// This is untrusted proposal data, never provider input or authority. Omitted serialization
-    /// preserves the exact bytes of every legacy authorization/evidence record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_use: Option<SecretUseProposal>,
-    /// Capability-specific, untrusted arguments.
     pub input: Value,
 }
 
 impl ProposedInvocation {
-    /// Constructs an unprivileged invocation proposal.
     #[must_use]
     pub fn new(
         id: InvocationId,
@@ -151,7 +128,6 @@ impl ProposedInvocation {
         }
     }
 
-    /// Attaches typed, untrusted secret-use intent without placing it in provider JSON.
     #[must_use]
     pub fn with_secret_use(mut self, secret_use: Option<SecretUseProposal>) -> Self {
         self.secret_use = secret_use;
@@ -159,21 +135,14 @@ impl ProposedInvocation {
     }
 }
 
-/// Broker-enforced buffered HTTP limits attached to one authorization.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct HttpConstraints {
-    /// Exact DNS names or IP authorities the invocation may contact.
     pub allowed_hosts: Vec<String>,
-    /// Exact case-sensitive HTTP method tokens the invocation may use.
     pub allowed_methods: Vec<String>,
-    /// Maximum number of HTTP requests in this provider invocation.
     pub max_requests: u32,
-    /// Maximum encoded request bytes, including headers and body.
     pub max_request_bytes: u64,
-    /// Maximum encoded response bytes, including headers and body.
     pub max_response_bytes: u64,
-    /// Whether explicitly allowed loopback hosts may use plaintext HTTP.
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_plaintext_loopback: bool,
 }
@@ -182,24 +151,13 @@ const fn is_false(value: &bool) -> bool {
     !*value
 }
 
-/// Maximum host or method entries one HTTP grant may carry.
 pub const MAX_HTTP_SCOPE_ENTRIES: usize = 64;
-/// Maximum bytes in one allowed-host entry.
 pub const MAX_HTTP_HOST_BYTES: usize = 512;
-/// Maximum bytes in one allowed-method token.
 pub const MAX_HTTP_METHOD_BYTES: usize = 64;
 
 impl HttpConstraints {
-    /// Checks that the grant is exact: bounded, non-empty, and made of entries the enforcing
-    /// host can actually match.
-    ///
-    /// This is the one definition of the entry grammar the documented fields promise. A grant
-    /// that passes any construction path but fails here would be accepted at startup and then
-    /// deny every call at runtime, so it is refused where it is built instead.
-    ///
-    /// # Errors
-    ///
-    /// Returns the first rule the grant violates.
+    /// This is the one definition of the grant's entry grammar; validating here catches a bad grant
+    /// before it silently denies every call at runtime.
     pub fn validate(&self) -> Result<(), HttpConstraintsError> {
         if self.allowed_hosts.is_empty() {
             return Err(HttpConstraintsError::NoHosts);
@@ -239,8 +197,6 @@ impl HttpConstraints {
     }
 }
 
-/// An exact authority: a host, or a host and port, with nothing a URL parser would read as
-/// structure and no wildcard.
 fn is_authority_scope(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= MAX_HTTP_HOST_BYTES
@@ -251,7 +207,6 @@ fn is_authority_scope(value: &str) -> bool {
         && !value.contains(['/', '?', '#', '@', '*'])
 }
 
-/// An RFC 9110 token, which is what an HTTP method is.
 fn is_http_token(value: &str) -> bool {
     !value.is_empty()
         && value.bytes().all(|byte| {
@@ -276,39 +231,22 @@ fn is_http_token(value: &str) -> bool {
         })
 }
 
-/// Why an HTTP grant is not exact enough to enforce.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum HttpConstraintsError {
-    /// HTTP was granted without an exact destination.
     #[error("HTTP authorization requires at least one allowed host")]
     NoHosts,
-    /// HTTP was granted without an exact method.
     #[error("HTTP authorization requires at least one allowed method")]
     NoMethods,
-    /// The host or method list exceeded the scope bound.
     #[error("HTTP authorization allows at most {maximum} host or method entries")]
-    TooManyEntries {
-        /// Entry bound per list.
-        maximum: usize,
-    },
-    /// An allowed host was not an exact authority.
+    TooManyEntries { maximum: usize },
     #[error("HTTP allowed host {value:?} is not an exact authority")]
-    InvalidHost {
-        /// The rejected entry.
-        value: String,
-    },
-    /// An allowed method was not an exact HTTP token.
+    InvalidHost { value: String },
     #[error("HTTP allowed method {value:?} is not an exact HTTP method token")]
-    InvalidMethod {
-        /// The rejected entry.
-        value: String,
-    },
-    /// HTTP was granted without positive call and byte limits.
+    InvalidMethod { value: String },
     #[error("HTTP authorization limits must be greater than zero")]
     ZeroLimit,
 }
 
-/// One canonical path rule for a secret-bearing HTTP request.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "match", rename_all = "camelCase", deny_unknown_fields)]
 pub enum HttpPathRule {
@@ -317,7 +255,6 @@ pub enum HttpPathRule {
 }
 
 impl HttpPathRule {
-    /// Validates the deliberately restrictive path grammar shared with the native host.
     pub fn validate(&self) -> Result<(), SecretUseGrantError> {
         let path = self.path();
         if !canonical_secret_path(path) {
@@ -328,7 +265,6 @@ impl HttpPathRule {
         Ok(())
     }
 
-    /// Returns the configured canonical path.
     #[must_use]
     pub fn path(&self) -> &str {
         match self {
@@ -336,7 +272,6 @@ impl HttpPathRule {
         }
     }
 
-    /// Matches the canonical path produced by the HTTP host's URL parser.
     #[must_use]
     pub fn matches(&self, candidate: &str) -> bool {
         match self {
@@ -366,7 +301,6 @@ fn canonical_secret_path(path: &str) -> bool {
             .all(|segment| !matches!(segment, "." | ".."))
 }
 
-/// Effective owner-authored scope attached to authorization for one proposed DRN use.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SecretUseGrant {
@@ -380,15 +314,12 @@ pub struct SecretUseGrant {
     #[serde(default, skip_serializing_if = "is_false")]
     pub allow_query: bool,
     pub max_injections: u32,
-    /// Stable owner-authored binding identifier committed into authorization and evidence.
     pub binding_id: String,
-    /// Owner-authored private-map revision selecting the physical source semantics.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub map_revision: Option<String>,
 }
 
 impl SecretUseGrant {
-    /// Validates exact bounded scope independently of any capability's broader HTTP grant.
     pub fn validate(&self) -> Result<(), SecretUseGrantError> {
         if self.allowed_hosts.is_empty()
             || self.allowed_methods.is_empty()
@@ -446,7 +377,6 @@ impl SecretUseGrant {
     }
 }
 
-/// Why a secret-use grant is not exact enough to enforce.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum SecretUseGrantError {
     #[error("secret use requires nonempty host, method, and path scopes")]
@@ -465,79 +395,59 @@ pub enum SecretUseGrantError {
     InvalidUsername,
 }
 
-/// Exact component storage interface selected for one capability.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StorageInterface {
-    /// Curated per-call JSONL operations.
     Jsonl,
-    /// Engine-neutral positional durable-file operations.
     DurableFiles,
 }
 
-/// Storage mutation authority selected for one capability.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StorageAccess {
-    /// Reads only; every mutating host call is terminally denied.
     ReadOnly,
-    /// Reads and direct per-call writes.
     ReadWrite,
 }
 
-/// Broker-owned logical namespace class.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum StorageNamespace {
-    /// Owner-private chat memory, scoped from trusted chat attestation.
     Chat,
 }
 
-/// Exact namespace-bound storage authority attached to one capability.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct StorageConstraints {
-    /// The only storage interface this invocation may call.
     pub interface: StorageInterface,
-    /// Whether mutation is permitted.
     pub access: StorageAccess,
-    /// Broker-owned namespace class; guests never supply namespace material.
+    /// Namespace is broker-owned; guests can never supply or influence it themselves.
     pub namespace: StorageNamespace,
 }
 
-/// Exact mutation grants for the conversation's temporary assets.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct AssetConstraints {
-    /// Permit attaching newly written assets to the conversation.
     #[serde(default)]
     pub attach: bool,
-    /// Permit removing assets that have not been sent.
     #[serde(default)]
     pub remove: bool,
-    /// Permit marking assets for external delivery on the reply.
     #[serde(default)]
     pub send: bool,
 }
 
-/// Broker-enforced execution limits attached to an authorization.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct ExecutionConstraints {
-    /// Maximum wall-clock duration allowed for provider execution.
     pub timeout_ms: u64,
-    /// Maximum serialized provider output size.
     pub max_output_bytes: u64,
-    /// Optional buffered HTTP grant. Its absence permits no HTTP host calls.
+    /// Its absence means no HTTP host calls are permitted at all, not unrestricted access.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http: Option<HttpConstraints>,
-    /// Optional exact storage grant. HTTP and storage cannot coexist in v1.
+    /// HTTP and storage grants are mutually exclusive; a capability cannot combine both in v1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage: Option<StorageConstraints>,
-    /// Optional asset mutation grant; absence permits reading passed inputs only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub asset: Option<AssetConstraints>,
-    /// Optional effective scope for one separately authorized public DRN.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_use: Option<SecretUseGrant>,
 }
@@ -555,14 +465,6 @@ impl Default for ExecutionConstraints {
     }
 }
 
-/// Evidence that an authorization decision occurred.
-///
-/// Receipts are emitted by the broker transition and cannot be assembled with a public
-/// struct literal.
-///
-/// The accessors below exist for evidence and audit inspection inside the broker boundary.
-/// Receipt data reaches every other consumer by [`Serialize`] into the evidence digest, not by
-/// being read field by field.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthorizationReceipt {
@@ -572,32 +474,24 @@ pub struct AuthorizationReceipt {
 }
 
 impl AuthorizationReceipt {
-    /// Stable broker decision identifier.
     #[must_use]
     pub fn decision_id(&self) -> &str {
         &self.decision_id
     }
 
-    /// Trusted principal that authorized the transition.
     #[must_use]
     pub fn authorized_by(&self) -> &PrincipalId {
         &self.authorized_by
     }
 
-    /// Policy revision evaluated by the broker.
     #[must_use]
     pub fn policy_revision(&self) -> &str {
         &self.policy_revision
     }
 }
 
-/// An invocation for which a broker has explicitly granted authority.
-///
-/// Private fields prevent accidental conversion from an untrusted proposal. The selected provider
-/// is bound alongside the proposal and constraints. The value is not cloneable or deserializable:
-/// the broker-owned execution boundary creates and consumes it once. It is serializable as
-/// inert data for broker-owned audit and evidence recording, but its serialized form is not a
-/// transferable bearer grant and intentionally cannot be deserialized.
+/// Not Clone or Deserialize: the broker creates and consumes this once, and its serialized form
+/// must never be treated as a reusable bearer grant.
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthorizedInvocation {
@@ -608,138 +502,92 @@ pub struct AuthorizedInvocation {
 }
 
 impl AuthorizedInvocation {
-    /// Returns the original untrusted proposal.
     #[must_use]
     pub fn proposal(&self) -> &ProposedInvocation {
         &self.proposal
     }
 
-    /// Returns the exact provider selected by trusted policy and routing.
     #[must_use]
     pub fn provider(&self) -> &ProviderId {
         &self.provider
     }
 
-    /// Returns the broker authorization receipt.
     #[must_use]
     pub fn receipt(&self) -> &AuthorizationReceipt {
         &self.receipt
     }
 
-    /// Returns constraints the provider host must enforce.
     #[must_use]
     pub fn constraints(&self) -> &ExecutionConstraints {
         &self.constraints
     }
 }
 
-/// Public, inert linkage to the broker decision behind an invocation result.
-///
-/// Unlike [`AuthorizationReceipt`], this value is deserializable because it carries no execution
-/// authority and cannot be converted into an [`AuthorizedInvocation`].
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct DecisionReference {
-    /// Stable broker decision identifier.
     pub decision_id: String,
-    /// Broker principal that owned the authority transition.
     pub authorized_by: PrincipalId,
-    /// Exact evaluated policy revision.
     pub policy_revision: String,
 }
 
-/// A piece of evidence produced during authorization or execution.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct Evidence {
-    /// Evidence category, such as `provider-response` or `policy-decision`.
     pub kind: String,
-    /// Digest of canonical evidence bytes.
     pub digest: String,
-    /// Media type of the referenced evidence.
     pub media_type: String,
-    /// Optional durable reference; secrets must never be embedded here.
+    /// This is only a durable reference; secrets must never be embedded in it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uri: Option<String>,
 }
 
-/// Terminal state of an attempted invocation.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "PascalCase")]
 pub enum InvocationOutcome {
-    /// Provider execution completed successfully.
     Succeeded,
-    /// Authorization denied execution.
     Denied,
-    /// Provider execution began but failed.
     Failed,
 }
 
-/// Serializable result and evidence for an invocation.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct InvocationResult {
-    /// Invocation identifier.
     pub invocation: InvocationId,
-    /// Inert linkage to the broker decision and policy revision.
     pub decision: DecisionReference,
-    /// Terminal state.
     pub outcome: InvocationOutcome,
-    /// Provider output when available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<Value>,
-    /// Concise failure reason when available.
-    ///
-    /// The broker's own stable classification, and the only failure field a caller branches on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// The provider's own failure code and message, when [`Self::error`] classified one.
-    ///
-    /// Present only for a typed provider failure; a host, transport, or storage failure has no
-    /// provider sentence to carry. It explains the classification rather than replacing it, so a
-    /// caller reads `error` to decide and this to say why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<ProviderFailureDetail>,
-    /// Evidence records collected during the invocation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<Evidence>,
 }
 
-/// Failure to apply the broker authorization transition.
 #[derive(Clone, Debug, Eq, Error, PartialEq)]
 pub enum AuthorizationError {
-    /// The broker supplied an empty decision identifier.
     #[error("authorization decision identifier must not be empty")]
     EmptyDecisionId,
-    /// The broker supplied an empty policy revision.
     #[error("authorization policy revision must not be empty")]
     EmptyPolicyRevision,
-    /// Provider execution was authorized without a positive timeout.
     #[error("authorization timeout must be greater than zero")]
     ZeroTimeout,
-    /// Provider execution was authorized without a positive output bound.
     #[error("authorization output limit must be greater than zero")]
     ZeroOutputLimit,
-    /// The HTTP grant was not exact enough to enforce.
     #[error(transparent)]
     InvalidHttp(#[from] HttpConstraintsError),
-    /// HTTP and storage authority were combined in one v1 capability.
     #[error("HTTP and storage authority cannot coexist in one capability")]
     MixedHttpAndStorage,
-    /// Proposed DRN/sink intent and the effective broker grant disagreed.
     #[error("authorization secret-use proposal does not match its effective grant")]
     SecretUseMismatch,
-    /// Effective secret-use scope was structurally invalid.
     #[error(transparent)]
     InvalidSecretUse(#[from] SecretUseGrantError),
 }
 
-/// Broker-only authority transition.
-///
-/// `AuthorizationGate` is constructed only by trusted broker code after its deployment boundary
-/// has authenticated a caller and evaluated policy. Public construction lets a separately
-/// packaged broker adapter own the transition; it does not authenticate anything by itself and
-/// must never be driven directly from model-provided data.
+/// Public so a separate broker adapter can own the transition, but construction authenticates
+/// nothing; never drive this directly from model-provided data.
 pub mod broker {
     use dekopon_core::{PrincipalId, ProviderId};
 
@@ -748,7 +596,6 @@ pub mod broker {
         ProposedInvocation,
     };
 
-    /// Handle that owns the proposal-to-authorization state transition.
     #[derive(Debug)]
     pub struct AuthorizationGate {
         _private: (),
@@ -759,17 +606,11 @@ pub mod broker {
         reason = "authority transitions should require an explicit broker-owned constructor"
     )]
     impl AuthorizationGate {
-        /// Creates a transition handle for trusted broker code.
-        ///
-        /// Construction itself conveys no authenticated identity or policy decision. Keep this
-        /// handle inside the privileged broker process and call [`Self::authorize`] only after
-        /// those checks have completed.
         #[must_use]
         pub const fn new() -> Self {
             Self { _private: () }
         }
 
-        /// Converts a proposal only after a broker has made an authorization decision.
         pub fn authorize(
             &self,
             proposal: ProposedInvocation,
@@ -854,9 +695,6 @@ mod tests {
         )
     }
 
-    /// `Display` feeds operator errors; serde feeds manifests and constraint-set
-    /// decoding. Both spellings are hand-written once each, so nothing but this test stops a new
-    /// variant from rendering one string to an operator and a different one to the audit record.
     #[test]
     fn display_matches_the_serde_rendering_for_every_variant() {
         for effect in [
@@ -942,8 +780,6 @@ mod tests {
                 },
                 HttpConstraintsError::ZeroLimit,
             ),
-            // Entries the gate used to wave through, which then matched no authority the host
-            // could compute and denied every call at runtime.
             (
                 HttpConstraints {
                     allowed_hosts: vec![" api.github.com".to_owned()],
@@ -1020,7 +856,6 @@ mod tests {
         }
     }
 
-    /// An authority with a port, and every method token the broker's own policies use.
     #[test]
     fn broker_gate_accepts_exact_http_authority() {
         let http = HttpConstraints {

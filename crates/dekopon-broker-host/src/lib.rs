@@ -1,9 +1,3 @@
-//! Broker-owned bounded asynchronous WebAssembly provider hosting.
-//!
-//! This crate is the privileged host for the separately deployed broker: it accepts an
-//! [`AuthorizedInvocation`], links only the project-owned buffered HTTP and namespace-bound
-//! storage interfaces, and applies the invocation's exact host-call constraints in a fresh store.
-
 #![cfg_attr(
     test,
     allow(
@@ -81,75 +75,39 @@ pub(crate) mod bindings {
     });
 }
 
-/// Provider export package mirrored into the broker host bindings.
 pub const PROVIDER_WIT: &str = include_str!("../wit/deps/provider.wit");
-/// Buffered HTTP package mirrored into the broker host bindings.
 pub const HTTP_WIT: &str = include_str!("../wit/deps/http.wit");
-/// Namespace-bound storage package mirrored into the broker host bindings.
 pub const STORAGE_WIT: &str = include_str!("../wit/deps/storage.wit");
 
-/// Hard maximum source bytes for one provider component (64 MiB).
 pub const HARD_MAX_PROVIDER_COMPONENT_BYTES: u64 = 64 * 1024 * 1024;
-/// Default maximum HTTP calls in one invocation.
 pub const DEFAULT_MAX_HTTP_REQUESTS: u32 = 32;
-/// Default maximum accounted HTTP request bytes (1 MiB).
 pub const DEFAULT_MAX_HTTP_REQUEST_BYTES: u64 = 1024 * 1024;
-/// Default maximum accounted HTTP response bytes (4 MiB).
 pub const DEFAULT_MAX_HTTP_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
-/// Default maximum HTTP header count in either direction.
 pub const DEFAULT_MAX_HTTP_HEADERS: usize = 128;
-/// Default maximum aggregate HTTP header bytes in either direction (64 KiB).
 pub const DEFAULT_MAX_HTTP_HEADER_BYTES: usize = 64 * 1024;
-/// Default Wasm instruction fuel supplied to each store.
-///
-/// Durable-memory compaction parses the bounded near-threshold turn and dedup files and emits one
-/// multi-megabyte replacement inside the guest. The independent wall-clock deadline still bounds
-/// execution; this ceiling keeps the default valid memory limits from deterministically trapping
-/// on their first full compaction.
+/// Fuel is set high enough that durable-memory compaction's multi-megabyte rewrite completes
+/// without trapping before the wall-clock deadline does.
 pub const DEFAULT_FUEL: u64 = 8_000_000_000;
-/// Host ceiling for one provider description or invocation.
 pub const DEFAULT_MAX_TIMEOUT: Duration = Duration::from_secs(30);
-/// Default aggregate guest linear memory across concurrently live stores (256 MiB).
-///
-/// [`BrokerHostLimits::max_memory_bytes`] bounds one store; nothing bounded all of them together
-/// until this default existed, so the effective ceiling was the daemon's connection ceiling times
-/// the per-store ceiling — 4 GiB at `dekopon-brokerd`'s defaults, a number the container's OOM
-/// killer enforced rather than the broker. 256 MiB is four concurrent stores at the default 64 MiB
-/// per store, which is the value `crates/dekopon-brokerd/README.md` and the Helm chart already
-/// carried as the example worth copying. A deployment that wants more concurrency raises it; one
-/// that genuinely wants the old unbounded behavior writes `maxTotalMemoryBytes: null`.
+/// Bounds guest memory across all live stores, since max_memory_bytes only bounds one; set it to
+/// null for the old unbounded behavior.
 pub const DEFAULT_MAX_TOTAL_MEMORY_BYTES: usize = 256 * 1024 * 1024;
 
-/// Broker-owned ceilings that authorization may narrow but never widen.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrokerHostLimits {
-    /// Maximum size of each linear memory in one fresh store.
     pub max_memory_bytes: usize,
-    /// Maximum elements in each Wasm table.
     pub max_table_elements: usize,
-    /// Maximum core instances in one store.
     pub max_instances: usize,
-    /// Maximum tables in one store.
     pub max_tables: usize,
-    /// Maximum linear memories in one store.
     pub max_memories: usize,
-    /// Maximum serialized invocation input.
     pub max_input_bytes: usize,
-    /// Maximum serialized manifest or invocation output.
     pub max_output_bytes: usize,
-    /// Maximum HTTP calls accepted in one invocation.
     pub max_http_requests: u32,
-    /// Maximum authorized accounted request bytes.
     pub max_http_request_bytes: u64,
-    /// Maximum authorized accounted response bytes.
     pub max_http_response_bytes: u64,
-    /// Maximum HTTP header count in a request or response.
     pub max_http_headers: usize,
-    /// Maximum aggregate HTTP header bytes in a request or response.
     pub max_http_header_bytes: usize,
-    /// Wasm fuel in one fresh store.
     pub fuel: u64,
-    /// Maximum wall-clock duration accepted from an authorization.
     pub max_timeout: Duration,
 }
 
@@ -174,36 +132,13 @@ impl Default for BrokerHostLimits {
     }
 }
 
-/// Operational broker-host settings that are deliberately not part of the authority surface.
-///
-/// Nothing here narrows or widens what an authorization may do, which is why it is separate from
-/// [`BrokerHostLimits`]: the broker commits its host ceilings into the effective-authority
-/// generation, and pointing a compilation cache at a different directory must not rotate that.
-/// [`Self::plaintext_hosts`] sits here for that same reason from the other side: it decides which
-/// destinations the native HTTP host will speak plaintext to, which is a transport rule rather
-/// than a bound an authorization could narrow, and an owner adding a LAN host to it must not
-/// rotate every stored chat-memory namespace.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BrokerHostOptions {
-    /// Broker-owned persistent directory for immutable, mmap-backed compiled artifacts.
-    ///
-    /// `None` compiles from Wasm without a cache. Managed broker configurations derive this
-    /// from the provider store unless `compileOnLoad` is true. The operator must not modify
-    /// mapped files while the registry lives; hashes are verified once at registry startup.
+    /// None compiles without a cache; the operator must not modify these mapped files while the
+    /// registry is alive, since hashes are checked once at startup.
     pub cwasm_dir: Option<PathBuf>,
-    /// Aggregate guest linear memory reservable across concurrently live stores.
-    ///
-    /// [`BrokerHostLimits::max_memory_bytes`] bounds one invocation; this bounds all of them at
-    /// once, so a daemon that accepts many connections refuses cleanly instead of being OOM-killed.
-    /// Defaults to [`DEFAULT_MAX_TOTAL_MEMORY_BYTES`]. `None` leaves the aggregate unbounded, which
-    /// is only safe when the connection ceiling multiplied by the per-store ceiling still fits the
-    /// container.
     pub max_total_memory_bytes: Option<usize>,
-    /// Exact hostnames plaintext HTTP is permitted to besides loopback.
-    ///
-    /// Empty — the default — is the loopback-only rule every deployment starts with.
     pub plaintext_hosts: PlaintextHosts,
-    /// Additional HTTPS roots, independent of the destination egress rule.
     pub extra_ca_bundles: Arc<Vec<Vec<u8>>>,
     /// Exact private HTTPS destinations; never populated from provider input.
     pub non_public_https: Arc<Vec<NonPublicHttpsAuthority>>,
@@ -224,11 +159,6 @@ impl Default for BrokerHostOptions {
     }
 }
 
-/// One content-locked provider component the broker may compile.
-///
-/// The expected identity is checked against the exact buffer passed to Wasmtime, rather than a
-/// separate preflight read. This closes the gap between a generated provider lock and the bytes the
-/// privileged host actually executes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LockedProviderSource {
     path: PathBuf,
@@ -238,13 +168,6 @@ pub struct LockedProviderSource {
 }
 
 impl LockedProviderSource {
-    /// Creates a locked source after validating the canonical lowercase SHA-256 spelling.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerHostError::InvalidArtifactSize`] when the expected byte length is zero or
-    /// above the hard source ceiling, and [`BrokerHostError::InvalidArtifactDigest`] when
-    /// `artifact_sha256` is not exactly sixty-four lowercase hexadecimal characters.
     pub fn new(
         path: impl Into<PathBuf>,
         artifact_bytes: u64,
@@ -273,25 +196,21 @@ impl LockedProviderSource {
         })
     }
 
-    /// Returns the local component path.
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
 
-    /// Returns the expected component byte length.
     #[must_use]
     pub const fn artifact_bytes(&self) -> u64 {
         self.artifact_bytes
     }
 
-    /// Returns the expected lowercase SHA-256 digest.
     #[must_use]
     pub fn artifact_sha256(&self) -> &str {
         &self.artifact_sha256
     }
 
-    /// Returns the provider identity the component must describe.
     #[must_use]
     pub fn provider_id(&self) -> &ProviderId {
         &self.provider_id
@@ -322,18 +241,11 @@ impl From<LockedProviderSource> for ProviderSource {
     }
 }
 
-/// Upper bound on the fuel a store may burn between async yields.
-///
-/// A store holding billions of units of fuel must still hand the executor back often enough for the
-/// wall-clock deadline to fire, so the interval is capped independently of the fuel ceiling. Kept
-/// private so the policy has exactly one definition: [`BrokerHostLimits::fuel_yield_interval`].
+/// Capped independently of the fuel ceiling so a store holding huge fuel still yields to the
+/// executor often enough for the wall-clock deadline to fire.
 const MAX_FUEL_YIELD_INTERVAL: u64 = 10_000;
 
 impl BrokerHostLimits {
-    /// Returns the fuel interval every store built from these limits actually yields on.
-    ///
-    /// An operational view that re-derived this from [`fuel`](Self::fuel) would keep displaying the
-    /// old formula after the policy changed, with no compile error and no failing test.
     #[must_use]
     pub const fn fuel_yield_interval(&self) -> u64 {
         if self.fuel < MAX_FUEL_YIELD_INTERVAL {
@@ -343,7 +255,6 @@ impl BrokerHostLimits {
         }
     }
 
-    /// The subset of these ceilings Wasmtime enforces on one fresh store.
     fn store_bounds(&self) -> StoreLimits {
         StoreLimits {
             max_memory_bytes: self.max_memory_bytes,
@@ -355,18 +266,10 @@ impl BrokerHostLimits {
     }
 }
 
-/// Failed broker-provider invocation and the evidence for calls that already executed.
-///
-/// An invocation can fail after the guest has already dispatched authorized HTTP requests, so
-/// the terminal failure carries the same sanitized metadata a success would have carried. The
-/// evidence is empty only when the failure preceded any dispatch.
 #[derive(Debug)]
 pub struct BrokerInvocationFailure {
-    /// Host failure that ended the invocation.
     pub error: Box<BrokerHostError>,
-    /// Sanitized metadata for every HTTP call dispatched before the failure.
     pub http_calls: Vec<HttpCallEvidence>,
-    /// Content-free storage evidence when a storage invocation began.
     pub storage: Option<StorageEvidence>,
 }
 
@@ -392,30 +295,19 @@ impl std::error::Error for BrokerInvocationFailure {
     }
 }
 
-/// Successful broker-provider output and bounded HTTP evidence metadata.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrokerInvocationOutput {
-    /// Successful typed asset effects and their read-only files.
     #[serde(skip)]
     pub assets: asset::AssetOutputs,
-    /// Provider selected by the trusted capability route.
     pub provider: ProviderId,
-    /// Invoked capability.
     pub capability: CapabilityId,
-    /// Valid JSON returned by the provider.
     pub output: Value,
-    /// Sanitized HTTP metadata emitted by the host.
     pub http_calls: Vec<HttpCallEvidence>,
-    /// Content-free storage evidence when this invocation used storage.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage: Option<StorageEvidence>,
 }
 
-/// Aggregate guest-memory reservation shared by every live store in one runtime.
-///
-/// Reservation is pessimistic — a store books its whole per-invocation ceiling whether or not the
-/// guest ever grows into it — because the point is to refuse before the allocation exists.
 #[derive(Debug)]
 struct MemoryBudget {
     maximum: usize,
@@ -438,7 +330,6 @@ impl MemoryBudget {
     }
 }
 
-/// Releases one store's reservation on every path a store can end on, including cancellation.
 struct MemoryReservation {
     budget: Arc<MemoryBudget>,
     bytes: usize,
@@ -456,9 +347,6 @@ struct Runtime {
     engine: Engine,
     engine_key: String,
     cwasm: Option<cwasm::Cache>,
-    // One linker for the whole process. Its contents are fixed by the generated bindings, so
-    // rebuilding it per call only re-registered the same host functions and forced every
-    // instantiation to resolve imports from scratch.
     linker: Linker<StoreState>,
     limits: BrokerHostLimits,
     memory_budget: Option<Arc<MemoryBudget>>,
@@ -548,9 +436,6 @@ impl Runtime {
         store
             .fuel_async_yield_interval(Some(self.limits.fuel_yield_interval()))
             .map_err(|source| BrokerHostError::Store { source })?;
-        // Every store is built inside a `provider.describe`, `provider.run_command`, or
-        // `provider.invoke` span, and one fresh store per operation is what this attribute makes
-        // readable: an operation that recorded none was refused before a store existed.
         tracing::Span::current().record("stores", 1_u64);
         Ok(store)
     }
@@ -578,11 +463,6 @@ struct StoreState {
     clock: ClockState,
     settings: SettingsState,
     table: wasmtime::component::ResourceTable,
-    /// Component instantiations in this store, recorded onto the operation's span when it ends.
-    ///
-    /// Exactly one is the invariant: imports are resolved into an `InstancePre` at load, so a
-    /// second instantiation inside one describe, command run, or invocation would mean a call
-    /// path started rebuilding instances per call, which is invisible without a number to read.
     instantiations: u64,
     _reserved: Option<MemoryReservation>,
 }
@@ -704,7 +584,6 @@ impl bindings::dekopon::http::client::Host for StoreState {
     }
 }
 
-/// One provider component after Cranelift, before it has described itself.
 struct CompiledComponent {
     source: PathBuf,
     expected_provider_id: Option<ProviderId>,
@@ -715,18 +594,13 @@ struct CompiledComponent {
     command_export: CommandExport,
 }
 
-/// One provider component compiled by the broker host.
 pub struct BrokerWasmProvider {
     runtime: Arc<Runtime>,
-    // Imports are resolved and type-checked once here rather than on every call. Wasmtime's own
-    // shape for repeated instantiation, and the difference between a link per chat-message
-    // capability call and none.
     pre: bindings::ProviderPre<StoreState>,
     source: PathBuf,
     artifact_bytes: u64,
     artifact_sha256: String,
     manifest: ProviderManifest,
-    /// Which command export the component offers, read once from its type at compile.
     command_export: CommandExport,
 }
 
@@ -740,9 +614,6 @@ impl fmt::Debug for BrokerWasmProvider {
     }
 }
 
-/// Compiles one provider component, off the asynchronous runtime.
-///
-/// Source verification, compilation, and mmap loading stay off Tokio's async workers.
 fn compile_component(
     runtime: &Runtime,
     source: ProviderSource,
@@ -787,10 +658,8 @@ fn prepare_component(
     source: ProviderSource,
 ) -> Result<CompiledComponent, BrokerHostError> {
     let started = Instant::now();
-    // Open and read once. A digest taken from a second read cannot prove it describes the bytes
-    // Cranelift consumed. Locked metadata is checked on this descriptor before allocation, then the
-    // read itself is capped at one byte beyond the applicable limit so concurrent growth cannot
-    // turn a trusted startup input into an unbounded allocation.
+    // Reads once, capped one byte over the limit, since a second read can't prove it matches what
+    // Cranelift consumed and concurrent growth could otherwise allocate unbounded memory.
     let file =
         std::fs::File::open(&source.path).map_err(|error| BrokerHostError::ArtifactMetadata {
             path: source.path.clone(),
@@ -905,7 +774,7 @@ fn prepare_component(
         expected_provider_id,
         artifact_bytes: artifact.bytes,
         artifact_sha256: artifact.sha256,
-        compile_ms: 0, // Filled by the outer load span, including source verification and linking.
+        compile_ms: 0,
         pre,
         command_export,
     })
@@ -925,8 +794,6 @@ impl BrokerWasmProvider {
             pre,
             command_export,
         } = compiled;
-        // Startup's only guest execution, and otherwise invisible between `provider.compile` and
-        // the loaded-provider event below.
         let manifest_json = describe_component(&runtime, &pre, &source)
             .instrument(tracing::info_span!(
                 "provider.describe",
@@ -960,9 +827,8 @@ impl BrokerWasmProvider {
                 actual: manifest.id,
             });
         }
-        // A manifest that promises command words the component cannot run would fail at the
-        // first `gh …` a model typed, in a session, hours later. Prove it at load instead — from
-        // the component's own type, which distinguishes "no such export" from "wrong signature".
+        // Checked at load from the component's own type, so a manifest promising command words it
+        // can't run fails immediately rather than mid-session on first use.
         if let Err(problem) = check_command_export(&manifest, &command_export) {
             return Err(match problem {
                 CommandExportProblem::Missing => BrokerHostError::MissingCommandExport {
@@ -1000,18 +866,8 @@ impl BrokerWasmProvider {
         })
     }
 
-    /// Runs one command word's argv inside the guest and returns the JSON it produced.
-    ///
-    /// Bounded exactly as `describe` is: import-free, timed out, input- and output-capped. The run
-    /// happens *before* authorization, so a component that reaches for a host import here is
-    /// refused rather than trusted. That the component exports a callable `run-command` at all was
-    /// decided once at load from its own type.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerHostError::CommandInputTooLarge`] before instantiation when `argv` plus
-    /// `stdin` exceed the host's input bound, and any instantiation, trap, timeout, host-import, or
-    /// output-size failure from the run itself.
+    /// Runs before authorization, so a host-import attempt here is refused rather than trusted; it
+    /// is import-free, timed out, and input/output-capped like describe.
     pub async fn run_command(
         &self,
         argv: &[String],
@@ -1097,8 +953,8 @@ impl BrokerWasmProvider {
                     timeout_ms: operation_timeout.as_millis() as u64,
                 });
         record_store_outcome(&mut store, self.runtime.limits.fuel);
-        // A refused clock read traps, so it is checked before the trap surfaces: the tripwire names
-        // the cause, where the trap would only report that the guest stopped.
+        // Check for a refused clock or settings read before the trap surfaces, or the real cause is
+        // lost.
         if store.data().clock.attempted() || store.data().settings.attempted() {
             return Err(BrokerHostError::RunCommandUsedHostImport {
                 path: self.source.clone(),
@@ -1202,17 +1058,16 @@ impl BrokerWasmProvider {
         )
         .await
         .map_err(|source| BrokerHostError::AssetInput { source })?;
-        // Read the actual initial balance before instantiation, rather than assuming a
-        // configured budget was supplied. An unavailable observation is not zero usage.
+        // Reads the actual initial fuel balance rather than assuming the configured budget applies,
+        // since an unavailable observation must not be treated as zero usage.
         let initial_fuel = store.get_fuel().ok();
         store.data_mut().limits.observe_invocation(
             self.manifest.id.as_str(),
             capability.as_str(),
             initial_fuel,
         );
-        // The store outlives the guest on every path, including the one where the timeout drops
-        // the operation future, so evidence for dispatched calls is harvested exactly once and
-        // reaches the caller whether the invocation succeeded or failed.
+        // The store outlives the guest on every path, including a timeout dropping the operation
+        // future, so dispatched-call evidence is harvested exactly once regardless of outcome.
         let mut executed = self
             .execute_in_store(
                 &mut store,
@@ -1223,8 +1078,8 @@ impl BrokerWasmProvider {
             )
             .await;
         store.data().assets.drain().await;
-        // A caught, typed disk failure stays terminal even if later guest work times out or
-        // triggers another host refusal. Never infer exhaustion from cancellation itself.
+        // A caught, typed disk failure stays terminal even if later guest work times out or is
+        // refused; never infer exhaustion from cancellation itself.
         if matches!(
             store.data().assets.violation(),
             Some(bindings::dekopon::asset::asset::ErrorCode::OverBudget)
@@ -1278,7 +1133,6 @@ impl BrokerWasmProvider {
         }
     }
 
-    /// Runs one guest invocation to a terminal outcome, leaving its store to the caller.
     async fn execute_in_store(
         &self,
         store: &mut Store<StoreState>,
@@ -1319,9 +1173,8 @@ impl BrokerWasmProvider {
                     operation: format!("invoke {capability}"),
                     timeout_ms: constraints.timeout_ms,
                 })?;
-        // Sticky host authority wins even when the guest catches the typed error or a failing
-        // resource destructor turns it into a component trap. Inspect policy state before
-        // propagating the guest call result.
+        // Host policy violations win even if the guest catches the error or a failing destructor
+        // turns it into a trap; check policy before trusting the guest's result.
         if let Some(reason) = store.data().http.policy_violation() {
             return Err(BrokerHostError::HostCallRejected {
                 provider: self.manifest.id.clone(),
@@ -1374,7 +1227,6 @@ impl BrokerWasmProvider {
     }
 }
 
-/// Deterministic capability registry owned by a privileged broker.
 #[derive(Debug)]
 pub struct BrokerProviderRegistry {
     providers: Vec<BrokerWasmProvider>,
@@ -1384,7 +1236,6 @@ pub struct BrokerProviderRegistry {
 }
 
 impl BrokerProviderRegistry {
-    /// Compiles and validates provider components using one shared asynchronous engine.
     pub async fn load<I, P>(sources: I, limits: BrokerHostLimits) -> Result<Self, BrokerHostError>
     where
         I: IntoIterator<Item = P>,
@@ -1393,7 +1244,6 @@ impl BrokerProviderRegistry {
         Self::load_with_storage(sources, limits, None).await
     }
 
-    /// Compiles providers with an optional broker-owned storage engine.
     pub async fn load_with_storage<I, P>(
         sources: I,
         limits: BrokerHostLimits,
@@ -1406,7 +1256,6 @@ impl BrokerProviderRegistry {
         Self::load_with_options(sources, limits, storage_host, &BrokerHostOptions::default()).await
     }
 
-    /// Compiles providers with operational settings the authority surface does not commit.
     pub async fn load_with_options<I, P>(
         sources: I,
         limits: BrokerHostLimits,
@@ -1428,8 +1277,6 @@ impl BrokerProviderRegistry {
         .await
     }
 
-    /// Compiles content-locked providers and compares each expected digest, length, and provider
-    /// identity with the exact bytes and manifest the host consumes.
     pub async fn load_locked_with_options<I>(
         sources: I,
         limits: BrokerHostLimits,
@@ -1471,13 +1318,7 @@ impl BrokerProviderRegistry {
                 return Err(BrokerHostError::NoProviders);
             }
             let runtime = Arc::new(Runtime::new(limits, options)?);
-            // Load one component at a time, off Tokio. This bounds compiler/source working
-            // memory and stops scheduling work on the first failure; no detached startup jobs
-            // continue writing the cache after refusal. Cranelift may still parallelize within
-            // a component. Carry the registry span into the blocking task.
             let mut providers = Vec::with_capacity(sources.len());
-            // Every conflict, then one failure. Returning on the first would make fixing a provider
-            // directory take one restart per mistake; an operator should see the whole picture once.
             let mut scan = ConflictScan::new();
             for source in sources {
                 let task_runtime = Arc::clone(&runtime);
@@ -1486,10 +1327,6 @@ impl BrokerProviderRegistry {
                 let compiling = tokio::task::spawn_blocking(move || {
                     span.in_scope(|| compile_component(&task_runtime, task_source))
                 });
-                // A compilation task that panicked used to report itself as a fabricated "did not
-                // complete", sending an operator to look for a truncated artifact. The join failure
-                // says which it was — a panic and its message, or a cancellation — so it is kept as
-                // the cause rather than replaced.
                 let compiled = compiling.await.map_err(|join| BrokerHostError::Compile {
                     path: source.path,
                     source: wasmtime::Error::new(join),
@@ -1521,7 +1358,6 @@ impl BrokerProviderRegistry {
         result
     }
 
-    /// Returns each provider's command words, in load order.
     #[must_use]
     pub fn command_words_by_provider(&self) -> Vec<(&ProviderId, &[String])> {
         self.providers
@@ -1536,7 +1372,6 @@ impl BrokerProviderRegistry {
             .collect()
     }
 
-    /// Returns every command word the loaded providers contribute, in identifier order.
     #[must_use]
     pub fn command_words(&self) -> Vec<String> {
         let mut words = self
@@ -1549,17 +1384,6 @@ impl BrokerProviderRegistry {
         words
     }
 
-    /// Runs one command word's argv through the provider that declared it.
-    ///
-    /// The provider's `run-command` export receives `argv` and `stdin` and answers with a
-    /// [`CommandRunOutcome`].
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerHostError::UnknownCommandWord`] when no loaded provider declared it,
-    /// [`BrokerHostError::CommandInputTooLarge`] when `argv` plus `stdin` exceed the input bound,
-    /// [`BrokerHostError::InvalidCommandRun`] when the guest's answer is not its wire type, and any
-    /// guest failure from the run itself.
     pub async fn run_command(
         &self,
         word: &str,
@@ -1579,8 +1403,6 @@ impl BrokerProviderRegistry {
             .ok_or_else(|| BrokerHostError::UnknownCommandWord {
                 word: word.to_owned(),
             })?;
-        // What the script ran, what it piped, and what the guest answered are the run, so all three
-        // are on the span: each bounded to one attribute's cap, with its full length beside it.
         let span = tracing::info_span!(
             "provider.run_command",
             provider = %provider.manifest.id,
@@ -1612,8 +1434,6 @@ impl BrokerProviderRegistry {
             .await?;
         span.record("command.output", &*dekopon_core::bounded_attribute(&json));
         span.record("command.output.bytes", json.len());
-        // Parsed here rather than handed onward as JSON: guest output is this crate's concern, and
-        // a daemon that never sees the raw string cannot accidentally forward it to a caller.
         serde_json::from_str::<CommandRunOutcome>(&json).map_err(|source| {
             BrokerHostError::InvalidCommandRun {
                 provider: provider.manifest.id.clone(),
@@ -1622,12 +1442,10 @@ impl BrokerProviderRegistry {
         })
     }
 
-    /// Returns validated manifests in component load order.
     pub fn manifests(&self) -> impl ExactSizeIterator<Item = &ProviderManifest> {
         self.providers.iter().map(|provider| &provider.manifest)
     }
 
-    /// Returns owned documentation metadata for every component loaded into this registry.
     pub fn loaded_provider_metadata(
         &self,
     ) -> impl ExactSizeIterator<Item = LoadedProviderMetadata> + '_ {
@@ -1641,7 +1459,6 @@ impl BrokerProviderRegistry {
             })
     }
 
-    /// Returns the independent component-host ceilings used for authority commitments.
     #[must_use]
     pub fn host_limits(&self) -> &BrokerHostLimits {
         &self
@@ -1652,21 +1469,15 @@ impl BrokerProviderRegistry {
             .limits
     }
 
-    /// Installs the broker-owned ephemeral directory shared by all invocations.
     pub fn set_assets(&mut self, directory: dekopon_http_host::asset::AssetDirectory) {
         self.assets = Some(directory);
     }
 
-    /// Returns the configured storage host handle, when storage is enabled.
     #[must_use]
     pub fn storage_host(&self) -> Option<StorageHost> {
         self.storage_host.clone()
     }
 
-    /// Returns one routed capability and the provider declaring it, by identifier.
-    ///
-    /// Routes are already keyed by capability, so a caller filtering constraint sets does not have
-    /// to scan every route per set.
     #[must_use]
     pub fn capability(
         &self,
@@ -1682,7 +1493,6 @@ impl BrokerProviderRegistry {
         Some((&provider.manifest.id, capability))
     }
 
-    /// Returns capabilities in deterministic identifier order.
     pub fn capabilities(&self) -> impl Iterator<Item = (&ProviderId, &ProviderCapability)> {
         self.routes.iter().map(|(capability_id, provider_index)| {
             let provider = &self.providers[*provider_index];
@@ -1696,7 +1506,6 @@ impl BrokerProviderRegistry {
         })
     }
 
-    /// Validates one policy grant against the component host's independent ceilings.
     pub fn validate_constraints(
         &self,
         constraints: &ExecutionConstraints,
@@ -1712,12 +1521,8 @@ impl BrokerProviderRegistry {
         validate_authorized_constraints(constraints, &runtime.limits)
     }
 
-    /// Consumes one broker-authorized proposal through its trusted capability route.
-    ///
-    /// `credential` rides alongside the authorization rather than inside it: an
-    /// `AuthorizedInvocation` is inert-serializable as evidence, and a secret must never share a
-    /// container with anything that can be rendered. The host injects it at the native HTTP
-    /// boundary only for destinations inside its binding; the guest never observes it.
+    /// The credential stays separate from the authorization, which must remain safely renderable as
+    /// evidence; a secret can't share that container, and the guest never observes it.
     pub async fn invoke(
         &self,
         authorized: AuthorizedInvocation,
@@ -1728,7 +1533,6 @@ impl BrokerProviderRegistry {
             .await
     }
 
-    /// Consumes an invocation plus its exact non-forgeable storage grant when storage is enabled.
     pub async fn invoke_with_storage(
         &self,
         authorized: AuthorizedInvocation,
@@ -1798,12 +1602,6 @@ impl BrokerProviderRegistry {
                 )
             }
         };
-        // `proposal.input` is a field on this span whether or not the capability is storage-backed.
-        // It is untrusted payload, and containing it is the authority boundary's job rather than
-        // telemetry's: the operator's trace is where the run is reconstructed from, so what a
-        // provider was actually asked to do belongs in it. It rides the attribute bound like the
-        // command fields, rendered through it so an input carrying image bytes is never copied
-        // whole to be cut afterwards.
         let span = tracing::info_span!(
             "provider.invoke",
             capability = %proposal.capability,
@@ -1836,14 +1634,6 @@ impl BrokerProviderRegistry {
     }
 }
 
-/// Records what one operation's store did, on the span that operation is running under.
-///
-/// `stores` is knowable when the store is built; these two are only knowable once the guest has
-/// stopped, so they are recorded together on every path a store can end on — success, trap,
-/// rejection, and timeout alike. Fuel is read back from Wasmtime rather than accumulated
-/// alongside it, because the remaining count in the store is the authority on what the guest
-/// actually burned; a store that reports none records nothing rather than a zero that would read
-/// as an invocation that ran for free.
 fn record_store_outcome(store: &mut Store<StoreState>, supplied: u64) {
     let span = tracing::Span::current();
     span.record("instantiations", store.data().instantiations);
@@ -1854,10 +1644,6 @@ fn record_store_outcome(store: &mut Store<StoreState>, supplied: u64) {
     store.data_mut().limits.record_remaining_fuel(remaining);
 }
 
-/// The export name a load line and a run span report for one component.
-///
-/// A mismatched export is reported as `none` here: nothing callable exists under it, and a manifest
-/// declaring words never loads with one, so the line only ever says it for a wordless component.
 const fn command_export_name(export: &CommandExport) -> &'static str {
     match export {
         CommandExport::Present => RUN_COMMAND_EXPORT,
@@ -1908,7 +1694,8 @@ async fn describe_component(
                 timeout_ms: operation_timeout.as_millis() as u64,
             });
     record_store_outcome(&mut store, runtime.limits.fuel);
-    // As in a command run: a refused clock read traps, and the tripwire names it before the trap.
+    // During describe, check for a refused clock or settings read before the trap surfaces, or the
+    // cause is lost.
     if store.data().clock.attempted() || store.data().settings.attempted() {
         return Err(BrokerHostError::DescribeUsedHostImport {
             path: source.to_path_buf(),
@@ -2014,8 +1801,6 @@ fn validate_authorized_constraints(
 }
 
 fn validate_manifest(manifest: &ProviderManifest, source: &Path) -> Result<(), BrokerHostError> {
-    // The loader gates on no effect: the broker authorizes an effect per invocation, so a manifest
-    // declaring an external write loads here and is refused by policy, not by the loader.
     host::validate_manifest(manifest)
         .map_err(|rejection| invalid_manifest(source, rejection.to_string()))
 }
@@ -2027,438 +1812,264 @@ fn invalid_manifest(source: &Path, message: impl Into<String>) -> BrokerHostErro
     }
 }
 
-/// Failure to load or execute a broker-owned provider component.
 #[derive(Debug, Error)]
 pub enum BrokerHostError {
-    /// The invocation exhausted native asset disk capacity.
     #[error("over-budget: broker asset disk capacity exhausted")]
     AssetOverBudget,
-    /// Passed asset table or file descriptors failed admission.
     #[error("invalid invocation assets")]
     AssetInput {
         #[source]
         source: asset::AssetAdmissionError,
     },
 
-    /// No components were configured.
     #[error("at least one broker provider component is required")]
     NoProviders,
-    /// A host ceiling was zero.
     #[error("broker host limit {name} must be greater than zero")]
-    InvalidLimit {
-        /// Invalid field.
-        name: &'static str,
-    },
-    /// An authorization attempted to exceed a broker host ceiling.
+    InvalidLimit { name: &'static str },
     #[error("authorization constraint {field} exceeds the broker host ceiling")]
-    AuthorizationExceedsHostLimit {
-        /// Constraint field.
-        field: &'static str,
-    },
-    /// HTTP authorization was present but incomplete or unbounded.
+    AuthorizationExceedsHostLimit { field: &'static str },
     #[error("HTTP authorization must contain destinations, methods, and positive limits")]
     InvalidHttpAuthorization,
-    /// HTTP and storage authority were combined in one v1 capability.
     #[error("HTTP and storage authority cannot coexist in one capability")]
     MixedHostAuthorization,
-    /// Secret-use authorization was structurally invalid.
     #[error("secret-use authorization is invalid")]
     InvalidSecretAuthorization {
         #[source]
         source: dekopon_capability::SecretUseGrantError,
     },
-    /// Secret-use scope exceeded the surrounding HTTP authorization.
     #[error("secret-use authorization exceeds HTTP authority")]
     SecretAuthorizationExceedsHttp,
-    /// Resolved secret material did not match the DRN/sink/binding committed into authorization.
     #[error("resolved secret credential does not match authorized secret use")]
     SecretCredentialMismatch,
-    /// Storage was constrained but no native storage engine is configured.
     #[error("provider storage is disabled")]
     StorageDisabled,
-    /// Storage authority was required but no grant reached the invocation boundary.
     #[error("authorized storage invocation is missing its storage grant")]
     MissingStorageGrant,
-    /// A storage grant accompanied an invocation with no storage constraint.
     #[error("storage grant accompanied an invocation with no storage authority")]
     UnexpectedStorageGrant,
-    /// The single-use storage grant did not match the authorized invocation.
     #[error("storage grant does not match authorized invocation")]
     StorageGrantMismatch,
-    /// Native storage setup, operation, or finalization failed.
     #[error("broker provider storage failed")]
     Storage {
         #[source]
         source: dekopon_storage_host::StorageHostError,
     },
-    /// The native HTTP execution context rejected its ceiling or grant configuration.
     #[error("could not initialize the bounded HTTP execution context")]
     HttpConfiguration {
-        /// Native validation failure.
         #[source]
         source: dekopon_http_host::ConfigurationError,
     },
-    /// Wasmtime engine initialization failed.
     #[error("could not initialize the broker Wasmtime engine")]
     Engine {
-        /// Wasmtime error.
         #[source]
         source: wasmtime::Error,
     },
-    /// Store initialization failed.
     #[error("could not initialize a bounded broker Wasmtime store")]
     Store {
-        /// Wasmtime error.
         #[source]
         source: wasmtime::Error,
     },
-    /// Generated host imports could not be registered.
     #[error("could not register broker host interfaces")]
     Linker {
-        /// Wasmtime error.
         #[source]
         source: wasmtime::Error,
     },
-    /// A generated lock supplied a zero or over-ceiling expected component length.
     #[error("locked provider artifact is {size} bytes; maximum is {maximum}")]
-    InvalidArtifactSize {
-        /// Locked byte length.
-        size: u64,
-        /// Hard maximum.
-        maximum: u64,
-    },
-    /// A generated lock supplied a malformed expected component digest.
+    InvalidArtifactSize { size: u64, maximum: u64 },
     #[error("locked provider artifact digest must be sixty-four lowercase hexadecimal characters")]
     InvalidArtifactDigest,
-    /// An unlocked component exceeded the same hard source-byte ceiling.
     #[error(
         "broker provider component {} is {actual} bytes; maximum is {maximum}",
         path.display()
     )]
     ArtifactTooLarge {
-        /// Component path.
         path: PathBuf,
-        /// Actual descriptor or bounded-read length.
         actual: u64,
-        /// Hard maximum.
         maximum: u64,
     },
-    /// The exact component buffer did not have the locked byte length.
     #[error(
         "broker provider component {} is {actual} bytes; provider lock expects {expected}",
         path.display()
     )]
     ArtifactSizeMismatch {
-        /// Component path.
         path: PathBuf,
-        /// Locked byte length.
         expected: u64,
-        /// Actual buffer length.
         actual: u64,
     },
-    /// The exact component buffer did not have the locked digest.
     #[error(
         "broker provider component {} has SHA-256 {actual}; provider lock expects {expected}",
         path.display()
     )]
     ArtifactDigestMismatch {
-        /// Component path.
         path: PathBuf,
-        /// Locked lowercase SHA-256.
         expected: String,
-        /// Actual lowercase SHA-256.
         actual: String,
     },
-    /// The validated manifest did not describe the provider identity recorded in the lock.
     #[error(
         "broker provider component {} describes provider {actual}; provider lock expects {expected}",
         path.display()
     )]
     ProviderIdentityMismatch {
-        /// Component path.
         path: PathBuf,
-        /// Locked provider identity.
         expected: ProviderId,
-        /// Manifest provider identity.
         actual: ProviderId,
     },
-    /// Source artifact metadata could not be read for the informational provider view.
     #[error("could not inspect broker provider artifact {}", path.display())]
     ArtifactMetadata {
-        /// Component path.
         path: PathBuf,
-        /// File read failure.
         #[source]
         source: std::io::Error,
     },
-    /// A compiled artifact could not be built, verified, published, or mapped. No fallback.
     #[error("compiled artifact load failed for {}; set compileOnLoad: true to bypass the cwasm cache", path.display())]
     CompiledArtifact {
-        /// Provider source path.
         path: PathBuf,
-        /// Wasmtime error.
         #[source]
         source: wasmtime::Error,
     },
-    /// Concurrently live stores already reserve the whole aggregate guest-memory ceiling.
     #[error(
         "broker provider stores already reserve the {maximum}-byte aggregate guest memory ceiling; \
          another {requested} bytes cannot be admitted"
     )]
-    MemoryBudgetExhausted {
-        /// Bytes one more store would reserve.
-        requested: usize,
-        /// Configured aggregate ceiling.
-        maximum: usize,
-    },
-    /// Component compilation failed.
+    MemoryBudgetExhausted { requested: usize, maximum: usize },
     #[error("could not compile broker provider component {}", path.display())]
     Compile {
-        /// Component path.
         path: PathBuf,
-        /// Wasmtime error.
         #[source]
         source: wasmtime::Error,
     },
-    /// Component imports or exports could not be linked.
     #[error("could not instantiate broker provider component {}", path.display())]
     Instantiate {
-        /// Component path.
         path: PathBuf,
-        /// Wasmtime error.
         #[source]
         source: wasmtime::Error,
     },
-    /// Provider attempted a host call while describing itself.
     #[error("provider component {} attempted a host import during describe", path.display())]
-    DescribeUsedHostImport {
-        /// Component path.
-        path: PathBuf,
-    },
-    /// One or more providers conflict with each other or with the shell's reserved vocabulary.
+    DescribeUsedHostImport { path: PathBuf },
     #[error("{report}")]
-    ConflictingProviders {
-        /// Every conflict found, boxed to keep this enum small.
-        report: Box<ProviderConflicts>,
-    },
-    /// A provider returned something that is not a command run outcome.
+    ConflictingProviders { report: Box<ProviderConflicts> },
     #[error("provider {provider} returned an unreadable command run outcome")]
     InvalidCommandRun {
-        /// Provider identity.
         provider: ProviderId,
-        /// Decode failure.
         #[source]
         source: serde_json::Error,
     },
-    /// No loaded provider declared the requested command word.
     #[error("no loaded provider declares the command word {word:?}")]
-    UnknownCommandWord {
-        /// The unclaimed word.
-        word: String,
-    },
-    /// Provider declared command words but exports no way to run them.
+    UnknownCommandWord { word: String },
     #[error(
         "provider {provider} declares command words but component {} exports no run-command; \
          rebuild it against the dekopon:provider/provider-cli world",
         path.display()
     )]
-    MissingCommandExport {
-        /// Provider identity.
-        provider: ProviderId,
-        /// Component path.
-        path: PathBuf,
-    },
-    /// Provider exports the command export as something the host cannot call.
+    MissingCommandExport { provider: ProviderId, path: PathBuf },
     #[error(
         "provider {provider} exports run-command from component {} as {found}, not the function \
          the dekopon:provider package declares",
         path.display()
     )]
     CommandExportSignature {
-        /// Provider identity.
         provider: ProviderId,
-        /// Component path.
         path: PathBuf,
-        /// Bounded description of what the component actually exports.
         found: String,
     },
-    /// A command word's argv plus its piped value exceeded the host input bound.
     #[error("command input for provider {provider} is {length} bytes; broker maximum is {maximum}")]
     CommandInputTooLarge {
-        /// Provider identity.
         provider: ProviderId,
-        /// Actual bytes: every argv word plus the piped value.
         length: usize,
-        /// Maximum bytes.
         maximum: usize,
     },
-    /// Running a command word failed inside the guest.
     #[error("provider {provider} failed while running a command word")]
     RunCommand {
-        /// Provider identity.
         provider: ProviderId,
-        /// Underlying trap or error.
         #[source]
         source: wasmtime::Error,
     },
-    /// Provider attempted a host call while running a command word.
-    ///
-    /// The run happens before authorization, so a component reaching for host authority there is
-    /// refused rather than trusted.
     #[error(
         "provider component {} attempted a host import during a command run",
         path.display()
     )]
-    RunCommandUsedHostImport {
-        /// Component path.
-        path: PathBuf,
-    },
-    /// Provider description failed.
+    RunCommandUsedHostImport { path: PathBuf },
     #[error("broker provider component {} failed while describing itself", path.display())]
     Describe {
-        /// Component path.
         path: PathBuf,
-        /// Wasmtime error.
         #[source]
         source: wasmtime::Error,
     },
-    /// Manifest JSON was malformed.
     #[error("broker provider component {} returned an invalid manifest", path.display())]
     InvalidManifest {
-        /// Component path.
         path: PathBuf,
-        /// JSON error.
         #[source]
         source: serde_json::Error,
     },
-    /// Manifest violated a semantic rule.
     #[error("broker provider component {} has an invalid manifest: {message}", path.display())]
-    Manifest {
-        /// Component path.
-        path: PathBuf,
-        /// Validation detail.
-        message: String,
-    },
-    /// Authorized capability has no provider route.
+    Manifest { path: PathBuf, message: String },
     #[error("no broker provider implements authorized capability {capability}")]
-    UnknownCapability {
-        /// Capability ID.
-        capability: CapabilityId,
-    },
-    /// Authorization selected a different provider than the trusted route.
+    UnknownCapability { capability: CapabilityId },
     #[error(
         "authorization selected provider {authorized} for {capability}, but route selects {routed}"
     )]
     AuthorizedProviderMismatch {
-        /// Capability.
         capability: CapabilityId,
-        /// Provider bound into authorization.
         authorized: ProviderId,
-        /// Provider selected by the loaded route.
         routed: ProviderId,
     },
-    /// Selected provider did not implement the routed capability.
     #[error("broker provider {provider} does not implement capability {capability}")]
     ProviderDoesNotImplement {
-        /// Provider ID.
         provider: ProviderId,
-        /// Capability ID.
         capability: CapabilityId,
     },
-    /// Input was not an object.
     #[error("input for broker capability {capability} must be a JSON object")]
-    InputNotObject {
-        /// Capability ID.
-        capability: CapabilityId,
-    },
-    /// Input serialization failed.
+    InputNotObject { capability: CapabilityId },
     #[error("could not serialize broker provider input")]
     SerializeInput {
-        /// JSON error.
         #[source]
         source: serde_json::Error,
     },
-    /// Input exceeded the host bound.
     #[error("input for {capability} is {length} bytes; broker maximum is {maximum}")]
     InputTooLarge {
-        /// Capability ID.
         capability: CapabilityId,
-        /// Actual bytes.
         length: usize,
-        /// Maximum bytes.
         maximum: usize,
     },
-    /// Provider output exceeded its bound.
     #[error("broker provider {provider} returned {length} bytes; maximum is {maximum}")]
     OutputTooLarge {
-        /// Provider ID or source path.
         provider: String,
-        /// Actual bytes.
         length: usize,
-        /// Maximum bytes.
         maximum: usize,
     },
-    /// Provider operation exceeded its deadline.
     #[error("broker provider operation {operation} exceeded {timeout_ms} ms")]
-    Timeout {
-        /// Operation.
-        operation: String,
-        /// Bound.
-        timeout_ms: u64,
-    },
-    /// Provider attempted a host call outside its authorization.
+    Timeout { operation: String, timeout_ms: u64 },
     #[error("broker rejected host call {reason} from provider {provider} capability {capability}")]
     HostCallRejected {
-        /// Provider ID.
         provider: ProviderId,
-        /// Capability ID.
         capability: CapabilityId,
-        /// Stable rejection class.
         reason: &'static str,
     },
-    /// Provider attempted a storage call outside its exact interface/access grant.
     #[error(
         "broker rejected storage call {reason} from provider {provider} capability {capability}"
     )]
     StorageCallRejected {
-        /// Provider ID.
         provider: ProviderId,
-        /// Capability ID.
         capability: CapabilityId,
-        /// Stable rejection class.
         reason: &'static str,
     },
-    /// Provider export trapped or failed.
     #[error("broker provider {provider} failed while invoking {capability}")]
     Invoke {
-        /// Provider ID.
         provider: ProviderId,
-        /// Capability ID.
         capability: CapabilityId,
-        /// Wasmtime error.
         #[source]
         source: wasmtime::Error,
     },
-    /// Provider returned a typed failure.
     #[error("broker provider {provider} failed {capability} with {code}: {message}")]
     ProviderFailure {
-        /// Provider ID.
         provider: ProviderId,
-        /// Capability ID.
         capability: CapabilityId,
-        /// Stable provider code.
         code: String,
-        /// Bounded provider detail.
         message: String,
     },
-    /// Provider response JSON was malformed.
     #[error("broker provider {provider} returned an invalid response for {capability}")]
     InvalidOutput {
-        /// Provider ID.
         provider: ProviderId,
-        /// Capability ID.
         capability: CapabilityId,
-        /// JSON error.
         #[source]
         source: serde_json::Error,
     },

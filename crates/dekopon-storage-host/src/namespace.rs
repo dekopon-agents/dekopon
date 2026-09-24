@@ -1,5 +1,3 @@
-//! Non-reusing namespace derivation, exact housekeeping planning, and continuity pointers.
-
 use std::{
     fs::{File, TryLockError},
     path::PathBuf,
@@ -29,33 +27,22 @@ pub(crate) struct Namespace {
     pub(crate) directory: Directory,
     pub(crate) data_directory: Directory,
     pub(crate) scope_commitment: String,
-    /// Held before the generation lease is acquired and retained through the invocation.
     pub(crate) _base_lease: File,
 }
 
-/// Why a plan rotates its namespace to a fresh generation instead of opening the one it names.
 #[derive(Debug)]
 pub(crate) struct Reset {
-    /// The check the retained state failed.
     pub(crate) check: &'static str,
-    /// The generation that failed it, when the retained state still named one.
     pub(crate) previous_generation: Option<String>,
-    /// The entry that failed it.
     pub(crate) path: Option<PathBuf>,
 }
 
-/// A fully materialized, non-mutating namespace plan.
-///
-/// Random epochs, encoded pointers, existing target lengths, and the base lease are all
-/// fixed here. The host can therefore reserve the exact peak before [`apply`](Self::apply) performs
-/// the first mutation.
 pub(crate) struct NamespacePlan {
     base_token: String,
     scope_commitment: String,
     generation_token: String,
     authority_pointer: Option<Vec<u8>>,
     remove_authority_pointer: bool,
-    /// The name a corrupt stable generation is moved to, freeing its deterministic name.
     set_aside: Option<String>,
     reset: Option<Reset>,
     existing_base: Option<Directory>,
@@ -66,13 +53,10 @@ pub(crate) struct NamespacePlan {
     maximum_generation_peak_bytes: u64,
 }
 
-/// The generation one grant opens and the pointer housekeeping selecting it takes.
 struct Selection {
     generation_token: String,
     authority_pointer: Option<Vec<u8>>,
-    /// Length of the stale pointer a stable grant removes.
     removed_pointer_length: Option<u64>,
-    /// Measured peak of the retained generation this grant reopens; `None` when it creates one.
     retained_peak_bytes: Option<u64>,
     set_aside: Option<String>,
 }
@@ -99,9 +83,6 @@ impl NamespacePlan {
         debug_assert_ne!(base_token, scope_commitment);
         let authority = token(DOMAIN_AUTHORITY, &[request.authority_surface()]);
 
-        // Faults up to here are the base's own shape: a symlink, a hard link, or a wrong mode
-        // anywhere under it. A fresh generation would sit beside them and fail the same scan, so
-        // they fail the grant, naming the entry, and nothing is rotated.
         let (existing_base, existing_base_lease, before_usage, pointer_length) = (|| {
             if !namespaces_root.exists(&base_token)? {
                 return Ok((None, None, Usage::default(), None));
@@ -132,8 +113,6 @@ impl NamespacePlan {
         };
         let (selection, reset) = match select(false) {
             Ok(selection) => (selection, None),
-            // Every check selection makes is about the generation the namespace names, so moving
-            // past that generation is the whole repair.
             Err(StorageHostError::Corrupt { scope, site }) => {
                 let site = site.map(|site| *site).unwrap_or_default();
                 (
@@ -150,15 +129,15 @@ impl NamespacePlan {
 
         let mut simulation = Simulation::default();
         if base.is_none() {
-            simulation.create_entry(0)?; // namespace base directory
-            simulation.create_entry(0)?; // base.lock
+            simulation.create_entry(0)?;
+            simulation.create_entry(0)?;
         }
         let maximum_generation_peak_bytes = match selection.retained_peak_bytes {
             Some(peak) => peak,
             None => {
-                simulation.create_entry(0)?; // generation directory
-                simulation.create_entry(0)?; // data directory
-                simulation.create_entry(0)?; // lease.lock
+                simulation.create_entry(0)?;
+                simulation.create_entry(0)?;
+                simulation.create_entry(0)?;
                 3_u64
                     .checked_mul(ENTRY_CHARGE)
                     .ok_or(StorageHostError::Arithmetic)?
@@ -202,7 +181,6 @@ impl NamespacePlan {
         self.maximum_generation_peak_bytes
     }
 
-    /// Why this plan rotates past the generation its namespace names, when it does.
     pub(crate) const fn take_reset(&mut self) -> Option<Reset> {
         self.reset.take()
     }
@@ -246,11 +224,6 @@ impl NamespacePlan {
     }
 }
 
-/// Chooses the generation a grant opens and checks the retained one it would reopen.
-///
-/// With `reset`, nothing retained is read or reopened: an authority-bound namespace mints a fresh
-/// epoch and a stable one moves its generation aside, so the fault that failed the first pass is
-/// no longer on the path.
 #[allow(
     clippy::too_many_arguments,
     reason = "every argument is one already-derived input of the single selection both passes share"
@@ -279,10 +252,9 @@ fn select_generation(
                 }
                 _ => None,
             };
-            // A stale authority pointer must not survive a period of explicit stable continuity.
-            // Otherwise authority-bound A -> stable -> A would reopen A's old random epoch instead
-            // of minting the required non-reusing generation. Its contents are irrelevant here, so
-            // they are not read.
+            // A stale authority pointer must not survive stable continuity, or authority-bound A to
+            // stable to A would reopen A's old epoch instead of minting a new non-reusing
+            // generation.
             Ok(Selection {
                 generation_token,
                 authority_pointer: None,
@@ -340,7 +312,6 @@ fn select_generation(
     }
 }
 
-/// Checks one retained generation's shape and measures its peak; `None` when it does not exist.
 fn retained_generation(
     base: &Directory,
     base_token: &str,
@@ -376,7 +347,6 @@ fn retained_generation(
     .map_err(located)
 }
 
-/// The one shape a retained logical file has: a token-named, single-link regular private file.
 pub(crate) fn logical_file(
     data: &Directory,
     token: &str,
@@ -416,13 +386,11 @@ impl Simulation {
         self.observe()
     }
 
-    /// Simulates unique create-new temporary + sync + same-directory replacement.
     fn replace(
         &mut self,
         old_length: Option<u64>,
         new_length: u64,
     ) -> Result<(), StorageHostError> {
-        // The temporary coexists with the old target.
         self.create_entry(new_length)?;
         if let Some(old_length) = old_length {
             self.current_entries = self
@@ -455,8 +423,6 @@ impl Simulation {
                   carrying only out-of-range, which Arithmetic already states"
     )]
     fn observe(&mut self) -> Result<(), StorageHostError> {
-        // A plan may shrink an existing pointer, so its net delta can be negative. Only the
-        // positive peak needs reserving above the already-accounted baseline.
         if self.current_bytes > 0 {
             self.peak_bytes = self
                 .peak_bytes
@@ -529,8 +495,6 @@ fn read_pointer(
         || !is_token(&document.epoch)
         || !is_token(&document.authority)
     {
-        // A pointer that still decodes names the generation it pointed at, which is the directory
-        // an operator goes looking for.
         let previous = is_token(&document.epoch).then(|| {
             token(
                 DOMAIN_GENERATION,
@@ -544,24 +508,14 @@ fn read_pointer(
     Ok(Some(document))
 }
 
-/// The instant a lock wait of `timeout_ms` started now gives up at.
-///
-/// One grant computes this once and passes it through every wait it makes, so the configured
-/// `lockTimeoutMs` bounds the whole acquisition rather than each lock in turn.
 pub(crate) fn deadline_after(timeout_ms: u64) -> Result<Instant, StorageHostError> {
     Instant::now()
         .checked_add(Duration::from_millis(timeout_ms))
         .ok_or(StorageHostError::Arithmetic)
 }
 
-/// Takes a lease, polling until another holder releases it or `timeout_ms` elapses.
-///
-/// # Errors
-///
-/// [`StorageHostError::Timeout`] when another holder still has the lease at the deadline, and
-/// [`StorageHostError::Io`] when the lock could not be attempted at all. The two are not
-/// interchangeable: contention is transient and worth retrying, while a filesystem that fails or
-/// refuses advisory locks will refuse the next attempt too.
+/// Timeout means another holder still has the lease and is worth retrying; Io means the filesystem
+/// itself refuses advisory locks and retrying won't help.
 pub(crate) fn lock_exclusive(file: &File, deadline: Instant) -> Result<(), StorageHostError> {
     loop {
         match file.try_lock() {
@@ -574,12 +528,8 @@ pub(crate) fn lock_exclusive(file: &File, deadline: Instant) -> Result<(), Stora
     }
 }
 
-/// Classifies one failed `try_lock`; `None` means "another holder, and there is still time".
-///
-/// Separated from the wait loop for the same reason `writer_lock_failure` is: a filesystem that
-/// fails or refuses advisory locks cannot be produced on demand from a test — `flock` refuses a
-/// pipe on one platform this builds for and accepts it on another — and reporting one as `Timeout`
-/// would tell a caller to keep retrying something that will never succeed.
+/// `flock` refuses a pipe on some platforms and accepts it on others, so this is tested directly
+/// rather than reported as `Timeout`, which would suggest endless retrying.
 fn lease_lock_failure(error: TryLockError, expired: bool) -> Option<StorageHostError> {
     match error {
         TryLockError::WouldBlock if !expired => None,
@@ -606,10 +556,6 @@ mod tests {
     use super::{deadline_after, lease_lock_failure, lock_exclusive};
     use crate::StorageHostError;
 
-    /// A lease another holder has is contention, which is what `Timeout` means to a caller.
-    ///
-    /// Reporting it as `Io` would turn a namespace someone else is finalizing into a storage
-    /// failure the guest sees, and nothing anywhere would say the lease was merely busy.
     #[test]
     fn a_lease_another_holder_still_has_reports_timeout_rather_than_io() {
         let directory = tempfile::tempdir().expect("temporary directory");
@@ -617,7 +563,6 @@ mod tests {
         let held = File::create(&path).expect("lease file");
         held.try_lock().expect("the first holder takes the lease");
 
-        // A second open file description, which is what a second holder of this lease is.
         let contender = File::open(&path).expect("a second handle on the same lease");
         let started = Instant::now();
         let refused = lock_exclusive(&contender, deadline_after(30).expect("deadline"));
@@ -631,17 +576,11 @@ mod tests {
             "the deadline was reported without being waited out"
         );
 
-        // The control: releasing the lease makes the same call succeed, so the refusal above was
-        // the other holder rather than anything about the file.
         held.unlock().expect("the first holder releases the lease");
         lock_exclusive(&contender, deadline_after(30).expect("deadline"))
             .expect("an uncontended lease is taken");
     }
 
-    /// A filesystem that fails or refuses advisory locks is not another conforming writer.
-    ///
-    /// Both failures reach a caller as "the lease was not taken", and only the classification
-    /// tells it whether waiting is worth anything. A `Timeout` here would be an infinite retry.
     #[test]
     fn a_lock_failure_that_is_not_contention_is_io_at_either_side_of_the_deadline() {
         assert!(lease_lock_failure(TryLockError::WouldBlock, false).is_none());

@@ -1,17 +1,13 @@
-//! Deterministic auth-only rendering.
 use crate::{
     auth_result::{CommandResult, ModelAuthStatus},
     cli::OutputFormat,
 };
 use serde::Serialize;
 use thiserror::Error;
-/// Failure to serialize a typed command result.
 #[derive(Debug, Error)]
 pub enum RenderError {
-    /// JSON serialization failed.
     #[error("could not render JSON: {0}")]
     Json(#[from] serde_json::Error),
-    /// YAML serialization failed.
     #[error("could not render YAML: {0}")]
     Yaml(#[from] serde_yaml::Error),
 }
@@ -19,7 +15,6 @@ pub enum RenderError {
 pub(crate) fn render(result: &CommandResult, format: OutputFormat) -> Result<String, RenderError> {
     match result {
         CommandResult::Auth(status) => render_auth(status, format),
-        // Both export guards have passed; unwrap only for the intended stdout writer.
         CommandResult::CredentialExport(document) => Ok(document.expose().clone()),
     }
 }

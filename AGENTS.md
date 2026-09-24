@@ -41,6 +41,8 @@ The model proposes; a separate broker authorizes and executes provider effects.
 - Confirm repository root, branch and status; preserve unrelated work and artifacts.
   Start follow-ups from current main, not an already-merged feature branch.
 - Follow the change map for companion tests, documentation, examples and changelog.
+- Add no comments or doc comments unless they meet [Comments](#comments); delete the ones your
+  change makes stale instead of rewording them.
 - Keep [WIT mirrors](docs/development.md#provider-contract-or-host) byte-identical;
   bump affected published contracts. Rebuild generated Wasm with pinned build scripts;
   regenerate Cargo locks with Cargo, never hand-edit them.
@@ -158,10 +160,16 @@ The name states the invariant, the primitives are real, and every limit is teste
 
 ### Comments
 
-A comment says why or states the invariant; the code already says what.
+The owner reads the code; every comment is text he has to read past. Write none by default. A
+comment earns its line only by stating a constraint the code cannot show: an ordering requirement,
+an invariant other code relies on that the types do not enforce, the security reason behind a
+restriction that looks arbitrary, an upstream workaround with its link, or why the obvious simpler
+alternative is wrong here. One sentence, at the site. `///` and `//!` follow the same rule; the
+exceptions are one-or-two-sentence docs on the public items of `dekopon-provider-sdk` and its
+testkit, clap `///` (it is the `--help` text), `compile_fail` doctests, and `// SAFETY:`.
 
 - Yes: `// The descriptor closes before accounting is released; unlink alone is not disk reclamation.`
-- No: `// step 1: open the file`, `// handle error`, `// TODO: clean this up`.
+- No: a `///` that restates the item's name or signature; a module overview; `// step 1: open the file`; `// handle error`; `// TODO: clean this up`; history (`// previously…`, `// now uses…`, `// replaces the old…`); plan, finding or PR IDs (`// D18`, `// W2-E`, `// see #187`); a comment narrating what a test asserts; three lines where one sentence carries the constraint.
 
 ### The tells you are writing Python in Rust
 
@@ -192,6 +200,10 @@ reports the lane as blocked with both verdicts side by side; the disagreement is
 the brief's intent over its text and did something the text did not say, one line each with the
 sentence it overrode. `Limits`: one table of every ceiling constant the lane added or moved: name,
 value, the test that hits it and the test one past it.
+
+**Comment findings.** Every added or edited comment is read against Comments. One that does not
+state a constraint the code cannot show is a `guideline` finding, and the fix is deletion, not
+rewording.
 
 **Concurrency findings** name the owner and bound the change is missing, or the existing owner that
 makes a new primitive redundant; "this could race" is not a finding until the interleaving is named.

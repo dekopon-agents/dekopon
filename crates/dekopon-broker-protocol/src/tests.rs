@@ -14,7 +14,6 @@ use super::{
     TraceParentError, read_frame, write_frame,
 };
 
-/// One conversation fixture, spelled the way a transport mints it.
 fn conversation(
     kind: ConversationKind,
     container: Option<&str>,
@@ -52,12 +51,6 @@ fn scope() -> ChatScopeClaim {
     }
 }
 
-/// A socket parent both sides of the socket rule accept.
-///
-/// `tempfile::tempdir` applies the process umask, which normally leaves the directory
-/// world-traversable — a parent the broker refuses to bind under, and one this client refuses to
-/// connect through however private the socket's own mode looks. Fixtures that expect an exchange
-/// to happen start from a directory the broker could really have bound in.
 #[cfg(unix)]
 fn private_socket_directory() -> tempfile::TempDir {
     use std::os::unix::fs::PermissionsExt as _;
@@ -102,8 +95,6 @@ fn trace_parent_round_trips_through_its_wire_form() {
     assert_eq!(parsed.parent_id()[7], 0xb7);
 }
 
-/// Every rejection here is a value that would otherwise correlate broker spans to a trace that
-/// does not exist, or serialize one logical context two different ways.
 #[test]
 fn trace_parent_rejects_malformed_unsupported_and_zero_values() {
     for invalid in [
@@ -132,13 +123,6 @@ fn trace_parent_rejects_malformed_unsupported_and_zero_values() {
     );
 }
 
-/// `traceParent` is mandatory, and it carries the trace the audit record is correlated by.
-///
-/// It used to be an `Option` beside a separate Dekopon `trace` field, and a client that exported
-/// no telemetry sent `null`. Both halves are gone: the broker sources its audit correlation from
-/// this one field, so a request that omits it names no trace for the decision it is about to
-/// cause, and a decode that accepted the omission would write exactly the record an operator
-/// cannot find.
 #[test]
 fn invocation_request_requires_one_well_formed_trace_parent() {
     let complete = serde_json::to_value(invocation()).expect("request serializes");
@@ -224,12 +208,6 @@ async fn rejects_oversized_prefix_before_reading_a_body() {
     ));
 }
 
-/// A prefix is a claim, not a measurement.
-///
-/// An in-bound length is accepted, so it decides nothing about allocation: the reader must follow
-/// the bytes that actually arrive and refuse a frame that ends early rather than decoding a prefix
-/// of it. This is what keeps 64 connected peers that each announce a 2 MiB frame and then send
-/// nothing from pinning 128 MiB of zeroed buffers until the deadline.
 #[tokio::test]
 async fn in_bound_prefix_that_over_promises_fails_instead_of_decoding_a_short_frame() {
     let limits = FrameLimits {
@@ -257,7 +235,6 @@ async fn in_bound_prefix_that_over_promises_fails_instead_of_decoding_a_short_fr
     );
 }
 
-/// A peer that sends only a prefix holds the connection, never a frame's worth of memory.
 #[tokio::test]
 async fn prefix_only_peer_times_out_rather_than_completing_a_frame() {
     let limits = FrameLimits {
@@ -277,7 +254,6 @@ async fn prefix_only_peer_times_out_rather_than_completing_a_frame() {
     drop(writer);
 }
 
-/// One frame is one write: the length prefix is patched into space the buffer already reserved.
 #[tokio::test]
 async fn one_frame_reaches_the_socket_in_one_write() {
     use std::{
@@ -335,7 +311,6 @@ async fn one_frame_reaches_the_socket_in_one_write() {
     assert_eq!(&writer.bytes[..4], &length.to_be_bytes());
     assert_eq!(&writer.bytes[4..], &expected[..]);
 
-    // The reserved prefix is not payload, so the bound still counts exactly the JSON bytes.
     let mut exact = CountingWriter::default();
     let value = json!({"v": "x".repeat(26)});
     let encoded = serde_json::to_vec(&value).expect("value serializes");
@@ -378,11 +353,6 @@ async fn serialization_stops_at_the_frame_bound() {
     assert!(matches!(error, ProtocolError::FrameTooLarge { .. }));
 }
 
-/// A chat attachment rides one frame, and a frame is a buffer: a multi-megabyte one must not be
-/// held twice because its closing quote did not fit.
-///
-/// 11,185,049 payload bytes cost 22,370,098 while the buffer grew by doubling. Counting the payload
-/// first makes the allocation exact, so acceptance is the whole frame plus its four-byte prefix.
 #[test]
 fn a_multi_megabyte_frame_is_held_once_at_its_own_size() {
     let maximum = 16 * 1024 * 1024;
@@ -406,7 +376,6 @@ fn a_multi_megabyte_frame_is_held_once_at_its_own_size() {
     );
 }
 
-/// A frame past the maximum is refused without any of it being held.
 #[test]
 fn a_frame_past_the_maximum_is_counted_rather_than_buffered() {
     let mut counter = super::BoundedJsonCounter::new(32);
@@ -418,7 +387,6 @@ fn a_frame_past_the_maximum_is_counted_rather_than_buffered() {
     assert!(counter.length <= 32);
 }
 
-/// The payload buffer follows the bytes that arrive and stops exactly at the declared length.
 #[tokio::test]
 async fn a_multi_megabyte_payload_is_read_into_exactly_its_declared_length() {
     let payload = vec![b'x'; 11 * 1024 * 1024];
@@ -441,7 +409,6 @@ async fn a_multi_megabyte_payload_is_read_into_exactly_its_declared_length() {
     );
 }
 
-/// A peer that announces more than it sends fails rather than decoding a short frame.
 #[tokio::test]
 async fn a_payload_that_ends_early_is_not_decoded() {
     let (mut writer, mut reader) = duplex(64);
@@ -567,11 +534,6 @@ async fn unix_client_authenticates_private_socket_and_response_variant() {
     assert!(client.capabilities().await.is_err());
 }
 
-/// The executed-or-not distinction the wire codes carry must survive a client-local failure.
-///
-/// A request that never left is safe to resubmit under a fresh invocation identifier; a request
-/// whose response was lost is not, because the broker may have finished a non-idempotent external
-/// effect and suppresses no duplicate.
 #[cfg(unix)]
 #[tokio::test]
 async fn framing_failures_keep_the_executed_or_not_distinction() {
@@ -594,8 +556,6 @@ async fn framing_failures_keep_the_executed_or_not_distinction() {
         io_timeout: Duration::from_secs(1),
     };
 
-    // A broker that reads the complete proposal and then dies before answering is exactly the
-    // shape of the hazard: the work may have run, and nothing on this side can tell.
     let server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.expect("accept client fixture");
         read_frame::<_, RequestEnvelope>(&mut stream, limits)
@@ -620,7 +580,6 @@ async fn framing_failures_keep_the_executed_or_not_distinction() {
     );
     assert!(lost.may_have_executed());
 
-    // Serialization stops at the bound, so nothing was delivered and nothing ran.
     let listener = UnixListener::bind(directory.path().join("unread.sock")).expect("bind fixture");
     let unread = directory.path().join("unread.sock");
     std::fs::set_permissions(&unread, std::fs::Permissions::from_mode(0o600))
@@ -646,13 +605,10 @@ async fn framing_failures_keep_the_executed_or_not_distinction() {
         "expected a request-phase failure, got {oversized}"
     );
     assert!(!oversized.may_have_executed());
-    // The bounded framing detail reaches Display, where a model and an operator both read it. It
-    // names byte counts and never the socket path.
     let rendered = oversized.to_string();
     assert!(rendered.contains("maximum is 64"), "rendered {rendered}");
     assert!(!rendered.contains("unread.sock"), "rendered {rendered}");
 
-    // The same distinction the broker spends two stable wire codes on.
     assert!(
         ClientError::Remote {
             code: ERROR_OUTCOME_UNAUDITED.to_owned(),
@@ -670,7 +626,6 @@ async fn framing_failures_keep_the_executed_or_not_distinction() {
     assert!(!ClientError::ConnectTimeout.may_have_executed());
 }
 
-/// One version identifier, three renderings, nothing keeping them equal but this.
 #[test]
 fn protocol_version_constant_wire_form_and_display_agree() {
     assert_eq!(
@@ -753,7 +708,6 @@ fn one_canonical_conversation_form_decides_every_transport() {
     let telegram_user = sender("telegram.5551234");
     let whatsapp_user = sender("whatsapp.16034700182");
 
-    // Every accepted row of the derivation table, with the key each one is filed under.
     for (transport, subject, conversation, key) in [
         (
             ChatTransportKind::Slack,
@@ -777,8 +731,6 @@ fn one_canonical_conversation_form_decides_every_transport() {
             ),
             "d0123abc:1712345678.000100",
         ),
-        // A multi-person DM is `G…` on older workspaces and `C…` on newer ones: both are just
-        // lowercase tokens here, which is what F15 asked for.
         (
             ChatTransportKind::Slack,
             &slack_user,
@@ -841,7 +793,6 @@ fn one_canonical_conversation_form_decides_every_transport() {
             conversation(ConversationKind::Thread, Some("999"), "123", Some("456")),
             "123:456",
         ),
-        // The private chat id *is* the sender's user id, which is the correlation S25 pins.
         (
             ChatTransportKind::Telegram,
             &telegram_user,
@@ -1041,7 +992,6 @@ fn one_canonical_conversation_form_decides_every_transport() {
             conversation(ConversationKind::DirectMessage, None, "dev", Some("1")),
             "the local transport has no threads",
         ),
-        // Outside the wire bounds the grammar never runs: an unbounded part fails closed.
         (
             ChatTransportKind::Local,
             &telegram_user,
@@ -1072,7 +1022,6 @@ fn one_canonical_conversation_form_decides_every_transport() {
     }
 }
 
-/// The kind word is one spelling: the YAML list entry, the Cedar string, and the trace attribute.
 #[test]
 fn every_conversation_kind_has_exactly_one_spelling() {
     for kind in [
@@ -1093,7 +1042,6 @@ fn every_conversation_kind_has_exactly_one_spelling() {
     }
 }
 
-/// A Discord thread is itself a channel; every other service threads inside one.
 #[test]
 fn the_api_channel_is_the_thread_only_where_a_thread_is_a_channel() {
     let discord = conversation(ConversationKind::Thread, Some("999"), "123", Some("456"));
@@ -1112,7 +1060,6 @@ fn the_api_channel_is_the_thread_only_where_a_thread_is_a_channel() {
     );
 }
 
-/// A selector reports every problem at once, and `kind` is a list or the word `any`.
 #[test]
 fn a_conversation_selector_reports_every_problem_at_once() {
     let bad = ConversationMatch {
@@ -1185,8 +1132,6 @@ fn a_conversation_selector_reports_every_problem_at_once() {
         .is_empty()
     );
 
-    // `kind: channel` reads as though it claimed the threads under the channel too, so the decoder
-    // refuses it by name rather than accepting a narrower rule than it looks.
     let bare = serde_json::from_value::<ConversationMatch>(json!({"kind": "channel"}))
         .expect_err("a bare kind word is refused");
     assert!(bare.to_string().contains("kind: [channel]"), "{bare}");
@@ -1200,7 +1145,6 @@ fn a_conversation_selector_reports_every_problem_at_once() {
     );
 }
 
-/// A selector names the parent; the kind list decides whether its threads come with it.
 #[test]
 fn a_selector_matches_kind_container_and_id_but_never_a_thread() {
     let selector = ConversationMatch {
@@ -1296,8 +1240,6 @@ fn delivery_identities_are_typed_canonical_and_bound_to_scope() {
         kind: ChatTransportKind::Discord,
         conversation: conversation(ConversationKind::Channel, Some("999"), "123", None),
     };
-    // A thread is its own channel on Discord, so the delivery names the thread and the
-    // conversation names the parent.
     let discord_thread = ChatScopeClaim {
         transport: "discord".parse().expect("transport"),
         kind: ChatTransportKind::Discord,
@@ -1571,11 +1513,6 @@ mod broker_socket_discovery {
     }
 }
 
-/// One operation per verb, with the attestation as a field rather than an operation of its own.
-///
-/// The `operation` tag is the compatibility seam, so what each verb is spelled on the wire — and
-/// that a subject-only claim, a chat claim and no claim at all reach the *same* tag — is the part
-/// that has to be pinned rather than inferred.
 #[test]
 fn every_verb_is_one_operation_whatever_attestation_accompanies_it() {
     let turn = DeliveredTurnRequest {
@@ -1663,11 +1600,6 @@ fn every_verb_is_one_operation_whatever_attestation_accompanies_it() {
     }
 }
 
-/// The version seam refuses a mixed pair in both directions, loudly, before anything is authorized.
-///
-/// The previous protocol spelled the attestation shape into the operation tag — `capabilitiesFor`,
-/// `invokeForChat` — so a broker of this version reading an older client's frame would otherwise
-/// have to guess. It does not: the `apiVersion` fails first, and the retired tags fail after it.
 #[test]
 fn the_previous_protocol_version_and_its_retired_operation_tags_both_fail_to_decode() {
     let previous = json!({
@@ -1703,11 +1635,6 @@ fn the_previous_protocol_version_and_its_retired_operation_tags_both_fail_to_dec
     }
 }
 
-/// A claim is bound to the proposal it travels with, and carries no identifier without one.
-///
-/// The binding is redundant inside a single frame by construction, which is the point: it is
-/// defense in depth against a future refactor separating the claim from the proposal, and the
-/// client fills it in so a caller cannot build a frame whose two halves disagree.
 #[test]
 fn a_claim_binds_to_its_proposal_and_holds_no_identifier_without_one() {
     let identifier = invocation().id;
@@ -1721,8 +1648,6 @@ fn a_claim_binds_to_its_proposal_and_holds_no_identifier_without_one() {
     assert_eq!(bound.subject, unbound.subject);
     assert_eq!(bound.scope, unbound.scope);
 
-    // Structural bounds are checked before any grant is consulted, and a subject-only claim has no
-    // scope to bound.
     assert!(Attestation::for_subject(subject(), agent()).is_well_formed());
     assert!(unbound.is_well_formed());
     assert!(
@@ -1743,11 +1668,6 @@ fn a_claim_binds_to_its_proposal_and_holds_no_identifier_without_one() {
     );
 }
 
-/// Recording stays reachable only through its own operation, whatever attestation accompanies one.
-///
-/// `RecordDeliveredTurn` is the only variant that carries a [`DeliveredTurnRequest`] at all, and
-/// every variant is `deny_unknown_fields`, so a proposal cannot smuggle a turn into `invoke` and
-/// an attestation cannot promote one.
 #[test]
 fn recording_is_reachable_only_through_its_own_operation() {
     let turn = json!({
@@ -1757,7 +1677,6 @@ fn recording_is_reachable_only_through_its_own_operation() {
         "user": "hello",
         "assistant": "hi",
     });
-    // Each frame is otherwise well-formed, so the smuggled turn is the only reason it is refused.
     for smuggled in [
         json!({"operation": "invoke", "invocation": {
             "id": "invoke-chat", "capability": "cli-probe.upper",
@@ -1780,8 +1699,6 @@ fn recording_is_reachable_only_through_its_own_operation() {
     }
 }
 
-/// The piped value is one optional field on the run frame, absent when nothing was piped, so a
-/// bare run is the same frame with or without a `stdin` key and a piped one carries the text.
 #[test]
 fn a_run_command_frame_omits_an_absent_piped_value() {
     let bare = RequestEnvelope::run_command(
@@ -1814,11 +1731,6 @@ fn a_run_command_frame_omits_an_absent_piped_value() {
     );
 }
 
-/// A run frame names the trace its word belongs to, exactly as an invocation does.
-///
-/// The word, its arguments, and the guest's answer are the first half of the proposal that
-/// follows, so a frame without a parent — or with one the broker would have to guess at — is
-/// refused at decode rather than landing the run in a trace of its own.
 #[test]
 fn a_run_command_frame_requires_one_well_formed_trace_parent() {
     let complete = serde_json::to_value(RequestEnvelope::run_command(
@@ -1881,8 +1793,6 @@ fn a_run_command_frame_requires_one_well_formed_trace_parent() {
     );
 }
 
-/// Every answer a guest can give travels intact under its own tag, so a script sees exactly what
-/// the upstream tool would have printed and a decline keeps its stable code.
 #[test]
 fn a_command_run_response_round_trips_each_outcome() {
     for (expected, result) in [
@@ -1896,8 +1806,6 @@ fn a_command_run_response_round_trips_each_outcome() {
                 secret_use: None,
             },
         ),
-        // A provider command may name a public DRN beside its proposal; the broker authorizes that
-        // use like any other, so the proposal has to reach the agent carrying it.
         (
             "proposed",
             CommandRunOutcome::Proposed {
@@ -1970,8 +1878,6 @@ fn a_command_run_response_round_trips_each_outcome() {
     }
 }
 
-/// A rendered answer crosses the socket as the guest produced it: the client hands back the help
-/// page and the status the provider chose, never a decline dressed as one.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_run_command_exchange_decodes_a_rendered_answer() {
@@ -2032,8 +1938,6 @@ async fn a_run_command_exchange_decodes_a_rendered_answer() {
     server.await.expect("server fixture exits");
 }
 
-/// An oversized piped value stops at the frame ceiling on this side: nothing is written, the
-/// failure sits in the request phase, and it names the bound rather than the socket.
 #[cfg(unix)]
 #[tokio::test]
 async fn an_oversized_piped_value_is_refused_before_it_leaves_the_client() {
@@ -2081,11 +1985,6 @@ async fn an_oversized_piped_value_is_refused_before_it_leaves_the_client() {
     assert!(!rendered.contains("unread.sock"), "rendered {rendered}");
 }
 
-/// A refused attested inspection reaches the client as an opaque failure, never as an empty list.
-///
-/// Answering with an empty capability list would tell an ungranted caller that the subject is
-/// mapped. The client must therefore surface the stable failure code and nothing else — no
-/// capability, no command word, no memory surface.
 #[cfg(unix)]
 #[tokio::test]
 async fn a_refused_attested_surface_is_a_stable_failure_rather_than_an_empty_answer() {
@@ -2227,7 +2126,6 @@ fn retired_reporting_operations_are_refused() {
 #[cfg(unix)]
 mod asset_descriptors;
 
-/// One failed result fixture carrying the provider's own answer.
 fn failed_with_detail() -> InvocationResult {
     InvocationResult {
         invocation: "invoke-gpt-image-edit"
@@ -2249,8 +2147,6 @@ fn failed_with_detail() -> InvocationResult {
     }
 }
 
-/// The wire spells the pair `detail: { code, message }` in camelCase like every other field, and a
-/// result with no provider answer keeps exactly the shape it had.
 #[tokio::test]
 async fn a_failed_invocation_round_trips_the_providers_own_code_and_message() {
     let limits = FrameLimits {
@@ -2283,8 +2179,6 @@ async fn a_failed_invocation_round_trips_the_providers_own_code_and_message() {
     assert_eq!(actual, expected);
 }
 
-/// A failure no provider reported leaves the field off the wire entirely, so nothing about a
-/// success, a denial, or a host failure changes shape.
 #[test]
 fn a_result_without_a_provider_detail_keeps_the_field_off_the_wire() {
     let result = InvocationResult {
@@ -2308,9 +2202,6 @@ fn a_result_without_a_provider_detail_keeps_the_field_off_the_wire() {
     );
 }
 
-/// The coupling is lockstep by construction: the result refuses a field it does not know, so a
-/// gateway one release behind fails loudly on a detail it cannot read rather than silently
-/// dropping the only record of why the provider refused.
 #[test]
 fn an_unknown_sibling_of_the_provider_detail_is_refused_rather_than_ignored() {
     let mut document = serde_json::to_value(failed_with_detail()).expect("the result serializes");

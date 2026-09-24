@@ -1,9 +1,3 @@
-//! Local Dekopon configuration discovery, loading, and validation.
-//!
-//! YAML and JSON are accepted through the same parser. A file may contain one resource,
-//! a YAML sequence of resources, or multiple YAML documents. Parsing happens once into a
-//! [`LocalCatalog`], after which consumers operate only on typed protocol resources.
-
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
 #![cfg_attr(
@@ -31,23 +25,18 @@ pub mod skill;
 
 pub use skill::{Skill, SkillError, SkillResource, load_skill};
 
-/// Environment variable used for an explicit configuration path.
 pub const CONFIG_ENV: &str = "DEKOPON_CONFIG";
 
-/// A validated, deterministically ordered local resource catalog.
 #[derive(Clone, Debug)]
 pub struct LocalCatalog {
     source: PathBuf,
     agents: BTreeMap<AgentId, Agent>,
-    /// Every agent's mounted skills, in the order its `spec.skills` names them.
-    ///
-    /// Read once here, at load, so a session never touches the filesystem to show a model a
-    /// skill, and so a skill that cannot be read refuses the catalog instead of a session.
+    /// Skills are read once at catalog load so a live session never touches the filesystem, and a
+    /// broken skill fails the catalog, not a running session.
     skills: BTreeMap<AgentId, Vec<Skill>>,
 }
 
 impl LocalCatalog {
-    /// Reads, parses, and validates a YAML or JSON catalog.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let contents = fs::read_to_string(path).map_err(|source| ConfigError::Read {
@@ -57,7 +46,6 @@ impl LocalCatalog {
         Self::from_str(path, &contents)
     }
 
-    /// Parses and validates catalog text while retaining a source name for diagnostics.
     pub fn from_str(source: impl AsRef<Path>, contents: &str) -> Result<Self, ConfigError> {
         let source = source.as_ref().to_path_buf();
         let source_name = source.display().to_string();
@@ -101,10 +89,6 @@ impl LocalCatalog {
             let outcome = match string_field(&value, "kind").map(str::to_owned) {
                 Some(kind) => match kind.as_str() {
                     Agent::KIND => agents.insert(&origin, value),
-                    // Named rather than folded into the unknown-kind message. These documents
-                    // were authored against a shipped schema, so the refusal points at the
-                    // upgrade instead of sending an operator to hunt for a typo in a file that
-                    // is exactly what they wrote.
                     "Capability" | "Provider" => Err(CatalogProblem::RemovedKind { origin, kind }),
                     _ => Err(CatalogProblem::UnsupportedKind { origin, kind }),
                 },
@@ -114,9 +98,6 @@ impl LocalCatalog {
                 problems.push(problem);
             }
         }
-        // Skills reference files rather than other resources, so an agent that decoded can have
-        // its skills checked whatever happened to the rest of the catalog. Relative paths resolve
-        // against the catalog file's own directory, the rule `dekopond` applies to its own paths.
         let base = source.parent().map(Path::to_path_buf).unwrap_or_default();
         let skills = load_agent_skills(&agents, &base, &mut problems);
 
@@ -134,27 +115,20 @@ impl LocalCatalog {
         })
     }
 
-    /// Source file from which the catalog was loaded.
     #[must_use]
     pub fn source(&self) -> &Path {
         &self.source
     }
 
-    /// Agents in deterministic identifier order.
     pub fn agents(&self) -> impl ExactSizeIterator<Item = &Agent> {
         self.agents.values()
     }
 
-    /// Looks up an agent by validated identifier.
     #[must_use]
     pub fn agent(&self, id: &AgentId) -> Option<&Agent> {
         self.agents.get(id)
     }
 
-    /// The skills one agent mounts, in the order its `spec.skills` names them.
-    ///
-    /// Empty for an agent that mounts none and for an identifier the catalog does not declare;
-    /// [`Self::agent`] is the question "does this agent exist".
     #[must_use]
     pub fn agent_skills(&self, id: &AgentId) -> &[Skill] {
         self.skills.get(id).map_or(&[], Vec::as_slice)
@@ -168,15 +142,11 @@ fn string_field<'a>(value: &'a Value, field: &str) -> Option<&'a str> {
         .and_then(Value::as_str)
 }
 
-/// One authored resource kind, decoded and keyed by its own identifier type.
 trait Resource: Sized + for<'de> Deserialize<'de> {
-    /// Validated identifier type this kind is stored under.
     type Id: FromStr<Err = IdentifierError> + Ord + fmt::Display;
 
-    /// Authored `kind` discriminator.
     const KIND: &'static str;
 
-    /// Authored metadata name, before identifier validation.
     fn name(&self) -> &str;
 }
 
@@ -189,7 +159,6 @@ impl Resource for Agent {
     }
 }
 
-/// Resources of one kind, with the document each was declared in.
 struct ResourceSet<T: Resource> {
     entries: BTreeMap<T::Id, (String, T)>,
 }
@@ -203,11 +172,7 @@ impl<T: Resource> Default for ResourceSet<T> {
 }
 
 impl<T: Resource> ResourceSet<T> {
-    /// Decodes, validates, and admits one authored document, or reports why it cannot join.
     fn insert(&mut self, origin: &str, value: Value) -> Result<(), CatalogProblem> {
-        // The typed decoder knows exactly one API version, so a future one would fail here as an
-        // unknown enum variant. Reading the authored string first is what keeps the dedicated
-        // message reachable.
         if let Some(version) = string_field(&value, "apiVersion")
             && version != ApiVersion::V1Alpha1.to_string()
         {
@@ -259,13 +224,6 @@ impl<T: Resource> ResourceSet<T> {
     }
 }
 
-/// Reads every skill every agent names, reporting each one that cannot be mounted.
-///
-/// Every problem is collected rather than the first returned, for the reason the reference checks
-/// above scan the whole catalog: an operator with three broken skills fixes three and validates
-/// once. A skill that fails still leaves the agent's other skills checked, and two agents naming
-/// one directory read it twice rather than sharing a cache, because the catalog is loaded once per
-/// process and a skill directory is small.
 fn load_agent_skills(
     agents: &ResourceSet<Agent>,
     base: &Path,
@@ -295,8 +253,8 @@ fn load_agent_skills(
                     continue;
                 }
             };
-            // Two directories carrying one name would give a model two `read_skill` targets it
-            // cannot tell apart, so the second is refused rather than shadowing the first.
+            // Two skill directories sharing one name would give a model two indistinguishable read
+            // targets, so the second is refused rather than shadowing the first.
             if let Some(first) = names.insert(skill.name().clone(), path.display().to_string()) {
                 problems.push(CatalogProblem::DuplicateSkill {
                     agent: agent_id.to_string(),
@@ -313,11 +271,6 @@ fn load_agent_skills(
     mounted
 }
 
-/// Inputs used to resolve the configuration discovery precedence.
-///
-/// The explicit CLI and environment paths are authoritative even when they do not exist,
-/// so users receive a direct read error instead of an unexpected fallback. Default paths
-/// are selected only when an existing regular file is found.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DiscoveryContext {
     explicit: Option<PathBuf>,
@@ -328,7 +281,6 @@ pub struct DiscoveryContext {
 }
 
 impl DiscoveryContext {
-    /// Captures discovery inputs from the current process.
     pub fn from_process(explicit: Option<PathBuf>) -> Result<Self, ConfigError> {
         Ok(Self {
             explicit,
@@ -345,7 +297,6 @@ impl DiscoveryContext {
         })
     }
 
-    /// Creates an injectable discovery context for deterministic callers and tests.
     #[must_use]
     pub fn new(
         explicit: Option<PathBuf>,
@@ -363,7 +314,6 @@ impl DiscoveryContext {
         }
     }
 
-    /// Resolves the highest-precedence configuration path.
     pub fn resolve(&self) -> Result<PathBuf, ConfigError> {
         if let Some(path) = &self.explicit {
             return Ok(path.clone());
@@ -384,12 +334,10 @@ impl DiscoveryContext {
         for path in &searched {
             match fs::metadata(path) {
                 Ok(metadata) if metadata.is_file() => return Ok(path.clone()),
-                // A directory or device at a candidate path is not this location's config.
                 Ok(_) => {}
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                // Anything else — a permission or traversal failure on the parent — means an
-                // existing higher-precedence config may be hidden. Falling through would load a
-                // lower-precedence file, so refuse instead of guessing.
+                // A permission or traversal error might be hiding a higher-precedence config, so
+                // this refuses rather than silently falling through to a lower-precedence file.
                 Err(source) => {
                     return Err(ConfigError::Candidate {
                         path: path.display().to_string(),
@@ -409,78 +357,49 @@ impl DiscoveryContext {
     }
 }
 
-/// Discovers, reads, and validates configuration using process inputs.
 pub fn load_discovered(explicit: Option<PathBuf>) -> Result<LocalCatalog, ConfigError> {
     let path = DiscoveryContext::from_process(explicit)?.resolve()?;
     LocalCatalog::load(path)
 }
 
-/// Configuration discovery, parse, or validation failure.
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    /// An authoritative path could not be read.
     #[error("failed to read configuration {path}: {source}")]
     Read {
-        /// Display path.
         path: String,
-        /// Underlying file-system error.
         #[source]
         source: io::Error,
     },
-    /// The YAML/JSON stream could not be parsed.
     #[error("{path}: {origin}: invalid YAML or JSON: {source}")]
     Parse {
-        /// Display path.
         path: String,
-        /// Document and source location.
         origin: String,
-        /// Parser diagnostic.
         #[source]
         source: serde_yaml::Error,
     },
-    /// A typed resource could not be decoded.
     #[error("{path}: {origin}: invalid {kind}: {source}")]
     Decode {
-        /// Display path.
         path: String,
-        /// Document location.
         origin: String,
-        /// Authored kind.
         kind: String,
-        /// Typed decoder diagnostic.
         #[source]
         source: serde_yaml::Error,
     },
-    /// No resources were authored.
     #[error("{path}: configuration contains no resources")]
-    Empty {
-        /// Display path.
-        path: String,
-    },
-    /// The catalog parsed, and every semantic problem found in it is listed here.
+    Empty { path: String },
     #[error("{path}: {}", render_problems(.problems))]
     Invalid {
-        /// Display path.
         path: String,
-        /// Every problem found, in document then reference order.
         problems: Vec<CatalogProblem>,
     },
-    /// A default candidate path could not be examined.
     #[error("failed to examine configuration candidate {path}: {source}")]
     Candidate {
-        /// Display path.
         path: String,
-        /// Underlying file-system error.
         #[source]
         source: io::Error,
     },
-    /// No default candidate exists.
     #[error("no Dekopon configuration found; searched: {searched}")]
-    NotFound {
-        /// Comma-separated paths in precedence order.
-        searched: String,
-    },
-    /// The process current directory was unavailable.
+    NotFound { searched: String },
     #[error("could not resolve the current directory: {0}")]
     CurrentDirectory(#[source] io::Error),
 }
@@ -498,106 +417,56 @@ fn render_problems(problems: &[CatalogProblem]) -> String {
     rendered
 }
 
-/// One semantic problem in an otherwise parseable catalog.
-///
-/// A catalog is scanned to the end before it is refused, so an operator fixing three mistakes
-/// loads the catalog once rather than three times. Problems are reported through
-/// [`ConfigError::Invalid`], which owns the source path they all share.
 #[derive(Debug, Error)]
 pub enum CatalogProblem {
-    /// A resource omitted its discriminator.
     #[error("{origin}: resource is missing string field `kind`")]
-    MissingKind {
-        /// Document location.
-        origin: String,
-    },
-    /// The authored resource kind is not implemented.
+    MissingKind { origin: String },
     #[error("{origin}: unsupported resource kind {kind:?}")]
-    UnsupportedKind {
-        /// Document location.
-        origin: String,
-        /// Authored kind.
-        kind: String,
-    },
-    /// The authored resource kind was withdrawn from the catalog.
+    UnsupportedKind { origin: String, kind: String },
     #[error(
         "{origin}: kind {kind} is no longer part of the catalog; remove the document. \
          Capabilities and providers come from the broker, which builds them from provider \
          manifests and its own constraint sets"
     )]
-    RemovedKind {
-        /// Document location.
-        origin: String,
-        /// Authored kind.
-        kind: String,
-    },
-    /// The authored API version is not the one this crate implements.
+    RemovedKind { origin: String, kind: String },
     #[error("{origin}: unsupported API version {version:?}")]
-    UnsupportedApiVersion {
-        /// Document location.
-        origin: String,
-        /// Authored API version.
-        version: String,
-    },
-    /// A typed resource could not be decoded.
+    UnsupportedApiVersion { origin: String, version: String },
     #[error("{origin}: invalid {kind}: {source}")]
     Decode {
-        /// Document location.
         origin: String,
-        /// Authored kind.
         kind: &'static str,
-        /// Typed decoder diagnostic.
         #[source]
         source: serde_yaml::Error,
     },
-    /// Resource metadata contained an invalid kind-specific identifier.
     #[error("{origin}: invalid {kind} name {name:?}: {source}")]
     InvalidName {
-        /// Document location.
         origin: String,
-        /// Resource kind.
         kind: &'static str,
-        /// Invalid name.
         name: String,
-        /// Identifier diagnostic.
         #[source]
         source: Box<IdentifierError>,
     },
-    /// Two resources of the same kind used one name.
     #[error("duplicate {kind} {name:?} at {duplicate}; first declared at {first}")]
     DuplicateResource {
-        /// Resource kind.
         kind: &'static str,
-        /// Duplicate name.
         name: String,
-        /// First declaration.
         first: String,
-        /// Duplicate declaration.
         duplicate: String,
     },
-    /// An agent named a skill directory that could not be mounted.
     #[error("agent {agent:?} mounts skill {path:?}, which could not be loaded: {source}")]
     Skill {
-        /// Agent name.
         agent: String,
-        /// The authored skill path.
         path: String,
-        /// Why the directory was refused, naming the file.
         #[source]
         source: Box<SkillError>,
     },
-    /// An agent mounted two directories carrying one skill name.
     #[error(
         "agent {agent:?} mounts skill {name:?} twice, at {first:?} and {duplicate:?}; a model could not tell them apart"
     )]
     DuplicateSkill {
-        /// Agent name.
         agent: String,
-        /// The repeated skill name.
         name: String,
-        /// The first path carrying it.
         first: String,
-        /// The second path carrying it.
         duplicate: String,
     },
 }
