@@ -164,6 +164,11 @@ strip = "symbols"
 # Preserve cross-crate optimization while letting release runners codegen in parallel.
 codegen-units = 4
 
+# Test executables are what a warm CI build still links, and full DWARF for Wasmtime dominates
+# that link. Line tables keep panic backtraces in workspace code.
+[profile.dev]
+debug = "line-tables-only"
+
 # Every broker boot compiles provider components with Cranelift. Unoptimized, that compile is
 # ~90% of `cargo test` CPU; optimizing just the compiler crates cuts suite CPU 8x.
 [profile.dev.package]
@@ -179,3 +184,4 @@ wasmparser = { opt-level = 3 }
 wasmtime-environ = { opt-level = 3 }
 wasmtime-internal-cranelift = { opt-level = 3 }
 gimli = { opt-level = 3 }
+"*" = { debug = false }
