@@ -66,6 +66,8 @@ fn the_example_gateway_configuration_agrees_with_its_broker_and_its_catalog() {
             idle_timeout_ms: 900_000,
             max_turns: 12,
             max_bytes: 65_536,
+            recall: None,
+            forget_after_ms: None,
         }
     );
     assert_eq!(config.sessions.max_conversations, 1024);
@@ -130,9 +132,16 @@ fn classic_and_agent_slack_manifests_pin_their_intentional_scope_difference() {
     assert!(agent_scopes.iter().any(|scope| scope == "groups:history"));
     assert!(agent_scopes.iter().any(|scope| scope == "reactions:write"));
     assert!(
-        !classic_scopes
+        classic_scopes
             .iter()
             .any(|scope| matches!(scope.as_str(), "channels:history" | "groups:history"))
+    );
+    assert!(
+        !classic["settings"]["event_subscriptions"]["bot_events"]
+            .as_sequence()
+            .expect("classic events are a sequence")
+            .iter()
+            .any(|event| matches!(event.as_str(), Some("message.channels" | "message.groups")))
     );
     let agent_events = agent["settings"]["event_subscriptions"]["bot_events"]
         .as_sequence()

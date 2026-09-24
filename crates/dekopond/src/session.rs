@@ -7,7 +7,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicU8, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant, SystemTime},
 };
 
 use dekopon_agent::{
@@ -15,7 +15,7 @@ use dekopon_agent::{
     attachment::{AssetDeliveryDisposition, ChatAssetInputs, ReplyAttachments},
     meta::{AgentConfigView, MemoryConfigView, MemoryScopeView, SessionConfigView, SkillView},
     prompt::{
-        CancellationProbe, History, PromptError, ReplyDisposition, SessionInputs,
+        CancellationProbe, ConversationTurn, History, PromptError, ReplyDisposition, SessionInputs,
         run_prompt_session,
     },
 };
@@ -39,16 +39,18 @@ use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tracing::Instrument as _;
 
 use crate::{
-    asset::{self, AssetAccess, AssetStore, SessionAssets},
+    asset::{self, AssetAccess, AssetStore, RecalledAsset, SessionAssets},
     config::{
-        MemoryPolicy, MemoryScope, MemoryWindow, ModelConfig, ResolvedBroker, ResolvedLiveness,
+        MemoryPolicy, MemoryScope, MemoryWindow, ModelConfig, RecallSource, ResolvedBroker,
+        ResolvedLiveness,
     },
     conversation::{ConversationKey, ConversationSeed, ConversationStore, EvictionReason},
+    journal::{self, Journal},
     progress::{ProgressInputs, ProgressPolicy, Terminal},
     routes::BoundRoute,
     transport::{
-        AssetFetcher, CancelRequest, ChatDriver, InboundMessage, OutboundReply, ThreadOwnership,
-        TransportError, bound_inbound, bound_outbound, credential_from,
+        AssetFetcher, CancelRequest, ChatDriver, InboundMessage, OutboundReply, PastMessage,
+        ThreadOwnership, TransportError, bound_inbound, bound_outbound, credential_from,
     },
 };
 
@@ -58,6 +60,10 @@ pub(crate) const FAILURE_REPLY: &str = "The agent could not complete this reques
 pub(crate) const UNREPORTED_WORK_REPLY: &str = "The agent attempted capability work but could not report the result. Check the audit before retrying.";
 pub(crate) const STOPPED_REPLY: &str = "Stopped.";
 pub(crate) const EMPTY_REPLY: &str = "[empty response]";
+
+const PLATFORM_RECALL_MAX_MESSAGES: usize = 100;
+// A history read that outlasts this is abandoned; the message is answered from an empty window.
+const PLATFORM_RECALL_TIMEOUT: Duration = Duration::from_secs(5);
 
 const SESSION_RUNNING: u8 = 0;
 const SESSION_CANCELLED: u8 = 1;
@@ -598,11 +604,184 @@ pub(crate) struct SessionRunner {
     pub gate: SessionGate,
     pub reply_on_busy: bool,
     pub conversations: ConversationStore,
+    pub journal: Option<Arc<Journal>>,
     pub assets: Arc<AssetStore>,
     pub asset_fetchers: HashMap<String, Arc<dyn AssetFetcher>>,
     pub liveness: BTreeMap<String, Arc<ResolvedLiveness>>,
     pub thread_ownership: HashMap<String, Arc<dyn ThreadOwnership>>,
     pub active_sessions: ActiveSessions,
+}
+
+struct RecalledWindow {
+    history: History,
+    assets: Vec<RecalledAsset>,
+    next_asset_id: u64,
+}
+
+async fn recall_window(
+    runner: &SessionRunner,
+    driver: &dyn ChatDriver,
+    message: &InboundMessage,
+    key: &ConversationKey,
+    granted: &[String],
+    window: MemoryWindow,
+) -> Option<RecalledWindow> {
+    let span = tracing::Span::current();
+    match window.recall {
+        RecallSource::None => None,
+        RecallSource::Journal => {
+            let journal = Arc::clone(runner.journal.as_ref()?);
+            let stem = key.journal_stem();
+            let grant = journal::grant_digest(granted);
+            let recalled = tokio::task::spawn_blocking(move || {
+                journal.recall(&stem, &grant, window, SystemTime::now())
+            })
+            .await;
+            match recalled {
+                Ok(Ok(recalled)) => {
+                    span.record("conversation.recall_source", "journal");
+                    Some(RecalledWindow {
+                        history: recalled.history,
+                        assets: recalled.assets,
+                        next_asset_id: recalled.next_asset_id,
+                    })
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(
+                        event = "gateway_recall_failed",
+                        source = "journal",
+                        reason = error.label()
+                    );
+                    None
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        event = "gateway_recall_failed",
+                        source = "journal",
+                        reason = "task"
+                    );
+                    None
+                }
+            }
+        }
+        RecallSource::Platform => {
+            let history = driver.history()?;
+            let limit = window
+                .limits
+                .max_turns
+                .saturating_mul(2)
+                .min(PLATFORM_RECALL_MAX_MESSAGES);
+            let read = tokio::time::timeout(
+                PLATFORM_RECALL_TIMEOUT,
+                history.recent(&message.conversation, &message.message_id, limit),
+            )
+            .await;
+            let reason = match read {
+                Ok(Ok(messages)) => {
+                    span.record("conversation.recall_source", "platform");
+                    return Some(platform_window(messages, window, SystemTime::now()));
+                }
+                Ok(Err(error)) => error.category(),
+                Err(_) => "timeout",
+            };
+            tracing::warn!(event = "gateway_recall_failed", source = "platform", reason);
+            None
+        }
+    }
+}
+
+// Authors come from the chat service, not the broker, so the label does not claim authentication.
+fn platform_window(
+    messages: Vec<PastMessage>,
+    window: MemoryWindow,
+    now: SystemTime,
+) -> RecalledWindow {
+    let horizon = now
+        .checked_sub(window.forget_after)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let mut turns = Vec::new();
+    let mut assets = Vec::new();
+    let mut pending_user = String::new();
+    let mut next_asset_id = 1;
+    // Without Discord's Message Content intent other people's messages arrive with no content.
+    for message in messages
+        .into_iter()
+        .filter(|message| message.at >= horizon)
+        .filter(|message| !message.text.trim().is_empty() || !message.assets.is_empty())
+    {
+        let mut text = message.text;
+        for asset in message.assets {
+            text.push_str(&format!(
+                "\n[gateway: attached Chat Asset #{next_asset_id} — {}]",
+                asset.name
+            ));
+            assets.push(RecalledAsset {
+                id: next_asset_id,
+                asset,
+            });
+            next_asset_id += 1;
+        }
+        if message.from_bot {
+            let user = if pending_user.is_empty() {
+                "[gateway: earlier in this conversation]".to_owned()
+            } else {
+                std::mem::take(&mut pending_user)
+            };
+            turns.push(ConversationTurn::completed(user, text));
+        } else {
+            if !pending_user.is_empty() {
+                pending_user.push('\n');
+            }
+            pending_user.push_str(&format!(
+                "[gateway: chat history, from {}]\n{text}",
+                message.author
+            ));
+        }
+    }
+    if !pending_user.is_empty() {
+        turns.push(ConversationTurn::unanswered(pending_user));
+    }
+    let excess = assets
+        .len()
+        .saturating_sub(asset::MAX_ASSETS_PER_CONVERSATION);
+    assets.drain(..excess);
+    RecalledWindow {
+        history: History::from_turns(window.limits, turns),
+        assets,
+        next_asset_id,
+    }
+}
+
+async fn append_journal(
+    journal: &Arc<Journal>,
+    key: &ConversationKey,
+    granted: &[String],
+    window: MemoryWindow,
+    turn: ConversationTurn,
+    inventory: Vec<asset::AssetRef>,
+) {
+    let journal = Arc::clone(journal);
+    let stem = key.journal_stem();
+    let grant = journal::grant_digest(granted);
+    let appended = tokio::task::spawn_blocking(move || {
+        journal.append(
+            &stem,
+            &journal::Entry {
+                at: SystemTime::now(),
+                grant: &grant,
+                turn: &turn,
+                inventory: &inventory,
+            },
+            window,
+        )
+    })
+    .await;
+    let reason = match appended {
+        Ok(Ok(())) => return,
+        Ok(Err(error)) => error.label(),
+        Err(_) => "task",
+    };
+    tracing::warn!(event = "gateway_journal_append_failed", reason);
 }
 
 fn conversation_key(route: &BoundRoute, message: &InboundMessage) -> ConversationKey {
@@ -731,6 +910,9 @@ async fn execute(
             conversation.thread = message.conversation.thread.as_deref().unwrap_or_default(),
             conversation.turns = tracing::field::Empty,
             conversation.bytes = tracing::field::Empty,
+            conversation.recall_source = tracing::field::Empty,
+            conversation.recalled_turns = tracing::field::Empty,
+            conversation.carried_assets = tracing::field::Empty,
         ))
         .await;
     drop(admission);
@@ -807,6 +989,22 @@ async fn session(
     let window = route.memory.window();
     let (seeded, cache_key, conversation_lease, asset_access, gateway_notice) = match window {
         Some(window) => {
+            let recalled = if runner
+                .conversations
+                .resident(&key, &granted, window, Instant::now())
+            {
+                None
+            } else {
+                recall_window(runner, driver.as_ref(), message, &key, &granted, window).await
+            };
+            let (recalled_history, recalled_assets, next_asset_id) = match recalled {
+                Some(recalled) => (
+                    Some(recalled.history),
+                    recalled.assets,
+                    recalled.next_asset_id,
+                ),
+                None => (None, Vec::new(), 1),
+            };
             let ConversationSeed {
                 history,
                 cache_key,
@@ -814,9 +1012,22 @@ async fn session(
                 lease,
                 input,
                 gateway_notice,
-            } = runner
-                .conversations
-                .begin(&key, &granted, window, Instant::now());
+                created,
+            } = runner.conversations.begin(
+                &key,
+                &granted,
+                window,
+                recalled_history,
+                Instant::now(),
+            );
+            if created {
+                let span = tracing::Span::current();
+                span.record("conversation.recalled_turns", history.len());
+                span.record("conversation.carried_assets", recalled_assets.len());
+                runner
+                    .assets
+                    .restore(&assets, recalled_assets, next_asset_id, Instant::now());
+            }
             _active_registration
                 .late_photos
                 .authorized(input, assets.clone(), cache_key.clone());
@@ -877,6 +1088,7 @@ async fn session(
         Some(note) => bound_inbound(&format!("{}\n\n{note}", message.text)),
         None => message.text.clone(),
     };
+    let journal_access = asset_access.clone();
     let text = match runner.assets.take_delivery_notice(&asset_access) {
         Some(note) => bound_inbound(&format!("{note}\n{text}")),
         None => text,
@@ -1046,7 +1258,14 @@ async fn session(
         && let Some(turn) = turn
         && let Some(lease) = conversation_lease
     {
-        lease.commit(window, turn, &cache_key, Instant::now());
+        let journaled = (window.recall == RecallSource::Journal).then(|| turn.clone());
+        if lease.commit(window, turn, &cache_key, Instant::now())
+            && let Some(turn) = journaled
+            && let Some(journal) = runner.journal.as_ref()
+        {
+            let inventory = runner.assets.inventory(&journal_access);
+            append_journal(journal, &key, &granted, window, turn, inventory).await;
+        }
     }
 
     if matches!(

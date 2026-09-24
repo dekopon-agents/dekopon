@@ -4,8 +4,8 @@
 
 use std::{
     collections::{HashMap, VecDeque},
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, OnceLock},
+    time::{Duration, SystemTime},
 };
 
 use async_trait::async_trait;
@@ -27,12 +27,12 @@ use crate::{
     config::{DISCORD_ENDPOINT, LivenessMode, LivenessSettings},
     progress::ProgressText,
     transport::{
-        AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver,
+        AckToken, AssetFetcher, CancelButton, CancelPress, CancelRequest, ChatDriver, ChatHistory,
         ChatTransport, InboundMessage, InboundReaction, LivenessTarget, MessageRef, OutboundReply,
-        ProgressLimits, ProgressMessage, ReplyTarget, SeenIds, StreamLimits, StreamedText,
-        TextStream, TextUnit, TransportError, TransportEvent, TransportIdentity, TypingLease,
-        asset_buffer, bound_inbound, credential_client, floor_boundary, jitter_below, receive_span,
-        record_conversation, reserve_for_chunk, retry_after_from_body, split_message,
+        PastMessage, ProgressLimits, ProgressMessage, ReplyTarget, SeenIds, StreamLimits,
+        StreamedText, TextStream, TextUnit, TransportError, TransportEvent, TransportIdentity,
+        TypingLease, asset_buffer, bound_inbound, credential_client, floor_boundary, jitter_below,
+        receive_span, record_conversation, reserve_for_chunk, retry_after_from_body, split_message,
     },
 };
 
@@ -58,6 +58,8 @@ const CANCEL_CUSTOM_ID_PREFIX: &str = "stop:";
 const MAX_INTERACTION_TOKEN_BYTES: usize = 256;
 const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(30);
 const MAX_REST_COOLDOWN_WAITS: u8 = 2;
+const MAX_HISTORY_MESSAGES: usize = 100;
+const DISCORD_EPOCH_MILLIS: u64 = 1_420_070_400_000;
 
 const DISCORD_CDN_HOSTS: [&str; 2] = ["cdn.discordapp.com", "media.discordapp.net"];
 const FATAL_GATEWAY_CLOSE_CODES: [u16; 6] = [4004, 4010, 4011, 4012, 4013, 4014];
@@ -122,6 +124,7 @@ impl DiscordTransport {
                 rest_lock: Mutex::new(()),
                 rest_cooldown_until: std::sync::Mutex::new(None),
                 liveness_cooldown_until: std::sync::Mutex::new(None),
+                bot_user: OnceLock::new(),
             }),
             gateway_url: None,
             session_starts: None,
@@ -391,6 +394,7 @@ impl DiscordTransport {
                         self.resume_gateway_url =
                             Some(gateway_url(resume, self.endpoint == DISCORD_ENDPOINT)?);
                         self.session_id = Some(session_id.to_owned());
+                        self.driver.bot_user.get_or_init(|| user_id.to_owned());
                         self.identity = TransportIdentity {
                             user_id: Some(user_id.to_owned()),
                             // Discord mentions are identifier-based and the structured mentions
@@ -906,6 +910,7 @@ pub(crate) struct DiscordDriver {
     rest_lock: Mutex<()>,
     rest_cooldown_until: std::sync::Mutex<Option<Instant>>,
     liveness_cooldown_until: std::sync::Mutex<Option<Instant>>,
+    bot_user: OnceLock<String>,
 }
 
 #[async_trait]
@@ -979,6 +984,94 @@ impl ChatDriver for DiscordDriver {
     fn cancel_button(&self) -> Option<&dyn CancelButton> {
         Some(self)
     }
+
+    fn history(&self) -> Option<&dyn ChatHistory> {
+        Some(self)
+    }
+}
+
+#[async_trait]
+impl ChatHistory for DiscordDriver {
+    async fn recent(
+        &self,
+        conversation: &Conversation,
+        before: &str,
+        limit: usize,
+    ) -> Result<Vec<PastMessage>, TransportError> {
+        let bot = self.bot_user.get().ok_or(TransportError::Closed)?;
+        let channel_id = conversation.api_channel(ChatTransportKind::Discord);
+        if !is_snowflake(channel_id) || !is_snowflake(before) {
+            return Err(TransportError::Response);
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = limit.min(MAX_HISTORY_MESSAGES).to_string();
+        let response = self
+            .send_rest(
+                self.http
+                    .get(format!(
+                        "{}/api/v{API_VERSION}/channels/{channel_id}/messages",
+                        self.endpoint
+                    ))
+                    .query(&[("before", before), ("limit", limit.as_str())])
+                    .header("authorization", format!("Bot {}", self.token.expose())),
+            )
+            .await?;
+        if response.status().as_u16() == 429 {
+            let bytes = response
+                .bytes()
+                .await
+                .map_err(|source| TransportError::Request(Box::new(source)))?;
+            let body = serde_json::from_slice::<Value>(&bytes)
+                .map_err(TransportError::MalformedResponse)?;
+            if let Some(retry) = retry_after_from_body(&body, MAX_RATE_LIMIT_WAIT) {
+                self.publish_rest_cooldown(retry.wait);
+            }
+            return Err(TransportError::Service {
+                code: "http-429".to_owned(),
+            });
+        }
+        let body = decode(response).await?;
+        let messages = body.as_array().ok_or(TransportError::Response)?;
+        Ok(messages
+            .iter()
+            .rev()
+            .filter_map(|message| self.past_message(message, bot))
+            .collect())
+    }
+}
+
+impl DiscordDriver {
+    fn past_message(&self, message: &Value, bot: &str) -> Option<PastMessage> {
+        if !matches!(message["type"].as_u64().unwrap_or_default(), 0 | 19) {
+            return None;
+        }
+        let author = message["author"]["id"]
+            .as_str()
+            .filter(|id| is_snowflake(id))?;
+        let channel_id = message["channel_id"]
+            .as_str()
+            .filter(|id| is_snowflake(id))?;
+        let message_id = message["id"].as_str().filter(|id| is_snowflake(id))?;
+        let text = bound_inbound(message["content"].as_str().unwrap_or_default());
+        let assets = pending_assets(&message["attachments"], self, channel_id, message_id);
+        if text.trim().is_empty() && assets.is_empty() {
+            return None;
+        }
+        Some(PastMessage {
+            from_bot: author == bot,
+            author: author.to_owned(),
+            text,
+            assets,
+            at: snowflake_instant(message_id)?,
+        })
+    }
+}
+
+fn snowflake_instant(id: &str) -> Option<SystemTime> {
+    let millis = (id.parse::<u64>().ok()? >> 22).checked_add(DISCORD_EPOCH_MILLIS)?;
+    SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(millis))
 }
 
 #[async_trait]
@@ -1863,16 +1956,17 @@ mod unit_tests {
     use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
 
     use super::{
-        CANCEL_CUSTOM_ID_PREFIX, ChannelShape, ConversationKind, DiscordDriver, DiscordTransport,
-        MAX_MESSAGE_CHARS, SessionStarts, TextUnit, allowed_asset_url, cancel_components, client,
-        gateway_url, is_fatal, is_interaction_token, percent_encoded, split_message,
+        CANCEL_CUSTOM_ID_PREFIX, ChannelShape, Conversation, ConversationKind, DiscordDriver,
+        DiscordTransport, MAX_HISTORY_MESSAGES, MAX_MESSAGE_CHARS, SessionStarts, TextUnit,
+        allowed_asset_url, cancel_components, client, gateway_url, is_fatal, is_interaction_token,
+        percent_encoded, split_message,
     };
     use crate::{
         config::{LivenessMode, LivenessSettings},
         progress::ProgressText,
         transport::{
-            AckToken, CancelPress, ChatDriver as _, LivenessTarget, MessageRef, OutboundReply,
-            StreamedText, TransportError, TransportIdentity, receive_span,
+            AckToken, CancelPress, ChatDriver as _, ChatHistory as _, LivenessTarget, MessageRef,
+            OutboundReply, StreamedText, TransportError, TransportIdentity, receive_span,
         },
     };
 
@@ -1962,6 +2056,7 @@ mod unit_tests {
     }
 
     const UNREACHABLE: &str = "http://127.0.0.1:1";
+    const BOT_USER: &str = "999";
 
     fn driver(endpoint: &str) -> DiscordDriver {
         DiscordDriver {
@@ -1972,6 +2067,7 @@ mod unit_tests {
             rest_lock: Mutex::new(()),
             rest_cooldown_until: std::sync::Mutex::new(None),
             liveness_cooldown_until: std::sync::Mutex::new(None),
+            bot_user: std::sync::OnceLock::from(BOT_USER.to_owned()),
         }
     }
 
@@ -2684,5 +2780,188 @@ mod unit_tests {
             routed.liveness.is_none(),
             "liveness off leaves nothing for the policy to render on"
         );
+    }
+
+    fn thread_conversation() -> Conversation {
+        Conversation {
+            kind: ConversationKind::Thread,
+            container: Some("77".to_owned()),
+            id: "100".to_owned(),
+            thread: Some("300".to_owned()),
+        }
+    }
+
+    fn direct_conversation() -> Conversation {
+        Conversation {
+            kind: ConversationKind::DirectMessage,
+            container: None,
+            id: "300".to_owned(),
+            thread: None,
+        }
+    }
+
+    fn photo() -> Value {
+        json!([{
+            "id": "61",
+            "filename": "cat.png",
+            "content_type": "image/png; charset=binary",
+            "size": 42,
+            "url": "http://127.0.0.1:1/attachments/cat.png",
+        }])
+    }
+
+    fn posted(id: &str, author: &str, content: &str) -> Value {
+        message(
+            json!({ "id": id, "channel_id": "300", "author": { "id": author }, "content": content }),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_thread_is_recalled_oldest_first_from_the_messages_before_the_trigger() {
+        let mut shared = posted("1100000004194304000", "42", "");
+        shared["attachments"] = photo();
+        let mut joined = posted("1100000008388608000", "42", "joined");
+        joined["type"] = json!(7);
+        let newest_first = json!([
+            posted("1100000012582912000", BOT_USER, "a cat"),
+            joined,
+            shared,
+            posted("1100000000000000000", "42", "hello"),
+        ]);
+        let (endpoint, server) = loopback(vec![(200, newest_first.to_string())]);
+
+        let recalled = driver(&endpoint)
+            .history()
+            .expect("Discord reads its own history")
+            .recent(&thread_conversation(), "1100000016777216000", 4)
+            .await
+            .expect("the history reads");
+
+        let recorded = server.await.expect("the stand-in joins");
+        assert_eq!(recorded[0].method, "GET");
+        assert_eq!(
+            recorded[0].path,
+            "/api/v10/channels/300/messages?before=1100000016777216000&limit=4"
+        );
+        assert!(
+            recorded[0]
+                .head
+                .to_ascii_lowercase()
+                .contains("authorization: bot bot-secret")
+        );
+        let seen = recalled
+            .iter()
+            .map(|message| {
+                (
+                    message.from_bot,
+                    message.author.as_str(),
+                    message.text.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            seen,
+            [
+                (false, "42", "hello"),
+                (false, "42", ""),
+                (true, BOT_USER, "a cat")
+            ]
+        );
+        assert!(recalled.windows(2).all(|pair| pair[0].at < pair[1].at));
+    }
+
+    #[tokio::test]
+    async fn a_recalled_attachment_is_the_asset_the_inbound_path_would_have_built() {
+        let mut shared = posted("170", "42", "look");
+        shared["attachments"] = photo();
+        let (endpoint, server) = loopback(vec![(200, json!([shared.clone()]).to_string())]);
+        let mut transport = transport("elote");
+        transport.identity = TransportIdentity {
+            user_id: Some(BOT_USER.to_owned()),
+            handle: None,
+        };
+        let inbound = transport
+            .routable(&shared, &tracing::Span::none())
+            .await
+            .expect("a routable message")
+            .expect("the message routes");
+
+        let recalled = driver(&endpoint)
+            .recent(&direct_conversation(), "200", 10)
+            .await
+            .expect("the history reads");
+        server.await.expect("the stand-in joins");
+
+        assert_eq!(recalled.len(), 1);
+        assert!(!recalled[0].assets.is_empty());
+        assert_eq!(recalled[0].assets, inbound.assets);
+    }
+
+    #[tokio::test]
+    async fn a_history_read_never_asks_for_more_than_discords_page_ceiling() {
+        let (endpoint, server) = loopback(vec![(200, "[]".to_owned()), (200, "[]".to_owned())]);
+        let driver = driver(&endpoint);
+
+        for limit in [MAX_HISTORY_MESSAGES, MAX_HISTORY_MESSAGES + 1] {
+            driver
+                .recent(&direct_conversation(), "200", limit)
+                .await
+                .expect("the history reads");
+        }
+
+        let recorded = server.await.expect("the stand-in joins");
+        let ceiling =
+            format!("/api/v10/channels/300/messages?before=200&limit={MAX_HISTORY_MESSAGES}");
+        assert_eq!(recorded[0].path, ceiling);
+        assert_eq!(recorded[1].path, ceiling);
+    }
+
+    #[tokio::test]
+    async fn a_throttled_history_read_fails_and_publishes_the_rest_cooldown() {
+        let (endpoint, server) = loopback(vec![(
+            429,
+            json!({ "retry_after": 1.5, "global": false }).to_string(),
+        )]);
+        let driver = driver(&endpoint);
+
+        let throttled = driver.recent(&direct_conversation(), "200", 10).await;
+        server.await.expect("the stand-in joins");
+
+        assert!(
+            matches!(&throttled, Err(TransportError::Service { code }) if code == "http-429"),
+            "{throttled:?}"
+        );
+        assert!(
+            driver.rest_cooldown().is_some(),
+            "replies wait out the same limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_history_read_is_an_error_naming_discords_code() {
+        let (endpoint, server) = loopback(vec![(
+            403,
+            json!({ "code": 50001, "message": "Missing Access" }).to_string(),
+        )]);
+
+        let refused = driver(&endpoint)
+            .recent(&direct_conversation(), "200", 10)
+            .await;
+        server.await.expect("the stand-in joins");
+
+        assert!(
+            matches!(&refused, Err(TransportError::Service { code }) if code == "50001"),
+            "{refused:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_is_unreadable_until_the_bot_knows_who_it_is() {
+        let mut driver = driver(UNREACHABLE);
+        driver.bot_user = std::sync::OnceLock::new();
+
+        let early = driver.recent(&direct_conversation(), "200", 10).await;
+
+        assert!(matches!(early, Err(TransportError::Closed)), "{early:?}");
     }
 }

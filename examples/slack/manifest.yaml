@@ -77,8 +77,12 @@ oauth_config:
       - files:read
       - files:write
       - groups:read
+      # `*:history` let `memory.recall: platform` read the thread or DM a cold window rebuilds from.
+      - channels:history
+      - groups:history
       - im:history
       - im:read
+      - mpim:history
       - mpim:read
       - reactions:write
 settings:

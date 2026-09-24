@@ -331,6 +331,61 @@ impl AssetStore {
             .unwrap_or_else(Registered::empty)
     }
 
+    // Recalled ids are kept because replayed turns already name them as `Chat Asset #N`.
+    pub fn restore(
+        &self,
+        access: &AssetAccess,
+        recalled: Vec<RecalledAsset>,
+        next_id: u64,
+        now: Instant,
+    ) {
+        if let Some(fence) = access.fence.as_ref() {
+            fence.next_asset_id.fetch_max(next_id, Ordering::AcqRel);
+        }
+        if recalled.is_empty() {
+            return;
+        }
+        access.with_active(|state_key| {
+            let mut entries = self
+                .entries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Self::expire(&mut entries, self.idle_timeout, now);
+            let entry = entries
+                .entry(state_key.clone())
+                .or_insert_with(|| ConversationAssets {
+                    assets: Vec::new(),
+                    touched: now,
+                    fence: access.weak_fence(),
+                    delivery_failed: false,
+                });
+            entry.touched = now;
+            entry
+                .assets
+                .extend(recalled.into_iter().map(|recalled| AssetRef {
+                    id: recalled.id,
+                    name: recalled.asset.name,
+                    mime: recalled.asset.mime,
+                    size: recalled.asset.size,
+                    source: recalled.asset.source,
+                    fetched: false,
+                    encoding: AssetEncoding::Identity,
+                    sent: false,
+                }));
+            entry.assets.sort_by_key(|asset| asset.id);
+            let excess = entry
+                .assets
+                .len()
+                .saturating_sub(MAX_ASSETS_PER_CONVERSATION);
+            entry.assets.drain(..excess);
+            Self::enforce_ceiling(&mut entries, self.conversations);
+        });
+    }
+
+    pub fn inventory(&self, access: &AssetAccess) -> Vec<AssetRef> {
+        self.get_inventory(access)
+    }
+
     #[cfg(test)]
     pub fn get(&self, conversation: &ConversationKey, id: u64, now: Instant) -> Option<AssetRef> {
         self.get_access(&AssetAccess::one_shot(conversation.clone()), id, now)
@@ -406,6 +461,12 @@ pub(crate) struct PendingAsset {
     pub mime: String,
     pub size: Option<u64>,
     pub source: Option<AssetSourceRef>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RecalledAsset {
+    pub id: u64,
+    pub asset: PendingAsset,
 }
 
 const READABLE_IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/webp", "image/gif"];

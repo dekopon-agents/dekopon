@@ -182,6 +182,7 @@ action performed by this chart.
 | broker ChatGPT credential | `/var/lib/dekopon/broker-chatgpt/chatgpt-auth.json` | A + writable parent | init container, **once**; then `dekopon-brokerd` owns it |
 | providers | `/opt/dekopon/providers/*.wasm` | B | baked into the image |
 | managed provider set | `/var/lib/dekopon/providers/` | owned `0700` dir, broker-only | the directory by the init container; the lock and the store by the operator's sync step |
+| gateway conversation journal | `gateway.journal.mountPath` (default `/var/lib/dekopond/journal`), `gateway.journal.subdir` on the claim | owned `0700` dir, gateway-only | the directory by the init container when `gateway.journal.enabled`; `0600` files by `dekopond`. Set `sessions.journal.path` in `dekopond.yaml` to the mount path |
 
 `/etc/dekopon` and `/run/dekopon` are memory-backed `emptyDir`s, so the credentials file and the
 socket never reach the node's disk. `/var/lib/dekopon` is the retained model-credential claim.

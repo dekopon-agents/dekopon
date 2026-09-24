@@ -594,7 +594,19 @@ pub enum MemoryConfig {
         max_turns: usize,
         #[serde(default = "default_conversation_max_bytes")]
         max_bytes: usize,
+        #[serde(default)]
+        recall: Option<RecallSource>,
+        #[serde(default)]
+        forget_after_ms: Option<u64>,
     },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum RecallSource {
+    None,
+    Journal,
+    Platform,
 }
 
 impl Default for MemoryConfig {
@@ -614,6 +626,9 @@ const fn default_conversation_max_turns() -> usize {
 const fn default_conversation_max_bytes() -> usize {
     DEFAULT_CONVERSATION_MAX_BYTES
 }
+
+// One week matches how long WhatsApp keeps an inbound media id, so recalled photos stay fetchable.
+pub const DEFAULT_FORGET_AFTER: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -666,6 +681,8 @@ pub struct MemoryWindow {
     pub scope: MemoryScope,
     pub idle_timeout: Duration,
     pub limits: HistoryLimits,
+    pub recall: RecallSource,
+    pub forget_after: Duration,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -698,7 +715,20 @@ pub struct ResolvedRoute {
     pub memory: MemoryPolicy,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct JournalConfig {
+    pub path: PathBuf,
+    pub max_bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResolvedJournal {
+    pub dir: PathBuf,
+    pub max_bytes: u64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct SessionsConfig {
     #[serde(default = "default_asset_retention_bytes")]
@@ -709,6 +739,8 @@ pub struct SessionsConfig {
     pub reply_on_busy: bool,
     #[serde(default = "default_max_conversations")]
     pub max_conversations: usize,
+    #[serde(default)]
+    pub journal: Option<JournalConfig>,
 }
 
 impl Default for SessionsConfig {
@@ -718,6 +750,7 @@ impl Default for SessionsConfig {
             max_concurrent: DEFAULT_MAX_CONCURRENT_SESSIONS,
             reply_on_busy: true,
             max_conversations: DEFAULT_MAX_CONVERSATIONS,
+            journal: None,
         }
     }
 }
@@ -771,6 +804,7 @@ pub struct ResolvedConfig {
     pub(crate) liveness: BTreeMap<String, Arc<ResolvedLiveness>>,
     pub(crate) stop_words: Vec<String>,
     pub sessions: SessionsConfig,
+    pub journal: Option<ResolvedJournal>,
     pub shutdown_grace: Duration,
     pub telemetry: Option<ResolvedTelemetry>,
 }
@@ -1168,11 +1202,45 @@ pub(crate) fn resolve(
                 idle_timeout_ms,
                 max_turns,
                 max_bytes,
+                recall,
+                forget_after_ms,
             } => {
-                if idle_timeout_ms == 0 || max_turns == 0 || max_bytes == 0 {
+                if idle_timeout_ms == 0
+                    || max_turns == 0
+                    || max_bytes == 0
+                    || forget_after_ms == Some(0)
+                {
                     problems.push(ConfigProblem::InvalidMemoryBounds {
                         agent: route.agent.to_string(),
                     });
+                }
+                let journaled = config.sessions.journal.is_some();
+                let recall = recall.unwrap_or(if journaled {
+                    RecallSource::Journal
+                } else {
+                    RecallSource::None
+                });
+                match recall {
+                    RecallSource::Journal if !journaled => {
+                        problems.push(ConfigProblem::JournalRecallWithoutJournal { route: index });
+                    }
+                    RecallSource::Platform => {
+                        if let Some(kind) = transport_kinds.get(&route.transport)
+                            && !matches!(
+                                kind,
+                                ChatTransportKind::Slack | ChatTransportKind::Discord
+                            )
+                        {
+                            problems.push(ConfigProblem::PlatformRecallUnsupported {
+                                route: index,
+                                kind: *kind,
+                            });
+                        }
+                    }
+                    RecallSource::None if forget_after_ms.is_some() => {
+                        problems.push(ConfigProblem::ForgetAfterWithoutRecall { route: index });
+                    }
+                    RecallSource::None | RecallSource::Journal => {}
                 }
                 MemoryPolicy::Persistent(MemoryWindow {
                     scope,
@@ -1181,6 +1249,9 @@ pub(crate) fn resolve(
                         max_turns,
                         max_bytes,
                     },
+                    recall,
+                    forget_after: forget_after_ms
+                        .map_or(DEFAULT_FORGET_AFTER, Duration::from_millis),
                 })
             }
         };
@@ -1219,6 +1290,15 @@ pub(crate) fn resolve(
     if config.sessions.max_conversations == 0 {
         problems.push(ConfigProblem::InvalidMaxConversations);
     }
+    let journal = config.sessions.journal.as_ref().map(|journal| {
+        if journal.max_bytes == 0 {
+            problems.push(ConfigProblem::InvalidJournalBytes);
+        }
+        ResolvedJournal {
+            dir: resolve_path(journal.path.clone()),
+            max_bytes: journal.max_bytes,
+        }
+    });
     let shutdown_grace = match config.shutdown_grace_ms {
         Some(0) => {
             problems.push(ConfigProblem::InvalidSessionLimits);
@@ -1292,6 +1372,7 @@ pub(crate) fn resolve(
                 liveness: liveness_settings,
                 stop_words,
                 sessions: config.sessions,
+                journal,
                 shutdown_grace,
                 telemetry,
             })
@@ -1768,6 +1849,23 @@ pub enum ConfigProblem {
         "sessions.maxConversations must be greater than zero; a zero ceiling evicts every conversation immediately and turns a persistent route into an expensive one-shot one"
     )]
     InvalidMaxConversations,
+    #[error(
+        "sessions.journal.maxBytes must be greater than zero; omit sessions.journal to keep nothing on disk"
+    )]
+    InvalidJournalBytes,
+    #[error("routes[{route}]: `memory.recall: journal` needs `sessions.journal`")]
+    JournalRecallWithoutJournal { route: usize },
+    #[error(
+        "routes[{route}]: `memory.recall: platform` needs a chat service with a history API; {kind} has none, so use `journal`"
+    )]
+    PlatformRecallUnsupported {
+        route: usize,
+        kind: ChatTransportKind,
+    },
+    #[error(
+        "routes[{route}]: `memory.forgetAfterMs` bounds recall, and this route recalls nothing; set `recall` or remove it"
+    )]
+    ForgetAfterWithoutRecall { route: usize },
     #[error(
         "{name:?} is not a valid environment variable name; transports and models name variables, never secrets"
     )]
