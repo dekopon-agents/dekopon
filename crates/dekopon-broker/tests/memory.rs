@@ -463,7 +463,7 @@ async fn authorization_audit_failure_precedes_every_storage_tree_mutation() {
         denied.outcome,
         dekopon_capability::InvocationOutcome::Denied
     );
-    assert_eq!(audit.records().await.len(), 1);
+    assert_eq!(audit.records().len(), 1);
     let before = snapshot_tree_bytes(&root);
 
     let id = "audit-full-record"
@@ -1446,7 +1446,7 @@ async fn records_after_typed_acceptance_and_retrieves_after_restart() {
         .file_name()
         .into_string()
         .expect("opaque UTF-8 token");
-    let records = audit.records().await;
+    let records = audit.records();
     assert_eq!(records.len(), 5);
     // A storage-backed record carries every identity and policy field a non-storage record does:
     // the storage boundary contains what was stored, not who asked for it or which policy let them.

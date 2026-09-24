@@ -25,7 +25,14 @@
 
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
-
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        reason = "tests spawn, join and drain freely; production sites carry their own expectation"
+    )
+)]
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -330,90 +337,6 @@ pub fn command_run_from_outcome(outcome: CommandRunOutcome) -> CommandRun {
         CommandRunOutcome::Failed { error } => CommandRun::Failed {
             message: error.message,
         },
-    }
-}
-
-/// Records a command-word run whose caller was dropped while its process node was still joined.
-///
-/// The audit record carries only fixed categories — the leg, the outcome, an error kind — never
-/// the word, the argv, the piped value, or the text a provider rendered. The complete cause of a
-/// failure goes out as an ordinary error event at the same site, so it is recorded exactly once
-/// and never inside the audit stream, where a provider path or broker text does not belong.
-/// `error_type` names the stable kind of the leg's own error, since each leg fails differently.
-pub fn report_unobserved_command_run<E: std::error::Error + 'static>(
-    leg: &'static str,
-    outcome: ProcessOutcome<CommandRun, E>,
-    error_type: fn(&E) -> &'static str,
-) {
-    match outcome {
-        ProcessOutcome::Completed(Ok(_run)) => {
-            tracing::warn!(
-                target: "dekopon_agent::audit",
-                {
-                    audit.event = "agent.command.unobserved",
-                    command.leg = leg,
-                    outcome = "succeeded",
-                    error.type = "none",
-                },
-                "unobserved command run completed"
-            );
-        }
-        ProcessOutcome::Completed(Err(error)) => {
-            tracing::error!(
-                target: "dekopon_agent::audit",
-                {
-                    audit.event = "agent.command.unobserved",
-                    command.leg = leg,
-                    outcome = "operation-error",
-                    error.type = error_type(&error),
-                },
-                "unobserved command run failed"
-            );
-            tracing::error!(
-                command.leg = leg,
-                error = %dekopon_core::error_chain(&error),
-                "unobserved command run failed"
-            );
-        }
-        ProcessOutcome::TaskFailed(error) => {
-            let (outcome, error_type) = if error.is_cancelled() {
-                ("cancelled", "task-cancelled")
-            } else {
-                ("task-failed", "task-panicked")
-            };
-            tracing::error!(
-                target: "dekopon_agent::audit",
-                {
-                    audit.event = "agent.command.unobserved",
-                    command.leg = leg,
-                    outcome = outcome,
-                    error.type = error_type,
-                },
-                "unobserved command run task failed"
-            );
-            tracing::error!(
-                command.leg = leg,
-                error = %error,
-                "unobserved command run task failed"
-            );
-        }
-    }
-}
-
-/// The stable kind of one broker-client failure, for the unobserved-run record.
-#[cfg(unix)]
-fn client_error_kind(error: &ClientError) -> &'static str {
-    match error {
-        ClientError::SocketMetadata { .. } => "socket-metadata",
-        ClientError::UnsafeSocket => "unsafe-socket",
-        ClientError::ConnectTimeout => "connect-timeout",
-        ClientError::Connect { .. } => "connect",
-        ClientError::PeerCredentials { .. } => "peer-credentials",
-        ClientError::ServerIdentity { .. } => "server-identity",
-        ClientError::Limits(_) => "limits",
-        ClientError::Protocol { .. } => "protocol",
-        ClientError::Remote { .. } => "remote",
-        ClientError::UnexpectedResponse => "unexpected-response",
     }
 }
 
@@ -805,7 +728,7 @@ impl CapabilityInvoker for BrokerLeg {
             calls_max: self.calls_max,
         });
         // The round trip is one cancellable process node: a gateway Stop aborts it at its next
-        // await and the supervisor still joins it before this returns, so the leg never answers
+        // await and is still joined before this returns, so the leg never answers
         // while the request could still be in flight. The node owns its inputs for the whole run,
         // which is why the client (a path, a UID, and two bounds) is cloned into it.
         let client = self.client.clone();
@@ -825,11 +748,7 @@ impl CapabilityInvoker for BrokerLeg {
             },
         );
         // Safe for the reason `invoke` documents: this runs on a `spawn_blocking` thread.
-        let outcome = self
-            .runtime
-            .block_on(ProcessRun::execute(operation, |outcome| {
-                report_unobserved_command_run("broker", outcome, client_error_kind);
-            }));
+        let outcome = self.runtime.block_on(ProcessRun::execute(operation));
         let run = match outcome {
             ProcessOutcome::Completed(Ok(run)) => run,
             // A transport failure is not the provider declining: the model reads it as the broker

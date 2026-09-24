@@ -81,9 +81,8 @@ use std::{
 };
 
 use jaq_core::{
-    Compiler, Ctx, Vars, data,
+    Compiler, Ctx, Exn, Vars, data,
     load::{Arena, File, Loader},
-    unwrap_valr,
 };
 use jaq_json::{Num, Val};
 use serde_json::Value;
@@ -142,6 +141,10 @@ impl Builtin for Jq {
 }
 
 /// How many abandoned filter workers this process tolerates before refusing to start another.
+///
+/// A soft threshold, not a reservation: admission reads the count without claiming a slot, so
+/// filters admitted together can all be abandoned past it. The worst case is this ceiling minus one
+/// plus every filter the gateway runs at once.
 ///
 /// Only workers that never yield can accumulate here, and each one is a core spinning until the
 /// process exits. On the one-core deployment this crate is embedded in, four is already most of the
@@ -207,15 +210,23 @@ impl Worker {
     /// Returns this process's running abandonment total when the worker really was still going, and
     /// `None` when it had already returned and nothing outlives the command.
     fn abandon(&self) -> Option<u64> {
-        self.0
+        // Charge before publishing `ABANDONED`: `finish` releases the charge as soon as it sees that
+        // state, and releasing first would wrap the count below zero. A lost exchange undoes the
+        // charge, so the count can briefly read one high, never low.
+        ABANDONED_WORKERS.fetch_add(1, Ordering::SeqCst);
+        if self
+            .0
             .compare_exchange(
                 Self::RUNNING,
                 Self::ABANDONED,
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             )
-            .ok()?;
-        ABANDONED_WORKERS.fetch_add(1, Ordering::SeqCst);
+            .is_err()
+        {
+            ABANDONED_WORKERS.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
         Some(
             TOTAL_ABANDONMENTS
                 .fetch_add(1, Ordering::SeqCst)
@@ -317,6 +328,11 @@ fn submit(job: Job) -> Result<(), CommandFailure> {
     };
 
     let (jobs, queue) = sync_channel::<Job>(1);
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "owner: one reused worker per shell thread, never joined because a non-yielding \
+                  filter cannot be stopped; bound: MAX_ABANDONED_WORKERS plus the session ceiling"
+    )]
     std::thread::Builder::new()
         .name("dekopon-shell-jq".to_owned())
         .spawn(move || serve(&queue))
@@ -496,8 +512,8 @@ fn run_filter(filter: &str, input: Value, sender: &SyncSender<Produced>) -> Resu
         .map_err(|error| format!("jq: invalid input: {error}"))?;
 
     let context = Ctx::<data::JustLut<Val>>::new(&compiled.lut, Vars::new([]));
-    for result in compiled.id.run((context, value)).map(unwrap_valr) {
-        let produced = result.map_err(|error| format!("jq: {error}"))?;
+    for result in compiled.id.run((context, value)) {
+        let produced = result.map_err(describe_exception)?;
         let value = convert(&produced, 0)?;
         let bytes = weigh(&value);
         // A closed receiver means the evaluator abandoned this filter, so there is nothing left
@@ -507,6 +523,21 @@ fn run_filter(filter: &str, input: Value, sender: &SyncSender<Produced>) -> Resu
         }
     }
     Ok(())
+}
+
+/// Turns a filter's exception into this command's failure.
+///
+/// Stands in for `jaq_core::unwrap_valr`, which calls `std::process::exit` when a filter runs
+/// `halt`, `halt(n)` or `halt_error`. Here that would end the whole gateway, so a halt is an
+/// ordinary `jq` failure like any other.
+fn describe_exception(exception: Exn<'_, Val>) -> String {
+    match exception.get_err() {
+        Ok(error) => format!("jq: {error}"),
+        Err(exception) => match exception.get_halt() {
+            Ok(code) => format!("jq: halt({code}) is not supported"),
+            Err(_) => "jq: internal control flow escaped the filter".to_owned(),
+        },
+    }
 }
 
 /// How deeply a filter's output may nest before `jq` refuses it.
@@ -837,6 +868,14 @@ mod tests {
             filter("ltrimstr(\"a\")", json!("abc")).expect("filter runs"),
             json!("bc")
         );
+    }
+
+    #[test]
+    fn halt_fails_the_command_instead_of_exiting_the_process() {
+        for source in ["halt", "halt(3)", "\"x\" | halt_error", "1, halt, 2"] {
+            let message = message(filter(source, json!({})).expect_err(source));
+            assert!(message.contains("halt("), "{source}: {message}");
+        }
     }
 
     #[test]

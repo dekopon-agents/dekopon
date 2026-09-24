@@ -108,6 +108,11 @@ pub(crate) trait ModelFactory: Send + Sync {
 #[derive(Default)]
 pub(crate) struct ConfiguredModels {
     clients: Mutex<HashMap<String, Arc<ModelClient>>>,
+    /// One ChatGPT credential per auth file, however many models name it. A rotation that could
+    /// not be written back lives only in the instance that made it, so a second instance over the
+    /// same file would spend the refresh token the provider just retired.
+    chatgpt_credentials:
+        Mutex<HashMap<std::path::PathBuf, Arc<dekopon_model::chatgpt::CredentialFile>>>,
 }
 
 /// The bearer token a configured model's `apiKeyEnv` names, when it names one.
@@ -153,6 +158,34 @@ pub(crate) fn model_credential(
 }
 
 impl ConfiguredModels {
+    /// The shared credential for one auth file, opened by the first model that names it.
+    fn chatgpt_credential(
+        &self,
+        auth_file: Option<&std::path::Path>,
+        timeout: std::time::Duration,
+    ) -> Result<Arc<dekopon_model::chatgpt::CredentialFile>, InferenceError> {
+        use dekopon_model::{chatgpt, error::AuthError};
+        let path = chatgpt::resolve_auth_path(auth_file).map_err(AuthError::Credential)?;
+        let cached = self
+            .chatgpt_credentials
+            .lock()
+            .expect("gateway chatgpt credentials")
+            .get(&path)
+            .cloned();
+        if let Some(credential) = cached {
+            return Ok(credential);
+        }
+        // Opened outside the lock, like a client; two models racing to open one file keep the
+        // first instance, which is the one every later model is handed.
+        let opened =
+            Arc::new(chatgpt::CredentialFile::open(&path, timeout).map_err(AuthError::Credential)?);
+        let mut credentials = self
+            .chatgpt_credentials
+            .lock()
+            .expect("gateway chatgpt credentials");
+        Ok(Arc::clone(credentials.entry(path).or_insert(opened)))
+    }
+
     fn construct(&self, model: &ModelConfig) -> Result<Arc<ModelClient>, SessionError> {
         self.construct_with(model, |variable| std::env::var_os(variable))
     }
@@ -224,14 +257,13 @@ impl ConfiguredModels {
                 auth_file,
                 timeout_ms,
                 ..
-            } => Ok(Arc::new(ModelClient::Codex(
-                CodexClient::new(
-                    model,
-                    auth_file.as_deref(),
-                    std::time::Duration::from_millis(*timeout_ms),
-                )?
-                .with_name(name),
-            ))),
+            } => {
+                let timeout = std::time::Duration::from_millis(*timeout_ms);
+                let credential = self.chatgpt_credential(auth_file.as_deref(), timeout)?;
+                Ok(Arc::new(ModelClient::Codex(
+                    CodexClient::with_credential(model, credential, timeout)?.with_name(name),
+                )))
+            }
         }
     }
 }
@@ -302,6 +334,10 @@ impl ModelCache {
 pub(crate) struct SessionGate {
     permits: Arc<Semaphore>,
     late_permits: Arc<Semaphore>,
+    /// Refusal, busy and stopped replies waiting on a chat service. They are not sessions, but on
+    /// Discord they queue on the same REST lock as real answers, so a flood of them would delay
+    /// the answers they are refusing on behalf of.
+    refusals: Arc<Semaphore>,
     in_flight: Arc<Mutex<BTreeSet<AdmissionKey>>>,
 }
 
@@ -310,6 +346,7 @@ impl SessionGate {
         Self {
             permits: Arc::new(Semaphore::new(max_concurrent)),
             late_permits: Arc::new(Semaphore::new(max_concurrent)),
+            refusals: Arc::new(Semaphore::new(max_concurrent)),
             in_flight: Arc::new(Mutex::new(BTreeSet::new())),
         }
     }
@@ -327,6 +364,22 @@ impl SessionGate {
             key,
             in_flight: Arc::clone(&self.in_flight),
         })
+    }
+}
+
+impl SessionGate {
+    /// Reserves one pending refusal reply, or `None` when enough are already waiting on a chat
+    /// service. The message's trace already carries its disposition, so a skipped reply loses
+    /// only the courtesy text, never the record.
+    pub fn refusal(&self) -> Option<OwnedSemaphorePermit> {
+        let permit = Arc::clone(&self.refusals).try_acquire_owned().ok();
+        if permit.is_none() {
+            tracing::info!(
+                event = "gateway_refusal_reply_skipped",
+                reason = "refusals-full"
+            );
+        }
+        permit
     }
 }
 
@@ -769,7 +822,9 @@ async fn execute(
             if late.is_stopped() {
                 return "stopped";
             }
-            answer(&driver, &message, late_photos::REFUSED_REPLY).await;
+            if let Some(_reply) = runner.gate.refusal() {
+                answer(&driver, &message, late_photos::REFUSED_REPLY).await;
+            }
             return "late-busy";
         };
         return late
@@ -783,7 +838,9 @@ async fn execute(
     let key = (message.transport.clone(), message.conversation.key());
     let Some(admission) = runner.gate.admit(key) else {
         tracing::info!(event = "gateway_session_rejected", reason = "busy");
-        if runner.reply_on_busy || !message.constituents.is_empty() {
+        if (runner.reply_on_busy || !message.constituents.is_empty())
+            && let Some(_reply) = runner.gate.refusal()
+        {
             answer(&driver, &message, BUSY_REPLY).await;
         }
         return "busy";
@@ -1185,7 +1242,6 @@ async fn session(
                     notice,
                 )))
                 .await;
-            progress.finish_in_background();
             if replied && let Some(notice) = notice {
                 _active_registration
                     .late_photos
@@ -1227,7 +1283,6 @@ async fn session(
         // about a session that ended. The unanswered in-process turn was committed above so a
         // later continuation still sees what the person said.
         progress.terminal(Terminal::Silent).await;
-        progress.finish_in_background();
         return "declined";
     }
 
@@ -1287,7 +1342,6 @@ async fn session(
         (Ok(_), false) => AssetDeliveryDisposition::Failed,
         (Err(_), _) => AssetDeliveryDisposition::Abandoned,
     });
-    progress.finish_in_background();
     if delivered {
         if let Some(notice) = late_notice {
             _active_registration
@@ -1319,7 +1373,6 @@ async fn stopped(
     tracing::info!(event = "gateway_session_cancelled");
     let by = cancellation.source().unwrap_or(CancelSource::Operator);
     progress.terminal(Terminal::Cancelled { by }).await;
-    progress.finish_in_background();
     "cancelled"
 }
 
@@ -1767,5 +1820,34 @@ mod model_factory_tests {
             cache.get("codex"),
             Some(client) if matches!(client.as_ref(), ModelClient::Codex(_))
         ));
+    }
+
+    #[test]
+    fn chatgpt_models_on_one_auth_file_share_one_credential() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let factory = ConfiguredModels::default();
+        let directory = tempfile::TempDir::new().unwrap();
+        let credential = serde_json::json!({"version":1,"access":"synthetic","refresh":"synthetic","expiresAt":u64::MAX,"accountId":"synthetic"});
+        let shared = directory.path().join("auth.json");
+        let separate = directory.path().join("other.json");
+        for path in [&shared, &separate] {
+            std::fs::write(path, serde_json::to_vec(&credential).unwrap()).unwrap();
+        }
+        for (name, path) in [("astra", &shared), ("terra", &shared), ("luna", &separate)] {
+            let config: ModelConfig = serde_json::from_value(serde_json::json!({"kind":"chatgptSubscription", "name":name, "model":"fixture", "timeoutMs":2000, "authFile":path})).unwrap();
+            factory
+                .build(
+                    &config,
+                    runtime.handle().clone(),
+                    tokio::sync::watch::channel(false).1,
+                )
+                .unwrap();
+        }
+        assert_eq!(factory.clients.lock().unwrap().len(), 3);
+        assert_eq!(
+            factory.chatgpt_credentials.lock().unwrap().len(),
+            2,
+            "one credential per auth file, not per model"
+        );
     }
 }

@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "tests spawn, join and drain freely"
+)]
 #![cfg(unix)]
 #![allow(clippy::unwrap_used)]
 
@@ -2207,4 +2212,66 @@ fn b1_original_load_budget_and_write_growth_are_independent() {
     assert!(before.iter().any(|(_, bytes)| bytes == b"0\n0\n"));
     assert!(before.iter().any(|(_, bytes)| bytes == b"0\n"));
     handle.commit().expect("finish");
+}
+
+/// Contenders for one namespace queue on an in-process lock before the base lease. Each used to
+/// get its own `lockTimeoutMs` after the one ahead of it gave up, so the k-th waited k timeouts.
+#[test]
+fn every_contender_for_a_held_namespace_times_out_within_one_lock_timeout() {
+    const TIMEOUT_MS: u64 = 200;
+    let (_temporary, root) = fixture();
+    let host = Arc::new(
+        StorageHost::open(
+            &root,
+            StorageLimits {
+                lock_timeout_ms: TIMEOUT_MS,
+                ..StorageLimits::default()
+            },
+        )
+        .expect("host"),
+    );
+    let held = host
+        .grant(scoped_request(
+            b"authority",
+            ContinuityPolicy::Stable,
+            "lease-held",
+            StorageAccess::ReadOnly,
+            "slack.t0123abc.uone",
+        ))
+        .expect("held grant");
+    let held = host.begin(held).expect("held transaction");
+
+    let contenders = 3;
+    let barrier = Arc::new(Barrier::new(contenders + 1));
+    let workers = (0..contenders)
+        .map(|index| {
+            let host = Arc::clone(&host);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                let started = std::time::Instant::now();
+                let result = host.grant(scoped_request(
+                    b"authority",
+                    ContinuityPolicy::Stable,
+                    &format!("lease-contender-{index}"),
+                    StorageAccess::ReadOnly,
+                    "slack.t0123abc.uone",
+                ));
+                (result.map(|_| ()), started.elapsed())
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    for worker in workers {
+        let (result, elapsed) = worker.join().expect("contender");
+        assert!(
+            matches!(result, Err(StorageHostError::Timeout)),
+            "{result:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(2 * TIMEOUT_MS),
+            "a contender waited {elapsed:?}, past one {TIMEOUT_MS} ms deadline"
+        );
+    }
+    held.finish_read().expect("held transaction finishes");
 }

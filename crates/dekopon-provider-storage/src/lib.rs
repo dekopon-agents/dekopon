@@ -5,7 +5,14 @@
 
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
-
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        reason = "tests spawn, join and drain freely; production sites carry their own expectation"
+    )
+)]
 /// The imported storage WIT contract used by the generated guest bindings.
 pub const STORAGE_WIT: &str = include_str!("../wit/deps/storage.wit");
 

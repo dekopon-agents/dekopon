@@ -129,6 +129,19 @@ tokio is the runtime; the `bindgen!` host traits are already `async fn` in trait
 - Yes: `trait Sink { fn write(&mut self, chunk: &[u8]) -> impl Future<Output = io::Result<()>> + Send; }` where a spawn needs it; `tokio::task::spawn_blocking(move || blob.read())`.
 - No: `#[async_trait]`, `Pin<Box<dyn Future<Output = …>>>` in a signature, `std::fs::read` inside an `async fn`.
 
+### Concurrency
+
+Every task, thread, queue and lock has an owner, a bound and a shutdown path. Before adding one,
+name what already bounds the work (a session gate, `&mut self`, a lock that already serializes
+it); if something does, add nothing, and prefer deleting a redundant primitive to adding a new one.
+[`clippy.toml`](clippy.toml) bans the raw forms below through `disallowed-methods` and
+`disallowed-types`, beside the workspace `await_holding_*` lints. A production use needs a site
+`#[expect(clippy::disallowed_methods, reason = "owner: …; bound: …")]`: the reason is the registry,
+and rustc fails an expectation that stops firing. Tests are exempt at each crate root.
+
+- Yes: tasks in a `JoinSet` the owner joins at shutdown; `mpsc::channel(N)` with the full-queue policy named; `Arc::clone(&permits).try_acquire_owned()` **before** spawning, the permit moved into the task; `std::sync::Mutex` for bookkeeping, locked, copied out and dropped; `watch` for latest state, `oneshot` for one reply; an awaited `spawn_blocking`, carrying its permit into the closure when the job can outlive its caller; `Handle::block_on` only on a blocking thread.
+- No: `tokio::spawn` with a dropped `JoinHandle`; `unbounded_channel`; a `Condvar` drain; a lock held across `block_on`, network I/O or a channel wait; `tokio::sync::Mutex` for plain bookkeeping; `std::thread::spawn`; cancellation machinery for native work that is correct to let finish (a token rotation); a CI script, registry file or grep gate to enforce any of this.
+
 ### Dependencies
 
 The workspace already carries the mature crate; wrapping it is one function, re-implementing it is a second security boundary.
@@ -179,6 +192,9 @@ reports the lane as blocked with both verdicts side by side; the disagreement is
 the brief's intent over its text and did something the text did not say, one line each with the
 sentence it overrode. `Limits`: one table of every ceiling constant the lane added or moved: name,
 value, the test that hits it and the test one past it.
+
+**Concurrency findings** name the owner and bound the change is missing, or the existing owner that
+makes a new primitive redundant; "this could race" is not a finding until the interleaving is named.
 
 **The PR reviewer** reads the assembled change for what only the whole shows: one definition per
 fact across lanes, seams matching on both sides, deletions complete, docs describing only the new

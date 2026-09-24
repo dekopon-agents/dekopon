@@ -10,7 +10,14 @@
 
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
-
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        reason = "tests spawn, join and drain freely; production sites carry their own expectation"
+    )
+)]
 pub mod asset;
 mod stream;
 pub use stream::{
@@ -559,7 +566,8 @@ impl BoundCredential {
         }
         #[allow(
             clippy::map_err_ignore,
-            reason = "Utf8Error carries the secret-derived invalid byte offset and valid prefix length; the fixed structural refusal must not expose either"
+            reason = "Utf8Error carries the secret-derived invalid byte offset and valid prefix \
+                      length; the fixed structural refusal must not expose either"
         )]
         let token = std::str::from_utf8(secret.expose()).map_err(|_| {
             ConfigurationError::InvalidCredential {

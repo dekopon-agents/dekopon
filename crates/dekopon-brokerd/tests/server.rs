@@ -1,3 +1,8 @@
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "tests spawn, join and drain freely"
+)]
 #![allow(clippy::unwrap_used)]
 
 use std::{
@@ -315,10 +320,7 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
         }
         other => panic!("expected a rendered help page, got {other:?}"),
     }
-    assert!(
-        audit.records().await.is_empty(),
-        "rendering decides nothing"
-    );
+    assert!(audit.records().is_empty(), "rendering decides nothing");
 
     let (capability, input) = match client
         .run_command(
@@ -361,7 +363,7 @@ async fn run_command_over_the_socket_renders_help_then_proposes() {
     assert_eq!(result.result.outcome, InvocationOutcome::Succeeded);
     assert_eq!(result.result.output, Some(json!({"text": "HELLO"})));
     assert_eq!(
-        audit.records().await.len(),
+        audit.records().len(),
         2,
         "one decision and one execution for the one invocation"
     );
@@ -405,7 +407,7 @@ async fn authenticated_unix_peer_can_inspect_and_invoke_under_policy() {
         result.result.output,
         Some(json!({"text": "HELLO THROUGH BROKER"}))
     );
-    assert_eq!(audit.records().await.len(), 2);
+    assert_eq!(audit.records().len(), 2);
 
     shutdown_send.send(()).expect("signal clean shutdown");
     task.await
@@ -686,7 +688,7 @@ async fn a_failed_terminal_audit_is_distinguishable_from_an_invocation_that_neve
         "the client must be told the effect may have happened: {message}"
     );
     // The Decision landed; the provider ran; nothing recorded the outcome.
-    assert_eq!(audit.records().await.len(), 1);
+    assert_eq!(audit.records().len(), 1);
 
     let never_ran = client
         .invoke(None, request("invoke-never-ran"), Default::default())
@@ -759,7 +761,7 @@ async fn an_attested_invoke_over_the_socket_succeeds_for_an_attestor_peer() {
         Some(json!({"text": "HELLO THROUGH BROKER"}))
     );
 
-    let records = audit.records().await;
+    let records = audit.records();
     assert_eq!(records.len(), 2);
     let encoded: Value = serde_json::to_value(&records).expect("audit serializes");
     assert_eq!(encoded[0]["principal"], "cpetersen");
@@ -807,7 +809,7 @@ async fn an_attested_invoke_from_a_peer_without_a_grant_is_denied_not_erred() {
     assert_eq!(result.result.outcome, InvocationOutcome::Denied);
     assert_eq!(result.result.error.as_deref(), Some("attestation-denied"));
 
-    let records = audit.records().await;
+    let records = audit.records();
     assert_eq!(records.len(), 1);
     let encoded: Value = serde_json::to_value(&records).expect("audit serializes");
     assert_eq!(
@@ -875,7 +877,7 @@ async fn mismatched_attestation_binding_is_a_protocol_error() {
     };
     assert_eq!(code, ERROR_INVALID_REQUEST);
     assert!(
-        audit.records().await.is_empty(),
+        audit.records().is_empty(),
         "a frame refused before dispatch is not a decision about anything"
     );
 
@@ -1152,7 +1154,7 @@ async fn a_non_invoke_frame_with_descriptors_is_refused_without_a_broker_decisio
     assert!(
         matches!(response.response, BrokerResponse::Error { code, .. } if code == ERROR_INVALID_REQUEST)
     );
-    assert!(audit.records().await.is_empty());
+    assert!(audit.records().is_empty());
     shutdown_send.send(()).unwrap();
     task.await.unwrap().unwrap();
 }
@@ -1277,7 +1279,7 @@ async fn successful_asset_descriptors_and_send_effects_cross_the_real_server_wit
     assert_eq!(sent.result.outcome, InvocationOutcome::Succeeded);
     assert_eq!(sent.sent, vec![1]);
     assert!(sent.descriptors.is_empty());
-    assert_eq!(audit.records().await.len(), 4);
+    assert_eq!(audit.records().len(), 4);
 
     let mut invocation = request("caught-over-budget");
     invocation.capability = capability.clone();
@@ -1317,7 +1319,7 @@ async fn successful_asset_descriptors_and_send_effects_cross_the_real_server_wit
         .await
         .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
-        while audit.records().await.len() < 8 {
+        while audit.records().len() < 8 {
             tokio::task::yield_now().await;
         }
     })

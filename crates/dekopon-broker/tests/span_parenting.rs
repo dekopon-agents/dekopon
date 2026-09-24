@@ -10,6 +10,11 @@
 //! This lives in its own test binary because `tracing` resolves per-callsite interest against the
 //! global dispatcher, and because the interleaving it depends on needs a single-threaded runtime.
 
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "tests spawn, join and drain freely"
+)]
 #![allow(clippy::unwrap_used)]
 
 use std::{collections::BTreeMap, sync::Arc};

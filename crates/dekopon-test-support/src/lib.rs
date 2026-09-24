@@ -17,7 +17,11 @@
 //! generic socket, file, capture and transport fixtures do not compile the prompt loop.
 
 #![cfg_attr(test, allow(clippy::unwrap_used))]
-
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "tests spawn, join and drain freely; production sites carry their own expectation"
+)]
 use std::{
     io::{ErrorKind, Read as _, Write as _},
     net::{TcpListener, TcpStream},

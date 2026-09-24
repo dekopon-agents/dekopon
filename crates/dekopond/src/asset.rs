@@ -275,7 +275,6 @@ pub(crate) struct AssetStore {
     idle_timeout: Duration,
     entries: Mutex<HashMap<AssetStateKey, ConversationAssets>>,
     retention: Mutex<Retention>,
-    downloads: Mutex<()>,
     next_one_shot_id: AtomicU64,
 }
 
@@ -307,7 +306,6 @@ impl AssetStore {
             idle_timeout,
             entries: Mutex::new(HashMap::new()),
             retention: Mutex::new(Retention::new(budget)),
-            downloads: Mutex::new(()),
             next_one_shot_id: AtomicU64::new(1),
         }
     }
@@ -660,6 +658,13 @@ const MAX_ASSET_BYTES: u64 = dekopon_model::asset::MAX_ATTACHMENT_BYTES as u64;
 /// touring the conversation's history, and each fetch is a round trip plus a re-encoded prompt.
 const MAX_FETCHES_PER_SESSION: u32 = 4;
 
+/// The longest one attachment download may take, end to end.
+///
+/// Transport clients time out per request, a fetch can be several requests, and Telegram's shares
+/// its long-poll client's 70 s timeout, so without this a stalled CDN holds the session's blocking
+/// thread for minutes.
+const ASSET_FETCH_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// One session's view of the attachments it may show its model.
 ///
 /// Implements [`dekopon_agent::prompt::AssetSource`], whose `fetch` is synchronous because the
@@ -804,12 +809,9 @@ impl SessionAssets {
     /// The one definition both entry points share, so the model-facing wording and the
     /// capability-facing refusal reason can never disagree about what is readable.
     fn load(&self, id: u64, consumer: AssetConsumer) -> Result<(AssetRef, DiskBlob), AssetFailure> {
-        // Serialize first fetch/publication: concurrent references must not redownload the same file.
-        let _download = self
-            .store
-            .downloads
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // No store-wide download lock: `SessionGate` admits one session per conversation and a
+        // session's reads are sequential, so one attachment is never fetched twice at once, and a
+        // stalled download elsewhere must not hold up this read. `admit` still keeps the first copy.
         let Some(asset) = self.store.get_access(&self.access, id, Instant::now()) else {
             // Pin lookup emits the correlated unknown/reclaimed/unauthorized distinction.
             return match self.store.pin(&self.access, id, false) {
@@ -856,7 +858,13 @@ impl SessionAssets {
         };
         let data = self
             .runtime
-            .block_on(fetcher.fetch(source, MAX_ASSET_BYTES))
+            .block_on(tokio::time::timeout(
+                ASSET_FETCH_TIMEOUT,
+                fetcher.fetch(source, MAX_ASSET_BYTES),
+            ))
+            .map_err(|_elapsed| AssetFailure::Transport {
+                category: "fetch-timeout",
+            })?
             .map_err(|error| AssetFailure::Transport {
                 // The transport's own category, never its message: a transport error can carry
                 // service text, and this string goes into a prompt.
@@ -1019,6 +1027,13 @@ impl Retention {
         len: usize,
         create: impl FnOnce() -> Result<DiskBlob, BlobError>,
     ) -> Result<DiskBlob, BlobError> {
+        // Two reads of one attachment can finish their downloads back to back; the second keeps
+        // the first copy rather than charging the budget for it twice.
+        if let Some(entry) = self.resident.get_mut(&key) {
+            self.clock += 1;
+            entry.used = self.clock;
+            return Ok(entry.data.clone());
+        }
         self.check_size(key.1, len)?;
         let charge = len.max(1);
         let needed = (self.bytes + charge).saturating_sub(self.budget);
@@ -1952,6 +1967,70 @@ mod retention_tests {
         })
         .await
         .unwrap();
+    }
+
+    /// A download that announces it has started, then never answers until released.
+    struct Stalled {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+    impl AssetFetcher for Stalled {
+        fn fetch(
+            &self,
+            _: &AssetSourceRef,
+            _: u64,
+        ) -> futures_util::future::BoxFuture<'_, Result<Vec<u8>, crate::transport::TransportError>>
+        {
+            self.entered.notify_one();
+            Box::pin(async {
+                let _released = self.release.acquire().await;
+                Ok(b"ok".to_vec())
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stalled_download_does_not_hold_up_another_conversations_retained_attachment() {
+        let store = store(8);
+        let stalled_access = access("stalled");
+        let stalled_id = register(&store, &stalled_access);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let fetcher = Stalled {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        };
+        let stalled = SessionAssets::new(
+            Arc::clone(&store),
+            stalled_access,
+            Some(Arc::new(fetcher) as Arc<dyn AssetFetcher>),
+            Handle::current(),
+            true,
+            true,
+        );
+        let stalled = tokio::task::spawn_blocking(move || {
+            stalled
+                .fetch(stalled_id)
+                .map(|asset| asset.data.read().unwrap())
+        });
+        entered.notified().await;
+
+        let retained_access = access("retained");
+        let retained_id = register(&store, &retained_access);
+        drop(store.admit(&retained_access, retained_id, b"kep").unwrap());
+        let retained = session(Arc::clone(&store), retained_access);
+        let read = tokio::time::timeout(
+            Duration::from_secs(5),
+            tokio::task::spawn_blocking(move || retained.fetch(retained_id)),
+        )
+        .await
+        .expect("a retained read does not wait on another conversation's download")
+        .unwrap()
+        .unwrap();
+        assert_eq!(read.data.read().unwrap(), b"kep");
+
+        release.add_permits(1);
+        assert_eq!(stalled.await.unwrap().unwrap(), b"ok");
     }
 
     fn received(bytes: &[u8], label: &str, encoding: AssetEncoding) -> (OwnedFd, NewAsset) {

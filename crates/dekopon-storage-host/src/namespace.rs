@@ -89,7 +89,7 @@ impl NamespacePlan {
     pub(crate) fn prepare(
         namespaces_root: &Directory,
         request: &StorageGrantRequest,
-        lock_timeout_ms: u64,
+        deadline: Instant,
         maximum_entries: u64,
     ) -> Result<Self, StorageHostError> {
         let values = request.scope_values();
@@ -108,7 +108,7 @@ impl NamespacePlan {
             }
             let base = namespaces_root.open_directory(&base_token)?;
             let lease = base.open_private("base.lock", false)?;
-            lock_exclusive(&lease, lock_timeout_ms)?;
+            lock_exclusive(&lease, deadline)?;
             if !namespaces_root.retains_child(&base_token, &base)? {
                 return Err(StorageHostError::Busy);
             }
@@ -210,7 +210,7 @@ impl NamespacePlan {
     pub(crate) fn apply(
         mut self,
         namespaces_root: &Directory,
-        lock_timeout_ms: u64,
+        deadline: Instant,
     ) -> Result<Namespace, StorageHostError> {
         let (base, base_lease) = match (self.existing_base.take(), self.existing_base_lease.take())
         {
@@ -218,7 +218,7 @@ impl NamespacePlan {
             (None, None) => {
                 let base = namespaces_root.ensure_directory(&self.base_token)?;
                 let lease = base.open_private("base.lock", true)?;
-                lock_exclusive(&lease, lock_timeout_ms)?;
+                lock_exclusive(&lease, deadline)?;
                 (base, lease)
             }
             _ => return Err(StorageHostError::corrupt("namespace-plan")),
@@ -544,6 +544,16 @@ fn read_pointer(
     Ok(Some(document))
 }
 
+/// The instant a lock wait of `timeout_ms` started now gives up at.
+///
+/// One grant computes this once and passes it through every wait it makes, so the configured
+/// `lockTimeoutMs` bounds the whole acquisition rather than each lock in turn.
+pub(crate) fn deadline_after(timeout_ms: u64) -> Result<Instant, StorageHostError> {
+    Instant::now()
+        .checked_add(Duration::from_millis(timeout_ms))
+        .ok_or(StorageHostError::Arithmetic)
+}
+
 /// Takes a lease, polling until another holder releases it or `timeout_ms` elapses.
 ///
 /// # Errors
@@ -552,10 +562,7 @@ fn read_pointer(
 /// [`StorageHostError::Io`] when the lock could not be attempted at all. The two are not
 /// interchangeable: contention is transient and worth retrying, while a filesystem that fails or
 /// refuses advisory locks will refuse the next attempt too.
-pub(crate) fn lock_exclusive(file: &File, timeout_ms: u64) -> Result<(), StorageHostError> {
-    let deadline = Instant::now()
-        .checked_add(Duration::from_millis(timeout_ms))
-        .ok_or(StorageHostError::Arithmetic)?;
+pub(crate) fn lock_exclusive(file: &File, deadline: Instant) -> Result<(), StorageHostError> {
     loop {
         match file.try_lock() {
             Ok(()) => return Ok(()),
@@ -596,7 +603,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use super::{lease_lock_failure, lock_exclusive};
+    use super::{deadline_after, lease_lock_failure, lock_exclusive};
     use crate::StorageHostError;
 
     /// A lease another holder has is contention, which is what `Timeout` means to a caller.
@@ -613,7 +620,7 @@ mod tests {
         // A second open file description, which is what a second holder of this lease is.
         let contender = File::open(&path).expect("a second handle on the same lease");
         let started = Instant::now();
-        let refused = lock_exclusive(&contender, 30);
+        let refused = lock_exclusive(&contender, deadline_after(30).expect("deadline"));
 
         assert!(
             matches!(refused, Err(StorageHostError::Timeout)),
@@ -627,7 +634,8 @@ mod tests {
         // The control: releasing the lease makes the same call succeed, so the refusal above was
         // the other holder rather than anything about the file.
         held.unlock().expect("the first holder releases the lease");
-        lock_exclusive(&contender, 30).expect("an uncontended lease is taken");
+        lock_exclusive(&contender, deadline_after(30).expect("deadline"))
+            .expect("an uncontended lease is taken");
     }
 
     /// A filesystem that fails or refuses advisory locks is not another conforming writer.

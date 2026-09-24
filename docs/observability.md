@@ -195,7 +195,6 @@ these carries a fixed category rather than the untrusted text that triggered it:
 | `config.startup.warning` | `dekopon-brokerd` | the capability id and a stable `reason` — `unrouted-constraint-set` or `unconstrained-capability` |
 | `command.resolve.failed` | `dekopon-brokerd` | the provider-declared command word, a stable `error.kind`, and the host error's chain, recorded when running the word (`runCommand`) fails rather than declines: no provider declares it, the argv plus piped value exceeded `maxInputBytes`, the guest trapped or reached for an import, or its answer would not decode |
 | `policy.request.refused` | `dekopon-broker` | the capability id and a rendered `error.reason` for a Cedar request the policy schema could not admit — the caller sees plain `policy-denied` |
-| `agent.command.unobserved` | `dekopon-agent` | `command.leg` (`broker` or `direct`), a low-cardinality `outcome` (`succeeded`, `operation-error`, `cancelled`, or `task-failed`), and a fixed `error.type` (`none`, the leg's own error kind, `task-cancelled`, or `task-panicked`), recorded when a command-word run's caller was dropped while its process node was joined; never the word, the argv, the piped value, or the text a provider rendered, and the failure's complete cause goes out as an ordinary error event at the same site rather than into this record |
 
 `agent.improvement.suggested` is the exception to that sentence. Its four free-text fields are
 model-authored — bounded and stripped of control characters other than newline and tab, never
@@ -1074,10 +1073,7 @@ shell excludes, and an exhausted sandbox budget.
 
 Structured log records use stable `audit.event` attributes and do not mirror spans: a command's
 start, end, duration, parent, and outcome all live on its `shell.command` span, so the log stream
-carries accounting, refusals, errors, and payloads. `agent.command.unobserved`
-records a command-word run whose caller was dropped while the owning runtime remains alive; it
-carries `command.leg`, a low-cardinality outcome and error kind, never output or argv, and its
-complete failure cause is an ordinary error event beside the record. Logs inside the active trace
+carries accounting, refusals, errors, and payloads. Logs inside the active trace
 carry generated `trace_id` and `span_id`, so an OTLP log result pivots to the performance trace.
 
 ## Exclusions

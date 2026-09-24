@@ -9,6 +9,11 @@
 //! global dispatcher, so a sibling test reaching these callsites with no subscriber installed can
 //! disable them for the whole process.
 
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "tests spawn, join and drain freely"
+)]
 #![allow(clippy::unwrap_used)]
 
 use std::{

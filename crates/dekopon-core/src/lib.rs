@@ -12,7 +12,14 @@
 
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
-
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        reason = "tests spawn, join and drain freely; production sites carry their own expectation"
+    )
+)]
 pub mod asset;
 
 /// Shared bounded native base64 plumbing; absent from guest builds.

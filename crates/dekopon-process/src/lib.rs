@@ -2,9 +2,9 @@
 //!
 //! This slice owns exactly one boundary: run one asynchronous operation in a traced Tokio task and
 //! join it before returning. A process is either non-interruptible or cancellable. Cancellation is
-//! cooperative and minimal: a [`CancelHandle`] asks, the supervisor aborts the node's Tokio task at
-//! its next `.await`, and the supervisor still joins that task before it reports anything. The
-//! supervisor joins the node's own Tokio task and nothing else: work the node handed to
+//! cooperative and minimal: a [`CancelHandle`] asks, [`ProcessRun::execute`] aborts the node's Tokio
+//! task at its next `.await`, and still joins that task before it reports anything. It joins the
+//! node's own Tokio task and nothing else: work the node handed to
 //! [`tokio::task::spawn_blocking`] or spawned as another task is detached by the abort, is not
 //! joined, and can outlive a `cancelled` outcome. A node that must not leave such work behind
 //! must stay [`ProcessMetadata::non_interruptible`]. Structured process trees, ports, deadlines,
@@ -12,7 +12,14 @@
 
 #![forbid(unsafe_code)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
-
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        reason = "tests spawn, join and drain freely; production sites carry their own expectation"
+    )
+)]
 use std::{
     error::Error,
     fmt,
@@ -21,7 +28,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use tokio::sync::watch;
+use tokio::{sync::watch, task::JoinSet};
 use tracing::Instrument as _;
 
 static NEXT_RUN_ID: AtomicU64 = AtomicU64::new(1);
@@ -89,7 +96,7 @@ impl CancelHandle {
 ///     std::future::pending::<Result<(), io::Error>>().await
 /// });
 /// handle.cancel();
-/// match ProcessRun::execute(process, |_| {}).await {
+/// match ProcessRun::execute(process).await {
 ///     ProcessOutcome::TaskFailed(error) => assert!(error.is_cancelled()),
 ///     ProcessOutcome::Completed(_) => panic!("a parked process cannot complete"),
 /// }
@@ -110,7 +117,7 @@ impl CancelSignal {
 
     /// Creates a signal that nobody can ever request.
     ///
-    /// Its sender is dropped immediately, which the supervisor treats as "pend forever", never as
+    /// Its sender is dropped immediately, which `execute` treats as "pend forever", never as
     /// a cancellation.
     #[must_use]
     pub fn never() -> Self {
@@ -122,7 +129,7 @@ impl CancelSignal {
     /// Reports whether cancellation has already been requested.
     ///
     /// The point-in-time read for a caller that must decide now rather than await: a synchronous
-    /// boundary deciding whether to start work at all, where the supervisor's own await on this
+    /// boundary deciding whether to start work at all, where `execute`'s own await on this
     /// signal has nothing yet to abort. Once requested it stays `true`, and a
     /// [`CancelSignal::never`] signal is always `false`. A signal fired the instant after this
     /// returns `false` is the ordinary race any cooperative check has: work started on that answer
@@ -132,7 +139,7 @@ impl CancelSignal {
         *self.receiver.borrow()
     }
 
-    /// Clones the cancellation watch for consumers outside the process supervisor.
+    /// Clones the cancellation watch for consumers outside the process.
     #[must_use]
     pub fn watch(&self) -> watch::Receiver<bool> {
         self.receiver.clone()
@@ -269,16 +276,16 @@ pub enum ProcessOutcome<Output, OperationError> {
     ///
     /// A requested cancellation arrives here with
     /// [`JoinError::is_cancelled`](tokio::task::JoinError::is_cancelled) set, and only after the
-    /// supervisor has joined the aborted task.
+    /// node has been joined the aborted task.
     TaskFailed(tokio::task::JoinError),
 }
 
 /// One-run/one-node Tokio execution boundary.
 ///
 /// The run and node identities exist only as trace fields; Tokio task IDs are not application
-/// identity. `execute` transfers the process into a self-contained supervisor before its first
-/// await. While the owning Tokio runtime remains alive, the supervisor owns and joins the node even
-/// if the caller drops the `execute` future. Runtime shutdown is the ownership boundary.
+/// identity. The node runs in a one-task [`JoinSet`] owned by the `execute`
+/// future, so dropping that future aborts the node; the one caller drives it to completion with
+/// `block_on`, which never drops it early.
 ///
 /// # Example
 ///
@@ -296,12 +303,7 @@ pub enum ProcessOutcome<Output, OperationError> {
 ///         || async { Ok::<_, io::Error>(42_u8) },
 ///     );
 ///
-///     let on_unobserved = |outcome| match outcome {
-///         ProcessOutcome::Completed(Ok(_)) => eprintln!("unobserved process succeeded"),
-///         ProcessOutcome::Completed(Err(error)) => eprintln!("unobserved error: {error}"),
-///         ProcessOutcome::TaskFailed(error) => eprintln!("unobserved task failure: {error}"),
-///     };
-///     match ProcessRun::execute(process, on_unobserved).await {
+///     match ProcessRun::execute(process).await {
 ///         ProcessOutcome::Completed(Ok(value)) => assert_eq!(value, 42),
 ///         ProcessOutcome::Completed(Err(error)) => panic!("operation failed: {error}"),
 ///         ProcessOutcome::TaskFailed(error) => panic!("task failed: {error}"),
@@ -312,52 +314,6 @@ pub struct ProcessRun {
     _private: (),
 }
 
-struct OutcomeEnvelope<Outcome, Observer>
-where
-    Observer: FnOnce(Outcome),
-{
-    outcome: Option<Outcome>,
-    observer: Option<Observer>,
-}
-
-impl<Outcome, Observer> OutcomeEnvelope<Outcome, Observer>
-where
-    Observer: FnOnce(Outcome),
-{
-    fn new(outcome: Outcome, observer: Observer) -> Self {
-        Self {
-            outcome: Some(outcome),
-            observer: Some(observer),
-        }
-    }
-
-    fn claim(mut self) -> Outcome {
-        let outcome = self
-            .outcome
-            .take()
-            .expect("an unclaimed envelope always contains its outcome");
-        let observer = self
-            .observer
-            .take()
-            .expect("an unclaimed envelope always contains its observer");
-        drop(observer);
-        outcome
-    }
-}
-
-impl<Outcome, Observer> Drop for OutcomeEnvelope<Outcome, Observer>
-where
-    Observer: FnOnce(Outcome),
-{
-    fn drop(&mut self) {
-        match (self.outcome.take(), self.observer.take()) {
-            (Some(outcome), Some(observer)) => observer(outcome),
-            (None, None) => {}
-            _ => unreachable!("outcome and observer are always claimed together"),
-        }
-    }
-}
-
 impl ProcessRun {
     /// Runs one process in a traced Tokio task and joins it before returning.
     ///
@@ -365,18 +321,9 @@ impl ProcessRun {
     /// node's task is aborted and then still joined, so this never returns while the node could
     /// be running. A node that finished before the abort landed keeps its real result.
     ///
-    /// If this future is dropped while its Tokio runtime remains alive, the internal supervisor
-    /// continues joining the node and delivers its full outcome to `on_unobserved`. A private RAII
-    /// envelope also invokes the observer if a delivered-but-unclaimed outcome is abandoned. The
-    /// callback must not panic and is responsible for handling every abandoned success or failure
-    /// without leaking operation payloads into telemetry.
-    pub async fn execute<P, Observer>(
-        process: P,
-        on_unobserved: Observer,
-    ) -> ProcessOutcome<P::Output, P::Error>
+    pub async fn execute<P>(process: P) -> ProcessOutcome<P::Output, P::Error>
     where
         P: Process,
-        Observer: FnOnce(ProcessOutcome<P::Output, P::Error>) + Send + 'static,
     {
         let metadata = process.metadata();
         let run_id = RunId(NEXT_RUN_ID.fetch_add(1, Ordering::Relaxed));
@@ -388,7 +335,6 @@ impl ProcessRun {
             "process.run",
             run.id = %run_id,
         );
-        let run_instrument = run_span.clone().or_current();
         let node_span = tracing::debug_span!(
             parent: &run_span,
             "process.node",
@@ -400,80 +346,50 @@ impl ProcessRun {
             process.outcome = tracing::field::Empty,
         );
         let node_instrument = node_span.clone().or_current();
-        let outcome_span = node_span;
-        let interruptibility = metadata.interruptibility;
 
-        let (outcome_sender, outcome_receiver) = tokio::sync::oneshot::channel();
-        // There is deliberately no await between constructing this supervisor and moving
-        // `process` into `tokio::spawn`. Once admitted, the supervisor owns the process node and,
-        // while the runtime lives, remains responsible for joining, recording, and delivering it
-        // even if this outer future is dropped.
-        let supervisor = tokio::spawn(
-            async move {
-                let mut task = tokio::spawn(process.run().instrument(node_instrument));
-                let (joined, cancel_requested) = match interruptibility {
-                    Interruptibility::NonInterruptible => (task.await, false),
-                    Interruptibility::Cancellable(mut signal) => {
-                        tokio::select! {
-                            biased;
-                            joined = &mut task => (joined, false),
-                            () = signal.cancelled() => {
-                                // Abort is cooperative: it lands at the node's next await. The
-                                // join below is what makes the outcome safe to report.
-                                task.abort();
-                                (task.await, true)
-                            }
+        async move {
+            // A task rather than an inline future so a panicking node reports a `JoinError`
+            // instead of unwinding through the caller.
+            let mut node = JoinSet::new();
+            node.spawn(process.run().instrument(node_instrument));
+            let (joined, cancel_requested) = match metadata.interruptibility {
+                Interruptibility::NonInterruptible => (join_one(&mut node).await, false),
+                Interruptibility::Cancellable(mut signal) => {
+                    tokio::select! {
+                        biased;
+                        joined = join_one(&mut node) => (joined, false),
+                        () = signal.cancelled() => {
+                            // Abort is cooperative: it lands at the node's next await. The join
+                            // below is what makes the outcome safe to report.
+                            node.abort_all();
+                            (join_one(&mut node).await, true)
                         }
                     }
-                };
-                let outcome = match joined {
-                    Ok(result) => {
-                        outcome_span.in_scope(|| {
-                            outcome_span.record(
-                                "process.outcome",
-                                if result.is_ok() {
-                                    "succeeded"
-                                } else {
-                                    "operation-error"
-                                },
-                            );
-                        });
-                        ProcessOutcome::Completed(result)
-                    }
-                    Err(error) => {
-                        outcome_span.in_scope(|| {
-                            outcome_span.record(
-                                "process.outcome",
-                                if error.is_panic() {
-                                    "panicked"
-                                } else if cancel_requested {
-                                    "cancelled"
-                                } else {
-                                    "task-cancelled"
-                                },
-                            );
-                        });
-                        ProcessOutcome::TaskFailed(error)
-                    }
-                };
-                let envelope = OutcomeEnvelope::new(outcome, on_unobserved);
-                if let Err(envelope) = outcome_sender.send(envelope) {
-                    drop(envelope);
                 }
-            }
-            .instrument(run_instrument),
-        );
-
-        match outcome_receiver.await {
-            Ok(envelope) => envelope.claim(),
-            Err(receive_error) => match supervisor.await {
+            };
+            let label = match &joined {
+                Ok(Ok(_)) => "succeeded",
+                Ok(Err(_)) => "operation-error",
+                Err(error) if error.is_panic() => "panicked",
+                Err(_) if cancel_requested => "cancelled",
+                Err(_) => "task-cancelled",
+            };
+            node_span.in_scope(|| node_span.record("process.outcome", label));
+            match joined {
+                Ok(result) => ProcessOutcome::Completed(result),
                 Err(error) => ProcessOutcome::TaskFailed(error),
-                Ok(()) => panic!(
-                    "a successful process supervisor always delivers an outcome: {receive_error}"
-                ),
-            },
+            }
         }
+        .instrument(run_span.or_current())
+        .await
     }
+}
+
+/// Joins the one node a [`ProcessRun`] spawned.
+async fn join_one<T: 'static>(node: &mut JoinSet<T>) -> Result<T, tokio::task::JoinError> {
+    node.join_next()
+        .await
+        .expect("the node set holds its node until it is joined")
 }
 
 #[cfg(test)]

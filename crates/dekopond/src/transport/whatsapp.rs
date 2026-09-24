@@ -85,7 +85,8 @@ pub(crate) struct WhatsappTransport {
     receiver: mpsc::Receiver<QueuedDelivery>,
     pending: VecDeque<QueuedDelivery>,
     driver: Arc<WhatsappDriver>,
-    server: Option<tokio::task::JoinHandle<()>>,
+    /// The accept loop, at most one; dropping the transport aborts it.
+    server: tokio::task::JoinSet<()>,
 }
 
 #[derive(Clone)]
@@ -299,16 +300,8 @@ impl WhatsappTransport {
             receiver,
             pending: VecDeque::new(),
             driver,
-            server: None,
+            server: tokio::task::JoinSet::new(),
         })
-    }
-}
-
-impl Drop for WhatsappTransport {
-    fn drop(&mut self) {
-        if let Some(server) = self.server.take() {
-            server.abort();
-        }
     }
 }
 
@@ -319,7 +312,7 @@ impl ChatTransport for WhatsappTransport {
 
     fn connect(&mut self) -> BoxFuture<'_, Result<TransportIdentity, TransportError>> {
         Box::pin(async move {
-            if self.server.is_some() {
+            if !self.server.is_empty() {
                 return Err(TransportError::Response);
             }
             let listener = tokio::net::TcpListener::bind(self.bind)
@@ -334,7 +327,7 @@ impl ChatTransport for WhatsappTransport {
                 })
                 .with_state(self.state.clone());
             let name = self.name.clone();
-            self.server = Some(tokio::spawn(async move {
+            self.server.spawn(async move {
                 let mut connections = tokio::task::JoinSet::new();
                 let connection_limit = Arc::new(Semaphore::new(MAX_WEBHOOK_CONCURRENCY));
                 loop {
@@ -389,7 +382,9 @@ impl ChatTransport for WhatsappTransport {
                                 // beyond the same hard deadline as a buffered webhook request.
                                 #[allow(
                                     clippy::let_underscore_must_use,
-                                    reason = "the outcome is that one untrusted client's connection ended, by deadline or by hanging up; the router already recorded whatever it answered"
+                                    reason = "the outcome is that one untrusted client's \
+                                              connection ended, by deadline or by hanging up; the \
+                                              router already recorded whatever it answered"
                                 )]
                                 let _ = tokio::time::timeout(WEBHOOK_REQUEST_TIMEOUT, connection).await;
                             });
@@ -397,7 +392,7 @@ impl ChatTransport for WhatsappTransport {
                         Some(_) = connections.join_next(), if !connections.is_empty() => {}
                     }
                 }
-            }));
+            });
             Ok(TransportIdentity::default())
         })
     }
@@ -418,20 +413,19 @@ impl ChatTransport for WhatsappTransport {
                     continue;
                 }
 
-                let source = {
-                    let Some(server) = self.server.as_mut() else {
-                        return Err(TransportError::Closed);
-                    };
-                    tokio::select! {
-                        delivery = self.receiver.recv() => delivery
-                            .map_or(Source::ListenerStopped, Source::Delivery),
-                        _ = server => Source::ListenerStopped,
-                    }
+                if self.server.is_empty() {
+                    return Err(TransportError::Closed);
+                }
+                let source = tokio::select! {
+                    delivery = self.receiver.recv() => delivery
+                        .map_or(Source::ListenerStopped, Source::Delivery),
+                    _ = self.server.join_next() => Source::ListenerStopped,
                 };
                 match source {
                     Source::Delivery(delivery) => self.pending.push_back(delivery),
+                    // Empties the set either way, so a later `connect` may listen again.
                     Source::ListenerStopped => {
-                        self.server.take();
+                        self.server.shutdown().await;
                         return Err(TransportError::Closed);
                     }
                 }
@@ -1585,7 +1579,7 @@ mod tests {
             running.connect().await.is_err(),
             "a second accept loop is refused"
         );
-        running.server.as_ref().expect("server handle").abort();
+        running.server.abort_all();
         let stopped = tokio::time::timeout(Duration::from_secs(1), running.next())
             .await
             .expect("listener completion is observed");

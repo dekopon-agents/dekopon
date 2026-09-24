@@ -26,15 +26,17 @@ predecessor, and any copy of the file taken before that refresh is dead.
 **A refresh is serialized across processes.** `CredentialFile::refresh_if_needed` takes an exclusive advisory lock
 on a sibling `chatgpt-auth.json.lock` before refreshing, then re-reads the credential file and
 adopts the stored record when its `expiresAt` is later than the one in memory. That is the whole
-defence against the rotation trap: `dekopond` shares one client per configured model, but each
+defence against the rotation trap: `dekopond` shares one client per configured model and one
+`CredentialFile` per auth file across models (its refresh timeout is the first such model's
+`timeoutMs`), but each
 concurrent turn runs on a credential snapshot taken before the lock, and an external embedding or a
 second daemon on the same host can open the same file; two arriving near the refresh margin would
 otherwise both present the same refresh token, and OAuth reuse detection can revoke the entire
 token family rather than just failing the second call. The same adoption runs before the forced
 refresh a `401` triggers. The turn is resent once after that pre-body refresh, within the original
-total deadline. If the lock cannot be taken at all — a read-only directory, a filesystem without
-advisory locking — the refresh proceeds uncoordinated and logs
-`chatgpt_credential_lock_unavailable`, because no turn at all is worse than an uncoordinated one.
+total deadline. If the lock cannot be taken at all (a read-only directory, a filesystem without
+advisory locking) the refresh fails with `LockAuth` before the token endpoint is called: an
+uncoordinated rotation buys one turn and then leaves another holder spending a retired token.
 
 **The rotated value should be persisted, and the turn continues either way.** The refresh assigns
 the new record and then writes it. A write failure logs `chatgpt_credential_save_failed` at error

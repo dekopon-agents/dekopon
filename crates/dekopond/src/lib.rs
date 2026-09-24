@@ -23,7 +23,14 @@
 #![forbid(unsafe_code)]
 #![cfg(unix)]
 #![cfg_attr(test, allow(clippy::unwrap_used))]
-
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        reason = "tests spawn, join and drain freely; production sites carry their own expectation"
+    )
+)]
 mod asset;
 mod cache_key;
 mod collection;
@@ -408,10 +415,12 @@ fn dispatch(
                 active_outcome,
                 CancelOutcome::NoSession | CancelOutcome::OtherSubject | CancelOutcome::Completing
             ) && let Some(driver) = drivers.get(&message.transport).cloned()
+                && let Some(reply) = runner.gate.refusal()
             {
                 let receipt = message.receive_span.clone();
                 sessions.spawn(
                     async move {
+                        let _reply = reply;
                         session::answer(&driver, &message, session::STOPPED_REPLY).await;
                     }
                     .instrument(receipt),
@@ -476,9 +485,12 @@ fn dispatch(
         }
         collection::Offered::Refused(message, reason) => {
             collection::disposition(&message.receive_span, reason);
-            if let Some(driver) = drivers.get(&message.transport).cloned() {
+            if let Some(driver) = drivers.get(&message.transport).cloned()
+                && let Some(permit) = runner.gate.refusal()
+            {
                 let receipt = message.receive_span.clone();
                 sessions.spawn(async move {
+                    let _permit = permit;
                     let reply = match reason {
                         "late-instructions" => "Your instruction was not processed. Please send it after the current request completes; the earlier photos are still being collected.",
                         "different-run" => "This input was not processed because another request's photos are still being collected. Please send it separately after that request completes.",

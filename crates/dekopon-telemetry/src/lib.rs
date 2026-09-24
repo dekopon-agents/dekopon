@@ -13,7 +13,14 @@
 //! this crate parses, and never attached to a span attribute or log field.
 
 #![cfg_attr(test, allow(clippy::unwrap_used))]
-
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        reason = "tests spawn, join and drain freely; production sites carry their own expectation"
+    )
+)]
 mod install;
 
 use std::{fmt, str::FromStr, sync::OnceLock, time::Duration};
@@ -401,16 +408,20 @@ fn otlp_client_from(
 impl OtlpHttpClient {
     fn new(timeout: Duration) -> Result<Self, TelemetryError> {
         // reqwest's blocking client owns a private runtime and refuses to create it from within
-        // Dekopon's Tokio runtime. Build it on a plain thread, as the upstream OTLP adapter does.
-        let client = std::thread::Builder::new()
-            .name("dekopon-otlp-http-client".to_owned())
-            .spawn(move || otlp_client_from(reqwest::blocking::Client::builder(), timeout).build())
-            .map_err(TelemetryError::HttpClientThread)?
-            .join()
-            .map_err(|payload| TelemetryError::HttpClientThreadPanicked {
-                message: panic_message(&*payload),
-            })?
-            .map_err(TelemetryError::HttpClient)?;
+        // Dekopon's Tokio runtime. Build it on a scoped thread, as the upstream OTLP adapter does.
+        let client = std::thread::scope(|scope| {
+            std::thread::Builder::new()
+                .name("dekopon-otlp-http-client".to_owned())
+                .spawn_scoped(scope, move || {
+                    otlp_client_from(reqwest::blocking::Client::builder(), timeout).build()
+                })
+                .map_err(TelemetryError::HttpClientThread)?
+                .join()
+                .map_err(|payload| TelemetryError::HttpClientThreadPanicked {
+                    message: panic_message(&*payload),
+                })
+        })?
+        .map_err(TelemetryError::HttpClient)?;
         Ok(Self(client))
     }
 }

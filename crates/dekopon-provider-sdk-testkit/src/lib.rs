@@ -44,7 +44,14 @@
 //! `#[tokio::test(flavor = "multi_thread")]`.
 
 #![cfg_attr(test, allow(clippy::unwrap_used))]
-
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        clippy::disallowed_types,
+        reason = "tests spawn, join and drain freely; production sites carry their own expectation"
+    )
+)]
 use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},

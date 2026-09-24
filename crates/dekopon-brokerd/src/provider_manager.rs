@@ -955,7 +955,7 @@ struct OciDescriptor {
 struct RegistryClient {
     client: reqwest::Client,
     plaintext: BTreeSet<String>,
-    tokens: Arc<tokio::sync::Mutex<BTreeMap<String, RegistryToken>>>,
+    tokens: Arc<std::sync::Mutex<BTreeMap<String, RegistryToken>>>,
 }
 
 #[derive(Clone)]
@@ -989,7 +989,7 @@ impl RegistryClient {
         Ok(Self {
             client,
             plaintext: allowed,
-            tokens: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
+            tokens: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -1172,7 +1172,12 @@ impl RegistryClient {
         operation: &'static str,
     ) -> Result<reqwest::Response, ProviderManagerError> {
         let key = format!("{}/{}", reference.registry(), reference.repository());
-        let cached = { self.tokens.lock().await.get(&key).cloned() };
+        let cached = self
+            .tokens
+            .lock()
+            .expect("registry token cache")
+            .get(&key)
+            .cloned();
         let mut response = self
             .send_get(url.clone(), accept, cached.as_ref(), operation)
             .await?;
@@ -1193,7 +1198,10 @@ impl RegistryClient {
             // untrusted and never enters the surfaced error or ordinary logs.
             bounded_response_bytes(response, HARD_MAX_REGISTRY_ERROR_BYTES, operation).await?;
             let token = self.fetch_token(reference, &challenge).await?;
-            self.tokens.lock().await.insert(key, token.clone());
+            self.tokens
+                .lock()
+                .expect("registry token cache")
+                .insert(key, token.clone());
             response = self.send_get(url, accept, Some(&token), operation).await?;
         }
         if !response.status().is_success() {

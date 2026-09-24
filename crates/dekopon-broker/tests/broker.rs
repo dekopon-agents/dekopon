@@ -415,7 +415,7 @@ async fn policy_authorizes_and_audits_no_payloads() {
     );
     assert_eq!(result.result.evidence.len(), 2);
 
-    let records = audit.records().await;
+    let records = audit.records();
     assert_eq!(records.len(), 2);
     assert!(matches!(
         records[0],
@@ -479,7 +479,7 @@ async fn unmatched_identity_is_denied_before_provider_execution() {
     assert_eq!(result.result.decision.decision_id, "deny-invoke-denied");
     assert_eq!(result.result.error.as_deref(), Some("policy-denied"));
     assert!(result.result.output.is_none());
-    let records = audit.records().await;
+    let records = audit.records();
     assert_eq!(records.len(), 1);
     assert!(matches!(
         records[0],
@@ -656,7 +656,7 @@ async fn http_audit_contains_only_sanitized_call_metadata() {
     assert!(wire.ends_with(b"\r\n\r\nbody-secret"));
     server.join();
 
-    let records = audit.records().await;
+    let records = audit.records();
     assert_eq!(records.len(), 2);
     let serialized = serde_json::to_string(&records).expect("audit serializes");
     assert!(serialized.contains(&authority));
@@ -816,7 +816,7 @@ async fn jsonplaceholder_write_requires_external_write_policy_and_redacts_conten
     );
     server.join();
 
-    let records = audit.records().await;
+    let records = audit.records();
     assert_eq!(records.len(), 3);
     let serialized = serde_json::to_string(&records).expect("audit serializes");
     assert!(serialized.contains(&authority));
@@ -936,7 +936,7 @@ async fn failed_execution_audits_the_external_write_that_already_landed() {
         "a failure that dispatched HTTP must return http-call evidence"
     );
 
-    let records = audit.records().await;
+    let records = audit.records();
     assert_eq!(records.len(), 2);
     let AuditEvent::Execution {
         outcome,
@@ -1052,7 +1052,7 @@ async fn credentialed_constraint_sets_inject_bound_secrets_and_never_audit_them(
     server.join();
 
     // Presence is recorded; the value is not — not in audit, not in the public result.
-    let records = audit.records().await;
+    let records = audit.records();
     let serialized = serde_json::to_string(&records).expect("audit serializes");
     assert!(
         serialized.contains("\"credentialInjected\":true"),
@@ -1213,7 +1213,7 @@ async fn a_refreshing_credential_resolves_once_per_invocation_outside_the_guest_
     assert!(wire.contains("chatgpt-account-id: acct-fixture"), "{wire}");
     server.join();
 
-    let records = audit.records().await;
+    let records = audit.records();
     let AuditEvent::Execution {
         credential,
         http_calls,
@@ -1344,7 +1344,7 @@ async fn an_unrenewable_credential_fails_its_invocation_and_classifies_why() {
     );
     assert_eq!(resolutions.load(std::sync::atomic::Ordering::SeqCst), 2);
 
-    let records = audit.records().await;
+    let records = audit.records();
     for record in &records {
         if let AuditEvent::Execution { credential, .. } = record {
             assert_eq!(
@@ -1444,7 +1444,7 @@ async fn model_selected_drn_requires_dual_policy_and_exact_private_binding() {
     );
     server.join();
 
-    let serialized = serde_json::to_string(&audit.records().await).expect("audit serializes");
+    let serialized = serde_json::to_string(&audit.records()).expect("audit serializes");
     assert!(
         serialized.contains(secret_drn().as_str()),
         "DRN is attributable"
@@ -1519,7 +1519,7 @@ async fn capability_policy_alone_cannot_authorize_a_drn() {
         dekopon_capability::InvocationOutcome::Denied
     );
     assert_eq!(result.result.error.as_deref(), Some("secret-denied"));
-    let encoded = serde_json::to_string(&audit.records().await).expect("audit serializes");
+    let encoded = serde_json::to_string(&audit.records()).expect("audit serializes");
     assert!(encoded.contains(secret_drn().as_str()), "{encoded}");
     assert!(encoded.contains("secret_sink"), "{encoded}");
     assert!(!encoded.contains("never-resolved"), "{encoded}");
@@ -1636,10 +1636,7 @@ async fn a_command_word_proposes_basic_secret_use_from_its_argv() {
             }),
         }
     );
-    assert!(
-        audit.records().await.is_empty(),
-        "running a word decides nothing"
-    );
+    assert!(audit.records().is_empty(), "running a word decides nothing");
 }
 
 /// A word's Basic proposal is authorized like any other secret use, and the binding fixes the
@@ -1747,7 +1744,7 @@ async fn a_command_word_s_basic_proposal_needs_a_binding_for_its_exact_username(
     );
     server.join();
 
-    let serialized = serde_json::to_string(&audit.records().await).expect("audit serializes");
+    let serialized = serde_json::to_string(&audit.records()).expect("audit serializes");
     assert!(
         serialized.contains(secret_drn().as_str()),
         "DRN is attributable"
@@ -1830,7 +1827,7 @@ async fn authorized_source_failure_is_a_terminal_audited_failure_not_an_ambiguou
         dekopon_capability::InvocationOutcome::Failed
     );
     assert_eq!(result.result.error.as_deref(), Some("secret-resolution"));
-    let records = audit.records().await;
+    let records = audit.records();
     assert_eq!(records.len(), 2, "decision plus terminal failed execution");
     let AuditEvent::Execution {
         error, http_calls, ..
@@ -1976,7 +1973,7 @@ async fn per_agent_credentials_select_by_agent_and_fall_back_to_the_default() {
     server.join();
 
     // Which authority a write used is exactly what an auditor needs; the value still is not.
-    let records = audit.records().await;
+    let records = audit.records();
     let encoded = serde_json::to_value(&records).expect("audit serializes");
     let selected = encoded
         .as_array()
@@ -2082,7 +2079,7 @@ async fn an_agent_with_no_override_and_no_default_transacts_unauthenticated() {
     );
     server.join();
 
-    let records = audit.records().await;
+    let records = audit.records();
     let encoded = serde_json::to_value(&records).expect("audit serializes");
     let selected = encoded
         .as_array()
@@ -2389,7 +2386,7 @@ async fn via_isolation_holds_in_both_directions() {
         "attestor authority is not capability: the gateway holds nothing of its own"
     );
 
-    let records = audit.records().await;
+    let records = audit.records();
     assert_eq!(records.len(), 4, "one allow plus execution, two denials");
 }
 
@@ -2458,7 +2455,7 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
         Some("attestation-denied")
     );
 
-    let records = audit.records().await;
+    let records = audit.records();
     assert_eq!(records.len(), 2);
     for record in &records {
         let AuditEvent::Decision {
@@ -2515,7 +2512,7 @@ async fn attestation_refusals_are_audited_denials_under_the_peer() {
         dekopon_capability::InvocationOutcome::Denied
     );
     assert_eq!(unmapped.result.error.as_deref(), Some("unmapped-subject"));
-    let records = audit.records().await;
+    let records = audit.records();
     assert_eq!(records.len(), 1);
     let AuditEvent::Decision {
         principal,
@@ -2568,7 +2565,7 @@ async fn attested_success_audits_via_and_subject() {
         dekopon_capability::InvocationOutcome::Succeeded
     );
 
-    let records = audit.records().await;
+    let records = audit.records();
     assert_eq!(records.len(), 2);
     let encoded = serde_json::to_value(&records).expect("audit serializes");
     // Event field names are the enum's own snake_case. Asserting the literal keys keeps them from
@@ -2846,7 +2843,7 @@ async fn audit_records_carry_determining_policy_ids_and_the_policy_digest() {
         .await
         .expect("the denial is accounted");
 
-    let records = audit.records().await;
+    let records = audit.records();
     let encoded = serde_json::to_value(&records).expect("audit serializes");
     // Event fields keep the enum's own snake_case.
     for index in [0, 1] {
@@ -3182,8 +3179,5 @@ async fn a_command_word_renders_help_and_reads_the_piped_value_through_the_broke
         }
         other => panic!("expected a rendered usage error, got {other:?}"),
     }
-    assert!(
-        audit.records().await.is_empty(),
-        "running a word decides nothing"
-    );
+    assert!(audit.records().is_empty(), "running a word decides nothing");
 }

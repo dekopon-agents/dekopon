@@ -278,7 +278,7 @@ impl CredentialFile {
         let _entered = span.enter();
         let started = Instant::now();
 
-        let _lock = CredentialLock::acquire(&self.path);
+        let _lock = CredentialLock::acquire(&self.path)?;
         // Re-read under the refresh lock: another session may have rotated while this one
         // awaited its 401, including a rotation that could not be persisted.
         *credentials = self.snapshot();
@@ -950,7 +950,7 @@ fn exported_path(value: Option<OsString>) -> Option<PathBuf> {
     value.filter(|value| !value.is_empty()).map(PathBuf::from)
 }
 
-pub(crate) fn resolve_auth_path(explicit: Option<&Path>) -> Result<PathBuf, ChatGptError> {
+pub fn resolve_auth_path(explicit: Option<&Path>) -> Result<PathBuf, ChatGptError> {
     resolve_auth_path_named(explicit, DEFAULT_AUTH_FILE_NAME)
 }
 
@@ -1000,41 +1000,28 @@ struct CredentialLock {
 }
 
 impl CredentialLock {
-    /// Blocks until this process holds the lock, or gives up and returns `None`.
+    /// Blocks until this process holds the lock.
     ///
-    /// Failing to lock is not made fatal. A read-only directory or a filesystem without advisory
-    /// locking would otherwise turn a recoverable single-writer deployment into one that cannot
-    /// refresh at all; an uncoordinated refresh is worse than a coordinated one and better than no
-    /// turn. The warning is what an operator sees when the coordination is not actually in force.
-    fn acquire(auth_path: &Path) -> Option<Self> {
-        let path = credential_lock_path(auth_path)?;
+    /// Failing to lock fails the refresh. The refresh token rotates, so an uncoordinated refresh
+    /// buys one turn and then leaves another process spending a token the provider has retired.
+    /// A read-only directory or a filesystem without advisory locks is a deployment fault an
+    /// operator fixes, not something to paper over one rotation at a time.
+    fn acquire(auth_path: &Path) -> Result<Self, ChatGptError> {
+        let path = credential_lock_path(auth_path).ok_or_else(|| ChatGptError::LockAuth {
+            path: auth_path.to_path_buf(),
+            source: io::Error::from(io::ErrorKind::InvalidInput),
+        })?;
         let mut options = OpenOptions::new();
         options.read(true).write(true).create(true);
         set_private_file_mode(&mut options);
-        let file = match options.open(&path) {
-            Ok(file) => file,
-            Err(source) => {
-                tracing::warn!(
-                    event = "chatgpt_credential_lock_unavailable",
-                    path = %path.display(),
-                    error = %source,
-                    "could not open the ChatGPT credential lock; refreshing without cross-process \
-                     coordination"
-                );
-                return None;
-            }
-        };
-        if let Err(source) = file.lock() {
-            tracing::warn!(
-                event = "chatgpt_credential_lock_unavailable",
-                path = %path.display(),
-                error = %source,
-                "could not lock the ChatGPT credential lock; refreshing without cross-process \
-                 coordination"
-            );
-            return None;
-        }
-        Some(Self { file })
+        let file = options
+            .open(&path)
+            .and_then(|file| file.lock().map(|()| file))
+            .map_err(|source| ChatGptError::LockAuth {
+                path: path.clone(),
+                source,
+            })?;
+        Ok(Self { file })
     }
 }
 
@@ -1284,6 +1271,15 @@ pub enum ChatGptError {
         /// JSON error.
         #[source]
         source: serde_json::Error,
+    },
+    /// Taking the cross-process refresh lock beside the credential file failed.
+    #[error("could not lock ChatGPT credential refresh at {}", path.display())]
+    LockAuth {
+        /// Lock file path.
+        path: PathBuf,
+        /// Filesystem error.
+        #[source]
+        source: io::Error,
     },
     /// Writing credentials failed.
     #[error("could not write ChatGPT credentials at {}", path.display())]
@@ -2586,6 +2582,9 @@ mod tests {
         )
         .expect("model client");
 
+        // The refresh lock is a deployment precondition, so it exists before the directory
+        // stops accepting new files; only the credential write-back is meant to fail.
+        fs::File::create(credential_lock_path(&path).expect("lock path")).expect("lock file");
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o500))
             .expect("make the credential directory unwritable");
         let turn = generate_turn(
@@ -2960,6 +2959,39 @@ mod tests {
         assert_eq!(server.requests().len(), 1);
     }
 
+    /// A refresh that cannot take the cross-process lock is refused before the token endpoint is
+    /// called: rotating without it spends a refresh token another holder may already hold.
+    #[test]
+    fn a_refresh_that_cannot_lock_fails_without_spending_the_refresh_token() {
+        let server = MockServer::start(Vec::new());
+        let temp = TempDir::new().expect("temporary directory");
+        let path = temp.path().join("auth.json");
+        save_credentials(&path, &credential_fixture("acct-old", "refresh-old", 0))
+            .expect("save credentials");
+        // A directory where the lock file belongs: opening it for writing fails on every platform.
+        fs::create_dir(credential_lock_path(&path).expect("lock path")).expect("block the lock");
+        let credential = CredentialFile::with_endpoints(
+            &path,
+            Duration::from_secs(2),
+            ChatGptEndpoints::local(&server.base_url()),
+        )
+        .expect("the credential opens");
+
+        let refused = credential
+            .current()
+            .expect_err("an unlocked refresh is refused");
+
+        assert!(
+            matches!(refused, ChatGptError::LockAuth { .. }),
+            "{refused:?}"
+        );
+        assert!(server.requests().is_empty(), "the refresh token was spent");
+        assert_eq!(
+            load_credentials(&path).expect("stored").refresh.expose(),
+            "refresh-old"
+        );
+    }
+
     /// `invalid_grant` is the one refresh failure no retry can fix: the token family is gone and a
     /// human has to log in again. The error has to name it, because that is how a caller tells a
     /// permanent re-authorization from a transient network failure.
@@ -3033,6 +3065,9 @@ mod tests {
         )
         .expect("the credential opens");
 
+        // The refresh lock is a deployment precondition, so it exists before the directory
+        // stops accepting new files; only the credential write-back is meant to fail.
+        fs::File::create(credential_lock_path(&path).expect("lock path")).expect("lock file");
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o500))
             .expect("make the credential directory unwritable");
         let resolved = credential.current();

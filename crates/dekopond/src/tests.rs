@@ -4893,6 +4893,26 @@ async fn concurrency_is_bounded_across_every_conversation() {
     drop(second);
 }
 
+#[tokio::test]
+async fn refusal_replies_waiting_on_a_chat_service_are_bounded_apart_from_sessions() {
+    // A stalled chat service must not turn a stream of refused messages into an unbounded pile of
+    // pending replies, and those replies must not spend the slots real sessions run in.
+    let gate = SessionGate::new(2);
+    let first = gate.refusal().expect("first refusal reply");
+    let _second = gate.refusal().expect("second refusal reply");
+    assert!(gate.refusal().is_none(), "one past the ceiling is skipped");
+    assert!(
+        gate.admit(("a".to_owned(), "a".to_owned())).is_some(),
+        "pending refusals leave session admission alone"
+    );
+
+    drop(first);
+    assert!(
+        gate.refusal().is_some(),
+        "a delivered reply releases its slot"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_session_answers_one_fixed_line_and_never_raw_error_text() {
     // A `PromptError` can carry model-chosen text, a provider message, or a transport diagnostic.

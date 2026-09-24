@@ -16,6 +16,11 @@
 //! Its own test binary, because `tracing` caches per-callsite interest against the global
 //! dispatcher for the whole process. Both tests share the one subscriber a process can install.
 
+#![allow(
+    clippy::disallowed_methods,
+    clippy::disallowed_types,
+    reason = "tests spawn, join and drain freely"
+)]
 #![allow(clippy::unwrap_used)]
 
 use std::{

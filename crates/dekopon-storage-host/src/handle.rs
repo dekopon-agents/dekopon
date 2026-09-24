@@ -5,7 +5,7 @@ use crate::{
         DOMAIN_LOGICAL_PATH, DOMAIN_OPERATION_EVIDENCE, DOMAIN_OUTPUT_EVIDENCE, commitment, token,
     },
     layout::{ENTRY_CHARGE, EntryKind, Usage, scan_usage, usage_with_directory_entry},
-    namespace::{Namespace, lock_exclusive, logical_file},
+    namespace::{Namespace, deadline_after, lock_exclusive, logical_file},
     quota::{QuotaLedger, Reservation},
     vfs::LockLevel,
 };
@@ -201,7 +201,7 @@ impl StorageHandle {
             .namespace
             .directory
             .open_private("lease.lock", false)?;
-        lock_exclusive(&lease, grant.limits.lock_timeout_ms)?;
+        lock_exclusive(&lease, deadline_after(grant.limits.lock_timeout_ms)?)?;
 
         // The one tree walk of this invocation. Every mutation below carries its own delta
         // forward instead of asking the tree again.

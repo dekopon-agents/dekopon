@@ -7,6 +7,32 @@ All notable changes to Dekopon are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed
+
+- A ChatGPT refresh that cannot take its cross-process lock now fails with `LockAuth` instead of
+  rotating uncoordinated, and `dekopond` shares one credential per auth file across models.
+- Busy, refusal and stopped replies share a bounded budget sized like `sessions.maxConcurrent`; a
+  reply that finds it full is skipped with a `gateway_refusal_reply_skipped` event.
+- Storage grants wait on one `lockTimeoutMs` deadline across the namespace housekeeping lock and
+  the base lease, rather than one timeout per wait.
+- Attachment downloads have a 60 s end-to-end deadline, and a stalled one no longer blocks other
+  conversations' attachment reads.
+- The local development transport bounds its queues and stops answering a caller that stops
+  reading.
+- `clippy.toml` bans raw task, thread and unbounded-queue constructors and `Condvar`; production
+  uses carry a site `#[expect]` naming owner and bound; two remain (the jq worker thread and the
+  progress policy task). `AGENTS.md` gains a Concurrency section.
+- `dekopon-process` joins its node in a `JoinSet` and no longer detaches a supervisor; dropping
+  `ProcessRun::execute` aborts the node. `execute` loses its `on_unobserved` argument, and
+  `dekopon-agent`'s `report_unobserved_command_run` and the `agent.command.unobserved` record are
+  removed: the one caller runs `execute` to completion, so they never fired.
+
+### Fixed
+
+- `jq halt`, `halt(n)` and `halt_error` exited `dekopond`; they now fail the command.
+- The jq abandoned-worker count could wrap below zero when a worker finished between its
+  abandonment being published and charged.
+
 ## [0.20.0] - 2026-09-23
 
 ### Added

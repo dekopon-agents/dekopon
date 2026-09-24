@@ -16,7 +16,9 @@
 
 use std::{
     collections::BTreeMap,
-    fs, io,
+    fs,
+    future::Future,
+    io,
     os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _},
     path::{Path, PathBuf},
     sync::{
@@ -38,6 +40,7 @@ use tokio::{
     io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader},
     net::{UnixListener, UnixStream},
     sync::{mpsc, oneshot},
+    task::JoinSet,
 };
 
 use crate::{
@@ -54,6 +57,15 @@ use crate::{
 
 /// Longest line the development transport accepts, matching the inbound text bound plus envelope.
 const MAX_LINE_BYTES: u64 = 64 * 1024;
+/// Parsed lines waiting for the gateway, across every connection. A reader that finds it full
+/// waits, which stops it reading its socket: the caller feels backpressure, not a growing queue.
+const INBOUND_BUFFER: usize = 64;
+/// Lines waiting for one connection's writer. Every emit waits for its own acknowledgement, so this
+/// only has to cover the signals of one session writing at once.
+const OUTBOUND_BUFFER: usize = 16;
+/// How long a line may wait for the kernel to take it. A caller that stopped reading its socket is
+/// dropped rather than holding a session's progress and answer forever.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often the reference driver re-emits its typing line.
 ///
 /// A JSON line expires from nothing, so this interval exists only to drive the policy's renewal
@@ -103,10 +115,12 @@ pub(crate) struct LocalTransport {
     socket_path: PathBuf,
     listener: Option<UnixListener>,
     guard: Option<SocketGuard>,
-    inbound: Option<mpsc::UnboundedReceiver<TransportEvent>>,
-    sender: mpsc::UnboundedSender<TransportEvent>,
+    inbound: Option<mpsc::Receiver<TransportEvent>>,
+    sender: mpsc::Sender<TransportEvent>,
     driver: Arc<LocalDriver>,
     connections: AtomicU64,
+    /// One task per open connection; dropping the transport aborts them.
+    serving: JoinSet<()>,
     boot_nonce: Option<String>,
     /// `liveness.mode: native` — an inbound line carries coordinates for transient signals.
     ///
@@ -119,7 +133,7 @@ pub(crate) struct LocalTransport {
 
 impl LocalTransport {
     pub(crate) fn new(name: String, socket_path: PathBuf, liveness: LivenessSettings) -> Self {
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::channel(INBOUND_BUFFER);
         Self {
             name,
             socket_path,
@@ -129,15 +143,16 @@ impl LocalTransport {
             sender,
             driver: Arc::new(LocalDriver::default()),
             connections: AtomicU64::new(1),
+            serving: JoinSet::new(),
             boot_nonce: None,
             native: liveness.mode == LivenessMode::Native,
         }
     }
 
     /// Serves one connection: JSON lines in, JSON lines out, until the caller hangs up.
-    fn serve(&self, stream: UnixStream) {
+    fn serve(&self, stream: UnixStream) -> impl Future<Output = ()> + Send + 'static {
         let connection = self.connections.fetch_add(1, Ordering::Relaxed);
-        let (outbound_send, mut outbound_receive) = mpsc::unbounded_channel::<LocalWrite>();
+        let (outbound_send, mut outbound_receive) = mpsc::channel::<LocalWrite>(OUTBOUND_BUFFER);
         self.driver.register(connection, outbound_send);
 
         let name = self.name.clone();
@@ -145,13 +160,16 @@ impl LocalTransport {
         let boot_nonce = self.boot_nonce.clone().unwrap_or_default();
         let inbound = self.sender.clone();
         let driver = Arc::clone(&self.driver);
-        tokio::spawn(async move {
+        async move {
             let (reader, mut writer) = stream.into_split();
             // `Take` re-armed per line rather than per connection: a line ceiling has to bound the
             // buffer *before* it is allocated, and a connection ceiling would end a long dev
             // session after enough short requests.
             let mut reader = BufReader::new(reader).take(MAX_LINE_BYTES);
-            let writes = tokio::spawn(async move {
+            // Its own task rather than a `select!` arm: a stop line's acknowledgment is itself a
+            // write, awaited inside the reader. Dropping the set when the reader ends aborts it.
+            let mut writes = JoinSet::new();
+            writes.spawn(async move {
                 while let Some(reply) = outbound_receive.recv().await {
                     let accepted =
                         writer.write_all(&reply.line).await.is_ok() && writer.flush().await.is_ok();
@@ -244,7 +262,7 @@ impl LocalTransport {
                         // origin from `CancelVia::Button`.
                         via: CancelVia::StopReply,
                     });
-                    if inbound.send(cancelled).is_err() {
+                    if inbound.send(cancelled).await.is_err() {
                         break;
                     }
                     continue;
@@ -295,14 +313,14 @@ impl LocalTransport {
                 };
                 if inbound
                     .send(TransportEvent::Message(Box::new(message)))
+                    .await
                     .is_err()
                 {
                     break;
                 }
             }
             driver.forget(connection);
-            writes.abort();
-        });
+        }
     }
 }
 
@@ -345,8 +363,10 @@ impl ChatTransport for LocalTransport {
                 tokio::select! {
                     accepted = listener.accept() => {
                         let (stream, _) = accepted.map_err(TransportError::Io)?;
-                        self.serve(stream);
+                        let connection = self.serve(stream);
+                        self.serving.spawn(connection);
                     }
+                    Some(_) = self.serving.join_next(), if !self.serving.is_empty() => {}
                     event = receiver.recv() => {
                         return event.ok_or(TransportError::Closed);
                     }
@@ -368,7 +388,7 @@ impl ChatTransport for LocalTransport {
 /// without a chat service at all.
 #[derive(Default)]
 pub(crate) struct LocalDriver {
-    connections: Mutex<BTreeMap<u64, mpsc::UnboundedSender<LocalWrite>>>,
+    connections: Mutex<BTreeMap<u64, mpsc::Sender<LocalWrite>>>,
     /// Mints the identifier a progress or stream message is re-emitted under.
     ///
     /// A number rather than a service snowflake, because there is no service: the identifier
@@ -431,7 +451,7 @@ impl serde::Serialize for Base64Data<'_> {
 }
 
 impl LocalDriver {
-    fn register(&self, connection: u64, sender: mpsc::UnboundedSender<LocalWrite>) {
+    fn register(&self, connection: u64, sender: mpsc::Sender<LocalWrite>) {
         self.connections
             .lock()
             .expect("local connection registry")
@@ -477,13 +497,21 @@ impl LocalDriver {
         )]
         let line = super::compact_json(line, b"\n").map_err(|_| TransportError::Response)?;
         let (ack, received) = oneshot::channel();
-        sender
-            .send(LocalWrite { line, ack })
-            .map_err(|_| TransportError::Closed)?;
-        if received.await.map_err(|_| TransportError::Closed)? {
-            Ok(())
-        } else {
-            Err(TransportError::Closed)
+        let written = tokio::time::timeout(WRITE_TIMEOUT, async {
+            sender
+                .send(LocalWrite { line, ack })
+                .await
+                .map_err(|_| TransportError::Closed)?;
+            received.await.map_err(|_| TransportError::Closed)
+        })
+        .await;
+        match written {
+            Ok(Ok(true)) => Ok(()),
+            Ok(Ok(false) | Err(_)) => Err(TransportError::Closed),
+            Err(_elapsed) => {
+                self.forget(connection);
+                Err(TransportError::Closed)
+            }
         }
     }
 
@@ -879,7 +907,7 @@ mod unit_tests {
         sync::mpsc,
     };
 
-    use super::{LocalDriver, LocalTransport, LocalWrite};
+    use super::{LocalDriver, LocalTransport, LocalWrite, OUTBOUND_BUFFER, WRITE_TIMEOUT};
     use crate::{
         config::{LivenessMode, LivenessSettings},
         progress::ProgressText,
@@ -940,7 +968,7 @@ mod unit_tests {
     /// bytes were accepted, so a recorder that never answered would hang every call under test
     /// exactly as a hung-up caller does.
     fn connect(driver: &LocalDriver, connection: u64) -> Arc<Mutex<Vec<Value>>> {
-        let (sender, mut receiver) = mpsc::unbounded_channel::<LocalWrite>();
+        let (sender, mut receiver) = mpsc::channel::<LocalWrite>(OUTBOUND_BUFFER);
         driver.register(connection, sender);
         let lines = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&lines);
@@ -1280,5 +1308,35 @@ mod unit_tests {
             .await
             .expect_err("the answer has nowhere to go");
         assert_eq!(closed.category(), "closed");
+    }
+
+    /// A caller that stops reading its socket is dropped after the write deadline instead of
+    /// holding the session's progress and answer open forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_caller_that_never_reads_is_dropped_at_the_write_deadline() {
+        let driver = LocalDriver::default();
+        let (sender, _never_acknowledged) = mpsc::channel::<LocalWrite>(OUTBOUND_BUFFER);
+        driver.register(5, sender);
+        let target = LivenessTarget::Local { connection: 5 };
+        let status = driver.status().expect("a native status is implemented");
+
+        let started = tokio::time::Instant::now();
+        let stalled = status
+            .set(&target, Status::Idle)
+            .await
+            .expect_err("nothing acknowledged the line");
+        assert_eq!(stalled.category(), "closed");
+        assert!(started.elapsed() >= WRITE_TIMEOUT);
+
+        let started = tokio::time::Instant::now();
+        let forgotten = status
+            .set(&target, Status::Idle)
+            .await
+            .expect_err("the connection was dropped");
+        assert_eq!(forgotten.category(), "closed");
+        assert!(
+            started.elapsed() < WRITE_TIMEOUT,
+            "a dropped connection fails at once"
+        );
     }
 }
